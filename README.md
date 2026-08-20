@@ -70,13 +70,13 @@ CUDA distribution appropriate for the machine. Known-good configurations are:
 | Thor-U | `sm_101` | CUDA 12.8 |
 | Jetson AGX Orin | `sm_87` | CUDA 12.6 and 13.2 |
 
-Set the toolkit path and the architecture before building. Do not omit the
-architecture on Jetson:
+Set the toolkit path before building. On a native build, ApxInf queries the
+CUDA runtime and automatically selects the architecture of the visible GPU:
 
 ```bash
 export CUDA_PATH=/usr/local/cuda
 export PATH="${CUDA_PATH}/bin:$PATH"
-export APXINF_CUDA_ARCH=sm_110  # use sm_101 for Thor-U or sm_87 for Orin
+unset APXINF_CUDA_ARCH APXINF_CUDA_ARCH_CUTLASS
 
 nvcc --version
 test -f "${CUDA_PATH}/include/cuda_runtime.h"
@@ -85,6 +85,21 @@ test -f "${CUDA_PATH}/include/cuda_runtime.h"
 The build itself locates `nvcc` through `CUDA_PATH`; the `PATH` entry is what
 makes the `nvcc --version` check above work on a shell that has no CUDA on its
 default path.
+
+Set `APXINF_CUDA_ARCH` explicitly when cross-compiling, building in a container
+without a visible GPU, or producing binaries for a different machine. Prefer a
+one-shot override so later native builds still use hardware detection:
+
+```bash
+APXINF_CUDA_ARCH=sm_110 cargo build --release --features cuda
+# Use sm_101 for Thor-U or sm_87 for Orin.
+```
+
+The override always takes precedence over hardware detection. If visible GPUs
+have different compute capabilities, restrict the build with
+`CUDA_VISIBLE_DEVICES` or set `APXINF_CUDA_ARCH`. The corresponding
+architecture-specific CUTLASS target (for example `sm_110a`) is selected
+automatically and can be overridden with `APXINF_CUDA_ARCH_CUTLASS`.
 
 If CUDA is installed elsewhere, point `CUDA_PATH` at that directory. The
 runtime libraries must also be visible to the system dynamic linker.
