@@ -1,0 +1,66 @@
+{
+  "schema": "apxinf.qwen38_27b.multimodal_capability_contract.v1",
+  "status": "released",
+  "overlay_for": {
+    "contract": "apxinf.qwen38_27b.leaderboard_contract.v1",
+    "contract_sha256": "16005ce97ee85c4d2ffd580b08a382077d40d6de83a9c1be00e21dc25c2367d6"
+  },
+  "purpose": "An independently frozen capability track for integrated image input. It does not change the v1 100-point base score or the 20-point context and multi-request bonuses.",
+  "model": {
+    "repo_id": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+    "revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "processor_class": "Qwen3VLProcessor",
+    "image_processor_type": "Qwen2VLImageProcessorFast"
+  },
+  "interface": {
+    "health_capability": "capabilities.multimodal",
+    "endpoint": "/v1/chat/completions",
+    "request_format": "OpenAI chat content parts with one data:image/png;base64 image_url followed by one text part",
+    "temperature": 0.0,
+    "max_completion_tokens": 32,
+    "stream": false,
+    "chat_template_kwargs": {"enable_thinking": false},
+    "supported_rule": "A service that reports multimodal=true must execute the image requests through the submitted ApxInf implementation without fallback.",
+    "unsupported_rule": "A service that reports multimodal=false remains eligible for the text leaderboard, but an image probe must fail closed with HTTP 400, 415, 422, or 501 and error.type=unsupported_capability. HTTP 200, HTTP 500, ignoring the image, or silently delegating to another backend is invalid."
+  },
+  "image_generation": {
+    "format": "deterministic RGB PNG",
+    "width": 448,
+    "height": 448,
+    "dependencies": "Python standard library only",
+    "public_seed": 380038,
+    "categories": [
+      "seven_segment_ocr",
+      "spatial_color",
+      "bar_arithmetic",
+      "object_count"
+    ]
+  },
+  "public_suite": {
+    "case_count": 4,
+    "cases_per_category": 1,
+    "release_rule": "The generator, seed, prompts, images, exact answers, and manifest are public."
+  },
+  "hidden_suite": {
+    "case_count": 8,
+    "cases_per_category": 2,
+    "release_rule": "The generator shape is public; the seed, generated PNG files, prompts, exact answers, and manifest stay teacher-only and are frozen before the course opens."
+  },
+  "normalization": "Take choices[0].message.content, discard at most one leading <think>...</think> block when present, and strip surrounding ASCII whitespace. The remaining text must exactly equal the case answer.",
+  "badges": {
+    "multimodal-public-pass": "All 4 public cases pass.",
+    "multimodal-ready": "All 4 public and all 8 hidden cases pass, every request succeeds, the service remains healthy, multimodal=true is declared, and no fallback is active.",
+    "declared-unsupported": "multimodal=false and the required fail-closed probe passes. This is a valid text-only submission, not a multimodal pass."
+  },
+  "scoring": {
+    "leaderboard_points": 0,
+    "policy": "This v1 track publishes a capability badge and diagnostics only. Promoting it to points requires a new leaderboard contract and a newly frozen cohort; it cannot be added retroactively to an active round.",
+    "diagnostic_metrics": [
+      "case pass rate",
+      "request success rate",
+      "client-observed end-to-end latency",
+      "peak VRAM when supplied by the teacher harness"
+    ]
+  }
+}

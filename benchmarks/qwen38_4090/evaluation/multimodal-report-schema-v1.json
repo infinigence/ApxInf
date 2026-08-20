@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/infinigence/ApxInf/benchmarks/qwen38_4090/evaluation/multimodal-report-schema-v1.json",
+  "title": "ApxInf Qwen3.8-27B multimodal capability report",
+  "type": "object",
+  "required": [
+    "schema",
+    "implementation",
+    "split",
+    "capability_declared",
+    "fallback_active",
+    "fail_closed",
+    "cases_passed",
+    "cases_total",
+    "request_success_rate",
+    "service_healthy_after_run",
+    "evidence"
+  ],
+  "properties": {
+    "schema": {"const": "apxinf.qwen38_27b.multimodal_report.v1"},
+    "implementation": {
+      "type": "object",
+      "required": ["name", "revision", "backend"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "backend": {"type": "string", "minLength": 1}
+      }
+    },
+    "split": {"enum": ["public", "hidden"]},
+    "capability_declared": {"type": ["boolean", "null"]},
+    "fallback_active": {"type": ["boolean", "null"]},
+    "fail_closed": {"type": ["boolean", "null"]},
+    "probe_status": {"type": ["integer", "null"]},
+    "cases_passed": {"type": "integer", "minimum": 0},
+    "cases_total": {"type": "integer", "minimum": 0},
+    "request_success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+    "median_e2e_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
+    "service_healthy_after_run": {"type": "boolean"},
+    "records": {"type": "array", "items": {"type": "object"}},
+    "evidence": {
+      "type": "object",
+      "required": ["contract_sha256", "manifest_sha256", "cases_jsonl_sha256"],
+      "properties": {
+        "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "cases_jsonl_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

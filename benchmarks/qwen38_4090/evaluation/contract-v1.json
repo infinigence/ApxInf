@@ -1,0 +1,249 @@
+{
+  "schema": "apxinf.qwen38_27b.leaderboard_contract.v1",
+  "status": "released",
+  "scenario": {
+    "name": "qwen38_27b_rtx4090_course_leaderboard",
+    "interface_contract": "apxinf.qwen38_27b.inference_interface.v1",
+    "primary": "single_request_offline_service",
+    "description": "The 100-point base score measures one text request at a time. Context beyond 32K and multi-request goodput are separately capped bonus tracks.",
+    "non_goals": [
+      "multimodal scoring in the base leaderboard",
+      "student-side BF16 execution",
+      "multi-GPU execution",
+      "contexts beyond the checkpoint native limit"
+    ]
+  },
+  "model": {
+    "repo_id": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+    "revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "quantization": "compressed-tensors W4A16 group-32 asymmetric",
+    "native_max_position_embeddings": 262144,
+    "dense_equivalent_flops_per_token": 54000000000,
+    "full_attention_layers": 16,
+    "attention_query_width": 6144,
+    "minimum_weight_bytes": 21017689808,
+    "efficiency_model_note": "The FLOP and byte counts are frozen leaderboard proxies. They omit some elementwise and recurrent work, and minimum_weight_bytes is a checkpoint-sweep proxy rather than measured HBM traffic."
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "count": 1,
+    "compute_capability": "8.9",
+    "peak_bf16_tensor_tflops_dense_fp32_accumulate": 165.2,
+    "peak_int4_tensor_tops_dense": 1321.2,
+    "peak_memory_bandwidth_gb_s": 1008.0,
+    "structured_sparsity_allowed": false,
+    "peak_source": "NVIDIA Ada GPU Architecture whitepaper, Appendix A"
+  },
+  "request": {
+    "modality": "text",
+    "temperature": 0.0,
+    "thinking": false,
+    "preserve_thinking": false,
+    "parallel_requests_base": 1,
+    "max_num_seqs_base": 1,
+    "require_pretokenized_input_ids": true,
+    "require_exact_prompt_tokens": true,
+    "performance_require_exact_output_budget": true,
+    "functional_cases_allow_eos": true
+  },
+  "correctness_workload": {
+    "normalization": "Decode with the pinned tokenizer and skip_special_tokens=true, strip surrounding ASCII whitespace, then apply the case-declared exact validator. No semantic judge or post-hoc tolerance is allowed.",
+    "public_functional_suite": {
+      "case_count": 6,
+      "case_ids": [
+        "text-niah-1024-p10",
+        "text-niah-1024-p50",
+        "text-niah-1024-p90",
+        "longdoc-multihop-8192",
+        "longdoc-revision-8192",
+        "longdoc-aggregate-8192"
+      ],
+      "matrix": "Three exact-key retrieval cases at 1K with the needle at 10%, 50%, and 90%, plus deterministic 8K multi-hop, revision-resolution, and aggregate questions embedded in a pinned Dream of the Red Chamber corpus.",
+      "output_tokens_per_case": 64
+    },
+    "hidden_functional_suite": {
+      "case_count": 12,
+      "maximum_prompt_tokens": 16384,
+      "composition": [
+        {"category": "exact_retrieval", "case_count": 4, "policy": "Pinned 1K-16K prompts with early, middle, and late placements not reused from public cases."},
+        {"category": "distractor_disambiguation", "case_count": 2, "policy": "Duplicate-key, delimiter-noise, and irrelevant-number variants with one exact answer."},
+        {"category": "multi_hop", "case_count": 2, "policy": "Resolve a two- or three-edge chain over private records inserted at separated document positions."},
+        {"category": "revision_resolution", "case_count": 2, "policy": "Return the final valid value after superseding or revoking earlier records."},
+        {"category": "aggregate", "case_count": 2, "policy": "Compute a deterministic integer aggregate over a bounded set of private records."}
+      ],
+      "output_tokens_per_case": 64,
+      "release_rule": "Case contents, seeds, expected outputs, and the teacher manifest hash are frozen before course release and remain teacher-only. The published count, categories, prompt ceiling, interface, budgets, and validators cannot change during a leaderboard round."
+    },
+    "public_token_trajectory_suite": {
+      "case_ids": ["text-perf-1024", "text-perf-8192"],
+      "tokens_per_case": 128,
+      "total_tokens": 256
+    },
+    "hidden_token_trajectory_suite": {
+      "case_count": 2,
+      "prompt_token_range": [2048, 16384],
+      "tokens_per_case": 128,
+      "total_tokens": 256,
+      "release_rule": "Prompts and frozen vLLM greedy reference token IDs remain teacher-only; shapes and token budgets are public and fixed."
+    },
+    "token_trajectory_definition": "Categorical token edit similarity against the frozen vLLM greedy reference. Both trajectories must contain the complete frozen output budget. Compute unit-cost Levenshtein distance over token IDs (insertion, deletion, substitution), then passed_tokens=max(0, expected_tokens-distance). Token IDs are never compared with MAE, cosine, embeddings, or a semantic judge."
+  },
+  "score_profiles": {
+    "public_calibration": {
+      "measurement": {
+        "minimum_measured_repeats_per_latency_cell": 1,
+        "required_warmup_repeats": 0,
+        "maximum_latency_cv": null,
+        "statistic": "median"
+      },
+      "correctness": {
+        "protocol": 5.0,
+        "public_cases": 20.0,
+        "hidden_cases": 0.0,
+        "public_token_trajectory": 5.0,
+        "hidden_token_trajectory": 0.0
+      },
+      "eligibility": {
+        "public_pass_rate_min": 1.0,
+        "hidden_pass_rate_min": null,
+        "public_token_trajectory_rate_min": 0.0,
+        "hidden_token_trajectory_rate_min": null,
+        "request_success_rate_min": 0.99
+      },
+      "score_note": "A public score is provisional. Public cases are intentionally reweighted to keep the visible base ceiling at 100; only the midterm profile determines the official correctness split."
+    },
+    "midterm_leaderboard": {
+      "measurement": {
+        "minimum_measured_repeats_per_latency_cell": 5,
+        "required_warmup_repeats": 1,
+        "maximum_latency_cv": 0.1,
+        "statistic": "median"
+      },
+      "correctness": {
+        "protocol": 5.0,
+        "public_cases": 5.0,
+        "hidden_cases": 15.0,
+        "public_token_trajectory": 2.0,
+        "hidden_token_trajectory": 3.0
+      },
+      "eligibility": {
+        "public_pass_rate_min": 1.0,
+        "hidden_pass_rate_min": 0.9166666666666666,
+        "public_token_trajectory_rate_min": 0.0,
+        "hidden_token_trajectory_rate_min": 0.0,
+        "request_success_rate_min": 0.99
+      }
+    }
+  },
+  "performance_scoring": {
+    "reference_population": "For each cell and metric, take the best valid median among the same-round teacher-run vLLM control and all correctness/reliability-eligible PR submissions.",
+    "required_official_control_backend": "vllm",
+    "formula": "points = weight * min(1, best_valid_median_seconds / observed_median_seconds)",
+    "refresh_policy": "Scores are recomputed when the cohort changes and are frozen at each announced leaderboard snapshot. A one-submission self-score is diagnostic, not official.",
+    "ttft_cells": [
+      {"id": "text-perf-1024", "prompt_tokens": 1024, "output_tokens": 128, "weight": 5.0},
+      {"id": "text-perf-2048", "prompt_tokens": 2048, "output_tokens": 128, "weight": 5.0},
+      {"id": "text-perf-4096", "prompt_tokens": 4096, "output_tokens": 128, "weight": 7.0},
+      {"id": "text-perf-8192", "prompt_tokens": 8192, "output_tokens": 128, "weight": 8.0},
+      {"id": "text-perf-16384", "prompt_tokens": 16384, "output_tokens": 128, "weight": 10.0}
+    ],
+    "tpot_cells": [
+      {"id": "text-perf-1024", "prompt_tokens": 1024, "output_tokens": 128, "weight": 10.0},
+      {"id": "text-perf-8192", "prompt_tokens": 8192, "output_tokens": 128, "weight": 15.0}
+    ]
+  },
+  "context_bonus": {
+    "weight": 10.0,
+    "bonus_start_prompt_tokens": 32768,
+    "full_bonus_prompt_tokens": 262016,
+    "required_output_tokens": 128,
+    "required_cases_at_max_context": 6,
+    "required_pass_rate_at_max_context": 1.0,
+    "formula": "weight * clamp(log2(max_verified_prompt/bonus_start_prompt) / log2(full_bonus_prompt/bonus_start_prompt), 0, 1)",
+    "context_staircase_prompt_tokens": [32640, 32768, 65536, 131072, 196608, 262016],
+    "required_task_categories_at_max_context": [
+      "retrieval_early",
+      "retrieval_middle",
+      "retrieval_late",
+      "multi_hop",
+      "revision_resolution",
+      "aggregate"
+    ],
+    "verification": "32640 is a non-scoring diagnostic for implementations whose total sequence limit is 32768 after reserving the 128-token output. At every scoring length above the 32768 bonus start, run three exact retrieval placements plus deterministic multi-hop, revision-resolution, and aggregate questions over the pinned long-document corpus. All six must start with the exact expected answer and generate all 128 requested tokens. Then verify health and one small request after the first larger capacity failure. 262016 equals the native 262144 positions minus the 128-token output budget."
+  },
+  "data_generation": {
+    "schema": "apxinf.qwen38_27b.data_generation.v1",
+    "public_seed": 380027,
+    "corpus": {
+      "id": "project-gutenberg-24264-hong-lou-meng",
+      "title": "紅樓夢",
+      "language": "zh",
+      "source_url": "https://www.gutenberg.org/cache/epub/24264/pg24264.txt",
+      "ebook_url": "https://www.gutenberg.org/ebooks/24264",
+      "license_url": "https://www.gutenberg.org/policy/license.html",
+      "bytes": 2663455,
+      "sha256": "ff1526996bf4b81807651921a85e5c1c0f1d1d123c9fa4553057ba6a3ec72011",
+      "distribution_policy": "Fetch and verify at dataset-generation time. Do not vendor the full corpus in the starter repository. Users outside the United States must check the copyright law that applies to them."
+    },
+    "scored_qa_policy": "Only deterministic private-record questions with case-declared exact or prefix validators are machine scored. Open literary interpretation is qualitative demonstration evidence and never changes correctness or leaderboard points."
+  },
+  "multi_request_bonus": {
+    "weight": 10.0,
+    "description": "Closed-loop concurrent text serving bonus. Queueing is included. It is not mixed into base TTFT or TPOT.",
+    "formula": "For each valid cell: 1 support point + 4 * min(1, observed_goodput / best_valid_goodput).",
+    "reference_population": "Best valid same-round goodput among teacher-run controls and eligible PR submissions.",
+    "correct_output_goodput_definition": "Sum of completion tokens from successful, functionally correct requests divided by client-observed batch makespan.",
+    "validity": {
+      "success_rate": 1.0,
+      "correctness_rate": 1.0,
+      "minimum_jain_fairness_index": 0.95,
+      "maximum_p95_ttft_multiple_of_own_single_request": 1.5,
+      "maximum_p95_tpot_multiple_of_own_single_request": 3.0,
+      "require_no_fallback": true,
+      "require_service_healthy_after_run": true
+    },
+    "cells": [
+      {"id": "multi-c4-text-perf-1024", "base_cell_id": "text-perf-1024", "concurrency": 4, "total_requests": 32, "prompt_tokens": 1024, "output_tokens": 128, "support_weight": 1.0, "goodput_weight": 4.0},
+      {"id": "multi-c8-text-perf-1024", "base_cell_id": "text-perf-1024", "concurrency": 8, "total_requests": 32, "prompt_tokens": 1024, "output_tokens": 128, "support_weight": 1.0, "goodput_weight": 4.0}
+    ]
+  },
+  "reliability_scoring": {
+    "weight": 10.0,
+    "request_success_rate_weight": 5.0,
+    "boolean_checks": [
+      "no_unexpected_oom",
+      "no_nan",
+      "no_fallback",
+      "no_xid",
+      "service_healthy_after_failure"
+    ],
+    "note": "An expected, recovered capacity-boundary OOM or admission failure is not an unexpected OOM. OOM in a scored base cell is unexpected."
+  },
+  "score_totals": {
+    "base": {
+      "correctness": 30.0,
+      "ttft": 35.0,
+      "tpot": 25.0,
+      "reliability": 10.0,
+      "total": 100.0
+    },
+    "bonus": {
+      "context": 10.0,
+      "multi_request": 10.0,
+      "total": 20.0
+    },
+    "maximum_leaderboard_score": 120.0
+  },
+  "course_grade": {
+    "automated_leaderboard_percent": 80,
+    "automated_formula": "min(80, 0.8 * eligible_leaderboard_score). Bonus can recover base-score deficits but cannot make the automated course component exceed 80.",
+    "pr_review_percent": 20,
+    "pr_review_breakdown": {
+      "tests_and_negative_controls": 8,
+      "interface_and_error_handling": 4,
+      "reproducibility": 4,
+      "analysis_and_decision": 4
+    }
+  }
+}

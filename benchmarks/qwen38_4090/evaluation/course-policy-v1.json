@@ -1,0 +1,131 @@
+{
+  "schema": "apxinf.qwen38_27b.course_policy.v1",
+  "status": "released",
+  "overlay_for": {
+    "leaderboard_contract": "apxinf.qwen38_27b.leaderboard_contract.v1",
+    "contract_sha256": "16005ce97ee85c4d2ffd580b08a382077d40d6de83a9c1be00e21dc25c2367d6"
+  },
+  "scope": "Course schedule, submission snapshots, final report, and teacher-reviewed workflow innovation bonus. This policy does not change leaderboard cells, weights, eligibility gates, or dynamic performance references.",
+  "timezone": "Asia/Shanghai",
+  "schedule": {
+    "duration_days": 7,
+    "day_1": {
+      "name": "kickoff_and_baseline",
+      "requirements": [
+        "Complete environment and build smoke.",
+        "Start the service and pass public protocol checks.",
+        "Record one reproducible baseline artifact."
+      ]
+    },
+    "day_2": {
+      "name": "correctness_and_profiling",
+      "requirements": [
+        "Pass public functional correctness.",
+        "Select one primary optimization cell.",
+        "Write a falsifiable optimization hypothesis."
+      ]
+    },
+    "day_3": {
+      "name": "first_candidate",
+      "requirements": [
+        "Implement and validate the first end-to-end candidate.",
+        "Retain accepted and rejected evidence."
+      ]
+    },
+    "day_4": {
+      "name": "midterm_snapshot",
+      "cutoff_local_time": "19:00:00",
+      "submission": [
+        "A full immutable PR commit SHA available to the teacher before the cutoff.",
+        "A public evaluator artifact generated from that SHA.",
+        "A concise midterm summary naming the baseline, candidate, target cells, results, and known limitations."
+      ],
+      "late_change_policy": "Changes after the cutoff belong to the final snapshot and are not included in the midterm cohort."
+    },
+    "midterm_teacher_action": {
+      "steps": [
+        "Freeze the submitted cohort by full PR SHA.",
+        "Build every entry from a clean checkout on the same RTX 4090 environment.",
+        "Run the required vLLM control, public and hidden suites, and cohort scorer.",
+        "Publish a named midterm leaderboard snapshot and concise feedback."
+      ],
+      "publication_timing": "After the unified evaluation completes; do not publish rolling scores from partial cohorts."
+    },
+    "day_5": {
+      "name": "leaderboard_analysis",
+      "requirements": [
+        "Interpret the midterm snapshot and teacher feedback.",
+        "Select the bounded final optimization hypothesis."
+      ]
+    },
+    "day_6": {
+      "name": "final_candidate_and_report",
+      "requirements": [
+        "Complete final correctness and performance validation.",
+        "Prepare reproducibility artifacts and the detailed final report."
+      ]
+    },
+    "day_7": {
+      "name": "final_submission",
+      "cutoff_local_time": "19:00:00",
+      "submission": [
+        "Final PR commit SHA.",
+        "Detailed REPORT.md in the PR; an exported PDF is optional.",
+        "Canonical submission, efficiency output, raw evidence references, and reproduction commands."
+      ]
+    }
+  },
+  "workflow_innovation_bonus": {
+    "maximum_course_points": 5.0,
+    "leaderboard_effect": "none",
+    "course_grade_formula": "min(100, automated_course_points + pr_review_points + workflow_innovation_bonus)",
+    "eligibility": [
+      "The submission passes the public functional suite.",
+      "The workflow does not weaken correctness, timing, hardware, model, or fallback contracts.",
+      "The final report contains reproducible evidence for the workflow claim."
+    ],
+    "rubric": {
+      "novelty_and_system_relevance": 2.0,
+      "measured_evidence_value": 1.0,
+      "reusability_documentation_and_tests": 1.0,
+      "correctness_safety_and_ssot_preservation": 1.0
+    },
+    "examples": [
+      "Reproducible baseline/candidate orchestration that reduces manual error.",
+      "Artifact provenance, hashing, comparison, or failure-triage automation.",
+      "Reusable shape/tactic search or profiler workflow tied to end-to-end validation.",
+      "Automated capacity-boundary probing and recovery verification.",
+      "A public/hidden-safe experiment workflow that improves evidence quality."
+    ],
+    "not_sufficient": [
+      "A cosmetic command wrapper without measured value.",
+      "Hard-coded public cases, expected outputs, or benchmark-specific shortcuts.",
+      "A workflow that changes the frozen workload or hides fallback.",
+      "An unmeasured novelty claim without reusable artifacts or tests."
+    ],
+    "award_policy": "The bonus rewards validated experimental workflow innovation. It cannot make an ineligible leaderboard submission eligible and cannot make the final course grade exceed 100."
+  },
+  "final_report": {
+    "required_file": "REPORT.md",
+    "suggested_length": "Equivalent to 6-10 pages of technical content; prioritize evidence over padding.",
+    "required_sections": [
+      "Executive summary and final claim.",
+      "Frozen deployment, model, hardware, workload, and timing contract.",
+      "Baseline architecture and bottleneck analysis.",
+      "Optimization hypotheses and implementation changes.",
+      "Correctness, reliability, performance, VRAM, MFU/BWU, and optional profiler evidence.",
+      "Accepted, rejected, negative, and inconclusive experiments.",
+      "Midterm-to-final changes and interpretation of leaderboard feedback.",
+      "Known limitations, unsupported modes, and rollback plan.",
+      "Exact build, serve, evaluator, and reproduction commands.",
+      "Conclusion and one bounded next step."
+    ],
+    "required_references": [
+      "Final PR SHA.",
+      "Public submission artifact and raw evidence hash.",
+      "compute_efficiency.py output or an explanation of unavailable fields.",
+      "Profiler capture IDs when profiler-derived claims are made."
+    ],
+    "grading_note": "A report is evaluated for evidence quality, causal reasoning, reproducibility, negative-result handling, and alignment with the submitted implementation."
+  }
+}
