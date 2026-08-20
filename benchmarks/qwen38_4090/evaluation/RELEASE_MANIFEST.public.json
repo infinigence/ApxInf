@@ -1,15 +1,12 @@
 {
   "schema": "apxinf.qwen38_27b.public_release_manifest.v1",
-  "status": "candidate",
+  "status": "released",
   "release_id": "qwen38-4090-summer-camp-v1",
-  "release_blockers": [
-    "freeze the teacher release manifest against the latest public starter revision"
-  ],
+  "release_blockers": [],
   "starter": {
     "public_url": "https://github.com/infinigence/ApxInf",
-    "base_revision": "770fb0ccdf02294ce090e2a1f803c36f63979e60",
-    "base_tree": "1439f598cb751baa7fe8afbb320cbc09b0704a89",
-    "release_revision": null
+    "revision": "d2aebcd6d895de8527bd465af0649d6e1fcc438a",
+    "tree": "2bac9e9f13acf7f3304f2d3d7f55b11a78c74672"
   },
   "contract_sha256": "16005ce97ee85c4d2ffd580b08a382077d40d6de83a9c1be00e21dc25c2367d6",
   "course_policy_sha256": "928862f97b10b1708ec299cf061900bd826e2c4f542523ec687c7d5ea3b451cd",
@@ -85,5 +82,5 @@
     "contents": "teacher-only"
   },
   "vllm_multimodal_reference": null,
-  "teacher_release_manifest_sha256": null
+  "teacher_release_manifest_sha256": "a86b4d2f4ad43e39f7a07e9aa73ffe74b97b0343428a9c6a2b1ffb38fdee2869"
 }
