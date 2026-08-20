@@ -1,5 +1,10 @@
 use std::env;
 
+#[path = "build_support/cuda_arch.rs"]
+mod cuda_arch;
+
+use cuda_arch::{is_cutlass_sm100_family, select_cuda_arch, ArchSource};
+
 const FNV1A_128_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV1A_128_PRIME: u128 = 0x0000000001000000000000000000013b;
 
@@ -93,13 +98,6 @@ fn emit_rerun_if_changed_tree(root: &std::path::Path) {
     }
 }
 
-fn is_cutlass_sm100_family(arch: &str) -> bool {
-    matches!(
-        arch,
-        "sm_100" | "sm_100a" | "sm_101" | "sm_101a" | "sm_110" | "sm_110a" | "sm_120" | "sm_120a"
-    )
-}
-
 fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
@@ -115,6 +113,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
+    println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
+    println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     // Only try to link CUDA if the toolkit is available.
     let cuda_path = env::var("CUDA_PATH")
         .or_else(|_| env::var("CUDA_HOME"))
@@ -191,27 +192,49 @@ fn main() {
             println!("cargo:rerun-if-changed={kernels_dir}");
             println!("cargo:rerun-if-changed={adapters_dir}");
             emit_rerun_if_changed_tree(std::path::Path::new(&adapters_dir));
-            // Pick a target arch: explicit override > aarch64→sm_101 (Drive OS
-            // Thor, Blackwell automotive) > x86_64 leaves nvcc's default (lets
-            // the host JIT for whatever GPU is present, preserving prior
-            // behavior on desktop RTX cards).
+            // Pick a target arch: explicit override > native CUDA device
+            // detection. Never infer a GPU architecture from the CPU target:
+            // Orin, Thor-U, and Thor are all aarch64 but require different
+            // device code. Cross-compilation therefore requires an override.
             let arch_for_target = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-            let nvcc_arch: Option<String> = env::var("APXINF_CUDA_ARCH").ok().or_else(|| {
-                if arch_for_target == "aarch64" {
-                    Some("sm_101".into())
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let nvcc = {
+                let bundled = format!("{cuda_path}/bin/nvcc");
+                if std::path::Path::new(&bundled).exists() {
+                    bundled
                 } else {
-                    None
+                    "nvcc".to_string()
                 }
+            };
+            let host = env::var("HOST").unwrap_or_default();
+            let target = env::var("TARGET").unwrap_or_default();
+            let selection = select_cuda_arch(
+                env::var("APXINF_CUDA_ARCH").ok(),
+                env::var("APXINF_CUDA_ARCH_CUTLASS").ok(),
+                &host,
+                &target,
+                std::path::Path::new(&nvcc),
+                std::path::Path::new(&out_dir),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "CUDA architecture selection failed: {error}\n\
+                     Set APXINF_CUDA_ARCH explicitly when auto-detection is unavailable \
+                     (Orin: sm_87, Thor-U: sm_101, Thor: sm_110)."
+                )
             });
-            let cutlass_arch = env::var("APXINF_CUDA_ARCH_CUTLASS").ok().or_else(|| {
-                nvcc_arch.as_ref().map(|arch| {
-                    if is_cutlass_sm100_family(arch) && !arch.ends_with('a') {
-                        format!("{arch}a")
-                    } else {
-                        arch.clone()
-                    }
-                })
-            });
+            match &selection.source {
+                ArchSource::Explicit => println!(
+                    "cargo:warning=ApxInf CUDA architecture: {} (explicit), CUTLASS: {}",
+                    selection.nvcc_arch, selection.cutlass_arch
+                ),
+                ArchSource::Detected { device_count } => println!(
+                    "cargo:warning=ApxInf CUDA architecture: {} (auto-detected from {device_count} visible GPU(s)), CUTLASS: {}",
+                    selection.nvcc_arch, selection.cutlass_arch
+                ),
+            }
+            let nvcc_arch = Some(selection.nvcc_arch);
+            let cutlass_arch = Some(selection.cutlass_arch);
             let kernel_build_id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
                 computed_kernel_build_id(
                     std::path::Path::new(&manifest_dir),
@@ -342,15 +365,6 @@ fn main() {
             }
 
             if !kernel_files.is_empty() {
-                let out_dir = env::var("OUT_DIR").unwrap();
-                let nvcc = {
-                    let bundled = format!("{cuda_path}/bin/nvcc");
-                    if std::path::Path::new(&bundled).exists() {
-                        bundled
-                    } else {
-                        "nvcc".to_string()
-                    }
-                };
                 let target_include_dirs = [
                     format!("{cuda_path}/include"),
                     format!("{cuda_path}/targets/{arch}/include"),
