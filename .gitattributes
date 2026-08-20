@@ -1,0 +1,4 @@
+# Preserve imported CUDA headers byte-for-byte, including upstream whitespace.
+crates/apxinf-cuda/kernels/cutlass/fmha/** whitespace=-trailing-space,-space-before-tab
+crates/apxinf-cuda/kernels/cutlass/include/** whitespace=-trailing-space,-space-before-tab
+crates/apxinf-cuda/kernels/cutlass/tools/** whitespace=-trailing-space,-space-before-tab

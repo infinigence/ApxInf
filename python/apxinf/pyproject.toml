@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apxinf"
+version = "0.1.0"
+description = "ApxInf Python frontend: numpy processor library + L2 Pi05Policy."
+requires-python = ">=3.9"
+# The processor library is pure numpy/PIL/sentencepiece with no GPU / no Rust
+# dependency, so it installs and unit-tests offline. `apxinf-py` is only needed
+# when a real Pi05Policy is constructed, hence it is an optional extra.
+dependencies = [
+    "numpy>=1.21",
+    "Pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+# The prompt tokenizer needs sentencepiece; the golden/layering tests want it too.
+tokenizer = ["sentencepiece>=0.1.99"]
+# A live Pi05Policy binds the PyO3 model handle (Phase 1).
+policy = ["apxinf-py>=0.1.0"]
+# The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
+serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+test = ["pytest>=7", "sentencepiece>=0.1.99"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apxinf*"]

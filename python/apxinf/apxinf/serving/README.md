@@ -1,0 +1,278 @@
+# Serving pi05 over the OpenPI websocket protocol
+
+Run a pi05 checkpoint on the ApxInf engine and expose it through an
+**OpenPI-compatible websocket**, so any unmodified upstream `openpi_client` can
+connect. This guide covers starting the server, calling it, running the
+LIBERO-10 accuracy eval, and porting an OpenPI config + processors for a new
+robot.
+
+Paths below are relative to the repo root. The engine binding (`apxinf_py`) is
+built per GPU architecture — see the root [README](../../../../README.md) for the
+Rust/CUDA build (`APXINF_CUDA_ARCH=sm_87` for Orin, `sm_110` for Thor).
+
+## 1. Environment
+
+```bash
+# engine binding (architecture-specific wheel built from crates/apxinf-py)
+pip install apxinf_py-*.whl
+# numpy frontend: processors + L2 policy + serving
+pip install -e python/apxinf
+# transport + processor deps
+pip install -r scripts/requirements-pi05-websocket.txt
+# upstream client (for §3 / §4)
+pip install openpi-client
+```
+
+Self-check the engine loads (`num_views` / `action` shape must match the
+checkpoint):
+
+```bash
+python -c "import apxinf_py; print(apxinf_py.Model.load('pi05','<ckpt>/model.safetensors',device='cuda:0',precision='bf16'))"
+# Model(device=cuda:0, action=[50, 32], views=3, image=224, patch=14)
+```
+
+> The engine `.so` is compiled per GPU arch — a wheel built for one arch will not
+> load on another. BF16 is the supported serving precision.
+
+## 2. Start the server
+
+```bash
+python scripts/pi05_openpi_websocket_server.py \
+    --model-dir <ckpt> \
+    --precision bf16 \
+    --device cuda:0 \
+    --action-dim 7 \        # deployment width; 0 keeps the full 32 dims
+    --host 0.0.0.0 --port 8000
+```
+
+- `--host 0.0.0.0` accepts remote clients (split deployment); `127.0.0.1` for a
+  local-only test.
+- `--action-dim 7` — LIBERO uses the first 7 dims (last is the gripper).
+- Health check: `curl http://<host>:8000/healthz` → `OK`.
+- On connect the server pushes its metadata (`num_views` / `action_horizon` /
+  `precision` / ...).
+
+## 3. Call it (stock `openpi_client`, unmodified)
+
+```python
+from openpi_client import websocket_client_policy
+
+client = websocket_client_policy.WebsocketClientPolicy("<host>", 8000)
+print(client.get_server_metadata())          # {'num_views':3,'action_horizon':50,'precision':'bf16',...}
+
+result = client.infer({
+    "observation/image":       base_rgb_uint8,    # HWC uint8; the server resizes
+    "observation/wrist_image": wrist_rgb_uint8,
+    "observation/state":       state_f32,          # dropped on the LIBERO path; see §5 for a robot
+    "prompt":                  "put both moka pots on the stove",
+})
+result["actions"]         # float32 [H, 7]; H is the checkpoint's native horizon
+result["policy_timing"]   # {'infer_ms': bare model, 'policy_ms': full policy}
+```
+
+Reference client: [python/apxinf/examples/openpi_client.py](../../examples/openpi_client.py).
+
+## 4. LIBERO-10 accuracy eval
+
+The simulation side (client) can run two ways; the server always hosts the
+engine. LIBERO needs a pinned sim stack (`robosuite==1.4.0` / `mujoco==2.3.2` /
+`bddl==1.0.1`) and `MUJOCO_GL=egl` on headless boxes, plus a LIBERO checkout on
+`PYTHONPATH`.
+
+### Form A — same machine
+
+```bash
+# terminal 1: server (see §2)
+python scripts/pi05_openpi_websocket_server.py --model-dir <ckpt> --precision bf16 --port 8000 &
+
+# terminal 2: eval against the local server
+export MUJOCO_GL=egl
+export PYTHONPATH=<path/to/LIBERO>
+python scripts/eval_pi05_libero_openpi.py \
+    --host 127.0.0.1 --port 8000 --precision bf16 \
+    --task-ids 0,1,2,3,4,5,6,7,8,9 --trials-per-task 10 \
+    --results-jsonl out/libero_bf16.jsonl \
+    --summary-json  out/libero_bf16.summary.json
+```
+
+### Form B — split: client on an x86 sim box, server remote
+
+Decouple via websocket: keep the fragile sim stack on a machine that already runs
+LIBERO, and let the engine host be inference-only — the production-shaped call
+pattern (robot/sim on one end, engine on the other).
+
+```bash
+# server host: start with --host 0.0.0.0 (see §2)
+# x86 client (its own LIBERO env):
+python scripts/eval_pi05_libero_openpi.py \
+    --host <server-host> --port 8000 --precision bf16 \
+    --task-ids 0,1,2,3,4,5,6,7,8,9 --trials-per-task 10 \
+    --results-jsonl out/libero_bf16.jsonl \
+    --summary-json  out/libero_bf16.summary.json
+```
+
+The evaluator is resumable (fsync'd JSONL ledger, skips completed trials on
+rerun); every trial records success / steps / replans and a four-segment timing
+split; the summary rolls up `success_rate` and timing. Key `summary.json`
+fields:
+
+```jsonc
+{
+  "success_rate": 0.87,                 // LIBERO-10 task-level success (accuracy)
+  "per_task": { "0": {"success_rate": ...}, ... },
+  "timing": {
+    "total_inference_calls": 431,       // = total replans
+    "per_call_ms": {                    // mean split per websocket inference call
+      "model_ms": 213.4,                //   bare model (engine)
+      "server_processor_ms": 6.1,       //   server pre/post pipeline
+      "websocket_transport_ms": 4.8,    //   transport + serialization
+      "preprocess_ms": 2.3,             //   client resize+state (not in round-trip)
+      "inference_ms": 224.5             //   round-trip wall clock ≈ sum of the first three
+    }
+  }
+}
+```
+
+> LIBERO is a **Franka Panda 7-DoF** benchmark (7-dim action = 6 EEF deltas + 1
+> gripper), so eval runs the Panda/libero path with `--action-dim 7`. It is a
+> different embodiment from the robots in §5 (e.g. G1) and unrelated to them.
+
+## 5. Port an OpenPI config + processors into apxinf (for your own robot)
+
+Given an **OpenPI fine-tune config + a set of `DataTransformFn` pre/post
+transforms** (e.g. `pi05_UnitreeG1`: 3 cameras, 16-DoF state, `action_dim=32`,
+delta joint actions, with `unitreeG1Inputs` / `unitreeG1Outputs`), you do **not**
+pull any external framework into apxinf. You port those `dict→dict` transforms,
+by semantics, into apxinf `ProcessorStep`s and splice them into the pre/post
+`Pipeline` of `Pi05Policy`.
+
+A working G1 example ships in-tree — copy and adapt it:
+
+```
+python/apxinf/apxinf/processors/robots/unitree_g1.py   # robot-specific ProcessorSteps
+python/apxinf/apxinf/robots/unitree_g1.py              # build_unitree_g1_policy factory
+```
+
+### 5.1 Two landing spots
+
+| Layer | Where | What |
+|---|---|---|
+| **robot-specific step** (pure numpy, per-embodiment, model-agnostic) | `python/apxinf/apxinf/processors/robots/<robot>.py` | `ProcessorStep` subclasses: decode-state / delta→absolute / encode-actions |
+| **assembly factory** (wires the steps onto `Pi05Policy`) | `python/apxinf/apxinf/robots/<robot>.py` | a `build_<robot>_policy(...)` that rewrites the pre/post pipelines after `from_pretrained` |
+
+### 5.2 OpenPI transform → apxinf equivalent (G1 as the sample)
+
+| OpenPI transform | apxinf equivalent | Note |
+|---|---|---|
+| camera rename + CHW→HWC + float→uint8 | `image_keys` config + existing `ParseImage` | **no new code** — `ParseImage` already does CHW→HWC / float→uint8 |
+| `_decode_state` (joint flip + gripper→angle) | `UnitreeG1DecodeState` (**input** step, before `tokenize`) | so both discretized state and delta→absolute see decoded state |
+| 32-dim unnormalize | existing `Unnormalize` (**full model width**) | full-width so delta→absolute sees the complete action |
+| `AbsoluteActions` (delta→absolute, needs state) | `UnitreeG1AbsoluteActions` (**output** step) | adds current state on masked joint dims; gripper dims pass through |
+| `unitreeG1Outputs` 32→16 + flip + gripper | `UnitreeG1EncodeActions` (**output** step) | trim to robot dims, apply flip, invert gripper map |
+
+> **Not ported**: training-time data-cleaning variants (`_NoLeftCam` /
+> `fixed_hand`) are on the training-data path, not the serving path.
+
+### 5.3 Write a ProcessorStep
+
+Narrow contract: `__call__(data) -> data`, mutating the `data` dict in place;
+observation lives under `OBSERVATION`, actions under `ACTIONS` (see
+`apxinf/processors/transforms.py`). List tunable knobs in `PARAMS` (for
+`with_overrides` to copy-and-tweak). Skeleton:
+
+```python
+import numpy as np
+from ..base import ProcessorStep
+from ..transforms import ACTIONS, OBSERVATION
+
+class MyRobotEncodeActions(ProcessorStep):
+    """Map absolute pi actions back to robot space: 32->N, flip, gripper."""
+    def __call__(self, data):
+        actions = np.asarray(data[ACTIONS], dtype=np.float32)[:, :ROBOT_DIM]
+        # ...embodiment-specific flip / gripper inverse-map...
+        data[ACTIONS] = np.ascontiguousarray(actions)
+        return data
+```
+
+An input step is analogous: read state from `data[OBSERVATION][state_key]`,
+decode, write back (work on a **shallow copy** — don't mutate the caller's dict).
+Port **placeholder calibration** faithfully as a hook (in G1 the flip mask is all
+`1`, gripper `clip(0,1)` — currently pass-through); fill in real calibration here.
+
+### 5.4 Assemble the pipeline in the factory
+
+Default pi05 pipelines: input `[image_stack, tokenize, sample_noise]`, output
+`[trim, unnormalize]`. `Pipeline` offers
+`insert_before/insert_after/replace/override/remove/reorder` (each returns a new
+pipeline). The factory does three things: load full-width → insert decode on the
+input → rewrite the output pipeline:
+
+```python
+from ..policies.impls.pi05 import Pi05Policy
+from ..processors import Pipeline
+from ..processors.robots.my_robot import (
+    MyRobotDecodeState, MyRobotAbsoluteActions, MyRobotEncodeActions,
+    ROBOT_CAMERAS, ROBOT_DIM,
+)
+
+def build_my_robot_policy(model_dir, *, use_delta_joint_actions=True, adapt_to_pi=True,
+                          state_key="observation/state", image_keys=ROBOT_CAMERAS, **kw):
+    base = Pi05Policy.from_pretrained(
+        model_dir,
+        image_keys=tuple(image_keys),
+        action_dim=None,        # keep full 32 dims; the encode step trims to ROBOT_DIM
+        state_key=state_key,
+        **kw,
+    )
+    input_pipeline = base.input_pipeline
+    if adapt_to_pi:
+        input_pipeline = input_pipeline.insert_before(
+            "tokenize", ("decode_state", MyRobotDecodeState(state_key)))
+
+    output_steps = [("unnormalize", base.output_pipeline["unnormalize"])]   # full width
+    if use_delta_joint_actions:
+        output_steps.append(("absolute", MyRobotAbsoluteActions(state_key)))
+    if adapt_to_pi:
+        output_steps.append(("encode", MyRobotEncodeActions()))
+
+    return Pi05Policy(
+        base.model,
+        input_pipeline=input_pipeline,
+        output_pipeline=Pipeline(output_steps),
+        image_keys=tuple(image_keys),
+        state_key=state_key,
+        action_dim=ROBOT_DIM,
+        metadata={"robot": "my_robot"},
+    )
+```
+
+Resulting pipelines:
+
+```
+input : [image_stack, decode_state, tokenize, sample_noise]
+output: [unnormalize, absolute, encode]   # normalized[H,32] -> actions[H,ROBOT_DIM]
+```
+
+### 5.5 One general framework hook (built in, nothing to change)
+
+The delta→absolute output step needs to see the **input state**.
+`Pi05Policy.infer` already passes the (decoded) observation into the output
+pipeline; the stock `trim`/`unnormalize` ignore it, so existing numbers are
+unchanged (matching OpenPI's "output transforms can see input state" semantics).
+
+### 5.6 Use and verify
+
+```python
+from apxinf import build_unitree_g1_policy          # shipped G1 example
+policy = build_unitree_g1_policy("<g1-ckpt>", use_delta_joint_actions=True, adapt_to_pi=True)
+actions = policy.infer(obs)["actions"]               # [H, 16]
+```
+
+Smoke test (plumbing/shape): [scripts/g1_adapter_smoke.py](../../../../scripts/g1_adapter_smoke.py)
+feeds a G1-shaped observation (3 cameras uint8 HWC + 16-dim state + prompt)
+through the whole chain and asserts the output is `[H,16]`, finite, gripper dims
+∈ [0,1]. **Without real weights / norm_stats** the unnormalize degrades to a
+full-width identity — that proves the config runs end-to-end through the apxinf
+interface (compatibility), not executable numbers. For real values, supply the
+robot's `norm_stats` (≥ROBOT_DIM wide) + real gripper limits + checkpoint; the
+**same adapter code runs unchanged**.

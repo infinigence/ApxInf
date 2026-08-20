@@ -1,0 +1,28 @@
+{
+  "device": "Thor-U sm_101a",
+  "cuda": "12.8",
+  "profile": "pi05_two_view_h10_steps10",
+  "generated": "2026-08-04",
+  "tactics": {
+    "fp8_f16_m10_n1024_k32": { "tactic": 1, "milliseconds": 0.00692892 },
+    "fp8_f16_m10_n1024_k2048": { "tactic": 0, "milliseconds": 0.00931704 },
+    "fp8_f16_m10_n1024_k4096": { "tactic": 0, "milliseconds": 0.01331924 },
+    "fp8_f16_m10_n2560_k1024": { "tactic": 0, "milliseconds": 0.01065000 },
+    "fp8_f16_m10_n8192_k1024": { "tactic": 0, "milliseconds": 0.01817964 },
+    "fp8_f16_m1_n1024_k1024": { "tactic": 0, "milliseconds": 0.00736072 },
+    "fp8_f16_m1_n3072_k1024": { "tactic": 0, "milliseconds": 0.01091888 },
+    "fp8_f16_m512_n1152_k1152": { "tactic": 4, "milliseconds": 0.01335628 },
+    "fp8_f16_m512_n1152_k4304": { "tactic": 4, "milliseconds": 0.03371000 },
+    "fp8_f16_m512_n2048_k1152": { "tactic": 4, "milliseconds": 0.01734072 },
+    "fp8_f16_m512_n3456_k1152": { "tactic": 4, "milliseconds": 0.02552484 },
+    "fp8_f16_m512_n4304_k1152": { "tactic": 4, "milliseconds": 0.02962332 },
+    "fp8_f16_m522_n2048_k2048": { "tactic": 4, "milliseconds": 0.02965184 },
+    "fp8_f16_m522_n2048_k16384": { "tactic": 4, "milliseconds": 0.18187408 },
+    "fp8_f16_m522_n2560_k2048": { "tactic": 4, "milliseconds": 0.03473816 },
+    "fp8_f16_m522_n32768_k2048": { "tactic": 4, "milliseconds": 0.45566592 },
+    "fp8_f16_m712_n2048_k2048": { "tactic": 4, "milliseconds": 0.02965188 },
+    "fp8_f16_m712_n2048_k16384": { "tactic": 4, "milliseconds": 0.19733924 },
+    "fp8_f16_m712_n2560_k2048": { "tactic": 4, "milliseconds": 0.03585224 },
+    "fp8_f16_m712_n32768_k2048": { "tactic": 4, "milliseconds": 0.44603852 }
+  }
+}

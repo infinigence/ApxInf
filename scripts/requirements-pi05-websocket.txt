@@ -1,0 +1,9 @@
+# Transport + processor deps for the in-process OpenPI websocket server.
+# The compiled CUDA binding `apxinf_py` must be installed separately (maturin);
+# the pure-Python `apxinf` package is imported from ../python/apxinf.
+msgpack>=1.0.5
+numpy>=1.22.4
+Pillow>=9.0.0
+sentencepiece>=0.1.99
+typing_extensions>=4.12
+websockets>=14.0

@@ -1,0 +1,20 @@
+[package]
+name = "apxinf-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# BLAS backends — enable one at a time. If none is enabled, a naive
+# Rust fallback is used.
+accelerate = ["cblas", "libc"]   # Apple Accelerate framework (macOS)
+openblas = ["cblas"]              # OpenBLAS (Linux / cross-platform, requires system libopenblas-dev)
+
+[dependencies]
+thiserror = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+# BLAS integration — only pulled in when a backend feature is enabled
+cblas = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }          # linked by Accelerate on macOS

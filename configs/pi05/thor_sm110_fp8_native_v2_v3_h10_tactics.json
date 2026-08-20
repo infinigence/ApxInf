@@ -1,0 +1,4865 @@
+{
+  "cublas_version": "13.0",
+  "cuda_version": "13.0",
+  "device_name": "NVIDIA Thor",
+  "generator": {
+    "crate_version": "0.1.0",
+    "method": "cold_l2_exact_shape",
+    "name": "pi05_cutlass_tune"
+  },
+  "kernel_build_id": "kb1-72b398f332ec581e84b8489c4d336ddf",
+  "measurement": {
+    "benchmark_iterations": 30,
+    "eviction_buffer_bytes": 134217728,
+    "eviction_policy": "read_write_full_4x_l2_before_every_launch",
+    "l2_cache_bytes": 33554432,
+    "selection": "minimum candidate mean; exact physical M/N/K",
+    "timing": "CUDA events around GEMM only; eviction excluded",
+    "warmup_iterations": 10
+  },
+  "prefix_tokens_by_view": {
+    "2v_t10": 522,
+    "2v_t200": 712,
+    "2v_t21": 533,
+    "2v_t50": 562,
+    "3v_t10": 778,
+    "3v_t200": 968,
+    "3v_t21": 789,
+    "3v_t50": 818
+  },
+  "schema": "apxinf.cuda.tuning.v1",
+  "sm": 110,
+  "tactics": {
+    "fp8_f16_m10_n1024_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.02781439572572708
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.026791464537382126
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.027064530178904533
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.026470398530364037
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.028888529166579247
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.027802668511867523
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.027231999797125657,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.027940266765654087,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.03221546709537506,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.03149439990520477,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.027070933394134043,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.029111466805140176,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.02657919991761446,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.030209066718816756,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.026470398530364037,
+      "tactic": 3,
+      "workloads": [
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.attention_out",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m10_n1024_k32": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.006442666985094547
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.006557866930961609
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.006533333100378513
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.006467199418693781
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.007006933446973562
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.007327998988330364
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.006718933364997307,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.00857066676641504,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.008878933514157932,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.009081600202868382,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.008452266780659556,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.008720000181347132,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.00802453354311486,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.009050666773691773,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.006442666985094547,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.input",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m10_n1024_k4096": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.039818666875362396
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.0347231961786747
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.039740804582834244
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.03952853009104729
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.03978667035698891
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.03480212390422821
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.042243197560310364
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.03874240070581436
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.03754133308927218,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.037066666533549626,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.04404586677749952,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.037215999762217206,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.03618239959081014,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.036229332784811656,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.03695573310057322,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.04294506708780924,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.0347231961786747,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.down",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m10_n2560_k1024": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.029111463576555252
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.032840535044670105
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.027891196310520172
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.028227200731635094
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.03186560422182083
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.03621332719922066
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.036055464297533035
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.03028266876935959
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.03123840019106865,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.03250239969541629,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.03633919966717561,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.03099626675248146,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.03201813362538815,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.0307669331630071,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.03230079989880323,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.035916799555222194,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.027891196310520172,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.qkv",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m10_n32_k1024": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.007465599570423365
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.007011199835687876
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.007116800174117088
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.008523733355104923
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.009731198661029339
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.008198400028049946
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.008803200908005238
+        }
+      ],
+      "cutlass_candidates": [],
+      "milliseconds": 0.007011199835687876,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.output",
+          "repetitions": 10,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m10_n8192_k1024": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05718400701880455
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06494932621717453
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05316907539963722
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.0738869458436966
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06561386585235596
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.054259203374385834
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06430506706237793
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06207786500453949
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.05621333283682664,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.055332266415158905,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.06464746582011381,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.05533546693623066,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.054661332567532854,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.054137599840760234,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06372693342467149,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.061108266562223436,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05316907539963722,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.gate_up",
+          "repetitions": 180,
+          "stage": "action",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m1_n1024_k1024": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.015636267140507698
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.01581333391368389
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.0159424040466547
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.017874132841825485
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.017722666263580322
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.01688426686450839,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.016914133510241906,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.01756693354497353,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.01760213350256284,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.01825066693127155,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.017625600192695857,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.01781866680830717,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.01963093305627505,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.015636267140507698,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_in",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 3
+        },
+        {
+          "name": "time.mlp_out",
+          "repetitions": 10,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m1_n3072_k1024": {
+      "backend": "cutlass",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.03911999613046646
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.03154773637652397
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.03952319920063019
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.038331735879182816
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.031378135085105896
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.0316842719912529
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.032084266655147076,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.0339861328403155,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.03743360017736753,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.03115306676675876,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.03374613281339407,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.03227520001431306,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.03420586610833804,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.0369418665766716,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.03115306676675876,
+      "tactic": 3,
+      "workloads": [
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 2
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "action.ada_style",
+          "repetitions": 370,
+          "stage": "conditioning",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m512_n1152_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.030131198465824127
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.02946239709854126
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.029489068314433098
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.03017706423997879
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.03110826201736927
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.030354134738445282
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.030806396156549454
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.031228801235556602
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.03470399926106135,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.036538666238387425,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.0370239997903506,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.03729279997448127,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.0338581328590711,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.035302399471402165,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.03231040028234323,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.03400959943731626,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.02946239709854126,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m512_n1152_k4304": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05872640386223793
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06283412873744965
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06609919667243958
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06023786962032318
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05717653036117554
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07173120230436325
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.07651626318693161
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.07154026627540588
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.0897951990365982,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.10331733350952467,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.08378026634454727,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.08645546560486157,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07474773426850637,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.0767488015194734,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06810453236103058,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.08229866673549016,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05717653036117554,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m512_n1152_k588": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.07403306663036346
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.05797332897782326
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05863146483898163
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.09239894896745682
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.07860373705625534
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07301227003335953
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.05862400308251381
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.08984639495611191
+        }
+      ],
+      "cutlass_candidates": [],
+      "milliseconds": 0.05797332897782326,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m512_n2048_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.04127147048711777
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.03654399886727333
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.033690668642520905
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.035102926194667816
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.045891206711530685
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.03927786275744438
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.04775359481573105
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.03533119708299637
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.04816426647206148,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.04725013288358847,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.047279999653498335,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.04508373315135638,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.04053013374408086,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.04150720089673996,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.042579200491309165,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.046280532826979956,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.033690668642520905,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m512_n3456_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.056092798709869385
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.055448535829782486
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06371626257896423
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.057191457599401474
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05782400816679001
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.06393172591924667
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.057391997426748276
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.05709972605109215
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.06862719890971979,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.08200106720129649,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.07325333431363105,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.07392640064160029,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.06581653207540512,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.07111466651161512,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06883306577801704,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07770346775650978,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.055448535829782486,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m512_n4304_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.07910186797380447
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.07692372798919678
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.0767093226313591
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.0833493247628212
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.09903040528297424
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.08351680636405945
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.08006932586431503
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.08234986662864685
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.09340053300062816,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.11136853223045667,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.10220053419470787,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.10092053512732188,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.08696319883068403,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.09573226769765218,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08601599832375845,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.10221866716941198,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.0767093226313591,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 2
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 2
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 2
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m522_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.27439576387405396
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.2734965682029724
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.2754250764846802
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.431060254573822
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.4260117709636688
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.34710508584976196
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.2993450462818146
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.3730207681655884
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.3454154531160991,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.4518485337495804,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.2772703995307287,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.27987093329429624,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.3616853346427282,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.30169280370076496,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.36823040147622427,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.3004778683185577,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.2734965682029724,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m522_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.048963189125061035
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.05057813227176666
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.04533012956380844
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.046501342207193375
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05174826830625534
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.04566080495715141
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.05602133274078369
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.0576341338455677
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.06989546616872151,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.07694080124298731,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.05624853335320949,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.060929066687822345,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.05454079993069172,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.0581471998244524,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.05769386614362399,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.0626880002518495,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.04533012956380844,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m522_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.057105064392089844
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.055817604064941406
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05699627101421356
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.060224004089832306
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.058605875819921494
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.05981440469622612
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.057201072573661804
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06219520792365074
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.07631040116151173,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.09563626746336619,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.06748479927579562,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.0667029321193695,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.06322453320026397,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06477866557737191,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06984319960077603,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07277440056204795,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.055817604064941406,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 10,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m522_n32768_k2048": {
+      "backend": "cutlass",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.5985758900642395
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.3557171821594238
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.6091039776802063
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 1.2750688791275024
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.907136082649231
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.1811466217041016
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.6023434996604919
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 3.614701509475708
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.7806869347890218,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.1663104017575583,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.7381877322991689,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.6149962683518727,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.5794080038865407,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.5810656030972798,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.6127658605575561,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.7767040034135183,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.5794080038865407,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m533_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.265999972820282
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.2694624066352844
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.27394983172416687
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.42854297161102295
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.4331893026828766
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.43844690918922424
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.3460085093975067
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.36505281925201416
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.3261578599611918,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.45673706630865735,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.27788693010807036,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.2757919987042745,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.3317834655443827,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.2932501326004664,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.3565408001343409,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.2862378656864166,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.265999972820282,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m533_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.050387196242809296
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.051509324461221695
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.050972796976566315
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.04532480239868164
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.044760532677173615
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.0518549345433712
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.04442773386836052
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.057076264172792435
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.06738773236672084,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.07619200100501379,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.05716266619662444,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.05951893304785093,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.055007999887069066,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.05527786687016487,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.059624533355236056,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.06235519958039125,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.04442773386836052,
+      "tactic": 6,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m533_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05650666728615761
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.05585920810699463
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05738133192062378
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.05967467278242111
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05952747166156769
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.05942293629050255
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.05796267092227936
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.057685334235429764
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.0766848015288512,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.1006026675303777,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.0702197328209877,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.06945706630746523,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.06510933215419451,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06847359910607338,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.07341866716742515,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.0762816016872724,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05585920810699463,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 21,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m533_n32768_k2048": {
+      "backend": "cutlass",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.5904864072799683
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.342842936515808
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.6086528301239014
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 1.242192029953003
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.8654656410217285
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.1921534538269043
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 3.492645502090454
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.8839433789253235
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.7632981280485789,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.1383402665456137,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.6562293370564779,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.6020842711130778,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.5731818656126658,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.5846410632133484,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.6259029308954874,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.7705407996972402,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.5731818656126658,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m562_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.27935361862182617
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.27569279074668884
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.4354453682899475
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.4409802556037903
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.3523189127445221
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.31390824913978577
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.3669162690639496
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.3147338628768921
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.331922133763631,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.4557941337426504,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.2900757352511088,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.28950079878171286,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.372844797372818,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.305210667848587,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.37007253170013427,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.2983221342166265,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.27569279074668884,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m562_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05088212713599205
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.050501324236392975
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.04586772993206978
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.050818122923374176
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.04392639920115471
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.05642453581094742
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.05601707473397255
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.05950720235705376
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.06939519916971525,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.07657173474629721,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.05984639922777812,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.0600426667680343,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.05706879956026872,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.05756906668345133,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.05879893327752749,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.06321173297862212,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.04392639920115471,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m562_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05974506959319115
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.061642661690711975
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05995520204305649
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.060994137078523636
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05681920424103737
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.058535464107990265
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06241065636277199
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.054358404129743576
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.07840746864676476,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.10000533486406009,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.07237333382169406,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.07127999986211458,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.06616959894696871,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06868693282206853,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.07276160071293512,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07805226842562357,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.054358404129743576,
+      "tactic": 7,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 50,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m562_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.6055628061294556
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.4015827178955078
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.6409557461738586
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 1.301054835319519
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.186187744140625
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 3.680086612701416
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.9013845324516296
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 1.2295734882354736
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.7759829382101695,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.1712085286776224,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.7842101355393728,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.6397802650928497,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.617058132092158,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.6092896004517873,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.6794240017731984,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.8048224012056987,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.6055628061294556,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m712_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.4579104483127594
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.46199798583984375
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.38813653588294983
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.33367255330085754
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.3809930086135864
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.33048215508461
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.42522773146629333
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.43475621938705444
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.7973610639572144,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.5812917371590932,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.33447573383649193,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.372300797700882,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.4012565344572067,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.41448320051034293,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.521476270755132,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.37192426522572836,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.33048215508461,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m712_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05796372890472412
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.0561450719833374
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05824640765786171
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.056856535375118256
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06153387203812599
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.055249061435461044
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.061723742634058
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.061740804463624954
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.08091200093428294,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.08866773198048274,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.06790719901522001,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.06803733234604199,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.06412586644291877,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06331946675976118,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06677546550830206,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.06958933273951212,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.055249061435461044,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m712_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.06369706988334656
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06632959097623825
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06394772231578827
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06326719373464584
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06528106331825256
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.06586132198572159
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06707839667797089
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06047147512435913
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.09762986724575361,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.11386239950855573,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.08615359837810198,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.08228266686201095,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07451306705673535,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.07645013531049093,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.07663360064228376,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.08694933181007704,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06047147512435913,
+      "tactic": 7,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m712_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.6873589754104614
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.7064393162727356
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.8575305938720703
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 1.2415074110031128
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.6880053281784058
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.1518518924713135
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.7112767696380615
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 1.4296948909759521
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.0175690551598866,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.305408000946045,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.88518186211586,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.7290666619936625,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.7021514674027761,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.6991839985052745,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.7244586606820425,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.8878165284792582,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.6873589754104614,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 2
+        }
+      ]
+    },
+    "fp8_f16_m768_n1152_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.032500263303518295
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.03357972949743271
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.03666132688522339
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.033101871609687805
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.0343957357108593
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.032094936817884445
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.03623039647936821
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.03553706407546997
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.04141973406076431,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.051756799966096875,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.046778666352232295,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.049809066702922185,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.04046826710303624,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.04782186634838581,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.042024533698956174,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.04734293309350809,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.032094936817884445,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.attention_out",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m768_n1152_k4304": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.06808426976203918
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06987199932336807
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.08054612576961517
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.07570026069879532
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.07077226787805557
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07438933849334717
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06815680116415024
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.07776106148958206
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.10407680124044419,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.14027199745178223,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.09541973372300466,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.1034698670109113,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.0786997340619564,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.08991786614060401,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.07812693491578102,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.09082453275720279,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06808426976203918,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.fc2",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m768_n1152_k588": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.09765759110450745
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.07303572446107864
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.07310613244771957
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.1283136010169983
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.10622825473546982
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.10022079199552536
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.0808832123875618
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.14245013892650604
+        }
+      ],
+      "cutlass_candidates": [],
+      "milliseconds": 0.07303572446107864,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.patch",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m768_n2048_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.04458559677004814
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.04275413975119591
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05390506610274315
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.04543253406882286
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.048202671110630035
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.04634132608771324
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.050728533416986465
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.05038079991936684
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.05947839990258217,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.05893119958539804,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.05337280035018921,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.05435946683088939,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.05139840009311835,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.051698133597771326,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.05404160084823768,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.05634133319060008,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.04275413975119591,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.projector",
+          "repetitions": 1,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m768_n3456_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.06336746364831924
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06578239798545837
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06368746608495712
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.07189866155385971
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06514772772789001
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.06294719874858856
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.07188159972429276
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.07267626374959946
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.09676906690001488,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.10038080165783564,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.08478826507925988,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.08873173221945763,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.0811392011741797,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.0852842646340529,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08177493338783583,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.08758933221300443,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06294719874858856,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.qkv",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m768_n4304_k1152": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.10420479625463486
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.09971093386411667
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.10268481075763702
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.09897815436124802
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.09085013717412949
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.11789228767156601
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.09733759611845016
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.1066165342926979
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.1341610660155614,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.14301333278417588,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.1192800002793471,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.11120213270187378,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.10209813465674718,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.10879679918289184,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.10272320186098417,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.12066666781902313,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.09085013717412949,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 10,
+          "views": 3
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 21,
+          "views": 3
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 50,
+          "views": 3
+        },
+        {
+          "name": "vision.fc1",
+          "repetitions": 27,
+          "stage": "vision",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m778_n2048_k16384": {
+      "backend": "cutlass",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.5003936290740967
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.4710955023765564
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.48621124029159546
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.4989332854747772
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.43992215394973755
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.35666781663894653
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.3877674639225006
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.44646185636520386
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.960918406645457,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.6251914660135905,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.3911146660645803,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.35049173335234324,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.6443391978740692,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.328698667883873,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.571890131632487,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.40686826705932616,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.328698667883873,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m778_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05818454176187515
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.05833173170685768
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06242773309350014
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06396586447954178
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06207253783941269
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.06094507500529289
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.0629621297121048
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06102827936410904
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.0857951986292998,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.09621013427774111,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.07109439969062806,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.07292373403906822,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07141333321730296,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06866986627380053,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06907093301415443,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07539306754867235,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05818454176187515,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m778_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.0693248063325882
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06679999083280563
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.07151679694652557
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06758826225996017
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06352532655000687
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07306133210659027
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.0656789243221283
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.065406933426857
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.10236480136712392,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.11635306651393572,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.08666986500223478,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.08557013124227524,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.08303146734833718,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.08066240176558495,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08608319809039434,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.09000319888194402,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06352532655000687,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 10,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m778_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 1.1464873552322388
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.7873791456222534
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.7495637536048889
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.8494858145713806
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.1257802248001099
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.4979766607284546
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 1.9997484683990479
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.7452768087387085
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.0507349332173666,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.3546730637550355,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.9131381313006083,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.8133877396583558,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.846230399608612,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.7920597354571025,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.7927093346913655,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.9653088013331096,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.7452768087387085,
+      "tactic": 7,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 10,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m789_n2048_k16384": {
+      "backend": "cutlass",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.4980171024799347
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.4521876573562622
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.4784213602542877
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.48737820982933044
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.43818554282188416
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.35687682032585144
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.39086297154426575
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.43471676111221313
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.8919840057690938,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.6309290647506713,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.39956906537214915,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.33434560100237526,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.6199861367543539,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.3216213325659434,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.5530986626942952,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.4054666688044866,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.3216213325659434,
+      "tactic": 5,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m789_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.05722026899456978
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.05596373975276947
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.059272538870573044
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.0621119923889637
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.05934613570570946
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.05808959901332855
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06106986850500107
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.059902939945459366
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.0858890655140082,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.09466453393300374,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.06958613271514574,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.07069120009740194,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07046826630830764,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.06707199861605963,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06787519877155622,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07494293401638667,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05596373975276947,
+      "tactic": 1,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m789_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.07059840857982635
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06952320039272308
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.07162666320800781
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06907093524932861
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06540800631046295
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07222186774015427
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.06666239351034164
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06844159960746765
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.10306346789002419,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.12195093482732773,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.09438933332761129,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.09405653302868207,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.0882837325334549,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.08902719840407372,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08788159812490146,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.09691306675473849,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06540800631046295,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 21,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m789_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 1.1554569005966187
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.7998766899108887
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.7576629519462585
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.8552191257476807
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.111948847770691
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.4988211393356323
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 2.0263071060180664
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.7600789666175842
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.0632959961891175,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.378484268983205,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.9214143971602122,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.8436981280644734,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.8618719975153605,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.812281600634257,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.8002442677815755,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.961405873298645,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.7576629519462585,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 21,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m818_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.45146340131759644
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.4768810272216797
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.4660320281982422
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.4717482328414917
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.3401450514793396
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.4531860947608948
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.4008406102657318
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.5322805047035217
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.8794890801111857,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.6351690689722697,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.43524159789085387,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.38551679650942483,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.6280213395754496,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.34599573016166685,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.5103615989287694,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.4198954651753108,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.3401450514793396,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m818_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.0598837286233902
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.062427736818790436
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.05884267017245293
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.061451736837625504
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06212480366230011
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.060542941093444824
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.062002137303352356
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06603199988603592
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.08418986573815346,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.09935786798596383,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.07479040076335271,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.07859626859426498,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07317973350485166,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.07484906713167826,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.06989653284351031,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.07939093510309855,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.05884267017245293,
+      "tactic": 2,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m818_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.07122346013784409
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.07117119431495667
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.07230399549007416
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06923306733369827
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.0703968033194542
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07624001801013947
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.0719861313700676
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.0728810653090477
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.10424426794052125,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.12228693440556526,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.09117760012547176,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.09421333347757657,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.08889813249309858,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.08965973233183225,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08930986573298773,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.09638506745298704,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06923306733369827,
+      "tactic": 3,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 50,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m818_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 1.8006654977798462
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 1.1324459314346313
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.9150368571281433
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 2.024782657623291
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.7670794725418091
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 1.4974666833877563
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 1.188069462776184
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 1.154598355293274
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.0866613229115805,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.3667253255844116,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.9233578662077586,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.8763711969057719,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.8430698613325754,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.8525514702002207,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.8038250605265299,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.9655765334765116,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.7670794725418091,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 50,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m968_n2048_k16384": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.504524827003479
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.5340309143066406
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.5207348465919495
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.5457888245582581
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.5175018906593323
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.5419434309005737
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.512890636920929
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.49541330337524414
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 2.339816522598267,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.0171488006909688,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.7503882666428884,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.7694624026616415,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.6622869292895,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.583490135272344,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.6813941339651743,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.6693866670131683,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.49541330337524414,
+      "tactic": 7,
+      "workloads": [
+        {
+          "name": "language.down",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m968_n2048_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.06440852582454681
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.06523732841014862
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.06654080003499985
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.06551359593868256
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06709972769021988
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.06619945913553238
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.0664181262254715
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.06761706620454788
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.09603200107812881,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.11781760056813557,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.08420693178971608,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.08777386521299681,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.07410346691807111,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.0845514657596747,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.07550506740808487,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.0847370649377505,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06440852582454681,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.attention_out",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m968_n2560_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.07343785464763641
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.07229439914226532
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.0715925395488739
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 0.07200320065021515
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 0.06940160691738129
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.07562773674726486
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 0.07744958996772766
+        },
+        {
+          "heuristic_rank": 7,
+          "milliseconds": 0.07384959608316422
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 0.11771733313798904,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 0.13294293532768886,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 0.09314026658733686,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.091754666219155,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.0899551992615064,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.09093866596619288,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.08373439883192381,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 0.0944618672132492,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.06940160691738129,
+      "tactic": 4,
+      "workloads": [
+        {
+          "name": "language.qkv",
+          "repetitions": 18,
+          "stage": "language",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    },
+    "fp8_f16_m968_n32768_k2048": {
+      "backend": "cublaslt",
+      "cublaslt_candidates": [
+        {
+          "heuristic_rank": 0,
+          "milliseconds": 0.8039210438728333
+        },
+        {
+          "heuristic_rank": 1,
+          "milliseconds": 0.8150132894515991
+        },
+        {
+          "heuristic_rank": 2,
+          "milliseconds": 0.8595060706138611
+        },
+        {
+          "heuristic_rank": 3,
+          "milliseconds": 1.2524296045303345
+        },
+        {
+          "heuristic_rank": 4,
+          "milliseconds": 1.077307939529419
+        },
+        {
+          "heuristic_rank": 5,
+          "milliseconds": 0.8989429473876953
+        },
+        {
+          "heuristic_rank": 6,
+          "milliseconds": 1.1252543926239014
+        }
+      ],
+      "cutlass_candidates": [
+        {
+          "milliseconds": 1.263329064846039,
+          "tactic": 0
+        },
+        {
+          "milliseconds": 1.4554218610127767,
+          "tactic": 1
+        },
+        {
+          "milliseconds": 1.0146762649218242,
+          "tactic": 2
+        },
+        {
+          "milliseconds": 0.9670954684416453,
+          "tactic": 3
+        },
+        {
+          "milliseconds": 0.9533973296483358,
+          "tactic": 4
+        },
+        {
+          "milliseconds": 0.9652160008748373,
+          "tactic": 5
+        },
+        {
+          "milliseconds": 0.9153845330079396,
+          "tactic": 6
+        },
+        {
+          "milliseconds": 1.048137613137563,
+          "tactic": 7
+        }
+      ],
+      "milliseconds": 0.8039210438728333,
+      "tactic": 0,
+      "workloads": [
+        {
+          "name": "language.gate_up",
+          "repetitions": 17,
+          "stage": "language",
+          "token_count": 200,
+          "views": 3
+        }
+      ]
+    }
+  },
+  "token_counts": [
+    10,
+    21,
+    50,
+    200
+  ],
+  "views": [
+    2,
+    3
+  ]
+}

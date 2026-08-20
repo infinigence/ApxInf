@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "apxinf-py"
+version = "0.1.0"
+description = "PyO3 bindings for the ApxInf VLA runtime (L0/L1 bare-model infer)."
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "ml_dtypes>=0.2"]
+
+[tool.maturin]
+module-name = "apxinf_py"
+# `extension-module` keeps the cdylib from linking libpython. CUDA builds add
+# the model runtime with `maturin develop --features cuda` (additive), which is
+# required for the pi05 runtime to be registered.
+features = ["extension-module"]

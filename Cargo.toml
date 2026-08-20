@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/apxinf-core",
+    "crates/apxinf-cuda",
+    "crates/apxinf-loader",
+    "crates/apxinf-model",
+    "crates/apxinf-tokenizer",
+    "crates/apxinf-py",
+]
+
+[package]
+name = "apxinf"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
+# build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
+# CUDA uses libnvToolsExt. Both are handled transparently — see
+# crates/apxinf-cuda/build.rs.
+cuda = ["dep:apxinf-cuda", "apxinf-cuda/nvtx", "apxinf-model/cuda"]
+# Same as `cuda` but with NVTX compiled out entirely (no-op stubs). Use
+# when the target has no NVTX library installed at all.
+cuda-no-nvtx = ["dep:apxinf-cuda", "apxinf-model/cuda"]
+# CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
+# if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
+# libopenblas — leave this off on Thor.
+openblas = ["apxinf-core/openblas"]
+
+[dependencies]
+apxinf-core = { path = "crates/apxinf-core" }
+apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
+apxinf-loader = { path = "crates/apxinf-loader" }
+apxinf-model = { path = "crates/apxinf-model" }
+apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }
+clap = { version = "=4.5.23", features = ["derive"] }
+serde_json = "1"
+half = "2"

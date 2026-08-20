@@ -1,0 +1,21 @@
+[package]
+name = "apxinf-cuda"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = ["nvtx"]
+# nsys profiling markers. Requires libnvtx3interop from the CUDA toolkit,
+# which some embedded CUDA runtimes (e.g. NVIDIA DRIVE OS) don't ship.
+# Disable with --no-default-features to build without profiling markers.
+nvtx = []
+
+[dependencies]
+apxinf-core = { path = "../apxinf-core" }
+thiserror = "1"
+half = { version = "2", features = ["bytemuck"] }
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"

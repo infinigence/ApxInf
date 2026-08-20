@@ -1,0 +1,29 @@
+[package]
+name = "apxinf-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 bindings for the ApxInf VLA runtime (L0/L1 bare-model infer)."
+
+[lib]
+name = "apxinf_py"
+# `cdylib` produces the Python extension module; `rlib` lets `cargo test`
+# build an in-crate unit-test harness against the same code.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+apxinf-core = { path = "../apxinf-core" }
+apxinf-model = { path = "../apxinf-model" }
+# Keep pyo3 default features (incl. `macros`); `extension-module` is opt-in
+# below so `cargo test` can still link a Python interpreter for the harness.
+pyo3 = "0.22"
+numpy = "0.22"
+
+[features]
+default = []
+# Enabled by maturin so the cdylib does not link libpython. Left off for
+# `cargo test`, which needs to link a Python interpreter for the harness.
+extension-module = ["pyo3/extension-module"]
+# Forward CUDA support to the model crate. Required for the pi05 runtime,
+# which is only registered on CUDA devices. Without it the extension still
+# imports and reports shapes, but `load` errors for pi05.
+cuda = ["apxinf-model/cuda"]
