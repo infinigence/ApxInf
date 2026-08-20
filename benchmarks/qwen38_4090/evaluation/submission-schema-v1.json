@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/infinigence/ApxInf/benchmarks/qwen38_4090/evaluation/submission-schema-v1.json",
+  "title": "ApxInf Qwen3.8-27B leaderboard submission",
+  "type": "object",
+  "required": ["schema", "implementation", "correctness", "cells", "context", "reliability", "evidence"],
+  "properties": {
+    "schema": {"const": "apxinf.qwen38_27b.leaderboard_submission.v1"},
+    "implementation": {
+      "type": "object",
+      "required": ["name", "revision", "backend"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "backend": {"type": "string", "minLength": 1}
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "required": [
+        "protocol_pass",
+        "public_cases_passed",
+        "public_cases_total",
+        "public_trajectory_tokens_passed",
+        "public_trajectory_tokens_total"
+      ],
+      "properties": {
+        "protocol_pass": {"type": "boolean"},
+        "public_cases_passed": {"type": "integer", "minimum": 0},
+        "public_cases_total": {"type": "integer", "minimum": 0},
+        "hidden_cases_passed": {"type": ["integer", "null"], "minimum": 0},
+        "hidden_cases_total": {"type": ["integer", "null"], "minimum": 0},
+        "public_trajectory_tokens_passed": {"type": "integer", "minimum": 0},
+        "public_trajectory_tokens_total": {"type": "integer", "minimum": 0},
+        "hidden_trajectory_tokens_passed": {"type": ["integer", "null"], "minimum": 0},
+        "hidden_trajectory_tokens_total": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "cells": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/singleRequestCell"}
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "max_verified_prompt_tokens",
+        "verified_output_tokens",
+        "verified_cases_at_max_context",
+        "pass_rate_at_max_context",
+        "service_healthy_after_failure"
+      ],
+      "properties": {
+        "max_verified_prompt_tokens": {"type": "integer", "minimum": 0},
+        "verified_output_tokens": {"type": "integer", "minimum": 0},
+        "verified_cases_at_max_context": {"type": "integer", "minimum": 0},
+        "pass_rate_at_max_context": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "first_failed_prompt_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "failure_mode": {"type": ["string", "null"]},
+        "service_healthy_after_failure": {"type": "boolean"}
+      }
+    },
+    "multi_request": {
+      "type": "object",
+      "required": ["cells"],
+      "properties": {
+        "cells": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/multiRequestCell"}
+        }
+      }
+    },
+    "reliability": {
+      "type": "object",
+      "required": [
+        "request_success_rate",
+        "no_unexpected_oom",
+        "no_nan",
+        "no_fallback",
+        "no_xid",
+        "service_healthy_after_failure"
+      ],
+      "properties": {
+        "request_success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "no_unexpected_oom": {"type": "boolean"},
+        "no_nan": {"type": "boolean"},
+        "no_fallback": {"type": "boolean"},
+        "no_xid": {"type": "boolean"},
+        "service_healthy_after_failure": {"type": "boolean"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "contract_sha256",
+        "public_manifest_sha256",
+        "raw_jsonl",
+        "raw_jsonl_sha256",
+        "environment_json",
+        "environment_json_sha256",
+        "trajectory_reference_sha256"
+      ],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "public_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "hidden_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "context_manifest_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "raw_jsonl": {"type": "string", "minLength": 1},
+        "raw_jsonl_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "environment_json": {"type": "string", "minLength": 1},
+        "environment_json_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "trajectory_reference_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "trajectory_details": {"type": "object"}
+      }
+    }
+  },
+  "$defs": {
+    "singleRequestCell": {
+      "type": "object",
+      "required": [
+        "actual_prompt_tokens",
+        "completion_tokens",
+        "success_rate",
+        "measured_repeats",
+        "warmup_repeats"
+      ],
+      "properties": {
+        "actual_prompt_tokens": {"type": "integer", "minimum": 1},
+        "completion_tokens": {"type": "integer", "minimum": 1},
+        "success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "measured_repeats": {"type": "integer", "minimum": 1},
+        "warmup_repeats": {"type": "integer", "minimum": 0},
+        "ttft_cv": {"type": ["number", "null"], "minimum": 0},
+        "tpot_cv": {"type": ["number", "null"], "minimum": 0},
+        "ttft_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "tpot_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "e2e_s": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "peak_vram_mib": {"type": ["number", "null"], "minimum": 0},
+        "profile": {
+          "type": "object",
+          "properties": {
+            "prefill": {"$ref": "#/$defs/profilePhase"},
+            "decode": {"$ref": "#/$defs/profilePhase"}
+          }
+        }
+      }
+    },
+    "multiRequestCell": {
+      "type": "object",
+      "required": [
+        "concurrency",
+        "total_requests",
+        "actual_prompt_tokens",
+        "completion_tokens",
+        "success_rate",
+        "correctness_rate",
+        "measured_repeats",
+        "warmup_repeats",
+        "goodput_tokens_per_s",
+        "p95_ttft_s",
+        "p95_tpot_s",
+        "jain_fairness_index",
+        "no_fallback",
+        "service_healthy_after_run"
+      ],
+      "properties": {
+        "concurrency": {"type": "integer", "minimum": 2},
+        "total_requests": {"type": "integer", "minimum": 1},
+        "actual_prompt_tokens": {"type": "integer", "minimum": 1},
+        "completion_tokens": {"type": "integer", "minimum": 1},
+        "success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "correctness_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "measured_repeats": {"type": "integer", "minimum": 1},
+        "warmup_repeats": {"type": "integer", "minimum": 0},
+        "goodput_tokens_per_s": {"type": "number", "exclusiveMinimum": 0},
+        "goodput_cv": {"type": ["number", "null"], "minimum": 0},
+        "p95_ttft_s": {"type": "number", "exclusiveMinimum": 0},
+        "p95_tpot_s": {"type": "number", "exclusiveMinimum": 0},
+        "jain_fairness_index": {"type": "number", "minimum": 0, "maximum": 1},
+        "no_fallback": {"type": "boolean"},
+        "service_healthy_after_run": {"type": "boolean"}
+      }
+    },
+    "profilePhase": {
+      "type": "object",
+      "required": ["kernel_elapsed_s", "dram_read_bytes", "dram_write_bytes"],
+      "properties": {
+        "kernel_elapsed_s": {"type": "number", "exclusiveMinimum": 0},
+        "dram_read_bytes": {"type": "number", "minimum": 0},
+        "dram_write_bytes": {"type": "number", "minimum": 0},
+        "tensor_pipe_active_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100}
+      }
+    }
+  }
+}

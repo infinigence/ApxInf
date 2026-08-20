@@ -300,14 +300,16 @@ impl Model {
         };
 
         let options = LoadOptions {
+            model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
             calibration_path,
             tuning_path: tactics,
             config: Some(config.clone()),
             synthetic: Some(SyntheticWeights { seed }),
             uniform_fp8_scale,
+            ..LoadOptions::default()
         };
-        let loaded = AutoModel::load_with_options(model, device, Path::new(""), &options)
+        let loaded = AutoModel::load_model(device, Path::new(""), &options)
             .map_err(runtime_err)?;
         Ok(Self {
             model: loaded,
