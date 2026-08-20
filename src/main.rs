@@ -85,8 +85,9 @@ enum Commands {
         port: u16,
         #[arg(long, default_value_t = 32768)]
         max_model_len: usize,
-        /// Allocate the experimental M64 Marlin prefill workspace. Requests
-        /// remain on M8 unless they explicitly set apxinf_prefill_mode.
+        /// Allocate the experimental M64 Marlin prefill workspace. Eligible
+        /// requests default to Marlin; set apxinf_prefill_mode=m8 per request
+        /// to use the rollback path.
         #[arg(long)]
         enable_experimental_marlin_m64: bool,
         /// Load the native Qwen3.8 visual encoder and enable one-image chat

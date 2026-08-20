@@ -839,6 +839,29 @@ fn handle_evaluation(
     }
 }
 
+fn select_chat_prefill_mode(
+    requested_mode: Option<&str>,
+    marlin_m64_enabled: bool,
+    prompt_tokens: usize,
+) -> Result<Qwen35PrefillMode, String> {
+    let default_mode = if marlin_m64_enabled && prompt_tokens >= 64 {
+        "marlin-m64"
+    } else {
+        "m8"
+    };
+    match requested_mode.unwrap_or(default_mode) {
+        "m8" => Ok(Qwen35PrefillMode::M8),
+        "marlin-m64" if marlin_m64_enabled => Ok(Qwen35PrefillMode::MarlinM64),
+        "marlin-m64" => Err(
+            "marlin-m64 was requested but the server was not started with --enable-experimental-marlin-m64"
+                .into(),
+        ),
+        other => Err(format!(
+            "unsupported apxinf_prefill_mode `{other}`"
+        )),
+    }
+}
+
 fn handle_chat(runtime: &NativeRuntime, stream: &mut TcpStream, raw: &[u8]) -> Result<(), String> {
     let body: Value = match serde_json::from_slice(raw) {
         Ok(body) => body,
@@ -938,21 +961,11 @@ fn handle_chat(runtime: &NativeRuntime, stream: &mut TcpStream, raw: &[u8]) -> R
             )
         }
     };
-    let prefill_mode = match body
-        .get("apxinf_prefill_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("m8")
-    {
-        "m8" => Qwen35PrefillMode::M8,
-        "marlin-m64" if runtime.marlin_m64_enabled => Qwen35PrefillMode::MarlinM64,
-        "marlin-m64" => {
-            return Err(
-                "marlin-m64 was requested but the server was not started with --enable-experimental-marlin-m64"
-                    .into(),
-            )
-        }
-        other => return Err(format!("unsupported apxinf_prefill_mode `{other}`")),
-    };
+    let prefill_mode = select_chat_prefill_mode(
+        body.get("apxinf_prefill_mode").and_then(Value::as_str),
+        runtime.marlin_m64_enabled,
+        prompt_tokens.len(),
+    )?;
     let max_tokens = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -1445,4 +1458,47 @@ fn send_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<(), S
     .map_err(|error| error.to_string())?;
     stream.write_all(&body).map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eligible_chat_defaults_to_marlin_when_enabled() {
+        let mode = select_chat_prefill_mode(None, true, 64).unwrap();
+        assert!(matches!(mode, Qwen35PrefillMode::MarlinM64));
+    }
+
+    #[test]
+    fn chat_defaults_to_m8_when_marlin_is_unavailable_or_prompt_is_short() {
+        let disabled = select_chat_prefill_mode(None, false, 1024).unwrap();
+        let short = select_chat_prefill_mode(None, true, 63).unwrap();
+        assert!(matches!(disabled, Qwen35PrefillMode::M8));
+        assert!(matches!(short, Qwen35PrefillMode::M8));
+    }
+
+    #[test]
+    fn explicit_m8_preserves_the_rollback_path() {
+        let mode = select_chat_prefill_mode(Some("m8"), true, 1024).unwrap();
+        assert!(matches!(mode, Qwen35PrefillMode::M8));
+    }
+
+    #[test]
+    fn explicit_marlin_still_requires_the_server_flag() {
+        let enabled = select_chat_prefill_mode(Some("marlin-m64"), true, 32).unwrap();
+        assert!(matches!(enabled, Qwen35PrefillMode::MarlinM64));
+
+        let error = select_chat_prefill_mode(Some("marlin-m64"), false, 1024).unwrap_err();
+        assert!(error.contains("--enable-experimental-marlin-m64"));
+    }
+
+    #[test]
+    fn unsupported_mode_still_fails() {
+        let error = select_chat_prefill_mode(Some("unknown"), true, 1024).unwrap_err();
+        assert_eq!(
+            error,
+            "unsupported apxinf_prefill_mode `unknown`"
+        );
+    }
 }
