@@ -9,25 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  contract-tests:
+  assignment-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Compile evaluator and run deterministic negative controls
-        run: |
-          python -m py_compile benchmarks/qwen38_4090/evaluation/*.py
-          python -m unittest discover \
-            -s benchmarks/qwen38_4090/evaluation \
-            -p 'test_*.py'
-
-  rust-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check the complete workspace
-        run: cargo check --workspace --locked
+      - name: Run the unified assignment check
+        run: python3 benchmarks/qwen38_4090/evaluation/test.py check

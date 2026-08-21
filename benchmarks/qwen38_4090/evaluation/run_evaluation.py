@@ -1216,7 +1216,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--parallel-requests-capability",
         type=int,
-        help="Teacher-declared vLLM adapter capacity; candidate services must advertise this in /health",
+        help="Platform-declared vLLM adapter capacity; candidate services must advertise this in /health",
     )
     parser.add_argument("--implementation-name", required=True)
     parser.add_argument("--implementation-revision", required=True)

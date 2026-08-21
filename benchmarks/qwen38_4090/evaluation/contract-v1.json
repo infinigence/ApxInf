@@ -73,7 +73,7 @@
         {"category": "aggregate", "case_count": 2, "policy": "Compute a deterministic integer aggregate over a bounded set of private records."}
       ],
       "output_tokens_per_case": 64,
-      "release_rule": "Case contents, seeds, expected outputs, and the teacher manifest hash are frozen before course release and remain teacher-only. The published count, categories, prompt ceiling, interface, budgets, and validators cannot change during a leaderboard round."
+      "release_rule": "Case contents, seeds, expected outputs, and manifest remain private to the evaluation platform. The published count, categories, prompt ceiling, interface, budgets, and validators cannot change during a leaderboard round."
     },
     "public_token_trajectory_suite": {
       "case_ids": ["text-perf-1024", "text-perf-8192"],
@@ -85,7 +85,7 @@
       "prompt_token_range": [2048, 16384],
       "tokens_per_case": 128,
       "total_tokens": 256,
-      "release_rule": "Prompts and frozen vLLM greedy reference token IDs remain teacher-only; shapes and token budgets are public and fixed."
+      "release_rule": "Prompts and frozen vLLM greedy reference token IDs remain private to the evaluation platform; shapes and token budgets are public and fixed."
     },
     "token_trajectory_definition": "Categorical token edit similarity against the frozen vLLM greedy reference. Both trajectories must contain the complete frozen output budget. Compute unit-cost Levenshtein distance over token IDs (insertion, deletion, substitution), then passed_tokens=max(0, expected_tokens-distance). Token IDs are never compared with MAE, cosine, embeddings, or a semantic judge."
   },
@@ -137,7 +137,7 @@
     }
   },
   "performance_scoring": {
-    "reference_population": "For each cell and metric, take the best valid median among the same-round teacher-run vLLM control and all correctness/reliability-eligible PR submissions.",
+    "reference_population": "For each cell and metric, take the best valid median among the same-round platform vLLM control and all correctness/reliability-eligible PR submissions.",
     "required_official_control_backend": "vllm",
     "formula": "points = weight * min(1, best_valid_median_seconds / observed_median_seconds)",
     "refresh_policy": "Scores are recomputed when the cohort changes and are frozen at each announced leaderboard snapshot. A one-submission self-score is diagnostic, not official.",
@@ -192,7 +192,7 @@
     "weight": 10.0,
     "description": "Closed-loop concurrent text serving bonus. Queueing is included. It is not mixed into base TTFT or TPOT.",
     "formula": "For each valid cell: 1 support point + 4 * min(1, observed_goodput / best_valid_goodput).",
-    "reference_population": "Best valid same-round goodput among teacher-run controls and eligible PR submissions.",
+    "reference_population": "Best valid same-round goodput among platform controls and eligible PR submissions.",
     "correct_output_goodput_definition": "Sum of completion tokens from successful, functionally correct requests divided by client-observed batch makespan.",
     "validity": {
       "success_rate": 1.0,
