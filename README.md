@@ -1,522 +1,177 @@
-# ApxInf
+# ApxInf 任务：单张 RTX 4090 上的 Qwen3.8-27B INT4 推理优化
 
-ApxInf is a Rust inference engine for autoregressive LLM/VLM generation and
-PI0.5 policy inference, with CUDA implementations for PI0.5 in FP8, BF16, and
-W8A8 INT8. Run the commands below from the repository root on the NVIDIA
-target machine.
+[English](README_EN.md) | 中文
 
-The CUDA kernels, CUTLASS, and FlashAttention sources needed by PI0.5 are
-vendored in this repository, so no external source checkout is required.
+## 1. 目标
 
-## PI0.5 Performance and Accuracy
+在 ApxInf 中实现并优化 `cyankiwi/Qwen3.8-27B-AWQ-INT4`，使它能在单张
+NVIDIA RTX 4090 上完成稳定、正确且高效的文本推理。
 
-ApxInf provides native PI0.5 CUDA paths for Jetson AGX Thor (SM110) and Jetson AGX
-Orin (SM87). The performance results below use the primary two-view, T=10 LIBERO
-workload with batch 1, 224 x 224 NHWC `uint8` images, 10 flow-matching steps,
-`H=10`, 10 warm-up iterations, and 30 measured samples.
+提交物是一个实现 PR 和一份 `REPORT.md`。模型权重及未公开评测数据不提交到仓库。
 
-**Best published ApxInf PI0.5 performance:** Thor FP8 reaches
-**50.02 ms (20 Hz)** on the performance workload.
+## 2. 固定条件
 
-### Performance
+- GPU：单张 RTX 4090，compute capability 8.9；
+- 模型 revision：`63768c10df38c0395e12ef49edac1bd539eaeeea`；
+- 权重：W4A16、group size 32、asymmetric；
+- 输入：预分词 `input_ids`；
+- 解码：greedy，`temperature=0`，thinking 关闭；
+- 基础场景：一次一个请求，输出 128 token；
+- 不允许切换到 vLLM、Transformers、CPU、其他模型或其他 GPU 作为 fallback；
+- [`contract-v1.json`](benchmarks/qwen38_4090/evaluation/contract-v1.json) 是 workload、门槛和分数的唯一机器合同。
 
-Latency is steady-state CUDA Graph replay P50. Throughput is the corresponding
-single-stream policy inference rate.
+可以修改 ApxInf 的 Rust、CUDA、调度、内存管理和服务实现，但不得修改
+`benchmarks/qwen38_4090/evaluation/` 中的合同、公开数据生成器或评测程序来提高结果。
 
-| Hardware | Mode | Latency | Throughput |
-|---|---|---:|---:|
-| Jetson AGX Thor | BF16 | 91.05 ms | 11 Hz |
-| Jetson AGX Thor | FP8 | **50.02 ms** | **20 Hz** |
-| Jetson AGX Orin | BF16 | 213.35 ms | 4.7 Hz |
+## 3. 服务接口
 
-### LIBERO accuracy
+### 健康检查
 
-The formal accuracy protocol uses two views, T=10, `H=50`, 500 episodes, and
-`replan=5`. The official PI0.5 reference success rate is 92.4%. ApxInf results
-will be filled in after the corresponding 500-episode runs are complete.
+`GET /health` 在服务可用时返回 HTTP 200：
 
-| Hardware | Mode | Trials | Success | Rate |
-|---|---|---:|---:|---:|
-| Jetson AGX Thor | BF16 | 500 | TBD | TBD |
-| Jetson AGX Thor | FP8 | 500 | TBD | TBD |
-| Jetson AGX Orin | BF16 | 500 | TBD | TBD |
-
-## 1. NVIDIA build environment
-
-Use a Linux host with an NVIDIA driver and a complete CUDA toolkit. The build
-needs:
-
-- `nvcc`, CUDA headers, and the CUDA runtime;
-- cuBLAS and cuBLASLt development libraries;
-- NVTX (`libnvToolsExt` on many Jetson systems or `libnvtx3interop` on desktop
-  CUDA installations);
-- a C/C++ compiler, linker, `ar`, Git, `pkg-config`, and Python 3.
-
-On Ubuntu, install the non-CUDA tools with:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential curl git pkg-config \
-  python3 python3-pip python3-venv
+```json
+{
+  "status": "ok",
+  "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+  "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+  "max_model_len": 32768,
+  "parallel_requests": 1,
+  "fallback_active": false,
+  "capabilities": {
+    "pretokenized_input_ids": true,
+    "token_id_output": true,
+    "multimodal": false
+  }
+}
 ```
 
-Install the NVIDIA driver and CUDA toolkit through the JetPack, DRIVE OS, or
-CUDA distribution appropriate for the machine. Known-good configurations are:
+### 生成请求
 
-| Device | CUDA architecture | Validated toolkit |
-|---|---:|---:|
-| Jetson Thor | `sm_110` | CUDA 13.0 |
-| Thor-U | `sm_101` | CUDA 12.8 |
-| Jetson AGX Orin | `sm_87` | CUDA 12.6 and 13.2 |
+`POST /v1/evaluations/generate` 接收：
 
-Set the toolkit path and the architecture before building. Do not omit the
-architecture on Jetson:
-
-```bash
-export CUDA_PATH=/usr/local/cuda
-export PATH="${CUDA_PATH}/bin:$PATH"
-export APXINF_CUDA_ARCH=sm_110  # use sm_101 for Thor-U or sm_87 for Orin
-
-nvcc --version
-test -f "${CUDA_PATH}/include/cuda_runtime.h"
+```json
+{
+  "input_ids": [151644, 872, 198],
+  "max_new_tokens": 128,
+  "temperature": 0.0,
+  "ignore_eos": true,
+  "stream": true
+}
 ```
 
-The build itself locates `nvcc` through `CUDA_PATH`; the `PATH` entry is what
-makes the `nvcc --version` check above work on a shell that has no CUDA on its
-default path.
+流式响应的每个 token 使用一个 SSE event：
 
-If CUDA is installed elsewhere, point `CUDA_PATH` at that directory. The
-runtime libraries must also be visible to the system dynamic linker.
-
-## 2. Rust toolchain
-
-Install the current stable Rust toolchain with `rustup`:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustup toolchain install stable --profile minimal
-rustup default stable
-rustc --version
-cargo --version
+```text
+data: {"type":"token","request_id":"req-1","index":0,"token_id":198}
 ```
 
-The current code has been built with Rust 1.95 and 1.96. The repository does
-not currently declare an older minimum supported Rust version.
+结束时返回：
 
-## 3. Build
+```text
+data: {"type":"done","request_id":"req-1","usage":{"prompt_tokens":3,"completion_tokens":128,"total_tokens":131}}
 
-Build the main ApxInf binary:
-
-```bash
-cargo build --release --features cuda
+data: [DONE]
 ```
 
-Build the unified PI0.5 benchmark (one example drives BF16 / FP8 / INT8 via
-`--dtype`):
+要求：
+
+- token index 从 0 连续递增；
+- 并发请求的 `request_id` 互不混淆；
+- 性能用例必须输出完整预算；
+- 非法参数返回 HTTP 400 和 JSON `error`；
+- 容量失败后，健康检查和小请求仍应成功；
+- TTFT 和 TPOT 以客户端接收时间计算，服务端自报时间不计分。
+
+图片能力是可选加分项。支持时，`capabilities.multimodal` 必须为 `true`，并通过
+`POST /v1/chat/completions` 接收一个 `data:image/png;base64` 图片 part 和一个文本 part；
+请求必须由提交的 ApxInf 实现执行且不能 fallback。不支持时保持 `false`，图片探测应以
+HTTP 400、415、422 或 501 及 `error.type=unsupported_capability` 明确失败。
+
+## 4. 评分
+
+基础分 100 分：
+
+| 项目 | 分值 | 要求 |
+|---|---:|---|
+| Correctness | 30 | 协议、公开用例及未公开用例 |
+| TTFT | 35 | 1K、2K、4K、8K、16K prompt |
+| TPOT | 25 | 1K 与 8K prompt |
+| Reliability | 10 | 成功率、无 fallback/OOM/NaN/Xid、失败后恢复 |
+
+可选加分：
+
+- 长上下文 0-10 分：从 32K 以上逐级验证，最高到模型原生 262,144 positions；
+- 多请求 0-10 分：C4/C8 closed-loop correct goodput，同时约束成功率、公平性和尾延迟；
+- 图片能力 0-10 分：公开正确性 2 分、私有正确性 6 分，两个 split 的完整集成与稳定性各
+  1 分。图片能力缺失得 0 分，但不影响合格的纯文本提交。
+
+基础分上限为 100，加分上限为 30，排行榜总分上限为 130。图片报告由评测平台生成并
+绑定实现 identity、合同 hash 和 split，`submission.json` 中的图片字段不能手工填写。
+
+性能 cell 先 warm-up 1 次，再测 5 次，取中位数；TTFT/TPOT 的 CV 不得超过 10%。
+同一轮中每个 cell 的最好有效结果作为该 cell 的满分参考。
+
+进入性能排名前必须满足：公开正确率 100%、未公开正确率至少 11/12、请求成功率至少
+99%，并且协议与可靠性门槛通过。公开运行仅用于本地调试，不代表正式成绩。
+
+## 5. 统一测试脚本
+
+本任务只有一个测试入口：`test.py`。
+
+先检查代码和任务包：
 
 ```bash
-cargo build --release -p apxinf-model --features cuda --example pi05_bench
+python3 benchmarks/qwen38_4090/evaluation/test.py check
 ```
 
-The resulting `pi05_bench` executable is under `target/release/examples/`. Set a
-separate `CARGO_TARGET_DIR` when keeping builds for multiple GPU architectures
-in the same checkout.
-
-### Checkpoint-free quickstart (no download)
-
-`pi05_bench` runs with deterministic **random weights** — graph-replay latency
-depends only on tensor shape and dtype, so no checkpoint is needed to measure the
-engine. Pass `random` in place of a checkpoint path:
+准备公开数据，需要本地模型目录及 `transformers`：
 
 ```bash
-# BF16 engine floor, 2 views, 10-token prompt
-target/release/examples/pi05_bench random --dtype bf16 --views 2 --token-count 10
-
-# FP8 (synthetic uniform activation scale; no calibration/tactics required)
-target/release/examples/pi05_bench random --dtype fp8 --views 2 --token-count 10
-
-# INT8 W8A8, 3 views
-target/release/examples/pi05_bench random --dtype int8 --views 3 --token-count 21
+python3 benchmarks/qwen38_4090/evaluation/test.py prepare \
+  --model-dir /path/to/Qwen3.8-27B-AWQ-INT4
 ```
 
-Random mode still runs the eager-vs-graph integrity self-test; it rejects
-`--reference` (there are no trained weights to match). It defaults to a reduced
-`H=10` action horizon (the shape the published Thor numbers use); sweep the horizon
-and other shapes with `--action-horizon/--num-flow-steps/--views/--image-size` —
-these are synthetic-only knobs. A **real checkpoint runs its native config instead**
-(see below).
-
-## 4. Run LLM and VLM generation
-
-`generate` detects the Hugging Face `model_type` and uses the same
-`LlmInput`/`LlmTrait` pipeline for Llama and Qwen3-VL. Text-only generation:
+启动自己的服务后运行公开测试：
 
 ```bash
-cargo run --release --features cuda-no-nvtx -- generate \
-  --model /path/to/model \
-  --prompt "Describe CUDA graphs." \
-  --device cuda --dtype bf16 --max-tokens 50
+python3 benchmarks/qwen38_4090/evaluation/test.py run \
+  --model-dir /path/to/Qwen3.8-27B-AWQ-INT4 \
+  --base-url http://127.0.0.1:8001
 ```
 
-For Qwen3-VL, add `--image`. The CLI shells out to the Hugging Face processor to
-turn the image into `pixel_values` + `image_grid_thw`, so that Python environment
-needs:
-
-```bash
-python3 -m pip install "transformers>=4.57" torch torchvision Pillow numpy
-```
-
-These four packages are needed **only for `--image`**. Text-only `generate` and
-everything under [Run PI0.5](#5-run-pi05) call no Python at all — the subprocess
-is spawned from the `--image` branch alone.
-
-Qwen3-VL landed in `transformers` 4.57.0, so anything older cannot build its
-processor: the run returns no `pixel_values` and fails with
-`KeyError: 'pixel_values'`. `torch` and `torchvision` are never called by ApxInf
-itself — `AutoProcessor` for Qwen3-VL constructs a `Qwen3VLVideoProcessor`
-sub-processor that hard-requires both even for a still image, and in
-`transformers` 5.x every image processor is torchvision-backed, so the import
-fails before the file is opened. Any build of torch for the machine will do; the
-tensors it produces are copied straight out to `.npy` and never touch a GPU.
-
-```bash
-cargo run --release --features cuda-no-nvtx -- generate \
-  --model /path/to/Qwen3-VL-2B-Instruct \
-  --image /path/to/image.jpg \
-  --prompt "What is in this image?" \
-  --device cuda --dtype bf16 --max-tokens 50
-```
-
-`generate` exits non-zero when preprocessing, loading, or generation fails, so it
-is safe to chain in a script.
-
-## 5. Run PI0.5
-
-### Model and common paths
-
-This repository ships **no checkpoint**. The checkpoint-free quickstart above
-needs no download; the commands below (real-weight benchmarks, websocket serving,
-LIBERO) need a `model.safetensors` on disk. Websocket serving also needs
-`norm_stats.json` and either `tokenizer.model` or `paligemma_tokenizer.model`.
-
-#### Pull a pi05 checkpoint
-
-pi05 weights come from the OpenPI π0.5 release; export them to a
-`model.safetensors` in a model directory. One recipe using the Hugging Face CLI:
-
-```bash
-python3 -m pip install -U "huggingface_hub[cli]"
-export APXINF_MODEL_DIR=/path/to/pi05_libero_base
-huggingface-cli download <org/pi05-repo> \
-  --local-dir "$APXINF_MODEL_DIR" \
-  --include "model.safetensors" "config.json" "norm_stats.json" "*tokenizer.model"
-```
-
-Substitute the π0.5 repo you have access to. Each future model registered with
-`AutoModel` adds its own pull recipe plus a registry entry; the benchmark and
-serving flags stay the same (`--dtype` / `--precision`, `--model`).
-
-Set these paths once for the following commands:
-
-```bash
-export APXINF_MODEL_DIR=/path/to/pi05_libero_base
-export APXINF_CHECKPOINT="${APXINF_MODEL_DIR}/model.safetensors"
-export APXINF_TACTICS=configs/pi05/thor_sm110_cutlass_tactics.json
-export APXINF_EXAMPLES=target/release/examples
-```
-
-For Thor-U, use `configs/pi05/thor_u_cutlass_tactics.json`. Orin does not have
-native FP8 Tensor Cores; its FP8 compatibility path accepts the tactic file but
-does not use its GEMM selections.
-
-#### FP8 activation calibration
-
-FP8 needs per-tensor activation scales. `--calibration` takes either a
-calibration JSON or `uniform:SCALE`, an unprofiled flat scale:
-
-```bash
-# latency/smoke only — a flat scale, not a real activation profile
-export APXINF_CALIBRATION=uniform:1.0
-```
-
-`uniform:` is enough to measure the FP8 engine and to prove the path runs, and it
-is what the FP8 benchmark commands below use. **It is not valid for accuracy**:
-use a real profile before reading anything into FP8 rollout success rates.
-
-No calibration file ships with this repository or with a π0.5 checkpoint. Build
-one from a BF16 activation sweep over your own checkpoint:
-
-```bash
-# 1. record BF16 activation amax (needs the FlashRT torch frontend + a GPU)
-python3 scripts/pi05_bf16_zero_reference.py \
-  --checkpoint "$APXINF_CHECKPOINT" \
-  --output /tmp/pi05-bf16-oracle.json \
-  --calibration-output /tmp/pi05-raw-calibration.json
-
-# 2. turn it into a conservative FP8 profile
-python3 scripts/pi05_prepare_libero_calibration.py \
-  --input /tmp/pi05-raw-calibration.json \
-  --output "${APXINF_MODEL_DIR}/calibration.json" --margin 2.35
-
-export APXINF_CALIBRATION="${APXINF_MODEL_DIR}/calibration.json"
-```
-
-Step 2 is a bootstrap profile derived from a zero fixture, not a production
-calibration; validate it behaviorally against BF16 before you rely on it. If a
-`calibration.json` sits in the model directory the loader picks it up
-automatically, so `--calibration` is only needed to point elsewhere.
-
-### Benchmark FP8, BF16, and INT8
-
-The following commands benchmark a checkpoint with a representative 21-token
-prompt for 30 iterations, selecting the dtype with `--dtype`.
-`APXINF_PI05_IMAGE_INPUT=nhwc` includes the captured CUDA path from raw,
-already-resized `uint8 [2,224,224,3]` RGB images through normalization,
-patchification, and policy inference.
-
-FP8:
-
-```bash
-APXINF_PI05_IMAGE_INPUT=nhwc \
-"${APXINF_EXAMPLES}/pi05_bench" "$APXINF_CHECKPOINT" --dtype fp8 \
-  --calibration "$APXINF_CALIBRATION" --tactics "$APXINF_TACTICS" \
-  --token-count 21 --iterations 30
-```
-
-BF16:
-
-```bash
-APXINF_PI05_IMAGE_INPUT=nhwc \
-"${APXINF_EXAMPLES}/pi05_bench" "$APXINF_CHECKPOINT" --dtype bf16 \
-  --token-count 21 --iterations 30
-```
-
-W8A8 INT8:
-
-```bash
-APXINF_PI05_IMAGE_INPUT=nhwc \
-"${APXINF_EXAMPLES}/pi05_bench" "$APXINF_CHECKPOINT" --dtype int8 \
-  --token-count 21 --iterations 30
-```
-
-Use `patches`, `nhwc`, or `nchw` for `APXINF_PI05_IMAGE_INPUT` (or the
-`--image-input` flag). Native FP8 is the optimized path on Thor/Thor-U. BF16 and
-INT8 are currently optimized primarily for SM87 Orin; FP8 on Orin is a
-correctness-oriented decode-to-FP16 compatibility path.
-
-> **Horizon contract.** A checkpoint **defaults** to the native config read from
-> `config.json` — `pi05_libero_base` emits `H=50`, the same chunk the LIBERO eval
-> and the websocket server run (the rollout then *executes* `replan_steps` of each
-> chunk; `H` is what the model *predicts*, not what is executed). The reduced
-> `H=10` figures in [the PI0.5 CUDA regression protocol](doc/pi05-cuda-regression.md)
-> are the **synthetic** workload, reproduced with
-> `pi05_bench random --action-horizon 10`.
->
-> `--action-horizon` also applies to a real checkpoint and **outranks
-> `config.json`**, on `pi05_bench`, `bench_pi05.py`, `eval_libero.py`, and
-> `pi05_openpi_websocket_server.py` alike — the horizon is a sequence length, not
-> a weight dimension, so the same weights run at the requested chunk length. That
-> is what makes an apples-to-apples `H=10` comparison against the synthetic
-> numbers possible. The remaining architecture overrides (`--views`,
-> `--image-size`, `--num-flow-steps`, `--max-token-len`) do reshape weights and
-> stay rejected on a checkpoint.
-
-### Python environment
-
-The layered benchmark, the websocket server, and the LIBERO evaluator all load
-the model in-process through the `apxinf_py` PyO3 binding, so build and install
-it — plus the pure-Python `apxinf` frontend — before running any of them:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r scripts/requirements-pi05-websocket.txt
-
-# `maturin develop` compiles the binding into the active virtualenv
-python3 -m pip install maturin
-APXINF_CUDA_ARCH=sm_110 CUDA_PATH=/usr/local/cuda \
-  maturin develop --release --features cuda -m crates/apxinf-py/Cargo.toml
-python3 -m pip install -e python/apxinf
-```
-
-`maturin develop` installs into the active virtualenv and does not run
-`auditwheel`. If you instead build a redistributable wheel on Jetson, use
-`maturin build --release --features cuda --auditwheel skip` — the default
-repair vendors a `libcuda` stub into the wheel, which makes the installed
-binding fail at runtime with CUDA error 304.
-
-The server itself does not import OpenPI. The smoke test, robot clients, and
-LIBERO evaluator use the official `openpi-client`; install it from an OpenPI
-checkout:
-
-```bash
-python3 -m pip install -e /path/to/openpi/packages/openpi-client
-```
-
-Verify the binding imports before going further:
-
-```bash
-python3 -c 'import apxinf_py; print(apxinf_py.__version__)'
-```
-
-### Layered Python latency (L0–L3)
-
-`scripts/bench_pi05.py` measures the concentric serving shells — L0 (`_infer_patches`,
-the engine floor) ⊂ L1 (`infer_rgb`) ⊂ L2 (`Pi05Policy.infer`) ⊂ L3 (websocket
-round trip). With no `--model-dir` it runs **checkpoint-free** on synthetic weights and
-defaults to L0/L1; add `l2` and it wraps the engine in synthetic processors (a
-fixed-length tokenizer + identity unnormalize, so L2's actions are latency-only).
-`--model-dir` runs a real checkpoint at its native horizon and defaults to every layer.
-L3 attaches to a running server and needs no local weights — start that server with
-`--random-weights` for a fully checkpoint-free L3. See [the PI0.5 CUDA regression protocol](doc/pi05-cuda-regression.md) for
-the sampling protocol and reference numbers.
-
-```bash
-# checkpoint-free engine floor — the zero-config default
-python3 scripts/bench_pi05.py --precision bf16 --views 2 --token-count 10
-
-# checkpoint-free L0/L1/L2 (synthetic processors; latency-only actions)
-python3 scripts/bench_pi05.py --layer l0,l1,l2 --precision bf16 --views 2 --token-count 10
-
-# full in-process breakdown against a checkpoint (native horizon, e.g. H=50)
-python3 scripts/bench_pi05.py --model-dir "$APXINF_MODEL_DIR" --layer l0,l1,l2 \
-  --precision bf16 --prompt "put both moka pots on the stove"
-
-# the same checkpoint forced to H=10, comparable to the synthetic numbers
-python3 scripts/bench_pi05.py --model-dir "$APXINF_MODEL_DIR" --layer l0,l1,l2 \
-  --precision bf16 --action-horizon 10
-
-# L3 against a running websocket server
-python3 scripts/bench_pi05.py --layer l3 --precision bf16 \
-  --host 127.0.0.1 --port 8000 --prompt "put both moka pots on the stove"
-```
-
-### Start an OpenPI-compatible websocket server
-
-The server loads the model in-process through the `apxinf_py` PyO3 binding (no
-subprocess), so activate the environment built in
-[Python environment](#python-environment) first:
-
-```bash
-source .venv/bin/activate
-```
-
-Start FP8 on port 8000:
-
-```bash
-python3 scripts/pi05_openpi_websocket_server.py \
-  --model-dir "$APXINF_MODEL_DIR" \
-  --calibration "$APXINF_CALIBRATION" \
-  --tactics "$APXINF_TACTICS" \
-  --precision fp8 --host 0.0.0.0 --port 8000
-```
-
-BF16 and INT8 do not require calibration or tactics:
-
-```bash
-# BF16
-python3 scripts/pi05_openpi_websocket_server.py \
-  --model-dir "$APXINF_MODEL_DIR" \
-  --precision bf16 --host 0.0.0.0 --port 8000
-
-# W8A8 INT8
-python3 scripts/pi05_openpi_websocket_server.py \
-  --model-dir "$APXINF_MODEL_DIR" \
-  --precision int8 --host 0.0.0.0 --port 8000
-```
-
-The server logs the shape it ended up serving (`serving H=... x D=...`) and
-publishes it in its connect-time metadata. It serves the checkpoint's native
-horizon unless `--action-horizon` says otherwise:
-
-```bash
-python3 scripts/pi05_openpi_websocket_server.py \
-  --model-dir "$APXINF_MODEL_DIR" \
-  --precision bf16 --action-horizon 10 --host 0.0.0.0 --port 8000
-```
-
-For a **checkpoint-free** server (transport/serving latency with no weights on disk),
-pass `--random-weights` instead of `--model-dir`. It serves the engine on synthetic
-weights and synthetic processors, so its actions are latency-only; shape knobs
-(`--num-views/--image-size/--action-horizon/--num-flow-steps/--token-count`) select the
-workload. This is what backs a fully checkpoint-free L3 measurement:
-
-```bash
-python3 scripts/pi05_openpi_websocket_server.py \
-  --random-weights --precision bf16 --num-views 2 --token-count 10 \
-  --host 0.0.0.0 --port 8000
-```
-
-Run a smoke test from another terminal, changing the expected precision to
-match the server:
-
-```bash
-source .venv/bin/activate
-python3 scripts/test_pi05_openpi_websocket.py \
-  --host 127.0.0.1 --port 8000 \
-  --expected-precision fp8 --requests 3
-```
-
-The smoke test asserts the action shape the server advertises, so it follows a
-checkpoint's native horizon with no extra flags. Pass `--action-horizon` /
-`--action-dim` to assert an exact shape instead.
-
-### Evaluate LIBERO-10
-
-Run the evaluator in a Python environment where LIBERO, MuJoCo, its simulator
-dependencies and assets, and `openpi-client` are installed. LIBERO and MuJoCo are
-not part of `requirements-pi05-websocket.txt` — install them from the LIBERO
-distribution you use. Verify the two main imports first:
-
-```bash
-python3 -c 'from libero.libero import benchmark; from openpi_client import websocket_client_policy'
-```
-
-The evaluator and the server do not have to share a process or even a machine, so
-this environment only needs the simulator and the client.
-
-Start the websocket server first, at the precision you are evaluating; `--precision`
-here asserts what the server reports. BF16 needs no calibration, so it is the
-shortest path to a working run:
-
-```bash
-MUJOCO_GL=egl python3 scripts/eval_libero.py --backend websocket \
-  --host 127.0.0.1 --port 8000 --precision bf16 \
-  --tasks 0 --trials-per-task 1 \
-  --results-jsonl /tmp/pi05-bf16-libero-smoke/results.jsonl \
-  --summary-json /tmp/pi05-bf16-libero-smoke/summary.json
-```
-
-Run the complete LIBERO-10 evaluation (10 tasks, 10 trials each):
-
-```bash
-MUJOCO_GL=egl python3 scripts/eval_libero.py --backend websocket \
-  --host 127.0.0.1 --port 8000 --precision bf16 \
-  --tasks 0,1,2,3,4,5,6,7,8,9 \
-  --trials-per-task 10 \
-  --results-jsonl /tmp/pi05-bf16-libero10/results.jsonl \
-  --summary-json /tmp/pi05-bf16-libero10/summary.json
-```
-
-Use `--precision fp8` or `--precision int8` against a server started at that
-precision, and use a separate results directory for each. FP8 rollout success
-rates are only meaningful with a real activation profile — a `uniform:` scale is
-a latency/smoke setting, not a calibration.
-
-Use `--backend in-process --model-dir "$APXINF_MODEL_DIR"` to evaluate without a
-running server (the policy is built in-process through `apxinf_py`); the other
-flags are unchanged. In that mode `--action-horizon` overrides the checkpoint's
-chunk length; with `--backend websocket` the horizon belongs to the server, so
-pass it there instead.
-
-The evaluator is resumable: completed task/trial rows in the JSONL ledger are
-skipped on the next run. If the evaluator and server are on different machines,
-replace `127.0.0.1` with the server's reachable IP address.
-
-## License
-
-ApxInf is licensed under the [Apache License 2.0](LICENSE). Vendored third-party
-components retain their respective copyright notices and licenses.
+默认产物位于 `benchmarks/qwen38_4090/evaluation/runs/`。脚本会生成原始请求记录、环境
+记录和 `submission.json`。不要手工填写或修改任何汇总结果。
+
+## 6. 建议过程
+
+1. 让 `test.py check` 通过；
+2. 实现 `/health` 和生成接口，完成公开 correctness；
+3. 记录初始 TTFT、TPOT、显存和失败边界；
+4. 每次只验证一个性能假设，并保留负结果；
+5. 优先优化端到端瓶颈，不用孤立 kernel 数字代替服务结果；
+6. 修改共享 CUDA/Rust 边界后重新运行统一测试；
+7. 最后从 clean checkout 重放构建、服务和公开测试。
+
+## 7. 提交要求
+
+PR 需要包含：
+
+- 设计变化及影响的执行阶段；
+- `test.py check` 与 `test.py run` 的命令和结果；
+- 至少一个负控制或回归测试；
+- correctness、性能、稳定性和显存之间的取舍；
+- 已知限制、失败实验和回滚方法；
+- `REPORT.md`：baseline、假设、实现、测量、结果和复现步骤。
+
+验收以 PR 的完整 commit SHA 为准。不得针对 case ID、公开 token 序列或已知答案硬编码
+输出，也不得提交模型权重、凭据、机器地址或未公开评测数据。
+
+## 8. 最低完成标准
+
+- clean checkout 能构建并启动；
+- 健康检查声明真实；
+- 公开功能用例全部通过；
+- 基础性能 cell 输出完整且不 OOM、不 fallback；
+- 非法请求和容量失败后服务仍可用；
+- 统一测试脚本能生成完整结果；
+- PR 中的报告足以让其他人独立复现。

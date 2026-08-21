@@ -31,7 +31,6 @@ MODULES = (
 )
 PUBLIC_FILES = {
     ".gitignore",
-    "ASSIGNMENT.md",
     "contract-v1.json",
     "fetch_public_corpus.py",
     "generate_evaluation_cases.py",
@@ -449,7 +448,13 @@ def check() -> None:
             f"missing={sorted(PUBLIC_FILES - actual)}, extra={sorted(actual - PUBLIC_FILES)}"
         )
 
-    assignment = (HERE / "ASSIGNMENT.md").read_text(encoding="utf-8").lower()
+    readmes = (REPOSITORY / "README.md", REPOSITORY / "README_EN.md")
+    for readme in readmes:
+        if not readme.is_file():
+            raise RuntimeError(f"missing assignment README: {readme.name}")
+    documentation = "\n".join(
+        readme.read_text(encoding="utf-8").lower() for readme in readmes
+    )
     forbidden = (
         "teach" + "er",
         "\u6559\u5e08",
@@ -457,9 +462,17 @@ def check() -> None:
         "slide_outline",
         "release_manifest",
     )
-    leaked = [word for word in forbidden if word in assignment]
+    leaked = [word for word in forbidden if word in documentation]
     if leaked:
-        raise RuntimeError(f"internal terminology in assignment: {leaked}")
+        raise RuntimeError(f"internal terminology in assignment READMEs: {leaked}")
+    for required in (
+        "63768c10df38c0395e12ef49edac1bd539eaeeea",
+        "maximum is\n130",
+        "排行榜总分上限为 130",
+        "python3 benchmarks/qwen38_4090/evaluation/test.py check",
+    ):
+        if required not in documentation:
+            raise RuntimeError(f"assignment READMEs are missing {required!r}")
 
     protocol_checks()
     multimodal_checks(contract)
