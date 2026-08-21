@@ -450,9 +450,38 @@ struct MarlinMlpPrefillWorkspace {
     kernel: MarlinWorkspace,
 }
 
+struct LayerMajorGdnWorkspace {
+    qkv: Tensor,
+    z: Tensor,
+    normalized: Tensor,
+    qkv_weight: MarlinPreparedWeight,
+    z_weight: MarlinPreparedWeight,
+    out_weight: MarlinPreparedWeight,
+}
+
+struct LayerMajorAttentionWorkspace {
+    q_projection: Tensor,
+    k_projection: Tensor,
+    v_projection: Tensor,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    gate: Tensor,
+    attended: Tensor,
+    gated: Tensor,
+    q_weight: MarlinPreparedWeight,
+    k_weight: MarlinPreparedWeight,
+    v_weight: MarlinPreparedWeight,
+    o_weight: MarlinPreparedWeight,
+}
+
 struct LayerMajorPrefillWorkspace {
     residual: Tensor,
     normalized: Tensor,
+    mixer_delta: Tensor,
+    gdn: LayerMajorGdnWorkspace,
+    attention: LayerMajorAttentionWorkspace,
+    kernel: MarlinWorkspace,
 }
 
 struct MarlinPrefillWorkspace {
@@ -761,6 +790,98 @@ impl HybridUnit {
                     layer_major: LayerMajorPrefillWorkspace {
                         residual: gpu_zeros(&[LAYER_MAJOR_PREFILL_ROWS, HIDDEN], DType::BF16)?,
                         normalized: gpu_zeros(&[LAYER_MAJOR_PREFILL_ROWS, HIDDEN], DType::BF16)?,
+                        mixer_delta: gpu_zeros(
+                            &[LAYER_MAJOR_PREFILL_ROWS, HIDDEN],
+                            DType::BF16,
+                        )?,
+                        gdn: LayerMajorGdnWorkspace {
+                            qkv: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, GDN_CONV_DIM],
+                                DType::BF16,
+                            )?,
+                            z: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, GDN_VALUE_WIDTH],
+                                DType::BF16,
+                            )?,
+                            normalized: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, GDN_HEADS, GDN_DIM],
+                                DType::BF16,
+                            )?,
+                            qkv_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                HIDDEN,
+                                GDN_CONV_DIM,
+                            )?,
+                            z_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                HIDDEN,
+                                GDN_VALUE_WIDTH,
+                            )?,
+                            out_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                GDN_VALUE_WIDTH,
+                                HIDDEN,
+                            )?,
+                        },
+                        attention: LayerMajorAttentionWorkspace {
+                            q_projection: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, 2 * ATTN_WIDTH],
+                                DType::BF16,
+                            )?,
+                            k_projection: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_KV_WIDTH],
+                                DType::BF16,
+                            )?,
+                            v_projection: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_KV_WIDTH],
+                                DType::BF16,
+                            )?,
+                            query: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_Q_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            key: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_KV_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            value: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_KV_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            gate: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_Q_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            attended: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_Q_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            gated: gpu_zeros(
+                                &[LAYER_MAJOR_PREFILL_ROWS, ATTN_Q_HEADS, ATTN_HEAD_DIM],
+                                DType::BF16,
+                            )?,
+                            q_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                HIDDEN,
+                                2 * ATTN_WIDTH,
+                            )?,
+                            k_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                HIDDEN,
+                                ATTN_KV_WIDTH,
+                            )?,
+                            v_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                HIDDEN,
+                                ATTN_KV_WIDTH,
+                            )?,
+                            o_weight: MarlinPreparedWeight::new(
+                                ctx,
+                                ATTN_WIDTH,
+                                HIDDEN,
+                            )?,
+                        },
+                        kernel: MarlinWorkspace::new(ctx)?,
                     },
                     mlp: MarlinMlpPrefillWorkspace {
                         gate_up: gpu_zeros(&[MARLIN_PREFILL_TILE, 2 * INTERMEDIATE], DType::BF16)?,
@@ -1454,36 +1575,24 @@ impl HybridUnit {
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let layer_range = format!("qwen35.prefill1k.layer_major.layer{}", layer.index);
             let _layer = profile.then(|| apxinf_cuda::nvtx::range(&layer_range));
+            match &layer.mixer {
+                Mixer::Gdn { weights, state } => {
+                    self.forward_gdn_layer_major_m64(ctx, weights, state)?
+                }
+                Mixer::Attention { weights, state } => {
+                    self.forward_attention_layer_major_m64(ctx, weights, state)?
+                }
+            }
             self.prepare_mlp_marlin64_layer_major(ctx, &layer.mlp)?;
             for tile_first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
                 for subtile in 0..MARLIN_PREFILL_SUBTILES {
                     let scratch_first = subtile * PREFILL_TILE;
                     let global_first = tile_first + scratch_first;
-                    let normalized = cuda_row_view(
-                        &workspace.layer_major.normalized,
+                    let mixer_delta = cuda_row_view(
+                        &workspace.layer_major.mixer_delta,
                         global_first,
                         PREFILL_TILE,
                     )?;
-                    let mixer_delta =
-                        cuda_row_view(&workspace.mixer_delta, scratch_first, PREFILL_TILE)?;
-                    match &layer.mixer {
-                        Mixer::Gdn { weights, state } => self.forward_gdn_prefill8(
-                            ctx,
-                            weights,
-                            state,
-                            &normalized,
-                            &mixer_delta,
-                        )?,
-                        Mixer::Attention { weights, state } => self.forward_attention_prefill8(
-                            ctx,
-                            weights,
-                            state,
-                            &normalized,
-                            &mixer_delta,
-                            global_first,
-                            global_first,
-                        )?,
-                    }
                     qwen35_common::residual_add_rmsnorm_offset_write(
                         ctx,
                         &cuda_row_view(
@@ -1536,6 +1645,347 @@ impl HybridUnit {
         Ok(())
     }
 
+    fn forward_gdn_layer_major_m64(
+        &self,
+        ctx: &CudaContext,
+        weights: &GdnWeights,
+        state: &GdnState,
+    ) -> Result<()> {
+        let workspace = &self
+            .marlin_prefill
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+            })?
+            .layer_major;
+        let gdn = &workspace.gdn;
+        let input = &workspace.normalized;
+
+        gdn.qkv_weight.prepare(ctx, weights.qkv.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(input, first, MARLIN_PREFILL_TILE)?,
+                gdn.qkv_weight.view(),
+                &cuda_row_view(&gdn.qkv, first, MARLIN_PREFILL_TILE)?,
+                &workspace.kernel,
+            )?;
+        }
+        gdn.z_weight.prepare(ctx, weights.z.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(input, first, MARLIN_PREFILL_TILE)?,
+                gdn.z_weight.view(),
+                &cuda_row_view(&gdn.z, first, MARLIN_PREFILL_TILE)?,
+                &workspace.kernel,
+            )?;
+        }
+
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(PREFILL_TILE) {
+            self.forward_gdn_layer_major_core(
+                ctx,
+                weights,
+                state,
+                &cuda_row_view(input, first, PREFILL_TILE)?,
+                &cuda_row_view(&gdn.qkv, first, PREFILL_TILE)?,
+                &cuda_row_view(&gdn.z, first, PREFILL_TILE)?,
+                &cuda_row_view(&gdn.normalized, first, PREFILL_TILE)?,
+            )?;
+        }
+
+        match &weights.out {
+            GdnOutputWeight::W4(weight) => {
+                gdn.out_weight.prepare(ctx, weight.view())?;
+                for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+                    gemm::w4a16_marlin_write(
+                        ctx,
+                        &cuda_row_view(&gdn.normalized, first, MARLIN_PREFILL_TILE)?
+                            .reshape(vec![MARLIN_PREFILL_TILE, GDN_VALUE_WIDTH])?,
+                        gdn.out_weight.view(),
+                        &cuda_row_view(
+                            &workspace.mixer_delta,
+                            first,
+                            MARLIN_PREFILL_TILE,
+                        )?,
+                        &workspace.kernel,
+                    )?;
+                }
+                Ok(())
+            }
+            GdnOutputWeight::Bf16 { weight, .. } => {
+                for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(PREFILL_TILE) {
+                    bf16_linear_serial_rows(
+                        ctx,
+                        &cuda_row_view(&gdn.normalized, first, PREFILL_TILE)?
+                            .reshape(vec![PREFILL_TILE, GDN_VALUE_WIDTH])?,
+                        weight,
+                        &cuda_row_view(&workspace.mixer_delta, first, PREFILL_TILE)?,
+                        PREFILL_TILE,
+                        GDN_VALUE_WIDTH,
+                        HIDDEN,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gdn_layer_major_core(
+        &self,
+        ctx: &CudaContext,
+        weights: &GdnWeights,
+        state: &GdnState,
+        input: &Tensor,
+        qkv: &Tensor,
+        z: &Tensor,
+        normalized: &Tensor,
+    ) -> Result<()> {
+        let scratch = &self.prefill.gdn;
+        bf16_linear_serial_rows(
+            ctx,
+            input,
+            &weights.ab,
+            &scratch.ab,
+            PREFILL_TILE,
+            HIDDEN,
+            2 * GDN_HEADS,
+        )?;
+        qwen35_conv4_prepare_m8_write(
+            ctx,
+            qkv,
+            &weights.conv,
+            &state.conv,
+            &scratch.ab,
+            &weights.a_log,
+            &weights.dt_bias,
+            &scratch.a,
+            &scratch.b,
+            &scratch.query,
+            &scratch.key,
+            &scratch.value,
+            &scratch.g,
+            &scratch.beta,
+        )?;
+        qwen35_recurrent_m8_write(
+            ctx,
+            &scratch.query,
+            &scratch.key,
+            &scratch.value,
+            &scratch.g,
+            &scratch.beta,
+            &state.recurrent,
+            &scratch.core,
+        )?;
+        qwen35_gated_rmsnorm_m8_write(
+            ctx,
+            &scratch.core,
+            &z.reshape(vec![PREFILL_TILE, GDN_HEADS, GDN_DIM])?,
+            &weights.norm,
+            normalized,
+            RMS_EPSILON,
+        )
+    }
+
+    fn forward_attention_layer_major_m64(
+        &self,
+        ctx: &CudaContext,
+        weights: &AttentionWeights,
+        state: &AttentionState,
+    ) -> Result<()> {
+        let workspace = &self
+            .marlin_prefill
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+            })?
+            .layer_major;
+        let attention_workspace = &workspace.attention;
+        let input = &workspace.normalized;
+
+        attention_workspace.q_weight.prepare(ctx, weights.q.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(input, first, MARLIN_PREFILL_TILE)?,
+                attention_workspace.q_weight.view(),
+                &cuda_row_view(
+                    &attention_workspace.q_projection,
+                    first,
+                    MARLIN_PREFILL_TILE,
+                )?,
+                &workspace.kernel,
+            )?;
+        }
+        attention_workspace.k_weight.prepare(ctx, weights.k.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(input, first, MARLIN_PREFILL_TILE)?,
+                attention_workspace.k_weight.view(),
+                &cuda_row_view(
+                    &attention_workspace.k_projection,
+                    first,
+                    MARLIN_PREFILL_TILE,
+                )?,
+                &workspace.kernel,
+            )?;
+        }
+        attention_workspace.v_weight.prepare(ctx, weights.v.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(input, first, MARLIN_PREFILL_TILE)?,
+                attention_workspace.v_weight.view(),
+                &cuda_row_view(
+                    &attention_workspace.v_projection,
+                    first,
+                    MARLIN_PREFILL_TILE,
+                )?,
+                &workspace.kernel,
+            )?;
+        }
+
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(PREFILL_TILE) {
+            self.forward_attention_layer_major_core(
+                ctx,
+                weights,
+                state,
+                attention_workspace,
+                first,
+            )?;
+        }
+
+        attention_workspace.o_weight.prepare(ctx, weights.o.view())?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+            gemm::w4a16_marlin_write(
+                ctx,
+                &cuda_row_view(
+                    &attention_workspace.gated,
+                    first,
+                    MARLIN_PREFILL_TILE,
+                )?
+                .reshape(vec![MARLIN_PREFILL_TILE, ATTN_WIDTH])?,
+                attention_workspace.o_weight.view(),
+                &cuda_row_view(
+                    &workspace.mixer_delta,
+                    first,
+                    MARLIN_PREFILL_TILE,
+                )?,
+                &workspace.kernel,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn forward_attention_layer_major_core(
+        &self,
+        ctx: &CudaContext,
+        weights: &AttentionWeights,
+        state: &AttentionState,
+        workspace: &LayerMajorAttentionWorkspace,
+        first: usize,
+    ) -> Result<()> {
+        let q_projection = cuda_row_view(&workspace.q_projection, first, PREFILL_TILE)?;
+        let k_projection = cuda_row_view(&workspace.k_projection, first, PREFILL_TILE)?;
+        let v_projection = cuda_row_view(&workspace.v_projection, first, PREFILL_TILE)?;
+        let query = cuda_row_view(&workspace.query, first, PREFILL_TILE)?;
+        let key = cuda_row_view(&workspace.key, first, PREFILL_TILE)?;
+        let value = cuda_row_view(&workspace.value, first, PREFILL_TILE)?;
+        let gate = cuda_row_view(&workspace.gate, first, PREFILL_TILE)?;
+        qwen35_attention::prepare_m8_write(
+            ctx,
+            &q_projection,
+            &k_projection,
+            &v_projection,
+            &weights.q_norm,
+            &weights.k_norm,
+            &query,
+            &key,
+            &value,
+            &gate,
+            self.prefill_rope_positions
+                .address_at(first * 3 * 4, PREFILL_TILE * 3 * 4)
+                .map_err(Error::Cuda)?,
+        )?;
+
+        let key_cache = CudaBuffer::from_tensor(&state.key_cache).map_err(Error::Cuda)?;
+        let value_cache = CudaBuffer::from_tensor(&state.value_cache).map_err(Error::Cuda)?;
+        cache::append(
+            ctx,
+            &key_cache,
+            &key,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+            self.max_seq_len,
+            first,
+            PREFILL_TILE,
+        )?;
+        cache::append(
+            ctx,
+            &value_cache,
+            &value,
+            ATTN_KV_HEADS,
+            ATTN_HEAD_DIM,
+            self.max_seq_len,
+            first,
+            PREFILL_TILE,
+        )?;
+
+        let all_query = CudaBuffer::from_tensor(&workspace.query).map_err(Error::Cuda)?;
+        let all_attended = CudaBuffer::from_tensor(&workspace.attended).map_err(Error::Cuda)?;
+        let row_bytes = ATTN_WIDTH * DType::BF16.size_in_bytes();
+        for token in first..first + PREFILL_TILE {
+            let position = self
+                .prefill_positions
+                .address_at(token * 4, 4)
+                .map_err(Error::Cuda)?;
+            let query_row = all_query
+                .view(token * row_bytes, row_bytes)
+                .map_err(Error::Cuda)?;
+            let attended_row = all_attended
+                .view(token * row_bytes, row_bytes)
+                .map_err(Error::Cuda)?;
+            let kv_len = token + 1;
+            if let Some(split) = qwen35_attention::split_cta_candidate_for_bucket(kv_len) {
+                qwen35_attention::flash_split_cta_buffer_write(
+                    ctx,
+                    &query_row,
+                    &key_cache,
+                    &value_cache,
+                    &attended_row,
+                    &self.workspace.attention.split,
+                    split,
+                    kv_len,
+                    self.max_seq_len,
+                    ATTENTION_SCALE,
+                    position,
+                )?;
+            } else {
+                attention::flash_bf16_into(
+                    ctx,
+                    &query_row,
+                    &key_cache,
+                    &value_cache,
+                    &attended_row,
+                    ATTN_Q_HEADS,
+                    ATTN_KV_HEADS,
+                    ATTN_HEAD_DIM,
+                    kv_len,
+                    self.max_seq_len,
+                    ATTENTION_SCALE,
+                    position,
+                )?;
+            }
+        }
+        qwen35_attention::gate_m8_write(
+            ctx,
+            &cuda_row_view(&workspace.attended, first, PREFILL_TILE)?,
+            &gate,
+            &cuda_row_view(&workspace.gated, first, PREFILL_TILE)?,
+        )
+    }
     fn forward_mlp_marlin64(
         &self,
         ctx: &CudaContext,
