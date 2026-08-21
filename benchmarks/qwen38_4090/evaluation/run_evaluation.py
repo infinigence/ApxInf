@@ -28,6 +28,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from multimodal_scoring import REPORT_SCHEMA as MULTIMODAL_REPORT_SCHEMA
+from multimodal_scoring import report_summary
+
 
 SUBMISSION_SCHEMA = "apxinf.qwen38_27b.leaderboard_submission.v1"
 TRAJECTORY_SCHEMA = "apxinf.qwen38_27b.trajectory_reference.v1"
@@ -59,6 +62,42 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: top-level JSON value must be an object")
     return value
+
+
+def load_multimodal_evidence(
+    public_path: Path | None,
+    hidden_path: Path | None,
+    multimodal_contract_path: Path,
+    leaderboard_contract_path: Path,
+    implementation: dict[str, str],
+) -> tuple[dict[str, Any] | None, dict[str, Path]]:
+    """Validate platform-generated image reports before attaching them to a submission."""
+    if hidden_path is not None and public_path is None:
+        raise ValueError("--multimodal-hidden-report requires --multimodal-public-report")
+    if public_path is None:
+        return None, {}
+    multimodal_contract = load_json(multimodal_contract_path)
+    leaderboard_hash = sha256_file(leaderboard_contract_path)
+    if multimodal_contract.get("overlay_for", {}).get("contract_sha256") != leaderboard_hash:
+        raise ValueError("multimodal contract does not overlay the selected leaderboard contract")
+    multimodal_contract_hash = sha256_file(multimodal_contract_path)
+    paths = {"public": public_path}
+    if hidden_path is not None:
+        paths["hidden"] = hidden_path
+    summaries: dict[str, Any] = {}
+    for split, path in paths.items():
+        report = load_json(path)
+        if report.get("schema") != MULTIMODAL_REPORT_SCHEMA:
+            raise ValueError(f"{path}: unsupported multimodal report schema")
+        if report.get("split") != split:
+            raise ValueError(f"{path}: expected {split!r} multimodal split")
+        if report.get("implementation") != implementation:
+            raise ValueError(f"{path}: implementation identity does not match this evaluation run")
+        evidence = report.get("evidence")
+        if not isinstance(evidence, dict) or evidence.get("contract_sha256") != multimodal_contract_hash:
+            raise ValueError(f"{path}: report belongs to a different multimodal contract")
+        summaries[split] = report_summary(report, report_sha256=sha256_file(path))
+    return {"public": summaries["public"], "hidden": summaries.get("hidden")}, paths
 
 
 def load_tokenizer(model_dir: Path):
@@ -1228,6 +1267,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trajectory-reference", type=Path)
     parser.add_argument("--capture-trajectory-reference", type=Path)
+    parser.add_argument("--multimodal-public-report", type=Path)
+    parser.add_argument("--multimodal-hidden-report", type=Path)
+    parser.add_argument(
+        "--multimodal-contract",
+        type=Path,
+        default=here / "multimodal-contract-v1.json",
+    )
     parser.add_argument("--run-context", action="store_true")
     parser.add_argument("--run-multi", action="store_true")
     parser.add_argument("--warmups", type=int)
@@ -1246,6 +1292,18 @@ def main() -> int:
     args = parse_args()
     run_started_epoch_s = time.time()
     contract = load_json(args.contract)
+    implementation = {
+        "name": args.implementation_name,
+        "revision": args.implementation_revision,
+        "backend": args.backend,
+    }
+    multimodal_evidence, multimodal_report_paths = load_multimodal_evidence(
+        args.multimodal_public_report,
+        args.multimodal_hidden_report,
+        args.multimodal_contract,
+        args.contract,
+        implementation,
+    )
     profile = contract["score_profiles"][args.profile]
     measurement = profile["measurement"]
     warmups = (
@@ -1315,6 +1373,11 @@ def main() -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_dir = args.output_dir / (args.run_id or f"{timestamp}-{args.backend}")
     run_dir.mkdir(parents=True, exist_ok=False)
+    if multimodal_evidence is not None:
+        for split, source in multimodal_report_paths.items():
+            target = run_dir / f"multimodal-{split}-report.json"
+            target.write_bytes(source.read_bytes())
+            multimodal_evidence[split]["report_file"] = target.name
     sampler = HardwareSampler()
     sampler.start()
     evaluator = Evaluator(
@@ -1548,11 +1611,7 @@ def main() -> int:
     )
     submission = {
         "schema": SUBMISSION_SCHEMA,
-        "implementation": {
-            "name": args.implementation_name,
-            "revision": args.implementation_revision,
-            "backend": args.backend,
-        },
+        "implementation": implementation,
         "correctness": {
             "protocol_pass": protocol_pass,
             "public_cases_passed": public_passed,
@@ -1602,6 +1661,8 @@ def main() -> int:
             },
         },
     }
+    if multimodal_evidence is not None:
+        submission["multimodal"] = multimodal_evidence
     submission_path = run_dir / "submission.json"
     submission_path.write_text(
         json.dumps(submission, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1614,6 +1675,7 @@ def main() -> int:
         "public_correctness": f"{public_passed}/{len(functional_public)}",
         "public_trajectory": f"{public_trajectory_passed}/{public_trajectory_total}",
         "request_success_rate": success_rate,
+        "multimodal_evidence_attached": multimodal_evidence is not None,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

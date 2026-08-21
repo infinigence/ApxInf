@@ -5,9 +5,9 @@
     "name": "qwen38_27b_rtx4090_course_leaderboard",
     "interface_contract": "apxinf.qwen38_27b.inference_interface.v1",
     "primary": "single_request_offline_service",
-    "description": "The 100-point base score measures one text request at a time. Context beyond 32K and multi-request goodput are separately capped bonus tracks.",
+    "description": "The 100-point base score measures one text request at a time. Context beyond 32K, multi-request goodput, and integrated image understanding are three separately capped bonus tracks.",
     "non_goals": [
-      "multimodal scoring in the base leaderboard",
+      "multimodal scoring inside the 100-point text base score",
       "student-side BF16 execution",
       "multi-GPU execution",
       "contexts beyond the checkpoint native limit"
@@ -208,6 +208,20 @@
       {"id": "multi-c8-text-perf-1024", "base_cell_id": "text-perf-1024", "concurrency": 8, "total_requests": 32, "prompt_tokens": 1024, "output_tokens": 128, "support_weight": 1.0, "goodput_weight": 4.0}
     ]
   },
+  "multimodal_bonus": {
+    "weight": 10.0,
+    "description": "Platform-verified integrated image-input correctness and reliability bonus. It is independent of text-base eligibility and has no latency-ranking component.",
+    "contract_schema": "apxinf.qwen38_27b.multimodal_capability_contract.v1",
+    "public_case_count": 4,
+    "hidden_case_count": 8,
+    "public_correctness_weight": 2.0,
+    "hidden_correctness_weight": 6.0,
+    "public_integration_weight": 1.0,
+    "hidden_integration_weight": 1.0,
+    "formula": "public_correctness=2*(public_cases_passed/4); hidden_correctness=6*(hidden_cases_passed/8); each split earns 1 integration point only when every case passes, every request succeeds, the service remains healthy, multimodal=true is declared, and fallback_active=false.",
+    "eligibility_policy": "Missing or unsupported multimodal capability earns zero multimodal bonus but does not make an otherwise eligible text submission ineligible. Any positive image score requires platform-generated evidence from the submitted implementation.",
+    "performance_policy": "Image latency, peak VRAM, and utilization are reported as diagnostics only in v1. They do not set dynamic references or change the 10-point capability bonus."
+  },
   "reliability_scoring": {
     "weight": 10.0,
     "request_success_rate_weight": 5.0,
@@ -231,9 +245,10 @@
     "bonus": {
       "context": 10.0,
       "multi_request": 10.0,
-      "total": 20.0
+      "multimodal": 10.0,
+      "total": 30.0
     },
-    "maximum_leaderboard_score": 120.0
+    "maximum_leaderboard_score": 130.0
   },
   "course_grade": {
     "automated_leaderboard_percent": 80,

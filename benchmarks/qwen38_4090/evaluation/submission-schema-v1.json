@@ -69,6 +69,19 @@
         }
       }
     },
+    "multimodal": {
+      "type": "object",
+      "required": ["public"],
+      "properties": {
+        "public": {"$ref": "#/$defs/multimodalSplit"},
+        "hidden": {
+          "oneOf": [
+            {"$ref": "#/$defs/multimodalSplit"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
     "reliability": {
       "type": "object",
       "required": [
@@ -116,6 +129,35 @@
     }
   },
   "$defs": {
+    "multimodalSplit": {
+      "type": "object",
+      "required": [
+        "split",
+        "capability_declared",
+        "fallback_active",
+        "fail_closed",
+        "cases_passed",
+        "cases_total",
+        "request_success_rate",
+        "service_healthy_after_run",
+        "contract_sha256",
+        "manifest_sha256",
+        "report_sha256"
+      ],
+      "properties": {
+        "split": {"enum": ["public", "hidden"]},
+        "capability_declared": {"type": ["boolean", "null"]},
+        "fallback_active": {"type": ["boolean", "null"]},
+        "fail_closed": {"type": ["boolean", "null"]},
+        "cases_passed": {"type": "integer", "minimum": 0},
+        "cases_total": {"type": "integer", "minimum": 0},
+        "request_success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "service_healthy_after_run": {"type": "boolean"},
+        "contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "singleRequestCell": {
       "type": "object",
       "required": [

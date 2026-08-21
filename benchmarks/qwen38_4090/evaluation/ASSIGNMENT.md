@@ -37,7 +37,8 @@ NVIDIA RTX 4090 上完成稳定、正确且高效的文本推理。
   "fallback_active": false,
   "capabilities": {
     "pretokenized_input_ids": true,
-    "token_id_output": true
+    "token_id_output": true,
+    "multimodal": false
   }
 }
 ```
@@ -79,6 +80,11 @@ data: [DONE]
 - 容量失败后，健康检查和小请求仍应成功；
 - TTFT 和 TPOT 以客户端接收时间计算，服务端自报时间不计分。
 
+图片能力是可选加分项。支持时，`capabilities.multimodal` 必须为 `true`，并通过
+`POST /v1/chat/completions` 接收一个 `data:image/png;base64` 图片 part 和一个文本 part；
+请求必须由提交的 ApxInf 实现执行且不能 fallback。不支持时保持 `false`，图片探测应以
+HTTP 400、415、422 或 501 及 `error.type=unsupported_capability` 明确失败。
+
 ## 4. 评分
 
 基础分 100 分：
@@ -93,7 +99,12 @@ data: [DONE]
 可选加分：
 
 - 长上下文 0-10 分：从 32K 以上逐级验证，最高到模型原生 262,144 positions；
-- 多请求 0-10 分：C4/C8 closed-loop correct goodput，同时约束成功率、公平性和尾延迟。
+- 多请求 0-10 分：C4/C8 closed-loop correct goodput，同时约束成功率、公平性和尾延迟；
+- 图片能力 0-10 分：公开正确性 2 分、私有正确性 6 分，两个 split 的完整集成与稳定性各
+  1 分。图片能力缺失得 0 分，但不影响合格的纯文本提交。
+
+基础分上限为 100，加分上限为 30，排行榜总分上限为 130。图片报告由评测平台生成并
+绑定实现 identity、合同 hash 和 split，`submission.json` 中的图片字段不能手工填写。
 
 性能 cell 先 warm-up 1 次，再测 5 次，取中位数；TTFT/TPOT 的 CV 不得超过 10%。
 同一轮中每个 cell 的最好有效结果作为该 cell 的满分参考。
@@ -127,7 +138,7 @@ python3 benchmarks/qwen38_4090/evaluation/test.py run \
 ```
 
 默认产物位于 `benchmarks/qwen38_4090/evaluation/runs/`。脚本会生成原始请求记录、环境
-记录和 `submission.json`。不要手工填写或修改汇总结果。
+记录和 `submission.json`。不要手工填写或修改任何汇总结果。
 
 ## 6. 建议过程
 
