@@ -37,6 +37,26 @@ impl RawTensor {
             .collect())
     }
 
+    pub fn as_shape(&self) -> Result<Vec<usize>, String> {
+        if self.dtype == "I32" {
+            return Ok(self
+                .bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                .collect());
+        }
+        if self.dtype == "I64" {
+            return Ok(self
+                .bytes
+                .chunks_exact(8)
+                .map(|c| {
+                    i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as usize
+                })
+                .collect());
+        }
+        Err(format!("tensor dtype is {}, not I32/I64", self.dtype))
+    }
+
     pub fn as_f32(&self) -> Result<Vec<f32>, String> {
         if self.dtype != "F32" {
             return Err(format!("tensor dtype is {}, not F32", self.dtype));
@@ -115,6 +135,18 @@ fn read_file_tensors(file: &Path) -> Result<HashMap<String, RawTensor>, String> 
 
     let mut out = HashMap::with_capacity(entries.len());
     for (name, info) in entries {
+        // Only the text model is needed; vision / MTP tensors are skipped.
+        if !(name.starts_with("model.language_model.") || name.starts_with("lm_head.")) {
+            continue;
+        }
+        // Skip non-tensor entries such as `__metadata__` (an object without
+        // dtype/data_offsets).
+        let Some(info) = info.as_object() else {
+            continue;
+        };
+        if info.get("dtype").is_none() || info.get("data_offsets").is_none() {
+            continue;
+        }
         let dtype = info
             .get("dtype")
             .and_then(|v| v.as_str())

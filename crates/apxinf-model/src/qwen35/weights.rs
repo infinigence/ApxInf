@@ -40,13 +40,13 @@ impl Q4Linear {
         let shape = map
             .get(&key("weight_shape"))
             .ok_or_else(|| format!("missing {}.weight_shape", base))?
-            .as_i32()?;
+            .as_shape()?;
         if shape.len() != 2 {
             return Err(format!("{base}.weight_shape must be length 2"));
         }
         Ok(Self {
-            out: shape[0] as usize,
-            inp: shape[1] as usize,
+            out: shape[0],
+            inp: shape[1],
             packed,
             scale,
             zp,
@@ -60,6 +60,40 @@ impl Q4Linear {
 
 /// Dense bf16 matrix stored row-major (`data[rows][cols]`), matching the
 /// on-disk `[rows, cols]` layout.
+/// Either a dense bf16 weight or a W4A16 packed weight (the checkpoint mixes
+/// both for `linear_attn.out_proj` depending on the layer).
+pub enum MatKind {
+    Dense(Bf16Mat),
+    Q4(Q4Linear),
+}
+
+impl MatKind {
+    pub fn from_tensors(
+        base: &str,
+        map: &HashMap<String, RawTensor>,
+        expect_out: usize,
+        expect_in: usize,
+    ) -> Result<Self, String> {
+        if map.contains_key(&format!("{base}.weight_packed")) {
+            let q = Q4Linear::from_tensors(base, map)?;
+            if q.out != expect_out || q.inp != expect_in {
+                return Err(format!(
+                    "{base}: expected [{expect_out}, {expect_in}], got [{}, {}]",
+                    q.out, q.inp
+                ));
+            }
+            Ok(MatKind::Q4(q))
+        } else {
+            Ok(MatKind::Dense(bf16_mat(
+                &format!("{base}.weight"),
+                map,
+                expect_out,
+                expect_in,
+            )?))
+        }
+    }
+}
+
 pub struct Bf16Mat {
     pub rows: usize,
     pub cols: usize,
@@ -118,7 +152,7 @@ pub enum LayerWeights {
         a_log: Vec<f32>,
         dt_bias: Vec<f32>,
         norm: Vec<bf16>,
-        out_proj: Bf16Mat,
+        out_proj: MatKind,
         gate: Q4Linear,
         up: Q4Linear,
         down: Q4Linear,
@@ -227,7 +261,7 @@ impl Qwen35Weights {
                 let a_log = f32_from_bf16(&format!("{base}.A_log"), &map, nv)?;
                 let dt_bias = f32_from_bf16(&format!("{base}.dt_bias"), &map, nv)?;
                 let norm = bf16_vec(&format!("{base}.norm.weight"), &map, config.linear_value_head_dim)?;
-                let out_proj = bf16_mat(&format!("{base}.out_proj.weight"), &map, hidden, v_dim)?;
+                let out_proj = MatKind::from_tensors(&format!("{base}.out_proj"), &map, hidden, v_dim)?;
                 LayerWeights::Linear {
                     in_qkv,
                     in_z,

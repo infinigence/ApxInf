@@ -4,6 +4,7 @@
 //! `multimodal: false`). Vision and MTP weights are ignored.
 
 pub mod config;
+pub mod cpu;
 pub mod dequant;
 pub mod safetensors_raw;
 pub mod weights;
