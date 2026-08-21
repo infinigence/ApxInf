@@ -3,6 +3,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+mod server;
+
 use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{AutoModel, ImageInput, LlmInput, LoadOptions};
@@ -58,6 +60,13 @@ enum Commands {
 
     /// Run a quick test of the engine
     Test,
+
+    /// Start the HTTP/SSE evaluation service
+    Serve {
+        /// Listen address (host:port)
+        #[arg(long, default_value = "127.0.0.1:8000")]
+        addr: String,
+    },
 }
 
 fn main() {
@@ -84,6 +93,13 @@ fn main() {
         }
         Commands::Test => {
             run_test();
+        }
+        Commands::Serve { addr } => {
+            let mut service = server::Server::new(addr, Box::new(server::PlaceholderGenerator));
+            if let Err(error) = service.run() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
     }
 }
