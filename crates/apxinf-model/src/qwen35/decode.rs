@@ -36,6 +36,7 @@ const ATTENTION_SCALE: f32 = 1.0 / 16.0;
 const PREFILL_TILE: usize = 8;
 const MARLIN_PREFILL_TILE: usize = 64;
 const MARLIN_PREFILL_SUBTILES: usize = MARLIN_PREFILL_TILE / PREFILL_TILE;
+const LAYER_MAJOR_PREFILL_ROWS: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HybridUnitMode {
@@ -449,12 +450,18 @@ struct MarlinMlpPrefillWorkspace {
     kernel: MarlinWorkspace,
 }
 
+struct LayerMajorPrefillWorkspace {
+    residual: Tensor,
+    normalized: Tensor,
+}
+
 struct MarlinPrefillWorkspace {
     residual: Tensor,
     normalized: Tensor,
     mlp_normalized: Tensor,
     mixer_delta: Tensor,
     mlp_delta: Tensor,
+    layer_major: LayerMajorPrefillWorkspace,
     mlp: MarlinMlpPrefillWorkspace,
 }
 
@@ -751,6 +758,10 @@ impl HybridUnit {
                     mlp_normalized: gpu_zeros(&[MARLIN_PREFILL_TILE, HIDDEN], DType::BF16)?,
                     mixer_delta: gpu_zeros(&[MARLIN_PREFILL_TILE, HIDDEN], DType::BF16)?,
                     mlp_delta: gpu_zeros(&[MARLIN_PREFILL_TILE, HIDDEN], DType::BF16)?,
+                    layer_major: LayerMajorPrefillWorkspace {
+                        residual: gpu_zeros(&[LAYER_MAJOR_PREFILL_ROWS, HIDDEN], DType::BF16)?,
+                        normalized: gpu_zeros(&[LAYER_MAJOR_PREFILL_ROWS, HIDDEN], DType::BF16)?,
+                    },
                     mlp: MarlinMlpPrefillWorkspace {
                         gate_up: gpu_zeros(&[MARLIN_PREFILL_TILE, 2 * INTERMEDIATE], DType::BF16)?,
                         hidden: gpu_zeros(&[MARLIN_PREFILL_TILE, INTERMEDIATE], DType::BF16)?,
@@ -765,7 +776,7 @@ impl HybridUnit {
             prefill_positions: HostMappedBuffer::alloc(
                 match prefill_mode {
                     Qwen35PrefillMode::M8 => PREFILL_TILE,
-                    Qwen35PrefillMode::MarlinM64 => MARLIN_PREFILL_TILE,
+                    Qwen35PrefillMode::MarlinM64 => LAYER_MAJOR_PREFILL_ROWS,
                 } * 4,
                 ctx.device_id(),
             )
@@ -773,7 +784,7 @@ impl HybridUnit {
             prefill_rope_positions: HostMappedBuffer::alloc(
                 match prefill_mode {
                     Qwen35PrefillMode::M8 => PREFILL_TILE,
-                    Qwen35PrefillMode::MarlinM64 => MARLIN_PREFILL_TILE,
+                    Qwen35PrefillMode::MarlinM64 => LAYER_MAJOR_PREFILL_ROWS,
                 } * 3
                     * 4,
                 ctx.device_id(),
@@ -896,6 +907,10 @@ impl HybridUnit {
         self.marlin_prefill.is_some()
     }
 
+    pub fn layer_major_prefill_rows() -> usize {
+        LAYER_MAJOR_PREFILL_ROWS
+    }
+
     pub fn set_marlin_prefill64_input(&self, ctx: &CudaContext, input: &Tensor) -> Result<()> {
         let workspace = self.marlin_prefill.as_ref().ok_or_else(|| {
             Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
@@ -916,6 +931,35 @@ impl HybridUnit {
                 &cuda_row_view(&workspace.residual, first, PREFILL_TILE)?,
                 &self.layers[0].input_norm,
                 &cuda_row_view(&workspace.normalized, first, PREFILL_TILE)?,
+                RMS_EPSILON,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn set_layer_major_prefill1k_input(
+        &self,
+        ctx: &CudaContext,
+        input: &Tensor,
+    ) -> Result<()> {
+        let workspace = self.marlin_prefill.as_ref().ok_or_else(|| {
+            Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+        })?;
+        if input.device() != Device::Cpu
+            || input.dtype() != DType::BF16
+            || input.shape().dims() != [LAYER_MAJOR_PREFILL_ROWS, HIDDEN]
+        {
+            return Err(Error::Other(format!(
+                "Qwen3.5 layer-major prefill input must be CPU BF16 [{LAYER_MAJOR_PREFILL_ROWS},{HIDDEN}]"
+            )));
+        }
+        transfers::copy_cpu_to_cuda(input, &workspace.layer_major.residual)?;
+        for first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(PREFILL_TILE) {
+            qwen35_common::rmsnorm_offset_write(
+                ctx,
+                &cuda_row_view(&workspace.layer_major.residual, first, PREFILL_TILE)?,
+                &self.layers[0].input_norm,
+                &cuda_row_view(&workspace.layer_major.normalized, first, PREFILL_TILE)?,
                 RMS_EPSILON,
             )?;
         }
@@ -1009,6 +1053,40 @@ impl HybridUnit {
         })
     }
 
+    pub fn forward_layer_major_prefill1k(
+        &self,
+        ctx: &CudaContext,
+        profile: bool,
+    ) -> Result<()> {
+        if self.marlin_prefill.is_none() {
+            return Err(Error::Other(
+                "Qwen3.5 Marlin M64 prefill was not enabled at model load".into(),
+            ));
+        }
+        if LAYER_MAJOR_PREFILL_ROWS > self.max_seq_len {
+            return Err(Error::Other(format!(
+                "Qwen3.5 layer-major prefill length {LAYER_MAJOR_PREFILL_ROWS} exceeds KV capacity {}",
+                self.max_seq_len
+            )));
+        }
+        let positions = (0..LAYER_MAJOR_PREFILL_ROWS)
+            .map(|position| position as u32)
+            .collect::<Vec<_>>();
+        self.prefill_positions
+            .write_u32s(&positions)
+            .map_err(Error::Cuda)?;
+        let rope_positions = positions
+            .iter()
+            .flat_map(|position| [*position, *position, *position])
+            .collect::<Vec<_>>();
+        self.prefill_rope_positions
+            .write_u32s(&rope_positions)
+            .map_err(Error::Cuda)?;
+        apxinf_cuda::kernels::with_workspace(&self.workspace.graph, || {
+            self.forward_layer_major_prefill1k_inner(ctx, profile)
+        })
+    }
+
     pub fn prefill_output(&self) -> &Tensor {
         &self.prefill.residual
     }
@@ -1066,6 +1144,31 @@ impl HybridUnit {
         for (source, destination) in [
             (&workspace.residual, &self.workspace.residual),
             (&workspace.normalized, &self.workspace.normalized),
+        ] {
+            let source = CudaBuffer::from_tensor(source)
+                .map_err(Error::Cuda)?
+                .view(offset, row_bytes)
+                .map_err(Error::Cuda)?;
+            let destination = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+            destination
+                .copy_from_device_async(&source, row_bytes, ctx.stream())
+                .map_err(Error::Cuda)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit_layer_major_prefill1k_last(&self, ctx: &CudaContext) -> Result<()> {
+        let workspace = self.marlin_prefill.as_ref().ok_or_else(|| {
+            Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+        })?;
+        let row_bytes = HIDDEN * DType::BF16.size_in_bytes();
+        let offset = (LAYER_MAJOR_PREFILL_ROWS - 1) * row_bytes;
+        for (source, destination) in [
+            (&workspace.layer_major.residual, &self.workspace.residual),
+            (
+                &workspace.layer_major.normalized,
+                &self.workspace.normalized,
+            ),
         ] {
             let source = CudaBuffer::from_tensor(source)
                 .map_err(Error::Cuda)?
@@ -1338,6 +1441,101 @@ impl HybridUnit {
         Ok(())
     }
 
+    fn forward_layer_major_prefill1k_inner(
+        &self,
+        ctx: &CudaContext,
+        profile: bool,
+    ) -> Result<()> {
+        let workspace = self.marlin_prefill.as_ref().ok_or_else(|| {
+            Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+        })?;
+        let _unit =
+            profile.then(|| apxinf_cuda::nvtx::range("qwen35.prefill1k.layer_major.complete"));
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let layer_range = format!("qwen35.prefill1k.layer_major.layer{}", layer.index);
+            let _layer = profile.then(|| apxinf_cuda::nvtx::range(&layer_range));
+            self.prepare_mlp_marlin64_layer_major(ctx, &layer.mlp)?;
+            for tile_first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
+                for subtile in 0..MARLIN_PREFILL_SUBTILES {
+                    let scratch_first = subtile * PREFILL_TILE;
+                    let global_first = tile_first + scratch_first;
+                    let normalized = cuda_row_view(
+                        &workspace.layer_major.normalized,
+                        global_first,
+                        PREFILL_TILE,
+                    )?;
+                    let mixer_delta =
+                        cuda_row_view(&workspace.mixer_delta, scratch_first, PREFILL_TILE)?;
+                    match &layer.mixer {
+                        Mixer::Gdn { weights, state } => self.forward_gdn_prefill8(
+                            ctx,
+                            weights,
+                            state,
+                            &normalized,
+                            &mixer_delta,
+                        )?,
+                        Mixer::Attention { weights, state } => self.forward_attention_prefill8(
+                            ctx,
+                            weights,
+                            state,
+                            &normalized,
+                            &mixer_delta,
+                            global_first,
+                            global_first,
+                        )?,
+                    }
+                    qwen35_common::residual_add_rmsnorm_offset_write(
+                        ctx,
+                        &cuda_row_view(
+                            &workspace.layer_major.residual,
+                            global_first,
+                            PREFILL_TILE,
+                        )?,
+                        &mixer_delta,
+                        &layer.post_attention_norm,
+                        &cuda_row_view(
+                            &workspace.mlp_normalized,
+                            scratch_first,
+                            PREFILL_TILE,
+                        )?,
+                        RMS_EPSILON,
+                    )?;
+                }
+                self.forward_mlp_marlin64_layer_major(
+                    ctx,
+                    &workspace.mlp_normalized,
+                    &workspace.mlp_delta,
+                )?;
+                let next_norm = if layer_index + 1 < self.layers.len() {
+                    &self.layers[layer_index + 1].input_norm
+                } else {
+                    &self.next_input_norm
+                };
+                for subtile in 0..MARLIN_PREFILL_SUBTILES {
+                    let scratch_first = subtile * PREFILL_TILE;
+                    let global_first = tile_first + scratch_first;
+                    qwen35_common::residual_add_rmsnorm_offset_write(
+                        ctx,
+                        &cuda_row_view(
+                            &workspace.layer_major.residual,
+                            global_first,
+                            PREFILL_TILE,
+                        )?,
+                        &cuda_row_view(&workspace.mlp_delta, scratch_first, PREFILL_TILE)?,
+                        next_norm,
+                        &cuda_row_view(
+                            &workspace.layer_major.normalized,
+                            global_first,
+                            PREFILL_TILE,
+                        )?,
+                        RMS_EPSILON,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward_mlp_marlin64(
         &self,
         ctx: &CudaContext,
@@ -1379,6 +1577,69 @@ impl HybridUnit {
             )?;
         }
         workspace.down_weight.prepare(ctx, weights.down.view())?;
+        gemm::w4a16_marlin_write(
+            ctx,
+            &workspace.hidden,
+            workspace.down_weight.view(),
+            output,
+            &workspace.kernel,
+        )
+    }
+
+    fn prepare_mlp_marlin64_layer_major(
+        &self,
+        ctx: &CudaContext,
+        weights: &MlpWeights,
+    ) -> Result<()> {
+        let workspace = &self
+            .marlin_prefill
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+            })?
+            .mlp;
+        workspace
+            .gate_up_weight
+            .prepare(ctx, weights.gate_up.view())?;
+        workspace.down_weight.prepare(ctx, weights.down.view())
+    }
+
+    fn forward_mlp_marlin64_layer_major(
+        &self,
+        ctx: &CudaContext,
+        input: &Tensor,
+        output: &Tensor,
+    ) -> Result<()> {
+        let workspace = &self
+            .marlin_prefill
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("Qwen3.5 Marlin M64 prefill workspace is not enabled".into())
+            })?
+            .mlp;
+        gemm::w4a16_marlin_write(
+            ctx,
+            input,
+            workspace.gate_up_weight.view(),
+            &workspace.gate_up,
+            &workspace.kernel,
+        )?;
+        let gate_up = CudaBuffer::from_tensor(&workspace.gate_up).map_err(Error::Cuda)?;
+        let hidden = CudaBuffer::from_tensor(&workspace.hidden).map_err(Error::Cuda)?;
+        let gate_up_bytes = 2 * INTERMEDIATE * DType::BF16.size_in_bytes();
+        let hidden_bytes = INTERMEDIATE * DType::BF16.size_in_bytes();
+        for token in 0..MARLIN_PREFILL_TILE {
+            activation::silu_mul_bf16_into(
+                ctx,
+                &gate_up
+                    .view(token * gate_up_bytes, gate_up_bytes)
+                    .map_err(Error::Cuda)?,
+                &hidden
+                    .view(token * hidden_bytes, hidden_bytes)
+                    .map_err(Error::Cuda)?,
+                INTERMEDIATE,
+            )?;
+        }
         gemm::w4a16_marlin_write(
             ctx,
             &workspace.hidden,

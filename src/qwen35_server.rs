@@ -191,9 +191,12 @@ impl NativeRuntime {
 
     fn load_embedding_tokens(&self, tokens: &[u32]) -> Result<Tensor, String> {
         const HIDDEN: usize = 5120;
-        if !matches!(tokens.len(), 1 | 8 | 64) {
+        if !matches!(tokens.len(), 1 | 8 | 64)
+            && tokens.len() != HybridUnit::layer_major_prefill_rows()
+        {
             return Err(format!(
-                "Qwen3.8 embedding batch requires 1, 8, or 64 tokens, got {}",
+                "Qwen3.8 embedding batch requires 1, 8, 64, or {} tokens, got {}",
+                HybridUnit::layer_major_prefill_rows(),
                 tokens.len()
             ));
         }
@@ -258,11 +261,31 @@ impl NativeRuntime {
                     .into(),
             );
         }
+        let layer_major_tokens = match prefill_mode {
+            Qwen35PrefillMode::MarlinM64
+                if prompt_tokens.len() >= HybridUnit::layer_major_prefill_rows() =>
+            {
+                HybridUnit::layer_major_prefill_rows()
+            }
+            _ => 0,
+        };
+        if layer_major_tokens > 0 {
+            let embedding = self.load_embedding_tokens(&prompt_tokens[..layer_major_tokens])?;
+            self.decoder
+                .set_layer_major_prefill1k_input(&self.context, &embedding)
+                .map_err(|error| error.to_string())?;
+            self.decoder
+                .forward_layer_major_prefill1k(&self.context, false)
+                .map_err(|error| error.to_string())?;
+        }
         let marlin_tokens = match prefill_mode {
             Qwen35PrefillMode::M8 => 0,
-            Qwen35PrefillMode::MarlinM64 => prompt_tokens.len() / 64 * 64,
+            Qwen35PrefillMode::MarlinM64 => {
+                layer_major_tokens
+                    + (prompt_tokens.len() - layer_major_tokens) / 64 * 64
+            }
         };
-        for position in (0..marlin_tokens).step_by(64) {
+        for position in (layer_major_tokens..marlin_tokens).step_by(64) {
             let embedding = self.load_embedding_tokens(&prompt_tokens[position..position + 64])?;
             self.decoder
                 .set_marlin_prefill64_input(&self.context, &embedding)
@@ -306,9 +329,13 @@ impl NativeRuntime {
                 self.decoder
                     .commit_prefill8_last(&self.context)
                     .map_err(|error| error.to_string())?;
-            } else if marlin_tokens > 0 {
+            } else if marlin_tokens > layer_major_tokens {
                 self.decoder
                     .commit_marlin_prefill64_last(&self.context)
+                    .map_err(|error| error.to_string())?;
+            } else if layer_major_tokens > 0 {
+                self.decoder
+                    .commit_layer_major_prefill1k_last(&self.context)
                     .map_err(|error| error.to_string())?;
             }
         }
