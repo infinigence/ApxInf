@@ -23,6 +23,11 @@ tokenizer = ["sentencepiece>=0.1.99"]
 policy = ["apxinf-py>=0.1.0"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+# The lerobot adapter (apxinf.adapters.lerobot) returns torch tensors, and its
+# build_inference_frame delegates to lerobot's own build_dataset_frame. lerobot
+# itself is deliberately *not* pinned here: the adapter is built against a moving
+# API, and users bring their own already-installed version.
+lerobot = ["torch>=2.0"]
 test = ["pytest>=7", "sentencepiece>=0.1.99"]
 
 [tool.setuptools.packages.find]
