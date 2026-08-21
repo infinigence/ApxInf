@@ -1,6 +1,7 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -19,6 +20,7 @@ namespace {
 #include "../kernels/custom/elementwise.cuh"
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
+#include "../kernels/custom/qwen35.cuh"
 }  // namespace
 
 extern "C" cudaError_t apxinf_static_evict_l2(
@@ -79,6 +81,49 @@ extern "C" cudaError_t apxinf_static_dequantize_e4m3_f16(
   dequantize_e4m3_f16_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const __nv_fp8_e4m3*>(input),
       static_cast<half*>(output), count, scale);
+  return cudaGetLastError();
+}
+
+
+extern "C" cudaError_t apxinf_static_dequantize_w4a16_asym_bf16(
+    const void* weight_packed, const void* weight_scale,
+    const void* weight_zero_point, void* dense, int in_cols, int out_cols,
+    int groups, cudaStream_t stream) {
+  if (weight_packed == nullptr || weight_scale == nullptr ||
+      weight_zero_point == nullptr || dense == nullptr || in_cols <= 0 ||
+      out_cols <= 0 || groups <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  const int64_t total = static_cast<int64_t>(in_cols) * out_cols;
+  int blocks = static_cast<int>((total + threads - 1) / threads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  dequantize_w4a16_asym_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const int32_t*>(weight_packed),
+      static_cast<const __nv_bfloat16*>(weight_scale),
+      static_cast<const int32_t*>(weight_zero_point),
+      static_cast<__nv_bfloat16*>(dense), in_cols, out_cols, groups);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_matmul_bf16_w4a16_asym(
+    const void* activation, const void* weight_packed, const void* weight_scale,
+    const void* weight_zero_point, void* output, int rows, int in_cols,
+    int out_cols, int groups, cudaStream_t stream) {
+  if (activation == nullptr || weight_packed == nullptr ||
+      weight_scale == nullptr || weight_zero_point == nullptr ||
+      output == nullptr || rows <= 0 || in_cols <= 0 || out_cols <= 0 ||
+      groups <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 block(128);
+  dim3 grid((out_cols + block.x - 1) / block.x, rows);
+  matmul_bf16_w4a16_asym_kernel<<<grid, block, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(weight_packed),
+      static_cast<const __nv_bfloat16*>(weight_scale),
+      static_cast<const int32_t*>(weight_zero_point),
+      static_cast<__nv_bfloat16*>(output), rows, in_cols, out_cols, groups);
   return cudaGetLastError();
 }
 
@@ -407,5 +452,197 @@ extern "C" cudaError_t apxinf_static_bias_position_f16(
       static_cast<const half*>(projection), static_cast<const half*>(bias),
       static_cast<const half*>(position), static_cast<half*>(output),
       count, cols, tokens_per_view);
+  return cudaGetLastError();
+}
+
+// ── Qwen3.5 hybrid linear-attention adapters ───────────────────────────────
+
+extern "C" cudaError_t apxinf_qwen35_conv_silu(
+    const void* input, const void* weight, void* output, void* state,
+    int seq, int channels, int kernel, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || output == nullptr ||
+      state == nullptr || seq <= 0 || channels <= 0 || kernel <= 1) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks = (channels + threads - 1) / threads;
+  blocks = blocks > 1024 ? 1024 : blocks;
+  const size_t shared = static_cast<size_t>(2 * kernel - 1) * threads *
+                        sizeof(float);
+  qwen35_conv_silu_kernel<<<blocks, threads, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), static_cast<float*>(state), seq,
+      channels, kernel);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_delta_step(
+    const void* qkv, const void* a, const void* b, const void* a_log,
+    const void* dt_bias, void* recurrent, void* out, int seq, int k_heads,
+    int v_heads, int kdim, int vdim, cudaStream_t stream) {
+  if (qkv == nullptr || a == nullptr || b == nullptr || a_log == nullptr ||
+      dt_bias == nullptr || recurrent == nullptr || out == nullptr ||
+      seq <= 0 || k_heads <= 0 || v_heads <= 0 || kdim <= 0 || vdim <= 0 ||
+      vdim % QWEN35_V_TILE != 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(vdim / QWEN35_V_TILE, v_heads);
+  const size_t shared =
+      static_cast<size_t>(2 * kdim + kdim * QWEN35_V_TILE) * sizeof(float);
+  qwen35_delta_step_kernel<<<grid, QWEN35_V_TILE, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const __nv_bfloat16*>(b),
+      static_cast<const __nv_bfloat16*>(a_log),
+      static_cast<const __nv_bfloat16*>(dt_bias),
+      static_cast<float*>(recurrent), static_cast<__nv_bfloat16*>(out), seq,
+      k_heads, v_heads, kdim, vdim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_gated_norm(
+    const void* input, const void* z, const void* weight, void* out,
+    int seq, int v_heads, int vdim, float eps, cudaStream_t stream) {
+  if (input == nullptr || z == nullptr || weight == nullptr || out == nullptr ||
+      seq <= 0 || v_heads <= 0 || vdim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, v_heads);
+  const int threads = vdim < 256 ? vdim : 256;
+  const size_t shared = static_cast<size_t>(vdim) * sizeof(float);
+  qwen35_gated_norm_kernel<<<grid, threads, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(z),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(out), seq, v_heads, vdim, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_q_split_norm_rope(
+    const void* q_gate, const void* q_norm_w, void* q_out, void* gate_out,
+    int seq, int heads, int head_dim, int rotary_dim, float theta,
+    uint32_t start_pos, cudaStream_t stream) {
+  if (q_gate == nullptr || q_norm_w == nullptr || q_out == nullptr ||
+      gate_out == nullptr || seq <= 0 || heads <= 0 || head_dim <= 0 ||
+      head_dim > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, heads);
+  qwen35_q_split_norm_rope_kernel<<<grid, head_dim, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q_gate),
+      static_cast<const __nv_bfloat16*>(q_norm_w),
+      static_cast<__nv_bfloat16*>(q_out),
+      static_cast<__nv_bfloat16*>(gate_out), seq, heads, head_dim, rotary_dim,
+      theta, start_pos);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_k_norm_rope_append(
+    const void* k_in, const void* k_norm_w, void* k_cache, int seq,
+    int n_kv_heads, int head_dim, int rotary_dim, float theta,
+    uint32_t start_pos, int max_seq_len, cudaStream_t stream) {
+  if (k_in == nullptr || k_norm_w == nullptr || k_cache == nullptr ||
+      seq <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim > 1024 ||
+      max_seq_len <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, n_kv_heads);
+  qwen35_k_norm_rope_append_kernel<<<grid, head_dim, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(k_in),
+      static_cast<const __nv_bfloat16*>(k_norm_w),
+      static_cast<__nv_bfloat16*>(k_cache), seq, n_kv_heads, head_dim,
+      rotary_dim, theta, start_pos, max_seq_len);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_sigmoid_mul(
+    const void* gate, const void* x, void* out, int64_t count,
+    cudaStream_t stream) {
+  if (gate == nullptr || x == nullptr || out == nullptr || count <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int blocks = (count + threads - 1) / threads;
+  blocks = blocks > 4096 ? 4096 : blocks;
+  qwen35_sigmoid_mul_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<const __nv_bfloat16*>(x),
+      static_cast<__nv_bfloat16*>(out), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_flash_prefill(
+    const void* q, const void* k_cache, const void* v_cache, void* out,
+    int seq, int heads, int n_kv_heads, int head_dim, float scale,
+    uint32_t start_pos, int max_seq_len, cudaStream_t stream) {
+  if (q == nullptr || k_cache == nullptr || v_cache == nullptr ||
+      out == nullptr || seq <= 0 || heads <= 0 || n_kv_heads <= 0 ||
+      head_dim <= 0 || head_dim > 1024 || heads % n_kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, heads);
+  qwen35_flash_prefill_kernel<<<grid, head_dim, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q),
+      static_cast<const __nv_bfloat16*>(k_cache),
+      static_cast<const __nv_bfloat16*>(v_cache),
+      static_cast<__nv_bfloat16*>(out), seq, heads, n_kv_heads, head_dim,
+      scale, start_pos, max_seq_len);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_silu_mul(
+    const void* gate, const void* up, void* out, int64_t count,
+    cudaStream_t stream) {
+  if (gate == nullptr || up == nullptr || out == nullptr || count <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  int64_t blocks = (count + threads - 1) / threads;
+  blocks = blocks > 65535 ? 65535 : blocks;
+  qwen35_silu_mul_kernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<const __nv_bfloat16*>(up), static_cast<__nv_bfloat16*>(out),
+      count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_dequant_w4a16_bf16_row(
+    const void* weight_packed, const void* weight_scale,
+    const void* weight_zero_point, void* dense, int in_cols, int out_cols,
+    int groups, cudaStream_t stream) {
+  if (weight_packed == nullptr || weight_scale == nullptr ||
+      weight_zero_point == nullptr || dense == nullptr || in_cols <= 0 ||
+      out_cols <= 0 || groups <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_dequant_w4a16_bf16_row_kernel<<<out_cols, 256, 0, stream>>>(
+      static_cast<const int32_t*>(weight_packed),
+      static_cast<const __nv_bfloat16*>(weight_scale),
+      static_cast<const int32_t*>(weight_zero_point),
+      static_cast<__nv_bfloat16*>(dense), in_cols, out_cols, groups);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16(
+    const void* activation, const void* weight_packed, const void* weight_scale,
+    const void* weight_zero_point, void* output, int in_cols, int out_cols,
+    int groups, cudaStream_t stream) {
+  if (activation == nullptr || weight_packed == nullptr ||
+      weight_scale == nullptr || weight_zero_point == nullptr ||
+      output == nullptr || in_cols <= 0 || out_cols <= 0 || groups <= 0 ||
+      out_cols % QWEN35_GEMM_OUT_TILE != 0) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared = static_cast<size_t>(QWEN35_GEMM_OUT_TILE) *
+                            QWEN35_GEMM_IN_TILE +
+                        QWEN35_GEMM_IN_TILE * sizeof(float);
+  qwen35_gemm_w4a16_bf16_kernel<<<out_cols / QWEN35_GEMM_OUT_TILE, 128,
+                                 shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(weight_packed),
+      static_cast<const __nv_bfloat16*>(weight_scale),
+      static_cast<const int32_t*>(weight_zero_point),
+      static_cast<__nv_bfloat16*>(output), in_cols, out_cols, groups);
   return cudaGetLastError();
 }

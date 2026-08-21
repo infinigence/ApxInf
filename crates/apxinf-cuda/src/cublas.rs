@@ -124,11 +124,12 @@ impl CublasHandle {
                         cuda_type,
                         n_i,
                         ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        -1, // CUBLAS_GEMM_DEFAULT
+                        99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
                     ))
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!("cuBLAS GEMM does not support {dtype} tensors")),
         }
     }
 
@@ -183,7 +184,7 @@ impl CublasHandle {
                     stride_c,
                     batch_count,
                     ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    -1, // CUBLAS_GEMM_DEFAULT
+                    99, // CUBLAS_GEMM_DEFAULT
                 ))
             },
             DType::F16 | DType::BF16 => {
@@ -223,6 +224,7 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!("cuBLAS GEMM does not support {dtype} tensors")),
         }
     }
 
@@ -293,7 +295,7 @@ impl CublasHandle {
                     ffi::cudaDataType_t::CUDA_R_32F,
                     ldc, // ldc_cm = ldc
                     ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    -1,
+                    99,
                 ))
             },
             DType::F16 | DType::BF16 => {
@@ -329,6 +331,7 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!("cuBLAS GEMM does not support {dtype} tensors")),
         }
     }
 

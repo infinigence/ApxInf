@@ -21,6 +21,152 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+
+    pub fn apxinf_static_dequantize_w4a16_asym_bf16(
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        dense: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_static_matmul_bf16_w4a16_asym(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_conv_silu(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        state: *mut c_void,
+        seq: i32,
+        channels: i32,
+        kernel: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_delta_step(
+        qkv: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        recurrent: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gated_norm(
+        input: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        seq: i32,
+        v_heads: i32,
+        vdim: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_q_split_norm_rope(
+        q_gate: *const c_void,
+        q_norm_w: *const c_void,
+        q_out: *mut c_void,
+        gate_out: *mut c_void,
+        seq: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        start_pos: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_k_norm_rope_append(
+        k_in: *const c_void,
+        k_norm_w: *const c_void,
+        k_cache: *mut c_void,
+        seq: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        start_pos: u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_sigmoid_mul(
+        gate: *const c_void,
+        x: *const c_void,
+        out: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_flash_prefill(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        out: *mut c_void,
+        seq: i32,
+        heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        start_pos: u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_dequant_w4a16_bf16_row(
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        dense: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_silu_mul(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_static_dequantize_int32_bf16(
         accumulators: *const c_void,
         row_scales: *const c_void,

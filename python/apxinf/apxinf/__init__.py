@@ -58,6 +58,7 @@ __all__ = [
     "build_unitree_g1_policy",
     # bindings (lazy)
     "Model",
+    "TextModel",
     # processor steps
     "ProcessorStep",
     "Pipeline",
@@ -80,4 +81,8 @@ def __getattr__(name: str):
         from apxinf_py import Model
 
         return Model
+    if name == "TextModel":
+        from apxinf_py import TextModel
+
+        return TextModel
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

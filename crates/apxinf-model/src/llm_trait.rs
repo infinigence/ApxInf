@@ -175,11 +175,15 @@ where
     let mut generated = Vec::with_capacity(max_new_tokens);
     let vocab_size = model.vocab_size();
 
+    // Each generation starts from scratch: the engine is reused across many
+    // requests, and full-attention KV caches plus linear-attention recurrent
+    // states must never leak between them.
+    model.reset();
+
     // Pre-capture any decode graphs (CUDA) BEFORE prefill so the per-token
     // TPOT below is pure graph replay — keeps capture/instantiate cost in
     // setup (TTFT bucket), not in the steady-state TPOT measurement.
     model.prewarm_decode(prompt_tokens.len(), max_new_tokens);
-
     // Prefill: process the entire prompt
     let logits = model.prefill(input)?;
     profile.record_first_token();
@@ -241,12 +245,20 @@ where
     profile.finalize(prompt_len, generated.len());
     Ok((generated, profile))
 }
-
-/// Extract logits for the last row and return its argmax token.
-/// `logits` shape: `[seq_len, vocab_size]`. Logits may live on any device — this
-/// helper moves to CPU if needed (callers' responsibility for now).
 fn argmax_last_row(logits: &Tensor, seq_len: usize, vocab_size: usize) -> Result<u32> {
-    let last_row_offset = (seq_len - 1) * vocab_size;
+    #[cfg(feature = "cuda")]
+    let logits = if logits.device().is_gpu() {
+        std::borrow::Cow::Owned(apxinf_cuda::transfers::to_cpu(logits)?)
+    } else {
+        std::borrow::Cow::Borrowed(logits)
+    };
+    #[cfg(not(feature = "cuda"))]
+    let logits = std::borrow::Cow::Borrowed(logits);
+    // The GPU fast path returns only the final row ([1, vocab]); the CPU path
+    // returns [seq, vocab]. Trust the tensor's own row count.
+    let rows = logits.shape().dims().first().copied().unwrap_or(1);
+    let _ = seq_len;
+    let last_row_offset = rows.saturating_sub(1) * vocab_size;
     // Fast path: scan bf16 directly (the decode graph returns a bf16 row).
     // Manual loop with `>` beats the iterator + partial_cmp (no NaN handling
     // overhead; logits don't contain NaN in practice).

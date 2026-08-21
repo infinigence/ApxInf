@@ -304,6 +304,8 @@ fn parse_dtype(s: &str) -> Option<DType> {
         "F16" => Some(DType::F16),
         "BF16" => Some(DType::BF16),
         "F8_E4M3" => Some(DType::F8E4M3),
+        "I32" => Some(DType::I32),
+        "I64" => Some(DType::I64),
         _ => None,
     }
 }
@@ -326,6 +328,8 @@ mod tests {
                 DType::F16 => "F16",
                 DType::BF16 => "BF16",
                 DType::F8E4M3 => "F8_E4M3",
+                DType::I32 => "I32",
+                DType::I64 => "I64",
             };
             let shape_json: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             let end = data_offset + data.len();
@@ -432,6 +436,31 @@ mod tests {
         let data = tensors["w"].as_bf16().unwrap();
         assert!((data[0].to_f32() - 1.5).abs() < 1e-3);
         assert!((data[1].to_f32() - -2.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_load_native_integer_tensors() {
+        let i32_data = [1i32, -2, 0x12345678]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let i64_data = [3i64, -4, 9_876_543_210]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let file_bytes = make_safetensors(&[
+            ("packed", DType::I32, &[3], &i32_data),
+            ("shape", DType::I64, &[3], &i64_data),
+        ]);
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&file_bytes).unwrap();
+
+        let (tensors, _) = load_native(tmp.path()).unwrap();
+        assert_eq!(tensors["packed"].dtype(), DType::I32);
+        assert_eq!(tensors["packed"].as_i32().unwrap(), &[1, -2, 0x12345678]);
+        assert_eq!(tensors["shape"].dtype(), DType::I64);
+        assert_eq!(tensors["shape"].as_i64().unwrap(), &[3, -4, 9_876_543_210]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ members = [
 name = "apxinf"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 license = "Apache-2.0"
 
 [features]
@@ -38,3 +39,5 @@ apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }
 clap = { version = "=4.5.23", features = ["derive"] }
 serde_json = "1"
 half = "2"
+
+

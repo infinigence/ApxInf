@@ -28,16 +28,16 @@ use std::path::{Path, PathBuf};
 
 use numpy::ndarray::Array2;
 use numpy::{
-    IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use apxinf_core::{Device, Shape, Tensor};
+use apxinf_core::{DType, Device, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
-    SyntheticWeights, VisionObservation,
+    AutoModel, ImageLayout, LlmInput, LoadOptions, LoadedModel, ModelPrecision, Observation,
+    Pi05Config, SyntheticWeights, VisionObservation,
 };
 
 /// Map any Rust error into a Python `RuntimeError`.
@@ -74,6 +74,17 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
         "int8" | "w8a8" => Ok(ModelPrecision::W8A8),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown precision `{other}` (expected auto|fp8|bf16|int8)"
+        ))),
+    }
+}
+
+fn parse_text_dtype(spec: &str) -> PyResult<Option<DType>> {
+    match spec {
+        "auto" => Ok(None),
+        "fp32" | "f32" => Ok(Some(DType::F32)),
+        "bf16" => Ok(Some(DType::BF16)),
+        other => Err(PyValueError::new_err(format!(
+            "apxinf_py.TextModel.load: unknown dtype `{other}` (expected auto|fp32|bf16)"
         ))),
     }
 }
@@ -497,9 +508,107 @@ impl Model {
     }
 }
 
+
+/// A loaded autoregressive text model handle for Python frontends.
+///
+/// This exposes the same `AutoModel` frontend as the CLI for pretokenized LLM
+/// requests. It is intentionally token-ID based: Python callers own tokenizer
+/// and chat-template policy, while Rust owns model loading and greedy decode.
+#[pyclass(unsendable)]
+pub struct TextModel {
+    model: LoadedModel,
+    device: Device,
+    model_name: String,
+}
+
+#[pymethods]
+impl TextModel {
+    /// Load an LLM/VLM text checkpoint through `AutoModel`.
+    ///
+    /// `model` is optional; when omitted, `config.json:model_type` is used. For
+    /// the assignment checkpoint this resolves to `qwen3_5`.
+    #[staticmethod]
+    #[pyo3(signature = (path, model=None, device="cuda:0", dtype="bf16"))]
+    fn load(
+        path: PathBuf,
+        model: Option<String>,
+        device: &str,
+        dtype: &str,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let model_name = match model {
+            Some(value) => value,
+            None => AutoModel::detect_model_name(&path).map_err(runtime_err)?,
+        };
+        let options = LoadOptions {
+            model_name: Some(model_name.clone()),
+            text_weight_dtype: parse_text_dtype(dtype)?,
+            ..LoadOptions::default()
+        };
+        let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
+        Ok(Self { model: loaded, device, model_name })
+    }
+
+    /// Greedy decode from pretokenized input IDs and return generated token IDs.
+    #[pyo3(signature = (input_ids, max_new_tokens, eos_token_id=None))]
+    fn generate_ids<'py>(
+        &mut self,
+        py: Python<'py>,
+        input_ids: PyReadonlyArray1<'py, u32>,
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let ids = input_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.TextModel.generate_ids: input_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        if ids.is_empty() {
+            return Err(PyValueError::new_err(
+                "apxinf_py.TextModel.generate_ids: input_ids must be non-empty",
+            ));
+        }
+        if max_new_tokens == 0 {
+            return Err(PyValueError::new_err(
+                "apxinf_py.TextModel.generate_ids: max_new_tokens must be positive",
+            ));
+        }
+        let (generated, _) = self
+            .model
+            .generate_streaming(LlmInput::text(&ids), max_new_tokens, |_| {}, eos_token_id)
+            .map_err(runtime_err)?;
+        Ok(generated.into_pyarray_bound(py))
+    }
+
+    fn reset(&mut self) -> PyResult<()> {
+        self.model.reset().map_err(runtime_err)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        match self.device {
+            Device::Cuda(index) => format!("cuda:{index}"),
+            Device::Cpu => "cpu".to_string(),
+        }
+    }
+
+    #[getter]
+    fn model_name(&self) -> String {
+        self.model_name.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("TextModel(model={}, device={})", self.model_name, self.device())
+    }
+}
+
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
+    module.add_class::<TextModel>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
@@ -525,6 +634,15 @@ mod tests {
         assert_eq!(parse_precision("int8").unwrap(), ModelPrecision::W8A8);
         assert_eq!(parse_precision("w8a8").unwrap(), ModelPrecision::W8A8);
         assert!(parse_precision("fp4").is_err());
+    }
+
+    #[test]
+    fn parses_text_dtype_forms() {
+        assert_eq!(parse_text_dtype("auto").unwrap(), None);
+        assert_eq!(parse_text_dtype("fp32").unwrap(), Some(DType::F32));
+        assert_eq!(parse_text_dtype("f32").unwrap(), Some(DType::F32));
+        assert_eq!(parse_text_dtype("bf16").unwrap(), Some(DType::BF16));
+        assert!(parse_text_dtype("int4").is_err());
     }
 
     #[test]

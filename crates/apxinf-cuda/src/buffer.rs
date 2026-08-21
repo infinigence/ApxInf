@@ -197,7 +197,7 @@ impl CudaBuffer {
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
-    pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
+    pub fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);
         let handle = GpuStorageHandle {
             ptr: self.ptr as usize,
@@ -205,6 +205,39 @@ impl CudaBuffer {
             _prevent_leak: Some(Arc::new(self)),
         };
         Tensor::from_raw_parts(shape, dtype, device, Storage::Gpu { device, handle })
+    }
+
+    /// Asynchronously zero the buffer on `stream`.
+    pub fn zero_async(&self, stream: &crate::stream::CudaStream) -> Result<(), String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                0,
+                self.len,
+                stream.handle(),
+            ))
+        }
+    }
+
+    /// Asynchronously copy `bytes` from `src` (device) into this buffer.
+    pub fn copy_d2d_async(
+        &self,
+        src: &CudaBuffer,
+        bytes: usize,
+        stream: &crate::stream::CudaStream,
+    ) -> Result<(), String> {
+        if bytes > self.len || bytes > src.len {
+            return Err("CUDA D2D copy exceeds buffer size".to_string());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                src.ptr,
+                bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))
+        }
     }
 }
 
@@ -262,6 +295,27 @@ impl HostMappedBuffer {
             len: self.len,
             device: self.device,
         }
+    }
+
+    /// Read one mapped u32 value back from the host side. Call after the
+    /// producing stream has synchronized.
+    pub fn read_u32(&self, index: usize) -> Result<u32, String> {
+        let offset = index
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 read offset overflow".to_string())?;
+        let end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 read size overflow".to_string())?;
+        if end > self.len {
+            return Err(format!(
+                "mapped buffer is {} bytes, read [{offset}..{end}]",
+                self.len
+            ));
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(unsafe {
+            std::ptr::read_volatile((self.host_ptr as *const u32).add(index))
+        })
     }
 
     /// Publish one mapped u32 value to the device without exposing host raw

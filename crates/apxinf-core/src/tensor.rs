@@ -178,6 +178,20 @@ impl Tensor {
         Ok(self.storage.as_cpu().unwrap())
     }
 
+    /// View the data as signed 32-bit integers.
+    pub fn as_i32(&self) -> Result<&[i32]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I32)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
+    /// View the data as signed 64-bit integers.
+    pub fn as_i64(&self) -> Result<&[i64]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I64)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
     /// Convert data to f32 regardless of stored dtype (copies if bf16).
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         self.ensure_cpu()?;
@@ -186,6 +200,7 @@ impl Tensor {
             DType::F16 => Ok(self.as_f16()?.iter().map(|x| x.to_f32()).collect()),
             DType::BF16 => Ok(self.as_bf16()?.iter().map(|x| x.to_f32()).collect()),
             DType::F8E4M3 => Err(Error::Other("raw E4M3 conversion requires an explicit quantization scale".into())),
+            DType::I32 | DType::I64 => Err(Error::Other(format!("cannot convert {dtype} tensor to f32 without an explicit quantization/decode policy", dtype = self.dtype))),
         }
     }
 

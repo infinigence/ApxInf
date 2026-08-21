@@ -105,3 +105,14 @@ def test_model_reexport_matches_binding():
     import apxinf
 
     assert apxinf.Model is apxinf_py.Model
+
+
+def test_text_model_lazy_reexport_uses_binding(monkeypatch):
+    import types
+    import apxinf
+
+    sentinel = object()
+    fake_binding = types.SimpleNamespace(TextModel=sentinel)
+    monkeypatch.setitem(sys.modules, "apxinf_py", fake_binding)
+
+    assert apxinf.TextModel is sentinel

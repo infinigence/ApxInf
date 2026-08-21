@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{AutoModel, ImageInput, LlmInput, LoadOptions};
 use apxinf_tokenizer::{Tokenizer, ChatMessage};
+mod serve;
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -56,6 +57,32 @@ enum Commands {
         dtype: String,
     },
 
+    /// Start the contest inference HTTP service (GET /health, POST /v1/evaluations/generate).
+    Serve {
+        /// Path to HuggingFace model directory (config.json, safetensors, tokenizer.json)
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Bind host
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Bind port
+        #[arg(long, default_value_t = 8001)]
+        port: u16,
+
+        /// Maximum total sequence length the service accepts (prompt + completion)
+        #[arg(long, default_value_t = 32768)]
+        max_model_len: usize,
+
+        /// Model revision reported by /health
+        #[arg(long, default_value = "63768c10df38c0395e12ef49edac1bd539eaeeea")]
+        model_revision: String,
+
+        /// Device to run inference on (cpu or cuda)
+        #[arg(short, long, default_value = "cuda")]
+        device: String,
+    },
     /// Run a quick test of the engine
     Test,
 }
@@ -82,7 +109,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Test => {
+        Commands::Serve { model, host, port, max_model_len, model_revision, device } => {
+            let device = parse_device(&device);
+            let config = serve::ServeConfig {
+                model_dir: model,
+                host,
+                port,
+                max_model_len,
+                model_revision,
+                device,
+            };
+            if let Err(error) = serve::run(config) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }        Commands::Test => {
             run_test();
         }
     }
@@ -537,3 +578,5 @@ fn cuda_test() {
 
     println!("[CUDA] All kernel tests completed.");
 }
+
+
