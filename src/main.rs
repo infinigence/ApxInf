@@ -66,6 +66,10 @@ enum Commands {
         /// Listen address (host:port)
         #[arg(long, default_value = "127.0.0.1:8000")]
         addr: String,
+
+        /// Model directory; when omitted a placeholder generator is used
+        #[arg(long)]
+        model: Option<std::path::PathBuf>,
     },
 }
 
@@ -94,8 +98,23 @@ fn main() {
         Commands::Test => {
             run_test();
         }
-        Commands::Serve { addr } => {
-            let mut service = server::Server::new(addr, Box::new(server::PlaceholderGenerator));
+        Commands::Serve { addr, model } => {
+            let generator: Box<dyn server::TokenGenerator> = match model {
+                Some(dir) => {
+                    eprintln!("[apxinf] loading model from {}", dir.display());
+                    let loaded = match apxinf_model::qwen35::cpu::CpuQwen35::load(&dir) {
+                        Ok(m) => m,
+                        Err(error) => {
+                            eprintln!("[apxinf] failed to load model: {error}");
+                            std::process::exit(1);
+                        }
+                    };
+                    eprintln!("[apxinf] model loaded");
+                    Box::new(server::ModelGenerator::new(loaded))
+                }
+                None => Box::new(server::PlaceholderGenerator),
+            };
+            let mut service = server::Server::new(addr, generator);
             if let Err(error) = service.run() {
                 eprintln!("{error}");
                 std::process::exit(1);

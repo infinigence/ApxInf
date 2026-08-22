@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 
+use apxinf_model::qwen35::cpu::CpuQwen35;
+
 /// Contract constants advertised in `/health`.
 pub const EVALUATION_CONTRACT: &str = "apxinf.qwen38_27b.inference_interface.v1";
 pub const MODEL_REVISION: &str = "63768c10df38c0395e12ef49edac1bd539eaeeea";
@@ -43,6 +45,29 @@ impl TokenGenerator for PlaceholderGenerator {
         _ignore_eos: bool,
     ) -> Result<Vec<u32>, String> {
         Ok(vec![0u32; max_new_tokens])
+    }
+}
+
+/// Real model generator backed by the CPU reference forward. Correctness-first
+/// (stateless full-sequence recompute); the CUDA path will replace it later.
+pub struct ModelGenerator {
+    model: CpuQwen35,
+}
+
+impl ModelGenerator {
+    pub fn new(model: CpuQwen35) -> Self {
+        Self { model }
+    }
+}
+
+impl TokenGenerator for ModelGenerator {
+    fn generate(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<Vec<u32>, String> {
+        self.model.generate_greedy(input_ids, max_new_tokens, ignore_eos)
     }
 }
 
