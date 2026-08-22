@@ -71,6 +71,37 @@ impl TokenGenerator for ModelGenerator {
     }
 }
 
+/// CUDA-backed generator: prefill + incremental decode through the captured
+/// CUDA graph. Requests are still served serially (parallel_requests: 1).
+#[cfg(feature = "cuda")]
+pub struct CudaGenerator {
+    model: apxinf_model::qwen35::gpu::CudaQwen35,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGenerator {
+    pub fn new(model: apxinf_model::qwen35::gpu::CudaQwen35) -> Self {
+        Self { model }
+    }
+}
+
+// The server is single-threaded (parallel_requests: 1); the CUDA context and
+// its buffers are owned and used by that one thread only.
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaGenerator {}
+
+#[cfg(feature = "cuda")]
+impl TokenGenerator for CudaGenerator {
+    fn generate(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<Vec<u32>, String> {
+        self.model.generate_greedy(input_ids, max_new_tokens, ignore_eos)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     InputIds,

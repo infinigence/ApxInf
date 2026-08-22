@@ -70,6 +70,10 @@ enum Commands {
         /// Model directory; when omitted a placeholder generator is used
         #[arg(long)]
         model: Option<std::path::PathBuf>,
+
+        /// Device: cpu or cuda
+        #[arg(long, default_value = "cpu")]
+        device: String,
     },
 }
 
@@ -98,20 +102,9 @@ fn main() {
         Commands::Test => {
             run_test();
         }
-        Commands::Serve { addr, model } => {
+        Commands::Serve { addr, model, device } => {
             let generator: Box<dyn server::TokenGenerator> = match model {
-                Some(dir) => {
-                    eprintln!("[apxinf] loading model from {}", dir.display());
-                    let loaded = match apxinf_model::qwen35::cpu::CpuQwen35::load(&dir) {
-                        Ok(m) => m,
-                        Err(error) => {
-                            eprintln!("[apxinf] failed to load model: {error}");
-                            std::process::exit(1);
-                        }
-                    };
-                    eprintln!("[apxinf] model loaded");
-                    Box::new(server::ModelGenerator::new(loaded))
-                }
+                Some(dir) => load_serve_model(&dir, &device),
                 None => Box::new(server::PlaceholderGenerator),
             };
             let mut service = server::Server::new(addr, generator);
@@ -120,6 +113,40 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+fn load_serve_model(dir: &std::path::Path, device: &str) -> Box<dyn server::TokenGenerator> {
+    if matches!(device.to_lowercase().as_str(), "cuda" | "gpu") {
+        #[cfg(feature = "cuda")]
+        {
+            eprintln!("[apxinf] loading model from {} (cuda)", dir.display());
+            let loaded = match apxinf_model::qwen35::gpu::CudaQwen35::load(dir) {
+                Ok(m) => m,
+                Err(error) => {
+                    eprintln!("[apxinf] failed to load model: {error}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("[apxinf] model loaded");
+            Box::new(server::CudaGenerator::new(loaded))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            eprintln!("[apxinf] this binary was built without CUDA support");
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!("[apxinf] loading model from {}", dir.display());
+        let loaded = match apxinf_model::qwen35::cpu::CpuQwen35::load(dir) {
+            Ok(m) => m,
+            Err(error) => {
+                eprintln!("[apxinf] failed to load model: {error}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!("[apxinf] model loaded");
+        Box::new(server::ModelGenerator::new(loaded))
     }
 }
 

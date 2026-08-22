@@ -18,7 +18,7 @@ use apxinf_cuda::{CudaBuffer, CudaContext};
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 4096; // parallel prefill length cap (workspace)
+const MAX_LEN: usize = 1024; // parallel prefill length cap (workspace)
 const MAX_SEQ: usize = 4096; // total sequence cap (rope + KV cache)
 
 struct GpuQ4 {
@@ -103,6 +103,7 @@ pub struct CudaQwen35 {
     pos_dev: CudaBuffer,      // [1] u32 absolute position (graph-safe)
     token_embed: CudaBuffer,  // [hidden] staging for the input token
     graph: Option<CapturedGraph>,
+    eos: u32,
 }
 
 struct Workspace {
@@ -223,6 +224,7 @@ impl CudaQwen35 {
         let vd = cfg.linear_value_head_dim;
         let conv_dim = 2 * nk * kd + nv * vd;
         let vocab = cfg.vocab_size;
+        let eos = cfg.eos_token_id.unwrap_or(248044) as u32;
         let eps = cfg.rms_norm_eps as f32;
         let rotary_dim = cfg.rotary_dim();
         let half = rotary_dim / 2;
@@ -351,6 +353,7 @@ impl CudaQwen35 {
             pos_dev,
             token_embed,
             graph: None,
+            eos,
         })
     }
 
@@ -601,8 +604,49 @@ impl CudaQwen35 {
         self.read_logits()
     }
 
+    /// End-of-sequence token id used for greedy early stopping.
+    pub fn eos_token(&self) -> u32 {
+        self.eos
+    }
+
+    /// Greedy incremental generation: prefill the prompt, then decode one
+    /// token at a time through the captured CUDA graph.
+    pub fn generate_greedy(
+        &mut self,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<Vec<u32>, String> {
+        if prompt.is_empty() {
+            return Err("empty prompt".to_string());
+        }
+        let mut logits = self.prefill_logits(prompt)?;
+        let mut out = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            let next = argmax(&logits) as u32;
+            out.push(next);
+            if !ignore_eos && next == self.eos {
+                break;
+            }
+            logits = self.decode_logits(next)?;
+        }
+        Ok(out)
+    }
+
     /// Compatibility wrapper: prefill and return the final-token logits.
     pub fn forward_last_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
         self.prefill_logits(ids)
     }
+}
+
+fn argmax(logits: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best = i;
+            best_v = v;
+        }
+    }
+    best
 }
