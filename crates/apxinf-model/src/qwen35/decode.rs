@@ -1744,12 +1744,11 @@ impl HybridUnit {
         normalized: &Tensor,
     ) -> Result<()> {
         let scratch = &self.prefill.gdn;
-        bf16_linear_serial_rows(
+        bf16_linear_prefill_m8(
             ctx,
             input,
             &weights.ab,
             &scratch.ab,
-            PREFILL_TILE,
             HIDDEN,
             2 * GDN_HEADS,
         )?;
@@ -2638,6 +2637,44 @@ fn bf16_linear(
         CublasTranspose::None,
         CublasTranspose::Transpose,
         1,
+        output_dim,
+        input_dim,
+        1.0,
+        &CudaBuffer::from_tensor(input).map_err(Error::Cuda)?,
+        input_dim as i32,
+        &CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?,
+        input_dim as i32,
+        0.0,
+        &CudaBuffer::from_tensor(output).map_err(Error::Cuda)?,
+        output_dim as i32,
+    )
+}
+
+fn bf16_linear_prefill_m8(
+    ctx: &CudaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    output: &Tensor,
+    input_dim: usize,
+    output_dim: usize,
+) -> Result<()> {
+    if input.dtype() != DType::BF16
+        || input.shape().dims() != [PREFILL_TILE, input_dim]
+        || weight.dtype() != DType::BF16
+        || weight.shape().dims() != [output_dim, input_dim]
+        || output.dtype() != DType::BF16
+        || output.shape().dims() != [PREFILL_TILE, output_dim]
+    {
+        return Err(Error::Other(
+            "Qwen3.5 BF16 direct M8 linear contract mismatch".into(),
+        ));
+    }
+    gemm::write_ex(
+        ctx,
+        DType::BF16,
+        CublasTranspose::None,
+        CublasTranspose::Transpose,
+        PREFILL_TILE,
         output_dim,
         input_dim,
         1.0,
