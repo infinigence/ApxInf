@@ -41,3 +41,10 @@ name = "qwen35_smoke"
 [[example]]
 name = "qwen35_gpu_smoke"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_cpu_long"
+
+[[example]]
+name = "qwen35_gpu_long"
+required-features = ["cuda"]

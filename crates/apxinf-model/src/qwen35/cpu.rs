@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 128;
+const MAX_LEN: usize = 4096;
 
 #[inline]
 fn nib4(v: i32, idx: usize) -> i32 {
