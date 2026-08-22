@@ -161,6 +161,7 @@ pub fn partial_rope_bf16_inplace(
     hd: usize,
     half: usize,
     max_len: usize,
+    pos0: usize,
 ) -> Result<()> {
     let dev = ctx.device_id();
     need(ctx, "x", dev, x, rows * hd * 2)?;
@@ -175,6 +176,7 @@ pub fn partial_rope_bf16_inplace(
             heads as i32,
             hd as i32,
             half as i32,
+            pos0 as i32,
             ctx.stream().handle(),
         )
     })
@@ -399,6 +401,119 @@ pub fn beta_g_bf16(
             g.ptr(),
             total as i32,
             nv as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+
+pub fn copy_bf16(ctx: &CudaContext, src: &CudaBuffer, dst: &CudaBuffer, n: usize) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "src", dev, src, n * 2)?;
+    need(ctx, "dst", dev, dst, n * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_copy_bf16(src.ptr(), dst.ptr(), n as i64, ctx.stream().handle())
+    })
+    .map_err(Error::Cuda)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_bf16_into(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    kcache: &CudaBuffer,
+    vcache: &CudaBuffer,
+    gate: &CudaBuffer,
+    out: &CudaBuffer,
+    seq: usize,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "q", dev, q, heads * hd * 2)?;
+    need(ctx, "kcache", dev, kcache, seq * kv_heads * hd * 2)?;
+    need(ctx, "vcache", dev, vcache, seq * kv_heads * hd * 2)?;
+    need(ctx, "gate", dev, gate, heads * hd * 2)?;
+    need(ctx, "out", dev, out, heads * hd * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_attention_decode_bf16(
+            q.ptr(),
+            kcache.ptr(),
+            vcache.ptr(),
+            gate.ptr(),
+            out.ptr(),
+            seq as i32,
+            heads as i32,
+            kv_heads as i32,
+            hd as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+pub fn conv_step_silu_bf16_into(
+    ctx: &CudaContext,
+    cur: &CudaBuffer,
+    hist: &CudaBuffer,
+    w: &CudaBuffer,
+    out: &CudaBuffer,
+    conv_dim: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "cur", dev, cur, conv_dim * 2)?;
+    need(ctx, "hist", dev, hist, 3 * conv_dim * 2)?;
+    need(ctx, "w", dev, w, conv_dim * 4 * 2)?;
+    need(ctx, "out", dev, out, conv_dim * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_conv_step_silu_bf16(
+            cur.ptr(),
+            hist.ptr(),
+            w.ptr(),
+            out.ptr(),
+            conv_dim as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn delta_step_bf16_into(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    beta: &CudaBuffer,
+    g: &CudaBuffer,
+    state: &CudaBuffer,
+    out: &CudaBuffer,
+    nv: usize,
+    kd: usize,
+    vd: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "q", dev, q, nv * kd * 2)?;
+    need(ctx, "k", dev, k, nv * kd * 2)?;
+    need(ctx, "v", dev, v, nv * vd * 2)?;
+    need(ctx, "beta", dev, beta, nv * 2)?;
+    need(ctx, "g", dev, g, nv * 2)?;
+    need(ctx, "state", dev, state, nv * kd * vd * 4)?;
+    need(ctx, "out", dev, out, nv * vd * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_delta_step_bf16(
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            beta.ptr(),
+            g.ptr(),
+            state.ptr(),
+            out.ptr(),
+            nv as i32,
+            kd as i32,
+            vd as i32,
             ctx.stream().handle(),
         )
     })

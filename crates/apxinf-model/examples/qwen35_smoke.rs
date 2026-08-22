@@ -38,4 +38,18 @@ fn main() {
     let t2 = Instant::now();
     let next = model.generate_greedy(&prompt, 1, false).expect("greedy");
     println!("greedy next token (ignore_eos=false): {}  [{:.2?}]", next[0], t2.elapsed());
+
+    if std::env::var_os("Q35_CPU9").is_some() {
+        let mut p9 = prompt.to_vec();
+        p9.push(264);
+        let t9 = Instant::now();
+        let logits9 = model.forward_last_logits(&p9).expect("forward9");
+        eprintln!("[cpu] 9-token forward in {:.2?}", t9.elapsed());
+        let mut b9: Vec<u8> = Vec::with_capacity(logits9.len() * 4);
+        for v in &logits9 {
+            b9.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write("/tmp/rust_logits9.bin", &b9).expect("write9");
+        eprintln!("[cpu] dumped 9-token logits to /tmp/rust_logits9.bin");
+    }
 }

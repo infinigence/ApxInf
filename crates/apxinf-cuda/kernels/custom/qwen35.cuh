@@ -119,13 +119,13 @@ __global__ void qwen_qg_split_bf16_kernel(
 // ── partial RoPE (first rotary dims, interleaved split-half) in-place ───
 __global__ void qwen_partial_rope_bf16_kernel(
     __nv_bfloat16* x, const __nv_bfloat16* cos, const __nv_bfloat16* sin,
-    int64_t pairs, int heads, int hd, int half) {
+    int64_t pairs, int heads, int hd, int half, int pos0) {
   // one thread per (row, i) pair; row = e / half, i = e % half
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= pairs) return;
   int row = (int)(e / half);
   int i = (int)(e % half);
-  int t = row / heads;                 // token index from flattened rows
+  int t = pos0 + row / heads;          // absolute token index
   float c = q35_bf16(cos, (int64_t)t * half + i);
   float s = q35_bf16(sin, (int64_t)t * half + i);
   float a = q35_bf16(x, (int64_t)row * hd + i);
@@ -487,3 +487,147 @@ __global__ void qwen_beta_g_bf16_kernel(
   g[e] = q35_b16(-__expf(a_log[h]) * sp);
   beta[e] = q35_b16(1.0f / (1.0f + __expf(-q35_bf16(b, e))));
 }
+
+// ── device-to-device bf16 copy (for cache population) ───────────────────
+__global__ void qwen_copy_bf16_kernel(
+    const __nv_bfloat16* src, __nv_bfloat16* dst, int64_t n) {
+  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= n) return;
+  dst[e] = src[e];
+}
+
+// ── single-token attention over a KV cache (online softmax) ─────────────
+__global__ void qwen_attention_decode_bf16_kernel(
+    const __nv_bfloat16* q,      // [heads, hd]
+    const __nv_bfloat16* kcache, // [seq, kvheads, hd]
+    const __nv_bfloat16* vcache, // [seq, kvheads, hd]
+    const __nv_bfloat16* gate,   // [heads, hd]
+    __nv_bfloat16* out,          // [heads, hd]
+    int seq, int heads, int kvheads, int hd) {
+  int h = blockIdx.x;
+  int d = threadIdx.x;
+  if (h >= heads || d >= hd) return;
+  int kh = h / (heads / kvheads);
+
+  __shared__ float warp_part[8];
+  __shared__ float total_s[1];
+
+  float qv = q35_bf16(q, (int64_t)h * hd + d);
+  float gv = q35_bf16(gate, (int64_t)h * hd + d);
+  float acc = 0.0f;
+  float m = -1e30f;
+  float l = 0.0f;
+  float scale = rsqrtf((float)hd);
+
+  for (int s = 0; s < seq; s++) {
+    float part = qv * q35_bf16(kcache, ((int64_t)s * kvheads + kh) * hd + d);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      part += __shfl_xor_sync(0xffffffffu, part, off);
+    }
+    if ((d & 31) == 0) warp_part[d >> 5] = part;
+    __syncthreads();
+    if (d < 8) {
+      float wp = warp_part[d];
+      #pragma unroll
+      for (int off = 4; off > 0; off >>= 1) {
+        wp += __shfl_xor_sync(0x000000ffu, wp, off);
+      }
+      if (d == 0) total_s[0] = wp;
+    }
+    __syncthreads();
+    float dot = total_s[0] * scale;
+
+    float m_new = fmaxf(m, dot);
+    float corr = expf(m - m_new);
+    float p = expf(dot - m_new);
+    l = l * corr + p;
+    acc = acc * corr + p * q35_bf16(vcache, ((int64_t)s * kvheads + kh) * hd + d);
+    m = m_new;
+  }
+
+  acc = acc / l;
+  float sig = 1.0f / (1.0f + expf(-gv));
+  out[(int64_t)h * hd + d] = q35_b16(acc * sig);
+}
+
+// ── single-token causal conv + history shift ────────────────────────────
+// hist layout: [3, conv_dim], hist[0] = newest tap (t-1), hist[2] = t-3.
+__global__ void qwen_conv_step_silu_bf16_kernel(
+    const __nv_bfloat16* cur, __nv_bfloat16* hist, const __nv_bfloat16* w,
+    __nv_bfloat16* out, int conv_dim) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) return;
+  float acc = q35_bf16(w, (int64_t)c * 4 + 0) * q35_bf16(cur, c);
+  #pragma unroll
+  for (int j = 1; j < 4; j++) {
+    acc += q35_bf16(w, (int64_t)c * 4 + j) * q35_bf16(hist, (int64_t)(j - 1) * conv_dim + c);
+  }
+  out[c] = q35_b16(acc / (1.0f + expf(-acc)));
+  // shift history (each thread owns channel c; source reads precede writes)
+  hist[(int64_t)2 * conv_dim + c] = hist[(int64_t)1 * conv_dim + c];
+  hist[(int64_t)1 * conv_dim + c] = hist[c];
+  hist[c] = cur[c];
+}
+
+// ── single-token GatedDeltaNet step over cached state (kd split) ────────
+__global__ void qwen_delta_step_bf16_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* beta, const __nv_bfloat16* g,
+    float* state, __nv_bfloat16* out, int nv, int kd, int vd) {
+  int h = blockIdx.x;
+  int j = threadIdx.x;
+  int y = threadIdx.y;
+  if (h >= nv || j >= vd) return;
+  const int chunk = kd / DR_KDCHUNK;
+  const int kk0 = y * chunk;
+  const int kk1 = kk0 + chunk;
+  float* S = state + (int64_t)h * kd * vd;
+
+  __shared__ float kv_part[DR_KDCHUNK][128];
+  __shared__ float o_part[DR_KDCHUNK][128];
+  __shared__ float delta_s[128];
+
+  const __nv_bfloat16* krow = k + (int64_t)h * kd;
+  const __nv_bfloat16* qrow = q + (int64_t)h * kd;
+
+  float decay = expf(q35_bf16(g, h));
+  for (int kk = kk0; kk < kk1; kk++) {
+    S[(int64_t)kk * vd + j] *= decay;
+  }
+  float pkv = 0.0f;
+  for (int kk = kk0; kk < kk1; kk++) {
+    pkv += S[(int64_t)kk * vd + j] * q35_bf16(krow, kk);
+  }
+  kv_part[y][j] = pkv;
+  __syncthreads();
+
+  if (y == 0) {
+    float kv = kv_part[0][j];
+    #pragma unroll
+    for (int yy = 1; yy < DR_KDCHUNK; yy++) kv += kv_part[yy][j];
+    float delta = (q35_bf16(v, (int64_t)h * vd + j) - kv) *
+                  q35_bf16(beta, h);
+    delta_s[j] = delta;
+  }
+  __syncthreads();
+
+  float dlt = delta_s[j];
+  for (int kk = kk0; kk < kk1; kk++) {
+    S[(int64_t)kk * vd + j] += q35_bf16(krow, kk) * dlt;
+  }
+  float po = 0.0f;
+  for (int kk = kk0; kk < kk1; kk++) {
+    po += S[(int64_t)kk * vd + j] * q35_bf16(qrow, kk);
+  }
+  o_part[y][j] = po;
+  __syncthreads();
+
+  if (y == 0) {
+    float o = o_part[0][j];
+    #pragma unroll
+    for (int yy = 1; yy < DR_KDCHUNK; yy++) o += o_part[yy][j];
+    out[(int64_t)h * vd + j] = q35_b16(o);
+  }
+}
+
