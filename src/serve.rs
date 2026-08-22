@@ -50,6 +50,7 @@ pub struct ServeConfig {
 
 struct Engine {
     model: LoadedModel,
+    tokenizer: Tokenizer,
     vocab_size: usize,
     eos_token_id: Option<u32>,
     max_model_len: usize,
@@ -92,9 +93,16 @@ pub fn run(config: ServeConfig) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum JobKind {
+    Evaluate,
+    Completions,
+}
+
 struct GenerateJob {
     stream: TcpStream,
     body: Vec<u8>,
+    kind: JobKind,
 }
 
 fn worker_loop(config: ServeConfig, job_rx: mpsc::Receiver<GenerateJob>) {
@@ -109,7 +117,10 @@ fn worker_loop(config: ServeConfig, job_rx: mpsc::Receiver<GenerateJob>) {
     while let Ok(mut job) = job_rx.recv() {
         let started = std::time::Instant::now();
         let result = (|| -> Result<(), String> {
-            handle_generate(&mut engine, &mut job.stream, &job.body)
+            match job.kind {
+                JobKind::Evaluate => handle_generate(&mut engine, &mut job.stream, &job.body),
+                JobKind::Completions => handle_completions(&mut engine, &mut job.stream, &job.body),
+            }
         })();
         eprintln!(
             "apxinf serve: generate -> {} ({:.3}s)",
@@ -135,6 +146,7 @@ impl Engine {
 
         Ok(Self {
             model,
+            tokenizer,
             vocab_size,
             eos_token_id,
             max_model_len: config.max_model_len,
@@ -261,7 +273,18 @@ fn handle_connection(
                 .map_err(|error| format!("write /health: {error}"))
         }
         ("POST", "/v1/evaluations/generate") => {
-            match job_tx.send(GenerateJob { stream, body }) {
+            match job_tx.send(GenerateJob { stream, body, kind: JobKind::Evaluate }) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let mut job = error.0;
+                    let payload = error_response(503, "capacity_unavailable", "model worker unavailable").1;
+                    write_full_response(&mut job.stream, 503, "application/json", Some(payload.len()), &payload)
+                        .map_err(|error| format!("write 503: {error}"))
+                }
+            }
+        }
+        ("POST", "/v1/completions") => {
+            match job_tx.send(GenerateJob { stream, body, kind: JobKind::Completions }) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     let mut job = error.0;
@@ -487,3 +510,179 @@ fn read_request(stream: &TcpStream) -> std::io::Result<Option<(String, String, V
 
 
 
+
+/// Parse a `POST /v1/completions` body into a text prompt + sampling params.
+struct CompletionsRequest {
+    prompt: String,
+    max_new_tokens: usize,
+    ignore_eos: bool,
+    stream: bool,
+}
+
+fn parse_completions(body: &[u8]) -> Result<CompletionsRequest, (u16, String)> {
+    let object: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| error_response(400, "invalid_request", format!("invalid JSON: {error}")))?;
+    let prompt = object
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| error_response(400, "invalid_request", "prompt must be a non-empty string"))?
+        .to_string();
+    if prompt.trim().is_empty() {
+        return Err(error_response(400, "invalid_request", "prompt must be a non-empty string"));
+    }
+    let max_new_tokens = object
+        .get("max_new_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| error_response(400, "invalid_request", "max_new_tokens must be a positive integer"))?
+        as usize;
+    if max_new_tokens == 0 {
+        return Err(error_response(400, "invalid_request", "max_new_tokens must be positive"));
+    }
+    let ignore_eos = object
+        .get("ignore_eos")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let stream = object
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    Ok(CompletionsRequest { prompt, max_new_tokens, ignore_eos, stream })
+}
+
+/// Tokenize a text prompt with the chat template and generate, streaming SSE
+/// (with decoded `text` on the done event) or returning one JSON result.
+fn handle_completions(
+    engine: &mut Engine,
+    stream: &mut TcpStream,
+    body: &[u8],
+) -> Result<(), String> {
+    let request = match parse_completions(body) {
+        Ok(request) => request,
+        Err((status, payload)) => {
+            write_full_response(stream, status, "application/json", Some(payload.len()), &payload)
+                .map_err(|error| format!("write validation error: {error}"))?;
+            return Ok(());
+        }
+    };
+
+    let messages = vec![
+        apxinf_tokenizer::ChatMessage::system("You are a helpful assistant."),
+        apxinf_tokenizer::ChatMessage::user(request.prompt.clone()),
+    ];
+    let input_ids = engine
+        .tokenizer
+        .encode_chat(&messages)
+        .map_err(|error| format!("tokenize prompt: {error}"))?;
+
+    #[cfg(feature = "cuda")]
+    let capacity = apxinf_model::qwen35::cuda::MAX_SEQ_LEN;
+    #[cfg(not(feature = "cuda"))]
+    let capacity = engine.max_model_len;
+    if input_ids.len().saturating_add(request.max_new_tokens) > capacity {
+        let payload = error_response(
+            400,
+            "capacity_exceeded",
+            format!(
+                "request length {} + {} exceeds engine capacity {}",
+                input_ids.len(),
+                request.max_new_tokens,
+                capacity
+            ),
+        )
+        .1;
+        write_full_response(stream, 400, "application/json", Some(payload.len()), &payload)
+            .map_err(|error| format!("write capacity error: {error}"))?;
+        return Ok(());
+    }
+
+    let request_id = engine.next_request_id();
+    let eos_token_id = if request.ignore_eos { None } else { engine.eos_token_id };
+    let generate = GenerateRequest {
+        input_ids,
+        max_new_tokens: request.max_new_tokens,
+        ignore_eos: request.ignore_eos,
+        stream: request.stream,
+    };
+
+    if request.stream {
+        run_generate_sse_text(engine, stream, &generate, &request_id, eos_token_id)
+            .map_err(|error| format!("streaming completions: {error}"))
+    } else {
+        let result = run_generate_collect(engine, &generate, eos_token_id)
+            .map_err(|error| format!("completions: {error}"))?;
+        let text = engine.tokenizer.decode(&result.output_ids).unwrap_or_default();
+        let payload = serde_json::json!({
+            "type": "result",
+            "request_id": request_id,
+            "output_ids": result.output_ids,
+            "text": text,
+            "usage": result.usage,
+        })
+        .to_string();
+        write_full_response(stream, 200, "application/json", Some(payload.len()), &payload)
+            .map_err(|error| format!("write completions result: {error}"))
+    }
+}
+
+/// Like [`run_generate_sse`] but accumulates the tokens and appends the
+/// decoded `text` to the done event.
+fn run_generate_sse_text(
+    engine: &mut Engine,
+    stream: &mut TcpStream,
+    request: &GenerateRequest,
+    request_id: &str,
+    eos_token_id: Option<u32>,
+) -> Result<(), String> {
+    start_sse(stream).map_err(|error| error.to_string())?;
+    let mut index = 0usize;
+    let mut all_tokens = Vec::new();
+    let mut write_failed = false;
+    let write_event = |stream: &mut TcpStream, json: serde_json::Value| -> Result<(), String> {
+        let payload = format!("data: {}\n\n", json);
+        stream
+            .write_all(payload.as_bytes())
+            .and_then(|_| stream.flush())
+            .map_err(|error| error.to_string())
+    };
+
+    let result = engine.model.generate_streaming(
+        LlmInput::text(&request.input_ids),
+        request.max_new_tokens,
+        |token| {
+            all_tokens.push(token);
+            let event = serde_json::json!({ "type": "token", "request_id": request_id, "index": index, "token_id": token });
+            if !write_failed {
+                if let Err(error) = write_event(&mut *stream, event) {
+                    eprintln!("apxinf serve: stream write error: {error}");
+                    write_failed = true;
+                }
+            }
+            index += 1;
+        },
+        eos_token_id,
+    );
+    let output_len = match result {
+        Ok((tokens, _profile)) => tokens.len(),
+        Err(error) => {
+            eprintln!("apxinf serve: generation error: {error}");
+            index
+        }
+    };
+
+    let text = engine.tokenizer.decode(&all_tokens).unwrap_or_default();
+    let done = serde_json::json!({
+        "type": "done",
+        "request_id": request_id,
+        "text": text,
+        "usage": {
+            "prompt_tokens": request.input_ids.len(),
+            "completion_tokens": output_len,
+            "total_tokens": request.input_ids.len() + output_len,
+        },
+    });
+    write_event(stream, done)?;
+    stream
+        .write_all(b"data: [DONE]\n\n")
+        .and_then(|_| stream.flush())
+        .map_err(|error| error.to_string())
+}
