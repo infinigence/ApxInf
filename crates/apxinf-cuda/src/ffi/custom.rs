@@ -944,3 +944,16 @@ extern "C" {
         eps: f32, scale: f32, stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+extern "C" {
+    pub fn apxinf_qwen_gemm_w4a16_bf16(
+        a: *const c_void, packed: *const c_void, scale: *const c_void,
+        zp: *const c_void, c: *mut c_void,
+        m: i32, n: i32, k: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_beta_g_bf16(
+        a: *const c_void, b: *const c_void, a_log: *const c_void,
+        dt_bias: *const c_void, beta: *mut c_void, g: *mut c_void,
+        total: i32, nv: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}

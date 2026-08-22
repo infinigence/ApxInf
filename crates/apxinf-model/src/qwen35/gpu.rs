@@ -54,8 +54,8 @@ struct GpuLinear {
     in_a: CudaBuffer,   // transposed [hidden, nv]
     in_b: CudaBuffer,
     conv_w: CudaBuffer, // [conv_dim, 4] flat
-    a_log: Vec<f32>,
-    dt_bias: Vec<f32>,
+    a_log: CudaBuffer, // [nv] f32
+    dt_bias: CudaBuffer, // [nv] f32
     norm_w: CudaBuffer, // [vd] (1+w)
     out_proj: GpuOutProj,
     in_norm_w: CudaBuffer,
@@ -123,13 +123,20 @@ struct Workspace {
     mlp_up: CudaBuffer,
     mlp_hid: CudaBuffer,
     mlp_down: CudaBuffer,
-    big_deq: CudaBuffer,
     logits: CudaBuffer,
     state: CudaBuffer,
 }
 
 fn bf16_bytes(v: &[bf16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
     for x in v {
         out.extend_from_slice(&x.to_le_bytes());
     }
@@ -245,8 +252,8 @@ impl CudaQwen35 {
                         in_a: upload_transposed(dev, in_a)?,
                         in_b: upload_transposed(dev, in_b)?,
                         conv_w: upload(dev, &bf16_bytes(&conv.data))?,
-                        a_log: a_log.clone(),
-                        dt_bias: dt_bias.clone(),
+                        a_log: upload(dev, &f32_bytes(a_log))?,
+                        dt_bias: upload(dev, &f32_bytes(dt_bias))?,
                         norm_w: upload(dev, &bf16_bytes(&norm_plus1(norm)))?,
                         out_proj: match out_proj {
                             MatKind::Q4(q) => GpuOutProj::Q4(upload_q4(dev, q)?),
@@ -295,7 +302,6 @@ impl CudaQwen35 {
             mlp_up: n(MAX_LEN * inter * 2)?,
             mlp_hid: n(MAX_LEN * inter * 2)?,
             mlp_down: n(MAX_LEN * hidden * 2)?,
-            big_deq: n(inter * hidden * 2)?,
             logits: n(vocab * 2)?,
             state: n(nv * kd * vd * 4)?,
         };
@@ -330,10 +336,9 @@ impl CudaQwen35 {
         self.ctx.cublas().gemm(DType::BF16, m, n, kk, 1.0f32, a, b, 0.0f32, c)
     }
 
-    fn deq_gemm(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
-        k::dequant_w4a16_bf16_into(&self.ctx, &q.packed, &q.scale, &q.zp, &self.ws.big_deq, q.out, q.inp)
-            .map_err(|e| e.to_string())?;
-        self.gemm(m, q.out, q.inp, a, &self.ws.big_deq, c)
+    fn gemm_q4(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
+        k::gemm_w4a16_bf16(&self.ctx, a, &q.packed, &q.scale, &q.zp, c, m, q.out, q.inp)
+            .map_err(|e| e.to_string())
     }
 
     fn rms(&self, x: &CudaBuffer, w: &CudaBuffer, out: &CudaBuffer, rows: usize, cols: usize) -> Result<(), String> {
@@ -344,39 +349,14 @@ impl CudaQwen35 {
         k::l2norm_bf16_into(&self.ctx, x, out, rows, cols, 1e-6f32, scale).map_err(|e| e.to_string())
     }
 
-    fn fill_beta_g(&self, l: usize, a_log: &[f32], dt_bias: &[f32]) -> Result<(), String> {
-        let n = l * self.nv;
-        let mut ha = vec![0u8; n * 2];
-        let mut hb = vec![0u8; n * 2];
-        self.ws.a.copy_to_host(&mut ha)?;
-        self.ws.b.copy_to_host(&mut hb)?;
-        let mut beta = Vec::with_capacity(n);
-        let mut g = Vec::with_capacity(n);
-        for t in 0..l {
-            for h in 0..self.nv {
-                let idx = t * self.nv + h;
-                let ai = bf16::from_le_bytes([ha[idx * 2], ha[idx * 2 + 1]]).to_f32();
-                let bi = bf16::from_le_bytes([hb[idx * 2], hb[idx * 2 + 1]]).to_f32();
-                let act = ai + dt_bias[h];
-                let sp = if act > 20.0 { act } else { (1.0 + act.exp()).ln() };
-                let gv = -a_log[h].exp() * sp;
-                let bv = 1.0 / (1.0 + (-bi).exp());
-                beta.push(bf16::from_f32(bv));
-                g.push(bf16::from_f32(gv));
-            }
-        }
-        self.ws.beta.copy_from_host(&bf16_bytes(&beta))?;
-        self.ws.g.copy_from_host(&bf16_bytes(&g))?;
-        Ok(())
-    }
 
     fn mlp_run(&self, mlp: &GpuMlp, post_w: &CudaBuffer, l: usize) -> Result<(), String> {
         self.rms(&self.ws.x, post_w, &self.ws.xn2, l, self.hidden)?;
-        self.deq_gemm(&mlp.gate, l, &self.ws.xn2, &self.ws.mlp_gate)?;
-        self.deq_gemm(&mlp.up, l, &self.ws.xn2, &self.ws.mlp_up)?;
+        self.gemm_q4(&mlp.gate, l, &self.ws.xn2, &self.ws.mlp_gate)?;
+        self.gemm_q4(&mlp.up, l, &self.ws.xn2, &self.ws.mlp_up)?;
         k::silu_bf16_into(&self.ctx, &self.ws.mlp_gate, &self.ws.mlp_gate, (l * self.inter) as usize).map_err(|e| e.to_string())?;
         k::mul_bf16_into(&self.ctx, &self.ws.mlp_gate, &self.ws.mlp_up, &self.ws.mlp_hid, (l * self.inter) as usize).map_err(|e| e.to_string())?;
-        self.deq_gemm(&mlp.down, l, &self.ws.mlp_hid, &self.ws.mlp_down)?;
+        self.gemm_q4(&mlp.down, l, &self.ws.mlp_hid, &self.ws.mlp_down)?;
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.mlp_down, (l * self.hidden) as usize).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -385,17 +365,17 @@ impl CudaQwen35 {
         self.rms(&self.ws.x, &layer.in_norm_w, &self.ws.xn, l, self.hidden)?;
         if dump0 { self.dump_buf(&self.ws.xn, "xn", l * self.hidden * 2); }
         // QKV + conv
-        self.deq_gemm(&layer.in_qkv, l, &self.ws.xn, &self.ws.qkv)?;
-        if dump0 { self.dump_buf(&self.ws.big_deq, "Wqkv", layer.in_qkv.inp * layer.in_qkv.out * 2); self.dump_buf(&self.ws.qkv, "qkv", l * self.conv_dim * 2); }
+        self.gemm_q4(&layer.in_qkv, l, &self.ws.xn, &self.ws.qkv)?;
+        if dump0 { self.dump_buf(&self.ws.qkv, "qkv", l * self.conv_dim * 2); }
         k::conv_silu_bf16_into(&self.ctx, &self.ws.qkv, &layer.conv_w, &self.ws.conv, l, self.conv_dim).map_err(|e| e.to_string())?;
         if dump0 { self.dump_buf(&self.ws.conv, "conv", l * self.conv_dim * 2); }
         // z, a, b
-        self.deq_gemm(&layer.in_z, l, &self.ws.xn, &self.ws.z)?;
+        self.gemm_q4(&layer.in_z, l, &self.ws.xn, &self.ws.z)?;
         if dump0 { self.dump_buf(&self.ws.z, "z", l * self.nv * self.vd * 2); }
         self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
         self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
         if dump0 { self.dump_buf(&self.ws.a, "a", l * self.nv * 2); self.dump_buf(&self.ws.b, "b", l * self.nv * 2); }
-        self.fill_beta_g(l, &layer.a_log, &layer.dt_bias)?;
+        k::beta_g_bf16(&self.ctx, &self.ws.a, &self.ws.b, &layer.a_log, &layer.dt_bias, &self.ws.beta, &self.ws.g, l * self.nv, self.nv).map_err(|e| e.to_string())?;
         if dump0 { self.dump_buf(&self.ws.beta, "beta", l * self.nv * 2); self.dump_buf(&self.ws.g, "g", l * self.nv * 2); }
         // split conv -> q/k expanded + v
         k::conv_split_bf16_into(
@@ -424,7 +404,7 @@ impl CudaQwen35 {
         if dump0 { self.dump_buf(&self.ws.z, "o_gated", l * self.nv * self.vd * 2); }
         // out projection + residual
         match &layer.out_proj {
-            GpuOutProj::Q4(q) => self.deq_gemm(q, l, &self.ws.z, &self.ws.o_out)?,
+            GpuOutProj::Q4(q) => self.gemm_q4(q, l, &self.ws.z, &self.ws.o_out)?,
             GpuOutProj::Dense(b) => self.gemm(l, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
         }
         if dump0 { self.dump_buf(&self.ws.o_out, "out_proj", l * self.hidden * 2); }
@@ -436,9 +416,9 @@ impl CudaQwen35 {
     fn full_layer(&self, layer: &GpuFull, l: usize, _dump0: bool) -> Result<(), String> {
         self.rms(&self.ws.x, &layer.in_norm_w, &self.ws.xn, l, self.hidden)?;
         let hdim = self.head_dim;
-        self.deq_gemm(&layer.wq, l, &self.ws.xn, &self.ws.qg)?;
-        self.deq_gemm(&layer.wk, l, &self.ws.xn, &self.ws.kn)?; // kn buffer [L*kv*hd]
-        self.deq_gemm(&layer.wv, l, &self.ws.xn, &self.ws.attn_v)?;
+        self.gemm_q4(&layer.wq, l, &self.ws.xn, &self.ws.qg)?;
+        self.gemm_q4(&layer.wk, l, &self.ws.xn, &self.ws.kn)?; // kn buffer [L*kv*hd]
+        self.gemm_q4(&layer.wv, l, &self.ws.xn, &self.ws.attn_v)?;
         k::qg_split_bf16_into(&self.ctx, &self.ws.qg, &self.ws.q, &self.ws.gate, (l * self.heads * hdim) as usize, self.heads, hdim).map_err(|e| e.to_string())?;
         // per-head q/k norm + partial RoPE
         self.rms(&self.ws.q, &layer.q_norm_w, &self.ws.qn, l * self.heads, hdim)?;
@@ -452,7 +432,7 @@ impl CudaQwen35 {
             &self.ws.attn_out, l, self.heads, self.kv_heads, hdim,
         ).map_err(|e| e.to_string())?;
         // o projection + residual
-        self.deq_gemm(&layer.wo, l, &self.ws.attn_out, &self.ws.o_out)?;
+        self.gemm_q4(&layer.wo, l, &self.ws.attn_out, &self.ws.o_out)?;
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, (l * self.hidden) as usize).map_err(|e| e.to_string())?;
         // MLP
         self.mlp_run(&layer.mlp, &layer.post_norm_w, l)

@@ -600,3 +600,34 @@ extern "C" cudaError_t apxinf_qwen_l2norm_bf16(
       static_cast<__nv_bfloat16*>(out), rows, cols, eps, scale);
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t apxinf_qwen_gemm_w4a16_bf16(
+    const void* a, const void* packed, const void* scale, const void* zp,
+    void* c, int m, int n, int k, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0) return cudaErrorInvalidValue;
+  dim3 grid((n + QW4_BN - 1) / QW4_BN, (m + QW4_BM - 1) / QW4_BM);
+  qwen_gemm_w4a16_bf16_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const int32_t*>(packed),
+      static_cast<const __nv_bfloat16*>(scale),
+      static_cast<const int32_t*>(zp),
+      static_cast<__nv_bfloat16*>(c), m, n, k);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen_beta_g_bf16(
+    const void* a, const void* b, const void* a_log, const void* dt_bias,
+    void* beta, void* g, int total, int nv, cudaStream_t stream) {
+  if (total <= 0 || nv <= 0) return cudaErrorInvalidValue;
+  int threads = 256;
+  int64_t blocks64 = ((int64_t)total + threads - 1) / threads;
+  int blocks = blocks64 > (1 << 20) ? (1 << 20) : (int)blocks64;
+  qwen_beta_g_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const __nv_bfloat16*>(b),
+      static_cast<const float*>(a_log),
+      static_cast<const float*>(dt_bias),
+      static_cast<__nv_bfloat16*>(beta),
+      static_cast<__nv_bfloat16*>(g), total, nv);
+  return cudaGetLastError();
+}

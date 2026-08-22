@@ -335,3 +335,72 @@ pub fn l2norm_bf16_into(
     })
     .map_err(Error::Cuda)
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_w4a16_bf16(
+    ctx: &CudaContext,
+    a: &CudaBuffer,
+    packed: &CudaBuffer,
+    scale: &CudaBuffer,
+    zp: &CudaBuffer,
+    c: &CudaBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "a", dev, a, m * k * 2)?;
+    need(ctx, "packed", dev, packed, n * k.div_ceil(8) * 4)?;
+    need(ctx, "scale", dev, scale, n * (k / 32) * 2)?;
+    need(ctx, "zp", dev, zp, n.div_ceil(8) * (k / 32) * 4)?;
+    need(ctx, "c", dev, c, m * n * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_gemm_w4a16_bf16(
+            a.ptr(),
+            packed.ptr(),
+            scale.ptr(),
+            zp.ptr(),
+            c.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn beta_g_bf16(
+    ctx: &CudaContext,
+    a: &CudaBuffer,
+    b: &CudaBuffer,
+    a_log: &CudaBuffer,
+    dt_bias: &CudaBuffer,
+    beta: &CudaBuffer,
+    g: &CudaBuffer,
+    total: usize,
+    nv: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "a", dev, a, total * 2)?;
+    need(ctx, "b", dev, b, total * 2)?;
+    need(ctx, "a_log", dev, a_log, nv * 4)?;
+    need(ctx, "dt_bias", dev, dt_bias, nv * 4)?;
+    need(ctx, "beta", dev, beta, total * 2)?;
+    need(ctx, "g", dev, g, total * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_beta_g_bf16(
+            a.ptr(),
+            b.ptr(),
+            a_log.ptr(),
+            dt_bias.ptr(),
+            beta.ptr(),
+            g.ptr(),
+            total as i32,
+            nv as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}

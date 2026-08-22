@@ -284,3 +284,110 @@ __global__ void qwen_l2norm_bf16_kernel(
     out[(int64_t)row * cols + j] = q35_b16(v * rstd);
   }
 }
+
+// ── INT4 W4A16 native GEMM (dequant fused into the GEMM) ────────────────
+// C[M,N] = A[M,K] @ Wt[N,K]^T, where Wt is packed int4 with per-group scale
+// and packed zero points (AWQ). All product dims here are multiples of 64,
+// 32 (group) and 8 (nibble); guards are kept for safety.
+// Tile: BM=32, BN=64, BK=64. A and the dequantized W tile live in shared.
+
+#define QW4_BM 32
+#define QW4_BN 64
+#define QW4_BK 64
+
+__global__ void qwen_gemm_w4a16_bf16_kernel(
+    const __nv_bfloat16* a,     // [M, K]
+    const int32_t* packed,      // [N, K/8]
+    const __nv_bfloat16* scale, // [N, K/32]
+    const int32_t* zp,          // [N/8, K/32]
+    __nv_bfloat16* c,           // [M, N]
+    int M, int N, int K) {
+  const int groups = K / 32;
+  const int packed_cols = K / 8;
+  __shared__ __nv_bfloat16 A_s[QW4_BM][QW4_BK];
+  __shared__ __nv_bfloat16 W_s[QW4_BN][QW4_BK];
+
+  const int n0 = blockIdx.x * QW4_BN;
+  const int m0 = blockIdx.y * QW4_BM;
+  const int tid = threadIdx.x;
+
+  float acc[8];
+  int ml[8], nl[8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    int e = tid + i * 256;
+    ml[i] = e >> 6;   // /64
+    nl[i] = e & 63;   // %64
+    acc[i] = 0.0f;
+  }
+
+  for (int k0 = 0; k0 < K; k0 += QW4_BK) {
+    // Cooperative A tile load: A_s[BM][BK]
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      int e = tid + i * 256;
+      int mm = e >> 6;
+      int kk = e & 63;
+      int mg = m0 + mm;
+      int kg = k0 + kk;
+      A_s[mm][kk] = (mg < M && kg < K)
+          ? a[(int64_t)mg * K + kg]
+          : __float2bfloat16(0.0f);
+    }
+    // Cooperative dequant of the W tile into W_s[BN][BK]
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+      int e = tid + i * 256;
+      int nn = e >> 6;
+      int kk = e & 63;
+      int ng = n0 + nn;
+      int kg = k0 + kk;
+      if (ng < N && kg < K) {
+        int g = kg / 32;
+        float s = __bfloat162float(scale[(int64_t)ng * groups + g]);
+        int zpv = ((zp[((int64_t)ng / 8) * groups + g] >> (4 * (ng & 7))) & 0xF) - 8;
+        int w4 = ((packed[(int64_t)ng * packed_cols + kg / 8] >> (4 * (kg & 7))) & 0xF) - 8;
+        W_s[nn][kk] = __float2bfloat16(s * (float)(w4 - zpv));
+      } else {
+        W_s[nn][kk] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      float t = 0.0f;
+      #pragma unroll
+      for (int kk = 0; kk < QW4_BK; kk++) {
+        t += __bfloat162float(A_s[ml[i]][kk]) *
+             __bfloat162float(W_s[nl[i]][kk]);
+      }
+      acc[i] += t;
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    int mg = m0 + ml[i];
+    int ng = n0 + nl[i];
+    if (mg < M && ng < N) {
+      c[(int64_t)mg * N + ng] = __float2bfloat16(acc[i]);
+    }
+  }
+}
+
+// ── beta/g gate computation (replaces the host round-trip) ──────────────
+__global__ void qwen_beta_g_bf16_kernel(
+    const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const float* a_log, const float* dt_bias,
+    __nv_bfloat16* beta, __nv_bfloat16* g,
+    int total, int nv) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= total) return;
+  int h = e % nv;
+  float act = q35_bf16(a, e) + dt_bias[h];
+  float sp = act > 20.0f ? act : __logf(1.0f + __expf(act));
+  g[e] = q35_b16(-__expf(a_log[h]) * sp);
+  beta[e] = q35_b16(1.0f / (1.0f + __expf(-q35_bf16(b, e))));
+}
