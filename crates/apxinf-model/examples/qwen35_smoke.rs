@@ -19,6 +19,15 @@ fn main() {
     let logits = model.forward_last_logits(&prompt).expect("forward");
     eprintln!("8-token prefill forward in {:.2?}", t1.elapsed());
 
+    // Dump the full logits vector for cross-checking against the PyTorch
+    // reference (little-endian f32).
+    let mut buf: Vec<u8> = Vec::with_capacity(logits.len() * 4);
+    for v in &logits {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write("/tmp/rust_logits.bin", &buf).expect("write logits");
+    eprintln!("dumped {} logits to /tmp/rust_logits.bin", logits.len());
+
     let mut order: Vec<usize> = (0..logits.len()).collect();
     order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
     println!("top-5 next-token candidates:");
