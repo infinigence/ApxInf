@@ -13,7 +13,8 @@ fn main() {
     let ids = [248045u32, 8678, 198, 24342, 286, 4879, 369, 716];
     let t1 = Instant::now();
     let logits = m.forward_last_logits(&ids).expect("forward");
-    eprintln!("[gpu] 8-token forward in {:.2?}", t1.elapsed());
+    let dt8 = t1.elapsed();
+    eprintln!("[gpu] 8-token forward in {dt8:.2?}");
 
     let mut order: Vec<usize> = (0..logits.len()).collect();
     order.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
@@ -26,4 +27,14 @@ fn main() {
     }
     std::fs::write("/tmp/gpu_logits.bin", &buf).expect("write logits");
     eprintln!("[gpu] dumped {} logits to /tmp/gpu_logits.bin", logits.len());
+
+    if std::env::var_os("Q35_L128").is_some() {
+        let mut long: Vec<u32> = Vec::with_capacity(128);
+        for i in 0..128 {
+            long.push(ids[i % ids.len()]);
+        }
+        let t2 = Instant::now();
+        let _ = m.forward_last_logits(&long).expect("forward l128");
+        eprintln!("[gpu] 128-token forward in {:.2?}", t2.elapsed());
+    }
 }

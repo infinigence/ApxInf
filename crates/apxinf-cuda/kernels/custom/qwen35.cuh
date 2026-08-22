@@ -3,6 +3,7 @@
 // adapters/custom_kernels.cu; safe Rust wrappers in kernels/qwen35.rs.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 __device__ __forceinline__ float q35_bf16(const __nv_bfloat16* p, size_t i) {
@@ -135,19 +136,31 @@ __global__ void qwen_partial_rope_bf16_kernel(
 __global__ void qwen_conv_silu_bf16_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* w,
     __nv_bfloat16* out, int L, int conv_dim) {
-  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t total = (int64_t)L * conv_dim;
-  if (e >= total) return;
-  int t = (int)(e / conv_dim);
-  int c = (int)(e % conv_dim);
-  float acc = 0.0f;
-  for (int j = 0; j < 4; j++) {
-    if (t >= j) {
-      acc += q35_bf16(w, (int64_t)c * 4 + j) *
-             q35_bf16(x, (int64_t)(t - j) * conv_dim + c);
+  // Process two channels per thread (bf16x2), keeping explicit causal taps.
+  int64_t total = (int64_t)L * (conv_dim / 2);
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < total;
+       e += (int64_t)gridDim.x * blockDim.x) {
+    int t = (int)(e / (conv_dim / 2));
+    int cp = (int)(e % (conv_dim / 2));
+    int c0 = 2 * cp;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      if (t >= j) {
+        __nv_bfloat162 xv = *reinterpret_cast<const __nv_bfloat162*>(
+            &x[(int64_t)(t - j) * conv_dim + c0]);
+        float x0 = __bfloat162float(__low2bfloat16(xv));
+        float x1 = __bfloat162float(__high2bfloat16(xv));
+        float w0 = __bfloat162float(w[(int64_t)c0 * 4 + j]);
+        float w1 = __bfloat162float(w[(int64_t)(c0 + 1) * 4 + j]);
+        acc0 += w0 * x0;
+        acc1 += w1 * x1;
+      }
     }
+    out[(int64_t)t * conv_dim + c0] = q35_b16(acc0 / (1.0f + expf(-acc0)));
+    out[(int64_t)t * conv_dim + c0 + 1] = q35_b16(acc1 / (1.0f + expf(-acc1)));
   }
-  out[e] = q35_b16(acc / (1.0f + expf(-acc)));
 }
 
 // ── GatedDeltaNet recurrence (fp32 state) ───────────────────────────────
@@ -294,6 +307,8 @@ __global__ void qwen_l2norm_bf16_kernel(
 #define QW4_BM 32
 #define QW4_BN 64
 #define QW4_BK 64
+#define QW4_MT 4
+#define QW4_NT 2
 
 __global__ void qwen_gemm_w4a16_bf16_kernel(
     const __nv_bfloat16* a,     // [M, K]
@@ -304,75 +319,96 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
     int M, int N, int K) {
   const int groups = K / 32;
   const int packed_cols = K / 8;
-  __shared__ __nv_bfloat16 A_s[QW4_BM][QW4_BK];
-  __shared__ __nv_bfloat16 W_s[QW4_BN][QW4_BK];
+  __shared__ __nv_bfloat162 A_s[QW4_BM][QW4_BK / 2];
+  __shared__ __nv_bfloat162 W_s[QW4_BN][QW4_BK / 2];
 
   const int n0 = blockIdx.x * QW4_BN;
   const int m0 = blockIdx.y * QW4_BM;
   const int tid = threadIdx.x;
+  const int tx = tid & 31;            // 32 lanes across BN
+  const int ty = tid >> 5;            // 8 lanes across BM
+  const int ml0 = ty * QW4_MT;        // 4 consecutive rows
+  const int nl0 = tx * QW4_NT;        // 2 consecutive cols
 
-  float acc[8];
-  int ml[8], nl[8];
+  float acc[QW4_MT][QW4_NT];
   #pragma unroll
-  for (int i = 0; i < 8; i++) {
-    int e = tid + i * 256;
-    ml[i] = e >> 6;   // /64
-    nl[i] = e & 63;   // %64
-    acc[i] = 0.0f;
-  }
+  for (int r = 0; r < QW4_MT; r++)
+    #pragma unroll
+    for (int cv = 0; cv < QW4_NT; cv++) acc[r][cv] = 0.0f;
 
   for (int k0 = 0; k0 < K; k0 += QW4_BK) {
-    // Cooperative A tile load: A_s[BM][BK]
+    // Cooperative bf16x2 A tile load: A_s[32][32] = 1024 vec2, 4 / thread
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int e = tid + i * 256;
+      int mm = e >> 5;
+      int kk2 = e & 31;
+      int mg = m0 + mm;
+      int kg = k0 + 2 * kk2;
+      if (mg < M && kg + 1 < K) {
+        A_s[mm][kk2] = *reinterpret_cast<const __nv_bfloat162*>(&a[(int64_t)mg * K + kg]);
+      } else {
+        A_s[mm][kk2] = __floats2bfloat162_rn(0.0f, 0.0f);
+      }
+    }
+    // Cooperative dequant W tile: W_s[64][32] = 2048 vec2, 8 / thread
     #pragma unroll
     for (int i = 0; i < 8; i++) {
       int e = tid + i * 256;
-      int mm = e >> 6;
-      int kk = e & 63;
-      int mg = m0 + mm;
-      int kg = k0 + kk;
-      A_s[mm][kk] = (mg < M && kg < K)
-          ? a[(int64_t)mg * K + kg]
-          : __float2bfloat16(0.0f);
-    }
-    // Cooperative dequant of the W tile into W_s[BN][BK]
-    #pragma unroll
-    for (int i = 0; i < 16; i++) {
-      int e = tid + i * 256;
-      int nn = e >> 6;
-      int kk = e & 63;
+      int nn = e >> 5;
+      int kk2 = e & 31;
       int ng = n0 + nn;
-      int kg = k0 + kk;
-      if (ng < N && kg < K) {
+      int kg = k0 + 2 * kk2;
+      if (ng < N && kg + 1 < K) {
         int g = kg / 32;
-        float s = __bfloat162float(scale[(int64_t)ng * groups + g]);
+        float sc = __bfloat162float(scale[(int64_t)ng * groups + g]);
         int zpv = ((zp[((int64_t)ng / 8) * groups + g] >> (4 * (ng & 7))) & 0xF) - 8;
-        int w4 = ((packed[(int64_t)ng * packed_cols + kg / 8] >> (4 * (kg & 7))) & 0xF) - 8;
-        W_s[nn][kk] = __float2bfloat16(s * (float)(w4 - zpv));
+        int32_t pw0 = packed[(int64_t)ng * packed_cols + kg / 8];
+        int32_t pw1 = packed[(int64_t)ng * packed_cols + (kg + 1) / 8];
+        int w0 = ((pw0 >> (4 * (kg & 7))) & 0xF) - 8;
+        int w1 = ((pw1 >> (4 * ((kg + 1) & 7))) & 0xF) - 8;
+        W_s[nn][kk2] = __floats2bfloat162_rn(
+            sc * (float)(w0 - zpv), sc * (float)(w1 - zpv));
       } else {
-        W_s[nn][kk] = __float2bfloat16(0.0f);
+        W_s[nn][kk2] = __floats2bfloat162_rn(0.0f, 0.0f);
       }
     }
     __syncthreads();
 
+    // 4x2 register micro-tile over the K chunk (bf16x2 -> 2 FMAs each)
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      float t = 0.0f;
+    for (int kk2 = 0; kk2 < QW4_BK / 2; kk2++) {
+      float2 av[QW4_MT], wv[QW4_NT];
       #pragma unroll
-      for (int kk = 0; kk < QW4_BK; kk++) {
-        t += __bfloat162float(A_s[ml[i]][kk]) *
-             __bfloat162float(W_s[nl[i]][kk]);
+      for (int r = 0; r < QW4_MT; r++) {
+        __nv_bfloat162 v = A_s[ml0 + r][kk2];
+        av[r].x = __bfloat162float(__low2bfloat16(v));
+        av[r].y = __bfloat162float(__high2bfloat16(v));
       }
-      acc[i] += t;
+      #pragma unroll
+      for (int cv = 0; cv < QW4_NT; cv++) {
+        __nv_bfloat162 v = W_s[nl0 + cv][kk2];
+        wv[cv].x = __bfloat162float(__low2bfloat16(v));
+        wv[cv].y = __bfloat162float(__high2bfloat16(v));
+      }
+      #pragma unroll
+      for (int r = 0; r < QW4_MT; r++)
+        #pragma unroll
+        for (int cv = 0; cv < QW4_NT; cv++)
+          acc[r][cv] += av[r].x * wv[cv].x + av[r].y * wv[cv].y;
     }
     __syncthreads();
   }
 
   #pragma unroll
-  for (int i = 0; i < 8; i++) {
-    int mg = m0 + ml[i];
-    int ng = n0 + nl[i];
-    if (mg < M && ng < N) {
-      c[(int64_t)mg * N + ng] = __float2bfloat16(acc[i]);
+  for (int r = 0; r < QW4_MT; r++) {
+    int mg = m0 + ml0 + r;
+    #pragma unroll
+    for (int cv = 0; cv < QW4_NT; cv++) {
+      int ng = n0 + nl0 + cv;
+      if (mg < M && ng < N) {
+        c[(int64_t)mg * N + ng] = __float2bfloat16(acc[r][cv]);
+      }
     }
   }
 }
