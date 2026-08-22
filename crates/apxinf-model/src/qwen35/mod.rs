@@ -6,6 +6,8 @@
 pub mod config;
 pub mod cpu;
 pub mod dequant;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod safetensors_raw;
 pub mod weights;
 
