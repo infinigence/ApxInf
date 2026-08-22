@@ -28,6 +28,8 @@ single-stream policy inference rate.
 | Jetson AGX Thor | BF16 | 72.454 ms | 13.8 Hz |
 | Jetson AGX Thor | FP8 | **41.159 ms** | **24.3 Hz** |
 | Jetson AGX Orin | BF16 | 165.665 ms | 6.0 Hz |
+| RTX 4090 | BF16 | 36.77 ms | 27.2 Hz |
+| RTX 4090 | INT8 | 25.99 ms | 38.5 Hz |
 
 ### LIBERO accuracy
 
@@ -69,6 +71,7 @@ CUDA distribution appropriate for the machine. Known-good configurations are:
 | Jetson Thor | `sm_110` | CUDA 13.0 |
 | Thor-U | `sm_101` | CUDA 12.8 |
 | Jetson AGX Orin | `sm_87` | CUDA 12.6 and 13.2 |
+| RTX 4090 | `sm_89` | CUDA 12.8 |
 
 Set the toolkit path before building. On a native build, ApxInf queries the
 CUDA runtime and automatically selects the architecture of the visible GPU:
