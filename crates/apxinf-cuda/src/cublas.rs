@@ -184,7 +184,7 @@ impl CublasHandle {
                     stride_c,
                     batch_count,
                     ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    99, // CUBLAS_GEMM_DEFAULT
+                    113, // fixed tensor-op algo
                 ))
             },
             DType::F16 | DType::BF16 => {
@@ -387,7 +387,290 @@ impl CublasHandle {
             ))
         }
     }
+    /// Attention scores: row-major `C[b] = q[b] @ k^T` for GQA heads sharing
+    /// one k cache. `q` is [seq, k] per head (stride `stride_q` bytes),
+    /// `k_cache` is [n, k] row-major (shared, stride 0), `c` is
+    /// [seq, row_stride] per head (row_stride >= n; stride `stride_c`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gemm_kt(
+        &self,
+        m: usize, // q rows (seq)
+        n: usize, // k rows (visible)
+        k: usize, // head dim
+        alpha: f32,
+        q: &CudaBuffer,
+        stride_q: i64,
+        k_cache: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        row_stride: i64,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_T, // k_cache [n,k] -> k^T... k [visible,256]
+                ffi::cublasOperation_t::CUBLAS_OP_N, // q [seq, k]
+                n as i32,                             // m_i = visible
+                m as i32,                             // n_i = seq
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                k_cache.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                k as i32, // lda = k (k_cache row length)
+                0,
+                q.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                k as i32, // ldb = k (q row length)
+                stride_q,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                row_stride as i32, // ldc = allocated row stride
+                stride_c,
+                batch_count,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
+    /// Attention output: row-major `C[b] = p[b] @ v` for GQA heads sharing
+    /// one v cache. `p` is [seq, row_stride] per head (rows are row_stride
+    /// long, only the first `k` = visible used), `v` is [k, n] row-major,
+    /// `c` is [seq, n] per head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gemm_pv(
+        &self,
+        m: usize, // seq
+        n: usize, // head dim
+        k: usize, // visible
+        alpha: f32,
+        p: &CudaBuffer,
+        row_stride: i64,
+        stride_p: i64,
+        v: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_N, // v [k, n]
+                ffi::cublasOperation_t::CUBLAS_OP_N, // p^T [k, seq] from [seq, row_stride]
+                n as i32,                             // m_i = head_dim
+                m as i32,                             // n_i = seq
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                v.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                n as i32, // lda = v row length
+                0,
+                p.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                row_stride as i32, // ldb = p allocated row stride
+                stride_p,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                n as i32, // ldc = head dim
+                stride_c,
+                batch_count,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
+
+    /// Pointer-array batched GEMM (cublasGemmBatchedEx). All pointer arrays
+    /// are device buffers of `batch_count` 8-byte pointers. The same
+    /// column-major swap as `gemm`/`batched_gemm` applies: for row-major
+    /// C = A @ B, pass transa/transb for B/A and lda/ldb/ldc as the row
+    /// lengths of the respective storages.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched_ex(
+        &self,
+        trans_a: ffi::cublasOperation_t,
+        trans_b: ffi::cublasOperation_t,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a_ptrs: &CudaBuffer,
+        lda: i32,
+        b_ptrs: &CudaBuffer,
+        ldb: i32,
+        beta: f32,
+        c_ptrs: &CudaBuffer,
+        ldc: i32,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmBatchedEx(
+                self.handle,
+                trans_a,
+                trans_b,
+                m as i32,
+                n as i32,
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                a_ptrs.ptr() as *const *const c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                lda,
+                b_ptrs.ptr() as *const *const c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                ldb,
+                beta_bytes.as_ptr() as *const c_void,
+                c_ptrs.ptr() as *mut *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                ldc,
+                batch_count,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
+
+    /// BF16 GEMM with an explicit row stride for A: row-major
+    /// C[m, n] = A[m, k] @ B[k, n] where A's rows are `lda` elements apart
+    /// (lda >= k). B and C are dense.
+    pub fn gemm_ld(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        b: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                n as i32,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                lda,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                ldc,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
+
+    /// BF16 inputs, F32 output GEMM with explicit strides:
+    /// C[m, n] = A[m, k] @ B[k, n] (A/B bf16, C f32, f32 accumulate).
+    pub fn gemm_bf16_f32(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        b: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                n as i32,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                lda,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
+    /// F32 A times BF16 B, F32 output: C[m, n] = A[m, k] @ B[k, n].
+    pub fn gemm_f32_bf16(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        b: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+    ) -> Result<(), String> {
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                alpha_bytes.as_ptr() as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                n as i32,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_32F,
+                lda,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
 }
+
 
 impl Drop for CublasHandle {
     fn drop(&mut self) {
@@ -397,4 +680,6 @@ impl Drop for CublasHandle {
             }
         }
     }
+
 }
+

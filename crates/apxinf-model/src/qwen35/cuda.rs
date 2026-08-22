@@ -25,7 +25,7 @@ use apxinf_cuda::{CudaBackend, CudaContext};
 use super::{LayerKind, Qwen35Config};
 
 /// Prefill chunk size: bounds all activation workspace buffers.
-const CHUNK: usize = 2048;
+const CHUNK: usize = 512;
 /// KV cache rows per full-attention layer. The base evaluation never
 /// exceeds 16384 prompt tokens + 128 output; 16640 leaves a small margin
 /// while freeing ~1 GB of VRAM versus the declared 32768 (longer requests
@@ -117,6 +117,11 @@ pub struct Qwen35Cuda {
     b: CudaBuffer,
     delta_out: CudaBuffer,
     qk_scratch: CudaBuffer,
+    attn_scores: CudaBuffer,
+    attn_l: CudaBuffer,
+    attn_kt: CudaBuffer,
+    attn_p: CudaBuffer,
+    attn_pv: CudaBuffer,
     gated: CudaBuffer,
     attn: CudaBuffer,
     attn2: CudaBuffer,
@@ -378,6 +383,31 @@ impl Qwen35Cuda {
             b: ws(CHUNK, 48)?,
             delta_out: ws(CHUNK, 6144)?,
             qk_scratch: ws(CHUNK, 4096)?, // 16 k_heads * 2 * 128 kdim bf16
+            attn_scores: CudaBuffer::alloc_zeros(
+                6 * CHUNK * MAX_SEQ_LEN * 4,
+                device,
+            )
+            .map_err(|e| Error::Other(format!("attn scores alloc: {e}")))?,
+            attn_l: CudaBuffer::alloc_zeros(
+                CHUNK * tc.n_heads * 4,
+                device,
+            )
+            .map_err(|e| Error::Other(format!("attn l alloc: {e}")))?,
+            attn_kt: CudaBuffer::alloc_zeros(
+                tc.n_kv_heads * tc.head_dim * MAX_SEQ_LEN * 2,
+                device,
+            )
+            .map_err(|e| Error::Other(format!("attn kt alloc: {e}")))?,
+            attn_p: CudaBuffer::alloc_zeros(
+                6 * CHUNK * MAX_SEQ_LEN * 2,
+                device,
+            )
+            .map_err(|e| Error::Other(format!("attn p alloc: {e}")))?,
+            attn_pv: CudaBuffer::alloc_zeros(
+                CHUNK * tc.n_heads * tc.head_dim * 4,
+                device,
+            )
+            .map_err(|e| Error::Other(format!("attn pv alloc: {e}")))?,
             gated: ws(CHUNK, 6144)?,
             attn: ws(CHUNK, tc.n_heads * tc.head_dim)?,
             attn2: ws(CHUNK, hidden)?,
@@ -788,30 +818,108 @@ impl Qwen35Cuda {
         }
 
         if l == 3 {
-            trace_buf("f3_vcache", &run.v_cache, 11 * self.n_kv_heads * self.head_dim);
-            trace_buf("f3_kcache", &run.k_cache, 11 * self.n_kv_heads * self.head_dim);
+            trace_buf("f3g_vcache", &run.v_cache, 11 * self.n_kv_heads * self.head_dim);
+            trace_buf("f3g_kcache", &run.k_cache, 11 * self.n_kv_heads * self.head_dim);
         }
-        // Causal flash attention — one kernel for decode (seq=1, visible =
-        // start_pos + 1) and prefill chunks. Supports head_dim=256 (the
-        // legacy decode kernel only handles 64/128).
-        kernels::qwen35::flash_prefill(
+        // Attention: decode steps (seq=1) use the proven fused flash
+        // kernel; prefill chunks use GEMM-based scores = q @ k^T, causal
+        // softmax, then out = sigmoid(gate) * (p @ v) / l.
+        let visible = start_pos as usize + seq;
+        if seq == 1 {
+            kernels::qwen35::flash_prefill(
+                ctx,
+                &self.q_buf,
+                &run.k_cache,
+                &run.v_cache,
+                &self.attn,
+                seq,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                1.0 / (self.head_dim as f32).sqrt(),
+                start_pos,
+                MAX_SEQ_LEN,
+            )?;
+            kernels::qwen35::sigmoid_mul(
+                ctx,
+                &self.gate_buf,
+                &self.attn,
+                &self.attn,
+                seq * self.n_heads * self.head_dim,
+            )?;
+            if l == 3 {
+                trace_buf("f3_attn_pre", &self.attn, seq * self.n_heads * self.head_dim);
+            }
+        } else {
+        let per_kv = self.n_heads / self.n_kv_heads;
+        for kv in 0..self.n_kv_heads {
+            let k_slice = run.k_cache.len() / self.n_kv_heads;
+            let k_view = run
+                .k_cache
+                .view(kv * k_slice, k_slice)
+                .map_err(Error::Cuda)?;
+            let v_slice = run.v_cache.len() / self.n_kv_heads;
+            let v_view = run
+                .v_cache
+                .view(kv * v_slice, v_slice)
+                .map_err(Error::Cuda)?;
+            kernels::qwen35::attention_gqa_dot(
+                ctx,
+                &self.q_buf,
+                &k_view,
+                &self.attn_kt,
+                &self.attn_scores,
+                kv,
+                seq,
+                visible,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                MAX_SEQ_LEN,
+            )?;
+            kernels::qwen35::attention_softmax_rows(
+                ctx,
+                &self.attn_scores,
+                &self.attn_p,
+                &self.attn_l,
+                kv * per_kv,
+                seq,
+                per_kv,
+                visible,
+                MAX_SEQ_LEN,
+                start_pos,
+                1.0 / (self.head_dim as f32).sqrt(),
+            )?;
+            kernels::qwen35::attention_gqa_pv(
+                ctx,
+                &self.attn_p,
+                &v_view,
+                &self.attn_pv,
+                kv,
+                seq,
+                visible,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                MAX_SEQ_LEN,
+            )?;
+        }
+        if l == 3 {
+            trace_buf_f32("f3g_scores_f32", &self.attn_scores, 6 * seq * MAX_SEQ_LEN);
+            trace_buf("f3g_p_bf16", &self.attn_p, 6 * seq * MAX_SEQ_LEN);
+        }
+        if l == 3 {
+            trace_buf_f32("f3g_pv_f32", &self.attn_pv, seq * self.n_heads * self.head_dim);
+        }
+        kernels::qwen35::scale_out(
             ctx,
-            &self.q_buf,
-            &run.k_cache,
-            &run.v_cache,
+            &self.attn_pv,
+            &self.attn_l,
             &self.attn,
             seq,
             self.n_heads,
-            self.n_kv_heads,
             self.head_dim,
-            1.0 / (self.head_dim as f32).sqrt(),
-            start_pos,
-            MAX_SEQ_LEN,
         )?;
-        if l == 3 {
-            trace_buf("f3_attn_pre", &self.attn, seq * self.n_heads * self.head_dim);
-        }
-
         kernels::qwen35::sigmoid_mul(
             ctx,
             &self.gate_buf,
@@ -819,8 +927,9 @@ impl Qwen35Cuda {
             &self.attn,
             seq * self.n_heads * self.head_dim,
         )?;
-        if l == 3 {
-            trace_buf("f3_attn_post", &self.attn, seq * self.n_heads * self.head_dim);
+            if l == 3 {
+                trace_buf("f3_attn_pre", &self.attn, seq * self.n_heads * self.head_dim);
+            }
         }
         gemm_run(ctx, &run.o, &self.attn, &self.attn2, seq, &self.dense_scratch)?;
         if l == 3 {
@@ -1152,6 +1261,20 @@ fn upload_bf16_flat(
     let buf = CudaBuffer::alloc(bf16.len(), device).map_err(Error::Cuda)?;
     buf.copy_from_host(&bf16).map_err(Error::Cuda)?;
     Ok(buf)
+}
+
+/// Debug: copy an f32 GPU buffer to /tmp/qwen35_trace/<name>.f32 when APXINF_TRACE is set.
+fn trace_buf_f32(name: &str, buf: &CudaBuffer, count: usize) {
+    if std::env::var_os("APXINF_TRACE").is_none() {
+        return;
+    }
+    let dir = std::path::Path::new("/tmp/qwen35_trace");
+    let _ = std::fs::create_dir_all(dir);
+    let mut bytes = vec![0u8; count * 4];
+    if buf.copy_to_host(&mut bytes).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{name}.f32")), bytes);
 }
 
 /// Debug: copy a GPU buffer to /tmp/qwen35_trace/<name>.f32 when APXINF_TRACE is set.

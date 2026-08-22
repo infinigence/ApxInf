@@ -673,3 +673,45 @@ extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16(
       static_cast<__nv_bfloat16*>(output), in_cols, out_cols, groups);
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t apxinf_qwen35_attention_softmax_rows(
+    const void* scores, void* p_out, void* l_out, int head_base, int seq,
+    int heads, int visible, int row_stride, int start_pos, float scale,
+    cudaStream_t stream) {
+  if (scores == nullptr || p_out == nullptr || l_out == nullptr || seq <= 0 ||
+      heads <= 0 || visible <= 0 || row_stride < visible || start_pos < 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, heads);
+  qwen35_attention_softmax_rows_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<const float*>(scores),
+      static_cast<__nv_bfloat16*>(p_out), static_cast<float*>(l_out),
+      head_base, seq, heads, visible, row_stride, start_pos, scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_scale_out(
+    const void* pv, const void* l, void* out, int seq, int heads,
+    int head_dim, cudaStream_t stream) {
+  if (pv == nullptr || l == nullptr || out == nullptr || seq <= 0 ||
+      heads <= 0 || head_dim <= 0 || head_dim > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, heads);
+  qwen35_scale_out_kernel<<<grid, head_dim, 0, stream>>>(
+      static_cast<const float*>(pv), static_cast<const float*>(l),
+      static_cast<__nv_bfloat16*>(out), seq, heads, head_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_transpose_kt(
+    const void* k, void* kt, int visible, int head_dim, cudaStream_t stream) {
+  if (k == nullptr || kt == nullptr || visible <= 0 || head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid((head_dim + 31) / 32, (visible + 31) / 32);
+  qwen35_transpose_kt_kernel<<<grid, dim3(32, 32), 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(k), static_cast<__nv_bfloat16*>(kt),
+      visible, head_dim);
+  return cudaGetLastError();
+}

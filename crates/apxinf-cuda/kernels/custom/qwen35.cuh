@@ -592,3 +592,78 @@ __global__ void qwen35_flash_prefill_kernel(
         __float2bfloat16(acc_global * inv_l);
   }
 }
+
+
+
+// ── KV transpose for the batched attention scores GEMM ─────────────────────
+// k: [visible, head_dim] bf16 -> kt: [head_dim, visible] bf16.
+__global__ void qwen35_transpose_kt_kernel(
+    const __nv_bfloat16* k, __nv_bfloat16* kt, int visible, int head_dim) {
+  const int d = blockIdx.x * 32 + threadIdx.x;
+  const int t = blockIdx.y * 32 + threadIdx.y;
+  if (d < head_dim && t < visible) kt[d * visible + t] = k[t * head_dim + d];
+}
+
+// ── GEMM-based GQA attention helpers ───────────────────────────────────────
+// The scores matrix is produced by strided-batched cublas GEMMs; these
+// kernels finish the softmax and the gate/scale fusion on the GPU.
+
+// scores: [heads, seq, visible] bf16 (q@k^T, unscaled)
+// l_out:  [heads, seq] f32 row sums of the softmax weights
+// grid: (seq, heads); block: 256 threads sweep `visible` twice.
+__global__ void qwen35_attention_softmax_rows_kernel(
+    const float* scores, __nv_bfloat16* p_out, float* l_out, int head_base,
+    int seq, int heads, int visible, int row_stride, int start_pos,
+    float scale) {
+  const int s = blockIdx.x;
+  const int h_local = blockIdx.y;
+  const int h = head_base + h_local;
+  const int tid = threadIdx.x;
+  const int row = h * seq + s;
+  const int local_row = h_local * seq + s;
+  const int valid = start_pos + s + 1;  // causal boundary for this row
+  const float* row_ptr = scores + local_row * row_stride;
+  __nv_bfloat16* p_row = p_out + local_row * row_stride;
+
+  // Pass 1: row max over t < valid.
+  float m = -INFINITY;
+  for (int t = tid; t < valid; t += 256)
+    m = fmaxf(m, row_ptr[t]);
+  for (int off = 16; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+  __shared__ float s_warp_max[8];
+  if (tid % 32 == 0) s_warp_max[tid / 32] = m;
+  __syncthreads();
+  for (int w = 0; w < 8; w++) m = fmaxf(m, s_warp_max[w]);
+  __syncthreads();
+
+  // Pass 2: exp((x - m) * scale), write bf16 p, accumulate l.
+  float l = 0.0f;
+  for (int t = tid; t < valid; t += 256) {
+    const float p = __expf((row_ptr[t] - m) * scale);
+    p_row[t] = __float2bfloat16(p);
+    l += p;
+  }
+  for (int off = 16; off > 0; off >>= 1)
+    l += __shfl_xor_sync(0xffffffff, l, off);
+  __shared__ float s_warp_l[8];
+  if (tid % 32 == 0) s_warp_l[tid / 32] = l;
+  __syncthreads();
+  l = 0.0f;
+  for (int w = 0; w < 8; w++) l += s_warp_l[w];
+  if (tid == 0) l_out[row] = (l > 0.0f) ? l : 0.0f;
+}
+
+// attn_bf16 = bf16(pv / l) per row; pv/l are f32, out is [seq, heads, dim].
+__global__ void qwen35_scale_out_kernel(
+    const float* pv, const float* l, __nv_bfloat16* out, int seq, int heads,
+    int head_dim) {
+  const int s = blockIdx.x;
+  const int h = blockIdx.y;
+  const int d = threadIdx.x;
+  const int row = h * seq + s;
+  const int idx = (s * heads + h) * head_dim + d;
+  const float inv_l = (l[row] > 0.0f) ? (1.0f / l[row]) : 0.0f;
+  out[idx] = __float2bfloat16(pv[idx] * inv_l);
+}
+

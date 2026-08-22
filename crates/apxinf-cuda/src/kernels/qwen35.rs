@@ -1,11 +1,41 @@
 //! Qwen3.5 hybrid linear-attention kernel contracts (bf16).
 
-use apxinf_core::{Error, Result};
+use apxinf_core::{DType, Error, Result};
 
 use super::contracts::check_cuda;
 use crate::buffer::{CudaBuffer, HostMappedBuffer};
 use crate::context::CudaContext;
 use crate::ffi;
+
+fn kernel_prof(ctx: &CudaContext, name: &str) -> Option<ffi::cudaEvent_t> {
+    if std::env::var_os("APXINF_KERNEL_PROF").is_none() {
+        return None;
+    }
+    let mut e0: ffi::cudaEvent_t = std::ptr::null_mut();
+    unsafe {
+        ffi::check_cuda(ffi::cudaEventCreate(&mut e0)).ok()?;
+        ffi::check_cuda(ffi::cudaEventRecord(e0, ctx.stream().handle())).ok()?;
+    }
+    Some(e0)
+}
+
+fn kernel_prof_end(ctx: &CudaContext, name: &str, e0: ffi::cudaEvent_t) {
+    let mut e1: ffi::cudaEvent_t = std::ptr::null_mut();
+    unsafe {
+        if ffi::check_cuda(ffi::cudaEventCreate(&mut e1)).is_err() {
+            return;
+        }
+        ffi::check_cuda(ffi::cudaEventRecord(e1, ctx.stream().handle())).ok();
+        ffi::check_cuda(ffi::cudaEventSynchronize(e1)).ok();
+        let mut ms: f32 = 0.0;
+        ffi::check_cuda(ffi::cudaEventElapsedTime(&mut ms, e0, e1)).ok();
+        if ms > 0.05 {
+            eprintln!("[kernel] {name} : {ms:.3} ms");
+        }
+        ffi::check_cuda(ffi::cudaEventDestroy(e0)).ok();
+        ffi::check_cuda(ffi::cudaEventDestroy(e1)).ok();
+    }
+}
 
 /// Argmax over `count` bf16 logits; writes the winning index to the mapped
 /// buffer. The caller synchronizes before reading it back.
@@ -44,7 +74,8 @@ pub fn silu_mul(
     if gate.len() < bytes || up.len() < bytes || out.len() < bytes {
         return Err(Error::Other("silu_mul: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "silu_mul");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_silu_mul(
             gate.ptr(),
             up.ptr(),
@@ -52,7 +83,11 @@ pub fn silu_mul(
             count as i64,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "silu_mul", ev);
+    }
+    prof_result
 }
 /// Causal depthwise conv + SiLU with carry state.
 /// `input` is `[seq, channels]` bf16, `weight` `[channels, kernel]` bf16,
@@ -86,7 +121,8 @@ pub fn conv_silu(
     if input.len() < bytes_in || weight.len() < bytes_w || state.len() < bytes_state {
         return Err(Error::Other("conv_silu: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "conv_silu");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_conv_silu(
             input.ptr(),
             weight.ptr(),
@@ -97,7 +133,11 @@ pub fn conv_silu(
             kernel as i32,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "conv_silu", ev);
+    }
+    prof_result
 }
 
 /// Normalizes q/k per (token, k_head) in a parallel prepass; `qk_out` is
@@ -122,7 +162,8 @@ pub fn delta_norm_prepass(
     if qk_out.len() < required {
         return Err(Error::Other("delta_norm_prepass: qk_out buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "delta_norm_prepass");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_delta_norm_prepass(
             qkv.ptr(),
             qk_out.ptr(),
@@ -133,7 +174,11 @@ pub fn delta_norm_prepass(
             vdim as i32,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "delta_norm_prepass", ev);
+    }
+    prof_result
 }
 
 /// Gated delta-rule recurrence (one launch sweeps the whole sequence).
@@ -202,7 +247,8 @@ pub fn delta_step(
     {
         return Err(Error::Other("delta_step: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "delta_step");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_delta_step(
             qkv.ptr(),
             qk_norm.ptr(),
@@ -219,7 +265,11 @@ pub fn delta_step(
             vdim as i32,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "delta_step", ev);
+    }
+    prof_result
 }
 
 /// Gated RMSNorm: `out = rms_norm(input) * weight * silu(z)` per head row.
@@ -248,7 +298,8 @@ pub fn gated_norm(
     if input.len() < bytes_row || z.len() < bytes_row || out.len() < bytes_row || weight.len() < bytes_w {
         return Err(Error::Other("gated_norm: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "gated_norm");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_gated_norm(
             input.ptr(),
             z.ptr(),
@@ -260,7 +311,11 @@ pub fn gated_norm(
             eps,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "gated_norm", ev);
+    }
+    prof_result
 }
 
 /// Split q_proj output into q/gate, RMSNorm q per head, apply partial RoPE.
@@ -301,7 +356,8 @@ pub fn q_split_norm_rope(
     {
         return Err(Error::Other("q_split_norm_rope: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "q_split_norm_rope");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_q_split_norm_rope(
             q_gate.ptr(),
             q_norm_w.ptr(),
@@ -315,7 +371,11 @@ pub fn q_split_norm_rope(
             start_pos,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "q_split_norm_rope", ev);
+    }
+    prof_result
 }
 
 /// RMSNorm k per head, apply partial RoPE, append into the K cache at
@@ -353,7 +413,8 @@ pub fn k_norm_rope_append(
     if k_in.len() < bytes_k || k_cache.len() < bytes_cache || k_norm_w.len() < bytes_w {
         return Err(Error::Other("k_norm_rope_append: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "k_norm_rope_append");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_k_norm_rope_append(
             k_in.ptr(),
             k_norm_w.ptr(),
@@ -367,7 +428,11 @@ pub fn k_norm_rope_append(
             max_seq_len as i32,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "k_norm_rope_append", ev);
+    }
+    prof_result
 }
 
 /// `out = sigmoid(gate) * x` elementwise bf16.
@@ -384,7 +449,8 @@ pub fn sigmoid_mul(
     if gate.len() < bytes || x.len() < bytes || out.len() < bytes {
         return Err(Error::Other("sigmoid_mul: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "sigmoid_mul");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_sigmoid_mul(
             gate.ptr(),
             x.ptr(),
@@ -392,7 +458,11 @@ pub fn sigmoid_mul(
             count as i64,
             ctx.stream().handle(),
         )
-    })
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "sigmoid_mul", ev);
+    }
+    prof_result
 }
 
 /// Causal GQA flash attention for the full-attention prefill.
@@ -427,7 +497,8 @@ pub fn flash_prefill(
     if q.len() < bytes_q || k_cache.len() < bytes_cache || v_cache.len() < bytes_cache || out.len() < bytes_q {
         return Err(Error::Other("flash_prefill: buffer too small".into()));
     }
-    check_cuda(unsafe {
+    let prof_ev = kernel_prof(ctx, "flash_prefill");
+    let prof_result = check_cuda(unsafe {
         ffi::apxinf_qwen35_flash_prefill(
             q.ptr(),
             k_cache.ptr(),
@@ -440,6 +511,196 @@ pub fn flash_prefill(
             scale,
             start_pos,
             max_seq_len as i32,
+            ctx.stream().handle(),
+        )
+    });
+    if let Some(ev) = prof_ev {
+        kernel_prof_end(ctx, "flash_prefill", ev);
+    }
+    prof_result
+}
+
+/// Scores = q @ k^T for one kv group (per_kv q heads) via plain per-head
+/// cublas GEMMs. `scores` is `[per_kv, seq, row_stride]` f32 (reused per
+/// kv group); `kt` holds the transposed k cache for this kv head
+/// `[head_dim, max_seq]` bf16; `q` is `[seq, heads, head_dim]` bf16.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_gqa_dot(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k_view: &CudaBuffer,
+    kt: &CudaBuffer,
+    scores: &CudaBuffer,
+    kv: usize,
+    seq: usize,
+    visible: usize,
+    heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    row_stride: usize,
+) -> Result<()> {
+    if heads % n_kv_heads != 0 || head_dim == 0 || visible == 0 || row_stride < visible {
+        return Err(Error::Other("attention_gqa_dot: invalid dimensions".into()));
+    }
+    let per_kv = heads / n_kv_heads;
+    let q_head_bytes = head_dim * 2;
+    let q_row_elems = heads * head_dim;
+    let score_head_bytes = seq * row_stride * 4;
+    transpose_kt(ctx, k_view, kt, visible, head_dim)?;
+    for i in 0..per_kv {
+        let h = kv * per_kv + i;
+        // q is [seq, heads, dim] row-major; head h is the [dim, seq]
+        // col-major slab at column offset h*dim with ld = heads*dim.
+        let q_view = q
+            .view(h * q_head_bytes, q.len() - h * q_head_bytes)
+            .map_err(Error::Cuda)?;
+        let c_view = scores
+            .view(i * score_head_bytes, score_head_bytes)
+            .map_err(Error::Cuda)?;
+        ctx.cublas()
+            .gemm_bf16_f32(
+                seq,
+                visible,
+                head_dim,
+                1.0,
+                &q_view,
+                q_row_elems as i32,
+                kt,
+                0.0,
+                &c_view,
+                row_stride as i32,
+            )
+            .map_err(Error::Cuda)?;
+    }
+    Ok(())
+}
+
+/// out = p @ v for one kv group (per_kv q heads, plain per-head GEMMs).
+/// p: `[per_kv, seq, row_stride]` bf16; out: `[seq, heads, head_dim]` f32.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_gqa_pv(
+    ctx: &CudaContext,
+    p: &CudaBuffer,
+    v_view: &CudaBuffer,
+    out: &CudaBuffer,
+    kv: usize,
+    seq: usize,
+    visible: usize,
+    heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    row_stride: usize,
+) -> Result<()> {
+    if heads % n_kv_heads != 0 || head_dim == 0 || visible == 0 {
+        return Err(Error::Other("attention_gqa_pv: invalid dimensions".into()));
+    }
+    let per_kv = heads / n_kv_heads;
+    let p_head_bytes = seq * row_stride * 2;
+    let out_head_bytes = head_dim * 4;
+    let out_row_elems = heads * head_dim;
+    for i in 0..per_kv {
+        let h = kv * per_kv + i;
+        let p_view = p.view(i * p_head_bytes, p_head_bytes).map_err(Error::Cuda)?;
+        // out is [seq, heads, dim] f32 row-major; head h is the [dim, seq]
+        // col-major slab with ld = heads*dim.
+        let o_view = out
+            .view(h * out_head_bytes, out.len() - h * out_head_bytes)
+            .map_err(Error::Cuda)?;
+        ctx.cublas()
+            .gemm_bf16_f32(
+                seq,
+                head_dim,
+                visible,
+                1.0,
+                &p_view,
+                row_stride as i32,
+                v_view,
+                0.0,
+                &o_view,
+                out_row_elems as i32,
+            )
+            .map_err(Error::Cuda)?;
+    }
+    Ok(())
+}
+
+/// Row-wise softmax over the causal prefix of the scores matrix.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_softmax_rows(
+    ctx: &CudaContext,
+    scores: &CudaBuffer,
+    p_out: &CudaBuffer,
+    l_out: &CudaBuffer,
+    head_base: usize,
+    seq: usize,
+    heads: usize,
+    visible: usize,
+    row_stride: usize,
+    start_pos: u32,
+    scale: f32,
+) -> Result<()> {
+    check_cuda(unsafe {
+        ffi::apxinf_qwen35_attention_softmax_rows(
+            scores.ptr(),
+            p_out.ptr(),
+            l_out.ptr(),
+            head_base as i32,
+            seq as i32,
+            heads as i32,
+            visible as i32,
+            row_stride as i32,
+            start_pos as i32,
+            scale,
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// out = bf16(pv / l) row-wise; pv is f32, out is bf16.
+pub fn scale_out(
+    ctx: &CudaContext,
+    pv: &CudaBuffer,
+    l: &CudaBuffer,
+    out: &CudaBuffer,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    check_cuda(unsafe {
+        ffi::apxinf_qwen35_scale_out(
+            pv.ptr(),
+            l.ptr(),
+            out.ptr(),
+            seq as i32,
+            heads as i32,
+            head_dim as i32,
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// Transposes a k cache slice for the scores GEMM: `kt` is
+/// `[head_dim, visible]` bf16 from `k` `[visible, head_dim]`.
+pub fn transpose_kt(
+    ctx: &CudaContext,
+    k: &CudaBuffer,
+    kt: &CudaBuffer,
+    visible: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let required = visible
+        .checked_mul(head_dim)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| Error::Other("transpose_kt size overflow".into()))?;
+    if kt.len() < required {
+        return Err(Error::Other("transpose_kt: kt buffer too small".into()));
+    }
+    check_cuda(unsafe {
+        ffi::apxinf_qwen35_transpose_kt(
+            k.ptr(),
+            kt.ptr(),
+            visible as i32,
+            head_dim as i32,
             ctx.stream().handle(),
         )
     })
