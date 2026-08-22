@@ -25,7 +25,7 @@ use apxinf_cuda::{CudaBackend, CudaContext};
 use super::{LayerKind, Qwen35Config};
 
 /// Prefill chunk size: bounds all activation workspace buffers.
-const CHUNK: usize = 512;
+const CHUNK: usize = 2048;
 /// KV cache rows per full-attention layer. The base evaluation never
 /// exceeds 16384 prompt tokens + 128 output; 16640 leaves a small margin
 /// while freeing ~1 GB of VRAM versus the declared 32768 (longer requests
@@ -116,6 +116,7 @@ pub struct Qwen35Cuda {
     a: CudaBuffer,
     b: CudaBuffer,
     delta_out: CudaBuffer,
+    qk_scratch: CudaBuffer,
     gated: CudaBuffer,
     attn: CudaBuffer,
     attn2: CudaBuffer,
@@ -376,6 +377,7 @@ impl Qwen35Cuda {
             a: ws(CHUNK, 48)?,
             b: ws(CHUNK, 48)?,
             delta_out: ws(CHUNK, 6144)?,
+            qk_scratch: ws(CHUNK, 4096)?, // 16 k_heads * 2 * 128 kdim bf16
             gated: ws(CHUNK, 6144)?,
             attn: ws(CHUNK, tc.n_heads * tc.head_dim)?,
             attn2: ws(CHUNK, hidden)?,
@@ -435,12 +437,20 @@ impl Qwen35Cuda {
         if seq == 0 {
             return Err(Error::Other("qwen3_5 GPU forward: empty input".into()));
         }
+        let perf = std::env::var_os("APXINF_PERF").is_some();
         let mut offset = 0usize;
         let mut last_chunk = 0usize;
         while offset < seq {
             let chunk = (seq - offset).min(CHUNK);
             let pos = start_pos + offset as u32;
+            let t0 = std::time::Instant::now();
             self.forward_chunk(&token_ids[offset..offset + chunk], chunk, pos)?;
+            let host_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if perf {
+                self.ctx().synchronize().map_err(Error::Cuda)?;
+                let gpu_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                eprintln!("[chunk] len={chunk} : host {host_ms:.2} ms, gpu {gpu_ms:.2} ms");
+            }
             last_chunk = chunk;
             offset += chunk;
         }
@@ -613,9 +623,20 @@ impl Qwen35Cuda {
         if l == 0 {
             trace_buf("gpu_qkv_post", &self.qkv, seq * run.conv_dim);
         }
+        kernels::qwen35::delta_norm_prepass(
+            ctx,
+            &self.qkv,
+            &self.qk_scratch,
+            seq,
+            run.k_heads,
+            run.v_heads,
+            run.kdim,
+            run.vdim,
+        )?;
         kernels::qwen35::delta_step(
             ctx,
             &self.qkv,
+            &self.qk_scratch,
             &self.a,
             &self.b,
             &run.a_log,

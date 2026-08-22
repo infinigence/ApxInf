@@ -57,8 +57,19 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_qwen35_delta_norm_prepass(
+        qkv: *const c_void,
+        qk_out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_qwen35_delta_step(
         qkv: *const c_void,
+        qk_norm: *const c_void,
         a: *const c_void,
         b: *const c_void,
         a_log: *const c_void,

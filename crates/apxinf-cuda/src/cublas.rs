@@ -124,7 +124,7 @@ impl CublasHandle {
                         cuda_type,
                         n_i,
                         ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                        113, // CUBLAS_GEMM_ALGO13_TENSOR_OP (fixed, no per-call heuristic)
                     ))
                 }
             }
@@ -383,7 +383,7 @@ impl CublasHandle {
                 ffi::cudaDataType_t::CUDA_R_32I,
                 n as i32,
                 ffi::cublasComputeType_t::CUBLAS_COMPUTE_32I,
-                99, // CUBLAS_GEMM_DEFAULT_TENSOR_OP
+                113, // CUBLAS_GEMM_ALGO13_TENSOR_OP (fixed, no per-call heuristic)
             ))
         }
     }

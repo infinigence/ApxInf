@@ -17,15 +17,15 @@
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 __device__ __forceinline__ float sigmoidf_f32(float x) {
-  return 1.0f / (1.0f + expf(-x));
+  return 1.0f / (1.0f + __expf(-x));
 }
 
 __device__ __forceinline__ float siluf_f32(float x) {
-  return x / (1.0f + expf(-x));
+  return x / (1.0f + __expf(-x));
 }
 
 __device__ __forceinline__ float softplusf_f32(float x) {
-  return x > 20.0f ? x : log1pf(expf(x));
+  return x > 20.0f ? x : __logf(1.0f + __expf(x));
 }
 
 // ── MLP: SiLU(gate) * up, elementwise over [seq, intermediate] ─────────────
@@ -104,10 +104,66 @@ __global__ void qwen35_conv_silu_kernel(
 // The state tile ([kdim, QWEN35_V_TILE] f32) lives in shared memory for the
 // whole sequence sweep, so HBM state traffic is one read + one write.
 
-#define QWEN35_V_TILE 32
+#define QWEN35_V_TILE 128
+#define QWEN35_KMAX 128
 
+// ── DeltaNet q/k norm prepass ──────────────────────────────────────────────
+// Normalizes q/k per (token, k_head) in a massively parallel pass so the
+// serial recurrence below contains no per-token reductions or shuffles.
+// qkv: [seq, 2*k_heads*kdim + v_heads*vdim] bf16 (post-conv)
+// qk_out: [seq, k_heads, 2, kdim] bf16 normalized rows
+// Grid: (seq, k_heads), block: kdim threads (kdim <= QWEN35_KMAX).
+__global__ void qwen35_delta_norm_prepass_kernel(
+    const __nv_bfloat16* qkv, __nv_bfloat16* qk_out, int seq, int k_heads,
+    int v_heads, int kdim, int vdim) {
+  const int s = blockIdx.x;
+  const int k_head = blockIdx.y;
+  const int lane = threadIdx.x;
+  const int kdim_total = k_heads * kdim;
+  const int row_stride = 2 * kdim_total + v_heads * vdim;
+  __shared__ float s_sq[2 * QWEN35_KMAX];  // [2][kdim] squared sums
+  float qv = 0.0f, kv = 0.0f;
+  if (lane < kdim) {
+    qv = __bfloat162float(qkv[s * row_stride + k_head * kdim + lane]);
+    kv = __bfloat162float(
+        qkv[s * row_stride + kdim_total + k_head * kdim + lane]);
+  }
+  s_sq[lane] = qv * qv;
+  s_sq[QWEN35_KMAX + lane] = kv * kv;
+  __syncthreads();
+  for (int off = kdim / 2; off > 0; off >>= 1) {
+    if (lane < off) {
+      s_sq[lane] += s_sq[lane + off];
+      s_sq[QWEN35_KMAX + lane] += s_sq[QWEN35_KMAX + lane + off];
+    }
+    __syncthreads();
+  }
+  const float q_inv = rsqrtf(s_sq[0] + 1e-6f);
+  const float k_inv = rsqrtf(s_sq[QWEN35_KMAX] + 1e-6f);
+  const int qk_stride = k_heads * 2 * kdim;
+  if (lane < kdim) {
+    qk_out[s * qk_stride + k_head * 2 * kdim + lane] =
+        __float2bfloat16(qv * q_inv);
+    qk_out[s * qk_stride + k_head * 2 * kdim + kdim + lane] =
+        __float2bfloat16(kv * k_inv);
+  }
+}
+
+// ── Linear attention: gated delta-rule recurrence ──────────────────────────
+//
+// qkv: [seq, 2*k_heads*kdim + v_heads*vdim] bf16 (post-conv; q/k entries
+//      unused here — the normalized qk_norm rows are consumed instead)
+// qk_norm: [seq, k_heads, 2, kdim] bf16 (from the prepass)
+// a/b: [seq, v_heads] bf16; a_log/dt_bias: [v_heads] bf16
+// recurrent: [v_heads, kdim, vdim] f32 (in/out)
+// out: [seq, v_heads*vdim] bf16
+//
+// Grid: (vdim / QWEN35_V_TILE, v_heads) blocks of QWEN35_V_TILE threads.
+// The state tile ([kdim, QWEN35_V_TILE] f32) lives in shared memory for the
+// whole sequence sweep, so HBM state traffic is one read + one write.
 __global__ void qwen35_delta_step_kernel(
-    const __nv_bfloat16* qkv, const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const __nv_bfloat16* qkv, const __nv_bfloat16* qk_norm,
+    const __nv_bfloat16* a, const __nv_bfloat16* b,
     const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias,
     float* recurrent, __nv_bfloat16* out, int seq, int k_heads, int v_heads,
     int kdim, int vdim) {
@@ -119,77 +175,68 @@ __global__ void qwen35_delta_step_kernel(
   const int k_head = v_head / repeat;
   const int kdim_total = k_heads * kdim;
   const int row_stride = 2 * kdim_total + v_heads * vdim;
+  const int qk_stride = k_heads * 2 * kdim;
 
-  extern __shared__ float s_qk[];  // [2][kdim] + [kdim][QWEN35_V_TILE]
+  extern __shared__ float s_delta_sh[];
+  float* s_state = s_delta_sh;                      // [kdim][QWEN35_V_TILE]
+  float* s_qk = s_delta_sh + kdim * QWEN35_V_TILE;  // [2][kdim]
   float* s_q = s_qk;
   float* s_k = s_qk + kdim;
-  float* s_state = s_qk + 2 * kdim;
 
   // Load the state tile into shared memory once.
   const int state_base = v_head * kdim * vdim + vd;
+#pragma unroll 4
   for (int kd = 0; kd < kdim; kd++)
-    s_state[kd * QWEN35_V_TILE + lane] = recurrent[state_base + kd * vdim];
+    s_state[kd * QWEN35_V_TILE + lane] =
+        __ldg(&recurrent[state_base + kd * vdim]);
 
   const float a_log_h = __bfloat162float(a_log[v_head]);
   const float dt_bias_h = __bfloat162float(dt_bias[v_head]);
   const float q_scale = 1.0f / sqrtf((float)kdim);
 
   for (int s = 0; s < seq; s++) {
-    const float a_h = __bfloat162float(a[s * v_heads + v_head]);
-    const float b_h = __bfloat162float(b[s * v_heads + v_head]);
-    const float decay = expf(-expf(a_log_h) * softplusf_f32(a_h + dt_bias_h));
+    const float a_h = __bfloat162float(__ldg(&a[s * v_heads + v_head]));
+    const float b_h = __bfloat162float(__ldg(&b[s * v_heads + v_head]));
+    const float decay = __expf(-__expf(a_log_h) * softplusf_f32(a_h + dt_bias_h));
     const float beta = sigmoidf_f32(b_h);
+    const float v = __bfloat162float(
+        __ldg(&qkv[s * row_stride + 2 * kdim_total + v_head * vdim + vd]));
 
-    const int q_base = k_head * kdim;
-    const int k_base = kdim_total + k_head * kdim;
-    const int v_base = 2 * kdim_total + v_head * vdim;
-
-    // Load q/k for this head and compute their l2 norms (warp-wide reduce).
-    float q_norm = 0.0f, k_norm = 0.0f;
-    for (int kd = lane; kd < kdim; kd += QWEN35_V_TILE) {
-      const float qv = __bfloat162float(qkv[s * row_stride + q_base + kd]);
-      const float kv = __bfloat162float(qkv[s * row_stride + k_base + kd]);
-      s_q[kd] = qv;
-      s_k[kd] = kv;
-      q_norm += qv * qv;
-      k_norm += kv * kv;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-      q_norm += __shfl_xor_sync(0xffffffff, q_norm, off);
-      k_norm += __shfl_xor_sync(0xffffffff, k_norm, off);
-    }
-    const float q_inv = rsqrtf(q_norm + 1e-6f);
-    const float k_inv = rsqrtf(k_norm + 1e-6f);
-    for (int kd = 0; kd < kdim; kd++) {
-      s_q[kd] *= q_inv;
-      s_k[kd] *= k_inv;
-    }
-    __syncthreads();  // normalized q/k visible to every lane
+    // Broadcast the normalized q/k row for this head into shared.
+    s_q[lane] = __bfloat162float(
+        __ldg(&qk_norm[s * qk_stride + k_head * 2 * kdim + lane]));
+    s_k[lane] = __bfloat162float(
+        __ldg(&qk_norm[s * qk_stride + k_head * 2 * kdim + kdim + lane]));
+    __syncthreads();  // s_q/s_k visible to every lane
 
     // Decay the state tile.
+#pragma unroll 4
     for (int kd = 0; kd < kdim; kd++)
       s_state[kd * QWEN35_V_TILE + lane] *= decay;
 
     // kv_mem[vd] = Σ_kd state[kd][vd] · k[kd]
-    const float v = __bfloat162float(qkv[s * row_stride + v_base + vd]);
     float mem = 0.0f;
+#pragma unroll 4
     for (int kd = 0; kd < kdim; kd++)
       mem += s_state[kd * QWEN35_V_TILE + lane] * s_k[kd];
     const float delta = (v - mem) * beta;
 
     // state[kd][vd] += k[kd] · delta
+#pragma unroll 4
     for (int kd = 0; kd < kdim; kd++)
       s_state[kd * QWEN35_V_TILE + lane] += s_k[kd] * delta;
 
     // out[vd] = Σ_kd state[kd][vd] · q[kd] · scale
     float acc = 0.0f;
+#pragma unroll 4
     for (int kd = 0; kd < kdim; kd++)
       acc += s_state[kd * QWEN35_V_TILE + lane] * s_q[kd] * q_scale;
     out[s * v_heads * vdim + v_head * vdim + vd] = __float2bfloat16(acc);
-    __syncthreads();  // s_q/s_k are rewritten next iteration
+    __syncthreads();  // s_q/s_k rewritten next iteration
   }
 
   // Write the final state tile back.
+#pragma unroll 4
   for (int kd = 0; kd < kdim; kd++)
     recurrent[state_base + kd * vdim] = s_state[kd * QWEN35_V_TILE + lane];
 }
@@ -386,7 +433,7 @@ __global__ void qwen35_dequant_w4a16_bf16_row_kernel(
 // shared memory, so each packed word is read from HBM exactly once.
 
 #define QWEN35_GEMM_OUT_TILE 128
-#define QWEN35_GEMM_IN_TILE 128
+#define QWEN35_GEMM_IN_TILE 256
 
 __global__ void qwen35_gemm_w4a16_bf16_kernel(
     const __nv_bfloat16* activation, const int32_t* weight_packed,
@@ -512,8 +559,8 @@ __global__ void qwen35_flash_prefill_kernel(
       dot += __shfl_xor_sync(0xffffffff, dot, off);
     dot *= scale;
     const float m_new = fmaxf(m, dot);
-    const float p = expf(dot - m_new);
-    const float exp_m = expf(m - m_new);
+    const float p = __expf(dot - m_new);
+    const float exp_m = __expf(m - m_new);
     l = l * exp_m + p;
     for (int i = 0; i < elems; i++)
       acc[i] = acc[i] * exp_m +
@@ -535,11 +582,11 @@ __global__ void qwen35_flash_prefill_kernel(
     m_global = fmaxf(m_global, s_m[w]);
   float l_global = 0.0f;
   for (int w = 0; w < QWEN35_PREFILL_WARPS; w++)
-    l_global += s_l[w] * expf(s_m[w] - m_global);
+    l_global += s_l[w] * __expf(s_m[w] - m_global);
   for (int i = 0; i < elems; i++) {
     float acc_global = 0.0f;
     for (int w = 0; w < QWEN35_PREFILL_WARPS; w++)
-      acc_global += s_acc[w][i][lane] * expf(s_m[w] - m_global);
+      acc_global += s_acc[w][i][lane] * __expf(s_m[w] - m_global);
     const float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
     out[(s * heads + q_head) * head_dim + i * 32 + lane] =
         __float2bfloat16(acc_global * inv_l);

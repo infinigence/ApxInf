@@ -477,21 +477,48 @@ extern "C" cudaError_t apxinf_qwen35_conv_silu(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_qwen35_delta_norm_prepass(
+    const void* qkv, void* qk_out, int seq, int k_heads, int v_heads,
+    int kdim, int vdim, cudaStream_t stream) {
+  if (qkv == nullptr || qk_out == nullptr || seq <= 0 || k_heads <= 0 ||
+      v_heads <= 0 || kdim <= 0 || kdim > QWEN35_KMAX || vdim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(seq, k_heads);
+  qwen35_delta_norm_prepass_kernel<<<grid, QWEN35_KMAX, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<__nv_bfloat16*>(qk_out), seq, k_heads, v_heads, kdim, vdim);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_qwen35_delta_step(
-    const void* qkv, const void* a, const void* b, const void* a_log,
-    const void* dt_bias, void* recurrent, void* out, int seq, int k_heads,
-    int v_heads, int kdim, int vdim, cudaStream_t stream) {
-  if (qkv == nullptr || a == nullptr || b == nullptr || a_log == nullptr ||
-      dt_bias == nullptr || recurrent == nullptr || out == nullptr ||
-      seq <= 0 || k_heads <= 0 || v_heads <= 0 || kdim <= 0 || vdim <= 0 ||
+    const void* qkv, const void* qk_norm, const void* a, const void* b,
+    const void* a_log, const void* dt_bias, void* recurrent, void* out,
+    int seq, int k_heads, int v_heads, int kdim, int vdim,
+    cudaStream_t stream) {
+  if (qkv == nullptr || qk_norm == nullptr || a == nullptr || b == nullptr ||
+      a_log == nullptr || dt_bias == nullptr || recurrent == nullptr ||
+      out == nullptr || seq <= 0 || k_heads <= 0 || v_heads <= 0 ||
+      kdim <= 0 || kdim > QWEN35_KMAX || vdim <= 0 ||
       vdim % QWEN35_V_TILE != 0) {
     return cudaErrorInvalidValue;
   }
   dim3 grid(vdim / QWEN35_V_TILE, v_heads);
   const size_t shared =
       static_cast<size_t>(2 * kdim + kdim * QWEN35_V_TILE) * sizeof(float);
+  static bool shared_opted = false;
+  if (!shared_opted) {
+    const cudaError_t opt = cudaFuncSetAttribute(
+        qwen35_delta_step_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+    if (opt != cudaSuccess) {
+      return opt;
+    }
+    shared_opted = true;
+  }
   qwen35_delta_step_kernel<<<grid, QWEN35_V_TILE, shared, stream>>>(
       static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<const __nv_bfloat16*>(qk_norm),
       static_cast<const __nv_bfloat16*>(a),
       static_cast<const __nv_bfloat16*>(b),
       static_cast<const __nv_bfloat16*>(a_log),

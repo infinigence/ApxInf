@@ -111,6 +111,14 @@ fn main() {
         }
         Commands::Serve { model, host, port, max_model_len, model_revision, device } => {
             let device = parse_device(&device);
+            // The CUDA backend allocates KV-cache rows up to qwen35::cuda::MAX_SEQ_LEN.
+            // Report that real capacity on /health (and use it for over-budget
+            // admission) instead of the CLI default, so the health declaration
+            // stays truthful until the backend limit is raised dynamically.
+            #[cfg(feature = "cuda")]
+            let max_model_len = max_model_len.min(apxinf_model::qwen35::cuda::MAX_SEQ_LEN);
+            #[cfg(not(feature = "cuda"))]
+            let max_model_len = max_model_len;
             let config = serve::ServeConfig {
                 model_dir: model,
                 host,

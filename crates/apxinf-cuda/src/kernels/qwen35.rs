@@ -100,16 +100,54 @@ pub fn conv_silu(
     })
 }
 
+/// Normalizes q/k per (token, k_head) in a parallel prepass; `qk_out` is
+/// `[seq, k_heads, 2, kdim]` bf16.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_norm_prepass(
+    ctx: &CudaContext,
+    qkv: &CudaBuffer,
+    qk_out: &CudaBuffer,
+    seq: usize,
+    k_heads: usize,
+    v_heads: usize,
+    kdim: usize,
+    vdim: usize,
+) -> Result<()> {
+    let required = seq
+        .checked_mul(k_heads)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(kdim))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| Error::Other("delta_norm_prepass size overflow".into()))?;
+    if qk_out.len() < required {
+        return Err(Error::Other("delta_norm_prepass: qk_out buffer too small".into()));
+    }
+    check_cuda(unsafe {
+        ffi::apxinf_qwen35_delta_norm_prepass(
+            qkv.ptr(),
+            qk_out.ptr(),
+            seq as i32,
+            k_heads as i32,
+            v_heads as i32,
+            kdim as i32,
+            vdim as i32,
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// Gated delta-rule recurrence (one launch sweeps the whole sequence).
 ///
 /// `qkv` is `[seq, k_heads*kdim*2 + v_heads*vdim]` bf16 (post-conv);
-/// `a`/`b` are `[seq, v_heads]` bf16; `a_log`/`dt_bias` are `[v_heads]` bf16;
-/// `recurrent` is `[v_heads, kdim, vdim]` f32, updated in place; `out` is
-/// `[seq, v_heads*vdim]` bf16.
+/// `qk_norm` is the normalized `[seq, k_heads, 2, kdim]` q/k from the
+/// prepass; `a`/`b` are `[seq, v_heads]` bf16; `a_log`/`dt_bias` are
+/// `[v_heads]` bf16; `recurrent` is `[v_heads, kdim, vdim]` f32, updated in
+/// place; `out` is `[seq, v_heads*vdim]` bf16.
 #[allow(clippy::too_many_arguments)]
 pub fn delta_step(
     ctx: &CudaContext,
     qkv: &CudaBuffer,
+    qk_norm: &CudaBuffer,
     a: &CudaBuffer,
     b: &CudaBuffer,
     a_log: &CudaBuffer,
@@ -134,6 +172,12 @@ pub fn delta_step(
         .checked_mul(v_heads)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| Error::Other("delta_step: a/b overflow".into()))?;
+    let bytes_qk = seq
+        .checked_mul(k_heads)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(kdim))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| Error::Other("delta_step: qk_norm overflow".into()))?;
     let bytes_heads = v_heads
         .checked_mul(2)
         .ok_or_else(|| Error::Other("delta_step: heads overflow".into()))?;
@@ -148,6 +192,7 @@ pub fn delta_step(
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| Error::Other("delta_step: output overflow".into()))?;
     if qkv.len() < bytes_qkv
+        || qk_norm.len() < bytes_qk
         || a.len() < bytes_ab
         || b.len() < bytes_ab
         || a_log.len() < bytes_heads
@@ -160,6 +205,7 @@ pub fn delta_step(
     check_cuda(unsafe {
         ffi::apxinf_qwen35_delta_step(
             qkv.ptr(),
+            qk_norm.ptr(),
             a.ptr(),
             b.ptr(),
             a_log.ptr(),

@@ -143,6 +143,7 @@ fn run_generate_dump(
         }
         .expect("forward");
         eprintln!("[step {step}] fwd: {:.2} ms", (std::time::Instant::now() - t0).as_secs_f32() * 1000.0);
+
         let t0 = std::time::Instant::now();
         let data = {
             #[cfg(feature = "cuda")]
