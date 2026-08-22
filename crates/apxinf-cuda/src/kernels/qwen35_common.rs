@@ -48,9 +48,9 @@ pub fn residual_add_rmsnorm_offset_write(
     output: &Tensor,
     epsilon: f32,
 ) -> Result<()> {
-    let rows = require_hidden(ctx, "residual", residual)?;
+    let rows = require_hidden_rows(ctx, "residual", residual, 64)?;
     for (name, tensor) in [("delta", delta), ("output", output)] {
-        if require_hidden(ctx, name, tensor)? != rows {
+        if require_hidden_rows(ctx, name, tensor, 64)? != rows {
             return Err(Error::Other(format!(
                 "Qwen3.5 residual offset RMSNorm {name} row mismatch"
             )));
@@ -82,11 +82,20 @@ pub fn residual_add_rmsnorm_offset_write(
 }
 
 fn require_hidden(ctx: &CudaContext, name: &str, tensor: &Tensor) -> Result<usize> {
+    require_hidden_rows(ctx, name, tensor, 8)
+}
+
+fn require_hidden_rows(
+    ctx: &CudaContext,
+    name: &str,
+    tensor: &Tensor,
+    max_rows: usize,
+) -> Result<usize> {
     let dims = tensor.shape().dims();
     if tensor.dtype() != DType::BF16
         || tensor.device() != Device::Cuda(ctx.device_id())
         || dims.len() != 2
-        || !(1..=8).contains(&dims[0])
+        || !(1..=max_rows).contains(&dims[0])
         || dims[1] != HIDDEN
     {
         return Err(Error::Other(format!(

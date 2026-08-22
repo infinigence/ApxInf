@@ -1586,31 +1586,22 @@ impl HybridUnit {
             }
             self.prepare_mlp_marlin64_layer_major(ctx, &layer.mlp)?;
             for tile_first in (0..LAYER_MAJOR_PREFILL_ROWS).step_by(MARLIN_PREFILL_TILE) {
-                for subtile in 0..MARLIN_PREFILL_SUBTILES {
-                    let scratch_first = subtile * PREFILL_TILE;
-                    let global_first = tile_first + scratch_first;
-                    let mixer_delta = cuda_row_view(
+                qwen35_common::residual_add_rmsnorm_offset_write(
+                    ctx,
+                    &cuda_row_view(
+                        &workspace.layer_major.residual,
+                        tile_first,
+                        MARLIN_PREFILL_TILE,
+                    )?,
+                    &cuda_row_view(
                         &workspace.layer_major.mixer_delta,
-                        global_first,
-                        PREFILL_TILE,
-                    )?;
-                    qwen35_common::residual_add_rmsnorm_offset_write(
-                        ctx,
-                        &cuda_row_view(
-                            &workspace.layer_major.residual,
-                            global_first,
-                            PREFILL_TILE,
-                        )?,
-                        &mixer_delta,
-                        &layer.post_attention_norm,
-                        &cuda_row_view(
-                            &workspace.mlp_normalized,
-                            scratch_first,
-                            PREFILL_TILE,
-                        )?,
-                        RMS_EPSILON,
-                    )?;
-                }
+                        tile_first,
+                        MARLIN_PREFILL_TILE,
+                    )?,
+                    &layer.post_attention_norm,
+                    &workspace.mlp_normalized,
+                    RMS_EPSILON,
+                )?;
                 self.forward_mlp_marlin64_layer_major(
                     ctx,
                     &workspace.mlp_normalized,
@@ -1621,26 +1612,22 @@ impl HybridUnit {
                 } else {
                     &self.next_input_norm
                 };
-                for subtile in 0..MARLIN_PREFILL_SUBTILES {
-                    let scratch_first = subtile * PREFILL_TILE;
-                    let global_first = tile_first + scratch_first;
-                    qwen35_common::residual_add_rmsnorm_offset_write(
-                        ctx,
-                        &cuda_row_view(
-                            &workspace.layer_major.residual,
-                            global_first,
-                            PREFILL_TILE,
-                        )?,
-                        &cuda_row_view(&workspace.mlp_delta, scratch_first, PREFILL_TILE)?,
-                        next_norm,
-                        &cuda_row_view(
-                            &workspace.layer_major.normalized,
-                            global_first,
-                            PREFILL_TILE,
-                        )?,
-                        RMS_EPSILON,
-                    )?;
-                }
+                qwen35_common::residual_add_rmsnorm_offset_write(
+                    ctx,
+                    &cuda_row_view(
+                        &workspace.layer_major.residual,
+                        tile_first,
+                        MARLIN_PREFILL_TILE,
+                    )?,
+                    &workspace.mlp_delta,
+                    next_norm,
+                    &cuda_row_view(
+                        &workspace.layer_major.normalized,
+                        tile_first,
+                        MARLIN_PREFILL_TILE,
+                    )?,
+                    RMS_EPSILON,
+                )?;
             }
         }
         Ok(())

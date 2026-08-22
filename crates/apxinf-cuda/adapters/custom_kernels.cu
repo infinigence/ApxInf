@@ -136,7 +136,7 @@ extern "C" cudaError_t apxinf_static_qwen35_residual_add_rmsnorm_offset_bf16(
     void* residual, const void* delta, const void* weight, void* output,
     int rows, int columns, float epsilon, cudaStream_t stream) {
   if (residual == nullptr || delta == nullptr || weight == nullptr ||
-      output == nullptr || rows < 1 || rows > 8 || columns != 5120 ||
+      output == nullptr || rows < 1 || rows > 64 || columns != 5120 ||
       !(epsilon > 0.0f)) {
     return cudaErrorInvalidValue;
   }
