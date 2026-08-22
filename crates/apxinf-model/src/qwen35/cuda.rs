@@ -120,7 +120,7 @@ pub struct Qwen35Cuda {
     attn_scores: CudaBuffer,
     attn_l: CudaBuffer,
     attn_kt: CudaBuffer,
-    attn_p: CudaBuffer,
+    attn_vf32: CudaBuffer,
     attn_pv: CudaBuffer,
     gated: CudaBuffer,
     attn: CudaBuffer,
@@ -398,11 +398,11 @@ impl Qwen35Cuda {
                 device,
             )
             .map_err(|e| Error::Other(format!("attn kt alloc: {e}")))?,
-            attn_p: CudaBuffer::alloc_zeros(
-                6 * CHUNK * MAX_SEQ_LEN * 2,
+            attn_vf32: CudaBuffer::alloc_zeros(
+                tc.n_kv_heads * MAX_SEQ_LEN * tc.head_dim * 4,
                 device,
             )
-            .map_err(|e| Error::Other(format!("attn p alloc: {e}")))?,
+            .map_err(|e| Error::Other(format!("attn vf32 alloc: {e}")))?,
             attn_pv: CudaBuffer::alloc_zeros(
                 CHUNK * tc.n_heads * tc.head_dim * 4,
                 device,
@@ -890,7 +890,6 @@ impl Qwen35Cuda {
             kernels::qwen35::attention_softmax_rows(
                 ctx,
                 &self.attn_scores,
-                &self.attn_p,
                 &self.attn_l,
                 kv * per_kv,
                 seq,
@@ -900,10 +899,24 @@ impl Qwen35Cuda {
                 start_pos,
                 1.0 / (self.head_dim as f32).sqrt(),
             )?;
+            let vf32_view = self
+                .attn_vf32
+                .view(
+                    kv * MAX_SEQ_LEN * self.head_dim * 4,
+                    MAX_SEQ_LEN * self.head_dim * 4,
+                )
+                .map_err(Error::Cuda)?;
+            kernels::qwen35::v_to_f32(
+                ctx,
+                &v_view,
+                &vf32_view,
+                visible,
+                self.head_dim,
+            )?;
             kernels::qwen35::attention_gqa_pv(
                 ctx,
-                &self.attn_p,
-                &v_view,
+                &self.attn_scores,
+                &vf32_view,
                 &self.attn_pv,
                 kv,
                 seq,
@@ -916,7 +929,6 @@ impl Qwen35Cuda {
         }
         if l == 3 {
             trace_buf_f32("f3g_scores_f32", &self.attn_scores, 6 * seq * MAX_SEQ_LEN);
-            trace_buf("f3g_p_bf16", &self.attn_p, 6 * seq * MAX_SEQ_LEN);
         }
         if l == 3 {
             trace_buf_f32("f3g_pv_f32", &self.attn_pv, seq * self.n_heads * self.head_dim);

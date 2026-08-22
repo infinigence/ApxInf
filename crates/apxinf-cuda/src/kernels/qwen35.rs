@@ -575,13 +575,14 @@ pub fn attention_gqa_dot(
     Ok(())
 }
 
-/// out = p @ v for one kv group (per_kv q heads, plain per-head GEMMs).
-/// p: `[per_kv, seq, row_stride]` bf16; out: `[seq, heads, head_dim]` f32.
+/// out = p @ v for one kv group (per_kv q heads, plain per-head f32 GEMMs).
+/// p: `[per_kv, seq, row_stride]` f32; vf32: `[visible, head_dim]` f32;
+/// out: `[seq, heads, head_dim]` f32.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_gqa_pv(
     ctx: &CudaContext,
     p: &CudaBuffer,
-    v_view: &CudaBuffer,
+    vf32: &CudaBuffer,
     out: &CudaBuffer,
     kv: usize,
     seq: usize,
@@ -595,7 +596,7 @@ pub fn attention_gqa_pv(
         return Err(Error::Other("attention_gqa_pv: invalid dimensions".into()));
     }
     let per_kv = heads / n_kv_heads;
-    let p_head_bytes = seq * row_stride * 2;
+    let p_head_bytes = seq * row_stride * 4;
     let out_head_bytes = head_dim * 4;
     let out_row_elems = heads * head_dim;
     for i in 0..per_kv {
@@ -607,14 +608,14 @@ pub fn attention_gqa_pv(
             .view(h * out_head_bytes, out.len() - h * out_head_bytes)
             .map_err(Error::Cuda)?;
         ctx.cublas()
-            .gemm_bf16_f32(
+            .gemm_ld_f32(
                 seq,
                 head_dim,
                 visible,
                 1.0,
                 &p_view,
                 row_stride as i32,
-                v_view,
+                vf32,
                 0.0,
                 &o_view,
                 out_row_elems as i32,
@@ -624,12 +625,30 @@ pub fn attention_gqa_pv(
     Ok(())
 }
 
+/// vf32 = f32(v) for the attention output GEMM.
+pub fn v_to_f32(
+    ctx: &CudaContext,
+    v: &CudaBuffer,
+    vf32: &CudaBuffer,
+    visible: usize,
+    head_dim: usize,
+) -> Result<()> {
+    check_cuda(unsafe {
+        ffi::apxinf_qwen35_v_to_f32(
+            v.ptr(),
+            vf32.ptr(),
+            visible as i32,
+            head_dim as i32,
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// Row-wise softmax over the causal prefix of the scores matrix.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_softmax_rows(
     ctx: &CudaContext,
     scores: &CudaBuffer,
-    p_out: &CudaBuffer,
     l_out: &CudaBuffer,
     head_base: usize,
     seq: usize,
@@ -642,7 +661,6 @@ pub fn attention_softmax_rows(
     check_cuda(unsafe {
         ffi::apxinf_qwen35_attention_softmax_rows(
             scores.ptr(),
-            p_out.ptr(),
             l_out.ptr(),
             head_base as i32,
             seq as i32,

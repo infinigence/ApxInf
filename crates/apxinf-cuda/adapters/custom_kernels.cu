@@ -675,18 +675,31 @@ extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16(
 }
 
 extern "C" cudaError_t apxinf_qwen35_attention_softmax_rows(
-    const void* scores, void* p_out, void* l_out, int head_base, int seq,
-    int heads, int visible, int row_stride, int start_pos, float scale,
+    const void* scores, void* l_out, int head_base, int seq, int heads,
+    int visible, int row_stride, int start_pos, float scale,
     cudaStream_t stream) {
-  if (scores == nullptr || p_out == nullptr || l_out == nullptr || seq <= 0 ||
-      heads <= 0 || visible <= 0 || row_stride < visible || start_pos < 0) {
+  if (scores == nullptr || l_out == nullptr || seq <= 0 || heads <= 0 ||
+      visible <= 0 || row_stride < visible || start_pos < 0) {
     return cudaErrorInvalidValue;
   }
   dim3 grid(seq, heads);
   qwen35_attention_softmax_rows_kernel<<<grid, 256, 0, stream>>>(
-      static_cast<const float*>(scores),
-      static_cast<__nv_bfloat16*>(p_out), static_cast<float*>(l_out),
-      head_base, seq, heads, visible, row_stride, start_pos, scale);
+      static_cast<float*>(const_cast<void*>(scores)),
+      static_cast<float*>(l_out), head_base, seq, heads, visible, row_stride,
+      start_pos, scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_v_to_f32(
+    const void* v, void* vf32, int visible, int head_dim,
+    cudaStream_t stream) {
+  if (v == nullptr || vf32 == nullptr || visible <= 0 || head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int total = visible * head_dim;
+  qwen35_v_to_f32_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(v), static_cast<float*>(vf32),
+      visible, head_dim);
   return cudaGetLastError();
 }
 

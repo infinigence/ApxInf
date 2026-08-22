@@ -669,6 +669,46 @@ impl CublasHandle {
         }
     }
 
+
+    /// F32 GEMM with explicit strides: C[m, n] = A[m, k] @ B[k, n].
+    pub fn gemm_ld_f32(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        b: &CudaBuffer,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+    ) -> Result<(), String> {
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmEx(
+                self.handle,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                ffi::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha as *const f32 as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_32F,
+                lda,
+                &beta as *const f32 as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                113,
+            ))
+        }
+    }
+
 }
 
 

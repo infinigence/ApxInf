@@ -1041,7 +1041,6 @@ extern "C" {
 
     pub fn apxinf_qwen35_attention_softmax_rows(
         scores: *const c_void,
-        p_out: *mut c_void,
         l_out: *mut c_void,
         head_base: i32,
         seq: i32,
@@ -1079,6 +1078,14 @@ extern "C" {
         in_cols: i32,
         out_cols: i32,
         groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_v_to_f32(
+        v: *const c_void,
+        vf32: *mut c_void,
+        visible: i32,
+        head_dim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 }

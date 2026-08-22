@@ -17,15 +17,15 @@
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 __device__ __forceinline__ float sigmoidf_f32(float x) {
-  return 1.0f / (1.0f + __expf(-x));
+  return 1.0f / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ float siluf_f32(float x) {
-  return x / (1.0f + __expf(-x));
+  return x / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ float softplusf_f32(float x) {
-  return x > 20.0f ? x : __logf(1.0f + __expf(x));
+  return x > 20.0f ? x : log1pf(expf(x));
 }
 
 // ── MLP: SiLU(gate) * up, elementwise over [seq, intermediate] ─────────────
@@ -197,7 +197,7 @@ __global__ void qwen35_delta_step_kernel(
   for (int s = 0; s < seq; s++) {
     const float a_h = __bfloat162float(__ldg(&a[s * v_heads + v_head]));
     const float b_h = __bfloat162float(__ldg(&b[s * v_heads + v_head]));
-    const float decay = __expf(-__expf(a_log_h) * softplusf_f32(a_h + dt_bias_h));
+    const float decay = expf(-expf(a_log_h) * softplusf_f32(a_h + dt_bias_h));
     const float beta = sigmoidf_f32(b_h);
     const float v = __bfloat162float(
         __ldg(&qkv[s * row_stride + 2 * kdim_total + v_head * vdim + vd]));
@@ -694,8 +694,8 @@ __global__ void qwen35_flash_prefill_kernel(
       dot += __shfl_xor_sync(0xffffffff, dot, off);
     dot *= scale;
     const float m_new = fmaxf(m, dot);
-    const float p = __expf(dot - m_new);
-    const float exp_m = __expf(m - m_new);
+    const float p = expf(dot - m_new);
+    const float exp_m = expf(m - m_new);
     l = l * exp_m + p;
     for (int i = 0; i < elems; i++)
       acc[i] = acc[i] * exp_m +
@@ -717,11 +717,11 @@ __global__ void qwen35_flash_prefill_kernel(
     m_global = fmaxf(m_global, s_m[w]);
   float l_global = 0.0f;
   for (int w = 0; w < QWEN35_PREFILL_WARPS; w++)
-    l_global += s_l[w] * __expf(s_m[w] - m_global);
+    l_global += s_l[w] * expf(s_m[w] - m_global);
   for (int i = 0; i < elems; i++) {
     float acc_global = 0.0f;
     for (int w = 0; w < QWEN35_PREFILL_WARPS; w++)
-      acc_global += s_acc[w][i][lane] * __expf(s_m[w] - m_global);
+      acc_global += s_acc[w][i][lane] * expf(s_m[w] - m_global);
     const float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
     out[(s * heads + q_head) * head_dim + i * 32 + lane] =
         __float2bfloat16(acc_global * inv_l);
@@ -729,6 +729,15 @@ __global__ void qwen35_flash_prefill_kernel(
 }
 
 
+
+
+// vf32 = f32(v) for the attention output GEMM: [visible, head_dim] f32.
+__global__ void qwen35_v_to_f32_kernel(
+    const __nv_bfloat16* v, float* vf32, int visible, int head_dim) {
+  const int idx = blockIdx.x * 256 + threadIdx.x;
+  if (idx < visible * head_dim)
+    vf32[idx] = __bfloat162float(v[idx]);
+}
 
 // ── KV transpose for the batched attention scores GEMM ─────────────────────
 // k: [visible, head_dim] bf16 -> kt: [head_dim, visible] bf16.
@@ -747,9 +756,8 @@ __global__ void qwen35_transpose_kt_kernel(
 // l_out:  [heads, seq] f32 row sums of the softmax weights
 // grid: (seq, heads); block: 256 threads sweep `visible` twice.
 __global__ void qwen35_attention_softmax_rows_kernel(
-    const float* scores, __nv_bfloat16* p_out, float* l_out, int head_base,
-    int seq, int heads, int visible, int row_stride, int start_pos,
-    float scale) {
+    float* scores, float* l_out, int head_base, int seq, int heads,
+    int visible, int row_stride, int start_pos, float scale) {
   const int s = blockIdx.x;
   const int h_local = blockIdx.y;
   const int h = head_base + h_local;
@@ -757,8 +765,7 @@ __global__ void qwen35_attention_softmax_rows_kernel(
   const int row = h * seq + s;
   const int local_row = h_local * seq + s;
   const int valid = start_pos + s + 1;  // causal boundary for this row
-  const float* row_ptr = scores + local_row * row_stride;
-  __nv_bfloat16* p_row = p_out + local_row * row_stride;
+  float* row_ptr = scores + local_row * row_stride;
 
   // Pass 1: row max over t < valid.
   float m = -INFINITY;
@@ -772,12 +779,17 @@ __global__ void qwen35_attention_softmax_rows_kernel(
   for (int w = 0; w < 8; w++) m = fmaxf(m, s_warp_max[w]);
   __syncthreads();
 
-  // Pass 2: exp((x - m) * scale), write bf16 p, accumulate l.
+  // Pass 2: exp((x - m) * scale) in place, accumulate l; zero the
+  // columns beyond the causal boundary (the pv GEMM sums all `visible`).
   float l = 0.0f;
-  for (int t = tid; t < valid; t += 256) {
-    const float p = __expf((row_ptr[t] - m) * scale);
-    p_row[t] = __float2bfloat16(p);
-    l += p;
+  for (int t = tid; t < visible; t += 256) {
+    if (t < valid) {
+      const float p = expf((row_ptr[t] - m) * scale);
+      row_ptr[t] = p;
+      l += p;
+    } else {
+      row_ptr[t] = 0.0f;
+    }
   }
   for (int off = 16; off > 0; off >>= 1)
     l += __shfl_xor_sync(0xffffffff, l, off);
