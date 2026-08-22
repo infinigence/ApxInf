@@ -1069,4 +1069,16 @@ extern "C" {
         head_dim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }

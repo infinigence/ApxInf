@@ -715,3 +715,29 @@ extern "C" cudaError_t apxinf_qwen35_transpose_kt(
       visible, head_dim);
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16_tc(
+    const void* activation, const void* weight_packed, const void* weight_scale,
+    const void* weight_zero_point, void* output, int in_cols, int out_cols,
+    int groups, cudaStream_t stream) {
+  if (activation == nullptr || weight_packed == nullptr ||
+      weight_scale == nullptr || weight_zero_point == nullptr ||
+      output == nullptr || in_cols <= 0 || in_cols % 16 != 0 ||
+      out_cols <= 0 || out_cols % QWEN35_TC_OUT_TILE != 0 || groups <= 0) {
+    return cudaErrorInvalidValue;
+  }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  qwen35_gemm_w4a16_bf16_tc_kernel<<<out_cols / QWEN35_TC_OUT_TILE, 256, 0,
+                                    stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(weight_packed),
+      static_cast<const __nv_bfloat16*>(weight_scale),
+      static_cast<const int32_t*>(weight_zero_point),
+      static_cast<__nv_bfloat16*>(output), in_cols, out_cols, groups);
+#else
+  (void)activation; (void)weight_packed; (void)weight_scale;
+  (void)weight_zero_point; (void)output; (void)in_cols; (void)out_cols;
+  (void)groups; (void)stream;
+#endif
+  return cudaGetLastError();
+}

@@ -579,10 +579,20 @@ impl Qwen35Cuda {
         Ok(())
     }
     fn run_layer(&mut self, l: usize, seq: usize, start_pos: u32) -> Result<()> {
-        match self.layers[l] {
+        let perf = std::env::var_os("APXINF_LAYER_PROF").is_some();
+        let t0 = std::time::Instant::now();
+        let result = match self.layers[l] {
             CudaLayer::Linear(_) => self.run_linear(l, seq),
             CudaLayer::Full(_) => self.run_full(l, seq, start_pos),
+        };
+        if perf {
+            self.ctx().synchronize().map_err(Error::Cuda)?;
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if ms > 0.3 {
+                eprintln!("[layer {l}] seq={seq} : {ms:.2} ms");
+            }
         }
+        result
     }
 
 
@@ -1084,6 +1094,20 @@ fn gemm_run(
         Shape::from(vec![gemm.out_cols.div_ceil(8), packed.groups]),
         DType::I32,
     );
+    if seq == 1 && gemm.in_cols % 16 == 0 && gemm.out_cols % 64 == 0 {
+        // Tensor-core decode GEMM (m16n8k16 bf16 MMA), allocation-free.
+        return kernels::quantization::matmul_bf16_w4a16_asym_tc(
+            ctx,
+            act,
+            &packed.w,
+            &packed.scale,
+            &packed.zp,
+            out,
+            gemm.in_cols,
+            gemm.out_cols,
+            packed.groups,
+        );
+    }
     if seq == 1 {
         // Allocation-free fused dequant-GEMM straight into the workspace slot.
         return kernels::quantization::matmul_bf16_w4a16_asym_into(

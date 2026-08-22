@@ -181,7 +181,67 @@ pub fn matmul_bf16_transposed(
     // so decode steps never touch cudaMalloc (which degrades after prefill
     // churns large transient buffers).
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_bf16_w4a16_asym_into(
+    /// Decode GEMM on tensor cores: [1, in_cols] x W4A16 -> [1, out_cols].
+pub fn matmul_bf16_w4a16_asym_tc(
+    ctx: &CudaContext,
+    activation: &CudaBuffer,
+    weight_packed: &CudaBuffer,
+    weight_scale: &CudaBuffer,
+    weight_zero_point: &CudaBuffer,
+    output: &CudaBuffer,
+    in_cols: usize,
+    out_cols: usize,
+    groups: usize,
+) -> Result<()> {
+    let out_bytes = out_cols
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("TC decode GEMM overflow".into()))?;
+    if output.len() < out_bytes {
+        return Err(Error::Other("TC decode GEMM: output buffer too small".into()));
+    }
+    let prof = std::env::var_os("APXINF_GEMM_PROF").is_some();
+    let mut e0: ffi::cudaEvent_t = std::ptr::null_mut();
+    let mut e1: ffi::cudaEvent_t = std::ptr::null_mut();
+    if prof {
+        unsafe {
+            ffi::check_cuda(ffi::cudaEventCreate(&mut e0)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventCreate(&mut e1)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventRecord(e0, ctx.stream().handle()))
+                .map_err(Error::Cuda)?;
+        }
+    }
+    let result = check_cuda(unsafe {
+        ffi::apxinf_qwen35_gemm_w4a16_bf16_tc(
+            activation.ptr(),
+            weight_packed.ptr(),
+            weight_scale.ptr(),
+            weight_zero_point.ptr(),
+            output.ptr(),
+            in_cols as i32,
+            out_cols as i32,
+            groups as i32,
+            ctx.stream().handle(),
+        )
+    });
+    if prof {
+        unsafe {
+            ffi::check_cuda(ffi::cudaEventRecord(e1, ctx.stream().handle()))
+                .map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventSynchronize(e1)).map_err(Error::Cuda)?;
+            let mut ms: f32 = 0.0;
+            ffi::check_cuda(ffi::cudaEventElapsedTime(&mut ms, e0, e1))
+                .map_err(Error::Cuda)?;
+            if ms > 0.01 {
+                eprintln!("[tc_gemm] {}x{} : {ms:.3} ms", out_cols, in_cols);
+            }
+            ffi::check_cuda(ffi::cudaEventDestroy(e0)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventDestroy(e1)).map_err(Error::Cuda)?;
+        }
+    }
+    result
+}
+
+pub fn matmul_bf16_w4a16_asym_into(
         ctx: &CudaContext,
         activation: &CudaBuffer,
         weight_packed: &CudaBuffer,
