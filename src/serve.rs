@@ -159,6 +159,12 @@ struct GenerateRequest {
 }
 
 fn parse_generate(body: &[u8], vocab_size: usize, max_model_len: usize) -> Result<GenerateRequest, (u16, String)> {
+    // Capacity bound: the on-device KV cache covers this many tokens; longer
+    // requests are rejected cleanly instead of overflowing the cache.
+    #[cfg(feature = "cuda")]
+    let capacity = apxinf_model::qwen35::cuda::MAX_SEQ_LEN;
+    #[cfg(not(feature = "cuda"))]
+    let capacity = max_model_len;
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|_| error_response(400, "invalid_request", "malformed JSON body"))?;
     let object = value
@@ -198,6 +204,15 @@ fn parse_generate(body: &[u8], vocab_size: usize, max_model_len: usize) -> Resul
         return Err(error_response(400, "invalid_request", "max_new_tokens must be positive"));
     }
     let prompt_tokens = tokens.len();
+    if prompt_tokens.saturating_add(max_new_tokens) > capacity {
+        return Err(error_response(
+            400,
+            "capacity_exceeded",
+            format!(
+                "request length {prompt_tokens} + {max_new_tokens} exceeds engine capacity {capacity}"
+            ),
+        ));
+    }
     if prompt_tokens.saturating_add(max_new_tokens) > max_model_len {
         return Err(error_response(400, "invalid_request", format!(
             "request length {prompt_tokens} + {max_new_tokens} exceeds max_model_len {max_model_len}"

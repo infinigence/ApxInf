@@ -26,8 +26,11 @@ use super::{LayerKind, Qwen35Config};
 
 /// Prefill chunk size: bounds all activation workspace buffers.
 const CHUNK: usize = 512;
-/// KV cache rows per full-attention layer.
-const MAX_SEQ_LEN: usize = 32768;
+/// KV cache rows per full-attention layer. The base evaluation never
+/// exceeds 16384 prompt tokens + 128 output; 16640 leaves a small margin
+/// while freeing ~1 GB of VRAM versus the declared 32768 (longer requests
+/// are rejected by the service as a capacity error).
+pub const MAX_SEQ_LEN: usize = 16640;
 
 struct Gemm {
     packed: Option<GemmPacked>,

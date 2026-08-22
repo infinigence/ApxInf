@@ -147,8 +147,10 @@ CPU torch model), `scripts/qwen38_dump_decode.py` (per-step logits).
 - **Correctness vs precision**: activations run in bf16 (like the reference
   backends); all reductions and recurrence states are f32. Exact-match tokens
   with 5+ margins on the public trajectory cases.
-- **Stability vs VRAM**: 32768-position KV caches sized for the declared
-  `max_model_len`; the >32K context bonus is out of VRAM reach on 24 GB.
+- **Stability vs VRAM**: the on-device KV caches cover 16640 tokens (the
+  base evaluation never exceeds 16384+128); longer requests are rejected
+  with a clean 400 `capacity_exceeded` instead of overflowing. The >32K
+  context bonus is out of VRAM reach on 24 GB.
 - **Simplicity vs speed**: the fused decode GEMM is scalar (no tensor cores);
   it is allocation-free and coalesced but leaves TPOT ~6× above a TC kernel.
 
