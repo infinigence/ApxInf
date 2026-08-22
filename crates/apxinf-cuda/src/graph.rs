@@ -7,19 +7,19 @@ use crate::ffi;
 use crate::buffer::CudaBuffer;
 
 #[derive(Clone, Copy)]
-pub(crate) enum CaptureMode {
+pub enum CaptureMode {
     ThreadLocal,
     Relaxed,
 }
 
-pub(crate) struct CapturedGraph {
+pub struct CapturedGraph {
     exec: ffi::cudaGraphExec_t,
     graph: ffi::cudaGraph_t,
     stream: ffi::cudaStream_t,
 }
 
 impl CapturedGraph {
-    pub(crate) fn replay(&self) -> Result<(), String> {
+    pub fn replay(&self) -> Result<(), String> {
         unsafe { ffi::check_cuda(ffi::cudaGraphLaunch(self.exec, self.stream)) }
     }
 }
@@ -33,7 +33,7 @@ impl Drop for CapturedGraph {
     }
 }
 
-pub(crate) fn begin(ctx: &CudaContext, mode: CaptureMode) -> Result<(), String> {
+pub fn begin(ctx: &CudaContext, mode: CaptureMode) -> Result<(), String> {
     let mode = match mode {
         CaptureMode::ThreadLocal => ffi::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
         CaptureMode::Relaxed => ffi::cudaStreamCaptureMode::cudaStreamCaptureModeRelaxed,
@@ -41,7 +41,7 @@ pub(crate) fn begin(ctx: &CudaContext, mode: CaptureMode) -> Result<(), String> 
     unsafe { ffi::check_cuda(ffi::cudaStreamBeginCapture(ctx.stream().handle(), mode)) }
 }
 
-pub(crate) fn end(ctx: &CudaContext) -> Result<CapturedGraph, String> {
+pub fn end(ctx: &CudaContext) -> Result<CapturedGraph, String> {
     let stream = ctx.stream().handle();
     let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
     unsafe {

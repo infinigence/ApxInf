@@ -119,13 +119,13 @@ __global__ void qwen_qg_split_bf16_kernel(
 // ── partial RoPE (first rotary dims, interleaved split-half) in-place ───
 __global__ void qwen_partial_rope_bf16_kernel(
     __nv_bfloat16* x, const __nv_bfloat16* cos, const __nv_bfloat16* sin,
-    int64_t pairs, int heads, int hd, int half, int pos0) {
+    int64_t pairs, int heads, int hd, int half, const int* pos0_ptr) {
   // one thread per (row, i) pair; row = e / half, i = e % half
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= pairs) return;
   int row = (int)(e / half);
   int i = (int)(e % half);
-  int t = pos0 + row / heads;          // absolute token index
+  int t = *pos0_ptr + row / heads;     // absolute token index
   float c = q35_bf16(cos, (int64_t)t * half + i);
   float s = q35_bf16(sin, (int64_t)t * half + i);
   float a = q35_bf16(x, (int64_t)row * hd + i);
@@ -503,11 +503,12 @@ __global__ void qwen_attention_decode_bf16_kernel(
     const __nv_bfloat16* vcache, // [seq, kvheads, hd]
     const __nv_bfloat16* gate,   // [heads, hd]
     __nv_bfloat16* out,          // [heads, hd]
-    int seq, int heads, int kvheads, int hd) {
+    const int* seq_ptr, int heads, int kvheads, int hd) {
   int h = blockIdx.x;
   int d = threadIdx.x;
   if (h >= heads || d >= hd) return;
   int kh = h / (heads / kvheads);
+  int seq = *seq_ptr + 1;
 
   __shared__ float warp_part[8];
   __shared__ float total_s[1];
@@ -631,3 +632,68 @@ __global__ void qwen_delta_step_bf16_kernel(
   }
 }
 
+
+// ── copy bf16 runs into a cache slot addressed by a device position ──────
+__global__ void qwen_copy_at_bf16_kernel(
+    const __nv_bfloat16* src, __nv_bfloat16* dst_base,
+    const int* pos_ptr, int stride_elems, int n) {
+  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= n) return;
+  int64_t off = (int64_t)(*pos_ptr) * stride_elems;
+  dst_base[off + e] = src[e];
+}
+
+// ── M=1 Q4 GEMM (decode specialist): one output row, one thread per column
+// A[K] is cooperatively staged in dynamic shared once; each thread walks the
+// packed weight row reusing the per-32-group scale/zp. No per-token W tile.
+__global__ void qwen_gemm_w4a16_m1_bf16_kernel(
+    const __nv_bfloat16* a,     // [K]
+    const int32_t* packed,      // [N, K/8]
+    const __nv_bfloat16* scale, // [N, K/32]
+    const int32_t* zp,          // [N/8, K/32]
+    __nv_bfloat16* c,           // [N]
+    int N, int K) {
+  // M=1 decode GEMM: packed tile staged coalesced in shared; scale/zp read
+  // per group like the batched kernel. One output column per thread.
+  const int BN = 128;
+  const int BK = 64;
+  __shared__ int32_t ps[BN][BK / 8 + 1];
+  __shared__ __nv_bfloat16 A_s[BK];
+
+  int n0 = blockIdx.x * BN;
+  int tid = threadIdx.x;
+  const int groups = K / 32;
+  const int pcols = K / 8;
+  float acc = 0.0f;
+
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    if (tid < BK) A_s[tid] = a[k0 + tid];
+    #pragma unroll
+    for (int it = 0; it < 8; it++) {
+      int e = it * BN + tid;
+      int nn = e >> 3;
+      int j = e & 7;
+      int ng = n0 + nn;
+      ps[nn][j] = (ng < N) ? packed[(int64_t)ng * pcols + (k0 >> 3) + j] : 0;
+    }
+    __syncthreads();
+
+    int n = n0 + tid;
+    if (n >= N) {
+      __syncthreads();
+      continue;
+    }
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk++) {
+      int g = (k0 >> 5) + (kk >> 5);
+      float s = __bfloat162float(scale[(int64_t)n * groups + g]);
+      int zpv = ((zp[((int64_t)n / 8) * groups + g] >> (4 * (n & 7))) & 0xF) - 8;
+      int w = ((ps[tid][kk >> 3] >> (4 * (kk & 7))) & 0xF) - 8;
+      acc += __bfloat162float(A_s[kk]) * (s * (float)(w - zpv));
+    }
+    __syncthreads();
+  }
+
+  int n = n0 + tid;
+  if (n < N) c[n] = __float2bfloat16(acc);
+}

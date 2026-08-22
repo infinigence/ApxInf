@@ -508,7 +508,7 @@ extern "C" cudaError_t apxinf_qwen_qg_split_bf16(
 
 extern "C" cudaError_t apxinf_qwen_partial_rope_bf16(
     void* x, const void* cos, const void* sin, int64_t pairs,
-    int heads, int hd, int half, int pos0, cudaStream_t stream) {
+    int heads, int hd, int half, const void* pos0, cudaStream_t stream) {
   if (pairs <= 0) return cudaErrorInvalidValue;
   int threads = 256;
   int64_t blocks64 = (pairs + threads - 1) / threads;
@@ -517,7 +517,7 @@ extern "C" cudaError_t apxinf_qwen_partial_rope_bf16(
       static_cast<__nv_bfloat16*>(x),
       static_cast<const __nv_bfloat16*>(cos),
       static_cast<const __nv_bfloat16*>(sin),
-      pairs, heads, hd, half, pos0);
+      pairs, heads, hd, half, static_cast<const int*>(pos0));
   return cudaGetLastError();
 }
 
@@ -647,8 +647,9 @@ extern "C" cudaError_t apxinf_qwen_copy_bf16(
 
 extern "C" cudaError_t apxinf_qwen_attention_decode_bf16(
     const void* q, const void* kcache, const void* vcache, const void* gate,
-    void* out, int seq, int heads, int kvheads, int hd, cudaStream_t stream) {
-  if (seq <= 0 || heads <= 0 || kvheads <= 0 || hd <= 0) return cudaErrorInvalidValue;
+    void* out, const void* seq_ptr, int heads, int kvheads, int hd,
+    cudaStream_t stream) {
+  if (heads <= 0 || kvheads <= 0 || hd <= 0) return cudaErrorInvalidValue;
   if (hd > 256 || (hd & (hd - 1)) != 0) return cudaErrorInvalidValue;
   qwen_attention_decode_bf16_kernel<<<heads, hd, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(q),
@@ -656,7 +657,7 @@ extern "C" cudaError_t apxinf_qwen_attention_decode_bf16(
       static_cast<const __nv_bfloat16*>(vcache),
       static_cast<const __nv_bfloat16*>(gate),
       static_cast<__nv_bfloat16*>(out),
-      seq, heads, kvheads, hd);
+      static_cast<const int*>(seq_ptr), heads, kvheads, hd);
   return cudaGetLastError();
 }
 
@@ -689,5 +690,33 @@ extern "C" cudaError_t apxinf_qwen_delta_step_bf16(
       static_cast<const __nv_bfloat16*>(g),
       static_cast<float*>(state),
       static_cast<__nv_bfloat16*>(out), nv, kd, vd);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen_copy_at_bf16(
+    const void* src, void* dst_base, const void* pos_ptr,
+    int stride_elems, int n, cudaStream_t stream) {
+  if (n <= 0) return cudaErrorInvalidValue;
+  int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  qwen_copy_at_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(src),
+      static_cast<__nv_bfloat16*>(dst_base),
+      static_cast<const int*>(pos_ptr), stride_elems, n);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen_gemm_w4a16_m1_bf16(
+    const void* a, const void* packed, const void* scale, const void* zp,
+    void* c, int n, int k, cudaStream_t stream) {
+  if (n <= 0 || k <= 0) return cudaErrorInvalidValue;
+  int threads = 128;
+  int blocks = (n + threads - 1) / threads;
+  qwen_gemm_w4a16_m1_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const int32_t*>(packed),
+      static_cast<const __nv_bfloat16*>(scale),
+      static_cast<const int32_t*>(zp),
+      static_cast<__nv_bfloat16*>(c), n, k);
   return cudaGetLastError();
 }

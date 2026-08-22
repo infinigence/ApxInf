@@ -161,12 +161,13 @@ pub fn partial_rope_bf16_inplace(
     hd: usize,
     half: usize,
     max_len: usize,
-    pos0: usize,
+    pos0: &CudaBuffer,
 ) -> Result<()> {
     let dev = ctx.device_id();
     need(ctx, "x", dev, x, rows * hd * 2)?;
     need(ctx, "cos", dev, cos, max_len * half * 2)?;
     need(ctx, "sin", dev, sin, max_len * half * 2)?;
+    need(ctx, "pos0", dev, pos0, 4)?;
     ffi::check_cuda(unsafe {
         ffi::apxinf_qwen_partial_rope_bf16(
             x.ptr(),
@@ -176,7 +177,7 @@ pub fn partial_rope_bf16_inplace(
             heads as i32,
             hd as i32,
             half as i32,
-            pos0 as i32,
+            pos0.ptr(),
             ctx.stream().handle(),
         )
     })
@@ -426,17 +427,18 @@ pub fn attention_decode_bf16_into(
     vcache: &CudaBuffer,
     gate: &CudaBuffer,
     out: &CudaBuffer,
-    seq: usize,
+    seq: &CudaBuffer,
     heads: usize,
     kv_heads: usize,
     hd: usize,
 ) -> Result<()> {
     let dev = ctx.device_id();
     need(ctx, "q", dev, q, heads * hd * 2)?;
-    need(ctx, "kcache", dev, kcache, seq * kv_heads * hd * 2)?;
-    need(ctx, "vcache", dev, vcache, seq * kv_heads * hd * 2)?;
+    need(ctx, "kcache", dev, kcache, 1)?;
+    need(ctx, "vcache", dev, vcache, 1)?;
     need(ctx, "gate", dev, gate, heads * hd * 2)?;
     need(ctx, "out", dev, out, heads * hd * 2)?;
+    need(ctx, "seq", dev, seq, 4)?;
     ffi::check_cuda(unsafe {
         ffi::apxinf_qwen_attention_decode_bf16(
             q.ptr(),
@@ -444,7 +446,7 @@ pub fn attention_decode_bf16_into(
             vcache.ptr(),
             gate.ptr(),
             out.ptr(),
-            seq as i32,
+            seq.ptr(),
             heads as i32,
             kv_heads as i32,
             hd as i32,
@@ -514,6 +516,62 @@ pub fn delta_step_bf16_into(
             nv as i32,
             kd as i32,
             vd as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+pub fn copy_at_bf16(
+    ctx: &CudaContext,
+    src: &CudaBuffer,
+    dst_base: &CudaBuffer,
+    pos: &CudaBuffer,
+    stride_elems: usize,
+    n: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "src", dev, src, n * 2)?;
+    need(ctx, "dst_base", dev, dst_base, 1)?;
+    need(ctx, "pos", dev, pos, 4)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_copy_at_bf16(
+            src.ptr(),
+            dst_base.ptr(),
+            pos.ptr(),
+            stride_elems as i32,
+            n as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
+pub fn gemm_w4a16_m1_bf16(
+    ctx: &CudaContext,
+    a: &CudaBuffer,
+    packed: &CudaBuffer,
+    scale: &CudaBuffer,
+    zp: &CudaBuffer,
+    c: &CudaBuffer,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "a", dev, a, k * 2)?;
+    need(ctx, "packed", dev, packed, n * k.div_ceil(8) * 4)?;
+    need(ctx, "scale", dev, scale, n * (k / 32) * 2)?;
+    need(ctx, "zp", dev, zp, n.div_ceil(8) * (k / 32) * 4)?;
+    need(ctx, "c", dev, c, n * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_gemm_w4a16_m1_bf16(
+            a.ptr(),
+            packed.ptr(),
+            scale.ptr(),
+            zp.ptr(),
+            c.ptr(),
+            n as i32,
+            k as i32,
             ctx.stream().handle(),
         )
     })
