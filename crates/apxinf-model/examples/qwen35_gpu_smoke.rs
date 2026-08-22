@@ -28,13 +28,15 @@ fn main() {
     std::fs::write("/tmp/gpu_logits.bin", &buf).expect("write logits");
     eprintln!("[gpu] dumped {} logits to /tmp/gpu_logits.bin", logits.len());
 
-    if std::env::var_os("Q35_L128").is_some() {
-        let mut long: Vec<u32> = Vec::with_capacity(128);
-        for i in 0..128 {
-            long.push(ids[i % ids.len()]);
+    for (env_name, want) in [("Q35_L128", 128usize), ("Q35_L1024", 1024usize)] {
+        if std::env::var_os(env_name).is_some() {
+            let mut long: Vec<u32> = Vec::with_capacity(want);
+            for i in 0..want {
+                long.push(ids[i % ids.len()]);
+            }
+            let t2 = Instant::now();
+            let _ = m.forward_last_logits(&long).expect("forward long");
+            eprintln!("[gpu] {want}-token forward in {:.2?}", t2.elapsed());
         }
-        let t2 = Instant::now();
-        let _ = m.forward_last_logits(&long).expect("forward l128");
-        eprintln!("[gpu] 128-token forward in {:.2?}", t2.elapsed());
     }
 }

@@ -542,8 +542,9 @@ extern "C" cudaError_t apxinf_qwen_delta_recurrence_bf16(
     void* state, void* out,
     int L, int nv, int kd, int vd, cudaStream_t stream) {
   if (L <= 0 || nv <= 0 || kd <= 0 || vd <= 0) return cudaErrorInvalidValue;
-  if (vd > 1024) return cudaErrorInvalidValue;
-  qwen_delta_recurrence_bf16_kernel<<<nv, vd, 0, stream>>>(
+  if (vd > 128 || kd % DR_KDCHUNK != 0) return cudaErrorInvalidValue;
+  dim3 block(vd, DR_KDCHUNK);
+  qwen_delta_recurrence_bf16_kernel<<<nv, block, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(q),
       static_cast<const __nv_bfloat16*>(k),
       static_cast<const __nv_bfloat16*>(v),
@@ -560,8 +561,8 @@ extern "C" cudaError_t apxinf_qwen_attention_bf16(
     void* out, int L, int heads, int kvheads, int hd,
     cudaStream_t stream) {
   if (L <= 0 || heads <= 0 || kvheads <= 0 || hd <= 0) return cudaErrorInvalidValue;
-  if (L > 128 || heads > 256) return cudaErrorInvalidValue;
-  qwen_attention_bf16_kernel<<<L, heads, 0, stream>>>(
+  if (hd > 256 || (hd & (hd - 1)) != 0) return cudaErrorInvalidValue;
+  qwen_attention_bf16_kernel<<<L * heads, hd, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(q),
       static_cast<const __nv_bfloat16*>(k),
       static_cast<const __nv_bfloat16*>(v),

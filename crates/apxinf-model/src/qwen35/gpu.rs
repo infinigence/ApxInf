@@ -15,7 +15,7 @@ use apxinf_cuda::{CudaBuffer, CudaContext};
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 128;
+const MAX_LEN: usize = 1024;
 
 struct GpuQ4 {
     packed: CudaBuffer,

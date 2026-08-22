@@ -4,6 +4,8 @@
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+
+#define DR_KDCHUNK 4
 #include <cstdint>
 
 __device__ __forceinline__ float q35_bf16(const __nv_bfloat16* p, size_t i) {
@@ -172,34 +174,74 @@ __global__ void qwen_delta_recurrence_bf16_kernel(
     float* state,                    // [nv, kd, vd]
     __nv_bfloat16* out,              // [L, nv, vd]
     int L, int nv, int kd, int vd) {
+  // grid = (nv), block = (vd, DR_KDCHUNK). Each thread owns kd-slice
+  // [kk0,kk1) of state column j; the kd reductions are split across the
+  // y dimension and combined through shared memory per time step.
   int h = blockIdx.x;
   int j = threadIdx.x;
+  int y = threadIdx.y;
   if (h >= nv || j >= vd) return;
+
+  const int chunk = kd / DR_KDCHUNK;
+  const int kk0 = y * chunk;
+  const int kk1 = kk0 + chunk;
   float* S = state + (int64_t)h * kd * vd;
-  // zero this thread's state columns: collectively resets the whole
-  // per-layer state matrix before the recurrence.
-  for (int kk = 0; kk < kd; kk++) {
+
+  // zero this thread's state slice (collectively resets the whole matrix)
+  for (int kk = kk0; kk < kk1; kk++) {
     S[(int64_t)kk * vd + j] = 0.0f;
   }
+
+  __shared__ float kv_part[DR_KDCHUNK][128];
+  __shared__ float o_part[DR_KDCHUNK][128];
+  __shared__ float delta_s[128];
+
   for (int t = 0; t < L; t++) {
     float decay = expf(q35_bf16(g, (int64_t)t * nv + h));
-    for (int kk = 0; kk < kd; kk++) {
+    const __nv_bfloat16* krow = k + ((int64_t)t * nv + h) * kd;
+    const __nv_bfloat16* qrow = q + ((int64_t)t * nv + h) * kd;
+
+    for (int kk = kk0; kk < kk1; kk++) {
       S[(int64_t)kk * vd + j] *= decay;
     }
-    float kv = 0.0f;
-    for (int kk = 0; kk < kd; kk++) {
-      kv += S[(int64_t)kk * vd + j] * q35_bf16(k, ((int64_t)t * nv + h) * kd + kk);
+
+    float pkv = 0.0f;
+    for (int kk = kk0; kk < kk1; kk++) {
+      pkv += S[(int64_t)kk * vd + j] * q35_bf16(krow, kk);
     }
-    float delta = (q35_bf16(v, ((int64_t)t * nv + h) * vd + j) - kv) *
-                  q35_bf16(beta, (int64_t)t * nv + h);
-    for (int kk = 0; kk < kd; kk++) {
-      S[(int64_t)kk * vd + j] += q35_bf16(k, ((int64_t)t * nv + h) * kd + kk) * delta;
+    kv_part[y][j] = pkv;
+    __syncthreads();
+
+    if (y == 0) {
+      float kv = kv_part[0][j];
+      #pragma unroll
+      for (int yy = 1; yy < DR_KDCHUNK; yy++) kv += kv_part[yy][j];
+      float delta =
+          (q35_bf16(v, ((int64_t)t * nv + h) * vd + j) - kv) *
+          q35_bf16(beta, (int64_t)t * nv + h);
+      delta_s[j] = delta;
     }
-    float o = 0.0f;
-    for (int kk = 0; kk < kd; kk++) {
-      o += S[(int64_t)kk * vd + j] * q35_bf16(q, ((int64_t)t * nv + h) * kd + kk);
+    __syncthreads();
+
+    float dlt = delta_s[j];
+    for (int kk = kk0; kk < kk1; kk++) {
+      S[(int64_t)kk * vd + j] += q35_bf16(krow, kk) * dlt;
     }
-    out[((int64_t)t * nv + h) * vd + j] = q35_b16(o);
+
+    float po = 0.0f;
+    for (int kk = kk0; kk < kk1; kk++) {
+      po += S[(int64_t)kk * vd + j] * q35_bf16(qrow, kk);
+    }
+    o_part[y][j] = po;
+    __syncthreads();
+
+    if (y == 0) {
+      float o = o_part[0][j];
+      #pragma unroll
+      for (int yy = 1; yy < DR_KDCHUNK; yy++) o += o_part[yy][j];
+      out[((int64_t)t * nv + h) * vd + j] = q35_b16(o);
+    }
+    __syncthreads();
   }
 }
 
@@ -212,38 +254,56 @@ __global__ void qwen_attention_bf16_kernel(
     const __nv_bfloat16* gate,  // [L, heads, hd]
     __nv_bfloat16* out,         // [L, heads, hd]
     int L, int heads, int kvheads, int hd) {
-  float scores[128];
-  int t = blockIdx.x;
-  int h = threadIdx.x;
+  // One block per (t, h); blockDim.x == hd. Causal, GQA-grouped, online
+  // softmax with warp-shuffle reductions (no per-s global atomics).
+  int bid = blockIdx.x;
+  int t = bid / heads;
+  int h = bid % heads;
   if (t >= L || h >= heads) return;
+  int d = threadIdx.x;
+  if (d >= hd) return;
   int kh = h / (heads / kvheads);
+
+  __shared__ float warp_part[8];
+  __shared__ float total_s[1];
+
+  float qv = q35_bf16(q, ((int64_t)t * heads + h) * hd + d);
+  float gv = q35_bf16(gate, ((int64_t)t * heads + h) * hd + d);
+  float acc = 0.0f;
+  float m = -1e30f;
+  float l = 0.0f;
   float scale = rsqrtf((float)hd);
-  float maxv = -1e30f;
+
   for (int s = 0; s <= t; s++) {
-    float dot = 0.0f;
-    for (int d = 0; d < hd; d++) {
-      dot += q35_bf16(q, ((int64_t)t * heads + h) * hd + d) *
-             q35_bf16(k, ((int64_t)s * kvheads + kh) * hd + d);
+    float part = qv * q35_bf16(k, ((int64_t)s * kvheads + kh) * hd + d);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      part += __shfl_xor_sync(0xffffffffu, part, off);
     }
-    dot *= scale;
-    scores[s] = dot;
-    if (dot > maxv) maxv = dot;
-  }
-  float sum = 0.0f;
-  for (int s = 0; s <= t; s++) {
-    scores[s] = expf(scores[s] - maxv);
-    sum += scores[s];
-  }
-  float inv_sum = 1.0f / sum;
-  for (int d = 0; d < hd; d++) {
-    float acc = 0.0f;
-    for (int s = 0; s <= t; s++) {
-      acc += scores[s] * q35_bf16(v, ((int64_t)s * kvheads + kh) * hd + d);
+    if ((d & 31) == 0) warp_part[d >> 5] = part;
+    __syncthreads();
+    if (d < 8) {
+      float wp = warp_part[d];
+      #pragma unroll
+      for (int off = 4; off > 0; off >>= 1) {
+        wp += __shfl_xor_sync(0x000000ffu, wp, off);
+      }
+      if (d == 0) total_s[0] = wp;
     }
-    float g = q35_bf16(gate, ((int64_t)t * heads + h) * hd + d);
-    float sig = 1.0f / (1.0f + expf(-g));
-    out[((int64_t)t * heads + h) * hd + d] = q35_b16(acc * inv_sum * sig);
+    __syncthreads();
+    float dot = total_s[0] * scale;
+
+    float m_new = fmaxf(m, dot);
+    float corr = expf(m - m_new);
+    float p = expf(dot - m_new);
+    l = l * corr + p;
+    acc = acc * corr + p * q35_bf16(v, ((int64_t)s * kvheads + kh) * hd + d);
+    m = m_new;
   }
+
+  acc = acc / l;
+  float sig = 1.0f / (1.0f + expf(-gv));
+  out[((int64_t)t * heads + h) * hd + d] = q35_b16(acc * sig);
 }
 
 // ── expand conv output into per-head q/k (GQA 3x) and v ─────────────────
