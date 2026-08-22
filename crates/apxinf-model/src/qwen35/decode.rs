@@ -1923,47 +1923,67 @@ impl HybridUnit {
         let all_query = CudaBuffer::from_tensor(&workspace.query).map_err(Error::Cuda)?;
         let all_attended = CudaBuffer::from_tensor(&workspace.attended).map_err(Error::Cuda)?;
         let row_bytes = ATTN_WIDTH * DType::BF16.size_in_bytes();
-        for token in first..first + PREFILL_TILE {
-            let position = self
-                .prefill_positions
-                .address_at(token * 4, 4)
-                .map_err(Error::Cuda)?;
-            let query_row = all_query
-                .view(token * row_bytes, row_bytes)
-                .map_err(Error::Cuda)?;
-            let attended_row = all_attended
-                .view(token * row_bytes, row_bytes)
-                .map_err(Error::Cuda)?;
-            let kv_len = token + 1;
-            if let Some(split) = qwen35_attention::split_cta_candidate_for_bucket(kv_len) {
-                qwen35_attention::flash_split_cta_buffer_write(
-                    ctx,
-                    &query_row,
-                    &key_cache,
-                    &value_cache,
-                    &attended_row,
-                    &self.workspace.attention.split,
-                    split,
-                    kv_len,
-                    self.max_seq_len,
-                    ATTENTION_SCALE,
-                    position,
-                )?;
-            } else {
-                attention::flash_bf16_into(
-                    ctx,
-                    &query_row,
-                    &key_cache,
-                    &value_cache,
-                    &attended_row,
-                    ATTN_Q_HEADS,
-                    ATTN_KV_HEADS,
-                    ATTN_HEAD_DIM,
-                    kv_len,
-                    self.max_seq_len,
-                    ATTENTION_SCALE,
-                    position,
-                )?;
+        if first >= 256 {
+            let tile_bytes = PREFILL_TILE * row_bytes;
+            qwen35_attention::flash_split_cta_m8_buffer_write(
+                ctx,
+                &all_query.view(first * row_bytes, tile_bytes).map_err(Error::Cuda)?,
+                &key_cache,
+                &value_cache,
+                &all_attended.view(first * row_bytes, tile_bytes).map_err(Error::Cuda)?,
+                &self.workspace.attention.split,
+                qwen35_attention::SPLIT_CTA_CANDIDATE_COUNT,
+                first + PREFILL_TILE,
+                self.max_seq_len,
+                ATTENTION_SCALE,
+                self.prefill_positions
+                    .address_at(first * 4, PREFILL_TILE * 4)
+                    .map_err(Error::Cuda)?,
+                PREFILL_TILE,
+            )?;
+        } else {
+            for token in first..first + PREFILL_TILE {
+                let position = self
+                    .prefill_positions
+                    .address_at(token * 4, 4)
+                    .map_err(Error::Cuda)?;
+                let query_row = all_query
+                    .view(token * row_bytes, row_bytes)
+                    .map_err(Error::Cuda)?;
+                let attended_row = all_attended
+                    .view(token * row_bytes, row_bytes)
+                    .map_err(Error::Cuda)?;
+                let kv_len = token + 1;
+                if let Some(split) = qwen35_attention::split_cta_candidate_for_bucket(kv_len) {
+                    qwen35_attention::flash_split_cta_buffer_write(
+                        ctx,
+                        &query_row,
+                        &key_cache,
+                        &value_cache,
+                        &attended_row,
+                        &self.workspace.attention.split,
+                        split,
+                        kv_len,
+                        self.max_seq_len,
+                        ATTENTION_SCALE,
+                        position,
+                    )?;
+                } else {
+                    attention::flash_bf16_into(
+                        ctx,
+                        &query_row,
+                        &key_cache,
+                        &value_cache,
+                        &attended_row,
+                        ATTN_Q_HEADS,
+                        ATTN_KV_HEADS,
+                        ATTN_HEAD_DIM,
+                        kv_len,
+                        self.max_seq_len,
+                        ATTENTION_SCALE,
+                        position,
+                    )?;
+                }
             }
         }
         qwen35_attention::gate_m8_write(

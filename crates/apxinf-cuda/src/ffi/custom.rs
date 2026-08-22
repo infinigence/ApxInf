@@ -223,6 +223,23 @@ extern "C" {
         position: *const c_void,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_qwen35_attention_flash_split_cta_m8_bf16(
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        partial_max: *mut c_void,
+        partial_sum: *mut c_void,
+        partial_accumulator: *mut c_void,
+        output: *mut c_void,
+        split_count: i32,
+        bucket_kv_len: i32,
+        max_seq_len: i32,
+        scale: f32,
+        positions: *const c_void,
+        tokens: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_static_w8a16_gemv_bf16(
         activation: *const c_void,
         weight: *const c_void,
