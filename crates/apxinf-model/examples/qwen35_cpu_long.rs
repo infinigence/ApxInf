@@ -36,6 +36,21 @@ fn main() {
     let mut model = CpuQwen35::load(Path::new(&dir)).expect("load model");
     eprintln!("[cpu] loaded in {:.2?}", t0.elapsed());
 
+    if let Some(path) = std::env::var_os("Q35_IDS_FILE") {
+        let ids: Vec<u32> = std::fs::read_to_string(std::path::Path::new(&path))
+            .expect("read ids")
+            .split_whitespace()
+            .map(|s| s.parse::<u32>().unwrap())
+            .collect();
+        let t = Instant::now();
+        let logits = model.forward_last_logits(&ids).expect("forward");
+        let dt = t.elapsed();
+        let argmax = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+        dump("/tmp/cpu_ids_logits.bin", &logits);
+        eprintln!("[cpu] ids-file L={} forward in {:.2?} argmax={argmax} -> /tmp/cpu_ids_logits.bin", ids.len(), dt);
+        return;
+    }
+
     for l in lens {
         let p = gen_prompt(l);
         let t = Instant::now();

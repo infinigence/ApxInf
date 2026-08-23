@@ -693,7 +693,7 @@ fn gated_delta_layer(
             let mut acc = 0.0f32;
             for j in 0..4usize {
                 if t >= j {
-                    acc += s.w_conv[c * 4 + j] * s.qkv[(t - j) * conv_dim + c];
+                    acc += s.w_conv[c * 4 + (3 - j)] * s.qkv[(t - j) * conv_dim + c];
                 }
             }
             s.conv[t * conv_dim + c] = silu(acc);
@@ -795,7 +795,7 @@ fn gated_delta_layer(
             let inv = 1.0 / (mean / vd as f32 + eps).sqrt();
             for j in 0..vd {
                 s.o_heads[base + j] =
-                    s.o_heads[base + j] * inv * (1.0 + norm_w[j]) * silu(s.z_heads[base + j]);
+                    s.o_heads[base + j] * inv * norm_w[j] * silu(s.z_heads[base + j]);
             }
         }
     }

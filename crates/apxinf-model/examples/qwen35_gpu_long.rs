@@ -50,13 +50,26 @@ fn main() {
         .unwrap_or(8);
     let steps: Option<usize> = std::env::var("Q35_DEC_STEPS").ok().and_then(|s| s.parse().ok());
 
+    let mut prompt: Vec<u32> = Vec::new();
+    let from_file = std::env::var_os("Q35_IDS_FILE")
+        .map(|p| {
+            prompt = std::fs::read_to_string(std::path::Path::new(&p))
+                .expect("read ids")
+                .split_whitespace()
+                .map(|s| s.parse::<u32>().unwrap())
+                .collect();
+            true
+        })
+        .unwrap_or(false);
+    let l = if from_file { prompt.len() } else { l };
+
     let t0 = Instant::now();
     let mut m = CudaQwen35::load(Path::new(&dir)).expect("load");
     eprintln!("[gpu] loaded in {:.2?}", t0.elapsed());
 
     // incremental self-consistency: prefill(l-1)+decode(last) vs prefill(l)
     let mut inc: Option<Vec<f32>> = None;
-    if std::env::var_os("Q35_INCCHECK").is_some() && l >= 2 {
+    if std::env::var_os("Q35_INCCHECK").is_some() && l >= 2 && !from_file {
         let sub = gen_prompt(l - 1);
         let last = gen_prompt(l)[l - 1];
         let t = Instant::now();
@@ -68,11 +81,15 @@ fn main() {
         inc = Some(inc_logits);
     }
 
-    let prompt = gen_prompt(l);
+    if !from_file { prompt = gen_prompt(l); }
     let t1 = Instant::now();
     let logits = m.prefill_logits(&prompt).expect("prefill");
     eprintln!("[gpu] L={l} prefill in {:.2?}", t1.elapsed());
-    dump(&format!("/tmp/gpu_logits_L{l}.bin"), &logits);
+    if from_file {
+        dump("/tmp/gpu_ids_logits.bin", &logits);
+    } else {
+        dump(&format!("/tmp/gpu_logits_L{l}.bin"), &logits);
+    }
     let (tok, top5) = top(&logits);
     let maxv = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let minv = logits.iter().cloned().fold(f32::INFINITY, f32::min);

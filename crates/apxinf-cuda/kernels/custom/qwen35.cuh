@@ -8,20 +8,20 @@
 #define DR_KDCHUNK 4
 #include <cstdint>
 
-__device__ __forceinline__ float q35_bf16(const __nv_bfloat16* p, size_t i) {
-  return __bfloat162float(p[i]);
+__device__ __forceinline__ float q35_bf16(const __half* p, size_t i) {
+  return __half2float(p[i]);
 }
 
-__device__ __forceinline__ __nv_bfloat16 q35_b16(float v) {
-  return __float2bfloat16(v);
+__device__ __forceinline__ __half q35_b16(float v) {
+  return __float2half(v);
 }
 
 // ── AWQ W4A16 → bf16, transposed layout [in, out] for cuBLAS row-major ──
 __global__ void qwen_dequant_w4a16_bf16_kernel(
     const int32_t* packed,          // [out, in/8]
-    const __nv_bfloat16* scale,     // [out, groups]
+    const __half* scale,     // [out, groups]
     const int32_t* zp,              // [ceil(out/8), groups]
-    __nv_bfloat16* out,             // [in, out] (transposed)
+    __half* out,             // [in, out] (transposed)
     int out_dim, int in_dim) {
   int groups = in_dim / 32;
   int64_t total = (int64_t)out_dim * in_dim;
@@ -34,22 +34,22 @@ __global__ void qwen_dequant_w4a16_bf16_kernel(
     int j8 = i % 8;
     int zpv = ((zp[(o / 8) * groups + g] >> (4 * (o % 8))) & 0xF) - 8;
     int w4 = ((packed[o * (in_dim / 8) + i / 8] >> (4 * j8)) & 0xF) - 8;
-    float s = __bfloat162float(scale[o * groups + g]);
-    out[(int64_t)i * out_dim + o] = __float2bfloat16(s * ((float)w4 - (float)zpv));
+    float s = __half2float(scale[o * groups + g]);
+    out[(int64_t)i * out_dim + o] = __float2half(s * ((float)w4 - (float)zpv));
   }
 }
 
 // ── elementwise ─────────────────────────────────────────────────────────
 __global__ void qwen_mul_bf16_kernel(
-    const __nv_bfloat16* a, const __nv_bfloat16* b,
-    __nv_bfloat16* out, int64_t n) {
+    const __half* a, const __half* b,
+    __half* out, int64_t n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
   out[e] = q35_b16(q35_bf16(a, e) * q35_bf16(b, e));
 }
 
 __global__ void qwen_silu_bf16_kernel(
-    const __nv_bfloat16* a, __nv_bfloat16* out, int64_t n) {
+    const __half* a, __half* out, int64_t n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
   float x = q35_bf16(a, e);
@@ -57,8 +57,8 @@ __global__ void qwen_silu_bf16_kernel(
 }
 
 __global__ void qwen_sigmoid_mul_bf16_kernel(
-    const __nv_bfloat16* a, const __nv_bfloat16* b,
-    __nv_bfloat16* out, int64_t n) {
+    const __half* a, const __half* b,
+    __half* out, int64_t n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
   float g = q35_bf16(a, e);
@@ -68,7 +68,7 @@ __global__ void qwen_sigmoid_mul_bf16_kernel(
 
 // dst += src
 __global__ void qwen_accum_bf16_kernel(
-    __nv_bfloat16* dst, const __nv_bfloat16* src, int64_t n) {
+    __half* dst, const __half* src, int64_t n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
   dst[e] = q35_b16(q35_bf16(dst, e) + q35_bf16(src, e));
@@ -76,8 +76,8 @@ __global__ void qwen_accum_bf16_kernel(
 
 // ── RMSNorm with precomputed (1+w) weights ──────────────────────────────
 __global__ void qwen_rms_norm_bf16_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* w,
-    __nv_bfloat16* out, int rows, int cols, float eps) {
+    const __half* x, const __half* w,
+    __half* out, int rows, int cols, float eps) {
   extern __shared__ float red[];
   int row = blockIdx.x;
   if (row >= rows) return;
@@ -103,7 +103,7 @@ __global__ void qwen_rms_norm_bf16_kernel(
 
 // ── split qg [L, heads, 2*hd] into q / gate [L*heads, hd] ───────────────
 __global__ void qwen_qg_split_bf16_kernel(
-    const __nv_bfloat16* qg, __nv_bfloat16* q, __nv_bfloat16* gate,
+    const __half* qg, __half* q, __half* gate,
     int64_t total_elems, int heads, int hd) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= total_elems) return;
@@ -118,7 +118,7 @@ __global__ void qwen_qg_split_bf16_kernel(
 
 // ── partial RoPE (first rotary dims, interleaved split-half) in-place ───
 __global__ void qwen_partial_rope_bf16_kernel(
-    __nv_bfloat16* x, const __nv_bfloat16* cos, const __nv_bfloat16* sin,
+    __half* x, const __half* cos, const __half* sin,
     int64_t pairs, int heads, int hd, int half, const int* pos0_ptr) {
   // one thread per (row, i) pair; row = e / half, i = e % half
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -136,8 +136,8 @@ __global__ void qwen_partial_rope_bf16_kernel(
 
 // ── depthwise causal conv kernel=4 + SiLU ───────────────────────────────
 __global__ void qwen_conv_silu_bf16_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* w,
-    __nv_bfloat16* out, int L, int conv_dim) {
+    const __half* x, const __half* w,
+    __half* out, int L, int conv_dim) {
   // Process two channels per thread (bf16x2), keeping explicit causal taps.
   int64_t total = (int64_t)L * (conv_dim / 2);
   for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -150,12 +150,12 @@ __global__ void qwen_conv_silu_bf16_kernel(
     #pragma unroll
     for (int j = 0; j < 4; j++) {
       if (t >= j) {
-        __nv_bfloat162 xv = *reinterpret_cast<const __nv_bfloat162*>(
+        __half2 xv = *reinterpret_cast<const __half2*>(
             &x[(int64_t)(t - j) * conv_dim + c0]);
-        float x0 = __bfloat162float(__low2bfloat16(xv));
-        float x1 = __bfloat162float(__high2bfloat16(xv));
-        float w0 = __bfloat162float(w[(int64_t)c0 * 4 + j]);
-        float w1 = __bfloat162float(w[(int64_t)(c0 + 1) * 4 + j]);
+        float x0 = __half2float(__low2half(xv));
+        float x1 = __half2float(__high2half(xv));
+        float w0 = __half2float(w[(int64_t)c0 * 4 + (3 - j)]);
+        float w1 = __half2float(w[(int64_t)(c0 + 1) * 4 + (3 - j)]);
         acc0 += w0 * x0;
         acc1 += w1 * x1;
       }
@@ -169,10 +169,10 @@ __global__ void qwen_conv_silu_bf16_kernel(
 // grid = (nv); block = vd threads. Thread j owns state column j for head h;
 // all reads/writes of column j are thread-local, so no cross-thread sync.
 __global__ void qwen_delta_recurrence_bf16_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* beta, const __nv_bfloat16* g,
+    const __half* q, const __half* k, const __half* v,
+    const __half* beta, const __half* g,
     float* state,                    // [nv, kd, vd]
-    __nv_bfloat16* out,              // [L, nv, vd]
+    __half* out,              // [L, nv, vd]
     int L, int nv, int kd, int vd) {
   // grid = (nv), block = (vd, DR_KDCHUNK). Each thread owns kd-slice
   // [kk0,kk1) of state column j; the kd reductions are split across the
@@ -198,8 +198,8 @@ __global__ void qwen_delta_recurrence_bf16_kernel(
 
   for (int t = 0; t < L; t++) {
     float decay = expf(q35_bf16(g, (int64_t)t * nv + h));
-    const __nv_bfloat16* krow = k + ((int64_t)t * nv + h) * kd;
-    const __nv_bfloat16* qrow = q + ((int64_t)t * nv + h) * kd;
+    const __half* krow = k + ((int64_t)t * nv + h) * kd;
+    const __half* qrow = q + ((int64_t)t * nv + h) * kd;
 
     for (int kk = kk0; kk < kk1; kk++) {
       S[(int64_t)kk * vd + j] *= decay;
@@ -248,11 +248,11 @@ __global__ void qwen_delta_recurrence_bf16_kernel(
 // ── Full attention for short prefill (L <= 128) ─────────────────────────
 // grid = (L); block = heads threads. Each thread computes one (t, h) output.
 __global__ void qwen_attention_bf16_kernel(
-    const __nv_bfloat16* q,     // [L, heads, hd]
-    const __nv_bfloat16* k,     // [L, kvheads, hd]
-    const __nv_bfloat16* v,     // [L, kvheads, hd]
-    const __nv_bfloat16* gate,  // [L, heads, hd]
-    __nv_bfloat16* out,         // [L, heads, hd]
+    const __half* q,     // [L, heads, hd]
+    const __half* k,     // [L, kvheads, hd]
+    const __half* v,     // [L, kvheads, hd]
+    const __half* gate,  // [L, heads, hd]
+    __half* out,         // [L, heads, hd]
     int L, int heads, int kvheads, int hd) {
   // One block per (t, h); blockDim.x == hd. Causal, GQA-grouped, online
   // softmax with warp-shuffle reductions (no per-s global atomics).
@@ -308,8 +308,8 @@ __global__ void qwen_attention_bf16_kernel(
 
 // ── expand conv output into per-head q/k (GQA 3x) and v ─────────────────
 __global__ void qwen_conv_split_bf16_kernel(
-    const __nv_bfloat16* conv, __nv_bfloat16* q, __nv_bfloat16* k,
-    __nv_bfloat16* v, int L, int nk, int nv, int kd, int vd, int conv_dim) {
+    const __half* conv, __half* q, __half* k,
+    __half* v, int L, int nk, int nv, int kd, int vd, int conv_dim) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   int64_t qk = (int64_t)L * nv * kd;
   int64_t vv = (int64_t)L * nv * vd;
@@ -334,7 +334,7 @@ __global__ void qwen_conv_split_bf16_kernel(
 
 // ── L2 normalization (no mean) then scalar scale: x/sqrt(sum+eps)*scale ──
 __global__ void qwen_l2norm_bf16_kernel(
-    const __nv_bfloat16* x, __nv_bfloat16* out,
+    const __half* x, __half* out,
     int rows, int cols, float eps, float scale) {
   extern __shared__ float red[];
   int row = blockIdx.x;
@@ -350,6 +350,7 @@ __global__ void qwen_l2norm_bf16_kernel(
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (tid < s) red[tid] += red[tid + s];
     __syncthreads();
+
   }
   float rstd = rsqrtf(red[0] + eps) * scale;
   for (int j = tid; j < cols; j += blockDim.x) {
@@ -371,16 +372,16 @@ __global__ void qwen_l2norm_bf16_kernel(
 #define QW4_NT 2
 
 __global__ void qwen_gemm_w4a16_bf16_kernel(
-    const __nv_bfloat16* a,     // [M, K]
+    const __half* a,     // [M, K]
     const int32_t* packed,      // [N, K/8]
-    const __nv_bfloat16* scale, // [N, K/32]
+    const __half* scale, // [N, K/32]
     const int32_t* zp,          // [N/8, K/32]
-    __nv_bfloat16* c,           // [M, N]
+    __half* c,           // [M, N]
     int M, int N, int K) {
   const int groups = K / 32;
   const int packed_cols = K / 8;
-  __shared__ __nv_bfloat162 A_s[QW4_BM][QW4_BK / 2];
-  __shared__ __nv_bfloat162 W_s[QW4_BN][QW4_BK / 2];
+  __shared__ __half2 A_s[QW4_BM][QW4_BK / 2];
+  __shared__ __half2 W_s[QW4_BN][QW4_BK / 2];
 
   const int n0 = blockIdx.x * QW4_BN;
   const int m0 = blockIdx.y * QW4_BM;
@@ -406,9 +407,9 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
       int mg = m0 + mm;
       int kg = k0 + 2 * kk2;
       if (mg < M && kg + 1 < K) {
-        A_s[mm][kk2] = *reinterpret_cast<const __nv_bfloat162*>(&a[(int64_t)mg * K + kg]);
+        A_s[mm][kk2] = *reinterpret_cast<const __half2*>(&a[(int64_t)mg * K + kg]);
       } else {
-        A_s[mm][kk2] = __floats2bfloat162_rn(0.0f, 0.0f);
+        A_s[mm][kk2] = __floats2half2_rn(0.0f, 0.0f);
       }
     }
     // Cooperative dequant W tile: W_s[64][32] = 2048 vec2, 8 / thread
@@ -421,16 +422,16 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
       int kg = k0 + 2 * kk2;
       if (ng < N && kg + 1 < K) {
         int g = kg / 32;
-        float sc = __bfloat162float(scale[(int64_t)ng * groups + g]);
+        float sc = __half2float(scale[(int64_t)ng * groups + g]);
         int zpv = ((zp[((int64_t)ng / 8) * groups + g] >> (4 * (ng & 7))) & 0xF) - 8;
         int32_t pw0 = packed[(int64_t)ng * packed_cols + kg / 8];
         int32_t pw1 = packed[(int64_t)ng * packed_cols + (kg + 1) / 8];
         int w0 = ((pw0 >> (4 * (kg & 7))) & 0xF) - 8;
         int w1 = ((pw1 >> (4 * ((kg + 1) & 7))) & 0xF) - 8;
-        W_s[nn][kk2] = __floats2bfloat162_rn(
+        W_s[nn][kk2] = __floats2half2_rn(
             sc * (float)(w0 - zpv), sc * (float)(w1 - zpv));
       } else {
-        W_s[nn][kk2] = __floats2bfloat162_rn(0.0f, 0.0f);
+        W_s[nn][kk2] = __floats2half2_rn(0.0f, 0.0f);
       }
     }
     __syncthreads();
@@ -441,15 +442,15 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
       float2 av[QW4_MT], wv[QW4_NT];
       #pragma unroll
       for (int r = 0; r < QW4_MT; r++) {
-        __nv_bfloat162 v = A_s[ml0 + r][kk2];
-        av[r].x = __bfloat162float(__low2bfloat16(v));
-        av[r].y = __bfloat162float(__high2bfloat16(v));
+        __half2 v = A_s[ml0 + r][kk2];
+        av[r].x = __half2float(__low2half(v));
+        av[r].y = __half2float(__high2half(v));
       }
       #pragma unroll
       for (int cv = 0; cv < QW4_NT; cv++) {
-        __nv_bfloat162 v = W_s[nl0 + cv][kk2];
-        wv[cv].x = __bfloat162float(__low2bfloat16(v));
-        wv[cv].y = __bfloat162float(__high2bfloat16(v));
+        __half2 v = W_s[nl0 + cv][kk2];
+        wv[cv].x = __half2float(__low2half(v));
+        wv[cv].y = __half2float(__high2half(v));
       }
       #pragma unroll
       for (int r = 0; r < QW4_MT; r++)
@@ -467,7 +468,7 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
     for (int cv = 0; cv < QW4_NT; cv++) {
       int ng = n0 + nl0 + cv;
       if (mg < M && ng < N) {
-        c[(int64_t)mg * N + ng] = __float2bfloat16(acc[r][cv]);
+        c[(int64_t)mg * N + ng] = __float2half(acc[r][cv]);
       }
     }
   }
@@ -475,9 +476,9 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
 
 // ── beta/g gate computation (replaces the host round-trip) ──────────────
 __global__ void qwen_beta_g_bf16_kernel(
-    const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const __half* a, const __half* b,
     const float* a_log, const float* dt_bias,
-    __nv_bfloat16* beta, __nv_bfloat16* g,
+    __half* beta, __half* g,
     int total, int nv) {
   int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= total) return;
@@ -490,7 +491,7 @@ __global__ void qwen_beta_g_bf16_kernel(
 
 // ── device-to-device bf16 copy (for cache population) ───────────────────
 __global__ void qwen_copy_bf16_kernel(
-    const __nv_bfloat16* src, __nv_bfloat16* dst, int64_t n) {
+    const __half* src, __half* dst, int64_t n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
   dst[e] = src[e];
@@ -498,11 +499,11 @@ __global__ void qwen_copy_bf16_kernel(
 
 // ── single-token attention over a KV cache (online softmax) ─────────────
 __global__ void qwen_attention_decode_bf16_kernel(
-    const __nv_bfloat16* q,      // [heads, hd]
-    const __nv_bfloat16* kcache, // [seq, kvheads, hd]
-    const __nv_bfloat16* vcache, // [seq, kvheads, hd]
-    const __nv_bfloat16* gate,   // [heads, hd]
-    __nv_bfloat16* out,          // [heads, hd]
+    const __half* q,      // [heads, hd]
+    const __half* kcache, // [seq, kvheads, hd]
+    const __half* vcache, // [seq, kvheads, hd]
+    const __half* gate,   // [heads, hd]
+    __half* out,          // [heads, hd]
     const int* seq_ptr, int heads, int kvheads, int hd) {
   int h = blockIdx.x;
   int d = threadIdx.x;
@@ -555,14 +556,14 @@ __global__ void qwen_attention_decode_bf16_kernel(
 // ── single-token causal conv + history shift ────────────────────────────
 // hist layout: [3, conv_dim], hist[0] = newest tap (t-1), hist[2] = t-3.
 __global__ void qwen_conv_step_silu_bf16_kernel(
-    const __nv_bfloat16* cur, __nv_bfloat16* hist, const __nv_bfloat16* w,
-    __nv_bfloat16* out, int conv_dim) {
+    const __half* cur, __half* hist, const __half* w,
+    __half* out, int conv_dim) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= conv_dim) return;
-  float acc = q35_bf16(w, (int64_t)c * 4 + 0) * q35_bf16(cur, c);
+  float acc = q35_bf16(w, (int64_t)c * 4 + 3) * q35_bf16(cur, c);
   #pragma unroll
   for (int j = 1; j < 4; j++) {
-    acc += q35_bf16(w, (int64_t)c * 4 + j) * q35_bf16(hist, (int64_t)(j - 1) * conv_dim + c);
+    acc += q35_bf16(w, (int64_t)c * 4 + (3 - j)) * q35_bf16(hist, (int64_t)(j - 1) * conv_dim + c);
   }
   out[c] = q35_b16(acc / (1.0f + expf(-acc)));
   // shift history (each thread owns channel c; source reads precede writes)
@@ -573,9 +574,9 @@ __global__ void qwen_conv_step_silu_bf16_kernel(
 
 // ── single-token GatedDeltaNet step over cached state (kd split) ────────
 __global__ void qwen_delta_step_bf16_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* beta, const __nv_bfloat16* g,
-    float* state, __nv_bfloat16* out, int nv, int kd, int vd) {
+    const __half* q, const __half* k, const __half* v,
+    const __half* beta, const __half* g,
+    float* state, __half* out, int nv, int kd, int vd) {
   int h = blockIdx.x;
   int j = threadIdx.x;
   int y = threadIdx.y;
@@ -589,8 +590,8 @@ __global__ void qwen_delta_step_bf16_kernel(
   __shared__ float o_part[DR_KDCHUNK][128];
   __shared__ float delta_s[128];
 
-  const __nv_bfloat16* krow = k + (int64_t)h * kd;
-  const __nv_bfloat16* qrow = q + (int64_t)h * kd;
+  const __half* krow = k + (int64_t)h * kd;
+  const __half* qrow = q + (int64_t)h * kd;
 
   float decay = expf(q35_bf16(g, h));
   for (int kk = kk0; kk < kk1; kk++) {
@@ -635,7 +636,7 @@ __global__ void qwen_delta_step_bf16_kernel(
 
 // ── copy bf16 runs into a cache slot addressed by a device position ──────
 __global__ void qwen_copy_at_bf16_kernel(
-    const __nv_bfloat16* src, __nv_bfloat16* dst_base,
+    const __half* src, __half* dst_base,
     const int* pos_ptr, int stride_elems, int n) {
   int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (e >= n) return;
@@ -647,18 +648,18 @@ __global__ void qwen_copy_at_bf16_kernel(
 // A[K] is cooperatively staged in dynamic shared once; each thread walks the
 // packed weight row reusing the per-32-group scale/zp. No per-token W tile.
 __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
-    const __nv_bfloat16* a,     // [K]
+    const __half* a,     // [K]
     const int32_t* packed,      // [N, K/8]
-    const __nv_bfloat16* scale, // [N, K/32]
+    const __half* scale, // [N, K/32]
     const int32_t* zp,          // [N/8, K/32]
-    __nv_bfloat16* c,           // [N]
+    __half* c,           // [N]
     int N, int K) {
   // M=1 decode GEMM: packed tile staged coalesced in shared; scale/zp read
   // per group like the batched kernel. One output column per thread.
   const int BN = 128;
   const int BK = 64;
   __shared__ int32_t ps[BN][BK / 8 + 1];
-  __shared__ __nv_bfloat16 A_s[BK];
+  __shared__ __half A_s[BK];
 
   int n0 = blockIdx.x * BN;
   int tid = threadIdx.x;
@@ -686,14 +687,14 @@ __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
     #pragma unroll
     for (int kk = 0; kk < BK; kk++) {
       int g = (k0 >> 5) + (kk >> 5);
-      float s = __bfloat162float(scale[(int64_t)n * groups + g]);
+      float s = __half2float(scale[(int64_t)n * groups + g]);
       int zpv = ((zp[((int64_t)n / 8) * groups + g] >> (4 * (n & 7))) & 0xF) - 8;
       int w = ((ps[tid][kk >> 3] >> (4 * (kk & 7))) & 0xF) - 8;
-      acc += __bfloat162float(A_s[kk]) * (s * (float)(w - zpv));
+      acc += __half2float(A_s[kk]) * (s * (float)(w - zpv));
     }
     __syncthreads();
   }
 
   int n = n0 + tid;
-  if (n < N) c[n] = __float2bfloat16(acc);
+  if (n < N) c[n] = __float2half(acc);
 }

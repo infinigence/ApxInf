@@ -212,16 +212,26 @@ for li in range(layers):
         print(f"[ref] layer {li+1}/{layers} done {time.time()-t0:.1f}s", flush=True)
 
 wfinal = b2f(data["model.language_model.norm.weight"])
-h = rms(x, wfinal, eps)[-1]
-logits = b2f(data["lm_head.weight"]) @ h        # [V]
+hall = rms(x, wfinal, eps)
+Wlm = b2f(data["lm_head.weight"])
+logits_all = (Wlm @ hall.T).T                   # [L, V]
 print(f"[ref] forward done {time.time()-t0:.1f}s", flush=True)
-logits.numpy().astype(np.float32).tofile("/tmp/ref_logits.bin")
+logits_all.numpy().astype(np.float32).tofile("/tmp/ref_logits_all.bin")
+logits = logits_all[-1]
 t5 = logits.topk(5)
 print("top5:", [(int(i), round(float(v), 4)) for i, v in zip(t5.indices.tolist(), t5.values.tolist())])
 print("argmax:", int(logits.argmax()))
 
 if os.path.exists("/tmp/rust_logits.bin"):
-    rust = np.fromfile("/tmp/rust_logits.bin", dtype=np.float32)
+    rust_all = np.fromfile("/tmp/rust_logits.bin", dtype=np.float32).reshape(-1, logits_all.shape[1])
+    ref_all_pos = logits_all
+    for pos in range(min(rust_all.shape[0], ref_all_pos.shape[0])):
+        ra = int(np.argmax(rust_all[pos])); rb = int(np.argmax(ref_all_pos[pos]))
+        if ra != rb:
+            print(f"[pos {pos}] rust argmax {ra} != ref argmax {rb}")
+    cos_all = float(np.dot(rust_all.ravel(), ref_all_pos.ravel())/(np.linalg.norm(rust_all.ravel())*np.linalg.norm(ref_all_pos.ravel())))
+    print("full cos:", cos_all)
+    rust = rust_all[-1]
     ref = logits.numpy().astype(np.float32)
     print("len rust/ref:", rust.shape[0], ref.shape[0])
     diff = np.abs(rust - ref)

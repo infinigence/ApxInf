@@ -22,7 +22,8 @@ pub const MAX_MODEL_LEN: usize = 32768;
 pub const VOCAB_SIZE: u64 = 248320;
 /// Context the current Rust forward can actually serve (KV cache + rope).
 /// /health keeps advertising the official model max_model_len.
-pub const SUPPORTED_CONTEXT_LEN: usize = 4096;
+pub const SUPPORTED_PREFILL_LEN: usize = 8192;
+pub const SUPPORTED_SEQ_LEN: usize = 9216;
 
 /// Produces `max_new_tokens` token ids for an already-tokenized prompt.
 /// The service thread owns one instance; requests are served serially.
@@ -347,11 +348,18 @@ impl Server {
             );
         }
         let requested = parsed.input_ids.len().saturating_add(parsed.max_new_tokens);
-        if parsed.input_ids.len() > SUPPORTED_CONTEXT_LEN || requested > SUPPORTED_CONTEXT_LEN {
+        if parsed.input_ids.len() > SUPPORTED_PREFILL_LEN {
             return write_json(
                 writer,
                 400,
-                &json!({"error": {"type": "invalid_request", "message": format!("request length {requested} exceeds supported context length {SUPPORTED_CONTEXT_LEN}")}}),
+                &json!({"error": {"type": "invalid_request", "message": format!("input length {} exceeds supported prefill length {SUPPORTED_PREFILL_LEN}", parsed.input_ids.len())}}),
+            );
+        }
+        if requested > SUPPORTED_SEQ_LEN {
+            return write_json(
+                writer,
+                400,
+                &json!({"error": {"type": "invalid_request", "message": format!("request length {requested} exceeds supported total sequence length {SUPPORTED_SEQ_LEN}")}}),
             );
         }
         for &id in &parsed.input_ids {

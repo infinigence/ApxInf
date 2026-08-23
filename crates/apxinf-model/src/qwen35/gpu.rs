@@ -9,7 +9,7 @@
 
 #![cfg(feature = "cuda")]
 
-use half::bf16;
+use half::{bf16, f16};
 
 use apxinf_core::DType;
 use apxinf_cuda::graph::{begin as graph_begin, end as graph_end, CaptureMode, CapturedGraph};
@@ -18,8 +18,8 @@ use apxinf_cuda::{CudaBuffer, CudaContext};
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 4096; // parallel prefill length cap (workspace)
-const MAX_SEQ: usize = 4096; // total sequence cap (rope + KV cache)
+const MAX_LEN: usize = 8192; // parallel prefill length cap (workspace)
+const MAX_SEQ: usize = 9216; // total sequence cap (rope + KV cache)
 
 struct GpuQ4 {
     packed: CudaBuffer,
@@ -147,6 +147,22 @@ fn bf16_bytes(v: &[bf16]) -> Vec<u8> {
     out
 }
 
+fn f16_bytes(v: &[f16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn bf16_to_f16_bytes(v: &[bf16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        out.extend_from_slice(&f16::from_f32(x.to_f32()).to_le_bytes());
+    }
+    out
+}
+
 fn i32_bytes(v: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for x in v {
@@ -173,7 +189,7 @@ fn upload_transposed(dev: usize, m: &Bf16Mat) -> Result<CudaBuffer, String> {
     let mut out = vec![0u8; m.rows * m.cols * 2];
     for i in 0..m.cols {
         for o in 0..m.rows {
-            let src = m.data[o * m.cols + i];
+            let src = f16::from_f32(m.data[o * m.cols + i].to_f32());
             out[(i * m.rows + o) * 2..(i * m.rows + o) * 2 + 2]
                 .copy_from_slice(&src.to_le_bytes());
         }
@@ -181,28 +197,28 @@ fn upload_transposed(dev: usize, m: &Bf16Mat) -> Result<CudaBuffer, String> {
     upload(dev, &out)
 }
 
-fn norm_plus1(v: &[bf16]) -> Vec<bf16> {
-    v.iter().map(|x| bf16::from_f32(x.to_f32() + 1.0)).collect()
+fn norm_plus1(v: &[bf16]) -> Vec<f16> {
+    v.iter().map(|x| f16::from_f32(x.to_f32() + 1.0)).collect()
 }
 
 fn upload_q4(dev: usize, q: &Q4Linear) -> Result<GpuQ4, String> {
     Ok(GpuQ4 {
         packed: upload(dev, &i32_bytes(&q.packed))?,
-        scale: upload(dev, &bf16_bytes(&q.scale))?,
+        scale: upload(dev, &bf16_to_f16_bytes(&q.scale))?,
         zp: upload(dev, &i32_bytes(&q.zp))?,
         out: q.out,
         inp: q.inp,
     })
 }
 
-fn rope_tables(theta: f64, half: usize, max_len: usize) -> (Vec<bf16>, Vec<bf16>) {
+fn rope_tables(theta: f64, half: usize, max_len: usize) -> (Vec<f16>, Vec<f16>) {
     let mut cos = Vec::with_capacity(max_len * half);
     let mut sin = Vec::with_capacity(max_len * half);
     for t in 0..max_len {
         for i in 0..half {
             let angle = (t as f64) * theta.powf(-(i as f64) / (half as f64));
-            cos.push(bf16::from_f32(angle.cos() as f32));
-            sin.push(bf16::from_f32(angle.sin() as f32));
+            cos.push(f16::from_f32(angle.cos() as f32));
+            sin.push(f16::from_f32(angle.sin() as f32));
         }
     }
     (cos, sin)
@@ -234,10 +250,10 @@ impl CudaQwen35 {
         let dev = ctx.device_id();
 
         let lm_head = upload_transposed(dev, &w.lm_head)?;
-        let final_w = upload(dev, &bf16_bytes(&norm_plus1(&w.final_norm)))?;
+        let final_w = upload(dev, &f16_bytes(&norm_plus1(&w.final_norm)))?;
         let (cos, sin) = rope_tables(cfg.rope_theta(), half, MAX_SEQ);
-        let rope_cos = upload(dev, &bf16_bytes(&cos))?;
-        let rope_sin = upload(dev, &bf16_bytes(&sin))?;
+        let rope_cos = upload(dev, &f16_bytes(&cos))?;
+        let rope_sin = upload(dev, &f16_bytes(&sin))?;
         let pos_dev = CudaBuffer::alloc(4, dev)?;
         pos_dev.copy_from_host(&0u32.to_le_bytes())?;
         let token_embed = CudaBuffer::alloc(hidden * 2, dev)?;
@@ -251,10 +267,10 @@ impl CudaQwen35 {
                         wk: upload_q4(dev, k)?,
                         wv: upload_q4(dev, v)?,
                         wo: upload_q4(dev, o)?,
-                        q_norm_w: upload(dev, &bf16_bytes(&norm_plus1(q_norm)))?,
-                        k_norm_w: upload(dev, &bf16_bytes(&norm_plus1(k_norm)))?,
-                        in_norm_w: upload(dev, &bf16_bytes(&norm_plus1(in_norm)))?,
-                        post_norm_w: upload(dev, &bf16_bytes(&norm_plus1(post_norm)))?,
+                        q_norm_w: upload(dev, &f16_bytes(&norm_plus1(q_norm)))?,
+                        k_norm_w: upload(dev, &f16_bytes(&norm_plus1(k_norm)))?,
+                        in_norm_w: upload(dev, &f16_bytes(&norm_plus1(in_norm)))?,
+                        post_norm_w: upload(dev, &f16_bytes(&norm_plus1(post_norm)))?,
                         mlp: GpuMlp {
                             gate: upload_q4(dev, gate)?,
                             up: upload_q4(dev, up)?,
@@ -270,16 +286,16 @@ impl CudaQwen35 {
                         in_z: upload_q4(dev, in_z)?,
                         in_a: upload_transposed(dev, in_a)?,
                         in_b: upload_transposed(dev, in_b)?,
-                        conv_w: upload(dev, &bf16_bytes(&conv.data))?,
+                        conv_w: upload(dev, &bf16_to_f16_bytes(&conv.data))?,
                         a_log: upload(dev, &f32_bytes(a_log))?,
                         dt_bias: upload(dev, &f32_bytes(dt_bias))?,
-                        norm_w: upload(dev, &bf16_bytes(&norm_plus1(norm)))?,
+                        norm_w: upload(dev, &bf16_to_f16_bytes(&norm))?,
                         out_proj: match out_proj {
                             MatKind::Q4(qq) => GpuOutProj::Q4(upload_q4(dev, qq)?),
                             MatKind::Dense(d) => GpuOutProj::Dense(upload_transposed(dev, d)?),
                         },
-                        in_norm_w: upload(dev, &bf16_bytes(&norm_plus1(in_norm)))?,
-                        post_norm_w: upload(dev, &bf16_bytes(&norm_plus1(post_norm)))?,
+                        in_norm_w: upload(dev, &f16_bytes(&norm_plus1(in_norm)))?,
+                        post_norm_w: upload(dev, &f16_bytes(&norm_plus1(post_norm)))?,
                         mlp: GpuMlp {
                             gate: upload_q4(dev, gate)?,
                             up: upload_q4(dev, up)?,
@@ -358,7 +374,7 @@ impl CudaQwen35 {
     }
 
     fn gemm(&self, m: usize, n: usize, kk: usize, a: &CudaBuffer, b: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
-        self.ctx.cublas().gemm(DType::BF16, m, n, kk, 1.0f32, a, b, 0.0f32, c)
+        self.ctx.cublas().gemm(DType::F16, m, n, kk, 1.0f32, a, b, 0.0f32, c)
     }
 
     fn gemm_q4(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
@@ -491,7 +507,7 @@ impl CudaQwen35 {
         self.ws.logits.copy_to_host(&mut bytes)?;
         let mut out = Vec::with_capacity(self.vocab);
         for j in 0..self.vocab {
-            let v = bf16::from_le_bytes([bytes[j * 2], bytes[j * 2 + 1]]).to_f32();
+            let v = f16::from_le_bytes([bytes[j * 2], bytes[j * 2 + 1]]).to_f32();
             out.push(v);
         }
         Ok(out)
@@ -520,7 +536,7 @@ impl CudaQwen35 {
                 return Err(format!("token id {id} out of range"));
             }
             for j in 0..self.hidden {
-                let src = self.embed[row * self.hidden + j];
+                let src = f16::from_f32(self.embed[row * self.hidden + j].to_f32());
                 host_x[(t * self.hidden + j) * 2..(t * self.hidden + j) * 2 + 2]
                     .copy_from_slice(&src.to_le_bytes());
             }
@@ -558,7 +574,7 @@ impl CudaQwen35 {
         }
         let mut host_x = vec![0u8; self.hidden * 2];
         for j in 0..self.hidden {
-            let src = self.embed[row * self.hidden + j];
+            let src = f16::from_f32(self.embed[row * self.hidden + j].to_f32());
             host_x[j * 2..j * 2 + 2].copy_from_slice(&src.to_le_bytes());
         }
         // publish dynamic graph inputs (embedding + absolute position)
