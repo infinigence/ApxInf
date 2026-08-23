@@ -20,6 +20,9 @@ pub const EVALUATION_CONTRACT: &str = "apxinf.qwen38_27b.inference_interface.v1"
 pub const MODEL_REVISION: &str = "63768c10df38c0395e12ef49edac1bd539eaeeea";
 pub const MAX_MODEL_LEN: usize = 32768;
 pub const VOCAB_SIZE: u64 = 248320;
+/// Context the current Rust forward can actually serve (KV cache + rope).
+/// /health keeps advertising the official model max_model_len.
+pub const SUPPORTED_CONTEXT_LEN: usize = 4096;
 
 /// Produces `max_new_tokens` token ids for an already-tokenized prompt.
 /// The service thread owns one instance; requests are served serially.
@@ -335,6 +338,31 @@ impl Server {
                 );
             }
         };
+
+        if parsed.input_ids.is_empty() {
+            return write_json(
+                writer,
+                400,
+                &json!({"error": {"type": "invalid_request", "message": "input_ids must not be empty"}}),
+            );
+        }
+        let requested = parsed.input_ids.len().saturating_add(parsed.max_new_tokens);
+        if parsed.input_ids.len() > SUPPORTED_CONTEXT_LEN || requested > SUPPORTED_CONTEXT_LEN {
+            return write_json(
+                writer,
+                400,
+                &json!({"error": {"type": "invalid_request", "message": format!("request length {requested} exceeds supported context length {SUPPORTED_CONTEXT_LEN}")}}),
+            );
+        }
+        for &id in &parsed.input_ids {
+            if id as u64 >= VOCAB_SIZE {
+                return write_json(
+                    writer,
+                    400,
+                    &json!({"error": {"type": "invalid_request", "message": format!("token id {id} out of range")}}),
+                );
+            }
+        }
 
         let tokens = match self.generator.generate(
             &parsed.input_ids,

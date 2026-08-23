@@ -18,7 +18,7 @@ use apxinf_cuda::{CudaBuffer, CudaContext};
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 1024; // parallel prefill length cap (workspace)
+const MAX_LEN: usize = 4096; // parallel prefill length cap (workspace)
 const MAX_SEQ: usize = 4096; // total sequence cap (rope + KV cache)
 
 struct GpuQ4 {
