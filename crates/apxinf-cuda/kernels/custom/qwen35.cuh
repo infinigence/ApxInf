@@ -535,101 +535,69 @@ __global__ void qwen35_gemm_w4a16_bf16_tc_kernel(
   const int lane = threadIdx.x % 32;
   const int group_size = (in_cols + groups - 1) / groups;
   const int packed_cols = (in_cols + 7) / 8;
-
-  // Coalesced packed tile [64 rows][16 words = 128 cols], per-warp
-  // dequantized weight tile [warp][16 k][8 n] bf16, and the hoisted
-  // per-group scale/zp for the block's 64 rows.
-  __shared__ uint32_t s_packed[64 * 16];
-  __shared__ __nv_bfloat16 s_w[8][16][8];
-  __shared__ float s_scale[64 * 4];
-  __shared__ int s_zp[8 * 4];
-
-
-  // A fragment: row 0 = activation pairs at columns 2*(lane%4)..+1 (+8).
+  __shared__ __nv_bfloat16 s_act[128];
   const int a_col = 2 * (lane % 4);
-  float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // This lane's B-fragment positions: (k, n) = (2l', j), (2l'+1, j),
+  // (2l'+8, j), (2l'+9, j) with l' = lane%4, j = lane/4 (the n index).
+  const int l4 = lane % 4;
+  const int jn = lane / 4;            // the output row within the tile
+  const int out_row = out_base + warp * 8 + jn;
+  const int k0 = 2 * l4;              // the first k pair
+  const int k1 = k0 + 8;              // the second k pair
+  float c[16] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
   for (int tile128 = 0; tile128 < in_cols; tile128 += 128) {
-    // Cooperative coalesced load of [64 x 16] packed words.
-    const int total = 64 * 16;
-    for (int idx = threadIdx.x; idx < total; idx += 256) {
-      const int row = idx / 16;
-      const int w = idx % 16;
-      s_packed[idx] = static_cast<uint32_t>(weight_packed[
-          static_cast<int64_t>(out_base + row) * packed_cols +
-          tile128 / 8 + w]);
-    }
+    for (int idx = threadIdx.x; idx < 128; idx += 256)
+      s_act[idx] = activation[tile128 + idx];
     __syncthreads();
-
-    // Hoist the zp/scale for the 4 groups of this 128-col tile.
-    const int group0 = tile128 / group_size;
-    for (int idx = threadIdx.x; idx < 64 * 4; idx += 256) {
-      const int row = idx / 4;
-      const int g = group0 + idx % 4;
-      s_scale[idx] =
-          __bfloat162float(weight_scale[static_cast<int64_t>(out_base + row) * groups + g]);
+    uint32_t a0[8], a2[8];
+#pragma unroll
+    for (int sub = 0; sub < 8; sub++) {
+      a0[sub] = 0;
+      a2[sub] = 0;
+      if (lane / 4 == 0) {
+        a0[sub] = qwen35_pack_bf16(s_act[sub * 16 + a_col],
+                                   s_act[sub * 16 + a_col + 1]);
+        a2[sub] = qwen35_pack_bf16(s_act[sub * 16 + a_col + 8],
+                                   s_act[sub * 16 + a_col + 9]);
+      }
     }
-    for (int idx = threadIdx.x; idx < 8 * 4; idx += 256) {
-      const int zrow = idx / 4;
-      const int g = group0 + idx % 4;
-      s_zp[idx] = static_cast<int>(static_cast<uint32_t>(
-          weight_zero_point[static_cast<int64_t>(out_base / 8 + zrow) * groups + g]));
-    }
-    __syncthreads();
-
+#pragma unroll
     for (int sub = 0; sub < 8; sub++) {
       const int group = (tile128 + sub * 16) / group_size;
-      // Dequant this warp's 16x8 sub-tile from the shared packed data:
-      // threads 0..15 each unpack one word (8 nibbles = 8 k-columns of one
-      // output row within the sub-tile).
-      if (lane < 16) {
-        const int word_idx = lane;             // 0..15 = (n, kword)
-        const int n_local = word_idx / 2;      // 0..7 output row in tile
-        const int kword = word_idx % 2;        // 0..1 word in the 16-col tile
-        const int out_row_local = warp * 8 + n_local;
-        const int out_row = out_base + out_row_local;
-        const uint32_t word = s_packed[out_row_local * 16 + sub * 2 + kword];
-        const uint32_t zp_word =
-            static_cast<uint32_t>(s_zp[(out_row_local / 8) * 4 + (group - group0)]);
-        const int zp = static_cast<int>((zp_word >> ((out_row & 7) * 4)) & 0xFu);
-        const float scale = s_scale[out_row_local * 4 + (group - group0)];
-#pragma unroll
-        for (int j = 0; j < 8; j++) {
-          const int q = static_cast<int>((word >> (j * 4)) & 0xFu);
-          s_w[warp][kword * 8 + j][n_local] =
-              __float2bfloat16(static_cast<float>(q - zp) * scale);
-        }
-      }
-      // A operands: a0 covers k-columns 0..7, a2 covers 8..15.
-      uint32_t a0 = 0, a2 = 0;
-      if (lane / 4 == 0) {
-        const __nv_bfloat16 x0 = activation[tile128 + sub * 16 + a_col];
-        const __nv_bfloat16 x1 = activation[tile128 + sub * 16 + a_col + 1];
-        const __nv_bfloat16 x2 = activation[tile128 + sub * 16 + a_col + 8];
-        const __nv_bfloat16 x3 = activation[tile128 + sub * 16 + a_col + 9];
-        a0 = qwen35_pack_bf16(x0, x1);
-        a2 = qwen35_pack_bf16(x2, x3);
-      }
-      __syncthreads();
-
-      // B fragments: b0 = s_w[2l'][j], s_w[2l'+1][j]; b1 = s_w[2l'+8][j], ...
-      const int b_col = lane / 4;
-      const int b_row = 2 * (lane % 4);
-      const uint32_t b0 = qwen35_pack_bf16(s_w[warp][b_row][b_col],
-                                           s_w[warp][b_row + 1][b_col]);
-      const uint32_t b1 = qwen35_pack_bf16(s_w[warp][b_row + 8][b_col],
-                                           s_w[warp][b_row + 9][b_col]);
-      qwen35_mma_bf16(c[0], c[1], c[2], c[3], a0, 0, a2, 0, b0, b1);
-      __syncthreads();
+      const int base_col = tile128 + sub * 16;
+      const uint32_t zp_word = static_cast<uint32_t>(weight_zero_point[
+          static_cast<int64_t>(out_row / 8) * groups + group]);
+      const int zp = static_cast<int>((zp_word >> ((out_row & 7) * 4)) & 0xFu);
+      const float scale = __bfloat162float(
+          weight_scale[static_cast<int64_t>(out_row) * groups + group]);
+      const uint32_t w0 = static_cast<uint32_t>(weight_packed[
+          static_cast<int64_t>(out_row) * packed_cols + (base_col + k0) / 8]);
+      const uint32_t w1 = static_cast<uint32_t>(weight_packed[
+          static_cast<int64_t>(out_row) * packed_cols + (base_col + k1) / 8]);
+      const int q00 = static_cast<int>((w0 >> ((k0 & 7) * 4)) & 0xFu);
+      const int q01 = static_cast<int>((w0 >> (((k0 + 1) & 7) * 4)) & 0xFu);
+      const int q10 = static_cast<int>((w1 >> ((k1 & 7) * 4)) & 0xFu);
+      const int q11 = static_cast<int>((w1 >> (((k1 + 1) & 7) * 4)) & 0xFu);
+      const uint32_t b0 = qwen35_pack_bf16(
+          __float2bfloat16(static_cast<float>(q00 - zp) * scale),
+          __float2bfloat16(static_cast<float>(q01 - zp) * scale));
+      const uint32_t b1 = qwen35_pack_bf16(
+          __float2bfloat16(static_cast<float>(q10 - zp) * scale),
+          __float2bfloat16(static_cast<float>(q11 - zp) * scale));
+      qwen35_mma_bf16(c[(sub % 4) * 4], c[(sub % 4) * 4 + 1],
+                      c[(sub % 4) * 4 + 2], c[(sub % 4) * 4 + 3],
+                      a0[sub], 0, a2[sub], 0, b0, b1);
     }
     __syncthreads();
   }
-
-  // Row 0 of the C fragments holds the result; lanes 0..3 write it.
   if (lane < 4) {
     const int col = 2 * lane;
-    output[out_base + warp * 8 + col] = __float2bfloat16(c[0]);
-    output[out_base + warp * 8 + col + 1] = __float2bfloat16(c[1]);
+    const float r0 = c[0] + c[4] + c[8] + c[12];
+    const float r1 = c[1] + c[5] + c[9] + c[13];
+    output[out_base + warp * 8 + col] = __float2bfloat16(r0);
+    output[out_base + warp * 8 + col + 1] = __float2bfloat16(r1);
   }
 }
 
