@@ -18,8 +18,8 @@ use apxinf_cuda::{CudaBuffer, CudaContext};
 
 use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Weights};
 
-const MAX_LEN: usize = 8192; // parallel prefill length cap (workspace)
-const MAX_SEQ: usize = 9216; // total sequence cap (rope + KV cache)
+const MAX_LEN: usize = 16384; // parallel prefill length cap (workspace)
+const MAX_SEQ: usize = 17408; // total sequence cap (rope + KV cache)
 
 struct GpuQ4 {
     packed: CudaBuffer,
@@ -114,9 +114,7 @@ struct Workspace {
     qkv: CudaBuffer,
     conv: CudaBuffer,
     z: CudaBuffer,
-    z2: CudaBuffer,
     o_delta: CudaBuffer,
-    o_norm: CudaBuffer,
     a: CudaBuffer,
     b: CudaBuffer,
     beta: CudaBuffer,
@@ -127,13 +125,11 @@ struct Workspace {
     qg: CudaBuffer,
     q: CudaBuffer,
     gate: CudaBuffer,
-    qn: CudaBuffer,
     kn: CudaBuffer,
     attn_v: CudaBuffer,
     attn_out: CudaBuffer,
     o_out: CudaBuffer,
     mlp_gate: CudaBuffer,
-    mlp_up: CudaBuffer,
     mlp_hid: CudaBuffer,
     mlp_down: CudaBuffer,
     logits: CudaBuffer,
@@ -317,9 +313,7 @@ impl CudaQwen35 {
             qkv: n(MAX_LEN * conv_dim * 2)?,
             conv: n(MAX_LEN * conv_dim * 2)?,
             z: n(MAX_LEN * nv * vd * 2)?,
-            z2: n(MAX_LEN * nv * vd * 2)?,
             o_delta: n(MAX_LEN * nv * vd * 2)?,
-            o_norm: n(MAX_LEN * nv * vd * 2)?,
             a: n(MAX_LEN * nv * 2)?,
             b: n(MAX_LEN * nv * 2)?,
             beta: n(MAX_LEN * nv * 2)?,
@@ -330,13 +324,11 @@ impl CudaQwen35 {
             qg: n(MAX_LEN * heads * 2 * head_dim * 2)?,
             q: n(MAX_LEN * heads * head_dim * 2)?,
             gate: n(MAX_LEN * heads * head_dim * 2)?,
-            qn: n(MAX_LEN * heads * head_dim * 2)?,
             kn: n(MAX_LEN * kv_heads * head_dim * 2)?,
             attn_v: n(MAX_LEN * kv_heads * head_dim * 2)?,
             attn_out: n(MAX_LEN * heads * head_dim * 2)?,
             o_out: n(MAX_LEN * hidden * 2)?,
             mlp_gate: n(MAX_LEN * inter * 2)?,
-            mlp_up: n(MAX_LEN * inter * 2)?,
             mlp_hid: n(MAX_LEN * inter * 2)?,
             mlp_down: n(MAX_LEN * hidden * 2)?,
             logits: n(vocab * 2)?,
@@ -398,10 +390,10 @@ impl CudaQwen35 {
     fn mlp_run(&self, mlp: &GpuMlp, post_w: &CudaBuffer, l: usize) -> Result<(), String> {
         self.rms(&self.ws.x, post_w, &self.ws.xn2, l, self.hidden)?;
         self.gemm_q4(&mlp.gate, l, &self.ws.xn2, &self.ws.mlp_gate)?;
-        self.gemm_q4(&mlp.up, l, &self.ws.xn2, &self.ws.mlp_up)?;
+        self.gemm_q4(&mlp.up, l, &self.ws.xn2, &self.ws.mlp_hid)?;
         k::silu_bf16_into(&self.ctx, &self.ws.mlp_gate, &self.ws.mlp_gate, l * self.inter).map_err(|e| e.to_string())?;
-        k::mul_bf16_into(&self.ctx, &self.ws.mlp_gate, &self.ws.mlp_up, &self.ws.mlp_hid, l * self.inter).map_err(|e| e.to_string())?;
-        self.gemm_q4(&mlp.down, l, &self.ws.mlp_hid, &self.ws.mlp_down)?;
+        k::mul_bf16_into(&self.ctx, &self.ws.mlp_gate, &self.ws.mlp_hid, &self.ws.mlp_gate, l * self.inter).map_err(|e| e.to_string())?;
+        self.gemm_q4(&mlp.down, l, &self.ws.mlp_gate, &self.ws.mlp_down)?;
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.mlp_down, l * self.hidden).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -413,13 +405,13 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.wk, l, &self.ws.xn, &self.ws.kn)?;
         self.gemm_q4(&layer.wv, l, &self.ws.xn, &self.ws.attn_v)?;
         k::qg_split_bf16_into(&self.ctx, &self.ws.qg, &self.ws.q, &self.ws.gate, l * self.heads * hd, self.heads, hd).map_err(|e| e.to_string())?;
-        self.rms(&self.ws.q, &layer.q_norm_w, &self.ws.qn, l * self.heads, hd)?;
+        self.rms(&self.ws.q, &layer.q_norm_w, &self.ws.q, l * self.heads, hd)?;
         self.rms(&self.ws.kn, &layer.k_norm_w, &self.ws.kn, l * self.kv_heads, hd)?;
-        k::partial_rope_bf16_inplace(&self.ctx, &self.ws.qn, &self.rope_cos, &self.rope_sin, l * self.heads, self.heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
+        k::partial_rope_bf16_inplace(&self.ctx, &self.ws.q, &self.rope_cos, &self.rope_sin, l * self.heads, self.heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
         k::partial_rope_bf16_inplace(&self.ctx, &self.ws.kn, &self.rope_cos, &self.rope_sin, l * self.kv_heads, self.kv_heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
         k::copy_bf16(&self.ctx, &self.ws.kn, &layer.kv_k, l * self.kv_heads * hd).map_err(|e| e.to_string())?;
         k::copy_bf16(&self.ctx, &self.ws.attn_v, &layer.kv_v, l * self.kv_heads * hd).map_err(|e| e.to_string())?;
-        k::attention_bf16_into(&self.ctx, &self.ws.qn, &self.ws.kn, &self.ws.attn_v, &self.ws.gate, &self.ws.attn_out, l, self.heads, self.kv_heads, hd).map_err(|e| e.to_string())?;
+        k::attention_bf16_into(&self.ctx, &self.ws.q, &self.ws.kn, &self.ws.attn_v, &self.ws.gate, &self.ws.attn_out, l, self.heads, self.kv_heads, hd).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.wo, l, &self.ws.attn_out, &self.ws.o_out)?;
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, l * self.hidden).map_err(|e| e.to_string())?;
         self.mlp_run(&layer.mlp, &layer.post_norm_w, l)
@@ -438,9 +430,9 @@ impl CudaQwen35 {
         self.l2norm(&self.ws.qh, &self.ws.qh, l * self.nv, self.kd, qscale)?;
         self.l2norm(&self.ws.kh, &self.ws.kh, l * self.nv, self.kd, 1.0f32)?;
         k::delta_recurrence_bf16_into(&self.ctx, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, &self.ws.beta, &self.ws.g, &layer.state, &self.ws.o_delta, l, self.nv, self.kd, self.vd).map_err(|e| e.to_string())?;
-        self.rms(&self.ws.o_delta, &layer.norm_w, &self.ws.o_norm, l * self.nv, self.vd)?;
-        k::silu_bf16_into(&self.ctx, &self.ws.z, &self.ws.z2, l * self.nv * self.vd).map_err(|e| e.to_string())?;
-        k::mul_bf16_into(&self.ctx, &self.ws.o_norm, &self.ws.z2, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
+        self.rms(&self.ws.o_delta, &layer.norm_w, &self.ws.o_delta, l * self.nv, self.vd)?;
+        k::silu_bf16_into(&self.ctx, &self.ws.z, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
+        k::mul_bf16_into(&self.ctx, &self.ws.o_delta, &self.ws.z, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
         match &layer.out_proj {
             GpuOutProj::Q4(q) => self.gemm_q4(q, l, &self.ws.z, &self.ws.o_out)?,
             GpuOutProj::Dense(b) => self.gemm(l, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
@@ -466,13 +458,13 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.wk, 1, &self.ws.xn, &self.ws.kn)?;
         self.gemm_q4(&layer.wv, 1, &self.ws.xn, &self.ws.attn_v)?;
         k::qg_split_bf16_into(&self.ctx, &self.ws.qg, &self.ws.q, &self.ws.gate, self.heads * hd, self.heads, hd).map_err(|e| e.to_string())?;
-        self.rms(&self.ws.q, &layer.q_norm_w, &self.ws.qn, self.heads, hd)?;
+        self.rms(&self.ws.q, &layer.q_norm_w, &self.ws.q, self.heads, hd)?;
         self.rms(&self.ws.kn, &layer.k_norm_w, &self.ws.kn, self.kv_heads, hd)?;
-        k::partial_rope_bf16_inplace(&self.ctx, &self.ws.qn, &self.rope_cos, &self.rope_sin, self.heads, self.heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
+        k::partial_rope_bf16_inplace(&self.ctx, &self.ws.q, &self.rope_cos, &self.rope_sin, self.heads, self.heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
         k::partial_rope_bf16_inplace(&self.ctx, &self.ws.kn, &self.rope_cos, &self.rope_sin, self.kv_heads, self.kv_heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
         k::copy_at_bf16(&self.ctx, &self.ws.kn, &layer.kv_k, &self.pos_dev, self.kv_heads * hd, self.kv_heads * hd).map_err(|e| e.to_string())?;
         k::copy_at_bf16(&self.ctx, &self.ws.attn_v, &layer.kv_v, &self.pos_dev, self.kv_heads * hd, self.kv_heads * hd).map_err(|e| e.to_string())?;
-        k::attention_decode_bf16_into(&self.ctx, &self.ws.qn, &layer.kv_k, &layer.kv_v, &self.ws.gate, &self.ws.attn_out, &self.pos_dev, self.heads, self.kv_heads, hd).map_err(|e| e.to_string())?;
+        k::attention_decode_bf16_into(&self.ctx, &self.ws.q, &layer.kv_k, &layer.kv_v, &self.ws.gate, &self.ws.attn_out, &self.pos_dev, self.heads, self.kv_heads, hd).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.wo, 1, &self.ws.attn_out, &self.ws.o_out)?;
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, self.hidden).map_err(|e| e.to_string())?;
         self.mlp_run(&layer.mlp, &layer.post_norm_w, 1)
@@ -491,9 +483,9 @@ impl CudaQwen35 {
         self.l2norm(&self.ws.qh, &self.ws.qh, self.nv, self.kd, qscale)?;
         self.l2norm(&self.ws.kh, &self.ws.kh, self.nv, self.kd, 1.0f32)?;
         k::delta_step_bf16_into(&self.ctx, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, &self.ws.beta, &self.ws.g, &layer.state, &self.ws.o_delta, self.nv, self.kd, self.vd).map_err(|e| e.to_string())?;
-        self.rms(&self.ws.o_delta, &layer.norm_w, &self.ws.o_norm, self.nv, self.vd)?;
-        k::silu_bf16_into(&self.ctx, &self.ws.z, &self.ws.z2, self.nv * self.vd).map_err(|e| e.to_string())?;
-        k::mul_bf16_into(&self.ctx, &self.ws.o_norm, &self.ws.z2, &self.ws.z, self.nv * self.vd).map_err(|e| e.to_string())?;
+        self.rms(&self.ws.o_delta, &layer.norm_w, &self.ws.o_delta, self.nv, self.vd)?;
+        k::silu_bf16_into(&self.ctx, &self.ws.z, &self.ws.z, self.nv * self.vd).map_err(|e| e.to_string())?;
+        k::mul_bf16_into(&self.ctx, &self.ws.o_delta, &self.ws.z, &self.ws.z, self.nv * self.vd).map_err(|e| e.to_string())?;
         match &layer.out_proj {
             GpuOutProj::Q4(q) => self.gemm_q4(q, 1, &self.ws.z, &self.ws.o_out)?,
             GpuOutProj::Dense(b) => self.gemm(1, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
@@ -641,6 +633,33 @@ impl CudaQwen35 {
         for _ in 0..max_new_tokens {
             let next = argmax(&logits) as u32;
             out.push(next);
+            if !ignore_eos && next == self.eos {
+                break;
+            }
+            logits = self.decode_logits(next)?;
+        }
+        Ok(out)
+    }
+
+    /// Same greedy decode, but invokes `on_token(index, token_id)` after each
+    /// token is sampled and before the next decode step, so a server can flush
+    /// SSE events incrementally (making client-measured TTFT/TPOT real).
+    pub fn generate_greedy_stream<F: FnMut(usize, u32) -> Result<(), String>>(
+        &mut self,
+        prompt: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        mut on_token: F,
+    ) -> Result<Vec<u32>, String> {
+        if prompt.is_empty() {
+            return Err("empty prompt".to_string());
+        }
+        let mut logits = self.prefill_logits(prompt)?;
+        let mut out = Vec::with_capacity(max_new_tokens);
+        for _ in 0..max_new_tokens {
+            let next = argmax(&logits) as u32;
+            out.push(next);
+            on_token(out.len() - 1, next).map_err(|e| e.to_string())?;
             if !ignore_eos && next == self.eos {
                 break;
             }

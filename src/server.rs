@@ -22,8 +22,8 @@ pub const MAX_MODEL_LEN: usize = 32768;
 pub const VOCAB_SIZE: u64 = 248320;
 /// Context the current Rust forward can actually serve (KV cache + rope).
 /// /health keeps advertising the official model max_model_len.
-pub const SUPPORTED_PREFILL_LEN: usize = 8192;
-pub const SUPPORTED_SEQ_LEN: usize = 9216;
+pub const SUPPORTED_PREFILL_LEN: usize = 16384;
+pub const SUPPORTED_SEQ_LEN: usize = 17408;
 
 /// Produces `max_new_tokens` token ids for an already-tokenized prompt.
 /// The service thread owns one instance; requests are served serially.
@@ -34,6 +34,23 @@ pub trait TokenGenerator: Send {
         max_new_tokens: usize,
         ignore_eos: bool,
     ) -> Result<Vec<u32>, String>;
+
+    /// Incremental variant: `on_token` is called with (index, token_id) after
+    /// each sampled token so the caller can flush it before the next decode
+    /// step. Default replay keeps existing generators working.
+    fn generate_stream(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        on_token: &mut dyn FnMut(usize, u32) -> Result<(), String>,
+    ) -> Result<Vec<u32>, String> {
+        let tokens = self.generate(input_ids, max_new_tokens, ignore_eos)?;
+        for (i, t) in tokens.iter().enumerate() {
+            on_token(i, *t).map_err(|e| e.to_string())?;
+        }
+        Ok(tokens)
+    }
 }
 
 /// Temporary stand-in so the protocol can be exercised before the Rust model
@@ -103,6 +120,17 @@ impl TokenGenerator for CudaGenerator {
         ignore_eos: bool,
     ) -> Result<Vec<u32>, String> {
         self.model.generate_greedy(input_ids, max_new_tokens, ignore_eos)
+    }
+
+    fn generate_stream(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        on_token: &mut dyn FnMut(usize, u32) -> Result<(), String>,
+    ) -> Result<Vec<u32>, String> {
+        self.model
+            .generate_greedy_stream(input_ids, max_new_tokens, ignore_eos, |i, t| on_token(i, t))
     }
 }
 
@@ -372,6 +400,59 @@ impl Server {
             }
         }
 
+        if parsed.stream {
+            let request_id = self.next_request_id();
+            // Send headers immediately so the client's TTFT clock starts with
+            // the connection, not after the whole generation finishes.
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+            writer.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())?;
+
+            let mut cb = |index: usize, token_id: u32| {
+                let event = json!({
+                    "type": "token",
+                    "request_id": request_id,
+                    "index": index,
+                    "token_id": token_id,
+                });
+                write_sse(writer, &event.to_string())
+            };
+            let tokens = self
+                .generator
+                .generate_stream(
+                    &parsed.input_ids,
+                    parsed.max_new_tokens,
+                    parsed.ignore_eos,
+                    &mut cb,
+                )
+                .map_err(|e| {
+                    let _ = write_json(
+                        writer,
+                        500,
+                        &json!({"error": {"type": "internal_error", "message": e}}),
+                    );
+                    String::new()
+                })?;
+
+            let prompt_tokens = parsed.input_ids.len();
+            let completion_tokens = tokens.len();
+            let usage = json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            });
+            let done = json!({
+                "type": "done",
+                "request_id": request_id,
+                "usage": usage,
+            });
+            write_sse(writer, &done.to_string())?;
+            writer
+                .write_all(b"data: [DONE]\n")
+                .map_err(|e| e.to_string())?;
+            return writer.flush().map_err(|e| e.to_string());
+        }
+
         let tokens = match self.generator.generate(
             &parsed.input_ids,
             parsed.max_new_tokens,
@@ -386,7 +467,6 @@ impl Server {
                 );
             }
         };
-
         let prompt_tokens = parsed.input_ids.len();
         let completion_tokens = tokens.len();
         let usage = json!({
@@ -394,37 +474,11 @@ impl Server {
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         });
-
-        if parsed.stream {
-            let request_id = self.next_request_id();
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-            writer.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-            for (index, token_id) in tokens.iter().enumerate() {
-                let event = json!({
-                    "type": "token",
-                    "request_id": request_id,
-                    "index": index,
-                    "token_id": token_id,
-                });
-                write_sse(writer, &event.to_string())?;
-            }
-            let done = json!({
-                "type": "done",
-                "request_id": request_id,
-                "usage": usage,
-            });
-            write_sse(writer, &done.to_string())?;
-            writer
-                .write_all(b"data: [DONE]\n")
-                .map_err(|e| e.to_string())?;
-            writer.flush().map_err(|e| e.to_string())
-        } else {
-            write_json(
-                writer,
-                200,
-                &json!({"type": "result", "output_ids": tokens, "usage": usage}),
-            )
-        }
+        write_json(
+            writer,
+            200,
+            &json!({"type": "result", "output_ids": tokens, "usage": usage}),
+        )
     }
 }
 
