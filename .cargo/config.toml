@@ -1,0 +1,2 @@
+[env]
+APXINF_CUDA_ARCH = "sm_89"

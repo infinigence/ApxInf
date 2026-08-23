@@ -10,6 +10,30 @@ fn hash_bytes(hash: &mut u128, bytes: &[u8]) {
     }
 }
 
+
+/// Newest modification time of any regular file under `root`.
+fn newest_mtime(root: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                newest = Some(match newest {
+                    Some(current) if current >= modified => current,
+                    _ => modified,
+                });
+            }
+        }
+    }
+    newest
+}
+
 fn collect_kernel_inputs(root: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -351,23 +375,59 @@ fn main() {
                         "nvcc".to_string()
                     }
                 };
+                let mut children: Vec<std::process::Child> = Vec::new();
                 let target_include_dirs = [
                     format!("{cuda_path}/include"),
                     format!("{cuda_path}/targets/{arch}/include"),
                     format!("{cuda_path}/targets/aarch64-linux/include"),
                     format!("{cuda_path}/thor/targets/aarch64-linux/include"),
                 ];
+                // Dependency mtimes: the .cu file itself plus its include
+                // tree — kernels/custom for the regular adapters, the cutlass
+                // tree for the cutlass/fa2 sources. Skip the nvcc invocation
+                // entirely when the object is up to date.
+                let custom_newest =
+                    newest_mtime(&std::path::Path::new(&kernels_dir).join("custom"));
+                let cutlass_newest = newest_mtime(std::path::Path::new(&cutlass_root));
                 for entry in &kernel_files {
                     println!("cargo:rerun-if-changed={}", entry.display());
                     let stem = entry.file_stem().unwrap().to_string_lossy().to_string();
-                    let obj = format!("{out_dir}/{stem}.o");
+                    let obj_path = std::path::PathBuf::from(format!("{out_dir}/{stem}.o"));
+                    let obj_mtime = std::fs::metadata(&obj_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    let src_mtime = std::fs::metadata(entry)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    let mut stale = false;
+                    if let (Some(obj_mtime), Some(src_mtime)) = (obj_mtime, src_mtime) {
+                        if obj_mtime < src_mtime {
+                            stale = true;
+                        }
+                        let is_cutlass_family = entry == &cutlass_fmha
+                            || entry == &cutlass_gemm
+                            || entry == &cutlass_int8
+                            || fa2_sources.contains(entry);
+                        let dep = if is_cutlass_family { cutlass_newest } else { custom_newest };
+                        if let Some(dep) = dep {
+                            if obj_mtime < dep {
+                                stale = true;
+                            }
+                        }
+                    } else {
+                        stale = true;
+                    }
+                    if !stale {
+                        println!("cargo:warning=skipping nvcc for {} (up to date)", stem);
+                        continue;
+                    }
 
                     let mut cmd = std::process::Command::new(&nvcc);
                     cmd.args([
                         "-c",
                         &entry.to_string_lossy(),
                         "-o",
-                        &obj,
+                        &format!("{out_dir}/{stem}.o"),
                         "--compiler-options",
                         "-fPIC",
                         "-O3",
@@ -415,9 +475,15 @@ fn main() {
                             cmd.arg(format!("-I{}", include.display()));
                         }
                     }
-                    let status = cmd.status().expect("failed to run nvcc");
-
-                    assert!(status.success(), "nvcc failed for {}", entry.display());
+                    children.push(
+                        cmd.spawn()
+                            .unwrap_or_else(|e| panic!("failed to spawn nvcc: {e}")),
+                    );
+                }
+                // Wait for all the parallel nvcc processes.
+                for mut child in children {
+                    let status = child.wait().expect("failed to wait for nvcc");
+                    assert!(status.success(), "nvcc failed");
                 }
 
                 // Create a static library from all kernel objects
