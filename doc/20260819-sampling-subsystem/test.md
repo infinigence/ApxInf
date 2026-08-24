@@ -65,8 +65,10 @@ A recording mock model verifies orchestration independently of model math:
 - the compatibility API follows the existing greedy prefill/decode sequence;
 - image data is consumed once during prefill and never enters decode;
 - text-only rejection occurs before prewarm or forward;
-- `GenerationOptions` exposes sampling and log-probabilities without a
-  model-specific hook;
+- partial `GenerationOptions` exposes request sampling and log-probabilities
+  without a model-specific hook;
+- `AutoModel` loads `generation_config.json`, while explicit request fields
+  override its defaults;
 - callbacks receive the same `GeneratedToken` values as the output;
 - zero-token generation performs no model work;
 - any configured EOS ID stops before another decode;

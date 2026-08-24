@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use apxinf_core::{
-    Backend, Device, Error, NextTokenLogits, Result, RngKey, Tensor,
-    TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSamplingInit, TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
 
+use crate::generation_config::{GenerationOptions, ResolvedGenerationOptions};
 use crate::profiling::GenerationProfile;
 
 /// Processor output for one or more images in a generation prompt.
@@ -67,34 +67,6 @@ pub struct LlmCapabilities {
 impl LlmCapabilities {
     pub const TEXT_ONLY: Self = Self { image: false };
     pub const VISION: Self = Self { image: true };
-}
-
-/// Options for one autoregressive generation request.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GenerationOptions {
-    pub max_new_tokens: usize,
-    pub eos_token_ids: Vec<u32>,
-    pub sampling: TokenSamplingParams,
-    pub rng: RngKey,
-}
-
-impl GenerationOptions {
-    /// Preserve the historical ApxInf behavior: greedy decoding with an
-    /// optional single EOS token.
-    pub fn greedy(max_new_tokens: usize, eos_token_id: Option<u32>) -> Self {
-        Self {
-            max_new_tokens,
-            eos_token_ids: eos_token_id.into_iter().collect(),
-            sampling: TokenSamplingParams::greedy(),
-            rng: RngKey::default(),
-        }
-    }
-}
-
-impl Default for GenerationOptions {
-    fn default() -> Self {
-        Self::greedy(0, None)
-    }
 }
 
 /// Complete prompt plus generation policy.
@@ -225,18 +197,31 @@ pub trait LlmTrait {
 pub fn generate_streaming_with_options<M, F>(
     model: &mut M,
     request: GenerationRequest<'_>,
+    on_token: F,
+) -> Result<GenerationOutput>
+where
+    M: LlmTrait + ?Sized,
+    F: FnMut(GeneratedToken),
+{
+    let options = request.options.resolve()?;
+    generate_streaming_with_resolved_options(model, request.input, &options, on_token)
+}
+
+fn generate_streaming_with_resolved_options<M, F>(
+    model: &mut M,
+    input: LlmInput<'_>,
+    options: &ResolvedGenerationOptions,
     mut on_token: F,
 ) -> Result<GenerationOutput>
 where
     M: LlmTrait + ?Sized,
     F: FnMut(GeneratedToken),
 {
-    let prompt_tokens = request.input.token_ids;
-    let options = request.options;
+    let prompt_tokens = input.token_ids;
     if prompt_tokens.is_empty() {
         return Err(Error::Other("generate_streaming: empty prompt".into()));
     }
-    if request.input.image.is_some() && !model.capabilities().image {
+    if input.image.is_some() && !model.capabilities().image {
         return Err(Error::Other(
             "this model does not support image input".into(),
         ));
@@ -269,7 +254,7 @@ where
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
 
     let mut generated = Vec::with_capacity(options.max_new_tokens);
-    let logits = model.prefill(request.input)?;
+    let logits = model.prefill(input)?;
     let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
     profile.record_first_token();
     let mut current = GeneratedToken {

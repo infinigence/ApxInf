@@ -122,6 +122,7 @@ dependencies = [
  "apxinf-loader",
  "half",
  "once_cell",
+ "serde",
  "serde_json",
  "thiserror",
 ]

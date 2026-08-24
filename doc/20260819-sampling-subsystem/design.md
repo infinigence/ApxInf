@@ -133,9 +133,18 @@ logits return errors rather than silently selecting a token.
 
 ## LLM and VLM integration
 
-`GenerationOptions` carries maximum output length, multiple EOS IDs, sampling
-parameters, and an `RngKey`. `GenerationRequest` pairs those options with the
-existing `LlmInput`. The shared driver:
+`GenerationOptions` is the public partial-settings layer: every field is
+optional so model defaults, deployment overrides, and request overrides can use
+the same type. `ResolvedGenerationOptions` is crate-private and carries the
+complete maximum output length, EOS IDs, sampling policy, and `RngKey` consumed
+by the generation driver. Resolution applies layers in this order:
+
+```text
+ApxInf defaults < generation_config.json < deployment overrides < request
+```
+
+`GenerationRequest` pairs public options with the existing `LlmInput`. The
+shared driver resolves them and then:
 
 1. validates modality and sampling parameters before model work;
 2. creates and initializes the sampler from `LlmTrait::backend()`;
@@ -152,22 +161,16 @@ Example:
 
 ```rust
 let options = GenerationOptions {
-    max_new_tokens: 50,
-    eos_token_ids: vec![eos_token_id],
-    sampling: TokenSamplingParams {
-        selection: TokenSelection::Random {
-            temperature: 0.8,
-            top_k: Some(40),
-            top_p: 0.95,
-        },
-        penalties: TokenPenalties {
-            repetition: 1.1,
-            frequency: 0.0,
-            presence: 0.0,
-        },
-        return_logprob: true,
-    },
-    rng: RngKey::new(42, request_sequence, 0),
+    max_new_tokens: Some(50),
+    eos_token_ids: Some(vec![eos_token_id]),
+    sampling_mode: Some(SamplingMode::Random),
+    temperature: Some(0.8),
+    top_k: Some(40),
+    top_p: Some(0.95),
+    repetition_penalty: Some(1.1),
+    seed: Some(42),
+    return_logprob: Some(true),
+    ..GenerationOptions::default()
 };
 
 let output = model.generate_streaming_with_options(input, &options, on_token)?;

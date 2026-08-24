@@ -14,6 +14,7 @@ Status: Implemented
 | CUDA kernels | `crates/apxinf-cuda/kernels/custom/sampling.cuh` |
 | CUB workspace queries and launch policy | `crates/apxinf-cuda/adapters/sampling_adapter.cu` |
 | CUDA ABI | `crates/apxinf-cuda/src/ffi/custom.rs` |
+| Layered generation settings / JSON loader | `crates/apxinf-model/src/generation_config.rs` |
 | Generation driver | `crates/apxinf-model/src/llm_trait.rs` |
 | Unified model frontend | `crates/apxinf-model/src/auto.rs` |
 | Llama/Qwen device-logit integration | `crates/apxinf-model/src/llama/`, `crates/apxinf-model/src/qwen3vl/` |
@@ -140,9 +141,16 @@ The default `Pi05Policy` input pipeline no longer contains a host
 and otherwise delegates generation to the binding. A caller can still install
 a `GaussianNoise` processor to preserve or customize the old host path.
 
-## CLI
+## Generation defaults and CLI
 
-Greedy remains the default. Random sampling is enabled explicitly:
+`AutoModel` reads `generation_config.json` once for text/VLM models and stores
+the resulting partial `GenerationOptions` beside the loaded model. VLA models,
+including PI0.5, skip this path. At request entry, ApxInf defaults, model
+defaults, deployment overrides, and request options are merged and normalized
+into the crate-private `ResolvedGenerationOptions`.
+
+The CLI uses model defaults automatically. Random or greedy selection can also
+be forced explicitly:
 
 ```bash
 cargo run --release --features cuda-no-nvtx -- generate \
@@ -153,6 +161,9 @@ cargo run --release --features cuda-no-nvtx -- generate \
   --repetition-penalty 1.1 --frequency-penalty 0.0 \
   --presence-penalty 0.0 --seed 42
 ```
+
+`--generation-config auto|apxinf|PATH` selects the default source and
+`--override-generation-config JSON` supplies deployment-level overrides.
 
 ## Current optimization opportunities
 

@@ -178,8 +178,11 @@ cargo run --release --features cuda-no-nvtx -- generate \
   --device cuda --dtype bf16 --max-tokens 50
 ```
 
-Greedy decoding is the default. Enable the backend-native logits pipeline with
-`--sample`; the seed identifies a reproducible counter-based random stream:
+By default, `generate` reads model-recommended settings from
+`generation_config.json`; missing fields fall back to ApxInf's historical
+greedy defaults. Request flags override the model settings. Use `--greedy` to
+force greedy decoding or `--sample` to force the backend-native random logits
+pipeline; the seed identifies a reproducible counter-based random stream:
 
 ```bash
 cargo run --release --features cuda-no-nvtx -- generate \
@@ -189,6 +192,13 @@ cargo run --release --features cuda-no-nvtx -- generate \
   --sample --temperature 0.8 --top-k 40 --top-p 0.95 \
   --repetition-penalty 1.1 --seed 42
 ```
+
+Use `--generation-config apxinf` to ignore the model file, or pass a JSON file
+or directory instead of `auto`. Deployment defaults can be layered with
+`--override-generation-config '{"temperature":0.7,"top_p":0.9}'`.
+Supported JSON fields are `max_new_tokens`, `eos_token_id` (scalar or list),
+`do_sample`, `temperature`, `top_k`, `top_p`, and the repetition/frequency/
+presence penalties; unrelated Hugging Face fields are ignored.
 
 For Qwen3-VL, add `--image`. The CLI shells out to the Hugging Face processor to
 turn the image into `pixel_values` + `image_grid_thw`, so that Python environment
