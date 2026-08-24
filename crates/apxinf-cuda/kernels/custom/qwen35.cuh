@@ -753,7 +753,7 @@ __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
   // M=1 decode GEMM: packed tile staged coalesced in shared; scale/zp read
   // per group like the batched kernel. One output column per thread.
   const int BN = 128;
-  const int BK = 64;
+  const int BK = 128;
   __shared__ int32_t ps[BN][BK / 8 + 1];
   __shared__ __half A_s[BK];
 
@@ -766,10 +766,10 @@ __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
   for (int k0 = 0; k0 < K; k0 += BK) {
     if (tid < BK) A_s[tid] = a[k0 + tid];
     #pragma unroll
-    for (int it = 0; it < 8; it++) {
+    for (int it = 0; it < BK / 8; it++) {
       int e = it * BN + tid;
-      int nn = e >> 3;
-      int j = e & 7;
+      int nn = e >> 4;
+      int j = e & 15;
       int ng = n0 + nn;
       ps[nn][j] = (ng < N) ? packed[(int64_t)ng * pcols + (k0 >> 3) + j] : 0;
     }

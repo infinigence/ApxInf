@@ -429,8 +429,8 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.in_qkv, l, &self.ws.xn, &self.ws.qkv)?;
         k::conv_silu_bf16_into(&self.ctx, &self.ws.qkv, &layer.conv_w, &self.ws.conv, l, self.conv_dim).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.in_z, l, &self.ws.xn, &self.ws.z)?;
-        self.gemm_dense(l, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
-        self.gemm_dense(l, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
+        self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
+        self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
         k::beta_g_bf16(&self.ctx, &self.ws.a, &self.ws.b, &layer.a_log, &layer.dt_bias, &self.ws.beta, &self.ws.g, l * self.nv, self.nv).map_err(|e| e.to_string())?;
         k::conv_split_bf16_into(&self.ctx, &self.ws.conv, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, l, self.nk, self.nv, self.kd, self.vd, self.conv_dim).map_err(|e| e.to_string())?;
         let qscale = 1.0f32 / (self.kd as f32).sqrt();
@@ -482,8 +482,8 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.in_qkv, 1, &self.ws.xn, &self.ws.qkv)?;
         k::conv_step_silu_bf16_into(&self.ctx, &self.ws.qkv, &layer.conv_hist, &layer.conv_w, &self.ws.conv, self.conv_dim).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.in_z, 1, &self.ws.xn, &self.ws.z)?;
-        self.gemm_dense(1, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
-        self.gemm_dense(1, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
+        self.gemm(1, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
+        self.gemm(1, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
         k::beta_g_bf16(&self.ctx, &self.ws.a, &self.ws.b, &layer.a_log, &layer.dt_bias, &self.ws.beta, &self.ws.g, self.nv, self.nv).map_err(|e| e.to_string())?;
         k::conv_split_bf16_into(&self.ctx, &self.ws.conv, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, 1, self.nk, self.nv, self.kd, self.vd, self.conv_dim).map_err(|e| e.to_string())?;
         let qscale = 1.0f32 / (self.kd as f32).sqrt();
