@@ -448,12 +448,11 @@ impl Qwen35Cuda {
             .downcast_ref::<CudaBackend>()
             .expect("qwen3_5 CUDA backend downcast")
             .context()
-            .stream()
-            .clone();
+            .stream();
         for layer in &mut self.layers {
             if let CudaLayer::Linear(l) = layer {
-                l.conv_state.zero_async(&stream).map_err(Error::Cuda)?;
-                l.recurrent.zero_async(&stream).map_err(Error::Cuda)?;
+                l.conv_state.zero_async(stream).map_err(Error::Cuda)?;
+                l.recurrent.zero_async(stream).map_err(Error::Cuda)?;
             }
         }
         Ok(())
@@ -639,11 +638,15 @@ impl Qwen35Cuda {
         if l == 0 {
             trace_buf("gpu_normed", &self.normed, seq * self.hidden);
         }
-        gemm_run(ctx, &run.qkv, &self.normed, &self.qkv, seq, &self.dense_scratch)?;
+        if !gemm_run_pair(
+            ctx, &run.qkv, &run.z, &self.normed, &self.qkv, &self.z, seq,
+        )? {
+            gemm_run(ctx, &run.qkv, &self.normed, &self.qkv, seq, &self.dense_scratch)?;
+            gemm_run(ctx, &run.z, &self.normed, &self.z, seq, &self.dense_scratch)?;
+        }
         if l == 0 {
             trace_buf("gpu_qkv_pre", &self.qkv, seq * run.conv_dim);
         }
-        gemm_run(ctx, &run.z, &self.normed, &self.z, seq, &self.dense_scratch)?;
         gemm_run(ctx, &run.a, &self.normed, &self.a, seq, &self.dense_scratch)?;
         gemm_run(ctx, &run.b, &self.normed, &self.b, seq, &self.dense_scratch)?;
         if l == 0 {
@@ -750,7 +753,6 @@ impl Qwen35Cuda {
     }
 
     fn run_full(&mut self, l: usize, seq: usize, start_pos: u32) -> Result<()> {
-        self.upload_pos(start_pos)?;
         let ctx = self.ctx();
         let mut run = self.take_full(l);
         kernels::norm::rms_into(
@@ -763,8 +765,12 @@ impl Qwen35Cuda {
         if l == 3 {
             trace_buf("f3_qgate", &self.q_gate, seq * self.n_heads * self.head_dim * 2);
         }
-        gemm_run(ctx, &run.k, &self.normed, &self.k_buf, seq, &self.dense_scratch)?;
-        gemm_run(ctx, &run.v, &self.normed, &self.v_buf, seq, &self.dense_scratch)?;
+        if !gemm_run_pair(
+            ctx, &run.k, &run.v, &self.normed, &self.k_buf, &self.v_buf, seq,
+        )? {
+            gemm_run(ctx, &run.k, &self.normed, &self.k_buf, seq, &self.dense_scratch)?;
+            gemm_run(ctx, &run.v, &self.normed, &self.v_buf, seq, &self.dense_scratch)?;
+        }
 
         kernels::qwen35::q_split_norm_rope(
             ctx,
@@ -985,8 +991,12 @@ impl Qwen35Cuda {
             ctx, DType::BF16, &self.x, post_norm_w, &self.normed2,
             self.hidden, seq, self.eps,
         )?;
-        gemm_run(ctx, gate, &self.normed2, &self.gate_proj, seq, &self.dense_scratch)?;
-        gemm_run(ctx, up, &self.normed2, &self.up_proj, seq, &self.dense_scratch)?;
+        if !gemm_run_pair(
+            ctx, gate, up, &self.normed2, &self.gate_proj, &self.up_proj, seq,
+        )? {
+            gemm_run(ctx, gate, &self.normed2, &self.gate_proj, seq, &self.dense_scratch)?;
+            gemm_run(ctx, up, &self.normed2, &self.up_proj, seq, &self.dense_scratch)?;
+        }
         kernels::qwen35::silu_mul(
             ctx, &self.gate_proj, &self.up_proj, &self.mlp_act,
             seq * self.intermediate,
@@ -1058,6 +1068,48 @@ fn gemm_clone(gemm: &Gemm) -> Gemm {
     }
 }
 
+/// Dispatch two compatible single-row packed GEMMs in one CUDA launch.
+/// Returns `false` when the ordinary per-GEMM path is required.
+fn gemm_run_pair(
+    ctx: &CudaContext,
+    first: &Gemm,
+    second: &Gemm,
+    act: &CudaBuffer,
+    first_out: &CudaBuffer,
+    second_out: &CudaBuffer,
+    seq: usize,
+) -> Result<bool> {
+    let (Some(first_packed), Some(second_packed)) = (&first.packed, &second.packed) else {
+        return Ok(false);
+    };
+    if seq != 1
+        || first.in_cols != second.in_cols
+        || first_packed.groups != second_packed.groups
+        || first.in_cols % 16 != 0
+        || first.out_cols % 64 != 0
+        || second.out_cols % 64 != 0
+    {
+        return Ok(false);
+    }
+    kernels::quantization::matmul_bf16_w4a16_asym_tc_pair(
+        ctx,
+        act,
+        &first_packed.w,
+        &first_packed.scale,
+        &first_packed.zp,
+        first_out,
+        first.out_cols,
+        &second_packed.w,
+        &second_packed.scale,
+        &second_packed.zp,
+        second_out,
+        second.out_cols,
+        first.in_cols,
+        first_packed.groups,
+    )?;
+    Ok(true)
+}
+
 /// Dispatch a GEMM: fused dequant kernel for single-row activations, dequant +
 /// cublas otherwise.
 fn gemm_run(
@@ -1091,21 +1143,6 @@ fn gemm_run(
         .packed
         .as_ref()
         .ok_or_else(|| Error::Other("GEMM has no weights".into()))?;
-    let act_tensor = act
-        .clone()
-        .into_tensor(Shape::from(vec![seq, gemm.in_cols]), DType::BF16);
-    let w_tensor = packed.w.clone().into_tensor(
-        Shape::from(vec![gemm.out_cols, gemm.in_cols.div_ceil(8)]),
-        DType::I32,
-    );
-    let s_tensor = packed
-        .scale
-        .clone()
-        .into_tensor(Shape::from(vec![gemm.out_cols, packed.groups]), DType::BF16);
-    let zp_tensor = packed.zp.clone().into_tensor(
-        Shape::from(vec![gemm.out_cols.div_ceil(8), packed.groups]),
-        DType::I32,
-    );
     if seq == 1 && gemm.in_cols % 16 == 0 && gemm.out_cols % 64 == 0 {
         // Tensor-core decode GEMM (m16n8k16 bf16 MMA), allocation-free.
         return kernels::quantization::matmul_bf16_w4a16_asym_tc(

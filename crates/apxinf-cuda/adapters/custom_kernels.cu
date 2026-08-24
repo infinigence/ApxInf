@@ -740,17 +740,54 @@ extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16_tc(
     return cudaErrorInvalidValue;
   }
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-  qwen35_gemm_w4a16_bf16_tc_kernel<<<out_cols / QWEN35_TC_OUT_TILE, 256, 0,
-                                    stream>>>(
-      static_cast<const __nv_bfloat16*>(activation),
-      static_cast<const int32_t*>(weight_packed),
-      static_cast<const __nv_bfloat16*>(weight_scale),
-      static_cast<const int32_t*>(weight_zero_point),
-      static_cast<__nv_bfloat16*>(output), in_cols, out_cols, groups);
+  qwen35_gemm_w4a16_bf16_tc_kernel<false>
+      <<<out_cols / QWEN35_TC_OUT_TILE, 256, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(activation),
+          static_cast<const int32_t*>(weight_packed),
+          static_cast<const __nv_bfloat16*>(weight_scale),
+          static_cast<const int32_t*>(weight_zero_point),
+          static_cast<__nv_bfloat16*>(output), out_cols, nullptr, nullptr,
+          nullptr, nullptr, in_cols, groups);
 #else
   (void)activation; (void)weight_packed; (void)weight_scale;
   (void)weight_zero_point; (void)output; (void)in_cols; (void)out_cols;
   (void)groups; (void)stream;
+#endif
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qwen35_gemm_w4a16_bf16_tc_pair(
+    const void* activation, const void* weight_packed0,
+    const void* weight_scale0, const void* weight_zero_point0, void* output0,
+    int out_cols0, const void* weight_packed1, const void* weight_scale1,
+    const void* weight_zero_point1, void* output1, int out_cols1, int in_cols,
+    int groups, cudaStream_t stream) {
+  if (activation == nullptr || weight_packed0 == nullptr ||
+      weight_scale0 == nullptr || weight_zero_point0 == nullptr ||
+      output0 == nullptr || weight_packed1 == nullptr ||
+      weight_scale1 == nullptr || weight_zero_point1 == nullptr ||
+      output1 == nullptr || in_cols <= 0 || in_cols % 16 != 0 ||
+      out_cols0 <= 0 || out_cols0 % QWEN35_TC_OUT_TILE != 0 ||
+      out_cols1 <= 0 || out_cols1 % QWEN35_TC_OUT_TILE != 0 || groups <= 0) {
+    return cudaErrorInvalidValue;
+  }
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  const int blocks = (out_cols0 + out_cols1) / QWEN35_TC_OUT_TILE;
+  qwen35_gemm_w4a16_bf16_tc_kernel<true><<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(weight_packed0),
+      static_cast<const __nv_bfloat16*>(weight_scale0),
+      static_cast<const int32_t*>(weight_zero_point0),
+      static_cast<__nv_bfloat16*>(output0), out_cols0,
+      static_cast<const int32_t*>(weight_packed1),
+      static_cast<const __nv_bfloat16*>(weight_scale1),
+      static_cast<const int32_t*>(weight_zero_point1),
+      static_cast<__nv_bfloat16*>(output1), in_cols, groups);
+#else
+  (void)activation; (void)weight_packed0; (void)weight_scale0;
+  (void)weight_zero_point0; (void)output0; (void)out_cols0;
+  (void)weight_packed1; (void)weight_scale1; (void)weight_zero_point1;
+  (void)output1; (void)out_cols1; (void)in_cols; (void)groups; (void)stream;
 #endif
   return cudaGetLastError();
 }

@@ -1081,6 +1081,23 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_qwen35_v_to_f32(
         v: *const c_void,
         vf32: *mut c_void,

@@ -241,6 +241,85 @@ pub fn matmul_bf16_w4a16_asym_tc(
     result
 }
 
+/// Runs two independent single-row W4A16 projections in one CUDA launch.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_bf16_w4a16_asym_tc_pair(
+    ctx: &CudaContext,
+    activation: &CudaBuffer,
+    weight_packed0: &CudaBuffer,
+    weight_scale0: &CudaBuffer,
+    weight_zero_point0: &CudaBuffer,
+    output0: &CudaBuffer,
+    out_cols0: usize,
+    weight_packed1: &CudaBuffer,
+    weight_scale1: &CudaBuffer,
+    weight_zero_point1: &CudaBuffer,
+    output1: &CudaBuffer,
+    out_cols1: usize,
+    in_cols: usize,
+    groups: usize,
+) -> Result<()> {
+    let out_bytes0 = out_cols0
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("paired TC decode GEMM output overflow".into()))?;
+    let out_bytes1 = out_cols1
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("paired TC decode GEMM output overflow".into()))?;
+    if output0.len() < out_bytes0 || output1.len() < out_bytes1 {
+        return Err(Error::Other(
+            "paired TC decode GEMM: output buffer too small".into(),
+        ));
+    }
+    let prof = std::env::var_os("APXINF_GEMM_PROF").is_some();
+    let mut e0: ffi::cudaEvent_t = std::ptr::null_mut();
+    let mut e1: ffi::cudaEvent_t = std::ptr::null_mut();
+    if prof {
+        unsafe {
+            ffi::check_cuda(ffi::cudaEventCreate(&mut e0)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventCreate(&mut e1)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventRecord(e0, ctx.stream().handle()))
+                .map_err(Error::Cuda)?;
+        }
+    }
+    let result = check_cuda(unsafe {
+        ffi::apxinf_qwen35_gemm_w4a16_bf16_tc_pair(
+            activation.ptr(),
+            weight_packed0.ptr(),
+            weight_scale0.ptr(),
+            weight_zero_point0.ptr(),
+            output0.ptr(),
+            out_cols0 as i32,
+            weight_packed1.ptr(),
+            weight_scale1.ptr(),
+            weight_zero_point1.ptr(),
+            output1.ptr(),
+            out_cols1 as i32,
+            in_cols as i32,
+            groups as i32,
+            ctx.stream().handle(),
+        )
+    });
+    if prof {
+        unsafe {
+            ffi::check_cuda(ffi::cudaEventRecord(e1, ctx.stream().handle()))
+                .map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventSynchronize(e1)).map_err(Error::Cuda)?;
+            let mut ms = 0.0;
+            ffi::check_cuda(ffi::cudaEventElapsedTime(&mut ms, e0, e1))
+                .map_err(Error::Cuda)?;
+            if ms > 0.01 {
+                eprintln!(
+                    "[tc_gemm_pair] {}+{}x{} : {ms:.3} ms",
+                    out_cols0, out_cols1, in_cols
+                );
+            }
+            ffi::check_cuda(ffi::cudaEventDestroy(e0)).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaEventDestroy(e1)).map_err(Error::Cuda)?;
+        }
+    }
+    result
+}
+
 pub fn matmul_bf16_w4a16_asym_into(
         ctx: &CudaContext,
         activation: &CudaBuffer,

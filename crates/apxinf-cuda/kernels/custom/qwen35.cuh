@@ -505,7 +505,7 @@ __global__ void qwen35_gemm_w4a16_bf16_kernel(
 // [1, in_cols] x W4A16 (group-32, asymmetric) -> [1, out_cols] via
 // m16n8k16 bf16 MMAs. The single activation row sits in A's row 0 (the
 // rest are zero), the weight tile is dequantized to bf16 in shared per
-// k-tile. Block computes QWEN35_TC_OUT_TILE = 128 outputs (8 warps x 16).
+// k-tile. Each 8-warp block computes QWEN35_TC_OUT_TILE = 64 outputs.
 
 #define QWEN35_TC_OUT_TILE 64
 
@@ -526,11 +526,27 @@ __device__ __forceinline__ void qwen35_mma_bf16(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+template <bool Pair>
 __global__ void qwen35_gemm_w4a16_bf16_tc_kernel(
-    const __nv_bfloat16* activation, const int32_t* weight_packed,
-    const __nv_bfloat16* weight_scale, const int32_t* weight_zero_point,
-    __nv_bfloat16* output, int in_cols, int out_cols, int groups) {
-  const int out_base = blockIdx.x * QWEN35_TC_OUT_TILE;
+    const __nv_bfloat16* activation, const int32_t* weight_packed0,
+    const __nv_bfloat16* weight_scale0, const int32_t* weight_zero_point0,
+    __nv_bfloat16* output0, int out_cols0, const int32_t* weight_packed1,
+    const __nv_bfloat16* weight_scale1, const int32_t* weight_zero_point1,
+    __nv_bfloat16* output1, int in_cols, int groups) {
+  int output_block = blockIdx.x;
+  const int first_blocks = out_cols0 / QWEN35_TC_OUT_TILE;
+  const int32_t* weight_packed = weight_packed0;
+  const __nv_bfloat16* weight_scale = weight_scale0;
+  const int32_t* weight_zero_point = weight_zero_point0;
+  __nv_bfloat16* output = output0;
+  if (Pair && output_block >= first_blocks) {
+    output_block -= first_blocks;
+    weight_packed = weight_packed1;
+    weight_scale = weight_scale1;
+    weight_zero_point = weight_zero_point1;
+    output = output1;
+  }
+  const int out_base = output_block * QWEN35_TC_OUT_TILE;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   const int group_size = (in_cols + groups - 1) / groups;
