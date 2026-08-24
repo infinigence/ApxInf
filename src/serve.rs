@@ -54,28 +54,31 @@ struct Engine {
     vocab_size: usize,
     eos_token_id: Option<u32>,
     max_model_len: usize,
-    model_revision: String,
     request_counter: u64,
 }
 
 /// Run the service. Blocks until the process is killed.
 pub fn run(config: ServeConfig) -> Result<(), String> {
     let address = format!("{}:{}", config.host, config.port);
-    let listener =
-        TcpListener::bind(&address).map_err(|error| format!("bind {address}: {error}"))?;
     let meta = EngineMeta {
         model_revision: config.model_revision.clone(),
         max_model_len: config.max_model_len,
     };
     let (job_tx, job_rx) = mpsc::channel::<GenerateJob>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     // The single model worker owns `Engine` for its whole lifetime, so the
-    // (non-Send) model trait objects never cross a thread boundary. Health
-    // and error routes are answered directly by the accept loop and stay
-    // responsive even while a generation is running.
+    // (non-Send) model trait objects never cross a thread boundary. Wait for
+    // model loading to finish before binding the health endpoint: HTTP 200
+    // must mean the advertised CUDA engine is actually ready.
     let worker_config = config.clone();
     std::thread::spawn(move || {
-        worker_loop(worker_config, job_rx);
+        worker_loop(worker_config, job_rx, ready_tx);
     });
+    ready_rx
+        .recv()
+        .map_err(|_| "model worker exited during startup".to_string())??;
+    let listener =
+        TcpListener::bind(&address).map_err(|error| format!("bind {address}: {error}"))?;
     println!("apxinf serve: listening on http://{address} (device={:?})", config.device);
 
     for connection in listener.incoming() {
@@ -105,15 +108,23 @@ struct GenerateJob {
     kind: JobKind,
 }
 
-fn worker_loop(config: ServeConfig, job_rx: mpsc::Receiver<GenerateJob>) {
+fn worker_loop(
+    config: ServeConfig,
+    job_rx: mpsc::Receiver<GenerateJob>,
+    ready_tx: mpsc::Sender<Result<(), String>>,
+) {
     println!("apxinf serve: loading model from {:?}...", config.model_dir);
     let mut engine = match Engine::load(&config) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("apxinf serve: model load failed: {error}");
+            let _ = ready_tx.send(Err(error));
             return;
         }
     };
+    if ready_tx.send(Ok(())).is_err() {
+        return;
+    }
     while let Ok(mut job) = job_rx.recv() {
         let started = std::time::Instant::now();
         let result = (|| -> Result<(), String> {
@@ -150,7 +161,6 @@ impl Engine {
             vocab_size,
             eos_token_id,
             max_model_len: config.max_model_len,
-            model_revision: config.model_revision.clone(),
             request_counter: 0,
         })
     }
@@ -240,14 +250,18 @@ fn parse_generate(body: &[u8], vocab_size: usize, max_model_len: usize) -> Resul
         }
     }
 
-    let ignore_eos = object
-        .get("ignore_eos")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let stream = object
-        .get("stream")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
+    let ignore_eos = match object.get("ignore_eos") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| error_response(400, "invalid_request", "ignore_eos must be a boolean"))?,
+    };
+    let stream = match object.get("stream") {
+        None => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| error_response(400, "invalid_request", "stream must be a boolean"))?,
+    };
 
     Ok(GenerateRequest { input_ids: tokens, max_new_tokens, ignore_eos, stream })
 }
@@ -394,28 +408,28 @@ fn run_generate_sse(
             .map_err(|error| error.to_string())
     };
 
-    let result = engine.model.generate_streaming(
-        LlmInput::text(&request.input_ids),
-        request.max_new_tokens,
-        |token| {
-            let event = serde_json::json!({ "type": "token", "request_id": request_id, "index": index, "token_id": token });
-            if !write_failed {
-                if let Err(error) = write_event(&mut *stream, event) {
-                    eprintln!("apxinf serve: stream write error: {error}");
-                    write_failed = true;
+    let (tokens, _profile) = engine
+        .model
+        .generate_streaming(
+            LlmInput::text(&request.input_ids),
+            request.max_new_tokens,
+            |token| {
+                let event = serde_json::json!({ "type": "token", "request_id": request_id, "index": index, "token_id": token });
+                if !write_failed {
+                    if let Err(error) = write_event(&mut *stream, event) {
+                        eprintln!("apxinf serve: stream write error: {error}");
+                        write_failed = true;
+                    }
                 }
-            }
-            index += 1;
-        },
-        eos_token_id,
-    );
-    let output_len = match result {
-        Ok((tokens, _profile)) => tokens.len(),
-        Err(error) => {
+                index += 1;
+            },
+            eos_token_id,
+        )
+        .map_err(|error| {
             eprintln!("apxinf serve: generation error: {error}");
-            index
-        }
-    };
+            error.to_string()
+        })?;
+    let output_len = tokens.len();
 
     if !write_failed {
         let done = serde_json::json!({
@@ -453,6 +467,7 @@ fn write_full_response(
         400 => "Bad Request",
         404 => "Not Found",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         _ => "OK",
     };
     let length_header = match content_length {
@@ -645,44 +660,65 @@ fn run_generate_sse_text(
             .map_err(|error| error.to_string())
     };
 
-    let result = engine.model.generate_streaming(
-        LlmInput::text(&request.input_ids),
-        request.max_new_tokens,
-        |token| {
-            all_tokens.push(token);
-            let event = serde_json::json!({ "type": "token", "request_id": request_id, "index": index, "token_id": token });
-            if !write_failed {
-                if let Err(error) = write_event(&mut *stream, event) {
-                    eprintln!("apxinf serve: stream write error: {error}");
-                    write_failed = true;
+    let (tokens, _profile) = engine
+        .model
+        .generate_streaming(
+            LlmInput::text(&request.input_ids),
+            request.max_new_tokens,
+            |token| {
+                all_tokens.push(token);
+                let event = serde_json::json!({ "type": "token", "request_id": request_id, "index": index, "token_id": token });
+                if !write_failed {
+                    if let Err(error) = write_event(&mut *stream, event) {
+                        eprintln!("apxinf serve: stream write error: {error}");
+                        write_failed = true;
+                    }
                 }
-            }
-            index += 1;
-        },
-        eos_token_id,
-    );
-    let output_len = match result {
-        Ok((tokens, _profile)) => tokens.len(),
-        Err(error) => {
+                index += 1;
+            },
+            eos_token_id,
+        )
+        .map_err(|error| {
             eprintln!("apxinf serve: generation error: {error}");
-            index
-        }
-    };
+            error.to_string()
+        })?;
+    let output_len = tokens.len();
 
-    let text = engine.tokenizer.decode(&all_tokens).unwrap_or_default();
-    let done = serde_json::json!({
-        "type": "done",
-        "request_id": request_id,
-        "text": text,
-        "usage": {
-            "prompt_tokens": request.input_ids.len(),
-            "completion_tokens": output_len,
-            "total_tokens": request.input_ids.len() + output_len,
-        },
-    });
-    write_event(stream, done)?;
-    stream
-        .write_all(b"data: [DONE]\n\n")
-        .and_then(|_| stream.flush())
-        .map_err(|error| error.to_string())
+    if !write_failed {
+        let text = engine.tokenizer.decode(&all_tokens).unwrap_or_default();
+        let done = serde_json::json!({
+            "type": "done",
+            "request_id": request_id,
+            "text": text,
+            "usage": {
+                "prompt_tokens": request.input_ids.len(),
+                "completion_tokens": output_len,
+                "total_tokens": request.input_ids.len() + output_len,
+            },
+        });
+        write_event(stream, done)?;
+        stream
+            .write_all(b"data: [DONE]\n\n")
+            .and_then(|_| stream.flush())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_rejects_non_boolean_flags() {
+        let bodies: &[&[u8]] = &[
+            br#"{"input_ids":[1],"max_new_tokens":1,"ignore_eos":0}"#,
+            br#"{"input_ids":[1],"max_new_tokens":1,"stream":"false"}"#,
+        ];
+        for body in bodies {
+            let (status, payload) = parse_generate(body, 10, 32).expect_err("invalid boolean");
+            assert_eq!(status, 400);
+            assert!(payload.contains("invalid_request"));
+        }
+    }
 }

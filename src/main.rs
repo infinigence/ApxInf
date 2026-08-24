@@ -92,7 +92,10 @@ fn main() {
 
     match cli.command {
         Commands::Generate { model, prompt, image, max_tokens, no_eos_stop, system, device, dtype } => {
-            let device = parse_device(&device);
+            let device = parse_device(&device).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            });
             // Report a failed generation through the exit status; a CLI that
             // printed an error and still exited 0 reads as success to any caller.
             if let Err(error) = run_generate(
@@ -110,7 +113,14 @@ fn main() {
             }
         }
         Commands::Serve { model, host, port, max_model_len, model_revision, device } => {
-            let device = parse_device(&device);
+            let device = parse_device(&device).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            });
+            if !matches!(device, Device::Cuda(_)) {
+                eprintln!("apxinf serve requires --device cuda");
+                std::process::exit(2);
+            }
             // The CUDA backend allocates KV-cache rows up to qwen35::cuda::MAX_SEQ_LEN.
             // Report that real capacity on /health (and use it for over-budget
             // admission) instead of the CLI default, so the health declaration
@@ -131,20 +141,18 @@ fn main() {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
-        }        Commands::Test => {
+        }
+        Commands::Test => {
             run_test();
         }
     }
 }
 
-fn parse_device(s: &str) -> Device {
+fn parse_device(s: &str) -> Result<Device, String> {
     match s.to_lowercase().as_str() {
-        "cuda" | "gpu" => Device::Cuda(0),
-        "cpu" => Device::Cpu,
-        _ => {
-            eprintln!("Unknown device '{s}', defaulting to CPU. Use 'cpu' or 'cuda'.");
-            Device::Cpu
-        }
+        "cuda" | "gpu" => Ok(Device::Cuda(0)),
+        "cpu" => Ok(Device::Cpu),
+        _ => Err(format!("unknown device '{s}'; use 'cpu' or 'cuda'")),
     }
 }
 
