@@ -583,13 +583,30 @@ impl CudaQwen35 {
         let no_graph = std::env::var_os("Q35_NOGRAPH").is_some();
         if no_graph {
             k::copy_bf16(&self.ctx, &self.token_embed, &self.ws.x, self.hidden).map_err(|e| e.to_string())?;
+            let prof = std::env::var_os("Q35_PROF").is_some();
+            let mut lin_ns = 0u128;
+            let mut full_ns = 0u128;
             for i in 0..self.n_layers {
+                if prof { self.ctx.synchronize()?; }
+                let t0 = std::time::Instant::now();
                 match &self.layers[i] {
                     GpuLayer::Full(fl) => self.full_layer_decode(fl)?,
                     GpuLayer::Linear(li) => self.linear_layer_decode(li)?,
                 }
+                if prof {
+                    self.ctx.synchronize()?;
+                    let dt = t0.elapsed().as_nanos();
+                    if matches!(&self.layers[i], GpuLayer::Full(_)) { full_ns += dt; } else { lin_ns += dt; }
+                }
             }
+            if prof { self.ctx.synchronize()?; }
+            let t0 = std::time::Instant::now();
             self.apply_logits(1)?;
+            if prof {
+                self.ctx.synchronize()?;
+                let logits_ns = t0.elapsed().as_nanos();
+                eprintln!("[prof] lin={:.2}ms full={:.2}ms logits={:.2}ms", lin_ns as f64/1e6, full_ns as f64/1e6, logits_ns as f64/1e6);
+            }
             self.ctx.synchronize()?;
             self.seq_len += 1;
             return self.read_logits();
