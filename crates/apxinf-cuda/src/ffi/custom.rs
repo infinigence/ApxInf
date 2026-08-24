@@ -990,3 +990,10 @@ extern "C" {
         zp: *const c_void, c: *mut c_void, n: i32, k: i32, stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+extern "C" {
+    pub fn apxinf_qwen_gemm_f16(
+        a: *const c_void, b: *const c_void, c: *mut c_void,
+        m: i32, n: i32, k: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}

@@ -369,6 +369,13 @@ impl CudaQwen35 {
         self.ctx.cublas().gemm(DType::F16, m, n, kk, 1.0f32, a, b, 0.0f32, c)
     }
 
+    /// Dense fp16 GEMM with deterministic accumulation order (matches the
+    /// w4a16 kernel), used where decode(m=1) and prefill(m=l) must agree
+    /// bit-for-bit: linear_attn.in_a / in_b and Dense out_proj.
+    fn gemm_dense(&self, m: usize, n: usize, kk: usize, a: &CudaBuffer, b: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
+        k::gemm_f16(&self.ctx, a, b, c, m, n, kk).map_err(|e| e.to_string())
+    }
+
     fn gemm_q4(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
         if m == 1 {
             k::gemm_w4a16_m1_bf16(&self.ctx, a, &q.packed, &q.scale, &q.zp, c, q.out, q.inp)
@@ -422,8 +429,8 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.in_qkv, l, &self.ws.xn, &self.ws.qkv)?;
         k::conv_silu_bf16_into(&self.ctx, &self.ws.qkv, &layer.conv_w, &self.ws.conv, l, self.conv_dim).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.in_z, l, &self.ws.xn, &self.ws.z)?;
-        self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
-        self.gemm(l, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
+        self.gemm_dense(l, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
+        self.gemm_dense(l, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
         k::beta_g_bf16(&self.ctx, &self.ws.a, &self.ws.b, &layer.a_log, &layer.dt_bias, &self.ws.beta, &self.ws.g, l * self.nv, self.nv).map_err(|e| e.to_string())?;
         k::conv_split_bf16_into(&self.ctx, &self.ws.conv, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, l, self.nk, self.nv, self.kd, self.vd, self.conv_dim).map_err(|e| e.to_string())?;
         let qscale = 1.0f32 / (self.kd as f32).sqrt();
@@ -435,7 +442,7 @@ impl CudaQwen35 {
         k::mul_bf16_into(&self.ctx, &self.ws.o_delta, &self.ws.z, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
         match &layer.out_proj {
             GpuOutProj::Q4(q) => self.gemm_q4(q, l, &self.ws.z, &self.ws.o_out)?,
-            GpuOutProj::Dense(b) => self.gemm(l, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
+            GpuOutProj::Dense(b) => self.gemm_dense(l, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
         }
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, l * self.hidden).map_err(|e| e.to_string())?;
         // stash the last 3 pre-conv qkv rows for the incremental conv taps
@@ -475,8 +482,8 @@ impl CudaQwen35 {
         self.gemm_q4(&layer.in_qkv, 1, &self.ws.xn, &self.ws.qkv)?;
         k::conv_step_silu_bf16_into(&self.ctx, &self.ws.qkv, &layer.conv_hist, &layer.conv_w, &self.ws.conv, self.conv_dim).map_err(|e| e.to_string())?;
         self.gemm_q4(&layer.in_z, 1, &self.ws.xn, &self.ws.z)?;
-        self.gemm(1, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
-        self.gemm(1, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
+        self.gemm_dense(1, self.nv, self.hidden, &self.ws.xn, &layer.in_a, &self.ws.a)?;
+        self.gemm_dense(1, self.nv, self.hidden, &self.ws.xn, &layer.in_b, &self.ws.b)?;
         k::beta_g_bf16(&self.ctx, &self.ws.a, &self.ws.b, &layer.a_log, &layer.dt_bias, &self.ws.beta, &self.ws.g, self.nv, self.nv).map_err(|e| e.to_string())?;
         k::conv_split_bf16_into(&self.ctx, &self.ws.conv, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, 1, self.nk, self.nv, self.kd, self.vd, self.conv_dim).map_err(|e| e.to_string())?;
         let qscale = 1.0f32 / (self.kd as f32).sqrt();
@@ -488,7 +495,7 @@ impl CudaQwen35 {
         k::mul_bf16_into(&self.ctx, &self.ws.o_delta, &self.ws.z, &self.ws.z, self.nv * self.vd).map_err(|e| e.to_string())?;
         match &layer.out_proj {
             GpuOutProj::Q4(q) => self.gemm_q4(q, 1, &self.ws.z, &self.ws.o_out)?,
-            GpuOutProj::Dense(b) => self.gemm(1, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
+            GpuOutProj::Dense(b) => self.gemm_dense(1, self.hidden, self.nv * self.vd, &self.ws.z, b, &self.ws.o_out)?,
         }
         k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, self.hidden).map_err(|e| e.to_string())?;
         self.mlp_run(&layer.mlp, &layer.post_norm_w, 1)

@@ -721,3 +721,15 @@ extern "C" cudaError_t apxinf_qwen_gemm_w4a16_m1_bf16(
       static_cast<__half*>(c), n, k);
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t apxinf_qwen_gemm_f16(
+    const void* a, const void* b, void* c,
+    int m, int n, int k, cudaStream_t stream) {
+  if (m <= 0 || n <= 0 || k <= 0) return cudaErrorInvalidValue;
+  dim3 grid((n + FW4_BN - 1) / FW4_BN, (m + FW4_BM - 1) / FW4_BM);
+  qwen_gemm_f16_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<const __half*>(a), static_cast<const __half*>(b),
+      static_cast<__half*>(c), m, n, k);
+  return cudaGetLastError();
+}
+

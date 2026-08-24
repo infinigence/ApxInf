@@ -547,6 +547,33 @@ pub fn copy_at_bf16(
     .map_err(Error::Cuda)
 }
 
+pub fn gemm_f16(
+    ctx: &CudaContext,
+    a: &CudaBuffer,
+    b: &CudaBuffer,
+    c: &CudaBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "a", dev, a, m * k * 2)?;
+    need(ctx, "b", dev, b, k * n * 2)?;
+    need(ctx, "c", dev, c, m * n * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_gemm_f16(
+            a.ptr(),
+            b.ptr(),
+            c.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
 pub fn gemm_w4a16_m1_bf16(
     ctx: &CudaContext,
     a: &CudaBuffer,

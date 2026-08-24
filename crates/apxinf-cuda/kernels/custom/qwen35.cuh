@@ -455,8 +455,10 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
       #pragma unroll
       for (int r = 0; r < QW4_MT; r++)
         #pragma unroll
-        for (int cv = 0; cv < QW4_NT; cv++)
-          acc[r][cv] += av[r].x * wv[cv].x + av[r].y * wv[cv].y;
+        for (int cv = 0; cv < QW4_NT; cv++) {
+          acc[r][cv] = fmaf(av[r].x, wv[cv].x, acc[r][cv]);
+          acc[r][cv] = fmaf(av[r].y, wv[cv].y, acc[r][cv]);
+        }
     }
     __syncthreads();
   }
@@ -466,6 +468,100 @@ __global__ void qwen_gemm_w4a16_bf16_kernel(
     int mg = m0 + ml0 + r;
     #pragma unroll
     for (int cv = 0; cv < QW4_NT; cv++) {
+      int ng = n0 + nl0 + cv;
+      if (mg < M && ng < N) {
+        c[(int64_t)mg * N + ng] = __float2half(acc[r][cv]);
+      }
+    }
+  }
+}
+
+#define FW4_BM 32
+#define FW4_BN 64
+#define FW4_BK 64
+#define FW4_MT 4
+#define FW4_NT 2
+
+// Dense fp16 GEMM: C[M,N] = A[M,K] @ B[K,N]^T, device `b` stored transposed
+// as [K,N] (same layout as upload_transposed). Deterministic per-output
+// accumulation order (K chunks of 64, pairwise fp16 FMAs) identical to the
+// w4a16 kernel, so m=1 (decode) and m=l (prefill) produce bit-identical rows.
+__global__ void qwen_gemm_f16_kernel(
+    const __half* a, const __half* b, __half* c, int M, int N, int K) {
+  __shared__ __half2 A_s[FW4_BM][FW4_BK / 2];
+  __shared__ __half2 B_s[FW4_BN][FW4_BK / 2];
+
+  const int n0 = blockIdx.x * FW4_BN;
+  const int m0 = blockIdx.y * FW4_BM;
+  const int tid = threadIdx.x;
+  const int tx = tid & 31;
+  const int ty = tid >> 5;
+  const int ml0 = ty * FW4_MT;
+  const int nl0 = tx * FW4_NT;
+
+  float acc[FW4_MT][FW4_NT];
+  #pragma unroll
+  for (int r = 0; r < FW4_MT; r++)
+    #pragma unroll
+    for (int cv = 0; cv < FW4_NT; cv++) acc[r][cv] = 0.0f;
+
+  for (int k0 = 0; k0 < K; k0 += FW4_BK) {
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int e = tid + i * 256;
+      int mm = e >> 5;
+      int kk2 = e & 31;
+      int mg = m0 + mm;
+      int kg = k0 + 2 * kk2;
+      if (mg < M && kg + 1 < K) {
+        A_s[mm][kk2] = *reinterpret_cast<const __half2*>(&a[(int64_t)mg * K + kg]);
+      } else {
+        A_s[mm][kk2] = __floats2half2_rn(0.0f, 0.0f);
+      }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      int e = tid + i * 256;
+      int nn = e >> 5;
+      int kk2 = e & 31;
+      int ng = n0 + nn;
+      int kg = k0 + 2 * kk2;
+      float f1 = 0.0f, f2 = 0.0f;
+      if (ng < N && kg < K) f1 = __half2float(b[(int64_t)kg * N + ng]);
+      if (ng < N && kg + 1 < K) f2 = __half2float(b[(int64_t)(kg + 1) * N + ng]);
+      B_s[nn][kk2] = __floats2half2_rn(f1, f2);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int kk2 = 0; kk2 < FW4_BK / 2; kk2++) {
+      float2 av[FW4_MT], bv[FW4_NT];
+      #pragma unroll
+      for (int r = 0; r < FW4_MT; r++) {
+        __half2 v = A_s[ml0 + r][kk2];
+        av[r].x = __half2float(__low2half(v));
+        av[r].y = __half2float(__high2half(v));
+      }
+      #pragma unroll
+      for (int cv = 0; cv < FW4_NT; cv++) {
+        __half2 v = B_s[nl0 + cv][kk2];
+        bv[cv].x = __half2float(__low2half(v));
+        bv[cv].y = __half2float(__high2half(v));
+      }
+      #pragma unroll
+      for (int r = 0; r < FW4_MT; r++)
+        #pragma unroll
+        for (int cv = 0; cv < FW4_NT; cv++)
+          acc[r][cv] += av[r].x * bv[cv].x + av[r].y * bv[cv].y;
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int r = 0; r < FW4_MT; r++) {
+    int mg = m0 + ml0 + r;
+    #pragma unroll
+    for (int cv = 0; cv < FW4_NT; cv++) {
       int ng = n0 + nl0 + cv;
       if (mg < M && ng < N) {
         c[(int64_t)mg * N + ng] = __float2half(acc[r][cv]);
@@ -685,12 +781,17 @@ __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
       continue;
     }
     #pragma unroll
-    for (int kk = 0; kk < BK; kk++) {
+    for (int kk2 = 0; kk2 < BK / 2; kk2++) {
+      int kk = 2 * kk2;
       int g = (k0 >> 5) + (kk >> 5);
       float s = __half2float(scale[(int64_t)n * groups + g]);
       int zpv = ((zp[((int64_t)n / 8) * groups + g] >> (4 * (n & 7))) & 0xF) - 8;
-      int w = ((ps[tid][kk >> 3] >> (4 * (kk & 7))) & 0xF) - 8;
-      acc += __half2float(A_s[kk]) * (s * (float)(w - zpv));
+      int w0 = ((ps[tid][kk >> 3] >> (4 * (kk & 7))) & 0xF) - 8;
+      int w1 = ((ps[tid][(kk + 1) >> 3] >> (4 * ((kk + 1) & 7))) & 0xF) - 8;
+      float wv0 = __half2float(__float2half_rn(s * (float)(w0 - zpv)));
+      float wv1 = __half2float(__float2half_rn(s * (float)(w1 - zpv)));
+      acc = fmaf(__half2float(A_s[kk]), wv0, acc);
+      acc = fmaf(__half2float(A_s[kk + 1]), wv1, acc);
     }
     __syncthreads();
   }
