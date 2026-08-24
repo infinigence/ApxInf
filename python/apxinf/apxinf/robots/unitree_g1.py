@@ -52,7 +52,8 @@ def build_unitree_g1_policy(
     (full model-width unnormalizer, so the delta->absolute step sees the whole
     action before the 32->16 robot truncation), then swaps in the G1 pipelines:
 
-    * **input**  — ``[image_stack, g1_decode_state?, tokenize, sample_noise]``
+    * **input**  — ``[image_stack, g1_decode_state?, tokenize]``; PI0.5 samples
+      its latent internally unless the caller supplies ``noise``
     * **output** — ``[unnormalize, g1_absolute?, g1_encode]``
 
     ``adapt_to_pi=False`` drops the decode/encode conventions (raw robot space);

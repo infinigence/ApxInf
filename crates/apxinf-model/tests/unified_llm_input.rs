@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 
-use apxinf_core::{Device, Result, Tensor};
+use apxinf_core::{
+    Backend, CpuBackend, Device, Result, RngKey, Tensor, TokenPenalties,
+    TokenSamplingParams, TokenSelection,
+};
 use apxinf_loader::ModelConfig;
 use apxinf_model::{
-    AutoModel, ImageInput, LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel,
+    AutoModel, GenerationOptions, GenerationRequest, ImageInput,
+    LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel,
 };
 
 #[derive(Default)]
@@ -41,6 +45,11 @@ impl LlmTrait for TextOnlyModel {
             _ => 1,
         };
         Self::logits(token_ids.len(), token)
+    }
+
+    fn backend(&self) -> &dyn Backend {
+        static BACKEND: CpuBackend = CpuBackend;
+        &BACKEND
     }
 
     fn reset(&mut self) {
@@ -88,6 +97,11 @@ impl LlmTrait for VisionModel {
         TextOnlyModel::logits(token_ids.len(), 3)
     }
 
+    fn backend(&self) -> &dyn Backend {
+        static BACKEND: CpuBackend = CpuBackend;
+        &BACKEND
+    }
+
     fn reset(&mut self) {
         self.saw_image_prefill = false;
         self.decode_calls.clear();
@@ -105,7 +119,7 @@ fn text_generation_keeps_the_existing_prefill_and_decode_path() {
 
     let (generated, _) = model
         .generate_streaming(
-            LlmInput::text(&[7, 8]),
+            LlmInput::text(&[0, 1]),
             3,
             |token| streamed.push(token),
             None,
@@ -117,7 +131,7 @@ fn text_generation_keeps_the_existing_prefill_and_decode_path() {
     assert_eq!(model.prewarm_calls, vec![(2, 3)]);
     assert_eq!(
         model.forward_calls,
-        vec![(vec![7, 8], 0), (vec![2], 2), (vec![3], 3)]
+        vec![(vec![0, 1], 0), (vec![2], 2), (vec![3], 3)]
     );
 }
 
@@ -128,7 +142,7 @@ fn text_only_model_rejects_an_image_before_forward() {
     let mut model = TextOnlyModel::default();
 
     let error = match model.generate_streaming(
-        LlmInput::with_image(&[7, 8], ImageInput::new(&pixels, &grid)),
+        LlmInput::with_image(&[0, 1], ImageInput::new(&pixels, &grid)),
         1,
         |_| {},
         None,
@@ -150,7 +164,7 @@ fn image_is_consumed_once_at_prefill_and_not_in_the_decode_loop() {
 
     let (generated, _) = model
         .generate_streaming(
-            LlmInput::with_image(&[10, 11, 12], ImageInput::new(&pixels, &grid)),
+            LlmInput::with_image(&[0, 1, 2], ImageInput::new(&pixels, &grid)),
             2,
             |_| {},
             None,
@@ -171,10 +185,121 @@ fn loaded_model_uses_the_same_generation_interface() {
         LlmCapabilities::default()
     );
     let (generated, _) = model
-        .generate_streaming(LlmInput::text(&[5, 6]), 2, |_| {}, None)
+        .generate_streaming(LlmInput::text(&[1, 2]), 2, |_| {}, None)
         .unwrap();
 
     assert_eq!(generated, vec![2, 3]);
+}
+
+#[test]
+fn options_api_exposes_sampling_and_logprob_without_changing_model_hooks() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions {
+        max_new_tokens: 2,
+        eos_token_ids: Vec::new(),
+        sampling: TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: 0.8,
+                top_k: Some(1),
+                top_p: 1.0,
+            },
+            penalties: TokenPenalties::default(),
+            return_logprob: true,
+        },
+        rng: RngKey::new(7, 11, 0),
+    };
+    let mut streamed = Vec::new();
+    let output = model
+        .generate_streaming_with_options(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            |token| streamed.push(token),
+        )
+        .unwrap();
+
+    assert_eq!(output.token_ids(), vec![2, 3]);
+    assert_eq!(streamed, output.tokens);
+    assert!(output.tokens.iter().all(|token| token.logprob == Some(0.0)));
+}
+
+#[test]
+fn zero_token_generation_does_not_run_the_model() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(0, None);
+    let output = model
+        .generate_streaming_with_options(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            |_| panic!("zero-token request invoked callback"),
+        )
+        .unwrap();
+
+    assert!(output.tokens.is_empty());
+    assert!(model.forward_calls.is_empty());
+    assert!(model.prewarm_calls.is_empty());
+}
+
+#[test]
+fn any_configured_eos_token_stops_before_another_decode() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions {
+        max_new_tokens: 8,
+        eos_token_ids: vec![0, 3],
+        ..GenerationOptions::greedy(8, None)
+    };
+    let mut streamed = Vec::new();
+    let output = model
+        .generate_streaming_with_options(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            |token| streamed.push(token.token_id),
+        )
+        .unwrap();
+
+    assert_eq!(output.token_ids(), vec![2, 3]);
+    assert_eq!(streamed, vec![2, 3]);
+    assert_eq!(
+        model.forward_calls,
+        vec![(vec![0, 1], 0), (vec![2], 2)]
+    );
+}
+
+#[test]
+fn invalid_sampling_options_fail_before_model_work() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions {
+        max_new_tokens: 1,
+        eos_token_ids: Vec::new(),
+        sampling: TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: 0.0,
+                top_k: None,
+                top_p: 1.0,
+            },
+            ..TokenSamplingParams::default()
+        },
+        rng: RngKey::default(),
+    };
+    let error = model
+        .generate_streaming_with_options(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            |_| {},
+        )
+        .err()
+        .expect("zero sampling temperature should fail");
+
+    assert!(error.to_string().contains("temperature"));
+    assert!(model.forward_calls.is_empty());
+    assert!(model.prewarm_calls.is_empty());
 }
 
 #[test]

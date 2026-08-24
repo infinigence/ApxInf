@@ -12,7 +12,8 @@ ApxInf gives you for free:
   `sdpa_decode`, `sdpa_prefill`, `kv_append`, `to_device`, `to_cpu`,
   `synchronize`. CUDA + CPU backends implement it.
 - A `LlmTrait` (`apxinf_model::LlmTrait`) with token-level `forward`, unified
-  text/image `prefill(LlmInput)`, and `generate_streaming`.
+  text/image `prefill(LlmInput)`, backend-bound GPU sampling, and
+  `generate_streaming_with_options`.
 - A `DecodeGraphConfig` + `DecodeGraphWeights` pattern for the
   allocation-free decode fast path (CUDA workspace + graph capture).
 - A safetensors loader (`apxinf_loader::safetensors`) that preserves bf16
@@ -24,7 +25,8 @@ What you always have to write:
 - A weights struct with `from_map(HashMap<String, Tensor>)` that picks the
   right keys and transposes 2D projections `[out, in]` → `[in, out]`.
 - A model struct implementing `LlmTrait`; multimodal models override `prefill`
-  and advertise `LlmCapabilities`.
+  and advertise `LlmCapabilities`. Every model returns its `backend()` so the
+  shared generation loop can create a sampler for device-resident logits.
 - A registered loader. `AutoModel` detects Hugging Face `model_type`, so the
   shared CLI generation path does not add a model-specific decode runner.
 
@@ -121,29 +123,30 @@ impl LlmTrait for GeneralMyModel {
         }
         self.kv.advance(seq_len);
         let x = self.backend.rms_norm(&x, &self.weights.norm, eps)?;
-        let logits = self.backend.matmul(&x, &self.weights.lm_head)?;
-        self.backend.synchronize()?;
-        self.backend.to_cpu(&logits)
+        self.backend.matmul(&x, &self.weights.lm_head)
+    }
+
+    fn backend(&self) -> &dyn Backend {
+        self.backend.as_ref()
     }
 }
 ```
+
+Return logits on the model device. The shared sampler selects from their final
+row; copying the complete vocabulary row to the host defeats the CUDA logits
+pipeline. See
+[`doc/20260819-sampling-subsystem`](20260819-sampling-subsystem/README.md) for
+the complete contract and backend implementation.
 
 **Key pattern:** borrow only `self.weights` (immutable) when building the
 `DecodeGraphWeights` view, so it can coexist with the `&mut self.kv`
 borrow for the KV cache.
 
-### CLI wiring (src/main.rs)
+### Loader registration
 
-Add a `model_type` check in `run_generate` that routes to your model:
-
-```rust
-let model_type = read_model_type(model_dir).unwrap_or_default();
-if model_type == "my_model_type" {
-    return run_generate_my_model(model_dir, prompt, ...);
-}
-```
-
-`read_model_type` reads `config.json` and returns the `model_type` field.
+Register the loader and its Hugging Face `model_type`. `AutoModel::load_model`
+detects it from `config.json`; the shared CLI and generation pipeline require
+no model-specific routing or decoding function.
 
 ## Decision tree: does my model need new kernels?
 
@@ -262,9 +265,10 @@ to localize bugs.
 4. **Reuse the primitives; don't re-invent them per model.** QK-norm is
    `rms_norm` on a reshape. The bar for adding a new kernel: is there any
    way to express this with existing kernels + a reshape?
-5. **BF16 is storage/compute default; fp32 is for reductions and
-   sampling.** Weights: bf16. Activations: bf16. RMSNorm variance sum:
-   fp32 accumulator. Final logits: fp32 (for greedy + sampling precision).
+5. **BF16 is storage/compute default; fp32 is for reductions.** Weights and
+   activations are bf16; reductions such as RMSNorm variance use fp32
+   accumulation. The backend sampler accepts f32, f16, or bf16 device logits
+   and performs probability calculations with fp32 precision.
 
 ## Concrete example
 

@@ -11,7 +11,7 @@ Three layers, kept deliberately decoupled:
 * **policies** — the **L2** layer (:mod:`apxinf.policies`).
   :class:`~apxinf.policies.impls.pi05.Pi05Policy` composes a pre pipeline + a
   bare-model handle (L1) + a post pipeline into a single
-  ``infer(obs_dict) -> {actions, timing, ...}`` call.
+  ``infer(obs_dict, noise=None) -> {actions, timing, ...}`` call.
   :class:`~apxinf.policies.auto.AutoPolicy` dispatches a checkpoint to its concrete
   policy by ``config.json`` model type; :class:`~apxinf.policies.base.Policy` is
   the structural contract they all satisfy.

@@ -76,10 +76,15 @@ class BetaNoise(ProcessorStep): ...
 
 # inject it — the transform (SampleNoise) is unchanged
 input_pipeline, output_pipeline = Pi05Policy.default_pipelines(model, ..., noise=BetaNoise(H, D))
-# or swap on an existing pipeline (copy-on-write):
-input_pipeline = input_pipeline.replace("sample_noise", SampleNoise(BetaNoise(H, D)))
+# or insert/swap it on an existing pipeline (copy-on-write):
+input_pipeline = input_pipeline.insert_after(
+    "tokenize", ("sample_noise", SampleNoise(BetaNoise(H, D)))
+)
 input_pipeline = input_pipeline.override("sample_noise", ...)   # tweak PARAMS only
 ```
+
+The default pipeline has no `sample_noise` step: omitting external noise lets
+the runtime generate it directly in the stable device buffer.
 
 **Organize growth by implementation family, not by transform key.** When a
 category earns a second implementation, promote its file to a package
@@ -126,7 +131,8 @@ For bare-model (L1) use, the binding is reachable as `apxinf.Model`:
 ```python
 from apxinf import Model
 model = Model.load("pi05", "model.safetensors", precision="bf16")
-model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # normalized-domain action
+model.infer_rgb(rgb_u8, "nhwc", token_ids)          # internal device sampling
+model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # exact external noise
 ```
 
 Any default step is replaceable at construction (`image_pipeline=`,
@@ -136,7 +142,7 @@ implementation.
 ## Policy contract
 
 `apxinf.Policy` is a structural `typing.Protocol` every L2 policy satisfies:
-`metadata`, `action_dim`, `action_horizon`, `infer(obs) -> dict`, `close()`.
+`metadata`, `action_dim`, `action_horizon`, `infer(obs, noise=None) -> dict`, `close()`.
 `infer` guarantees the `actions` and `timing` keys across all policies. It's the
 anchor point for future models (a `GrootPolicy` satisfies the same contract),
 for `AutoPolicy` dispatch, and for a future lerobot adaptor — no inheritance
@@ -179,12 +185,12 @@ async-inference server (`apxinf.serving` covers that need); `torch.compile`.
 `Policy.infer` eats. A frame that went through the second is also accepted and
 undone, but costs a device→host copy per tick, so the numpy seam is the default.
 
-**Whose pre/post runs: ours.** apxinf's `Pipeline` does all of resize, tokenize,
-noise and unnormalize — what the golden tests anchor the checkpoint's numerics to.
-lerobot splits the same work differently (resize and prior noise live *inside* its
-policy; normalize lives in its processor pipeline), so pipelines from its
+**Whose pre/post runs: ours.** apxinf's `Pipeline` does resize, tokenize, and
+unnormalize; the model runtime generates prior noise unless it is supplied
+explicitly. lerobot splits the same work differently (resize and prior noise live
+*inside* its policy; normalize lives in its processor pipeline), so pipelines from its
 `make_pre_post_processors` are **not** interchangeable with ours — feeding their
-output here would drop resize/noise and double-normalize. `ApxInfPolicy`'s own
+output here would drop resize and double-normalize. `ApxInfPolicy`'s own
 `make_pre_post_processors()` therefore returns pass-throughs that preserve the
 call shape and nothing more.
 

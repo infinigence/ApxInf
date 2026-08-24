@@ -41,7 +41,7 @@ needs_torch = pytest.mark.skipif(
 
 
 class MockModel:
-    """Deterministic stand-in: normalized action == the sampled noise."""
+    """Deterministic stand-in with a device-sampling-shaped default path."""
 
     def __init__(self):
         self.action_horizon = HORIZON
@@ -50,10 +50,12 @@ class MockModel:
         self.image_size = IMAGE_SIZE
         self.max_token_len = 200
 
-    def infer_rgb(self, rgb_u8, layout, token_ids, noise):
+    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None):
         assert layout == "nhwc"
         assert rgb_u8.dtype == np.uint8
         assert rgb_u8.shape == (NUM_VIEWS, IMAGE_SIZE, IMAGE_SIZE, 3)
+        if noise is None:
+            return np.zeros((HORIZON, MODEL_DIM), dtype=np.float32)
         return np.asarray(noise, dtype=np.float32)
 
 

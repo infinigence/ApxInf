@@ -4,8 +4,13 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use apxinf_core::{DType, Device, Tensor};
-use apxinf_model::{AutoModel, ImageInput, LlmInput, LoadOptions};
+use apxinf_core::{
+    DType, Device, RngKey, Tensor, TokenPenalties, TokenSamplingParams,
+    TokenSelection,
+};
+use apxinf_model::{
+    AutoModel, GenerationOptions, ImageInput, LlmInput, LoadOptions,
+};
 use apxinf_tokenizer::{Tokenizer, ChatMessage};
 
 #[derive(Parser)]
@@ -38,6 +43,38 @@ enum Commands {
         #[arg(long, default_value = "50")]
         max_tokens: usize,
 
+        /// Enable random categorical sampling instead of greedy selection.
+        #[arg(long)]
+        sample: bool,
+
+        /// Sampling temperature (used with --sample).
+        #[arg(long, default_value = "1.0")]
+        temperature: f32,
+
+        /// Retain only the highest-k logits (used with --sample).
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// Nucleus probability mass (used with --sample).
+        #[arg(long, default_value = "1.0")]
+        top_p: f32,
+
+        /// Repetition penalty; 1 disables it.
+        #[arg(long, default_value = "1.0")]
+        repetition_penalty: f32,
+
+        /// Frequency penalty applied per token occurrence.
+        #[arg(long, default_value = "0.0")]
+        frequency_penalty: f32,
+
+        /// Presence penalty applied once to previously seen tokens.
+        #[arg(long, default_value = "0.0")]
+        presence_penalty: f32,
+
+        /// Counter-based sampling seed.
+        #[arg(long, default_value = "0")]
+        seed: u64,
+
         /// Disable EOS-based early stopping (generate until max_tokens)
         #[arg(long)]
         no_eos_stop: bool,
@@ -64,7 +101,24 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Generate { model, prompt, image, max_tokens, no_eos_stop, system, device, dtype } => {
+        Commands::Generate {
+            model,
+            prompt,
+            image,
+            max_tokens,
+            sample,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            no_eos_stop,
+            system,
+            device,
+            dtype,
+        } => {
             let device = parse_device(&device);
             // Report a failed generation through the exit status; a CLI that
             // printed an error and still exited 0 reads as success to any caller.
@@ -77,6 +131,14 @@ fn main() {
                 system.as_deref(),
                 device,
                 &dtype,
+                sample,
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                seed,
             ) {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -108,6 +170,14 @@ fn run_generate(
     system_prompt: Option<&str>,
     device: Device,
     dtype: &str,
+    sample: bool,
+    temperature: f32,
+    top_k: Option<usize>,
+    top_p: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    seed: u64,
 ) -> Result<(), String> {
     println!("apxinf — LLM/VLM inference engine");
     println!();
@@ -197,28 +267,46 @@ fn run_generate(
     let mut out = stdout.lock();
     let mut all_tokens = tokens.clone();
 
-    let (_, profile) = model
-        .generate_streaming(
-            input,
-            max_tokens,
-            |token_id| {
-                all_tokens.push(token_id);
-                if let Ok(text) = tok.decode(&all_tokens) {
-                    let previous = tok
-                        .decode(&all_tokens[..all_tokens.len() - 1])
-                        .unwrap_or_default();
-                    let delta = text.strip_prefix(&previous).unwrap_or(&text);
-                    print!("{delta}");
-                    out.flush().ok();
+    let generation_options = GenerationOptions {
+        max_new_tokens: max_tokens,
+        eos_token_ids: eos_token_id.into_iter().collect(),
+        sampling: TokenSamplingParams {
+            selection: if sample {
+                TokenSelection::Random {
+                    temperature,
+                    top_k,
+                    top_p,
                 }
+            } else {
+                TokenSelection::Greedy
             },
-            eos_token_id,
-        )
+            penalties: TokenPenalties {
+                repetition: repetition_penalty,
+                frequency: frequency_penalty,
+                presence: presence_penalty,
+            },
+            return_logprob: false,
+        },
+        rng: RngKey::new(seed, 0, 0),
+    };
+    let output = model
+        .generate_streaming_with_options(input, &generation_options, |token| {
+            let token_id = token.token_id;
+            all_tokens.push(token_id);
+            if let Ok(text) = tok.decode(&all_tokens) {
+                let previous = tok
+                    .decode(&all_tokens[..all_tokens.len() - 1])
+                    .unwrap_or_default();
+                let delta = text.strip_prefix(&previous).unwrap_or(&text);
+                print!("{delta}");
+                out.flush().ok();
+            }
+        })
         .map_err(|error| format!("Generation failed: {error}"))?;
 
     println!();
     println!();
-    println!("{}", profile.summary());
+    println!("{}", output.profile.summary());
     Ok(())
 }
 

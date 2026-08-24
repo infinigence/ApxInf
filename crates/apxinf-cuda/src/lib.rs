@@ -16,6 +16,7 @@ pub mod kernels;
 pub mod kv_cache;
 pub mod nvtx;
 pub mod profiler;
+mod sampling;
 pub mod stream;
 pub mod transfers;
 pub mod tuning;

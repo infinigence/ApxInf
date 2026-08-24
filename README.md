@@ -178,6 +178,18 @@ cargo run --release --features cuda-no-nvtx -- generate \
   --device cuda --dtype bf16 --max-tokens 50
 ```
 
+Greedy decoding is the default. Enable the backend-native logits pipeline with
+`--sample`; the seed identifies a reproducible counter-based random stream:
+
+```bash
+cargo run --release --features cuda-no-nvtx -- generate \
+  --model /path/to/model \
+  --prompt "Describe CUDA graphs." \
+  --device cuda --dtype bf16 --max-tokens 50 \
+  --sample --temperature 0.8 --top-k 40 --top-p 0.95 \
+  --repetition-penalty 1.1 --seed 42
+```
+
 For Qwen3-VL, add `--image`. The CLI shells out to the Hugging Face processor to
 turn the image into `pixel_values` + `image_grid_thw`, so that Python environment
 needs:
@@ -209,6 +221,9 @@ cargo run --release --features cuda-no-nvtx -- generate \
 
 `generate` exits non-zero when preprocessing, loading, or generation fails, so it
 is safe to chain in a script.
+
+See the [sampling subsystem documentation](doc/20260819-sampling-subsystem/README.md)
+for the sampling API and backend design.
 
 ## 5. Run PI0.5
 
@@ -340,6 +355,12 @@ correctness-oriented decode-to-FP16 compatibility path.
 > numbers possible. The remaining architecture overrides (`--views`,
 > `--image-size`, `--num-flow-steps`, `--max-token-len`) do reshape weights and
 > stay rejected on a checkpoint.
+
+PI0.5 accepts an exact caller-supplied initial latent for debugging and parity
+checks. When no latent is supplied, it fills the model's stable CUDA latent
+buffer from the internal counter-based random stream, avoiding a host noise
+allocation and upload. The explicit seeded APIs remain available for exact
+replay.
 
 ### Python environment
 

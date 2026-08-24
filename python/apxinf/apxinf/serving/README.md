@@ -201,8 +201,10 @@ Port **placeholder calibration** faithfully as a hook (in G1 the flip mask is al
 
 ### 5.4 Assemble the pipeline in the factory
 
-Default pi05 pipelines: input `[image_stack, tokenize, sample_noise]`, output
-`[trim, unnormalize]`. `Pipeline` offers
+Default pi05 pipelines: input `[image_stack, tokenize]`, output
+`[trim, unnormalize]`. Noise is generated inside the runtime unless the caller
+passes it explicitly; a custom host sampler can still be inserted as a pipeline
+step. `Pipeline` offers
 `insert_before/insert_after/replace/override/remove/reorder` (each returns a new
 pipeline). The factory does three things: load full-width → insert decode on the
 input → rewrite the output pipeline:
@@ -249,7 +251,7 @@ def build_my_robot_policy(model_dir, *, use_delta_joint_actions=True, adapt_to_p
 Resulting pipelines:
 
 ```
-input : [image_stack, decode_state, tokenize, sample_noise]
+input : [image_stack, decode_state, tokenize]
 output: [unnormalize, absolute, encode]   # normalized[H,32] -> actions[H,ROBOT_DIM]
 ```
 

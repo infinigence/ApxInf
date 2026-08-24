@@ -58,8 +58,7 @@ impl Pi05Int8CapturedGraph {
         self.raw_image_layout
     }
 
-    fn update_noise_and_tokens(&self, token_ids: &[u32], noise: &Tensor) -> Result<()> {
-        transfers::copy_cpu_to_cuda(noise, &self.noise)?;
+    fn update_tokens(&self, token_ids: &[u32]) -> Result<()> {
         let bytes = token_ids
             .iter()
             .flat_map(|value| value.to_ne_bytes())
@@ -68,6 +67,11 @@ impl Pi05Int8CapturedGraph {
     }
 
     pub fn update_inputs(&self, patches: &Tensor, token_ids: &[u32], noise: &Tensor) -> Result<()> {
+        self.update_inputs_without_noise(patches, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    pub fn update_inputs_without_noise(&self, patches: &Tensor, token_ids: &[u32]) -> Result<()> {
         if self.raw_images.is_some() {
             return Err(Error::Other(
                 "π0.5 INT8 graph uses raw RGB input; call update_raw_image_inputs".into(),
@@ -82,7 +86,7 @@ impl Pi05Int8CapturedGraph {
         }
         self.backend.synchronize()?;
         transfers::copy_cpu_to_cuda(patches, &self.patches)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     pub fn update_raw_image_inputs(
@@ -90,6 +94,15 @@ impl Pi05Int8CapturedGraph {
         images: &[u8],
         token_ids: &[u32],
         noise: &Tensor,
+    ) -> Result<()> {
+        self.update_raw_image_inputs_without_noise(images, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    pub fn update_raw_image_inputs_without_noise(
+        &self,
+        images: &[u8],
+        token_ids: &[u32],
     ) -> Result<()> {
         let raw_images = self.raw_images.as_ref().ok_or_else(|| {
             Error::Other("π0.5 INT8 graph uses patch input; call update_inputs".into())
@@ -110,7 +123,7 @@ impl Pi05Int8CapturedGraph {
         }
         self.backend.synchronize()?;
         raw_images.copy_from_host(images).map_err(Error::Cuda)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     pub fn workspace_bytes(&self) -> usize {

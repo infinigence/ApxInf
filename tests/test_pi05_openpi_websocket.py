@@ -46,10 +46,14 @@ class MockModel:
         self.max_token_len = 200
         self.images: list[np.ndarray] = []
         self.noises: list[np.ndarray] = []
+        self.sampling_draw = 0
 
-    def infer_rgb(self, rgb_u8, layout, token_ids, noise):
+    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None):
         assert layout == "nhwc"
         self.images.append(np.asarray(rgb_u8).copy())
+        if noise is None:
+            noise = np.full((HORIZON, MODEL_DIM), self.sampling_draw, dtype=np.float32)
+            self.sampling_draw += 1
         self.noises.append(np.asarray(noise).copy())
         return np.zeros((HORIZON, MODEL_DIM), dtype=np.float32)
 

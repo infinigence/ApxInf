@@ -91,6 +91,7 @@ name = "apxinf-cuda"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "bytemuck",
  "cc",
  "half",
  "serde_json",

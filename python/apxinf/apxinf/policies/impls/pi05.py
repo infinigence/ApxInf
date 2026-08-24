@@ -154,15 +154,16 @@ class Pi05Policy:
         image_pipeline = image_pipeline or Pipeline(
             [("parse", ParseImage()), ("resize", ResizeWithPad(model.image_size))]
         )
-        noise = noise or GaussianNoise(model.action_horizon, model.action_dim)
-
-        input_pipeline = Pipeline(
-            [
-                ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
-                ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
-                ("sample_noise", SampleNoise(noise)),
-            ]
-        )
+        input_steps = [
+            ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
+            ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
+        ]
+        # The default leaves noise absent so the binding fills the stable latent
+        # buffer with its backend-native generator. Supplying an explicit sampler
+        # preserves the old host-generated/custom-processor path.
+        if noise is not None:
+            input_steps.append(("sample_noise", SampleNoise(noise)))
+        input_pipeline = Pipeline(input_steps)
         output_pipeline = Pipeline(
             [
                 ("trim", Trim(unnormalizer.width)),
@@ -233,6 +234,7 @@ class Pi05Policy:
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
+                sampling_seed=int(seed),
             )
         elif action_horizon is not None and int(action_horizon) != int(model.action_horizon):
             # A pre-built model carries its own horizon; silently ignoring the
@@ -252,14 +254,15 @@ class Pi05Policy:
         state_normalizer = (
             Normalizer.from_norm_stats(model_dir, key=state_norm_key) if discrete_state else None
         )
-        noise = GaussianNoise(model.action_horizon, model.action_dim, seed=seed)
+        reset_sampling = getattr(model, "reset_sampling", None)
+        if callable(reset_sampling):
+            reset_sampling(int(seed))
 
         input_pipeline, output_pipeline = cls.default_pipelines(
             model,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
             image_pipeline=image_pipeline,
-            noise=noise,
             state_normalizer=state_normalizer,
             image_keys=image_keys,
             state_key=state_key,
@@ -318,7 +321,9 @@ class Pi05Policy:
         width = int(action_dim) if action_dim is not None else int(model.action_dim)
         # Identity quantile map: with eps=0, unnormalize is (x + 1) * 1 + (-1) == x.
         unnormalizer = Unnormalizer(q01=[-1.0] * width, q99=[1.0] * width, dims=width, eps=0.0)
-        noise = GaussianNoise(model.action_horizon, model.action_dim, seed=seed)
+        reset_sampling = getattr(model, "reset_sampling", None)
+        if callable(reset_sampling):
+            reset_sampling(int(seed))
 
         if image_keys is None:
             image_keys = _synthetic_image_keys(model.num_views)
@@ -327,7 +332,6 @@ class Pi05Policy:
             model,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
-            noise=noise,
             image_keys=image_keys,
         )
         return cls(
@@ -343,12 +347,17 @@ class Pi05Policy:
 
     # --- inference ---------------------------------------------------------
 
-    def infer(self, observation: Mapping[str, Any]) -> dict:
+    def infer(self, observation: Mapping[str, Any], *, noise: Optional[np.ndarray] = None) -> dict:
         """Run pre-pipeline -> model -> post-pipeline on one raw observation dict.
 
         Returns ``actions`` (unnormalized ``float32`` ``[horizon, action_dim]``),
-        ``normalized_actions`` (the model's raw output), ``token_ids``, ``noise``,
-        and a ``timing`` dict distinguishing pure-model from end-to-end latency.
+        ``normalized_actions`` (the model's raw output), ``token_ids``, the
+        caller-provided ``noise`` (or ``None`` for internal sampling), and a
+        ``timing`` dict distinguishing pure-model from end-to-end latency.
+
+        ``noise`` is optional. An explicit keyword wins over ``observation["noise"]``
+        and over a custom input-pipeline sampler. If all are absent, the bare model
+        generates standard-normal noise directly in its device buffer.
         """
         started = time.perf_counter()
         if not isinstance(observation, Mapping):
@@ -359,15 +368,30 @@ class Pi05Policy:
         if not isinstance(prompt, str):
             raise TypeError(f"{self.prompt_key} must be a string, got {type(prompt)!r}")
 
-        # pre: obs dict -> model inputs (rgb / token_ids / noise)
+        # pre: obs dict -> model inputs (rgb / token_ids / optional noise)
         data = self.input_pipeline({OBSERVATION: observation, PROMPT: prompt})
         rgb = data[RGB]
         token_ids = data[TOKEN_IDS]
-        noise = data[NOISE]
+        selected_noise = noise
+        if selected_noise is None:
+            selected_noise = observation.get(NOISE)
+        if selected_noise is None:
+            selected_noise = data.get(NOISE)
+        if selected_noise is not None:
+            selected_noise = np.ascontiguousarray(selected_noise, dtype=np.float32)
+            expected_noise = (self.model.action_horizon, self.model.action_dim)
+            if selected_noise.shape != expected_noise:
+                raise ValueError(
+                    f"noise shape {selected_noise.shape}, expected {expected_noise}"
+                )
+            if not np.isfinite(selected_noise).all():
+                raise ValueError("noise must contain only finite values")
 
         # model: the policy's own middle step (not a pipeline stage)
         model_started = time.perf_counter()
-        normalized = np.asarray(self.model.infer_rgb(rgb, "nhwc", token_ids, noise), dtype=np.float32)
+        normalized = np.asarray(
+            self.model.infer_rgb(rgb, "nhwc", token_ids, selected_noise), dtype=np.float32
+        )
         model_ms = (time.perf_counter() - model_started) * 1000.0
 
         expected = (self.model.action_horizon, self.model.action_dim)
@@ -390,7 +414,7 @@ class Pi05Policy:
             "actions": actions,
             "normalized_actions": normalized,
             "token_ids": token_ids,
-            "noise": noise,
+            "noise": selected_noise,
             "timing": {"model_ms": model_ms, "total_ms": total_ms},
             "metadata": self.metadata,
         }

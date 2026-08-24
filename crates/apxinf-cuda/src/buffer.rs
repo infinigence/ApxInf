@@ -206,6 +206,23 @@ impl CudaBuffer {
         };
         Tensor::from_raw_parts(shape, dtype, device, Storage::Gpu { device, handle })
     }
+
+    /// Borrow this allocation as a tensor while retaining shared ownership.
+    /// The caller must ensure the requested shape and dtype exactly describe
+    /// the underlying bytes.
+    pub fn as_tensor(&self, shape: Shape, dtype: DType) -> Result<Tensor, String> {
+        let expected = shape
+            .numel()
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| "CUDA tensor byte size overflow".to_string())?;
+        if expected != self.len {
+            return Err(format!(
+                "CUDA tensor view needs {expected} bytes, buffer has {}",
+                self.len
+            ));
+        }
+        Ok(self.clone().into_tensor(shape, dtype))
+    }
 }
 
 /// Page-locked host memory that is also mapped into the GPU's address

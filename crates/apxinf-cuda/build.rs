@@ -261,6 +261,7 @@ fn main() {
             // the stable C ABI.
             let mut kernel_files = vec![
                 std::path::Path::new(&adapters_dir).join("core_kernels_adapter.cu"),
+                std::path::Path::new(&adapters_dir).join("sampling_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("static_bf16_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("w8a8_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("custom_kernels.cu"),

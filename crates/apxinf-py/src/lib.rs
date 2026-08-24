@@ -16,14 +16,17 @@
 //! removed without notice.
 //!
 //! Both return the **normalized-domain** action as a `float32` numpy array of
-//! shape `[action_horizon, action_dim]`. Tokenization, normalization, and noise
-//! sampling stay in Python (the `apxinf` package, Phase 2). No processor lives
-//! here.
+//! shape `[action_horizon, action_dim]`. Inference accepts optional exact
+//! caller-provided noise. When it is omitted, a model-owned counter-based stream
+//! generates the initial latent directly in the runtime's device buffer. The
+//! `*_seeded` variants remain available for explicitly keyed replay. No processor
+//! lives here.
 //!
 //! The pi05 runtime is only registered on CUDA devices, so real inference
 //! requires the `cuda` feature and a CUDA machine; without it the module still
 //! imports and reports shape contracts, but `load` errors for pi05.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use numpy::ndarray::Array2;
@@ -34,10 +37,10 @@ use numpy::{
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use apxinf_core::{Device, Shape, Tensor};
+use apxinf_core::{Device, RngKey, Shape, Tensor};
 use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
-    SyntheticWeights, VisionObservation,
+    SyntheticWeights, VisionObservation, VlaRequest,
 };
 
 /// Map any Rust error into a Python `RuntimeError`.
@@ -116,6 +119,8 @@ pub struct Model {
     model: LoadedModel,
     config: Pi05Config,
     device: Device,
+    sampling_seed: Cell<u64>,
+    sampling_draw: Cell<u64>,
 }
 
 impl Model {
@@ -164,14 +169,11 @@ impl Model {
         .map_err(runtime_err)
     }
 
-    /// Run inference and marshal the flat host action into a `[horizon, dim]`
-    /// numpy array, rejecting non-finite outputs.
-    fn run<'py>(
+    fn action_array<'py>(
         &self,
         py: Python<'py>,
-        observation: Observation,
+        flat: Vec<f32>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let flat = self.model.infer_host_f32(&observation).map_err(runtime_err)?;
         let horizon = self.config.action_horizon;
         let dim = self.config.action_dim;
         if flat.len() != horizon * dim {
@@ -191,6 +193,41 @@ impl Model {
         let array = Array2::from_shape_vec((horizon, dim), flat).map_err(runtime_err)?;
         Ok(array.into_pyarray_bound(py))
     }
+
+    fn next_sampling_rng(&self) -> PyResult<RngKey> {
+        let draw = self.sampling_draw.get();
+        let next = draw
+            .checked_add(1)
+            .ok_or_else(|| PyRuntimeError::new_err("implicit sampling draw counter overflow"))?;
+        self.sampling_draw.set(next);
+        Ok(RngKey::new(self.sampling_seed.get(), 0, draw))
+    }
+
+    /// Run with an exact caller-provided latent. This is the correctness and
+    /// OpenPI-parity path.
+    fn run_provided<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        latent: Tensor,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let request = VlaRequest::provided(&observation, &latent);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    /// Run with a standard-normal latent generated into the prepared device
+    /// buffer, avoiding a host allocation and H2D latent copy.
+    fn run_generated<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        rng: RngKey,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let request = VlaRequest::generated(&observation, rng);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
 }
 
 #[pymethods]
@@ -202,12 +239,14 @@ impl Model {
     /// * `device` — `cuda:N` (default) or `cpu`.
     /// * `precision` — `auto` (default), `fp8`, `bf16`, or `int8`.
     /// * `calibration` / `tactics` — optional FP8 calibration / tactics json.
+    /// * `sampling_seed` — seed for the implicit device-side noise stream used
+    ///   when inference is called without `noise`.
     /// * `action_horizon` — override the checkpoint's chunk length. `None`
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
     ///   the same weights load and run at the requested chunk length.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, sampling_seed=0))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -216,6 +255,7 @@ impl Model {
         calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
         action_horizon: Option<usize>,
+        sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         let mut config = load_config(&path)?;
@@ -243,6 +283,8 @@ impl Model {
             model: loaded,
             config,
             device,
+            sampling_seed: Cell::new(sampling_seed),
+            sampling_draw: Cell::new(0),
         })
     }
 
@@ -261,6 +303,7 @@ impl Model {
     /// * `tactics` — optional FP8 tactics json (a synthetic FP8 run falls back to
     ///   the kernel's default tactic when omitted).
     /// * `seed` — RNG seed for reproducible weights.
+    /// * `sampling_seed` — independent seed for implicit device-side noise.
     #[staticmethod]
     #[pyo3(signature = (
         model,
@@ -275,6 +318,7 @@ impl Model {
         calibration=None,
         tactics=None,
         seed=0,
+        sampling_seed=0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn random(
@@ -290,6 +334,7 @@ impl Model {
         calibration: Option<String>,
         tactics: Option<PathBuf>,
         seed: u64,
+        sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         let config = Pi05Config {
@@ -333,6 +378,8 @@ impl Model {
             model: loaded,
             config,
             device,
+            sampling_seed: Cell::new(sampling_seed),
+            sampling_draw: Cell::new(0),
         })
     }
 
@@ -342,16 +389,17 @@ impl Model {
     ///
     /// * `patches` — `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
     /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` — `float32` `[action_horizon, action_dim]`.
+    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
-    #[pyo3(name = "_infer_patches")]
+    #[pyo3(name = "_infer_patches", signature = (patches, token_ids, noise=None))]
     fn infer_patches<'py>(
         &self,
         py: Python<'py>,
         patches: PyReadonlyArray2<'py, f32>,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: PyReadonlyArray2<'py, f32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let expected = [self.patch_rows(), self.patch_width()];
         let shape = patches.shape();
@@ -372,7 +420,6 @@ impl Model {
             .to_vec();
         self.validate_tokens(&tokens)?;
 
-        let noise_tensor = self.noise_tensor(noise)?;
         let patch_tensor = Tensor::from_f32(
             Shape::new(vec![expected[0], expected[1]]),
             patch_data,
@@ -382,9 +429,60 @@ impl Model {
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
             token_ids: tokens,
-            noise: noise_tensor,
         };
-        self.run(py, observation)
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_provided(py, observation, noise_tensor)
+            }
+            None => self.run_generated(py, observation, self.next_sampling_rng()?),
+        }
+    }
+
+    /// **L0** seeded variant for runtime tests. The initial standard-normal
+    /// latent is generated directly in the prepared CUDA input buffer.
+    #[pyo3(name = "_infer_patches_seeded", signature = (patches, token_ids, seed, sequence=0, draw=0))]
+    fn infer_patches_seeded<'py>(
+        &self,
+        py: Python<'py>,
+        patches: PyReadonlyArray2<'py, f32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        seed: u64,
+        sequence: u64,
+        draw: u64,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let expected = [self.patch_rows(), self.patch_width()];
+        let shape = patches.shape();
+        if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._infer_patches_seeded: patches expected shape [{}, {}], got {:?}",
+                expected[0], expected[1], shape
+            )));
+        }
+        let patch_data = patches.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "apxinf_py._infer_patches_seeded: patches must be C-contiguous float32",
+            )
+        })?;
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._infer_patches_seeded: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let patch_tensor = Tensor::from_f32(
+            Shape::new(vec![expected[0], expected[1]]),
+            patch_data,
+        )
+        .map_err(runtime_err)?;
+        let observation = Observation {
+            vision: VisionObservation::Patches(patch_tensor),
+            token_ids: tokens,
+        };
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
     }
 
     /// **L1** — infer from resized RGB `uint8` images; vision→patches runs in the
@@ -394,16 +492,18 @@ impl Model {
     ///   bytes total, in `layout` order.
     /// * `layout` — `"nhwc"` or `"nchw"`.
     /// * `token_ids` — `uint32` `[token_count]`.
-    /// * `noise` — `float32` `[action_horizon, action_dim]`.
+    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
+    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None))]
     fn infer_rgb<'py>(
         &self,
         py: Python<'py>,
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: PyReadonlyArray2<'py, f32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let layout = parse_layout(layout)?;
         let expected_bytes =
@@ -431,14 +531,77 @@ impl Model {
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
-        let noise_tensor = self.noise_tensor(noise)?;
-
         let observation = Observation {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
-            noise: noise_tensor,
         };
-        self.run(py, observation)
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_provided(py, observation, noise_tensor)
+            }
+            None => self.run_generated(py, observation, self.next_sampling_rng()?),
+        }
+    }
+
+    /// Seeded L1 inference. This avoids creating or transferring a host noise
+    /// array and fills the latent on the runtime's CUDA stream.
+    #[pyo3(signature = (rgb_u8, layout, token_ids, seed, sequence=0, draw=0))]
+    fn infer_rgb_seeded<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        seed: u64,
+        sequence: u64,
+        draw: u64,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let layout = parse_layout(layout)?;
+        let expected_bytes =
+            self.config.num_views * self.config.image_size * self.config.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_seeded: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_seeded: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                self.config.num_views,
+                self.config.image_size,
+                self.config.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_seeded: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+        };
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
+    }
+
+    /// Reset the implicit device-side sampling stream used when `noise=None`.
+    /// Supplying a seed also replaces the configured seed.
+    #[pyo3(signature = (seed=None))]
+    fn reset_sampling(&self, seed: Option<u64>) {
+        if let Some(seed) = seed {
+            self.sampling_seed.set(seed);
+        }
+        self.sampling_draw.set(0);
     }
 
     /// Device string, e.g. `"cuda:0"`.

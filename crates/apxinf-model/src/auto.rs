@@ -6,11 +6,14 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend;
 use crate::builtin::register_builtin_models;
-use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
+use crate::llm_trait::{
+    GeneratedToken, GenerationOptions, GenerationOutput, GenerationRequest,
+    LlmCapabilities, LlmInput, LlmTrait,
+};
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::vla::{Action, InferenceSpec, Observation, PreparedInference, VlaRuntime};
+use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,19 +98,32 @@ impl LoadedModel {
             .generate_streaming_dyn(input, max_new_tokens, &mut on_token, eos_token_id)
     }
 
+    /// Sampling-aware generation for text and vision-language models.
+    pub fn generate_streaming_with_options(
+        &mut self,
+        input: LlmInput<'_>,
+        options: &GenerationOptions,
+        mut on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        self.text_mut()?.generate_streaming_with_options_dyn(
+            GenerationRequest { input, options },
+            &mut on_token,
+        )
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         self.text_mut()?.reset();
         Ok(())
     }
 
-    pub fn infer(&self, observation: &Observation) -> Result<Action> {
-        self.vla()?.infer(observation)
+    pub fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        self.vla()?.infer(request)
     }
 
     /// Run VLA inference and copy the action to host as `f32`. Convenience for
     /// callers that need host values without holding a backend handle.
-    pub fn infer_host_f32(&self, observation: &Observation) -> Result<Vec<f32>> {
-        self.vla()?.infer_host_f32(observation)
+    pub fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
+        self.vla()?.infer_host_f32(request)
     }
 
     pub fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {

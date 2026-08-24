@@ -11,7 +11,8 @@ concentric shells, each the cost of the layer around the one inside it:
 * **L1 rust** — ``Model.infer_rgb``: the ``apxinf_py`` binding from resized RGB;
   adds Rust-side vision→patches (in the CUDA graph) + PyO3 marshalling over L0.
 * **L2 python api** — ``Pi05Policy.infer``: adds the numpy pre chain
-  (parse/resize/tokenize/sample-noise) + post chain (trim/unnormalize) around L1.
+  (parse/resize/tokenize) + post chain (trim/unnormalize) around L1. Its default
+  latent is generated in the runtime's device buffer.
 * **L3 websocket** — one ``client.infer`` round trip: adds transport (websocket +
   msgpack) + the server processor pipeline around the bare model. Measured against
   a *running* server (``--host/--port``); this script attaches, it does not spawn.
@@ -334,7 +335,6 @@ def main() -> None:
                 # from the same pipeline so all layers see one consistent input.
                 from apxinf import Pi05Policy
                 from apxinf.processors.transforms import (
-                    NOISE,
                     OBSERVATION,
                     PROMPT,
                     RGB,
@@ -357,7 +357,9 @@ def main() -> None:
                 data = policy.input_pipeline({OBSERVATION: observation, PROMPT: args.prompt})
                 rgb = data[RGB]
                 token_ids = np.asarray(data[TOKEN_IDS], dtype=np.uint32)
-                noise = np.asarray(data[NOISE], dtype=np.float32)
+                noise = np.random.default_rng(args.seed).standard_normal(
+                    (handle.action_horizon, handle.action_dim), dtype=np.float32
+                )
                 token_count = int(token_ids.size)
             else:
                 views, size = handle.num_views, handle.image_size
@@ -380,7 +382,6 @@ def main() -> None:
             )
             handle = policy.model
             from apxinf.processors.transforms import (
-                NOISE,
                 OBSERVATION,
                 PROMPT,
                 RGB,
@@ -398,7 +399,9 @@ def main() -> None:
             data = policy.input_pipeline({OBSERVATION: observation, PROMPT: args.prompt})
             rgb = data[RGB]
             token_ids = np.asarray(data[TOKEN_IDS], dtype=np.uint32)
-            noise = np.asarray(data[NOISE], dtype=np.float32)
+            noise = np.random.default_rng(args.seed).standard_normal(
+                (handle.action_horizon, handle.action_dim), dtype=np.float32
+            )
             patch_rows = handle.num_views * handle.patches_per_view
             patch_width = 3 * handle.patch_size * handle.patch_size
             patches = np.zeros((patch_rows, patch_width), dtype=np.float32)

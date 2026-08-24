@@ -12,7 +12,7 @@ stays at the top level.**
 apxinf-model/src/
   ── Shared infrastructure (model-agnostic) ──
   lib.rs              module wiring + re-exports
-  llm_trait.rs        LlmTrait (the LLM regression process: prefill → decode → argmax → stream)
+  llm_trait.rs        LlmTrait (prefill → decode → backend sampling → stream)
   auto.rs             AutoModel (unified frontend, picks best impl)
   registry.rs         model factory registry
   builtin.rs          register_builtin_models()
@@ -43,8 +43,10 @@ apxinf-model/src/
 
 - **`LlmTrait`** — the shared autoregressive LLM/VLM process. Models
   implement token-level `forward`; request-level `prefill(LlmInput)` accepts
-  optional image processor output. `generate_streaming` is shared
-  (validate → prefill → argmax → token-only decode loop → stream).
+  optional image processor output, and `backend()` binds logits to the matching
+  sampler. `generate_streaming_with_options` is shared (validate → prefill →
+  penalties/filtering/selection → token-only decode loop → stream). The older
+  `generate_streaming` is a greedy compatibility wrapper around that pipeline.
 - **`AutoModel`** — unified frontend with one `load_model` entry point. It
   detects `config.json:model_type` by default, accepts an optional registry
   name override in `LoadOptions`, and picks the best device implementation.
@@ -76,19 +78,23 @@ Each model folder contains:
    decode graph, it's `qwen3vl/decode_graph.rs`.
 
 3. **Clear boundary between "pipeline" and "architecture".** The shared
-   `LlmTrait::generate_streaming` is the pipeline (prefill → decode →
-   argmax → stream). The model folder is the architecture (how one
-   forward pass works).
+   `LlmTrait::generate_streaming_with_options` is the pipeline (prefill →
+   decode → backend sampling → stream). The model folder is the architecture
+   (how one forward pass works).
 
 ## VLM and VLA boundaries
 
 VLM generation uses `LlmTrait` directly. `LlmInput` carries borrowed,
 optional processor output to `prefill`; Qwen3-VL keeps mRoPE, deepstack, and
-embedding scatter model-specific. See
-`doc/20260817-unified-llm-vlm-interface.md`.
+embedding scatter model-specific. See [adding a new model](adding-a-new-model.md)
+for the current interface contract.
 
 VLA models remain under the separate `VlaRuntime` interface because their
 observation/action contract and generation process are not autoregressive text.
+They share `RngKey` and the backend's standard-normal generator with the
+sampling infrastructure, but continuous action latents do not pass through the
+categorical token sampler. See
+[`doc/20260819-sampling-subsystem`](20260819-sampling-subsystem/README.md).
 
 ## KVCache
 
