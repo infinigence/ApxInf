@@ -650,7 +650,7 @@ fn run_inspect(model_dir: &PathBuf, json: bool) -> Result<(), String> {
             "native_capabilities": {
                 "text_generate": cfg!(feature = "cuda"),
                 "stateful_decode": cfg!(feature = "cuda"),
-                "multimodal": false,
+                "multimodal": cfg!(feature = "cuda"),
                 "m_gt_1_prefill": cfg!(feature = "cuda"),
                 "serial_prefill": cfg!(feature = "cuda"),
                 "openai_compatible_service": cfg!(feature = "cuda"),
