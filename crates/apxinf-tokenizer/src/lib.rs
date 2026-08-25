@@ -1,15 +1,11 @@
-//! Native tokenizer adapters for Hugging Face `tokenizer.json` and, behind the
-//! `sentencepiece` feature, SentencePiece `.model` checkpoints.
+//! Tokenizer wrapper using HuggingFace `tokenizers` crate.
 
 use std::path::Path;
 
+use minijinja::{Environment, Error as JinjaError, ErrorKind, State, Value};
 use apxinf_core::{Error, Result};
-use minijinja::Environment;
 use serde::{Deserialize, Serialize};
-use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
-
-#[cfg(feature = "sentencepiece")]
-use sentencepiece::SentencePieceProcessor;
+use tokenizers::Tokenizer as HfTokenizer;
 
 /// Chat message for template rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,8 +66,7 @@ impl Tokenizer {
             .map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
 
         // Try to load tokenizer_config.json from same directory
-        let config_path = path_ref
-            .parent()
+        let config_path = path_ref.parent()
             .map(|p| p.join("tokenizer_config.json"))
             .unwrap_or_else(|| path_ref.with_extension("config.json"));
 
@@ -87,35 +82,15 @@ impl Tokenizer {
         // Store chat template separately (we'll create env on demand)
         let chat_template = config.chat_template.clone();
 
-        Ok(Self {
-            inner,
-            config,
-            chat_template,
-        })
+        Ok(Self { inner, config, chat_template })
     }
 
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .inner
+        let encoding = self.inner
             .encode(text, false)
             .map_err(|e| Error::Other(format!("tokenizer encode: {e}")))?;
         Ok(encoding.get_ids().to_vec())
-    }
-
-    /// Add ordinary model tokens and return the number newly inserted.
-    pub fn add_tokens(&mut self, tokens: &[String]) -> usize {
-        let tokens = tokens
-            .iter()
-            .cloned()
-            .map(|token| AddedToken::from(token, false))
-            .collect::<Vec<_>>();
-        self.inner.add_tokens(&tokens)
-    }
-
-    /// Resolve one token to its vocabulary ID.
-    pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.inner.token_to_id(token)
     }
 
     /// Decode token IDs to text.
@@ -146,12 +121,9 @@ impl Tokenizer {
         }
 
         // Fallback: search vocabulary for common EOS tokens
-        self.inner
-            .get_vocab(true)
+        self.inner.get_vocab(true)
             .iter()
-            .find(|(token, _)| {
-                *token == "</s>" || *token == "<|eot_id|>" || *token == "<|end_of_text|>"
-            })
+            .find(|(token, _)| *token == "</s>" || *token == "<|eot_id|>" || *token == "<|end_of_text|>")
             .map(|(_, &id)| id)
     }
 
@@ -171,8 +143,7 @@ impl Tokenizer {
         }
 
         // Fallback: search vocabulary for common BOS tokens
-        self.inner
-            .get_vocab(true)
+        self.inner.get_vocab(true)
             .iter()
             .find(|(token, _)| *token == "<s>" || *token == "<|begin_of_text|>")
             .map(|(_, &id)| id)
@@ -193,38 +164,26 @@ impl Tokenizer {
 
         // Create environment and template on demand
         let mut env = Environment::new();
+        env.set_unknown_method_callback(python_string_method);
         env.add_template("chat", template_str)
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
-        let tmpl = env
-            .get_template("chat")
+        let tmpl = env.get_template("chat")
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
         // Build template context
-        let bos = self
-            .config
-            .bos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
+        let bos = self.config.bos_token.clone()
+            .or_else(|| self.inner.get_vocab(true)
+                .iter()
+                .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
+                .map(|(t, _)| t.clone()))
             .unwrap_or_default();
 
-        let eos = self
-            .config
-            .eos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
+        let eos = self.config.eos_token.clone()
+            .or_else(|| self.inner.get_vocab(true)
+                .iter()
+                .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
+                .map(|(t, _)| t.clone()))
             .unwrap_or_default();
 
         // Create context as serde Value (map)
@@ -235,8 +194,7 @@ impl Tokenizer {
             "add_generation_prompt": true,
         });
 
-        let result = tmpl
-            .render(context)
+        let result = tmpl.render(context)
             .map_err(|e| Error::Other(format!("template render error: {e}")))?;
 
         // Jinja2 in Python strips whitespace around control blocks, but minijinja doesn't.
@@ -267,53 +225,47 @@ impl Tokenizer {
     /// Convenience method that applies template and encodes the result.
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let prompt = self.apply_chat_template(messages)?;
-        println!("Formatted prompt:\n{}", prompt);
         self.encode(&prompt)
     }
 }
 
-/// Native SentencePiece tokenizer for checkpoints that carry a `.model` file.
-///
-/// This adapter deliberately exposes only deterministic inference. Training and
-/// subword sampling remain outside the ApxInf runtime.
-#[cfg(feature = "sentencepiece")]
-pub struct SentencePieceTokenizer {
-    inner: SentencePieceProcessor,
-}
-
-#[cfg(feature = "sentencepiece")]
-impl SentencePieceTokenizer {
-    /// Load a native SentencePiece protobuf model.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_ref = path.as_ref();
-        let inner = SentencePieceProcessor::open(path_ref)
-            .map_err(|error| Error::Other(format!("sentencepiece load: {error}")))?;
-        Ok(Self { inner })
+fn python_string_method(
+    _state: &State,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> std::result::Result<Value, JinjaError> {
+    if !matches!(method, "startswith" | "endswith") {
+        return Err(JinjaError::from(ErrorKind::UnknownMethod));
     }
-
-    /// Encode text to IDs, optionally prefixing the model-declared BOS token.
-    pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>> {
-        let pieces = self
-            .inner
-            .encode(text)
-            .map_err(|error| Error::Other(format!("sentencepiece encode: {error}")))?;
-        let mut ids = Vec::with_capacity(pieces.len() + usize::from(add_bos));
-        if add_bos {
-            let bos = self.inner.bos_id().ok_or_else(|| {
-                Error::Other("sentencepiece model does not declare a BOS token".to_string())
-            })?;
-            ids.push(bos);
-        }
-        ids.extend(pieces.into_iter().map(|piece| piece.id));
-        Ok(ids)
+    let source = value.as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string receiver"),
+        )
+    })?;
+    if args.len() != 1 {
+        return Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires exactly one argument"),
+        ));
     }
+    let needle = args[0].as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string argument"),
+        )
+    })?;
+    Ok(Value::from(if method == "startswith" {
+        source.starts_with(needle)
+    } else {
+        source.ends_with(needle)
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use tokenizers::models::wordlevel::WordLevel;
 
     #[test]
     fn test_chat_message_constructors() {
@@ -329,26 +281,19 @@ mod tests {
     }
 
     #[test]
-    fn added_tokens_are_encoded_and_resolved() {
-        let vocab = HashMap::from([("[UNK]".to_string(), 0), ("<|image_pad|>".to_string(), 1)]);
-        let model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("[UNK]".to_string())
-            .build()
+    fn test_qwen_python_string_methods() {
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(python_string_method);
+        env.add_template(
+            "qwen",
+            "{{ value.startswith('tool') }}|{{ value.endswith('call') }}",
+        )
+        .unwrap();
+        let rendered = env
+            .get_template("qwen")
+            .unwrap()
+            .render(serde_json::json!({"value":"tool_call"}))
             .unwrap();
-        let mut tokenizer = Tokenizer {
-            inner: HfTokenizer::new(model),
-            config: TokenizerConfig::default(),
-            chat_template: None,
-        };
-
-        assert_eq!(
-            tokenizer.add_tokens(&["<|propri|>".to_string(), "<|action|>".to_string()]),
-            2
-        );
-        assert_eq!(tokenizer.token_to_id("<|image_pad|>"), Some(1));
-        assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
-        assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
-        assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+        assert_eq!(rendered, "true|true");
     }
 }

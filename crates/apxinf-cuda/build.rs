@@ -98,62 +98,8 @@ fn emit_rerun_if_changed_tree(root: &std::path::Path) {
     }
 }
 
-/// The full argv of an nvcc invocation, in a form that changes whenever any
-/// flag, include path, define or architecture changes.
-fn describe_command(command: &std::process::Command) -> String {
-    let mut text = command.get_program().to_string_lossy().into_owned();
-    for argument in command.get_args() {
-        text.push('\u{1f}');
-        text.push_str(&argument.to_string_lossy());
-    }
-    text
-}
-
-/// True when `object` can be reused: it exists, the recorded command line is
-/// identical, a dependency list exists, and every file in that list is older
-/// than the object. Anything missing or unreadable means "rebuild" -- the
-/// cache never decides to skip on incomplete information.
-fn nvcc_object_is_current(object: &str, deps: &str, stamp: &str, cmdline: &str) -> bool {
-    let Ok(object_time) = std::fs::metadata(object).and_then(|m| m.modified()) else {
-        return false;
-    };
-    if std::fs::read_to_string(stamp).ok().as_deref() != Some(cmdline) {
-        return false;
-    }
-    let Ok(rule) = std::fs::read_to_string(deps) else {
-        return false;
-    };
-    // A make rule: "target: dep dep \\\n dep ...". Drop everything up to the
-    // first unescaped colon, then split on unescaped whitespace.
-    let Some((_, prerequisites)) = rule.split_once(':') else {
-        return false;
-    };
-    let mut any = false;
-    for prerequisite in prerequisites.split_whitespace() {
-        if prerequisite == "\\" {
-            continue;
-        }
-        any = true;
-        let Ok(time) = std::fs::metadata(prerequisite).and_then(|m| m.modified()) else {
-            return false;
-        };
-        if time > object_time {
-            return false;
-        }
-    }
-    any
-}
-
 fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
-}
-
-// Architectures that compile the vendored FlashAttention-2 BF16 forward
-// kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
-// the same v2.7.4 instantiations; the -arch flag selects the real target.
-fn is_fa2_bf16_arch(arch: &str) -> bool {
-    is_fa2_sm80_family(arch)
-        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
 }
 
 fn is_cutlass_sm89_family(arch: &str) -> bool {
@@ -168,13 +114,12 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_bf16_sm89)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
-    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_head_special)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_direct_e4m3_sm100)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_marlin_sm89)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
-    println!("cargo:rerun-if-env-changed=APXINF_FA2_TRIM_UNUSED");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
@@ -317,7 +262,6 @@ fn main() {
             // the stable C ABI.
             let mut kernel_files = vec![
                 std::path::Path::new(&adapters_dir).join("core_kernels_adapter.cu"),
-                std::path::Path::new(&adapters_dir).join("sampling_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("static_bf16_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("w8a8_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("custom_kernels.cu"),
@@ -343,9 +287,9 @@ fn main() {
             let cutlass_fmha = std::path::Path::new(&adapters_dir).join("cutlass_fmha_adapter.cu");
             let cutlass_gemm = std::path::Path::new(&adapters_dir).join("cutlass_fp8_adapter.cu");
             let cutlass_bf16 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_adapter.cu");
-            let cutlass_bf16_sm89 =
-                std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
+            let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
+            let marlin_adapter = std::path::Path::new(&adapters_dir).join("marlin_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
                 let fmha = cutlass_root.join("fmha");
@@ -435,29 +379,23 @@ fn main() {
             }
 
             let fa2_root = cutlass_root.join("fa2");
-            let fa2_compat = cutlass_root.join("fa2_compat");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
-            let fa2_hdim64_apx = cutlass_root.join("fa2_hdim64_bf16.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
             let mut fa2_includes = Vec::new();
-            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_bf16_arch);
+            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
-            let fa2_head_special = fa2_sm80 || fa2_f16_sm100;
             if fa2_sm80 || fa2_f16_sm100 {
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
-                let fa2_hdim128 = fa2_root.join("flash_attn/flash_fwd_hdim128_bf16_sm80.cu");
                 let fa2_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_bf16_sm80.cu");
                 let fa2_f16_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_fp16.cu");
                 let fa2_f16_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_fp16.cu");
                 let fa2_cutlass = fa2_root.join("cutlass/include");
                 assert!(
                     fa2_operator.is_file()
-                        && fa2_hdim64_apx.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
-                        && fa2_hdim128.is_file()
                         && fa2_hdim256.is_file()
                         && fa2_f16_hdim96.is_file()
                         && fa2_f16_hdim256.is_file()
@@ -467,32 +405,11 @@ fn main() {
                 );
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
-                    fa2_hdim64_apx,
                     fa2_hdim96,
-                    fa2_hdim128,
                     fa2_hdim256,
                     fa2_f16_hdim96,
                     fa2_f16_hdim256,
                 ]);
-                let fa2_split_hdim256 =
-                    fa2_root.join("flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu");
-                assert!(
-                    fa2_split_hdim256.is_file(),
-                    "vendored FlashAttention-2 split-KV source is incomplete under {}",
-                    fa2_root.display()
-                );
-                fa2_sources.push(fa2_split_hdim256);
-                // The head-64 and head-256 specialisations are ordinary
-                // Ampere-MMA FA2 kernels; Blackwell runs them. They were tied
-                // to the SM80 family only because that was the first device
-                // that needed them. `fa2_head_special` is the axis that
-                // decides whether the specialised dispatch exists, and it is
-                // now on wherever the underlying hdim kernels are compiled.
-                if fa2_head_special {
-                    fa2_sources
-                        .push(std::path::Path::new(&adapters_dir).join("fa2_head64_adapter.cu"));
-                    fa2_sources.push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
-                }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
                     let direct_operator = cutlass_root.join("fa2_f16_e4m3_sm100.cu");
@@ -509,16 +426,27 @@ fn main() {
                     kernel_files.extend(fa2_direct_e4m3_sources.iter().cloned());
                     println!("cargo:rustc-cfg=apxinf_fa2_direct_e4m3_sm100");
                 }
-                fa2_includes.extend([fa2_compat.clone(), fa2_root.clone(), fa2_cutlass]);
+                fa2_includes.extend([fa2_root.clone(), fa2_cutlass]);
                 kernel_files.extend(fa2_sources.iter().cloned());
                 if fa2_sm80 {
                     println!("cargo:rustc-cfg=apxinf_fa2_sm80");
                 }
-                if fa2_head_special {
-                    println!("cargo:rustc-cfg=apxinf_fa2_head_special");
-                }
                 emit_rerun_if_changed_tree(&fa2_root);
-                emit_rerun_if_changed_tree(&fa2_compat);
+            }
+
+            if nvcc_arch.as_deref() == Some("sm_89") {
+                let marlin_root = std::path::Path::new(&kernels_dir).join("marlin");
+                assert!(
+                    marlin_adapter.is_file()
+                        && marlin_root.join("kernel.h").is_file()
+                        && marlin_root.join("marlin_template.h").is_file()
+                        && marlin_root.join("core/scalar_type.hpp").is_file(),
+                    "vendored SM89 Marlin sources are incomplete under {}",
+                    marlin_root.display()
+                );
+                kernel_files.push(marlin_adapter.clone());
+                println!("cargo:rustc-cfg=apxinf_marlin_sm89");
+                emit_rerun_if_changed_tree(&marlin_root);
             }
 
             if !kernel_files.is_empty() {
@@ -532,6 +460,7 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", entry.display());
                     let stem = entry.file_stem().unwrap().to_string_lossy().to_string();
                     let obj = format!("{out_dir}/{stem}.o");
+
                     let mut cmd = std::process::Command::new(&nvcc);
                     cmd.args([
                         "-c",
@@ -559,13 +488,6 @@ fn main() {
                     };
                     if let Some(selected_arch) = selected_arch {
                         cmd.args([format!("-arch={selected_arch}")]);
-                    }
-                    if entry.ends_with("cublaslt_adapter.cu")
-                        && nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family)
-                    {
-                        // Keep the measured Blackwell FP8 NN layout. Other
-                        // targets stage KN weights into cuBLASLt's TN layout.
-                        cmd.arg("-DAPXINF_FP8_NN_LAYOUT=1");
                     }
                     for include in &target_include_dirs {
                         if std::path::Path::new(include).exists() {
@@ -605,57 +527,12 @@ fn main() {
                         cmd.args([
                             "--expt-relaxed-constexpr",
                             "--expt-extended-lambda",
-                        ]);
-                        // Reference SDPA specializations use libdevice exp/log in the
-                        // split combiner; fast math changes BF16 output rounding.
-                        if !entry.ends_with("fa2_head256_adapter.cu")
-                            && !entry.ends_with("fa2_head64_adapter.cu") {
-                            cmd.arg("--use_fast_math");
-                        }
-                        cmd.args([
+                            "--use_fast_math",
                             "-U__CUDA_NO_HALF_OPERATORS__",
                             "-U__CUDA_NO_HALF_CONVERSIONS__",
                             "-U__CUDA_NO_HALF2_OPERATORS__",
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2",
-                        ]);
-                        if fa2_sm80 {
-                            cmd.arg("-DAPXINF_FA2_SM80=1");
-                        }
-                        // Only the dispatch adapter and the two specialisations
-                        // read this; the hdim kernels do not, and putting it on
-                        // their command line would rebuild them for nothing.
-                        if fa2_head_special
-                            && (entry == &fa2_wrapper
-                                || entry.ends_with("fa2_head64_adapter.cu")
-                                || entry.ends_with("fa2_head256_adapter.cu"))
-                        {
-                            cmd.arg("-DAPXINF_FA2_HEAD_SPECIAL=1");
-                        }
-                        cmd.arg("-DAPXINF_FA2_SPLITKV=1");
-                        // Drop the FlashAttention-2 feature axes the adapter
-                        // never reaches. `fill_params` value-initializes the
-                        // parameter block and then leaves `alibi_slopes_ptr`
-                        // null and `softcap` zero; dropout is pinned to the
-                        // keep-everything encoding (`p_dropout == 1.0`,
-                        // `rp_dropout == 1.0`); and the window is either fully
-                        // open (-1/-1) or causal (right == 0), so `Is_local` is
-                        // never taken. Each macro removes one bool template
-                        // axis and the instantiations are their product, so the
-                        // four together cut ptxas work by up to 16x.
-                        //
-                        // That matters most on Orin, where ptxas needs multiple
-                        // hours per FA2 translation unit at sm_87 -- measured at
-                        // over 2.5h on flash_fwd_hdim128_bf16_sm80.cu alone,
-                        // 99.8% CPU and 5.4 GB RSS.
-                        //
-                        // UNEVEN_K is deliberately not disabled: seqlen_k is a
-                        // runtime value and is not block-aligned in general.
-                        cmd.args([
-                            "-DFLASHATTENTION_DISABLE_DROPOUT",
-                            "-DFLASHATTENTION_DISABLE_ALIBI",
-                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                            "-DFLASHATTENTION_DISABLE_LOCAL",
                         ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
@@ -673,39 +550,16 @@ fn main() {
                             "-DFLASH_NAMESPACE=apxinf_fa2_direct_e4m3",
                             "-DAPXINF_FA2_DIRECT_E4M3=1",
                         ]);
-                        // The direct-E4M3 path uses the same fixed feature set.
-                        cmd.args([
-                            "-DFLASHATTENTION_DISABLE_DROPOUT",
-                            "-DFLASHATTENTION_DISABLE_ALIBI",
-                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                            "-DFLASHATTENTION_DISABLE_LOCAL",
-                        ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
                     }
-                    // Every rerun of this script used to re-run nvcc for all
-                    // ~25 translation units, which is about 40 minutes on this
-                    // board and is paid for editing one line of Rust. Make the
-                    // step incremental the way make is: nvcc writes a
-                    // dependency list next to the object, and the object is
-                    // reused when it is newer than every file in that list and
-                    // the command line that produced it is unchanged.
-                    let deps = format!("{out_dir}/{stem}.d");
-                    let stamp = format!("{out_dir}/{stem}.cmdline");
-                    let cmdline = describe_command(&cmd);
-                    if nvcc_object_is_current(&obj, &deps, &stamp, &cmdline) {
-                        continue;
+                    if entry == &marlin_adapter {
+                        cmd.arg("--expt-relaxed-constexpr");
                     }
-                    cmd.arg("-MD").arg("-MF").arg(&deps);
                     let status = cmd.status().expect("failed to run nvcc");
 
                     assert!(status.success(), "nvcc failed for {}", entry.display());
-                    // Written only after nvcc succeeded, so an interrupted or
-                    // failed compile cannot leave a stamp that hides a stale
-                    // object from the next build.
-                    std::fs::write(&stamp, &cmdline)
-                        .unwrap_or_else(|error| panic!("write {stamp}: {error}"));
                 }
 
                 // Create a static library from all kernel objects

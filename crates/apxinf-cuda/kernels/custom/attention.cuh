@@ -57,12 +57,8 @@ __global__ void attention_softmax_f32_kernel(
     const float* scores, float* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads)
 {
-    // Grid is 1-D: one block per (row, col-tile). Recover the row from the
-    // flat block id because dim3.y is capped at 65535 and rows can exceed it
-    // (seq_len * n_heads for long prefills, e.g. Qwen3-VL-4B image prefill).
-    uint32_t n_col_blocks = (cols + blockDim.x - 1) / blockDim.x;
-    uint32_t row = blockIdx.x / n_col_blocks;
-    uint32_t col = (blockIdx.x % n_col_blocks) * blockDim.x + threadIdx.x;
+    uint32_t row = blockIdx.y;
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
 
     // Map row index to sequence position: each position has n_heads rows
@@ -173,11 +169,8 @@ __global__ void attention_softmax_bf16_kernel(
     const __nv_bfloat16* scores, __nv_bfloat16* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads)
 {
-    // Grid is 1-D (see attention_softmax_f32_kernel): dim3.y is capped at
-    // 65535 but rows = seq_len * n_heads can exceed it on multimodal prefills.
-    uint32_t n_col_blocks = (cols + blockDim.x - 1) / blockDim.x;
-    uint32_t row = blockIdx.x / n_col_blocks;
-    uint32_t col = (blockIdx.x % n_col_blocks) * blockDim.x + threadIdx.x;
+    uint32_t row = blockIdx.y;
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
 
     uint32_t seq_pos = row / n_heads;
@@ -238,8 +231,9 @@ __global__ void attention_softmax_decode_bf16_kernel(
 // Output:  [seq_len, n_heads * head_dim] bf16
 //
 // Non-causal: every query attends to every key. One block per (head, query).
-// 32 threads (= 1 warp); each thread handles 2 head_dim elements so head_dim
-// up to 64 fits in a single warp and the dot-product reduction uses __shfl.
+// 32 threads (= 1 warp); each thread handles strided head_dim elements. The
+// current contract covers head_dim 64 and 72, so at most three values live in
+// registers per thread and the dot-product reduction still uses __shfl.
 //
 // IMPORTANT: all 32 threads must reach every __shfl_xor_sync call (full mask
 // 0xffffffff). The inner loops are therefore non-strided — every thread
@@ -256,37 +250,40 @@ __global__ void vision_sdpa_bf16_kernel(
     uint32_t head = blockIdx.y;
     uint32_t qi   = blockIdx.x;
     if (qi >= seq_len) return;
-    int tid = threadIdx.x;          // 0..31 (one warp)
-
-    // Generic head_dim: each thread owns columns d = tid + 32*j. Works for
-    // head_dim=64 (2 cols/thread) and head_dim=72 (3 cols for the first 8
-    // threads, 2 for the rest). Out-of-range lanes are masked but stay
-    // converged so every __shfl_xor_sync uses the full warp mask.
-    int n_per = (head_dim + 31) / 32;
+    int tid = threadIdx.x;       // 0..31
+    constexpr int kMaxElementsPerThread = 3;
+    int dimensions[kMaxElementsPerThread];
+    float query_values[kMaxElementsPerThread];
+    int dimension_count = 0;
 
     extern __shared__ float smem[];
-    float* scores = smem;           // [seq_len] + 1 scratch slot
+    float* scores = smem;        // [seq_len] + 1 scratch slot
 
-    const __nv_bfloat16* q_row = q + qi * n_heads * head_dim + head * head_dim;
+    const __nv_bfloat16* q_row = q  + qi * n_heads * head_dim + head * head_dim;
+    for (uint32_t dimension = tid; dimension < head_dim; dimension += 32u) {
+        dimensions[dimension_count] = static_cast<int>(dimension);
+        query_values[dimension_count] = __bfloat162float(q_row[dimension]);
+        dimension_count++;
+    }
 
-    // Phase 1: scores[ki] = (Q[qi] . K[ki]) * scale. All threads iterate
-    // every ki so the warp stays converged; per-thread partial dots are
-    // summed with a full-mask shuffle reduction.
+    // Phase 1: scores[ki] = (Q[qi] · K[ki]) * scale. All threads iterate
+    // every ki so the shfl reduction stays converged.
     for (uint32_t ki = 0; ki < seq_len; ki++) {
         const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
         float dot = 0.0f;
-        for (int j = 0; j < n_per; j++) {
-            int d = tid + 32 * j;
-            if (d < (int)head_dim)
-                dot += __bfloat162float(q_row[d]) * __bfloat162float(k_row[d]);
+        for (int slot = 0; slot < dimension_count; slot++) {
+            dot += query_values[slot] *
+                __bfloat162float(k_row[dimensions[slot]]);
         }
-        for (int off = 16; off > 0; off >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, off);
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
         if (tid == 0) scores[ki] = dot * scale;
     }
     __syncthreads();
 
-    // Phase 2: online-style softmax over seq_len scores (strided reads).
+    // Phase 2: softmax (max → exp → sum → normalize).
+    // For seq_len > 32, the max/sum reductions are strided — but the shfl
+    // only needs the threads that have data. Use mask = __activemask() to
+    // avoid deadlocks when some threads drop out.
     float max_val = -INFINITY;
     for (uint32_t ki = tid; ki < seq_len; ki += 32u)
         max_val = fmaxf(max_val, scores[ki]);
@@ -296,8 +293,6 @@ __global__ void vision_sdpa_bf16_kernel(
     if (tid == 0) scores[seq_len] = max_val;
     __syncthreads();
     max_val = scores[seq_len];
-    // Protect the maximum reads before reusing the max/sum scratch slot.
-    __syncwarp();
 
     float sum = 0.0f;
     for (uint32_t ki = tid; ki < seq_len; ki += 32u) {
@@ -312,302 +307,23 @@ __global__ void vision_sdpa_bf16_kernel(
     for (uint32_t ki = tid; ki < seq_len; ki += 32u) scores[ki] *= inv_sum;
     __syncthreads();
 
-    // Phase 3: out[qi, head, d] = sum_k scores[k] * V[k, head, d]. Each
-    // thread accumulates its owned columns independently (no reduction).
-    for (int j = 0; j < n_per; j++) {
-        int d = tid + 32 * j;
-        if (d < (int)head_dim) {
-            float acc = 0.0f;
-            for (uint32_t ki = 0; ki < seq_len; ki++) {
-                const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
-                acc += scores[ki] * __bfloat162float(v_row[d]);
-            }
-            __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
-            out_row[d] = __float2bfloat16(acc);
-        }
-    }
-}
-
-
-
-// ── General non-causal SDPA (bf16) ───────────────────────────────────────
-//
-// Q:       [query_len, n_heads, head_dim] bf16 (contiguous, row-major)
-// K, V:    [key_value_len, n_heads, head_dim] bf16
-// Output:  [query_len, n_heads * head_dim] bf16
-//
-// Non-causal: every query attends to every key. One block per (head, query).
-// 32 threads (= 1 warp); active threads handle 2 head_dim elements. Even
-// Head dimensions up to 64 fit in one warp.
-//
-// IMPORTANT: all 32 threads must reach every __shfl_xor_sync call (full mask
-// 0xffffffff). The inner loops are therefore non-strided — every thread
-// iterates every ki so the warp stays converged. (A strided `ki += 32` loop
-// would deadlock when seq_len < 32 because some threads would exit early.)
-//
-// Shared mem: (key_value_len + 1) floats for scores + max/sum scratch.
-
-__global__ void noncausal_sdpa_bf16_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    __nv_bfloat16* out,
-    uint32_t query_len, uint32_t key_value_len,
-    uint32_t n_heads, uint32_t head_dim, float scale)
-{
-    uint32_t head = blockIdx.y;
-    uint32_t qi   = blockIdx.x;
-    if (qi >= query_len) return;
-    int tid = threadIdx.x;       // 0..31
-    int half = head_dim / 2;
-    bool active = tid < half;
-    int d0 = tid;                // first element this thread owns
-    int d1 = tid + half;         // second element
-
-    extern __shared__ float smem[];
-    float* scores = smem;        // [key_value_len] + 1 scratch slot
-
-    const __nv_bfloat16* q_row = q  + qi * n_heads * head_dim + head * head_dim;
-    float q0 = active ? __bfloat162float(q_row[d0]) : 0.0f;
-    float q1 = active ? __bfloat162float(q_row[d1]) : 0.0f;
-
-    // Phase 1: scores[ki] = (Q[qi] · K[ki]) * scale. All threads iterate
-    // every ki so the shfl reduction stays converged.
-    for (uint32_t ki = 0; ki < key_value_len; ki++) {
-        const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
-        float dot = active
-            ? q0 * __bfloat162float(k_row[d0]) + q1 * __bfloat162float(k_row[d1])
-            : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
-        if (tid == 0) scores[ki] = dot * scale;
-    }
-    __syncthreads();
-
-    // Phase 2: softmax (max → exp → sum → normalize).
-    // For seq_len > 32, the max/sum reductions are strided — but the shfl
-    // only needs the threads that have data. Use mask = __activemask() to
-    // avoid deadlocks when some threads drop out.
-    float max_val = -INFINITY;
-    for (uint32_t ki = tid; ki < key_value_len; ki += 32u)
-        max_val = fmaxf(max_val, scores[ki]);
-    unsigned mask = __activemask();
-    for (int off = 16; off > 0; off >>= 1)
-        max_val = fmaxf(max_val, __shfl_xor_sync(mask, max_val, off));
-    if (tid == 0) scores[key_value_len] = max_val;
-    __syncthreads();
-    max_val = scores[key_value_len];
-    // Protect the maximum reads before reusing the max/sum scratch slot.
-    __syncwarp();
-
-    float sum = 0.0f;
-    for (uint32_t ki = tid; ki < key_value_len; ki += 32u) {
-        float e = expf(scores[ki] - max_val);
-        scores[ki] = e;
-        sum += e;
-    }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(mask, sum, off);
-    if (tid == 0) scores[key_value_len] = sum;
-    __syncthreads();
-    float inv_sum = 1.0f / scores[key_value_len];
-    for (uint32_t ki = tid; ki < key_value_len; ki += 32u) scores[ki] *= inv_sum;
-    __syncthreads();
-
-    // Phase 3: out[qi, head, d0|d1] = sum_k scores[k] * V[k, head, d0|d1].
-    // All threads iterate every ki (d0/d1 differ per thread so no divergence).
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint32_t ki = 0; ki < key_value_len; ki++) {
+    // Phase 3: out[qi, head, d] = sum_k scores[k] * V[k, head, d].
+    // All threads iterate every ki; owned dimensions differ per thread.
+    float accumulators[kMaxElementsPerThread] = {0.0f, 0.0f, 0.0f};
+    for (uint32_t ki = 0; ki < seq_len; ki++) {
         float s = scores[ki];
         const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
-        if (active) {
-            acc0 += s * __bfloat162float(v_row[d0]);
-            acc1 += s * __bfloat162float(v_row[d1]);
+        for (int slot = 0; slot < dimension_count; slot++) {
+            accumulators[slot] +=
+                s * __bfloat162float(v_row[dimensions[slot]]);
         }
     }
     __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
-    if (active) {
-        out_row[d0] = __float2bfloat16(acc0);
-        out_row[d1] = __float2bfloat16(acc1);
+    for (int slot = 0; slot < dimension_count; slot++) {
+        out_row[dimensions[slot]] = __float2bfloat16(accumulators[slot]);
     }
 }
 
-
-
-// ── Vision SDPA v3 (bf16, head_dim=64): multi-warp flash-decoding ────────
-//
-// One block per (query, head); WARPS warps split the key dimension into
-// contiguous shards, each running a register-resident online softmax with
-// no per-query score buffer. Per-lane, per-warp partials are merged in
-// shared memory via log-sum-exp. Every lane owns two head_dim columns
-// (d0=lane, d1=lane+32), so this kernel targets head_dim 64, the ViT
-// configuration of Qwen3-VL-2B and -4B. head_dim 72 (8B) uses the generic
-// single-warp vision_sdpa_bf16_kernel.
-
-#ifndef APXINF_VISION_V3_WARPS
-#define APXINF_VISION_V3_WARPS 4
-#endif
-
-__global__ void vision_sdpa_bf16_v3_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    __nv_bfloat16* out,
-    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale)
-{
-    const int WARPS = APXINF_VISION_V3_WARPS;
-    uint32_t head = blockIdx.y;
-    uint32_t qi   = blockIdx.x;
-    if (qi >= seq_len) return;
-
-    int warp_id = threadIdx.x / 32;
-    int lane    = threadIdx.x % 32;
-    int d0 = lane;
-    int d1 = lane + 32;
-
-    const uint32_t row_stride = (uint32_t)n_heads * head_dim;
-    const size_t head_off = (size_t)head * head_dim;
-    const __nv_bfloat16* q_row = q + (size_t)qi * row_stride + head_off;
-    float q0 = __bfloat162float(q_row[d0]);
-    float q1 = __bfloat162float(q_row[d1]);
-
-    uint32_t shard = (seq_len + WARPS - 1) / WARPS;
-    uint32_t k_begin = (uint32_t)warp_id * shard;
-    uint32_t k_end = min(k_begin + shard, seq_len);
-
-    float local_max = -INFINITY;
-    float local_sum = 0.0f;
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint32_t ki = k_begin; ki < k_end; ki++) {
-        const __nv_bfloat16* k_row = k + (size_t)ki * row_stride + head_off;
-        float dot = q0 * __bfloat162float(k_row[d0])
-                  + q1 * __bfloat162float(k_row[d1]);
-        for (int off = 16; off > 0; off >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, off);
-        float score = dot * scale;
-        float new_max = fmaxf(local_max, score);
-        float rescale = (local_max == -INFINITY) ? 0.0f : expf(local_max - new_max);
-        float p = (score == -INFINITY) ? 0.0f : expf(score - new_max);
-        local_sum = local_sum * rescale + p;
-        acc0 = acc0 * rescale;
-        acc1 = acc1 * rescale;
-        const __nv_bfloat16* v_row = v + (size_t)ki * row_stride + head_off;
-        acc0 += p * __bfloat162float(v_row[d0]);
-        acc1 += p * __bfloat162float(v_row[d1]);
-        local_max = new_max;
-    }
-
-    __shared__ float s_max[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_sum[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_a0[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_a1[APXINF_VISION_V3_WARPS][32];
-    s_max[warp_id][lane] = local_max;
-    s_sum[warp_id][lane] = local_sum;
-    s_a0[warp_id][lane] = acc0;
-    s_a1[warp_id][lane] = acc1;
-    __syncthreads();
-
-    float gm = s_max[0][lane];
-    for (int w = 1; w < WARPS; w++) gm = fmaxf(gm, s_max[w][lane]);
-    float gs = 0.0f, o0 = 0.0f, o1 = 0.0f;
-    for (int w = 0; w < WARPS; w++) {
-        float r = expf(s_max[w][lane] - gm);
-        gs += s_sum[w][lane] * r;
-        o0 += s_a0[w][lane] * r;
-        o1 += s_a1[w][lane] * r;
-    }
-    __nv_bfloat16* o = out + (size_t)qi * row_stride + head_off;
-    o[d0] = __float2bfloat16(o0 / gs);
-    o[d1] = __float2bfloat16(o1 / gs);
-}
-
-
-// ── Vision SDPA v3 (bf16, head_dim=72): multi-warp flash-decoding ────────
-//
-// Same flash-decoding structure as the head_dim=64 kernel above. The extra
-// 8 columns (64..71) are owned by lanes 0..7 as a third column d2; every
-// warp reduction still spans 32 lanes, so after the xor-reduction every
-// lane holds the identical full 72-element dot product. Only lanes 0..7
-// touch d2, both in the Q*K loop and the value accumulation.
-__global__ void vision_sdpa_bf16_v3_hd72_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
-    __nv_bfloat16* out,
-    uint32_t seq_len, uint32_t n_heads, uint32_t scale_dim_unused, float scale)
-{
-    (void)scale_dim_unused;  // fixed at 72
-    const int WARPS = APXINF_VISION_V3_WARPS;
-    uint32_t head = blockIdx.y;
-    uint32_t qi   = blockIdx.x;
-    if (qi >= seq_len) return;
-
-    int warp_id = threadIdx.x / 32;
-    int lane    = threadIdx.x % 32;
-    int d0 = lane;
-    int d1 = lane + 32;
-    int d2 = lane + 64;   // valid only for lane < 8
-    const int HD = 72;
-
-    const uint32_t row_stride = (uint32_t)n_heads * HD;
-    const size_t head_off = (size_t)head * HD;
-    const __nv_bfloat16* q_row = q + (size_t)qi * row_stride + head_off;
-    float q0 = __bfloat162float(q_row[d0]);
-    float q1 = __bfloat162float(q_row[d1]);
-    float q2 = (lane < 8) ? __bfloat162float(q_row[d2]) : 0.0f;
-
-    uint32_t shard = (seq_len + WARPS - 1) / WARPS;
-    uint32_t k_begin = (uint32_t)warp_id * shard;
-    uint32_t k_end = min(k_begin + shard, seq_len);
-
-    float local_max = -INFINITY;
-    float local_sum = 0.0f;
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
-    for (uint32_t ki = k_begin; ki < k_end; ki++) {
-        const __nv_bfloat16* k_row = k + (size_t)ki * row_stride + head_off;
-        float dot = q0 * __bfloat162float(k_row[d0])
-                  + q1 * __bfloat162float(k_row[d1]);
-        if (lane < 8) dot += q2 * __bfloat162float(k_row[d2]);
-        for (int off = 16; off > 0; off >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, off);
-        float score = dot * scale;
-        float new_max = fmaxf(local_max, score);
-        float rescale = (local_max == -INFINITY) ? 0.0f : expf(local_max - new_max);
-        float p = (score == -INFINITY) ? 0.0f : expf(score - new_max);
-        local_sum = local_sum * rescale + p;
-        acc0 = acc0 * rescale;
-        acc1 = acc1 * rescale;
-        acc2 = acc2 * rescale;
-        const __nv_bfloat16* v_row = v + (size_t)ki * row_stride + head_off;
-        acc0 += p * __bfloat162float(v_row[d0]);
-        acc1 += p * __bfloat162float(v_row[d1]);
-        if (lane < 8) acc2 += p * __bfloat162float(v_row[d2]);
-        local_max = new_max;
-    }
-
-    __shared__ float s_max[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_sum[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_a0[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_a1[APXINF_VISION_V3_WARPS][32];
-    __shared__ float s_a2[APXINF_VISION_V3_WARPS][8];
-    s_max[warp_id][lane] = local_max;
-    s_sum[warp_id][lane] = local_sum;
-    s_a0[warp_id][lane] = acc0;
-    s_a1[warp_id][lane] = acc1;
-    if (lane < 8) s_a2[warp_id][lane] = acc2;
-    __syncthreads();
-
-    float gm = s_max[0][lane];
-    for (int w = 1; w < WARPS; w++) gm = fmaxf(gm, s_max[w][lane]);
-    float gs = 0.0f, o0 = 0.0f, o1 = 0.0f;
-    for (int w = 0; w < WARPS; w++) {
-        float r = expf(s_max[w][lane] - gm);
-        gs += s_sum[w][lane] * r;
-        o0 += s_a0[w][lane] * r;
-        o1 += s_a1[w][lane] * r;
-    }
-    __nv_bfloat16* o = out + (size_t)qi * row_stride + head_off;
-    o[d0] = __float2bfloat16(o0 / gs);
-    o[d1] = __float2bfloat16(o1 / gs);
-    if (lane < 8) {
-        float o2 = 0.0f;
-        for (int w = 0; w < WARPS; w++)
-            o2 += s_a2[w][lane] * expf(s_max[w][lane] - gm);
-        o[d2] = __float2bfloat16(o2 / gs);
-    }
-}
 
 
 // ── Flash Attention decode (bf16) — single-kernel online-softmax ────────
@@ -817,55 +533,86 @@ __global__ void flash_attn_decode_bf16_splitk_kernel(
 
 
 
-// In-place row softmax used by the cuBLAS MQA fallback. A full thread block
-// cooperates on each row and re-reads logits after the reductions, avoiding
-// a fixed per-thread register array and packed/alignment-specific paths.
+// One warp per row, matching FlashRT's Apache-2.0 FP16 softmax. The even
+// path packs two values per lane; the scalar path keeps arbitrary prompt
+// lengths correct without relying on half2 alignment between odd rows.
 constexpr int kSoftmaxMaxCols = 1024;
-constexpr int kMqaSoftmaxThreads = 128;
+constexpr int kSoftmaxIterations = kSoftmaxMaxCols / 32;
 
-__global__ void mqa_softmax_f16_block_kernel(half* data, int rows, int cols) {
-  __shared__ float reduction[kMqaSoftmaxThreads];
-  int thread = threadIdx.x;
+__global__ void softmax_even_f16_kernel(half* data, int rows, int cols) {
+  int lane = threadIdx.x;
   int row = blockIdx.x;
   if (row >= rows) return;
   half* source = data + static_cast<int64_t>(row) * cols;
+  half2* source2 = reinterpret_cast<half2*>(source);
+  int cols2 = cols / 2;
+  float values[kSoftmaxIterations];
   float maximum = -1.0e30f;
-  for (int col = thread; col < cols; col += blockDim.x) {
-    maximum = fmaxf(maximum, __half2float(source[col]));
-  }
-  reduction[thread] = maximum;
-  __syncthreads();
-  for (int stride = kMqaSoftmaxThreads / 2; stride > 0; stride >>= 1) {
-    if (thread < stride) {
-      reduction[thread] = fmaxf(reduction[thread], reduction[thread + stride]);
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations / 2; ++iteration) {
+    int col2 = iteration * 32 + lane;
+    if (col2 < cols2) {
+      half2 packed = source2[col2];
+      values[2 * iteration] = __half2float(packed.x);
+      values[2 * iteration + 1] = __half2float(packed.y);
+      maximum = fmaxf(maximum, fmaxf(values[2 * iteration],
+                                     values[2 * iteration + 1]));
+    } else {
+      values[2 * iteration] = -1.0e30f;
+      values[2 * iteration + 1] = -1.0e30f;
     }
-    __syncthreads();
   }
-  maximum = reduction[0];
-
+  maximum = warp_max(maximum);
   float sum = 0.0f;
-  for (int col = thread; col < cols; col += blockDim.x) {
-    sum += __expf(__half2float(source[col]) - maximum);
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
+    values[iteration] = __expf(values[iteration] - maximum);
+    sum += values[iteration];
   }
-  // All threads must read the maximum before its slot is overwritten.
-  __syncthreads();
-  reduction[thread] = sum;
-  __syncthreads();
-  for (int stride = kMqaSoftmaxThreads / 2; stride > 0; stride >>= 1) {
-    if (thread < stride) {
-      reduction[thread] += reduction[thread + stride];
+  sum = warp_sum_all(sum);
+  float inverse = 1.0f / sum;
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations / 2; ++iteration) {
+    int col2 = iteration * 32 + lane;
+    if (col2 < cols2) {
+      source2[col2] = __floats2half2_rn(values[2 * iteration] * inverse,
+                                        values[2 * iteration + 1] * inverse);
     }
-    __syncthreads();
   }
-  const float inverse = 1.0f / reduction[0];
-  for (int col = thread; col < cols; col += blockDim.x) {
-    source[col] = __float2half(__expf(__half2float(source[col]) - maximum) * inverse);
+}
+
+__global__ void softmax_scalar_f16_kernel(half* data, int rows, int cols) {
+  int lane = threadIdx.x;
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  half* source = data + static_cast<int64_t>(row) * cols;
+  float values[kSoftmaxIterations];
+  float maximum = -1.0e30f;
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
+    int col = iteration * 32 + lane;
+    float value = col < cols ? __half2float(source[col]) : -1.0e30f;
+    values[iteration] = value;
+    maximum = fmaxf(maximum, value);
+  }
+  maximum = warp_max(maximum);
+  float sum = 0.0f;
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
+    values[iteration] = __expf(values[iteration] - maximum);
+    sum += values[iteration];
+  }
+  sum = warp_sum_all(sum);
+  float inverse = 1.0f / sum;
+#pragma unroll
+  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
+    int col = iteration * 32 + lane;
+    if (col < cols) source[col] = __float2half(values[iteration] * inverse);
   }
 }
 
 // BF16 counterpart used by the Thor static-inference MQA path. One warp owns
 // a row, so each score is loaded once and all reductions stay warp-local.
-constexpr int kSoftmaxIterations = kSoftmaxMaxCols / 32;
 __global__ void softmax_scalar_bf16_kernel(
     __nv_bfloat16* data, int rows, int cols) {
   int lane = threadIdx.x;
@@ -1135,85 +882,4 @@ __global__ void mha_bf16_kernel(
   }
 }
 
-// Variable-length self-attention over a packed token matrix. Each z-grid
-// slice owns one segment described by offsets[segment..segment+2].
-__global__ void segmented_mha_bf16_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k,
-    const __nv_bfloat16* v, const uint32_t* offsets,
-    __nv_bfloat16* output, int heads, int head_dim) {
-  extern __shared__ float shared[];
-  const int segment = blockIdx.z;
-  const int begin = static_cast<int>(offsets[segment]);
-  const int end = static_cast<int>(offsets[segment + 1]);
-  const int tokens = end - begin;
-  const int query = blockIdx.x;
-  if (query >= tokens) return;
-  float* scores = shared;
-  float* warp_sums = scores + tokens;
-  const int head = blockIdx.y;
-  const int global_query = begin + query;
-  const int tid = threadIdx.x;
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  const int warps = blockDim.x >> 5;
-  const __nv_bfloat16* query_ptr =
-      q + (global_query * heads + head) * head_dim;
-  const float scale = rsqrtf(static_cast<float>(head_dim));
-  for (int token = 0; token < tokens; ++token) {
-    const __nv_bfloat16* key =
-        k + ((begin + token) * heads + head) * head_dim;
-    float dot = tid < head_dim
-        ? __bfloat162float(query_ptr[tid]) * __bfloat162float(key[tid])
-        : 0.0f;
-    dot = warp_sum(dot);
-    if (lane == 0) warp_sums[warp] = dot;
-    __syncthreads();
-    if (warp == 0) {
-      float total = lane < warps ? warp_sums[lane] : 0.0f;
-      total = warp_sum(total);
-      if (lane == 0) scores[token] = total * scale;
-    }
-    __syncthreads();
-  }
-  if (tid == 0) {
-    float maximum = -3.402823466e+38F;
-    for (int token = 0; token < tokens; ++token)
-      maximum = fmaxf(maximum, scores[token]);
-    float denominator = 0.0f;
-    for (int token = 0; token < tokens; ++token) {
-      scores[token] = expf(scores[token] - maximum);
-      denominator += scores[token];
-    }
-    for (int token = 0; token < tokens; ++token)
-      scores[token] /= denominator;
-  }
-  __syncthreads();
-  if (tid < head_dim) {
-    float accumulator = 0.0f;
-    for (int token = 0; token < tokens; ++token) {
-      accumulator += scores[token] * __bfloat162float(
-          v[((begin + token) * heads + head) * head_dim + tid]);
-    }
-    output[(global_query * heads + head) * head_dim + tid] =
-        __float2bfloat16(accumulator);
-  }
-}
 
-// Gather a KV cache prefix from per-layer [n_kv_heads, max_seq_len, hd]
-// into contiguous [tokens, n_kv_heads, hd] for the FlashAttention-2
-// varlen-style dense entry point. One bf16 element per thread.
-__global__ void kv_cache_gather_bf16_kernel(
-    const __nv_bfloat16* __restrict__ src,
-    __nv_bfloat16* __restrict__ dst,
-    uint32_t tokens, uint32_t n_kv_heads, uint32_t head_dim,
-    uint32_t max_seq_len, uint32_t kv_offset)
-{
-    uint32_t flat = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t total = tokens * n_kv_heads * head_dim;
-    if (flat >= total) return;
-    uint32_t d   = flat % head_dim;
-    uint32_t h   = (flat / head_dim) % n_kv_heads;
-    uint32_t tok = flat / (n_kv_heads * head_dim);
-    uint32_t src_pos = kv_offset + tok;
-    dst[flat] = src[((size_t)h * max_seq_len + src_pos) * head_dim + d];
-}

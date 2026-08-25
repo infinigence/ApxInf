@@ -55,28 +55,38 @@ fn forward_impl(
 ) -> Result<VisionOutput> {
     let _vision_range = crate::profiling::trace::range("vision_encoder");
     let vc = &cfg.vision;
-    let hidden = vc.hidden_size;       // 1024
-    let n_heads = vc.num_heads;        // 16
-    let head_dim = vc.head_dim();      // 64
+    let hidden = vc.hidden_size; // 1024
+    let n_heads = vc.num_heads; // 16
+    let head_dim = vc.head_dim(); // 64
     let merge = vc.spatial_merge_size; // 2
     let eps = 1e-6f32;
 
     let dims = pixel_values.shape().dims();
-    let n_patches = dims[0];           // e.g. 400
-    let (t, h, width) = (grid_thw[0][0] as usize, grid_thw[0][1] as usize, grid_thw[0][2] as usize);
+    let n_patches = dims[0]; // e.g. 400
+    let (t, h, width) = (
+        grid_thw[0][0] as usize,
+        grid_thw[0][1] as usize,
+        grid_thw[0][2] as usize,
+    );
 
     // ── Patch embedding: pixel_values @ W^T + bias → [N, 1024] ──────
     // patch_embed_weight is [1536, 1024] (already transposed). matmul
     // of [N, 1536] @ [1536, 1024] → [N, 1024].
     let mut x = b.matmul(pixel_values, &w.patch_embed_weight)?;
     x = b.add_bias(&x, &w.patch_embed_bias)?;
-    if let Some(d) = dump { dump_tensor(b, &x, &format!("{d}_post_patch_embed"))?; }
+    if let Some(d) = dump {
+        dump_tensor(b, &x, &format!("{d}_post_patch_embed"))?;
+    }
 
     // ── Positional embedding (bilinear-interpolated, permuted) ──────
     let pos_embeds = compute_pos_embeds(cfg, b, &w.pos_embed, t, h, width, merge, hidden)?;
-    if let Some(d) = dump { dump_tensor(b, &pos_embeds, &format!("{d}_pos_embeds"))?; }
+    if let Some(d) = dump {
+        dump_tensor(b, &pos_embeds, &format!("{d}_pos_embeds"))?;
+    }
     x = b.add(&x, &pos_embeds)?;
-    if let Some(d) = dump { dump_tensor(b, &x, &format!("{d}_post_add_pos"))?; }
+    if let Some(d) = dump {
+        dump_tensor(b, &x, &format!("{d}_post_add_pos"))?;
+    }
 
     // ── Vision 2D-RoPE position IDs ─────────────────────────────────
     let pos_ids = compute_vision_pos_ids(t, h, width, merge);
@@ -87,9 +97,19 @@ fn forward_impl(
         let _blk_range = crate::profiling::trace::range(&format!("vision_block_{i}"));
         // pre-attn LayerNorm
         let normed = b.layer_norm(&x, &blk.norm1_w, &blk.norm1_b, eps)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &normed, &format!("{d}_block0_norm1"))?;
+            }
+        }
         // QKV: [N, 1024] @ [1024, 3072] → [N, 3072]
         let qkv = b.matmul(&normed, &blk.qkv_w)?;
         let qkv = b.add_bias(&qkv, &blk.qkv_b)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &qkv, &format!("{d}_block0_qkv"))?;
+            }
+        }
         // Split Q/K/V: qkv is [N, 3072] = [N, 3, 1024] interleaved as
         // (q[N,0:1024], k[N,1024:2048], v[N,2048:3072]). Reshape to
         // [N, 3, n_heads, head_dim] then split.
@@ -106,23 +126,65 @@ fn forward_impl(
         // Vision 2D-RoPE on Q and K
         let q = b.rope_vision_2d(&q, n_heads, head_dim, 10000.0, &pos_ids)?;
         let k = b.rope_vision_2d(&k, n_heads, head_dim, 10000.0, &pos_ids)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &q, &format!("{d}_block0_q_rope"))?;
+                dump_tensor(b, &k, &format!("{d}_block0_k_rope"))?;
+                dump_tensor(b, &v, &format!("{d}_block0_v"))?;
+            }
+        }
 
         // Non-causal full attention
         let attn_out = b.vision_sdpa(&q, &k, &v, n_patches, n_heads, head_dim)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &attn_out, &format!("{d}_block0_sdpa"))?;
+            }
+        }
         // Output projection + residual
         let attn_out = b.matmul(&attn_out, &blk.proj_w)?;
         let attn_out = b.add_bias(&attn_out, &blk.proj_b)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &attn_out, &format!("{d}_block0_attn_delta"))?;
+            }
+        }
         x = b.add(&x, &attn_out)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &x, &format!("{d}_block0_post_attn"))?;
+            }
+        }
 
         // pre-MLP LayerNorm
         let normed = b.layer_norm(&x, &blk.norm2_w, &blk.norm2_b, eps)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &normed, &format!("{d}_block0_norm2"))?;
+            }
+        }
         // FC1 + GELU
         let h1 = b.matmul(&normed, &blk.fc1_w)?;
         let h1 = b.add_bias(&h1, &blk.fc1_b)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h1, &format!("{d}_block0_fc1"))?;
+            }
+        }
         let h1 = b.gelu_tanh(&h1)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h1, &format!("{d}_block0_gelu"))?;
+            }
+        }
         // FC2 + residual
         let h2 = b.matmul(&h1, &blk.fc2_w)?;
         let h2 = b.add_bias(&h2, &blk.fc2_b)?;
+        if i == 0 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h2, &format!("{d}_block0_mlp_delta"))?;
+            }
+        }
         x = b.add(&x, &h2)?;
 
         // Capture deepstack states at the configured block indexes.
@@ -145,7 +207,11 @@ fn forward_impl(
     // use_postshuffle_norm=True: reshape [N, 1024] → [N/4, 4096] first,
     // then LayerNorm(4096), then fc1 → GELU → fc2.
     let mut deepstack = Vec::with_capacity(3);
-    for (merger, hs) in w.deepstack_mergers.iter().zip(deepstack_hidden_states.iter()) {
+    for (merger, hs) in w
+        .deepstack_mergers
+        .iter()
+        .zip(deepstack_hidden_states.iter())
+    {
         let out = merge_deepstack(b, merger, hs, n_patches, hidden, merge, eps)?;
         deepstack.push(out);
     }
@@ -155,8 +221,13 @@ fn forward_impl(
 
 /// Primary merger: LayerNorm(1024) → reshape [N,1024]→[N/4,4096] → fc1 → GELU → fc2.
 fn merge_primary(
-    b: &dyn Backend, m: &super::vision_weights::Qwen3VLMerger,
-    x: &Tensor, n_patches: usize, hidden: usize, merge: usize, eps: f32,
+    b: &dyn Backend,
+    m: &super::vision_weights::Qwen3VLMerger,
+    x: &Tensor,
+    n_patches: usize,
+    hidden: usize,
+    merge: usize,
+    eps: f32,
 ) -> Result<Tensor> {
     let normed = b.layer_norm(x, &m.norm_w, &m.norm_b, eps)?;
     // Reshape [N, 1024] → [N/4, 4096]: concatenate 4 consecutive rows.
@@ -170,8 +241,13 @@ fn merge_primary(
 
 /// Deepstack merger: reshape [N,1024]→[N/4,4096] → LayerNorm(4096) → fc1 → GELU → fc2.
 fn merge_deepstack(
-    b: &dyn Backend, m: &super::vision_weights::Qwen3VLMerger,
-    x: &Tensor, n_patches: usize, hidden: usize, merge: usize, eps: f32,
+    b: &dyn Backend,
+    m: &super::vision_weights::Qwen3VLMerger,
+    x: &Tensor,
+    n_patches: usize,
+    hidden: usize,
+    merge: usize,
+    eps: f32,
 ) -> Result<Tensor> {
     let merged = reshape_merge(b, x, n_patches, hidden, merge)?;
     let normed = b.layer_norm(&merged, &m.norm_w, &m.norm_b, eps)?;
@@ -187,11 +263,15 @@ fn merge_deepstack(
 /// CPU (round-trip through to_cpu/to_device) since it's a one-time copy
 /// per image and the Backend trait has no strided-reshape op.
 fn reshape_merge(
-    b: &dyn Backend, x: &Tensor, n_patches: usize, hidden: usize, merge: usize,
+    b: &dyn Backend,
+    x: &Tensor,
+    n_patches: usize,
+    hidden: usize,
+    merge: usize,
 ) -> Result<Tensor> {
-    let merge_sq = merge * merge;  // 4
+    let merge_sq = merge * merge; // 4
     let out_rows = n_patches / merge_sq;
-    let out_cols = hidden * merge_sq;  // 4096
+    let out_cols = hidden * merge_sq; // 4096
     let cpu = b.to_cpu(x)?;
     let out = match cpu.dtype() {
         apxinf_core::DType::F32 => {
@@ -200,7 +280,8 @@ fn reshape_merge(
             for r in 0..out_rows {
                 for s in 0..merge_sq {
                     for c in 0..hidden {
-                        o[r * out_cols + s * hidden + c] = data[r * merge_sq * hidden + s * hidden + c];
+                        o[r * out_cols + s * hidden + c] =
+                            data[r * merge_sq * hidden + s * hidden + c];
                     }
                 }
             }
@@ -212,13 +293,18 @@ fn reshape_merge(
             for r in 0..out_rows {
                 for s in 0..merge_sq {
                     for c in 0..hidden {
-                        o[r * out_cols + s * hidden + c] = data[r * merge_sq * hidden + s * hidden + c];
+                        o[r * out_cols + s * hidden + c] =
+                            data[r * merge_sq * hidden + s * hidden + c];
                     }
                 }
             }
             Tensor::from_bf16(vec![out_rows, out_cols], &o)?
         }
-        dtype => return Err(Error::Other(format!("Qwen3-VL merge reshape does not support {dtype}"))),
+        dtype => {
+            return Err(Error::Other(format!(
+                "Qwen3-VL merge reshape does not support {dtype}"
+            )))
+        }
     };
     b.to_device(&out)
 }
@@ -227,11 +313,16 @@ fn reshape_merge(
 /// reshape to `[N, n_heads, head_dim]`. The qkv tensor is `[N, 3*hidden]`
 /// in row-major; slicing columns is a strided gather. Done on CPU for now.
 fn slice_and_reshape(
-    b: &dyn Backend, qkv: &Tensor, col_start: usize, width: usize,
-    n_patches: usize, n_heads: usize, head_dim: usize,
+    b: &dyn Backend,
+    qkv: &Tensor,
+    col_start: usize,
+    width: usize,
+    n_patches: usize,
+    n_heads: usize,
+    head_dim: usize,
 ) -> Result<Tensor> {
     let cpu = b.to_cpu(qkv)?;
-    let total_cols = 3 * width;  // 3 * hidden
+    let total_cols = 3 * width; // 3 * hidden
     let out = match cpu.dtype() {
         apxinf_core::DType::F32 => {
             let data = cpu.as_f32()?;
@@ -253,7 +344,11 @@ fn slice_and_reshape(
             }
             Tensor::from_bf16(vec![n_patches, n_heads, head_dim], &o)?
         }
-        dtype => return Err(Error::Other(format!("Qwen3-VL vision slice does not support {dtype}"))),
+        dtype => {
+            return Err(Error::Other(format!(
+                "Qwen3-VL vision slice does not support {dtype}"
+            )))
+        }
     };
     b.to_device(&out)
 }
@@ -263,15 +358,22 @@ fn slice_and_reshape(
 /// table, bilinearly interpolate to (H, W), then permute to the
 /// spatial-merge layout where 2×2 patches are consecutive.
 fn compute_pos_embeds(
-    cfg: &Qwen3VLConfig, b: &dyn Backend, pos_embed_table: &Tensor,
-    t: usize, h: usize, width: usize, merge: usize, hidden: usize,
+    cfg: &Qwen3VLConfig,
+    b: &dyn Backend,
+    pos_embed_table: &Tensor,
+    t: usize,
+    h: usize,
+    width: usize,
+    merge: usize,
+    hidden: usize,
 ) -> Result<Tensor> {
     let vc = &cfg.vision;
-    let num_pos = vc.num_position_embeddings;  // 2304
-    let grid_side = (num_pos as f64).sqrt().round() as usize;  // 48
+    let num_pos = vc.num_position_embeddings; // 2304
+    let grid_side = (num_pos as f64).sqrt().round() as usize; // 48
 
     let cpu = b.to_cpu(pos_embed_table)?;
-    let table = cpu.to_f32_vec()
+    let table = cpu
+        .to_f32_vec()
         .map_err(|e| apxinf_core::Error::Other(format!("pos_embed table: {e}")))?;
     // table is [2304, 1024] = [48*48, hidden].
 
@@ -294,9 +396,9 @@ fn compute_pos_embeds(
                 let v10 = table[(h1 * grid_side + w0) * hidden + c];
                 let v11 = table[(h1 * grid_side + w1) * hidden + c];
                 interp[dst + c] = (1.0 - dh) * (1.0 - dw) * v00
-                                + (1.0 - dh) * dw       * v01
-                                + dh       * (1.0 - dw) * v10
-                                + dh       * dw       * v11;
+                    + (1.0 - dh) * dw * v01
+                    + dh * (1.0 - dw) * v10
+                    + dh * dw * v11;
             }
         }
     }
@@ -306,7 +408,7 @@ fn compute_pos_embeds(
     // → flatten(0,4) → [t * (h/merge) * (width/merge) * merge * merge, hidden].
     let merged_h = h / merge;
     let merged_w = width / merge;
-    let n_tokens = t * merged_h * merged_w * merge * merge;  // = t * h * width
+    let n_tokens = t * merged_h * merged_w * merge * merge; // = t * h * width
     let mut permuted = vec![0.0f32; n_tokens * hidden];
     let mut idx = 0usize;
     for ti in 0..t {
@@ -362,15 +464,20 @@ fn dump_tensor(b: &dyn Backend, t: &Tensor, path: &str) -> Result<()> {
     let cpu = b.to_cpu(t)?;
     let f32_data = cpu.to_f32_vec()?;
     let dims = t.shape().dims().to_vec();
-    let shape_str = dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
-    let mut header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
+    let shape_str = dims
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
     let pad = (64 - ((header.len() + 10) % 64)) % 64;
     header.push_str(&" ".repeat(pad));
     header.push('\n');
     let mut out = Vec::new();
     out.extend_from_slice(b"\x93NUMPY");
-    out.push(1); out.push(0);
+    out.push(1);
+    out.push(0);
     out.extend_from_slice(&(header.len() as u16).to_le_bytes());
     out.extend_from_slice(header.as_bytes());
     out.extend(f32_data.iter().flat_map(|&v| v.to_le_bytes()));

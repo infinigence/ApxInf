@@ -2,14 +2,22 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Instant;
 
-use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
+#[cfg(feature = "cuda")]
+use apxinf_cuda::CudaContext;
+use apxinf_loader::safetensors;
+#[cfg(feature = "cuda")]
+use apxinf_model::qwen35::{load_embedding_row, HybridUnit, HybridUnitMode, Qwen35LmHead};
 use apxinf_model::{
-    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
-    LoadOptions, SamplingMode,
+    AutoModel, ImageInput, LlmInput, LoadOptions, Qwen35CheckpointReport, Qwen35Config,
 };
-use apxinf_tokenizer::{Tokenizer, ChatMessage};
+use apxinf_tokenizer::{ChatMessage, Tokenizer};
+use clap::{Parser, Subcommand};
+
+#[cfg(feature = "cuda")]
+mod qwen35_server;
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -38,52 +46,8 @@ enum Commands {
         image: Option<PathBuf>,
 
         /// Maximum new tokens to generate
-        #[arg(long)]
-        max_tokens: Option<usize>,
-
-        /// Explicitly enable random categorical sampling.
-        #[arg(long, conflicts_with = "greedy")]
-        sample: bool,
-
-        /// Explicitly use greedy token selection.
-        #[arg(long, conflicts_with = "sample")]
-        greedy: bool,
-
-        /// Sampling temperature. Zero selects greedy generation.
-        #[arg(long)]
-        temperature: Option<f32>,
-
-        /// Retain only the highest-k logits; zero or negative disables top-k.
-        #[arg(long)]
-        top_k: Option<i64>,
-
-        /// Nucleus probability mass.
-        #[arg(long)]
-        top_p: Option<f32>,
-
-        /// Repetition penalty; 1 disables it.
-        #[arg(long)]
-        repetition_penalty: Option<f32>,
-
-        /// Frequency penalty applied per token occurrence.
-        #[arg(long)]
-        frequency_penalty: Option<f32>,
-
-        /// Presence penalty applied once to previously seen tokens.
-        #[arg(long)]
-        presence_penalty: Option<f32>,
-
-        /// Counter-based sampling seed.
-        #[arg(long)]
-        seed: Option<u64>,
-
-        /// Generation defaults: auto, apxinf, or a JSON file/directory path.
-        #[arg(long, default_value = "auto")]
-        generation_config: String,
-
-        /// JSON object applied over model defaults and under request flags.
-        #[arg(long)]
-        override_generation_config: Option<String>,
+        #[arg(long, default_value = "50")]
+        max_tokens: usize,
 
         /// Disable EOS-based early stopping (generate until max_tokens)
         #[arg(long)]
@@ -103,6 +67,35 @@ enum Commands {
         dtype: String,
     },
 
+    /// Validate Qwen3.8 identity, config, shards, and quantization layout.
+    Inspect {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start the resident OpenAI-compatible Qwen3.8 INT4 text service.
+    Serve {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8001)]
+        port: u16,
+        #[arg(long, default_value_t = 32768)]
+        max_model_len: usize,
+        /// Allocate the experimental M64 Marlin prefill workspace. Requests
+        /// remain on M8 unless they explicitly set apxinf_prefill_mode.
+        #[arg(long)]
+        enable_experimental_marlin_m64: bool,
+        /// Load the native Qwen3.8 visual encoder and enable one-image chat
+        /// requests. Requires a Python executable with the pinned HF
+        /// processor dependencies in APXINF_PROCESSOR_PYTHON.
+        #[arg(long)]
+        enable_multimodal: bool,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -116,48 +109,86 @@ fn main() {
             prompt,
             image,
             max_tokens,
-            sample,
-            greedy,
-            temperature,
-            top_k,
-            top_p,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            seed,
-            generation_config,
-            override_generation_config,
             no_eos_stop,
             system,
             device,
             dtype,
         } => {
             let device = parse_device(&device);
-            // Report a failed generation through the exit status; a CLI that
-            // printed an error and still exited 0 reads as success to any caller.
-            if let Err(error) = run_generate(
-                &model,
-                &prompt,
-                image.as_ref(),
-                max_tokens,
-                !no_eos_stop,
-                system.as_deref(),
-                device,
-                &dtype,
-                sample,
-                greedy,
-                temperature,
-                top_k,
-                top_p,
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-                seed,
-                &generation_config,
-                override_generation_config.as_deref(),
-            ) {
+            if read_model_type(&model).as_deref() == Some("qwen3_5") {
+                if image.is_some() {
+                    eprintln!(
+                        "Qwen3.8 image execution is not implemented yet; the unified LlmInput image boundary remains unsupported for this native runtime"
+                    );
+                    std::process::exit(1);
+                } else {
+                    #[cfg(feature = "cuda")]
+                    run_generate_qwen35(
+                        &model,
+                        &prompt,
+                        max_tokens,
+                        !no_eos_stop,
+                        system.as_deref(),
+                        device,
+                    );
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        eprintln!("Qwen3.8 native generation requires an ApxInf CUDA build");
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Err(error) = run_generate(
+                    &model,
+                    &prompt,
+                    image.as_ref(),
+                    max_tokens,
+                    !no_eos_stop,
+                    system.as_deref(),
+                    device,
+                    &dtype,
+                ) {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+        Commands::Inspect { model, json } => {
+            if let Err(error) = run_inspect(&model, json) {
+                eprintln!("Model inspection failed: {error}");
+                std::process::exit(2);
+            }
+        }
+        Commands::Serve {
+            model,
+            host,
+            port,
+            max_model_len,
+            enable_experimental_marlin_m64,
+            enable_multimodal,
+        } => {
+            #[cfg(feature = "cuda")]
+            if let Err(error) = qwen35_server::serve(
+                &model,
+                &host,
+                port,
+                max_model_len,
+                enable_experimental_marlin_m64,
+                enable_multimodal,
+            ) {
+                eprintln!("Server failed: {error}");
+                std::process::exit(2);
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (
+                    model,
+                    host,
+                    port,
+                    max_model_len,
+                    enable_experimental_marlin_m64,
+                    enable_multimodal,
+                );
+                eprintln!("The native Qwen3.8 server requires an ApxInf CUDA build");
+                std::process::exit(2);
             }
         }
         Commands::Test => {
@@ -181,22 +212,11 @@ fn run_generate(
     model_dir: &PathBuf,
     prompt: &str,
     image_path: Option<&PathBuf>,
-    max_tokens: Option<usize>,
+    max_tokens: usize,
     eos_stop: bool,
     system_prompt: Option<&str>,
     device: Device,
     dtype: &str,
-    sample: bool,
-    greedy: bool,
-    temperature: Option<f32>,
-    top_k: Option<i64>,
-    top_p: Option<f32>,
-    repetition_penalty: Option<f32>,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-    generation_config: &str,
-    override_generation_config: Option<&str>,
 ) -> Result<(), String> {
     println!("apxinf — LLM/VLM inference engine");
     println!();
@@ -213,7 +233,7 @@ fn run_generate(
         .map_err(|error| format!("Failed to load tokenizer: {error}"))?;
     println!("Vocab size: {}", tok.vocab_size());
 
-    let eos_token_id = tok.eos_token_id();
+    let eos_token_id = if eos_stop { tok.eos_token_id() } else { None };
     if let Some(eos) = eos_token_id {
         println!("EOS token ID: {eos}");
     }
@@ -249,16 +269,9 @@ fn run_generate(
             ))
         }
     };
-    let generation_overrides = override_generation_config
-        .map(GenerationOptions::from_json_str)
-        .transpose()
-        .map_err(|error| format!("Invalid --override-generation-config: {error}"))?
-        .unwrap_or_default();
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
         text_weight_dtype,
-        generation_config: GenerationConfigSource::from_cli_value(generation_config),
-        generation_overrides,
         ..LoadOptions::default()
     };
 
@@ -277,73 +290,38 @@ fn run_generate(
     println!("Model ready.");
 
     let input = match prepared_image.as_ref() {
-        Some((pixels, grids)) => {
-            LlmInput::with_image(&tokens, ImageInput::new(pixels, grids))
-        }
+        Some((pixels, grids)) => LlmInput::with_image(&tokens, ImageInput::new(pixels, grids)),
         None => LlmInput::text(&tokens),
     };
 
-    let configured_eos = model
-        .generation_defaults()
-        .map_err(|error| format!("Cannot read generation defaults: {error}"))?
-        .eos_token_ids
-        .is_some();
-    let effective_max_tokens = max_tokens
-        .or(model
-            .generation_defaults()
-            .ok()
-            .and_then(|defaults| defaults.max_new_tokens))
-        .unwrap_or(GenerationOptions::DEFAULT_MAX_NEW_TOKENS);
-
     println!();
-    println!("Generating up to {effective_max_tokens} tokens...");
+    println!("Generating {max_tokens} tokens...");
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut all_tokens = tokens.clone();
 
-    let generation_options = GenerationOptions {
-        max_new_tokens: max_tokens,
-        eos_token_ids: if !eos_stop {
-            Some(Vec::new())
-        } else if configured_eos {
-            None
-        } else {
-            eos_token_id.map(|id| vec![id])
-        },
-        sampling_mode: if sample {
-            Some(SamplingMode::Random)
-        } else if greedy {
-            Some(SamplingMode::Greedy)
-        } else {
-            None
-        },
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty,
-        frequency_penalty,
-        presence_penalty,
-        seed,
-        return_logprob: Some(false),
-    };
-    let output = model
-        .generate_streaming_with_options(input, &generation_options, |token| {
-            let token_id = token.token_id;
-            all_tokens.push(token_id);
-            if let Ok(text) = tok.decode(&all_tokens) {
-                let previous = tok
-                    .decode(&all_tokens[..all_tokens.len() - 1])
-                    .unwrap_or_default();
-                let delta = text.strip_prefix(&previous).unwrap_or(&text);
-                print!("{delta}");
-                out.flush().ok();
-            }
-        })
+    let (_, profile) = model
+        .generate_streaming(
+            input,
+            max_tokens,
+            |token_id| {
+                all_tokens.push(token_id);
+                if let Ok(text) = tok.decode(&all_tokens) {
+                    let previous = tok
+                        .decode(&all_tokens[..all_tokens.len() - 1])
+                        .unwrap_or_default();
+                    let delta = text.strip_prefix(&previous).unwrap_or(&text);
+                    print!("{delta}");
+                    out.flush().ok();
+                }
+            },
+            eos_token_id,
+        )
         .map_err(|error| format!("Generation failed: {error}"))?;
 
     println!();
     println!();
-    println!("{}", output.profile.summary());
+    println!("{}", profile.summary());
     Ok(())
 }
 
@@ -358,11 +336,403 @@ fn encode_prompt(
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(prompt));
-        tokenizer.encode_chat(&messages).map_err(|error| error.to_string())
+        tokenizer
+            .encode_chat(&messages)
+            .map_err(|error| error.to_string())
     } else {
         tokenizer.encode(prompt).map_err(|error| error.to_string())
     }
 }
+#[cfg(feature = "cuda")]
+fn run_generate_qwen35(
+    model_dir: &PathBuf,
+    prompt: &str,
+    max_tokens: usize,
+    eos_stop: bool,
+    system_prompt: Option<&str>,
+    device: Device,
+) {
+    if device != Device::Cuda(0) {
+        eprintln!("Qwen3.5/Qwen3.8 native text generation currently requires --device cuda");
+        return;
+    }
+    if max_tokens == 0 {
+        eprintln!("--max-tokens must be positive");
+        return;
+    }
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = match Tokenizer::from_file(&tokenizer_path) {
+        Ok(tokenizer) => tokenizer,
+        Err(error) => {
+            eprintln!("Failed to load tokenizer: {error}");
+            return;
+        }
+    };
+    let prompt_tokens = if tokenizer.has_chat_template() {
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(prompt));
+        match tokenizer.encode_chat(&messages) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!("Failed to apply chat template: {error}");
+                return;
+            }
+        }
+    } else {
+        match tokenizer.encode(prompt) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                eprintln!("Failed to encode prompt: {error}");
+                return;
+            }
+        }
+    };
+    if prompt_tokens.is_empty() {
+        eprintln!("Tokenizer produced an empty prompt");
+        return;
+    }
+    let required = match prompt_tokens.len().checked_add(max_tokens) {
+        Some(required) if required <= 32768 => required,
+        _ => {
+            eprintln!(
+                "Current native text path supports prompt+output <=32768 tokens, got {}+{}",
+                prompt_tokens.len(),
+                max_tokens
+            );
+            return;
+        }
+    };
+    let max_seq_len = required.next_power_of_two().min(32768);
+    let manifest = match safetensors::inspect_path(model_dir) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("Failed to inspect checkpoint: {error}");
+            return;
+        }
+    };
+    let context = match CudaContext::new(0) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("Failed to initialize CUDA: {error}");
+            return;
+        }
+    };
+
+    println!("apxinf — Qwen3.8 native INT4 text generation");
+    println!(
+        "Loading 64 decoder layers and W8 LM head (KV capacity {})...",
+        max_seq_len
+    );
+    let load_start = Instant::now();
+    let decoder = match HybridUnit::load_all(&manifest, &context, max_seq_len) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            eprintln!("Failed to load Qwen3.8 decoder: {error}");
+            return;
+        }
+    };
+    let lm_head = match Qwen35LmHead::load(&manifest, &context) {
+        Ok(head) => head,
+        Err(error) => {
+            eprintln!("Failed to load Qwen3.8 LM head: {error}");
+            return;
+        }
+    };
+    let cache_shape = vec![4, max_seq_len, 256];
+    let key_cache = Tensor::zeros(cache_shape.clone(), DType::BF16);
+    let value_cache = Tensor::zeros(cache_shape, DType::BF16);
+    let first_embedding = match load_embedding_row(&manifest, prompt_tokens[0]) {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            eprintln!("Failed to load embedding: {error}");
+            return;
+        }
+    };
+    if let Err(error) = decoder.reset(&context, &first_embedding, &key_cache, &value_cache) {
+        eprintln!("Failed to initialize decoder state: {error}");
+        return;
+    }
+    println!("Model ready in {:.3}s", load_start.elapsed().as_secs_f64());
+    println!("Prompt tokens: {}", prompt_tokens.len());
+
+    let prefill_start = Instant::now();
+    let tiled_tokens = prompt_tokens.len() / 8 * 8;
+    for position in (0..tiled_tokens).step_by(8) {
+        let embedding =
+            match load_embedding_tile8(&manifest, &prompt_tokens[position..position + 8]) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    eprintln!("Embedding tile at {position}: {error}");
+                    return;
+                }
+            };
+        if let Err(error) = decoder.set_prefill8_input(&context, &embedding) {
+            eprintln!("Set prompt tile at {position}: {error}");
+            return;
+        }
+        if let Err(error) = decoder.forward_prefill8(&context, position, false) {
+            eprintln!("Prompt tile forward at {position}: {error}");
+            return;
+        }
+    }
+    for (offset, &token) in prompt_tokens[tiled_tokens..].iter().enumerate() {
+        let position = tiled_tokens + offset;
+        if position > 0 || tiled_tokens > 0 {
+            let embedding = match load_embedding_row(&manifest, token) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    eprintln!("Embedding row {token}: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = decoder.set_token_input(&context, &embedding) {
+                eprintln!("Set prompt token {position}: {error}");
+                return;
+            }
+        }
+        let bucket = (position + 1).next_power_of_two().min(max_seq_len);
+        if let Err(error) = decoder.forward(
+            &context,
+            HybridUnitMode::ModelOptimized,
+            bucket,
+            position as u32,
+            false,
+        ) {
+            eprintln!("Prompt forward at token {position}: {error}");
+            return;
+        }
+    }
+    if tiled_tokens == prompt_tokens.len() {
+        if let Err(error) = decoder.commit_prefill8_last(&context) {
+            eprintln!("Commit final prompt tile: {error}");
+            return;
+        }
+    }
+    if let Err(error) = context.synchronize() {
+        eprintln!("Prompt synchronization failed: {error}");
+        return;
+    }
+    let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+
+    let eos_token = if eos_stop {
+        tokenizer.eos_token_id()
+    } else {
+        None
+    };
+    let mut all_tokens = prompt_tokens.clone();
+    let mut generated = Vec::with_capacity(max_tokens);
+    let mut step_times = Vec::with_capacity(max_tokens);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    print!("\n");
+    for step in 0..max_tokens {
+        let step_start = Instant::now();
+        if step > 0 {
+            let previous = generated[step - 1];
+            let embedding = match load_embedding_row(&manifest, previous) {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    eprintln!("Embedding row {previous}: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = decoder.set_token_input(&context, &embedding) {
+                eprintln!("Set decode token {step}: {error}");
+                return;
+            }
+            let position = prompt_tokens.len() + step - 1;
+            let bucket = (position + 1).next_power_of_two().min(max_seq_len);
+            if let Err(error) = decoder.forward(
+                &context,
+                HybridUnitMode::ModelOptimized,
+                bucket,
+                position as u32,
+                false,
+            ) {
+                eprintln!("Decode forward at step {step}: {error}");
+                return;
+            }
+        }
+        if let Err(error) = lm_head.forward(&context, decoder.normalized_output()) {
+            eprintln!("LM head at step {step}: {error}");
+            return;
+        }
+        let token = match lm_head.argmax_cpu() {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("Argmax at step {step}: {error}");
+                return;
+            }
+        };
+        generated.push(token);
+        all_tokens.push(token);
+        step_times.push(step_start.elapsed().as_secs_f64());
+        if let Ok(text) = tokenizer.decode(&all_tokens) {
+            let previous_text = tokenizer
+                .decode(&all_tokens[..all_tokens.len() - 1])
+                .unwrap_or_default();
+            print!("{}", text.strip_prefix(&previous_text).unwrap_or(&text));
+            out.flush().ok();
+        }
+        if eos_token == Some(token) {
+            break;
+        }
+    }
+    println!("\n");
+    let decode_seconds = step_times.iter().sum::<f64>();
+    println!(
+        "ApxInf Qwen3.8: prefill={} tokens in {:.3}s ({:.1} tok/s, M8 tiles + M1 tail); decode={} tokens in {:.3}s ({:.2} tok/s, {:.2} ms/token)",
+        prompt_tokens.len(),
+        prefill_seconds,
+        prompt_tokens.len() as f64 / prefill_seconds,
+        generated.len(),
+        decode_seconds,
+        generated.len() as f64 / decode_seconds,
+        decode_seconds * 1000.0 / generated.len().max(1) as f64,
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn load_embedding_tile8(
+    manifest: &safetensors::CheckpointManifest,
+    tokens: &[u32],
+) -> Result<Tensor, String> {
+    const HIDDEN: usize = 5120;
+    if tokens.len() != 8 {
+        return Err(format!(
+            "Qwen3.8 prefill tile requires 8 tokens, got {}",
+            tokens.len()
+        ));
+    }
+    let mut values = Vec::with_capacity(tokens.len() * HIDDEN);
+    for &token in tokens {
+        let row = load_embedding_row(manifest, token).map_err(|error| error.to_string())?;
+        values.extend_from_slice(row.as_bf16().map_err(|error| error.to_string())?);
+    }
+    Tensor::from_bf16(vec![tokens.len(), HIDDEN], &values).map_err(|error| error.to_string())
+}
+
+/// Read `model_type` from `config.json` if present. Empty string on any
+/// error (falls back to the Llama path).
+fn read_model_type(model_dir: &PathBuf) -> Option<String> {
+    let cfg_path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("model_type")?.as_str().map(|s| s.to_string())
+}
+
+fn run_inspect(model_dir: &PathBuf, json: bool) -> Result<(), String> {
+    let model_type = read_model_type(model_dir)
+        .ok_or_else(|| format!("missing model_type in {}/config.json", model_dir.display()))?;
+    if model_type != "qwen3_5" {
+        return Err(format!(
+            "inspection contract currently supports model_type `qwen3_5`, got `{model_type}`"
+        ));
+    }
+    let config = Qwen35Config::from_json_file(&model_dir.join("config.json"))
+        .map_err(|error| error.to_string())?;
+    let report =
+        Qwen35CheckpointReport::inspect(model_dir, &config).map_err(|error| error.to_string())?;
+    let dtype_counts = report
+        .dtype_counts
+        .iter()
+        .map(|(dtype, count)| (dtype.to_string(), serde_json::json!(count)))
+        .collect::<serde_json::Map<_, _>>();
+
+    if json {
+        let output = serde_json::json!({
+            "status": "validated",
+            "native_execution_ready": cfg!(feature = "cuda"),
+            "native_capabilities": {
+                "text_generate": cfg!(feature = "cuda"),
+                "stateful_decode": cfg!(feature = "cuda"),
+                "multimodal": false,
+                "m_gt_1_prefill": cfg!(feature = "cuda"),
+                "serial_prefill": cfg!(feature = "cuda"),
+                "openai_compatible_service": cfg!(feature = "cuda"),
+                "unified_llm_input": false,
+            },
+            "model_type": config.model_type,
+            "architecture": config.architecture,
+            "text": {
+                "hidden_size": config.text.hidden_size,
+                "intermediate_size": config.text.intermediate_size,
+                "layers": config.text.n_layers,
+                "linear_attention_layers": report.linear_attention_layers,
+                "full_attention_layers": report.full_attention_layers,
+                "attention_heads": config.text.n_heads,
+                "kv_heads": config.text.n_kv_heads,
+                "head_dim": config.text.head_dim,
+                "max_position_embeddings": config.text.max_position_embeddings,
+            },
+            "vision": {
+                "depth": config.vision.depth,
+                "hidden_size": config.vision.hidden_size,
+                "output_hidden_size": config.vision.out_hidden_size,
+            },
+            "quantization": {
+                "method": config.quantization.method,
+                "format": config.quantization.format,
+                "bits": config.quantization.num_bits,
+                "group_size": config.quantization.group_size,
+                "symmetric": config.quantization.symmetric,
+                "quantized_linears": report.quantized_linears,
+                "ignored_modules": report.ignored_modules,
+            },
+            "checkpoint": {
+                "shards": report.shard_count,
+                "tensors": report.tensor_count,
+                "tensor_bytes": report.tensor_bytes,
+                "dtype_counts": dtype_counts,
+            },
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("ApxInf Qwen3.5/Qwen3.8 checkpoint contract: VALID");
+        println!("model: {} ({})", config.model_type, config.architecture);
+        println!(
+            "text: hidden={}, intermediate={}, layers={} ({} GDN + {} full attention), heads={}/{}, head_dim={}, max_context={}",
+            config.text.hidden_size,
+            config.text.intermediate_size,
+            config.text.n_layers,
+            report.linear_attention_layers,
+            report.full_attention_layers,
+            config.text.n_heads,
+            config.text.n_kv_heads,
+            config.text.head_dim,
+            config.text.max_position_embeddings,
+        );
+        println!(
+            "vision: depth={}, hidden={}, output_hidden={}",
+            config.vision.depth, config.vision.hidden_size, config.vision.out_hidden_size
+        );
+        println!(
+            "quantization: {} {}, W{} group={} asymmetric, {} packed linears, {} ignored modules",
+            config.quantization.method,
+            config.quantization.format,
+            config.quantization.num_bits,
+            config.quantization.group_size,
+            report.quantized_linears,
+            report.ignored_modules,
+        );
+        println!(
+            "checkpoint: {} shards, {} tensors, {} bytes, dtypes={dtype_counts:?}",
+            report.shard_count, report.tensor_count, report.tensor_bytes
+        );
+        println!(
+            "native_text_execution_ready: {} (M8 prefill and service ready; unified LlmInput image path remains unsupported)",
+            cfg!(feature = "cuda")
+        );
+    }
+    Ok(())
+}
+
 /// Preprocess an image with the model's Hugging Face processor. Raw image
 /// decoding and chat templating stay outside the model runtime; the resulting
 /// borrowed tensor is attached to LlmInput for unified generation.
@@ -375,10 +745,8 @@ fn preprocess_image(
     use std::process::Command;
 
     let suffix = std::process::id();
-    let pixel_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
-    let metadata_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
+    let pixel_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
+    let metadata_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
     let script = r#"
 import json
 import sys
@@ -451,16 +819,13 @@ with open(metadata_path, "w") as output:
     let grid = [
         grid_values[0]
             .as_u64()
-            .ok_or_else(|| "processor grid T is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid T is not an integer".to_string())? as u32,
         grid_values[1]
             .as_u64()
-            .ok_or_else(|| "processor grid H is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid H is not an integer".to_string())? as u32,
         grid_values[2]
             .as_u64()
-            .ok_or_else(|| "processor grid W is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid W is not an integer".to_string())? as u32,
     ];
     let tokens = metadata
         .get("tokens")
@@ -482,9 +847,7 @@ with open(metadata_path, "w") as output:
 }
 
 /// Read a NumPy v1 f32 array and convert it to bf16.
-fn read_npy_f32_to_bf16(
-    path: &std::path::Path,
-) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
+fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     use std::io::Read;
 
     let mut file =
@@ -525,9 +888,7 @@ fn read_npy_f32_to_bf16(
     }
     let data = raw
         .chunks_exact(4)
-        .map(|bytes| {
-            half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap()))
-        })
+        .map(|bytes| half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap())))
         .collect();
     Ok((shape, data))
 }
@@ -613,7 +974,10 @@ fn cuda_test() {
     let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
     let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0].iter().map(|x| x / (1.0 + (-x).exp())).collect();
+    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
+        .iter()
+        .map(|x| x / (1.0 + (-x).exp()))
+        .collect();
     println!("[CUDA] silu: {:?}", silu_data);
 
     // Add test
@@ -647,7 +1011,8 @@ fn cuda_test() {
     println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
 
     // RoPE test
-    let rope_input = Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
+    let rope_input =
+        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
     let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
     let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
     let rope_cpu = transfers::to_cpu(&rope_out).unwrap();
