@@ -43,35 +43,43 @@ __global__ void qwen_dequant_w4a16_bf16_kernel(
 __global__ void qwen_mul_bf16_kernel(
     const __half* a, const __half* b,
     __half* out, int64_t n) {
-  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= n) return;
-  out[e] = q35_b16(q35_bf16(a, e) * q35_bf16(b, e));
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < n;
+       e += (int64_t)gridDim.x * blockDim.x) {
+    out[e] = q35_b16(q35_bf16(a, e) * q35_bf16(b, e));
+  }
 }
 
 __global__ void qwen_silu_bf16_kernel(
     const __half* a, __half* out, int64_t n) {
-  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= n) return;
-  float x = q35_bf16(a, e);
-  out[e] = q35_b16(x / (1.0f + expf(-x)));
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < n;
+       e += (int64_t)gridDim.x * blockDim.x) {
+    float x = q35_bf16(a, e);
+    out[e] = q35_b16(x / (1.0f + expf(-x)));
+  }
 }
 
 __global__ void qwen_sigmoid_mul_bf16_kernel(
     const __half* a, const __half* b,
     __half* out, int64_t n) {
-  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= n) return;
-  float g = q35_bf16(a, e);
-  float sig = 1.0f / (1.0f + expf(-g));
-  out[e] = q35_b16(sig * q35_bf16(b, e));
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < n;
+       e += (int64_t)gridDim.x * blockDim.x) {
+    float g = q35_bf16(a, e);
+    float sig = 1.0f / (1.0f + expf(-g));
+    out[e] = q35_b16(sig * q35_bf16(b, e));
+  }
 }
 
 // dst += src
 __global__ void qwen_accum_bf16_kernel(
     __half* dst, const __half* src, int64_t n) {
-  int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (e >= n) return;
-  dst[e] = q35_b16(q35_bf16(dst, e) + q35_bf16(src, e));
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < n;
+       e += (int64_t)gridDim.x * blockDim.x) {
+    dst[e] = q35_b16(q35_bf16(dst, e) + q35_bf16(src, e));
+  }
 }
 
 // ── RMSNorm with precomputed (1+w) weights ──────────────────────────────
@@ -294,11 +302,16 @@ __global__ void qwen_attention_bf16_kernel(
     float dot = total_s[0] * scale;
 
     float m_new = fmaxf(m, dot);
-    float corr = expf(m - m_new);
-    float p = expf(dot - m_new);
-    l = l * corr + p;
-    acc = acc * corr + p * q35_bf16(v, ((int64_t)s * kvheads + kh) * hd + d);
-    m = m_new;
+    float p = __expf(dot - m_new);
+    if (m_new > m) {
+      float corr = __expf(m - m_new);
+      l = fmaf(l, corr, p);
+      acc = fmaf(acc, corr, p * q35_bf16(v, ((int64_t)s * kvheads + kh) * hd + d));
+      m = m_new;
+    } else {
+      l = fmaf(l, 1.0f, p);
+      acc = fmaf(acc, 1.0f, p * q35_bf16(v, ((int64_t)s * kvheads + kh) * hd + d));
+    }
   }
 
   acc = acc / l;
@@ -637,11 +650,16 @@ __global__ void qwen_attention_decode_bf16_kernel(
     float dot = total_s[0] * scale;
 
     float m_new = fmaxf(m, dot);
-    float corr = expf(m - m_new);
-    float p = expf(dot - m_new);
-    l = l * corr + p;
-    acc = acc * corr + p * q35_bf16(vcache, ((int64_t)s * kvheads + kh) * hd + d);
-    m = m_new;
+    float p = __expf(dot - m_new);
+    if (m_new > m) {
+      float corr = __expf(m - m_new);
+      l = fmaf(l, corr, p);
+      acc = fmaf(acc, corr, p * q35_bf16(vcache, ((int64_t)s * kvheads + kh) * hd + d));
+      m = m_new;
+    } else {
+      l = fmaf(l, 1.0f, p);
+      acc = fmaf(acc, 1.0f, p * q35_bf16(vcache, ((int64_t)s * kvheads + kh) * hd + d));
+    }
   }
 
   acc = acc / l;
