@@ -326,6 +326,17 @@ extern "C" {
         tokens: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_qwen35_gdn_recurrent_m8_hybrid_bf16(
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        recurrent_state: *mut c_void,
+        output: *mut c_void,
+        tokens: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_qwen35_gdn_gated_rmsnorm_m8_bf16(
         input: *const c_void,
         gate: *const c_void,

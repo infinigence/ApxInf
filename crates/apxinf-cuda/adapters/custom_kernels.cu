@@ -413,6 +413,24 @@ extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_m8_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_m8_hybrid_bf16(
+    const void* query, const void* key, const void* value, const void* g,
+    const void* beta, void* recurrent_state, void* output, int tokens,
+    cudaStream_t stream) {
+  if (query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || recurrent_state == nullptr || output == nullptr ||
+      tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_recurrent_m8_hybrid_bf16_kernel<<<48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key),
+      static_cast<const __nv_bfloat16*>(value), static_cast<const float*>(g),
+      static_cast<const float*>(beta), static_cast<float*>(recurrent_state),
+      static_cast<__nv_bfloat16*>(output), tokens);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_qwen35_gdn_gated_rmsnorm_m8_bf16(
     const void* input, const void* gate, const void* weight, void* output,
     float epsilon, int tokens, cudaStream_t stream) {

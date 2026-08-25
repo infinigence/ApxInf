@@ -532,6 +532,75 @@ pub fn qwen35_recurrent_m8_write(
     }
 }
 
+pub fn qwen35_recurrent_m8_hybrid_write(
+    ctx: &CudaContext,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    recurrent_state: &Tensor,
+    output: &Tensor,
+) -> Result<()> {
+    let device = Device::Cuda(ctx.device_id());
+    let tokens = query.shape().dims().first().copied().unwrap_or(0);
+    if !(1..=8).contains(&tokens) {
+        return Err(Error::Other(
+            "Qwen3.5 hybrid recurrent M8 tokens must be 1..=8".into(),
+        ));
+    }
+    for (name, tensor) in [("query", query), ("key", key), ("value", value)] {
+        require(
+            tensor,
+            name,
+            DType::BF16,
+            &[tokens, QWEN35_GDN_HEADS, QWEN35_GDN_KEY_DIM],
+            device,
+        )?;
+    }
+    for (name, tensor) in [("g", g), ("beta", beta)] {
+        require(
+            tensor,
+            name,
+            DType::F32,
+            &[tokens, QWEN35_GDN_HEADS],
+            device,
+        )?;
+    }
+    require(
+        recurrent_state,
+        "hybrid M8 recurrent state",
+        DType::F32,
+        &[QWEN35_GDN_HEADS, QWEN35_GDN_KEY_DIM, QWEN35_GDN_VALUE_DIM],
+        device,
+    )?;
+    require(
+        output,
+        "hybrid M8 recurrent output",
+        DType::BF16,
+        &[tokens, QWEN35_GDN_HEADS, QWEN35_GDN_VALUE_DIM],
+        device,
+    )?;
+    let buffers = [query, key, value, g, beta, recurrent_state, output]
+        .map(|tensor| CudaBuffer::from_tensor(tensor).map_err(Error::Cuda))
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_qwen35_gdn_recurrent_m8_hybrid_bf16(
+            buffers[0].ptr(),
+            buffers[1].ptr(),
+            buffers[2].ptr(),
+            buffers[3].ptr(),
+            buffers[4].ptr(),
+            buffers[5].ptr(),
+            buffers[6].ptr(),
+            tokens as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 pub fn qwen35_gated_rmsnorm_m8_write(
     ctx: &CudaContext,
     input: &Tensor,

@@ -333,6 +333,108 @@ __global__ void qwen35_gdn_recurrent_m8_bf16_kernel(
   }
 }
 
+__global__ void qwen35_gdn_recurrent_m8_hybrid_bf16_kernel(
+    const __nv_bfloat16* query, const __nv_bfloat16* key,
+    const __nv_bfloat16* value, const float* g, const float* beta,
+    float* recurrent_state, __nv_bfloat16* output, int tokens) {
+  constexpr int kHeads = 48;
+  constexpr int kDim = 128;
+  constexpr int kSharedKeyDims = 92;
+  constexpr int kRegisterKeyDims = kDim - kSharedKeyDims;
+  constexpr int kWidth = kHeads * kDim;
+  constexpr float kEpsilon = 1.0e-6f;
+  constexpr float kQueryScale = 0.08838834764831845f;
+  __shared__ float scratch[8];
+  __shared__ float normalized_query[kDim];
+  __shared__ float normalized_key[kDim];
+  __shared__ float staged_state[kSharedKeyDims * kDim];
+  const int head = blockIdx.x;
+  const int dimension = threadIdx.x;
+  const int64_t state_base = static_cast<int64_t>(head) * kDim * kDim;
+#pragma unroll 4
+  for (int key_dimension = 0; key_dimension < kSharedKeyDims;
+       ++key_dimension) {
+    staged_state[key_dimension * kDim + dimension] = recurrent_state[
+        state_base + static_cast<int64_t>(key_dimension) * kDim + dimension];
+  }
+  float resident_tail[kRegisterKeyDims];
+#pragma unroll
+  for (int tail = 0; tail < kRegisterKeyDims; ++tail) {
+    const int key_dimension = kSharedKeyDims + tail;
+    resident_tail[tail] = recurrent_state[
+        state_base + static_cast<int64_t>(key_dimension) * kDim + dimension];
+  }
+  __syncthreads();
+  for (int token = 0; token < tokens; ++token) {
+    const int64_t vector_offset =
+        static_cast<int64_t>(token) * kWidth + head * kDim;
+    const float query_value = __bfloat162float(query[vector_offset + dimension]);
+    const float key_value = __bfloat162float(key[vector_offset + dimension]);
+    const float query_sum = block_sum(query_value * query_value, scratch);
+    const float key_sum = block_sum(key_value * key_value, scratch);
+    const float query_normalizer =
+        rsqrtf(query_sum + kEpsilon) * kQueryScale;
+    const float key_normalizer = rsqrtf(key_sum + kEpsilon);
+    normalized_query[dimension] = query_value * query_normalizer;
+    normalized_key[dimension] = key_value * key_normalizer;
+    __syncthreads();
+    const float qk = block_sum(
+        normalized_query[dimension] * normalized_key[dimension], scratch);
+    const float decay = expf(g[token * kHeads + head]);
+    const float beta_value = beta[token * kHeads + head];
+    float key_memory = 0.0f;
+    float query_memory = 0.0f;
+#pragma unroll 4
+    for (int key_dimension = 0; key_dimension < kSharedKeyDims;
+         ++key_dimension) {
+      const float state = staged_state[key_dimension * kDim + dimension];
+      key_memory = fmaf(state, normalized_key[key_dimension], key_memory);
+      query_memory = fmaf(state, normalized_query[key_dimension], query_memory);
+    }
+#pragma unroll
+    for (int tail = 0; tail < kRegisterKeyDims; ++tail) {
+      const int key_dimension = kSharedKeyDims + tail;
+      const float state = resident_tail[tail];
+      key_memory = fmaf(state, normalized_key[key_dimension], key_memory);
+      query_memory = fmaf(state, normalized_query[key_dimension], query_memory);
+    }
+    const float value_value =
+        __bfloat162float(value[vector_offset + dimension]);
+    const float delta = (value_value - decay * key_memory) * beta_value;
+    const float output_value = decay * query_memory + delta * qk;
+#pragma unroll 4
+    for (int key_dimension = 0; key_dimension < kSharedKeyDims;
+         ++key_dimension) {
+      const int shared_index = key_dimension * kDim + dimension;
+      staged_state[shared_index] = fmaf(
+          normalized_key[key_dimension], delta,
+          staged_state[shared_index] * decay);
+    }
+#pragma unroll
+    for (int tail = 0; tail < kRegisterKeyDims; ++tail) {
+      const int key_dimension = kSharedKeyDims + tail;
+      resident_tail[tail] = fmaf(
+          normalized_key[key_dimension], delta, resident_tail[tail] * decay);
+    }
+    output[vector_offset + dimension] = __float2bfloat16(output_value);
+    __syncthreads();
+  }
+#pragma unroll 4
+  for (int key_dimension = 0; key_dimension < kSharedKeyDims;
+       ++key_dimension) {
+    recurrent_state[
+        state_base + static_cast<int64_t>(key_dimension) * kDim + dimension] =
+        staged_state[key_dimension * kDim + dimension];
+  }
+#pragma unroll
+  for (int tail = 0; tail < kRegisterKeyDims; ++tail) {
+    const int key_dimension = kSharedKeyDims + tail;
+    recurrent_state[
+        state_base + static_cast<int64_t>(key_dimension) * kDim + dimension] =
+        resident_tail[tail];
+  }
+}
+
 __global__ void qwen35_gdn_gated_rmsnorm_m8_bf16_kernel(
     const __nv_bfloat16* input, const __nv_bfloat16* gate,
     const __nv_bfloat16* weight, __nv_bfloat16* output,

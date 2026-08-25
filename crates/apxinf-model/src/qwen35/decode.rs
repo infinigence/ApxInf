@@ -8,8 +8,9 @@
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 use apxinf_cuda::kernels::gdn::{
     qwen35_conv4_prepare_m8_write, qwen35_conv4_prepare_write, qwen35_gated_rmsnorm_m8_write,
-    qwen35_gated_rmsnorm_write, qwen35_recurrent_m8_write, qwen35_recurrent_write,
-    QWEN35_GDN_CONV_DIM as GDN_CONV_DIM, QWEN35_GDN_CONV_KERNEL as GDN_CONV_KERNEL,
+    qwen35_gated_rmsnorm_write, qwen35_recurrent_m8_hybrid_write, qwen35_recurrent_m8_write,
+    qwen35_recurrent_write, QWEN35_GDN_CONV_DIM as GDN_CONV_DIM,
+    QWEN35_GDN_CONV_KERNEL as GDN_CONV_KERNEL,
     QWEN35_GDN_HEADS as GDN_HEADS, QWEN35_GDN_KEY_DIM as GDN_DIM,
 };
 use apxinf_cuda::kernels::gemm::{
@@ -1768,7 +1769,7 @@ impl HybridUnit {
             &scratch.g,
             &scratch.beta,
         )?;
-        qwen35_recurrent_m8_write(
+        qwen35_recurrent_m8_hybrid_write(
             ctx,
             &scratch.query,
             &scratch.key,
