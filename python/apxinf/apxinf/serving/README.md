@@ -39,18 +39,37 @@ python -c "import apxinf_py; print(apxinf_py.Model.load('pi05','<ckpt>/model.saf
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
     --model-dir <ckpt> \
+    --robot franka_libero \  # embodiment preset: wire keys + pre/post steps + action width
     --precision bf16 \
     --device cuda:0 \
-    --action-dim 7 \        # deployment width; 0 keeps the full 32 dims
     --host 0.0.0.0 --port 8000
 ```
 
+- `--robot` is the one flag that decides **which keys the client must send**. It
+  is openpi's `serve_policy.py --policy.config <TrainConfig>` equivalent: the
+  embodiment is fixed at startup and the client cannot negotiate it. A checkpoint
+  fine-tuned for another robot **must** name it — the wire keys, the state
+  routing, and the action encoding all differ, and a mismatch degrades silently
+  (plausible-looking actions from the wrong cameras) rather than failing.
+  `--robot` also sets `--action-dim` and `--discrete-state`; pass those flags only
+  to override the preset. `python scripts/pi05_openpi_websocket_server.py --help`
+  lists every preset with its slot→key mapping.
+- Presets are named `<arm>_<key convention>`, because the arm alone does not fix
+  the contract: LIBERO and DROID are both Franka Panda with different keys and
+  action spaces. `--robot libero` still resolves to `franka_libero`.
+- `--image-keys` / `--state-key` override individual keys, for a deployed client
+  that already speaks a fixed dialect. `--image-keys` order is significant: key
+  *i* fills model view slot *i* (`base_0_rgb`, `left_wrist_0_rgb`,
+  `right_wrist_0_rgb`).
 - `--host 0.0.0.0` accepts remote clients (split deployment); `127.0.0.1` for a
   local-only test.
-- `--action-dim 7` — LIBERO uses the first 7 dims (last is the gripper).
 - Health check: `curl http://<host>:8000/healthz` → `OK`.
-- On connect the server pushes its metadata (`num_views` / `action_horizon` /
-  `precision` / ...).
+- The startup log prints the served contract; the same fields are pushed to every
+  client on connect (see §3):
+
+  ```
+  serving robot=franka_libero H=10 x D=7 image_keys=['observation/image', 'observation/wrist_image'] state=observation/state discrete_state=False
+  ```
 
 ## 3. Call it (stock `openpi_client`, unmodified)
 
@@ -58,17 +77,32 @@ python scripts/pi05_openpi_websocket_server.py \
 from openpi_client import websocket_client_policy
 
 client = websocket_client_policy.WebsocketClientPolicy("<host>", 8000)
-print(client.get_server_metadata())          # {'num_views':3,'action_horizon':50,'precision':'bf16',...}
+meta = client.get_server_metadata()
+# {'robot': 'franka_libero', 'image_keys': ['observation/image', 'observation/wrist_image'],
+#  'state_key': 'observation/state', 'discrete_state': False, 'prompt_key': 'prompt',
+#  'num_views': 2, 'action_horizon': 10, 'action_dim': 7, 'precision': 'bf16', ...}
 
 result = client.infer({
-    "observation/image":       base_rgb_uint8,    # HWC uint8; the server resizes
+    "observation/image":       base_rgb_uint8,     # HWC uint8 RGB; the server resizes
     "observation/wrist_image": wrist_rgb_uint8,
-    "observation/state":       state_f32,          # dropped on the LIBERO path; see §5 for a robot
+    "observation/state":       state_f32,          # dropped unless discrete_state; see §5
     "prompt":                  "put both moka pots on the stove",
 })
-result["actions"]         # float32 [H, 7]; H is the checkpoint's native horizon
+result["actions"]         # float32 [H, action_dim]; H is the checkpoint's native horizon
 result["policy_timing"]   # {'infer_ms': bare model, 'policy_ms': full policy}
 ```
+
+The metadata **is** the wire contract — assert against `meta["image_keys"]` /
+`meta["state_key"]` instead of hardcoding keys, so a server/client mismatch shows
+up as a failed assertion at startup rather than as degraded accuracy in the
+field. Sending a key the server does not serve raises a `KeyError` naming both
+sides; sending an *extra* key is silently ignored (matching openpi).
+
+**Images are RGB.** Neither this server nor openpi converts colour: an `H×W×3`
+uint8 array is taken as RGB as-is. A client reading frames with OpenCV must
+`cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)` first — BGR frames run fine and score
+badly. Resizing *is* done server-side (aspect-preserving pad to the model's
+edge), so any input resolution is fine.
 
 Reference client: [python/apxinf/examples/openpi_client.py](../../examples/openpi_client.py).
 
@@ -134,8 +168,9 @@ fields:
 ```
 
 > LIBERO is a **Franka Panda 7-DoF** benchmark (7-dim action = 6 EEF deltas + 1
-> gripper), so eval runs the Panda/libero path with `--action-dim 7`. It is a
-> different embodiment from the robots in §5 (e.g. G1) and unrelated to them.
+> gripper), so eval runs the default `--robot franka_libero` preset, which
+> already sets the 2 camera keys and the 7-dim action width. It is a different
+> embodiment from the robots in §5 (e.g. G1) and unrelated to them.
 
 ## 5. Port an OpenPI config + processors into apxinf (for your own robot)
 
@@ -262,12 +297,60 @@ The delta→absolute output step needs to see the **input state**.
 pipeline; the stock `trim`/`unnormalize` ignore it, so existing numbers are
 unchanged (matching OpenPI's "output transforms can see input state" semantics).
 
-### 5.6 Use and verify
+### 5.6 Register a preset (the last step — do not skip it)
+
+A factory alone is not deployable: whoever launches the server still has to know
+your robot's wire keys, action width, and state routing, and getting any of them
+wrong is silent. Add one entry to
+[`python/apxinf/apxinf/robots/presets.py`](../robots/presets.py) and the whole
+contract becomes `--robot <name>`:
+
+```python
+MY_ROBOT = RobotPreset(
+    name="my_robot",                              # <arm>_<key convention> if the arm is shared
+    slots=(                                       # (model view slot, wire key), in slot order
+        ("base_0_rgb",        "images/cam_high"),
+        ("left_wrist_0_rgb",  "images/cam_left_wrist"),
+    ),
+    state_key="state",
+    action_dim=None,                              # None: the encode step trims
+    discrete_state=True,                          # False *drops* state entirely
+    builder=build_my_robot_policy,
+    summary="My robot: 2 cameras, 14-DoF state, delta joint actions",
+    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
+)
+
+ROBOT_PRESETS = {p.name: p for p in (FRANKA_LIBERO, UNITREE_G1, MY_ROBOT)}
+```
+
+Naming each wire key with the **model view slot** it fills is the point: the
+tuple is order-significant (entry *i* becomes model view slot *i*), and a wrong
+order still stacks, still has the right shape, and silently feeds the wrong
+camera to each slot. The pairing is validated — slots must be a prefix of
+`base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb` in order, with no duplicate
+wire keys.
+
+Wire keys may be written **flat** (`"observation/image"` — the slash is part of
+the name, as LIBERO and DROID send it) or as a **nested path**
+(`"images/cam_high"` → `obs["images"]["cam_high"]`, as ALOHA and G1 send it). A
+flat hit always wins, so both layouts work from one tuple and an unmodified
+upstream client needs no changes.
+
+The preset's contract is published in the served metadata (§3) and printed at
+startup, so a client can assert it.
+
+### 5.7 Use and verify
 
 ```python
 from apxinf import build_unitree_g1_policy          # shipped G1 example
 policy = build_unitree_g1_policy("<g1-ckpt>", use_delta_joint_actions=True, adapt_to_pi=True)
 actions = policy.infer(obs)["actions"]               # [H, 16]
+```
+
+Served the same way, once §5.6 is done:
+
+```bash
+python scripts/pi05_openpi_websocket_server.py --model-dir <g1-ckpt> --robot unitree_g1
 ```
 
 Smoke test (plumbing/shape): [scripts/g1_adapter_smoke.py](../../../../scripts/g1_adapter_smoke.py)

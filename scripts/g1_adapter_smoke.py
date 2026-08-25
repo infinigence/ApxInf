@@ -31,9 +31,7 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
 from apxinf import build_unitree_g1_policy  # noqa: E402
 from apxinf.processors import Unnormalizer  # noqa: E402
 from apxinf.processors.transforms import Unnormalize  # noqa: E402
-from apxinf.robots.unitree_g1 import G1_CAMERAS  # noqa: E402
-
-STATE_KEY = "observation/state"
+from apxinf.robots.unitree_g1 import G1_CAMERAS, G1_STATE_KEY  # noqa: E402
 
 
 def parse_args():
@@ -70,7 +68,7 @@ def main():
         model=model,  # reuse the already-loaded handle
         use_delta_joint_actions=True,
         adapt_to_pi=True,
-        state_key=STATE_KEY,
+        state_key=G1_STATE_KEY,
         unnormalizer=identity,
         precision=args.precision,
         device=args.device,
@@ -88,8 +86,16 @@ def main():
     else:
         cam = lambda: rng.integers(0, 256, (S, S, 3), dtype=np.uint8)  # noqa: E731
 
-    observation = {name: cam() for name in G1_CAMERAS}
-    observation[STATE_KEY] = rng.standard_normal(16).astype(np.float32)
+    # The exact layout an unmodified openpi G1 client sends: cameras nested one
+    # level under "images", state flat. The policy's image_keys are the paths
+    # ("images/cam_high"), which lookup_key walks into this dict.
+    groups: dict = {}
+    for key in G1_CAMERAS:
+        group, _, camera = key.partition("/")
+        assert camera, f"expected a nested camera path, got {key!r}"
+        groups.setdefault(group, {})[camera] = cam()
+    observation = dict(groups)
+    observation[G1_STATE_KEY] = rng.standard_normal(16).astype(np.float32)
     observation["prompt"] = args.prompt
 
     out = policy.infer(observation)

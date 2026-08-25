@@ -12,7 +12,7 @@ from .noise import GaussianNoise
 from .normalize import Normalizer, Unnormalizer, load_norm_stats
 from .resize import ParseImage, ResizeWithPad
 from .tokenize import PromptTokenizer, SyntheticTokenizer, build_prompt, discretize_state
-from .transforms import ImageStack, SampleNoise, Tokenize, Trim
+from .transforms import ImageStack, SampleNoise, Tokenize, Trim, has_key, lookup_key, set_key
 from .transforms import Unnormalize as UnnormalizeStep
 
 __all__ = [
@@ -31,6 +31,9 @@ __all__ = [
     # dict->dict steps for a policy's pre/post pipeline
     "ImageStack",
     "Tokenize",
+    "lookup_key",
+    "has_key",
+    "set_key",
     "SampleNoise",
     "Trim",
     "UnnormalizeStep",

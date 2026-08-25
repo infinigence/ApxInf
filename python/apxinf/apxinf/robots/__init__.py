@@ -10,11 +10,28 @@ This is the top assembly layer: it depends *downward* on both
 :mod:`apxinf.policies` (the model) and :mod:`apxinf.processors` (the steps).
 Neither depends back on it, so adding a robot never touches the policy or
 processor packages — you write steps under ``processors/robots/`` and a
-``build_*`` factory here.
+``build_*`` factory here, then register both in :mod:`apxinf.robots.presets` so
+they are reachable as ``--robot <name>`` at serving time.
 """
 
 from __future__ import annotations
 
+from .presets import (
+    ROBOT_PRESETS,
+    VIEW_SLOTS,
+    RobotPreset,
+    available_robots,
+    build_robot_policy,
+    get_robot_preset,
+)
 from .unitree_g1 import build_unitree_g1_policy
 
-__all__ = ["build_unitree_g1_policy"]
+__all__ = [
+    "build_unitree_g1_policy",
+    "RobotPreset",
+    "ROBOT_PRESETS",
+    "VIEW_SLOTS",
+    "available_robots",
+    "get_robot_preset",
+    "build_robot_policy",
+]

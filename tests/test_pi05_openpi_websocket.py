@@ -179,7 +179,7 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         self.assertNotIn("prev_total_ms", first["server_timing"])
         self.assertIn("prev_total_ms", second["server_timing"])
 
-        # The in-process model saw two NHWC calls, stacked + padded to num_views.
+        # The in-process model saw two NHWC calls, one row per configured camera.
         self.assertEqual(len(self.policy.model.images), 2)
         self.assertEqual(self.policy.model.images[0].shape, (NUM_VIEWS, 224, 224, 3))
         self.assertEqual(self.policy.model.images[0].dtype, np.dtype("uint8"))

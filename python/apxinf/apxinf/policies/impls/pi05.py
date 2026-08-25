@@ -64,6 +64,8 @@ from ...processors.transforms import (
     RGB,
     TOKEN_IDS,
     Unnormalize,
+    has_key,
+    lookup_key,
 )
 from ..registry import register_policy
 
@@ -115,6 +117,8 @@ class Pi05Policy:
             "num_views": model.num_views,
             "image_size": [model.image_size, model.image_size],
             "image_keys": list(self.image_keys),
+            "state_key": self.state_key,
+            "prompt_key": self.prompt_key,
             "discrete_state": self.discrete_state,
             "state_normalized": state_normalized,
             "input_pipeline": input_pipeline.names,
@@ -364,7 +368,7 @@ class Pi05Policy:
             raise TypeError(f"observation must be a mapping, got {type(observation)!r}")
         self._require_keys(observation)
 
-        prompt = observation[self.prompt_key]
+        prompt = lookup_key(observation, self.prompt_key)
         if not isinstance(prompt, str):
             raise TypeError(f"{self.prompt_key} must be a string, got {type(prompt)!r}")
 
@@ -439,13 +443,29 @@ class Pi05Policy:
     # --- helpers -----------------------------------------------------------
 
     def _require_keys(self, observation: Mapping[str, Any]) -> None:
+        """Reject an observation the configured pipeline cannot read.
+
+        Only the *configured* keys are required; any extra key the client sends
+        is ignored (openpi behaves the same). Each is resolved through
+        :func:`~apxinf.processors.transforms.lookup_key`, so a nested
+        ``{"images": {"cam_high": ...}}`` layout satisfies ``"images/cam_high"``.
+        The error names the served keys, because a key mismatch is the single
+        most common integration failure and the client cannot see our config
+        except through ``metadata``.
+        """
         required = list(self.image_keys) + [self.prompt_key]
         if self.discrete_state:
             # State is only mandatory when it is actually injected into the prompt.
             required.append(self.state_key)
-        missing = [key for key in required if key not in observation]
+        missing = [key for key in required if not has_key(observation, key)]
         if missing:
-            raise KeyError(f"Pi05Policy.infer: missing observation keys: {missing}")
+            raise KeyError(
+                f"Pi05Policy.infer: missing observation keys: {missing}. "
+                f"This policy serves image_keys={list(self.image_keys)}, "
+                f"prompt_key={self.prompt_key!r}"
+                + (f", state_key={self.state_key!r}" if self.discrete_state else "")
+                + f"; the observation has {sorted(observation)}."
+            )
 
     @staticmethod
     def _find_step(pipeline: Pipeline, name: str):

@@ -35,7 +35,14 @@ from __future__ import annotations
 
 from . import processors
 from .policies import AutoPolicy, Pi05Policy, Policy
-from .robots import build_unitree_g1_policy
+from .robots import (
+    ROBOT_PRESETS,
+    RobotPreset,
+    available_robots,
+    build_robot_policy,
+    build_unitree_g1_policy,
+    get_robot_preset,
+)
 from .processors import (
     GaussianNoise,
     Normalizer,
@@ -56,6 +63,12 @@ __all__ = [
     "AutoPolicy",
     # robot adapters
     "build_unitree_g1_policy",
+    # robot presets (embodiment -> wire keys + pipelines), openpi's TrainConfig analogue
+    "RobotPreset",
+    "ROBOT_PRESETS",
+    "available_robots",
+    "get_robot_preset",
+    "build_robot_policy",
     # bindings (lazy)
     "Model",
     # processor steps

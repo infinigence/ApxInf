@@ -25,6 +25,7 @@ from ..processors import Pipeline
 from ..processors.robots.unitree_g1 import (
     G1_CAMERAS,
     G1_ROBOT_DIM,
+    G1_STATE_KEY,
     UnitreeG1AbsoluteActions,
     UnitreeG1DecodeState,
     UnitreeG1EncodeActions,
@@ -39,9 +40,10 @@ def build_unitree_g1_policy(
     *,
     use_delta_joint_actions: bool = True,
     adapt_to_pi: bool = True,
-    state_key: str = "observation/state",
+    state_key: str = G1_STATE_KEY,
     image_keys: Sequence[str] = G1_CAMERAS,
-    discrete_state: bool = False,
+    discrete_state: bool = True,
+    action_dim: Optional[int] = None,
     unnormalizer: Optional[Unnormalize] = None,
     metadata: Optional[dict] = None,
     **from_pretrained_kwargs: Any,
@@ -58,10 +60,19 @@ def build_unitree_g1_policy(
 
     ``adapt_to_pi=False`` drops the decode/encode conventions (raw robot space);
     ``use_delta_joint_actions=False`` drops the delta->absolute step (the model
-    already emits absolute actions). By default the unnormalizer comes from the
-    checkpoint's ``norm_stats["actions"]``, so a real deployment needs G1
-    norm_stats at least ``16`` wide; pass ``unnormalizer=`` to inject one (e.g. a
-    full-width identity for a shape/plumbing test on a stand-in checkpoint).
+    already emits absolute actions). ``action_dim`` is the **deployable** width
+    reported to clients and defaults to :data:`G1_ROBOT_DIM` — the model always
+    runs at full width internally, and ``UnitreeG1EncodeActions`` performs the
+    truncation. By default the unnormalizer comes from the checkpoint's
+    ``norm_stats["actions"]``, so a real deployment needs G1 norm_stats at least
+    ``16`` wide; pass ``unnormalizer=`` to inject one (e.g. a full-width identity
+    for a shape/plumbing test on a stand-in checkpoint).
+
+    Defaults match what an unmodified openpi G1 client sends: the nested
+    ``obs["images"][...]`` cameras, a flat ``"state"``, and state discretized into
+    the prompt. Serving with ``discrete_state=False`` silently drops state, which
+    also makes ``use_delta_joint_actions`` a no-op (a delta cannot be resolved
+    without the current joint positions).
     """
     base = Pi05Policy.from_pretrained(
         model_dir,
@@ -93,6 +104,6 @@ def build_unitree_g1_policy(
         output_pipeline=output_pipeline,
         image_keys=tuple(image_keys),
         state_key=state_key,
-        action_dim=G1_ROBOT_DIM,
+        action_dim=G1_ROBOT_DIM if action_dim is None else int(action_dim),
         metadata={"robot": "unitree_g1", **(metadata or {})},
     )
