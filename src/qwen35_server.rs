@@ -99,13 +99,9 @@ impl NativeRuntime {
         } else {
             Qwen35PrefillMode::M8
         };
-        let decoder = HybridUnit::load_all_with_prefill_mode(
-            &manifest,
-            context,
-            max_model_len,
-            prefill_mode,
-        )
-        .map_err(|error| error.to_string())?;
+        let decoder =
+            HybridUnit::load_all_with_prefill_mode(&manifest, context, max_model_len, prefill_mode)
+                .map_err(|error| error.to_string())?;
         let lm_head = Qwen35LmHead::load(&manifest, context).map_err(|error| error.to_string())?;
         let embedding_entry = manifest
             .tensor("model.language_model.embed_tokens.weight")
@@ -291,8 +287,7 @@ impl NativeRuntime {
         let marlin_tokens = match prefill_mode {
             Qwen35PrefillMode::M8 => 0,
             Qwen35PrefillMode::MarlinM64 => {
-                layer_major_tokens
-                    + (prompt_tokens.len() - layer_major_tokens) / 64 * 64
+                layer_major_tokens + (prompt_tokens.len() - layer_major_tokens) / 64 * 64
             }
         };
         for position in (layer_major_tokens..marlin_tokens).step_by(64) {
@@ -349,7 +344,9 @@ impl NativeRuntime {
                     .map_err(|error| error.to_string())?;
             }
         }
-        self.backend.synchronize().map_err(|error| error.to_string())?;
+        self.backend
+            .synchronize()
+            .map_err(|error| error.to_string())?;
         let prefill_seconds = prefill_start.elapsed().as_secs_f64();
 
         let eos = eos_stop.then(|| self.tokenizer.eos_token_id()).flatten();
@@ -503,7 +500,12 @@ impl NativeRuntime {
                 .set_prefill8_input(self.backend.context(), &input)
                 .map_err(|error| error.to_string())?;
             self.decoder
-                .forward_prefill8_with_mrope(self.backend.context(), position, &rope_positions, false)
+                .forward_prefill8_with_mrope(
+                    self.backend.context(),
+                    position,
+                    &rope_positions,
+                    false,
+                )
                 .map_err(|error| error.to_string())?;
         }
         for position in tiled_tokens..prompt_tokens.len() {
@@ -530,7 +532,9 @@ impl NativeRuntime {
                 .commit_prefill8_last(self.backend.context())
                 .map_err(|error| error.to_string())?;
         }
-        self.backend.synchronize().map_err(|error| error.to_string())?;
+        self.backend
+            .synchronize()
+            .map_err(|error| error.to_string())?;
         let prefill_seconds = prefill_start.elapsed().as_secs_f64();
 
         let eos = eos_stop.then(|| self.tokenizer.eos_token_id()).flatten();
@@ -910,6 +914,13 @@ fn handle_chat(runtime: &NativeRuntime, stream: &mut TcpStream, raw: &[u8]) -> R
             )
         }
     };
+    if let Err(error) = validate_chat_sampling(&body) {
+        return send_json(
+            stream,
+            400,
+            &json!({"error":{"message":error,"type":"invalid_request"}}),
+        );
+    }
     let image_request = match parse_image_chat_input(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -933,18 +944,6 @@ fn handle_chat(runtime: &NativeRuntime, stream: &mut TcpStream, raw: &[u8]) -> R
                 stream,
                 400,
                 &json!({"error":{"message":"native multimodal v1 requires stream=false","type":"invalid_request"}}),
-            );
-        }
-        if body
-            .get("temperature")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-            != 0.0
-        {
-            return send_json(
-                stream,
-                400,
-                &json!({"error":{"message":"native multimodal v1 requires temperature=0","type":"invalid_request"}}),
             );
         }
         let python = runtime
@@ -1068,6 +1067,14 @@ fn handle_chat(runtime: &NativeRuntime, stream: &mut TcpStream, raw: &[u8]) -> R
         });
         log_generation(&id, &generation);
         send_json(stream, 200, &response)
+    }
+}
+
+fn validate_chat_sampling(body: &Value) -> Result<(), String> {
+    match body.get("temperature") {
+        None => Ok(()),
+        Some(value) if value.as_f64() == Some(0.0) => Ok(()),
+        Some(_) => Err("native Qwen3.8 chat requires numeric temperature=0".into()),
     }
 }
 
@@ -1533,10 +1540,15 @@ mod tests {
     #[test]
     fn unsupported_mode_still_fails() {
         let error = select_chat_prefill_mode(Some("unknown"), true, 1024).unwrap_err();
-        assert_eq!(
-            error,
-            "unsupported apxinf_prefill_mode `unknown`"
-        );
+        assert_eq!(error, "unsupported apxinf_prefill_mode `unknown`");
+    }
+
+    #[test]
+    fn chat_sampling_is_explicitly_greedy() {
+        assert!(validate_chat_sampling(&json!({})).is_ok());
+        assert!(validate_chat_sampling(&json!({"temperature": 0})).is_ok());
+        assert!(validate_chat_sampling(&json!({"temperature": 0.1})).is_err());
+        assert!(validate_chat_sampling(&json!({"temperature": "0"})).is_err());
     }
 }
 
