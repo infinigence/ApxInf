@@ -61,6 +61,14 @@ python scripts/pi05_openpi_websocket_server.py \
   that already speaks a fixed dialect. `--image-keys` order is significant: key
   *i* fills model view slot *i* (`base_0_rgb`, `left_wrist_0_rgb`,
   `right_wrist_0_rgb`).
+- `--num-views` serves a checkpoint with **fewer cameras than it declares** — a
+  3-view checkpoint on a 2-camera robot. The trailing view slots are dropped at
+  load time, which is numerically identical to what openpi does (it zero-pads the
+  absent view and masks it; a masked view is excluded from attention, occupies no
+  RoPE position, and the vision tower has no per-slot parameters) while skipping
+  that view's 256 patch tokens every step. It must equal the number of image
+  keys, and it is deliberately required rather than inferred, so a *forgotten*
+  camera key is an error instead of a quiet accuracy loss.
 - `--host 0.0.0.0` accepts remote clients (split deployment); `127.0.0.1` for a
   local-only test.
 - Health check: `curl http://<host>:8000/healthz` → `OK`.

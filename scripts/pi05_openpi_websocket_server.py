@@ -148,9 +148,19 @@ def parse_args() -> argparse.Namespace:
         "or 50 with --random-weights. An explicit value outranks the checkpoint "
         "(the horizon is a sequence length, not a weight dimension).",
     )
+    parser.add_argument(
+        "--num-views",
+        type=int,
+        default=None,
+        help="serve fewer cameras than the checkpoint declares (must equal the "
+        "number of image keys). Drops the trailing view slots at load time — "
+        "equivalent to openpi zero-padding and masking them, minus their patch "
+        "tokens. Required to be explicit: a short image_keys list on its own is "
+        "an error, so a forgotten camera fails instead of degrading. Also sets "
+        "the synthetic view count under --random-weights.",
+    )
     # Synthetic-shape knobs, used only with --random-weights (a checkpoint runs its
     # native config). They mirror apxinf_py.Model.random.
-    parser.add_argument("--num-views", type=int, default=None, help="random: camera views")
     parser.add_argument("--image-size", type=int, default=224, help="random: image edge")
     parser.add_argument("--num-flow-steps", type=int, default=10, help="random: flow steps")
     parser.add_argument("--max-token-len", type=int, default=200, help="random: max prompt tokens")
@@ -192,6 +202,12 @@ def main() -> None:
     image_keys = args.image_keys if args.image_keys is not None else preset.image_keys
     state_key = args.state_key if args.state_key is not None else preset.state_key
     discrete_state = preset.discrete_state if args.discrete_state is None else args.discrete_state
+    if args.num_views is not None and args.num_views != len(image_keys):
+        raise ValueError(
+            f"--num-views {args.num_views} disagrees with the {len(image_keys)} "
+            f"camera keys being served ({list(image_keys)}); they name the same "
+            "cameras, so they must match"
+        )
 
     metadata = {
         "protocol": "openpi.websocket_policy",
@@ -259,6 +275,7 @@ def main() -> None:
             state_key=state_key,
             discrete_state=discrete_state,
             action_dim=args.action_dim,
+            num_views=args.num_views,
             model_type=args.model_type,
             checkpoint=args.checkpoint,
             device=args.device,

@@ -18,11 +18,15 @@ class Model:
         precision: str = ...,
         calibration: str | None = ...,
         tactics: str | None = ...,
+        num_views: int | None = ...,
     ) -> "Model":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        ``num_views`` serves fewer cameras than the checkpoint declares (1..=its
+        own count), which is numerically equivalent to openpi padding + masking
+        the absent views but skips their patch tokens.
         """
         ...
 

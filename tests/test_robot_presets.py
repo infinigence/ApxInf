@@ -412,7 +412,35 @@ class ImageSlotOrderTest(unittest.TestCase):
                 unnormalizer=Unnormalizer(q01=[-1.0], q99=[1.0], dims=1, eps=0.0),
                 image_keys=("observation/image", "observation/wrist_image"),
             )
-        self.assertIn("3 camera views", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("3 camera views", message)
+        # Serving fewer cameras is legitimate; the error must name the way to do
+        # it rather than leaving the operator to pad with black frames.
+        self.assertIn("num_views=2", message)
+
+    def test_extra_image_keys_are_rejected_without_offering_a_fix(self) -> None:
+        # A checkpoint cannot grow a camera, so there is no num_views to suggest.
+        model = MockModel(num_views=1)
+        with self.assertRaises(ValueError) as caught:
+            Pi05Policy.default_pipelines(
+                model,
+                tokenizer=RecordingTokenizer(),
+                unnormalizer=Unnormalizer(q01=[-1.0], q99=[1.0], dims=1, eps=0.0),
+                image_keys=("observation/image", "observation/wrist_image"),
+            )
+        message = str(caught.exception)
+        self.assertNotIn("num_views=", message)
+        self.assertIn("cannot serve more cameras", message)
+
+
+    def test_num_views_disagreeing_with_a_passed_in_model_is_rejected(self) -> None:
+        # An already-loaded handle has its view count baked in, so honouring the
+        # argument is impossible; ignoring it would serve a shape nobody asked for.
+        with self.assertRaises(ValueError) as caught:
+            Pi05Policy.from_pretrained(
+                "/nonexistent", model=MockModel(num_views=3), num_views=2
+            )
+        self.assertIn("pass num_views to the load call", str(caught.exception))
 
 
 if __name__ == "__main__":

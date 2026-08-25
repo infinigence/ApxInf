@@ -143,17 +143,30 @@ class Pi05Policy:
     ) -> Tuple[Pipeline, Pipeline]:
         """Assemble the default ``(input_pipeline, output_pipeline)`` from parts.
 
-        pi05 runs the exact camera set the checkpoint declares (``model.num_views``,
-        parsed from the config's ``input_features``). The task's ``image_keys`` must
-        name precisely those cameras — no more, no fewer. Absent cameras are never
-        sent, so there is no padding: the model runs the real view shape directly.
+        pi05 runs the exact camera set the model was loaded for
+        (``model.num_views``, parsed from the config's ``input_features``). The
+        task's ``image_keys`` must name precisely those cameras — no more, no
+        fewer. Absent cameras are never sent, so there is no padding: the model
+        runs the real view shape directly.
+
+        A deployment with *fewer* cameras than the checkpoint declares is served
+        by loading with ``num_views=`` (``--num-views`` on the server), which
+        drops the trailing view slots at load time rather than zero-filling them
+        per request.
         """
         image_keys = tuple(image_keys)
         if len(image_keys) != model.num_views:
+            fix = (
+                f"load with num_views={len(image_keys)} to serve fewer cameras "
+                "than the checkpoint declares"
+                if len(image_keys) < model.num_views
+                else "a checkpoint cannot serve more cameras than it was trained on"
+            )
             raise ValueError(
                 f"Pi05Policy: model expects {model.num_views} camera views but "
                 f"{len(image_keys)} image_keys were given: {image_keys}. Supply "
-                f"exactly the checkpoint's cameras (real views only, no padding)."
+                f"exactly the loaded model's cameras (real views only, no "
+                f"padding), or {fix}."
             )
         image_pipeline = image_pipeline or Pipeline(
             [("parse", ParseImage()), ("resize", ResizeWithPad(model.image_size))]
@@ -199,6 +212,7 @@ class Pi05Policy:
         image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
         prompt_key: str = _PROMPT_KEY,
         state_key: str = _STATE_KEY,
+        num_views: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Pi05Policy":
         """Build the **default** policy from a checkpoint directory.
@@ -221,6 +235,13 @@ class Pi05Policy:
         ``norm_stats[state_norm_key]`` to map raw state to ``[-1, 1]`` before it is
         discretized into the prompt.
 
+        ``num_views`` loads the checkpoint for fewer cameras than it declares, for
+        a deployment that has fewer. It must equal ``len(image_keys)``. This drops
+        the trailing view slots at load time instead of zero-filling them per
+        request, which is numerically equivalent to openpi's padding + masking
+        (a masked view is excluded from attention, occupies no RoPE position, and
+        the vision tower has no per-slot parameters) and skips their patch tokens.
+
         For a **fully custom** pre/post chain, do not funnel it through here:
         build the parts yourself and use :meth:`default_pipelines` +
         :meth:`__init__` (or mutate ``policy.input_pipeline`` after construction).
@@ -238,6 +259,7 @@ class Pi05Policy:
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
+                **({"num_views": int(num_views)} if num_views is not None else {}),
                 sampling_seed=int(seed),
             )
         elif action_horizon is not None and int(action_horizon) != int(model.action_horizon):
@@ -247,6 +269,14 @@ class Pi05Policy:
                 f"Pi05Policy.from_pretrained: action_horizon={action_horizon} conflicts "
                 f"with the supplied model's horizon {model.action_horizon}; pass the "
                 f"override to the model constructor instead"
+            )
+        elif num_views is not None and num_views != model.num_views:
+            # An already-loaded handle has its view count baked in; silently
+            # ignoring the argument would serve a different shape than requested.
+            raise ValueError(
+                f"Pi05Policy.from_pretrained: num_views={num_views} but the model "
+                f"passed in was loaded with {model.num_views}; pass num_views to "
+                "the load call instead"
             )
 
         tokenizer = PromptTokenizer(

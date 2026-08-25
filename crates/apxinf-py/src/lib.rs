@@ -245,8 +245,17 @@ impl Model {
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
     ///   the same weights load and run at the requested chunk length.
+    /// * `num_views` — serve fewer cameras than the checkpoint declares.
+    ///
+    /// `num_views` exists because a deployment often has fewer cameras than the
+    /// checkpoint was trained with. Dropping the trailing views is numerically
+    /// equivalent to openpi zero-padding and masking them — a masked view is
+    /// excluded from attention and consumes no RoPE position, and the vision
+    /// tower has no per-slot parameters — while saving one view's worth of patch
+    /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
+    /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, sampling_seed=0))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, num_views=None, sampling_seed=0))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -255,6 +264,7 @@ impl Model {
         calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
         action_horizon: Option<usize>,
+        num_views: Option<usize>,
         sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
@@ -262,14 +272,28 @@ impl Model {
         // Only hand the loader an explicit config when the caller actually
         // overrode something; otherwise it reads `config.json` itself, exactly
         // as before.
-        let overridden = match action_horizon {
-            Some(horizon) => {
-                config.action_horizon = horizon;
-                config.validate().map_err(runtime_err)?;
-                true
+        let mut overridden = false;
+        if let Some(horizon) = action_horizon {
+            config.action_horizon = horizon;
+            overridden = true;
+        }
+        if let Some(views) = num_views {
+            if views == 0 || views > config.num_views {
+                return Err(PyValueError::new_err(format!(
+                    "apxinf_py.load: num_views={views} must be in 1..={} (the \
+                     checkpoint's view count); a checkpoint cannot serve more \
+                     cameras than it was trained on",
+                    config.num_views
+                )));
             }
-            None => false,
-        };
+            config.num_views = views;
+            overridden = true;
+        }
+        // Validate once, after every override, so a combination that is
+        // individually valid but jointly is not still fails here.
+        if overridden {
+            config.validate().map_err(runtime_err)?;
+        }
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
