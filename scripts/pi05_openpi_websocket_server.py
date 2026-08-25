@@ -227,6 +227,19 @@ def main() -> None:
         # The preset's cameras define the synthetic view count unless --num-views is
         # given explicitly, so --robot alone yields a servable synthetic engine.
         num_views = args.num_views if args.num_views is not None else len(image_keys)
+        # The synthetic tokenizer emits a fixed token stream and never reads state,
+        # so this server cannot reproduce a discrete-state preset. Say so: the
+        # published metadata is the wire contract, and silently serving
+        # discrete_state=False for a preset that declares True is precisely the
+        # mismatch --robot exists to prevent.
+        if discrete_state:
+            logging.warning(
+                "--random-weights cannot honour %s's discrete_state=True: the "
+                "synthetic tokenizer ignores state, so the served metadata will "
+                "say discrete_state=False. Use a checkpoint to preview the real "
+                "contract.",
+                preset.name,
+            )
         logging.info(
             "serving checkpoint-free %s random-weights engine (views=%d, H=%d, T=%d) "
             "— actions are latency-only",
