@@ -13,7 +13,8 @@ or Qwen3.5 checkpoint is supported.
 ## Build and inspect
 
 CUDA 12.x or 13.x and an RTX 4090-class SM89 target are required for native
-execution.
+execution. The upstream-integrated carrier was built with CUDA 12.3 and Rust
+1.97.1.
 
 ```bash
 APXINF_CUDA_ARCH=sm_89 cargo build --release --features cuda
@@ -56,11 +57,14 @@ and `prompt_tokens + completion_tokens <= max_model_len <= 32768`.
 
 ## Enable one-image requests
 
-Set `APXINF_PROCESSOR_PYTHON` to a Python environment containing a
-checkpoint-compatible `transformers`, `torch`, `Pillow`, and `numpy`, then add
-`--enable-multimodal` to the serve command. Multimodal v1 accepts exactly one
-PNG data URL in a user message, non-empty text, `temperature: 0`, and
-`stream: false`.
+Set `APXINF_PROCESSOR_PYTHON` to a checkpoint-compatible Python environment,
+then add `--enable-multimodal` to the serve command. The validated environment
+uses Python 3.10.12, Transformers 5.15.0, PyTorch 2.13.0, Pillow 12.3.0,
+NumPy 2.2.6, Tokenizers 0.22.2, Safetensors 0.8.0, and Hugging Face Hub 1.27.0.
+Older Transformers releases may construct a tokenizer-only batch without
+`pixel_values` and are rejected during a real image request. Multimodal v1
+accepts exactly one PNG data URL in a user message, non-empty text,
+`temperature: 0`, and `stream: false`.
 
 ```json
 {
