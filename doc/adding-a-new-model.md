@@ -128,8 +128,10 @@ dispatch, or captured execution.
 Preparation runs the real fixed-shape executor once, installs required native
 plans, and proves workspace capacity before capture. Configuration validation
 alone is not preparation. Keep a CPU implementation inside a layer only as a
-named correctness scaffold; it is not the preferred target path and must be
-reported as performance debt.
+named correctness scaffold with an exit criterion. For an accelerator target,
+replace it through an existing safe device path or `adding-new-kernels.md`
+before completion; a repeated host escape is unfinished implementation rather
+than ordinary best-effort optimization debt.
 
 For VLA models, include state shape, image/grid structure, masks, action horizon,
 action width, embodiment/category selection, and stochastic input shape where
@@ -203,8 +205,8 @@ the port is complete.
 
 The model has its own directory, uses the correct runtime contract, respects the
 model/backend boundary, loads through the maintained registry, passes declared
-numerical tolerances through the public path, has no unintended hot-path host
-escapes or reports them as measured performance debt, audits applicable
+numerical tolerances through the public path, has no accelerator hot-path host
+escapes unless a concrete operator blocker is recorded, audits applicable
 prepared/static/captured execution, reports functional and optimization status
 separately, reports unsupported cases clearly, and introduces no speculative
 shared abstraction. Explicit performance release gates remain mandatory;

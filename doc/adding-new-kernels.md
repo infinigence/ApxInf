@@ -26,6 +26,15 @@ The goal is not to translate the PyTorch graph node by node. The goal is to:
 - Organize Custom CUDA sources by physical operation, not by model, executor, inference stage, or precision.
 - Prefer existing operators, reshapes, and vendor libraries. Do not add a kernel for every PyTorch expression.
 - The first implementation should be correct, verifiable, and have a safe fallback. Perform fusion and tuning only after profiling.
+- A CPU fallback may serve as a temporary correctness oracle while a target
+  accelerator path is under development. After replay proves the semantics,
+  continue through safe Rust API, FFI, adapter, CUDA implementation, workspace,
+  dispatch, and target-hardware replay. Repeated model-layer D2H/H2D is not a
+  completed accelerator implementation and must not be reclassified as generic
+  performance debt merely because end-to-end values pass.
+- CUDA compilation cost affects iteration strategy, not the required execution
+  path. Batch related kernel changes, use focused compile checks where the build
+  permits, and pay the full target build when validation requires it.
 - When no matching tactic exists, an operator must use its explicitly defined safe default or return a clear unsupported error. A model-level precision policy may explicitly require calibration or tuning artifacts.
 - Kernel launchers must not call `cudaStreamSynchronize`; doing so breaks asynchronous execution and CUDA Graph capture.
 - Unsupported hardware, dtype, shape, or alignment must use a correct fallback or return a clear error. It must never silently produce an incorrect result.
@@ -180,6 +189,11 @@ Reuse an existing ApxInf operator
 ```
 
 Record the selected backend, fallback, hardware constraints, and rationale in the gap table.
+
+When the selected path is a temporary host scaffold, also record its **exit
+criterion**: the safe device API that will replace it, the required workspace
+lifetime, and the operator replay that removes the scaffold. A passing model
+fixture starts that replacement work; it does not close the gap.
 
 ## 5. Define the Safe Rust Operator Contract First
 

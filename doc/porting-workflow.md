@@ -38,15 +38,43 @@ capabilities, and CUDA toolchain. Do not infer a source revision, checkpoint
 variant, target precision, or hardware target from a similarly named branch or
 an unrelated previous experiment.
 
-If required facts remain unknown or ambiguous after that inspection, ask the
-user one concise, consolidated question. In particular, explicitly request the
-missing parts of:
+At the first user-facing preflight, ask the user to choose an execution mode:
+
+- **hands-off (recommended):** continue through every workflow stage and stop
+  only at completion, a concrete blocker, or a required approval;
+- **hands-on:** pause at named review checkpoints and ask for direction, for
+  example before committing, choosing between materially different public
+  interfaces, or accepting measured optimization debt.
+
+If the user does not select a mode but has asked the agent to implement or
+complete the port, use hands-off. Record the selected mode in the private port
+notes. A progress summary is an update, not a stopping condition in hands-off
+mode. In hands-on mode, a checkpoint pause must ask a concrete question and
+state the default action; a bare progress report is not a checkpoint. Continue
+safe read-only discovery while waiting for the mode choice.
+
+If required facts remain unknown or ambiguous after inspection, combine them
+with the mode choice in one concise question. Explicitly request the missing
+parts of:
 
 - reference source location and immutable revision;
 - checkpoint location and exact model variant;
 - target device or execution host, GPU/compute capability, and CUDA toolkit;
 - target inference dtype; and
 - mandatory correctness, latency, memory, or capture gates.
+
+Offer discovered defaults rather than presenting every blank as homework:
+
+- when no source is supplied, search the model owner's official GitHub
+  repositories and propose an immutable revision;
+- when no checkpoint is supplied, search the model owner's official
+  Hugging Face repositories and propose the exact model/revision, without
+  treating a ref or partial cache as a complete local snapshot;
+- inspect the local machine first; if it is a Thor or Orin, propose the detected
+  GPU, compute capability, CUDA toolkit, and available execution path; otherwise
+  leave the target-hardware default blank; and
+- label every proposed value as discovered and unconfirmed until the user
+  accepts it or the task already authorizes that exact target.
 
 Ask as ordinary requirements gathering and name what each missing value
 unlocks. Do not replace the question with a generic blocked-status message. A
@@ -73,6 +101,11 @@ implementation details. Present one recommended tuple and explain material
 alternatives. Record the confirmed or explicitly authorized tuple before
 implementation; never infer consent from a convenient cache or silently
 substitute a different model release.
+
+In hands-off mode, continue after every intermediate validation, build result,
+or numerical checkpoint while required completion criteria remain. Do not end
+a turn with a list of remaining work unless the same message contains a
+specific blocker or approval request that prevents that work.
 
 Keep private paths and generated evidence under the private workspace described
 in `AGENTS.md`. Do not commit model weights, captured tensors, environment
@@ -150,7 +183,7 @@ facade before consulting only the portable backend trait.
 The design must identify fusion choices, tensor lifetimes, reusable KV/state,
 workspace ownership, host transfers, and CUDA Graph eligibility. Any CPU
 implementation inside the steady-state model graph is a temporary correctness
-scaffold and must be reported as performance debt.
+scaffold. Give it a device replacement and exit criterion in the ledger.
 
 ## 6. Check kernel coverage
 
@@ -167,8 +200,9 @@ classify it as:
 Layout adaptations and device fallbacks require operator-level replay against
 captured reference tensors. A declared fallback without replay evidence is a
 kernel gap, not a passed capability. A host fallback in the hot path may satisfy
-functional correctness, but remains visible performance debt even when its
-numerical replay passes.
+an intermediate functional checkpoint, but the accelerator port remains
+unfinished until the fallback is replaced or a concrete operator blocker is
+established.
 
 When a genuine gap is found, follow
 [`adding-new-kernels.md`](adding-new-kernels.md). Hand off the operation's full
@@ -268,6 +302,9 @@ A port is complete only when:
   Graph eligibility have been audited;
 - applicable existing optimized paths have been attempted and remaining
   performance debt is itemized;
+- every accelerator hot-path correctness scaffold has been replaced by a
+  device implementation, or a concrete operator blocker names the missing
+  semantics, attempted safe interfaces, and required resolution;
 - performance is measured with the declared metric and reported independently
   from functional acceptance;
 - the repository diff contains no private or one-off experiment artifacts.

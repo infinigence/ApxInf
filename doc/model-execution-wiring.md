@@ -71,9 +71,16 @@ Host work is appropriate for checkpoint loading, one-time weight conversion,
 canonical input preprocessing, explicit calibration, and final output transfer.
 A CPU implementation inside a layer may be used briefly to establish numerical
 evidence, but it is a **correctness scaffold**. Mark the affected ledger row,
-profile its cost, and report it as performance debt until it is replaced. It
-does not invalidate functional acceptance by itself, but it must never be an
-unreported consequence of an absent backend-trait method.
+profile its cost, and use it to validate the replacement boundary. Once the
+semantics are established, resolve the row through an existing safe device
+composition or the complete [Adding New Kernels](adding-new-kernels.md) path.
+For an accelerator target, a steady-state host scaffold is not deliverable
+optimization debt: it remains unfinished implementation unless a concrete
+operator blocker makes a correct device path impossible. Long CUDA build times,
+adapter rebuild scope, or the availability of a numerically correct host path
+do not satisfy that blocker. Ordinary optimization debt may cover an unfused
+device composition, untuned tactic, or documented capture gap after the hot
+computation itself remains on the device.
 
 ## Plan tensor lifetime and reuse
 
@@ -110,7 +117,7 @@ and replayed outputs before relying on replay latency.
 Before reporting the port, provide evidence for all of the following:
 
 - every ledger row resolves to a safe device call, a named correctness
-  scaffold, or an explicit blocker;
+  scaffold that is still being replaced, or an explicit blocker;
 - every repeated adjacency has a documented fused-versus-unfused decision;
 - the steady-state host-transfer and synchronization list is empty except for
   public input/output boundaries;
@@ -134,6 +141,8 @@ Report two independent outcomes:
 Optimization is best effort unless the task explicitly defines it as a release
 gate. The agent must investigate and attempt the applicable existing paths, but
 an honest, measured performance gap does not erase a functionally correct port.
+Best effort does not waive the device-residency rule for repeated accelerator
+model computation.
 
 Only after this review should a genuinely missing row be handed to
 [Adding New Kernels](adding-new-kernels.md). That guide explains how to add a
