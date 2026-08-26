@@ -28,24 +28,51 @@ Before editing code, record outside the repository:
 - correctness tolerances and performance goals;
 - expected public API and deployment path.
 
-### Resolve missing inputs with the user
+### Discover missing inputs and ask early
+
+Treat the list above as a discovery contract, not as an assumption that the
+user has already supplied every value. Before implementation, inspect only the
+current task's allowed workspace and environment for evidence such as the
+reference checkout, checkpoint configuration, configured execution hosts, GPU
+capabilities, and CUDA toolchain. Do not infer a source revision, checkpoint
+variant, target precision, or hardware target from a similarly named branch or
+an unrelated previous experiment.
+
+If required facts remain unknown or ambiguous after that inspection, ask the
+user one concise, consolidated question. In particular, explicitly request the
+missing parts of:
+
+- reference source location and immutable revision;
+- checkpoint location and exact model variant;
+- target device or execution host, GPU/compute capability, and CUDA toolkit;
+- target inference dtype; and
+- mandatory correctness, latency, memory, or capture gates.
+
+Ask as ordinary requirements gathering and name what each missing value
+unlocks. Do not replace the question with a generic blocked-status message. A
+useful request is, for example: "To run the reference and design the CUDA path,
+please provide the reference source/revision, checkpoint, target GPU and CUDA
+environment, and inference dtype."
+
+This preflight is best effort rather than an all-or-nothing form:
+
+- continue independent repository inspection and design work while waiting
+  when it is safe and useful;
+- use an explicit user-provided value even when environment discovery suggests
+  a likely default;
+- when no performance target is supplied, pursue functional and numerical
+  acceptance first and report optimization as best effort;
+- do not require the user to repeat facts that are already available in the
+  current task or can be verified safely; and
+- report a blocker only when a specific missing fact prevents further useful
+  progress, after stating what was inspected, what operation is prevented, and
+  exactly what information or access would resolve it.
 
 The model variant, checkpoint, dtype, and target hardware are user choices, not
-implementation details. If any is missing, explicitly ask the user before
-implementation. First gather enough evidence to make the question useful:
-
-- inspect the model publisher's official GitHub repository and Hugging Face
-  organization for maintained variants, compatible checkpoints, licenses, and
-  reference precision;
-- inspect the available execution environment for GPU model, compute
-  capability, memory, CUDA toolkit, and existing official checkpoint caches;
-- compare those facts with ApxInf's currently supported devices and dtypes.
-
-Present one recommended default tuple and explain the tradeoff, plus alternatives
-when they materially change scope or feasibility. Recommendations are proposals:
-wait for the user to confirm or replace the model, checkpoint, dtype, and target
-hardware. Record the confirmed tuple before proceeding. Never infer consent from
-a convenient local cache or silently substitute a different model release.
+implementation details. Present one recommended tuple and explain material
+alternatives. Record the confirmed or explicitly authorized tuple before
+implementation; never infer consent from a convenient cache or silently
+substitute a different model release.
 
 Keep private paths and generated evidence under the private workspace described
 in `AGENTS.md`. Do not commit model weights, captured tensors, environment
