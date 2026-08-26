@@ -87,6 +87,20 @@ Portable models use `dyn Backend`. Optimized runtimes may use concrete backend
 facilities for fusion, graph capture, or transfers that should not enlarge the
 portable trait. Trait is the floor; concrete types are the ceiling.
 
+ApxInf currently concentrates on CUDA backends, and the maintained model set
+does not yet provide enough repeated fusion cases to justify a stable abstract
+interface for every high-performance composition. Following YAGNI, broadly
+useful primitive operations may live on `Backend`, while optimized CUDA model
+paths call safe model-neutral fused functions through the model directory's
+CUDA seam. This direct safe call is intentional; raw FFI remains forbidden.
+
+Revisit that boundary when multiple maintained models or hardware backends need
+the same semantic fusion and lifecycle contract. At that point, extract the
+smallest common interface supported by those implementations instead of
+forecasting variants through optional flags today. Moving a proven fusion
+behind a trait later is an architectural evolution, not a prerequisite for its
+first correct optimized use.
+
 A fused mega-kernel still lives in the backend as a kernel implementation, but
 the model chooses when its semantics match. The backend does not import the
 model type.

@@ -11,7 +11,9 @@ verification evidence agree.
 
 Before implementation, read [Adding a New Model](adding-a-new-model.md). Use
 [the model-layer architecture](model-layer-architecture.md) to decide ownership
-and refactoring boundaries. When coverage is missing, switch explicitly to
+and refactoring boundaries. Design the target device path with
+[Model Execution Wiring](model-execution-wiring.md). When coverage is missing,
+switch explicitly to
 [Adding New Kernels](adding-new-kernels.md) and return here after the kernel has
 been replayed against the original model evidence.
 
@@ -111,9 +113,22 @@ Do not approve a rewrite solely because shapes match or the final output looks
 plausible. If a supposedly canonical rewrite changes semantics, stop and report
 the gap.
 
-## 5. Check kernel coverage
+## 5. Design the target execution path
 
-For every computation required by the canonical model, classify it as:
+Before implementing the executor, build the execution ledger required by
+[Model Execution Wiring](model-execution-wiring.md). Resolve repeated semantic
+sequences against maintained optimized executors and the safe CUDA kernel
+facade before consulting only the portable backend trait.
+
+The design must identify fusion choices, tensor lifetimes, reusable KV/state,
+workspace ownership, host transfers, and CUDA Graph eligibility. Any CPU
+implementation inside the steady-state model graph is a temporary correctness
+scaffold and must be reported as performance debt.
+
+## 6. Check kernel coverage
+
+For every computation or repeated composition required by the canonical model,
+classify it as:
 
 - existing fused implementation;
 - existing primitive;
@@ -122,9 +137,11 @@ For every computation required by the canonical model, classify it as:
 - missing capability;
 - unsupported semantics.
 
-Layout adaptations and fallbacks require operator-level replay against captured
-reference tensors. A declared fallback without replay evidence is a kernel gap,
-not a passed capability.
+Layout adaptations and device fallbacks require operator-level replay against
+captured reference tensors. A declared fallback without replay evidence is a
+kernel gap, not a passed capability. A host fallback in the hot path may satisfy
+functional correctness, but remains visible performance debt even when its
+numerical replay passes.
 
 When a genuine gap is found, follow
 [`adding-new-kernels.md`](adding-new-kernels.md). Hand off the operation's full
@@ -135,7 +152,7 @@ After kernel work returns, replay it against the original model references and
 repeat coverage analysis. A returned implementation is not accepted merely
 because it builds or passes a synthetic unit test.
 
-## 6. Implement the model
+## 7. Implement the model
 
 Follow [Adding a New Model](adding-a-new-model.md), including its separate model
 directory, runtime-contract choice, and YAGNI rules. Consult
@@ -148,16 +165,16 @@ call raw CUDA, vendor libraries, or FFI directly.
 
 Prefer this order:
 
-1. reuse an existing runtime abstraction;
-2. reuse existing operators and layouts;
-3. add a model-neutral operator when semantics are genuinely missing;
-4. optimize only after correctness evidence exists.
+1. reuse the execution structure of a maintained optimized runtime;
+2. reuse matching fused safe interfaces;
+3. compose existing device primitives when fusion semantics do not match;
+4. add a model-neutral operator when semantics are genuinely missing.
 
 If implementation reveals that an earlier preflight assumption was wrong,
 return to semantic inventory or kernel coverage. Finding more work is progress,
 not completion.
 
-## 7. Verify independently
+## 8. Verify independently
 
 Verification must be runnable independently of the agent's reasoning notes.
 Use the repository's existing build, test, example, and benchmark mechanisms
@@ -171,12 +188,17 @@ Verify in increasing scope:
 3. complete deterministic inference against the reference;
 4. the public policy or serving API;
 5. requested target/precision tuples;
-6. latency and memory against stated goals.
+6. eager-versus-captured output parity;
+7. host-transfer and synchronization audit of the steady-state path;
+8. wall-clock and graph-replay latency plus memory against stated goals.
 
-Correctness gates are mandatory. Performance goals may remain explicitly
-unmet, but must not be reported as passed.
+Correctness gates are mandatory. Optimization is best effort unless the request
+explicitly declares a performance release gate. Report functional acceptance
+separately from optimization status. Unmet latency, host escapes, or capture
+gaps must include attempted reuse, measured impact where available, and the
+next concrete optimization; they must not be hidden behind a generic fallback.
 
-## 8. Prepare the review
+## 9. Prepare the review
 
 The reviewable change should contain only maintained product material:
 
@@ -215,5 +237,14 @@ A port is complete only when:
 - end-to-end output passes the declared tolerance;
 - the public deployment path has been exercised;
 - unsupported targets fail clearly;
-- performance is measured and reported honestly;
+- optimization opportunities, host escapes, static-buffer/KV reuse, and CUDA
+  Graph eligibility have been audited;
+- applicable existing optimized paths have been attempted and remaining
+  performance debt is itemized;
+- performance is measured with the declared metric and reported independently
+  from functional acceptance;
 - the repository diff contains no private or one-off experiment artifacts.
+
+When the task explicitly makes a latency, memory, or capture target a release
+gate, that target remains part of completion. Otherwise a functionally accepted
+port may finish with optimization status `best effort with performance debt`.

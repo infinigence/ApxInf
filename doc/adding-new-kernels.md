@@ -1,5 +1,12 @@
 # Workflow for Adding New Hardware, Models, and Missing Operators to ApxInf
 
+This guide covers the vertical path for a genuinely missing operator. Before
+adding one for a model port, use
+[Model Execution Wiring](model-execution-wiring.md) to check maintained fused
+interfaces, device compositions, and runtime lifetime requirements. Absence
+from the portable backend trait alone is not evidence that a CUDA capability is
+missing.
+
 This document is intended for an agent responsible for porting a working PyTorch reference model to ApxInf. It assumes that the model already runs on the target hardware and that an initial scan has identified operators, data types, shapes, or hardware implementations missing from ApxInf.
 
 The goal is not to translate the PyTorch graph node by node. The goal is to:
@@ -725,4 +732,3 @@ Final acceptance criteria:
 - Individual operator and complete model outputs agree with the PyTorch reference within the appropriate precision tolerance.
 - CUDA Graph paths perform no illegal resource creation, synchronization, or dynamic allocation.
 - Performance optimizations are supported by profiling data collected on the target hardware.
-

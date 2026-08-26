@@ -7,3 +7,6 @@ nsys/
 .DS_Store
 __pycache__/
 *.py[cod]
+
+# Local model-port worktrees
+experiment/
