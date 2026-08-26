@@ -4,6 +4,11 @@ A guide for porting a HuggingFace transformer model to ApxInf. Written
 after the Qwen3-VL-2B port; every claim here is based on what actually
 worked. See `doc/20260619-qwen3vl/` for the full case study.
 
+This doc covers the *model* side — weights, kernels, numerics. For the serving
+side of a VLA — which observation keys a client sends, how state is routed, and
+how to register a new robot — see
+[Adding an embodiment](adding-an-embodiment.md).
+
 ## One-page overview
 
 ApxInf gives you for free:

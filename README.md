@@ -453,6 +453,15 @@ subprocess), so activate the environment built in
 source .venv/bin/activate
 ```
 
+`--robot` selects the **embodiment** — the camera wire keys, the state routing,
+and the deployable action width — the way OpenPI's `serve_policy.py
+--policy.config <TrainConfig>` does. It defaults to `franka_libero`; a checkpoint
+fine-tuned for another robot must name its own preset, because a mismatch
+degrades silently rather than failing. `--help` lists every registered preset
+with its slot→key mapping. See
+[Adding an embodiment](doc/adding-an-embodiment.md) for the full launch guide and
+for how to register a new robot.
+
 Start FP8 on port 8000:
 
 ```bash
