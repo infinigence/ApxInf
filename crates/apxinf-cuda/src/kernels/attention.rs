@@ -580,6 +580,7 @@ fn fa2_attention(
             kv_heads as i32,
             head_dim as i32,
             (head_dim as f32).sqrt().recip(),
+            0i32,
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;
@@ -860,6 +861,7 @@ pub(crate) fn fa2_mqa_f16(
             1,
             q_shape[2] as i32,
             (q_shape[2] as f32).sqrt().recip(),
+            0i32,
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;

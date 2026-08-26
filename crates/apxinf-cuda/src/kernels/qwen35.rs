@@ -263,6 +263,12 @@ pub fn attention_bf16_into(
     need(ctx, "v", dev, v, l * kv_heads * hd * 2)?;
     need(ctx, "gate", dev, gate, l * heads * hd * 2)?;
     need(ctx, "out", dev, out, l * heads * hd * 2)?;
+    // TEST_FENG: FA2 causal prefill for long sequences (naive kernel
+    // stays for L<=128 where its O(L^2) cost is negligible).
+    #[cfg(apxinf_fa2_sm80)]
+    if l > 128 {
+        return attention_prefill_fa2(ctx, q, k, v, gate, out, l, heads, kv_heads, hd);
+    }
     ffi::check_cuda(unsafe {
         ffi::apxinf_qwen_attention_bf16(
             q.ptr(),
@@ -278,6 +284,49 @@ pub fn attention_bf16_into(
         )
     })
     .map_err(Error::Cuda)
+}
+
+#[cfg(apxinf_fa2_sm80)]
+#[allow(clippy::too_many_arguments)]
+fn attention_prefill_fa2(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    gate: &CudaBuffer,
+    out: &CudaBuffer,
+    l: usize,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    // Scratch for the FA2 log-sum-exp output; the vendored adapter
+    // requires a valid pointer even though we discard the values.
+    let lse = CudaBuffer::alloc(l * heads * std::mem::size_of::<f32>(), dev)
+        .map_err(Error::Other)?;
+    let softmax_scale = (hd as f32).sqrt().recip();
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_static_fa2_f16(
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            out.ptr(),
+            lse.ptr(),
+            1i32,
+            l as i32,
+            l as i32,
+            heads as i32,
+            kv_heads as i32,
+            hd as i32,
+            softmax_scale,
+            1i32, // causal prefill
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)?;
+    // Qwen3.5 gated-attention epilogue: out = sigmoid(gate) * attn.
+    sigmoid_mul_bf16_into(ctx, gate, out, out, l * heads * hd)
 }
 
 #[allow(clippy::too_many_arguments)]
