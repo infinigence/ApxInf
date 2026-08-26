@@ -93,8 +93,7 @@ VLA models remain under the separate `VlaRuntime` interface because their
 observation/action contract and generation process are not autoregressive text.
 They share `RngKey` and the backend's standard-normal generator with the
 sampling infrastructure, but continuous action latents do not pass through the
-categorical token sampler. See
-[`doc/20260819-sampling-subsystem`](20260819-sampling-subsystem/README.md).
+categorical token sampler.
 
 ## KVCache
 

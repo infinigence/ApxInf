@@ -201,7 +201,7 @@ Supported JSON fields are `max_new_tokens`, `eos_token_id` (scalar or list),
 presence penalties; unrelated Hugging Face fields are ignored.
 
 For Qwen3-VL, add `--image`. The CLI shells out to the Hugging Face processor to
-turn the image into `pixel_values` + `image_grid_thw`, so that Python environment
+turn the image into `pixel_values` + `image_gxgstrid_thw`, so that Python environment
 needs:
 
 ```bash
@@ -231,9 +231,6 @@ cargo run --release --features cuda-no-nvtx -- generate \
 
 `generate` exits non-zero when preprocessing, loading, or generation fails, so it
 is safe to chain in a script.
-
-See the [sampling subsystem documentation](doc/20260819-sampling-subsystem/README.md)
-for the sampling API and backend design.
 
 ## 5. Run PI0.5
 
