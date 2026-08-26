@@ -379,6 +379,12 @@ impl CudaQwen35 {
     }
 
     fn gemm_q4(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
+        // TEST_FENG: restore fused W4A16 decode GEMV (direct INT4 reads) for
+        // m=1; keep dequant+cuBLAS for prefill. See optimization experiment.
+        if m == 1 {
+            return k::gemm_w4a16_m1_bf16(&self.ctx, a, &q.packed, &q.scale, &q.zp, c, q.out, q.inp)
+                .map_err(|e| e.to_string());
+        }
         k::dequant_w4a16_bf16_into(&self.ctx, &q.packed, &q.scale, &q.zp, &self.ws.w_deq, q.out, q.inp)
             .map_err(|e| e.to_string())?;
         self.ctx.cublas().gemm(DType::F16, m, q.out, q.inp, 1.0f32, a, &self.ws.w_deq, 0.0f32, c)
