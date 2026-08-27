@@ -6,7 +6,7 @@ use apxinf_core::{Backend, Device, Result};
 #[cfg(not(feature = "cuda"))]
 use apxinf_core::Error;
 
-pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
+pub fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {
         Device::Cpu => Ok(Arc::new(apxinf_core::CpuBackend)),
         #[cfg(feature = "cuda")]

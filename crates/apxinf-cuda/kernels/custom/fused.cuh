@@ -72,6 +72,7 @@ __global__ void rms_norm_add_bf16_kernel(
 
 
 
+
 // ── Fused RoPE + KV cache write (bf16) for K ─────────────────────────────
 //
 // Applies 1-D rotate_half RoPE to K and writes the rotated values directly

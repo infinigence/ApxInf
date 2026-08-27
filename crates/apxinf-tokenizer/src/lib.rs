@@ -162,9 +162,17 @@ impl Tokenizer {
         let template_str = self.chat_template.as_ref()
             .ok_or_else(|| Error::Other("no chat template available (missing tokenizer_config.json with chat_template field)".to_string()))?;
 
+        // MiniJinja implements Jinja syntax but not Python string methods such
+        // as `value.startswith(...)` / `value.endswith(...)`.  Recent Qwen
+        // chat templates use those methods, so normalize the method-call spelling
+        // to filters and register exact Rust equivalents before compiling.
+        let template_source = normalize_python_string_methods(template_str);
+
         // Create environment and template on demand
         let mut env = Environment::new();
-        env.add_template("chat", template_str)
+        env.add_filter("starts_with", starts_with_filter);
+        env.add_filter("ends_with", ends_with_filter);
+        env.add_template("chat", &template_source)
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
         let tmpl = env.get_template("chat")
@@ -229,6 +237,20 @@ impl Tokenizer {
     }
 }
 
+fn normalize_python_string_methods(template: &str) -> String {
+    template
+        .replace(".startswith(", "|starts_with(")
+        .replace(".endswith(", "|ends_with(")
+}
+
+fn starts_with_filter(value: String, prefix: String) -> bool {
+    value.starts_with(&prefix)
+}
+
+fn ends_with_filter(value: String, suffix: String) -> bool {
+    value.ends_with(&suffix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +266,18 @@ mod tests {
 
         let system = ChatMessage::system("You are helpful");
         assert_eq!(system.role, "system");
+    }
+
+    #[test]
+    fn test_python_string_method_aliases_render() {
+        let template = normalize_python_string_methods(
+            "{% set content = '<tool_response>x</tool_response>' %}{{ content.startswith('<tool_response>') and content.endswith('</tool_response>') }}",
+        );
+        let mut env = Environment::new();
+        env.add_filter("starts_with", starts_with_filter);
+        env.add_filter("ends_with", ends_with_filter);
+        env.add_template("chat", &template).unwrap();
+        let rendered = env.get_template("chat").unwrap().render(()).unwrap();
+        assert_eq!(rendered, "true");
     }
 }

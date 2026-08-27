@@ -86,3 +86,72 @@ __global__ void dequantize_int32_bf16_kernel(
         column_scales[col]);
   }
 }
+
+
+
+__global__ void dequantize_w4a16_asym_bf16_kernel(
+    const int32_t* weight_packed,
+    const __nv_bfloat16* weight_scale,
+    const int32_t* weight_zero_point,
+    __nv_bfloat16* dense,
+    int in_cols,
+    int out_cols,
+    int groups) {
+  const int64_t total = static_cast<int64_t>(out_cols) * in_cols;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int packed_cols = (in_cols + 7) / 8;
+  const int group_size = (in_cols + groups - 1) / groups;
+  for (; index < total; index += stride) {
+    const int out_col = static_cast<int>(index / in_cols);
+    const int in_col = static_cast<int>(index - static_cast<int64_t>(out_col) * in_cols);
+    const int group = min(in_col / group_size, groups - 1);
+    const uint32_t word = static_cast<uint32_t>(
+        weight_packed[static_cast<int64_t>(out_col) * packed_cols + in_col / 8]);
+    const int q = static_cast<int>((word >> ((in_col & 7) * 4)) & 0xFU);
+    const int zp_row = out_col / 8;
+    const int zp_shift = (out_col & 7) * 4;
+    const uint32_t zp_word = static_cast<uint32_t>(
+        weight_zero_point[static_cast<int64_t>(zp_row) * groups + group]);
+    const int zp = static_cast<int>((zp_word >> zp_shift) & 0xFU);
+    const float scale = __bfloat162float(
+        weight_scale[static_cast<int64_t>(out_col) * groups + group]);
+    dense[index] = __float2bfloat16(static_cast<float>(q - zp) * scale);
+  }
+}
+
+__global__ void matmul_bf16_w4a16_asym_kernel(
+    const __nv_bfloat16* activation,
+    const int32_t* weight_packed,
+    const __nv_bfloat16* weight_scale,
+    const int32_t* weight_zero_point,
+    __nv_bfloat16* output,
+    int rows,
+    int in_cols,
+    int out_cols,
+    int groups) {
+  const int out_col = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (row >= rows || out_col >= out_cols) return;
+
+  const int packed_cols = (in_cols + 7) / 8;
+  const int group_size = (in_cols + groups - 1) / groups;
+  const int zp_row = out_col / 8;
+  const int zp_shift = (out_col & 7) * 4;
+  float acc = 0.0f;
+  for (int in_col = 0; in_col < in_cols; ++in_col) {
+    const int group = min(in_col / group_size, groups - 1);
+    const uint32_t word = static_cast<uint32_t>(
+        weight_packed[static_cast<int64_t>(out_col) * packed_cols + in_col / 8]);
+    const int q = static_cast<int>((word >> ((in_col & 7) * 4)) & 0xFU);
+    const uint32_t zp_word = static_cast<uint32_t>(
+        weight_zero_point[static_cast<int64_t>(zp_row) * groups + group]);
+    const int zp = static_cast<int>((zp_word >> zp_shift) & 0xFU);
+    const float scale = __bfloat162float(
+        weight_scale[static_cast<int64_t>(out_col) * groups + group]);
+    const float x = __bfloat162float(
+        activation[static_cast<int64_t>(row) * in_cols + in_col]);
+    acc += x * static_cast<float>(q - zp) * scale;
+  }
+  output[static_cast<int64_t>(row) * out_cols + out_col] = __float2bfloat16(acc);
+}

@@ -106,6 +106,7 @@ pub fn residual_add_rms_bf16_into(
     })
 }
 
+
 /// RMS normalization on CUDA. Dispatches on `input.dtype()`.
 pub fn rms(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let device_id = ctx.device_id();

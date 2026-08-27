@@ -86,6 +86,7 @@ __global__ void rms_norm_bf16_kernel(
 
 
 
+
 // ── LayerNorm (bf16) — Qwen3-VL vision tower ─────────────────────────────
 //
 // mean+variance normalization with affine transform: out = w * (x - mean) /

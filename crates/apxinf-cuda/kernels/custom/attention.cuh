@@ -366,7 +366,11 @@ __global__ void flash_attn_decode_bf16_kernel(
     const __nv_bfloat16* k_base = k_cache + kv_head * max_seq_len * HEAD_DIM;
     const __nv_bfloat16* v_base = v_cache + kv_head * max_seq_len * HEAD_DIM;
 
-    for (uint32_t t = 0; t < bucket_kv_len; t++) {
+    // The valid prefix is the complete causal domain for decode.  Do not
+    // stream the padded tail: unlike the old masked loop this avoids HBM
+    // reads of unwritten cache rows while retaining the exact online-softmax
+    // order over every visible token.
+    for (uint32_t t = 0; t < valid_len; t++) {
         // Dot product Q · K[t] (warp-reduced).
         float dot = 0.0f;
         #pragma unroll
@@ -378,12 +382,9 @@ __global__ void flash_attn_decode_bf16_kernel(
             dot += __shfl_xor_sync(0xffffffff, dot, off);
         dot *= scale;
 
-        // Mask invalid positions (t >= valid_len).
-        if (t >= valid_len) dot = -INFINITY;
-
-        // Online softmax update.
+        // Online softmax update over the causal prefix.
         float m_new = fmaxf(m, dot);
-        float p = (t < valid_len) ? expf(dot - m_new) : 0.0f;
+        float p = expf(dot - m_new);
         float exp_m = expf(m - m_new);
         l = l * exp_m + p;
         #pragma unroll

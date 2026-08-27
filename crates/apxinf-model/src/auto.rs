@@ -95,6 +95,24 @@ impl LoadedModel {
             .generate_streaming_dyn(input, max_new_tokens, &mut on_token, eos_token_id)
     }
 
+    /// Generate into reusable caller-owned token storage.
+    pub fn generate_streaming_into(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        generated: &mut Vec<u32>,
+        mut on_token: impl FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<GenerationProfile> {
+        self.text_mut()?.generate_streaming_into_dyn(
+            input,
+            max_new_tokens,
+            generated,
+            &mut on_token,
+            eos_token_id,
+        )
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         self.text_mut()?.reset();
         Ok(())

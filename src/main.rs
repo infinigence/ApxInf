@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{AutoModel, ImageInput, LlmInput, LoadOptions};
 use apxinf_tokenizer::{Tokenizer, ChatMessage};
+mod serve;
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -56,6 +57,32 @@ enum Commands {
         dtype: String,
     },
 
+    /// Start the contest inference HTTP service (GET /health, POST /v1/evaluations/generate).
+    Serve {
+        /// Path to HuggingFace model directory (config.json, safetensors, tokenizer.json)
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Bind host
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Bind port
+        #[arg(long, default_value_t = 8001)]
+        port: u16,
+
+        /// Maximum total sequence length the service accepts (prompt + completion)
+        #[arg(long, default_value_t = 65_664)]
+        max_model_len: usize,
+
+        /// Model revision reported by /health
+        #[arg(long, default_value = "63768c10df38c0395e12ef49edac1bd539eaeeea")]
+        model_revision: String,
+
+        /// Device to run inference on (cpu or cuda)
+        #[arg(short, long, default_value = "cuda")]
+        device: String,
+    },
     /// Run a quick test of the engine
     Test,
 }
@@ -65,7 +92,10 @@ fn main() {
 
     match cli.command {
         Commands::Generate { model, prompt, image, max_tokens, no_eos_stop, system, device, dtype } => {
-            let device = parse_device(&device);
+            let device = parse_device(&device).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            });
             // Report a failed generation through the exit status; a CLI that
             // printed an error and still exited 0 reads as success to any caller.
             if let Err(error) = run_generate(
@@ -82,20 +112,47 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Serve { model, host, port, max_model_len, model_revision, device } => {
+            let device = parse_device(&device).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(2);
+            });
+            if !matches!(device, Device::Cuda(_)) {
+                eprintln!("apxinf serve requires --device cuda");
+                std::process::exit(2);
+            }
+            // The CUDA backend allocates KV-cache rows up to qwen35::cuda::MAX_SEQ_LEN.
+            // Report that real capacity on /health (and use it for over-budget
+            // admission) instead of the CLI default, so the health declaration
+            // stays truthful until the backend limit is raised dynamically.
+            #[cfg(feature = "cuda")]
+            let max_model_len = max_model_len.min(apxinf_model::qwen35::cuda::MAX_SEQ_LEN);
+            #[cfg(not(feature = "cuda"))]
+            let max_model_len = max_model_len;
+            let config = serve::ServeConfig {
+                model_dir: model,
+                host,
+                port,
+                max_model_len,
+                model_revision,
+                device,
+            };
+            if let Err(error) = serve::run(config) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Test => {
             run_test();
         }
     }
 }
 
-fn parse_device(s: &str) -> Device {
+fn parse_device(s: &str) -> Result<Device, String> {
     match s.to_lowercase().as_str() {
-        "cuda" | "gpu" => Device::Cuda(0),
-        "cpu" => Device::Cpu,
-        _ => {
-            eprintln!("Unknown device '{s}', defaulting to CPU. Use 'cpu' or 'cuda'.");
-            Device::Cpu
-        }
+        "cuda" | "gpu" => Ok(Device::Cuda(0)),
+        "cpu" => Ok(Device::Cpu),
+        _ => Err(format!("unknown device '{s}'; use 'cpu' or 'cuda'")),
     }
 }
 
@@ -537,3 +594,5 @@ fn cuda_test() {
 
     println!("[CUDA] All kernel tests completed.");
 }
+
+

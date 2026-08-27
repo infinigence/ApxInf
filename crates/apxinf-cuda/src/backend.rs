@@ -1,5 +1,7 @@
 //! CUDA backend implementing the Backend trait.
 
+use std::sync::Arc;
+
 use apxinf_core::{Backend, Device, Error, Graph, KvCache, Result, Tensor};
 
 use crate::buffer::CudaBuffer;
@@ -10,7 +12,9 @@ use crate::transfers;
 use crate::CudaKVCache;
 
 struct CudaGraph {
+    // Drop the executable before releasing the stream it launches on.
     graph: crate::graph::CapturedGraph,
+    _ctx: Arc<CudaContext>,
 }
 
 impl Graph for CudaGraph {
@@ -24,13 +28,13 @@ impl Graph for CudaGraph {
 /// Implements the portable `Backend` trait. Also provides CUDA-specific
 /// extension methods via `CudaBackend` directly.
 pub struct CudaBackend {
-    ctx: CudaContext,
+    ctx: Arc<CudaContext>,
 }
 
 impl CudaBackend {
     /// Create a CUDA backend for the given device.
     pub fn new(device_id: usize) -> Result<Self> {
-        let ctx = CudaContext::new(device_id).map_err(Error::Cuda)?;
+        let ctx = Arc::new(CudaContext::new(device_id).map_err(Error::Cuda)?);
         eprintln!(
             "CUDA {}: {} (compute {}.{}, {}, {} SMs)",
             device_id,
@@ -345,6 +349,7 @@ impl Backend for CudaBackend {
     fn end_capture(&self) -> Result<Box<dyn Graph>> {
         Ok(Box::new(CudaGraph {
             graph: crate::graph::end(&self.ctx).map_err(Error::Cuda)?,
+            _ctx: Arc::clone(&self.ctx),
         }))
     }
 

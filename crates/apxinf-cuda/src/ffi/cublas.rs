@@ -132,6 +132,28 @@ extern "C" {
         head_dim: i32,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
+    pub fn cublasGemmBatchedEx(
+        handle: cublasHandle_t,
+        transa: cublasOperation_t,
+        transb: cublasOperation_t,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const c_void,
+        aarray: *const *const c_void,
+        atype: cudaDataType_t,
+        lda: i32,
+        barray: *const *const c_void,
+        btype: cudaDataType_t,
+        ldb: i32,
+        beta: *const c_void,
+        carray: *mut *mut c_void,
+        ctype: cudaDataType_t,
+        ldc: i32,
+        batch_count: i32,
+        compute_type: cublasComputeType_t,
+        algo: i32,
+    ) -> cublasStatus_t;
 }
 
 /// Check a cuBLAS call.
@@ -141,4 +163,6 @@ pub fn check_cublas(status: cublasStatus_t) -> std::result::Result<(), String> {
     } else {
         Err(format!("cuBLAS error: status {status}"))
     }
+
+
 }

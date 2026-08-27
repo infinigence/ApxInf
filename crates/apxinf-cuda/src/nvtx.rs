@@ -77,6 +77,25 @@ impl Drop for Range {
     }
 }
 
+/// Allocation-free guard for static NUL-terminated range names on hot paths.
+pub struct StaticRange;
+
+impl Drop for StaticRange {
+    fn drop(&mut self) {
+        unsafe {
+            imp::nvtxRangePop();
+        }
+    }
+}
+
+pub fn range_static(name: &'static [u8]) -> StaticRange {
+    debug_assert_eq!(name.last(), Some(&0));
+    unsafe {
+        imp::nvtxRangePushA(name.as_ptr().cast());
+    }
+    StaticRange
+}
+
 /// Convenience: `let _g = nvtx::range("name");` returns a guard that pops
 /// on drop.
 pub fn range(name: &str) -> Range {

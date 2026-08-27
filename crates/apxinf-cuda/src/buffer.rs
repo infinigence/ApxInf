@@ -27,6 +27,10 @@ impl CudaDeviceAddress {
     pub fn device(self) -> usize {
         self.device
     }
+
+    pub fn is_aligned(self, alignment: usize) -> bool {
+        alignment.is_power_of_two() && (self.ptr as usize) % alignment == 0
+    }
 }
 
 struct CudaAllocation {
@@ -197,7 +201,7 @@ impl CudaBuffer {
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
-    pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
+    pub fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);
         let handle = GpuStorageHandle {
             ptr: self.ptr as usize,
@@ -205,6 +209,39 @@ impl CudaBuffer {
             _prevent_leak: Some(Arc::new(self)),
         };
         Tensor::from_raw_parts(shape, dtype, device, Storage::Gpu { device, handle })
+    }
+
+    /// Asynchronously zero the buffer on `stream`.
+    pub fn zero_async(&self, stream: &crate::stream::CudaStream) -> Result<(), String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                0,
+                self.len,
+                stream.handle(),
+            ))
+        }
+    }
+
+    /// Asynchronously copy `bytes` from `src` (device) into this buffer.
+    pub fn copy_d2d_async(
+        &self,
+        src: &CudaBuffer,
+        bytes: usize,
+        stream: &crate::stream::CudaStream,
+    ) -> Result<(), String> {
+        if bytes > self.len || bytes > src.len {
+            return Err("CUDA D2D copy exceeds buffer size".to_string());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                src.ptr,
+                bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))
+        }
     }
 }
 
@@ -264,26 +301,62 @@ impl HostMappedBuffer {
         }
     }
 
+    /// Read one mapped u32 value back from the host side. Call after the
+    /// producing stream has synchronized.
+    pub fn read_u32(&self, index: usize) -> Result<u32, String> {
+        let offset = index
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 read offset overflow".to_string())?;
+        let end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 read size overflow".to_string())?;
+        if end > self.len {
+            return Err(format!(
+                "mapped buffer is {} bytes, read [{offset}..{end}]",
+                self.len
+            ));
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(unsafe {
+            std::ptr::read_volatile((self.host_ptr as *const u32).add(index))
+        })
+    }
+
     /// Publish one mapped u32 value to the device without exposing host raw
     /// pointers to model code.
     pub fn write_u32(&self, value: u32) -> Result<(), String> {
-        self.write_u32s(&[value])
+        self.write_u32s_at(0, &[value])
     }
 
     pub fn write_u32s(&self, values: &[u32]) -> Result<(), String> {
+        self.write_u32s_at(0, values)
+    }
+
+    /// Publish u32 values beginning at `index` without a CUDA transfer. The
+    /// mapped allocation has a stable device address suitable for graph replay.
+    pub fn write_u32s_at(&self, index: usize, values: &[u32]) -> Result<(), String> {
+        let offset = index
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 write offset overflow".to_string())?;
         let bytes = values
             .len()
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| "mapped u32 write size overflow".to_string())?;
-        if self.len < bytes {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| "mapped u32 write range overflow".to_string())?;
+        if self.len < end {
             return Err(format!(
-                "mapped buffer is {} bytes, need {}",
-                self.len, bytes
+                "mapped buffer is {} bytes, write range is [{offset}..{end}]",
+                self.len
             ));
         }
         unsafe {
-            for (index, value) in values.iter().copied().enumerate() {
-                std::ptr::write_volatile((self.host_ptr as *mut u32).add(index), value);
+            for (value_index, value) in values.iter().copied().enumerate() {
+                std::ptr::write_volatile(
+                    (self.host_ptr as *mut u32).add(index + value_index),
+                    value,
+                );
             }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

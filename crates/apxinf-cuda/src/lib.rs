@@ -33,4 +33,4 @@ pub use context::{CudaContext, CudaLibraryVersions};
 pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use kv_cache::CudaKVCache;
-pub use stream::CudaStream;
+pub use stream::{CudaEvent, CudaStream};
