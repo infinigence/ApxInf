@@ -18,7 +18,7 @@
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, Device, DType, Error, Graph, KvCache, Result, Shape, Tensor};
+use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, Shape, Tensor};
 
 use crate::accelerator::cuda::{
     kernels, Context as CudaContext, DeviceAddress,
@@ -151,21 +151,10 @@ fn weight_view(tensor: &Tensor, device_id: usize) -> Result<CudaBuffer> {
     Ok(buffer)
 }
 
-fn read_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
-    let dtype = ws.dtype;
-    let nbytes = vocab * dtype.size_in_bytes();
-    let mut host = vec![0u8; nbytes];
-    ws.logits.copy_to_host(&mut host).map_err(Error::Cuda)?;
-    match dtype {
-        DType::F32 => Tensor::from_raw(Shape::new(vec![1, vocab]), DType::F32, Device::Cpu, host),
-        DType::BF16 => {
-            let bf: Vec<half::bf16> = host.chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]])).collect();
-            let f32_data: Vec<f32> = bf.iter().map(|x| x.to_f32()).collect();
-            Tensor::from_f32(vec![1, vocab], &f32_data)
-        }
-        dtype => Err(Error::Other(format!("Qwen3-VL decode logits do not support {dtype}"))),
-    }
+fn device_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
+    ws.logits
+        .as_tensor(Shape::new(vec![1, vocab]), ws.dtype)
+        .map_err(Error::Cuda)
 }
 
 // ── Decode forward (graph body) ──────────────────────────────────────────
@@ -501,7 +490,7 @@ impl Qwen3VLDecodeGraph {
                 .map_err(Error::Cuda)?;
             decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
             backend.synchronize()?;
-            let logits = read_logits(&self.workspace, vocab)?;
+            let logits = device_logits(&self.workspace, vocab)?;
 
             backend.begin_capture_relaxed()?;
             let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
@@ -523,7 +512,8 @@ impl Qwen3VLDecodeGraph {
             .unwrap()
             .graph;
         graph.replay()?;
-        backend.synchronize()?;
-        read_logits(&self.workspace, vocab)
+        // Sampling follows on this same stream and synchronizes only when its
+        // 16-byte result is copied to the host.
+        device_logits(&self.workspace, vocab)
     }
 }

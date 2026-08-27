@@ -12,7 +12,7 @@
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, Device, DType, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
+use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
 
 use crate::accelerator::cuda::{
     kernels, Context as CudaContext, CublasTranspose,
@@ -177,24 +177,13 @@ fn write_u32_mapped(buf: &HostMappedBuffer, val: u32) {
         .expect("decode control buffer is allocated as one u32");
 }
 
-/// Read the logits row back to the CPU for sampling. Synchronous D2H — on
-/// Tegra this beats a host-mapped write (the GPU→host coherency flush for a
-/// 64 kB row costs more than the explicit copy).
-fn read_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
-    let dtype = ws.dtype();
-    let nbytes = vocab * dtype.size_in_bytes();
-    let mut host = vec![0u8; nbytes];
-    ws.logits.copy_to_host(&mut host).map_err(Error::Cuda)?;
-    match dtype {
-        DType::F32 => Tensor::from_raw(Shape::new(vec![1, vocab]), DType::F32, Device::Cpu, host),
-        DType::BF16 => {
-            // Return the bf16 bytes as-is — no f32 conversion here. The
-            // argmax in llm_trait scans bf16 directly, saving a 32k-element
-            // conversion + Vec alloc per token.
-            Tensor::from_raw(Shape::new(vec![1, vocab]), DType::BF16, Device::Cpu, host)
-        }
-        dtype => Err(Error::Other(format!("Llama decode logits do not support {dtype}"))),
-    }
+/// Borrow the fixed decode workspace's logits as a device tensor. The next
+/// decode overwrites the same allocation, so callers must sample it before
+/// advancing the model.
+fn device_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
+    ws.logits
+        .as_tensor(Shape::new(vec![1, vocab]), ws.dtype())
+        .map_err(Error::Cuda)
 }
 
 // ── Decode forward (graph body) ──────────────────────────────────────────
@@ -590,7 +579,7 @@ impl DecodeGraph {
             write_u32_mapped(&self.workspace.pos_buf, pos);
             decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
             backend.synchronize()?;
-            let logits = read_logits(&self.workspace, vocab)?;
+            let logits = device_logits(&self.workspace, vocab)?;
 
             backend.begin_capture_relaxed()?;
             let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
@@ -608,8 +597,7 @@ impl DecodeGraph {
         // use in production (loses the launch-overhead amortization).
         if std::env::var("APXINF_NO_GRAPH").map(|v| !v.is_empty()).unwrap_or(false) {
             decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
-            backend.synchronize()?;
-            return read_logits(&self.workspace, vocab);
+            return device_logits(&self.workspace, vocab);
         }
         let graph = &self
             .buckets
@@ -618,7 +606,8 @@ impl DecodeGraph {
             .unwrap()
             .graph;
         graph.replay()?;
-        backend.synchronize()?;
-        read_logits(&self.workspace, vocab)
+        // Sampling is enqueued on this same CUDA stream. Its tiny D2H result
+        // is the only synchronization needed in the steady-state loop.
+        device_logits(&self.workspace, vocab)
     }
 }

@@ -4,6 +4,7 @@ mod error;
 mod kv_cache;
 mod ops;
 mod op_impls;
+mod sampling;
 mod shape;
 pub mod storage;
 mod tensor;
@@ -13,6 +14,12 @@ pub use dtype::DType;
 pub use error::{Error, Result};
 pub use kv_cache::{CpuKVCache, KvCache};
 pub use op_impls::cpu::CpuBackend;
+pub use sampling::{
+    philox4x32_10, standard_normal_f32, uniform_f32, NextTokenLogits,
+    NormalGenerator, RngKey, SamplingBackend, TokenPenalties, TokenSample,
+    TokenSampler, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+    TokenSelection,
+};
 pub use shape::Shape;
 pub use storage::Storage;
 pub use tensor::Tensor;

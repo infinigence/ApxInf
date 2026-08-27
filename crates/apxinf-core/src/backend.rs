@@ -1,6 +1,6 @@
 //! Backend abstraction trait and Graph trait for execution capture/replay.
 
-use crate::{Device, Result, Tensor};
+use crate::{Device, Result, SamplingBackend, Tensor};
 use crate::kv_cache::KvCache;
 
 /// Backend-agnostic interface for tensor compute and device management.
@@ -11,7 +11,7 @@ use crate::kv_cache::KvCache;
 /// - Device management (transfer, cache creation)
 ///
 /// Object-safe so models can hold `dyn Backend`.
-pub trait Backend {
+pub trait Backend: SamplingBackend {
     // ── Primitive compute ops ────────────────────────────────────────
 
     /// RMS normalization: output = input * rsqrt(mean(input^2) + eps) * weight

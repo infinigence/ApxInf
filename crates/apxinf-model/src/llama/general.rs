@@ -205,11 +205,11 @@ impl LlmTrait for GeneralLlama {
         let x = self.backend.rms_norm(&x, &self.weights.output_norm_weight, self.config.rms_norm_eps)?;
         let logits = self.backend.matmul(&x, &self.weights.output_weight)?;
 
-        // Single sync per forward
-        self.backend.synchronize()?;
+        Ok(logits)
+    }
 
-        // Move logits to CPU so callers can read them for sampling.
-        self.backend.to_cpu(&logits)
+    fn backend(&self) -> &dyn Backend {
+        &*self.backend
     }
 
     #[cfg(feature = "cuda")]
@@ -249,14 +249,6 @@ impl LlmTrait for GeneralLlama {
 
     fn reset(&mut self) {
         let _ = self.kv.clear();
-    }
-
-    #[cfg(feature = "cuda")]
-    fn decode_token(&mut self, _token: u32, _pos: u32) -> Option<Result<u32>> {
-        // GPU-argmax path is disabled: the single-block argmax kernel
-        // under-occupies Thor's 14 SMs and costs more than the CPU scan.
-        // Re-enable once a multi-block 2-stage argmax lands.
-        None
     }
 
     fn vocab_size(&self) -> usize {

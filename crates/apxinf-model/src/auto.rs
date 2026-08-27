@@ -6,11 +6,16 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend;
 use crate::builtin::register_builtin_models;
-use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
+use crate::generation_config::{
+    load_generation_options, GenerationConfigSource, GenerationOptions,
+};
+use crate::llm_trait::{
+    GeneratedToken, GenerationOutput, GenerationRequest, LlmCapabilities, LlmInput, LlmTrait,
+};
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::vla::{Action, InferenceSpec, Observation, PreparedInference, VlaRuntime};
+use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,20 +52,35 @@ pub struct LoadOptions {
     pub synthetic: Option<SyntheticWeights>,
     /// Uniform FP8 activation scale, replacing a calibration file (synthetic use).
     pub uniform_fp8_scale: Option<f32>,
+    /// Source for autoregressive text/VLM generation defaults.
+    pub generation_config: GenerationConfigSource,
+    /// Deployment-level settings applied over model defaults and under each
+    /// request's explicit [`GenerationOptions`].
+    pub generation_overrides: GenerationOptions,
 }
 
 /// A loaded autoregressive language model (text-only or VLM), or a VLA model.
 /// Language generation and observation-to-action inference intentionally use
 /// separate traits.
 pub enum LoadedModel {
-    Text(Box<dyn LlmTrait>),
+    Text {
+        model: Box<dyn LlmTrait>,
+        generation_defaults: GenerationOptions,
+    },
     Vla(Box<dyn VlaRuntime>),
 }
 
 impl LoadedModel {
+    pub fn text(model: Box<dyn LlmTrait>) -> Self {
+        Self::Text {
+            model,
+            generation_defaults: GenerationOptions::default(),
+        }
+    }
+
     pub fn text_mut(&mut self) -> Result<&mut dyn LlmTrait> {
         match self {
-            Self::Text(model) => Ok(&mut **model),
+            Self::Text { model, .. } => Ok(&mut **model),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
         }
     }
@@ -68,7 +88,7 @@ impl LoadedModel {
     pub fn vla(&self) -> Result<&dyn VlaRuntime> {
         match self {
             Self::Vla(model) => Ok(&**model),
-            Self::Text(_) => Err(Error::Other("loaded model is text, not VLA".into())),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
         }
     }
 
@@ -78,8 +98,21 @@ impl LoadedModel {
 
     pub fn text_capabilities(&self) -> Result<LlmCapabilities> {
         match self {
-            Self::Text(model) => Ok(model.capabilities()),
+            Self::Text { model, .. } => Ok(model.capabilities()),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
+        }
+    }
+
+    /// Model plus deployment generation settings before request overrides.
+    pub fn generation_defaults(&self) -> Result<&GenerationOptions> {
+        match self {
+            Self::Text {
+                generation_defaults,
+                ..
+            } => Ok(generation_defaults),
+            Self::Vla(_) => Err(Error::Other(
+                "VLA models do not use autoregressive generation defaults".into(),
+            )),
         }
     }
 
@@ -91,8 +124,37 @@ impl LoadedModel {
         mut on_token: impl FnMut(u32),
         eos_token_id: Option<u32>,
     ) -> Result<(Vec<u32>, GenerationProfile)> {
-        self.text_mut()?
-            .generate_streaming_dyn(input, max_new_tokens, &mut on_token, eos_token_id)
+        let options = GenerationOptions::greedy(max_new_tokens, eos_token_id);
+        let output = self
+            .generate_streaming_with_options(input, &options, |token| on_token(token.token_id))?;
+        Ok((output.token_ids(), output.profile))
+    }
+
+    /// Sampling-aware generation for text and vision-language models.
+    pub fn generate_streaming_with_options(
+        &mut self,
+        input: LlmInput<'_>,
+        options: &GenerationOptions,
+        mut on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        match self {
+            Self::Text {
+                model,
+                generation_defaults,
+            } => {
+                let effective = GenerationOptions::apxinf_defaults()
+                    .overlay(generation_defaults)
+                    .overlay(options);
+                model.generate_streaming_with_options_dyn(
+                    GenerationRequest {
+                        input,
+                        options: &effective,
+                    },
+                    &mut on_token,
+                )
+            }
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
+        }
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -100,14 +162,14 @@ impl LoadedModel {
         Ok(())
     }
 
-    pub fn infer(&self, observation: &Observation) -> Result<Action> {
-        self.vla()?.infer(observation)
+    pub fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        self.vla()?.infer(request)
     }
 
     /// Run VLA inference and copy the action to host as `f32`. Convenience for
     /// callers that need host values without holding a backend handle.
-    pub fn infer_host_f32(&self, observation: &Observation) -> Result<Vec<f32>> {
-        self.vla()?.infer_host_f32(observation)
+    pub fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
+        self.vla()?.infer_host_f32(request)
     }
 
     pub fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
@@ -182,6 +244,19 @@ impl AutoModel {
                     "no model implementation for `{model_name}` on {device}"
                 ))
             })?;
-        factory(path, device, backend, options)
+        let mut loaded = factory(path, device, backend, options)?;
+        if let LoadedModel::Text {
+            generation_defaults,
+            ..
+        } = &mut loaded
+        {
+            let model_defaults = load_generation_options(path, &options.generation_config)?;
+            let defaults = model_defaults.overlay(&options.generation_overrides);
+            // Reject malformed model/deployment values at load time rather
+            // than waiting for the first generation request.
+            defaults.resolve()?;
+            *generation_defaults = defaults;
+        }
+        Ok(loaded)
     }
 }

@@ -592,6 +592,108 @@ fn fa2_attention(
     ))
 }
 
+#[cfg(apxinf_fa2_sm80)]
+fn fa2_splitkv_enabled(
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> bool {
+    if std::env::var_os("APXINF_DISABLE_FA2_SPLITKV").is_some() {
+        return false;
+    }
+    query_tokens <= 64
+        && key_tokens > query_tokens
+        && query_heads > kv_heads
+        && head_dim == 256
+}
+
+#[cfg(apxinf_fa2_sm80)]
+#[allow(clippy::too_many_arguments)]
+fn fa2_attention_splitkv(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let output = output_buffer(ctx, q.size_in_bytes())?;
+    let lse_elements = batches
+        .checked_mul(query_heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .ok_or_else(|| Error::Other("static inference BF16 split-KV LSE size overflow".into()))?;
+    let softmax_lse = output_buffer(
+        ctx,
+        lse_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::Other("static inference BF16 split-KV LSE overflow".into()))?,
+    )?;
+    let block_n = if head_dim <= 64 {
+        256
+    } else if head_dim <= 128 {
+        128
+    } else {
+        64
+    };
+    let max_splits = key_tokens.div_ceil(block_n).min(128);
+    let softmax_lse_accum = output_buffer(
+        ctx,
+        max_splits
+            .checked_mul(lse_elements)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                Error::Other("static inference BF16 split-KV LSE accum overflow".into())
+            })?,
+    )?;
+    let o_accum_elements = max_splits
+        .checked_mul(batches)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .and_then(|value| value.checked_mul(query_heads))
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| Error::Other("static inference BF16 split-KV O accum overflow".into()))?;
+    let o_accum = output_buffer(
+        ctx,
+        o_accum_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                Error::Other("static inference BF16 split-KV O accum byte overflow".into())
+            })?,
+    )?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_fa2_bf16_splitkv(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            softmax_lse.ptr(),
+            softmax_lse_accum.ptr(),
+            o_accum.ptr(),
+            batches as i32,
+            query_tokens as i32,
+            key_tokens as i32,
+            query_heads as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            (head_dim as f32).sqrt().recip(),
+            ctx.caps().multiprocessor_count as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        q.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 #[cfg(apxinf_cutlass_fmha)]
 fn cublas_mqa_bf16(
     ctx: &CudaContext,
@@ -649,6 +751,11 @@ pub fn mqa_bf16(
     }
     #[cfg(apxinf_fa2_sm80)]
     {
+        if fa2_splitkv_enabled(q_shape[0], key_tokens, q_shape[1], 1, q_shape[2]) {
+            return fa2_attention_splitkv(
+                ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2],
+            );
+        }
         return fa2_attention(
             ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2],
         );

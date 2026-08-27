@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::backend::{kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
 use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
+use apxinf_cuda::CudaArchFamily;
 use half::bf16 as HalfBf16;
 use kernels::{activation, cache, elementwise, embedding, gemm, norm, preprocess};
 
@@ -58,8 +59,7 @@ impl Pi05Bf16CapturedGraph {
         self.raw_image_layout
     }
 
-    fn update_noise_and_tokens(&self, token_ids: &[u32], noise: &Tensor) -> Result<()> {
-        transfers::copy_cpu_to_cuda(noise, &self.noise)?;
+    fn update_tokens(&self, token_ids: &[u32]) -> Result<()> {
         let bytes = token_ids
             .iter()
             .flat_map(|value| value.to_ne_bytes())
@@ -68,6 +68,11 @@ impl Pi05Bf16CapturedGraph {
     }
 
     pub fn update_inputs(&self, patches: &Tensor, token_ids: &[u32], noise: &Tensor) -> Result<()> {
+        self.update_inputs_without_noise(patches, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    pub fn update_inputs_without_noise(&self, patches: &Tensor, token_ids: &[u32]) -> Result<()> {
         if self.raw_images.is_some() {
             return Err(Error::Other(
                 "π0.5 BF16 graph uses raw RGB input; call update_raw_image_inputs".into(),
@@ -82,7 +87,7 @@ impl Pi05Bf16CapturedGraph {
         }
         self.backend.synchronize()?;
         transfers::copy_cpu_to_cuda(patches, &self.patches)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     pub fn update_raw_image_inputs(
@@ -90,6 +95,15 @@ impl Pi05Bf16CapturedGraph {
         images: &[u8],
         token_ids: &[u32],
         noise: &Tensor,
+    ) -> Result<()> {
+        self.update_raw_image_inputs_without_noise(images, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    pub fn update_raw_image_inputs_without_noise(
+        &self,
+        images: &[u8],
+        token_ids: &[u32],
     ) -> Result<()> {
         let raw_images = self.raw_images.as_ref().ok_or_else(|| {
             Error::Other("π0.5 BF16 graph uses patch input; call update_inputs".into())
@@ -110,7 +124,7 @@ impl Pi05Bf16CapturedGraph {
         }
         self.backend.synchronize()?;
         raw_images.copy_from_host(images).map_err(Error::Cuda)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     pub fn workspace_bytes(&self) -> usize {
@@ -153,6 +167,47 @@ impl Pi05Bf16CudaRuntime {
 
     fn ctx(&self) -> &Context {
         self.backend.context()
+    }
+
+    fn graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let mut bytes = self.config.cuda_graph_workspace_bytes_bf16(token_count)?;
+        if self.ctx().caps().arch_family == CudaArchFamily::Sm80 {
+            bytes = bytes
+                .checked_add(self.splitkv_workspace_bytes(token_count)?)
+                .ok_or_else(|| Error::Other("pi05 BF16 split-KV workspace overflow".into()))?;
+        }
+        Ok(bytes)
+    }
+
+    fn splitkv_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let patches = self.config.num_views * self.config.patches_per_view();
+        let prefix = patches
+            .checked_add(token_count)
+            .ok_or_else(|| Error::Other("pi05 split-KV prefix length overflow".into()))?;
+        let horizon = self.config.action_horizon;
+        let action = self.config.action_expert;
+        if action.num_heads <= action.num_kv_heads || action.head_dim != 256 || horizon > 64 {
+            return Ok(0);
+        }
+        let key_tokens = prefix
+            .checked_add(horizon)
+            .ok_or_else(|| Error::Other("pi05 split-KV key length overflow".into()))?;
+        let max_splits = key_tokens.div_ceil(64).min(128);
+        let lse = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV LSE workspace overflow".into()))?;
+        let output = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(action.head_dim))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV output workspace overflow".into()))?;
+        lse.checked_add(output)
+            .and_then(|value| value.checked_mul(self.config.action_expert.depth))
+            .and_then(|value| value.checked_mul(self.config.num_flow_steps))
+            .ok_or_else(|| Error::Other("pi05 split-KV workspace overflow".into()))
     }
 
     pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
@@ -473,7 +528,7 @@ impl Pi05Bf16CudaRuntime {
         let styles = self.prepare_all_styles(time_embeddings)?;
         backend.synchronize()?;
         let workspace = kernels::GraphWorkspace::new(
-            self.config.cuda_graph_workspace_bytes_bf16(token_count)?,
+            self.graph_workspace_bytes(token_count)?,
             self.ctx().device_id(),
         )?;
         let eager_output = kernels::prepare_with_workspace(&workspace, || {

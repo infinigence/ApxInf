@@ -180,8 +180,7 @@ impl Pi05CapturedGraph {
         self.raw_image_layout
     }
 
-    fn update_noise_and_tokens(&self, token_ids: &[u32], noise: &Tensor) -> Result<()> {
-        transfers::copy_cpu_to_cuda(noise, &self.noise)?;
+    fn update_tokens(&self, token_ids: &[u32]) -> Result<()> {
         let bytes = token_ids
             .iter()
             .flat_map(|value| value.to_ne_bytes())
@@ -192,6 +191,13 @@ impl Pi05CapturedGraph {
     /// Replace captured inputs while preserving every device address.
     /// `patches` and `noise` must be CPU tensors with the captured shapes.
     pub fn update_inputs(&self, patches: &Tensor, token_ids: &[u32], noise: &Tensor) -> Result<()> {
+        self.update_inputs_without_noise(patches, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    /// Replace non-random captured inputs while retaining the existing device
+    /// latent. Used when a bound device generator fills `noise` in place.
+    pub fn update_inputs_without_noise(&self, patches: &Tensor, token_ids: &[u32]) -> Result<()> {
         if self.raw_images.is_some() {
             return Err(Error::Other(
                 "π0.5 graph was captured for raw RGB input; use update_raw_image_inputs".into(),
@@ -207,7 +213,7 @@ impl Pi05CapturedGraph {
         // Do not overwrite an input while a preceding replay still reads it.
         self.backend.synchronize()?;
         transfers::copy_cpu_to_cuda(patches, &self.patches)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     /// Replace a captured raw RGB `uint8` batch and the shared prompt/noise
@@ -217,6 +223,15 @@ impl Pi05CapturedGraph {
         images: &[u8],
         token_ids: &[u32],
         noise: &Tensor,
+    ) -> Result<()> {
+        self.update_raw_image_inputs_without_noise(images, token_ids)?;
+        transfers::copy_cpu_to_cuda(noise, &self.noise)
+    }
+
+    pub fn update_raw_image_inputs_without_noise(
+        &self,
+        images: &[u8],
+        token_ids: &[u32],
     ) -> Result<()> {
         let raw_images = self.raw_images.as_ref().ok_or_else(|| {
             Error::Other("π0.5 graph was captured for FP16 patches; use update_inputs".into())
@@ -237,7 +252,7 @@ impl Pi05CapturedGraph {
         }
         self.backend.synchronize()?;
         raw_images.copy_from_host(images).map_err(Error::Cuda)?;
-        self.update_noise_and_tokens(token_ids, noise)
+        self.update_tokens(token_ids)
     }
 
     pub fn workspace_bytes(&self) -> usize {

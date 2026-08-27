@@ -1,276 +1,195 @@
 # Adding a New Model to ApxInf
 
-A guide for porting a HuggingFace transformer model to ApxInf. Written
-after the Qwen3-VL-2B port; every claim here is based on what actually
-worked. See `doc/20260619-qwen3vl/` for the full case study.
+Use this guide after the reference model runs and its semantics are understood.
+Follow [the porting workflow](porting-workflow.md) for evidence and acceptance,
+[the model-layer architecture](model-layer-architecture.md) for ownership and
+dependencies, and [the kernel guide](adding-new-kernels.md) for genuine backend
+gaps. For a VLA, [adding an embodiment](adding-an-embodiment.md) covers the
+Python-side serving contract this guide leaves to the policy layer: which
+observation keys a client sends, how state is routed, and how to register a new
+robot.
 
-## One-page overview
+## Start with a separate model directory
 
-ApxInf gives you for free:
-- A `Backend` trait (`apxinf_core::Backend`) with primitive ops: `matmul`,
-  `rms_norm`, `silu`, `add`, `mul`, `scale`, `rope`, `embedding`,
-  `sdpa_decode`, `sdpa_prefill`, `kv_append`, `to_device`, `to_cpu`,
-  `synchronize`. CUDA + CPU backends implement it.
-- A `LlmTrait` (`apxinf_model::LlmTrait`) with token-level `forward`, unified
-  text/image `prefill(LlmInput)`, and `generate_streaming`.
-- A `DecodeGraphConfig` + `DecodeGraphWeights` pattern for the
-  allocation-free decode fast path (CUDA workspace + graph capture).
-- A safetensors loader (`apxinf_loader::safetensors`) that preserves bf16
-  natively (`load_native`) or upcasts to f32 (`load`).
-- A tokenizer (`apxinf_tokenizer::Tokenizer`) with chat-template support.
+Every model implementation starts in its own directory:
 
-What you always have to write:
-- A config struct parsed from the model's `config.json`.
-- A weights struct with `from_map(HashMap<String, Tensor>)` that picks the
-  right keys and transposes 2D projections `[out, in]` → `[in, out]`.
-- A model struct implementing `LlmTrait`; multimodal models override `prefill`
-  and advertise `LlmCapabilities`.
-- A registered loader. `AutoModel` detects Hugging Face `model_type`, so the
-  shared CLI generation path does not add a model-specific decode runner.
-
-## The four-file recipe
-
-```
+```text
 crates/apxinf-model/src/<model>/
-  mod.rs         — module wiring + re-exports
-  config.rs      — <Model>Config parsed from HF config.json
-  weights.rs     — <Model>Weights with from_map() that transposes HF weights
-  general.rs     — General<Model> implementing LlmTrait
 ```
 
-For multimodal models, add:
-```
-  vision_weights.rs  — vision tower weights
-  vision.rs          — vision forward path
-```
+Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
+most code looks similar. Register the new directory from `lib.rs` and
+`builtin.rs`; keep model detection in the existing registry/`AutoModel` path.
 
-### config.rs
+The first correct implementation should be self-contained. Copying substantial
+code from the closest model is preferable to inventing a shared abstraction
+before the second implementation exposes the real common boundary. Preserve
+provenance when copying and rename model-specific concepts immediately.
 
-Parse the HF `config.json` directly with `serde_json`. Do NOT reuse
-`apxinf_loader::ModelConfig` — it's Llama-shaped and won't fit models with
-nested configs (like Qwen3-VL's `text_config` / `vision_config`).
+## Choose the runtime contract
 
-```rust
-pub struct MyConfig {
-    pub hidden_size: usize,
-    pub n_layers: usize,
-    // ...
-}
+### LLM and VLM
 
-impl MyConfig {
-    pub fn from_json_file(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        let v: serde_json::Value = serde_json::from_str(&raw)?;
-        Ok(Self {
-            hidden_size: v["hidden_size"].as_u64().unwrap_or(2048) as usize,
-            // ...
-        })
-    }
-}
+Autoregressive text models and vision-language models implement `LlmTrait`.
+VLMs use `LlmInput` and override `prefill` for processor output, image-token
+placement, multimodal positions, or other model-specific input semantics. They
+reuse the shared token generation and sampling pipeline.
+
+A small model commonly starts with:
+
+```text
+<model>/
+  mod.rs
+  config.rs
+  weights.rs
+  general.rs
 ```
 
-Add a unit test that parses a minimal config string — catches JSON
-schema mismatches early.
+Add files such as `vision.rs`, `vision_weights.rs`, or `decode_graph.rs` only
+when the architecture requires them.
 
-### weights.rs
+### VLA
 
-`from_map` takes a `HashMap<String, Tensor>` (from the safetensors loader)
-and picks out the model's keys. HF stores 2D Linear weights as
-`[out_features, in_features]`; cuBLAS row-major matmul wants
-`[in_features, out_features]`, so transpose every 2D projection.
+VLA models implement `VlaRuntime`; they do not use the categorical token
+generation loop. Their public contract is an observation-to-action inference
+path with model-specific state, image, language, noise, schedule, and action
+semantics.
 
-```rust
-pub fn from_map(cfg: &MyConfig, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
-    let take = |name: &str, m: &mut HashMap<String, Tensor>| -> Result<Tensor> {
-        m.remove(name).ok_or_else(|| Error::Other(format!("missing {name}")))
-    };
-    // ...
-    Ok(Self { /* ... */ })
-}
+PI0.5 is the maintained structural reference:
 
-fn transpose_2d(t: &Tensor) -> Result<Tensor> {
-    // [rows, cols] → [cols, rows], handles both F32 and BF16
-}
+```text
+pi05/
+  mod.rs                 module wiring and deliberate exports
+  backend.rs             the model's only CUDA-facing seam
+  config.rs              checkpoint and execution configuration
+  weights.rs             source checkpoint representation
+  *_weights.rs           device/precision-specific weight forms
+  math.rs                model mathematics without device ownership
+  schedule.rs            denoising/execution schedule
+  *_executor.rs          one precision's layer composition
+  *_runtime.rs           device state, workspace and captured execution
+  vla_runtime.rs         VlaRuntime adapter and registered loader
 ```
 
-**Gotcha:** if a weight is 4D/5D (e.g. a Conv3d weight
-`[out, in, k_t, k_h, k_w]`), reshape to 2D `[out, in*k_t*k_h*k_w]` first,
-then transpose. The reshape must flatten in C-contiguous order matching
-how the input is laid out.
+Create the new model's own directory and equivalent responsibilities. Do not
+place its state encoder, action decoder, denoising schedule, embodiment logic,
+or workspace inside `pi05/`. A first version may copy PI0.5 runtime or executor
+structure extensively; correctness and isolation are the initial goal.
 
-### general.rs
+Python preprocessing, normalization, policy metadata, and action
+postprocessing belong in the Python policy layer. Rust model code receives the
+canonical tensors and owns model structure, weights, and execution.
 
-The model struct holds the config, weights (on the backend's device),
-backend, and KV cache. The `forward` method runs the transformer layers
-via `dyn Backend` ops.
+## Implement by responsibility
 
-```rust
-pub struct GeneralMyModel {
-    config: MyConfig,
-    weights: MyWeights,
-    backend: Box<dyn Backend>,
-    kv: Box<dyn KvCache>,
-}
+### Configuration
 
-impl LlmTrait for GeneralMyModel {
-    fn forward(&mut self, token_ids: &[u32], start_pos: u32) -> Result<Tensor> {
-        let x = self.backend.embedding(&self.weights.token_embedding, token_ids)?;
-        let mut x = x;
-        for i in 0..self.config.n_layers {
-            x = self.forward_layer(&x, i, start_pos)?;
-        }
-        self.kv.advance(seq_len);
-        let x = self.backend.rms_norm(&x, &self.weights.norm, eps)?;
-        let logits = self.backend.matmul(&x, &self.weights.lm_head)?;
-        self.backend.synchronize()?;
-        self.backend.to_cpu(&logits)
-    }
-}
-```
+Parse the reference checkpoint configuration without forcing it into a
+Llama-shaped shared config. Validate dimensions and architecture invariants at
+load time. Defaults are acceptable only when the reference format defines the
+same defaults.
 
-**Key pattern:** borrow only `self.weights` (immutable) when building the
-`DecodeGraphWeights` view, so it can coexist with the `&mut self.kv`
-borrow for the KV cache.
+### Weights
 
-### CLI wiring (src/main.rs)
+Map checkpoint keys explicitly. Record every transpose, reshape, concatenation,
+packing operation, tied weight, and precision conversion. Hugging Face linear
+weights commonly require `[out, in]` to `[in, out]` transposition, while
+higher-rank convolutional weights require semantics-aware flattening.
 
-Add a `model_type` check in `run_generate` that routes to your model:
+Keep source weights, device weights, and precision-specific packed weights as
+separate concepts when their lifecycles differ. Perform stable transformations
+once during load, not in every inference.
 
-```rust
-let model_type = read_model_type(model_dir).unwrap_or_default();
-if model_type == "my_model_type" {
-    return run_generate_my_model(model_dir, prompt, ...);
-}
-```
+### Model mathematics
 
-`read_model_type` reads `config.json` and returns the `model_type` field.
+Express the architecture as model-level composition of safe backend operators.
+The model owns layer ordering, residual structure, attention layout, schedules,
+and fusion selection. The backend owns device management and individual kernel
+APIs; it never imports model types.
 
-## Decision tree: does my model need new kernels?
+Use `backend.rs` as the model directory's CUDA seam when the implementation
+needs concrete CUDA facilities. Portable operations use `dyn Backend`; a
+specialized fast path may recover a concrete backend for capabilities that do
+not belong on the portable trait. Trait is the floor; concrete types are the
+ceiling.
 
-Before adding a new CUDA kernel, check if you can spell it with existing
-ops + a reshape:
+### Execution and preparation
 
-1. **RMSNorm** — `rms_norm(input, weight, eps)`. If the model uses
-   LayerNorm instead, you need a new `layer_norm_bf16` kernel (has bias +
-   mean subtraction).
-2. **RoPE** — `rope(input, n_heads, head_dim, theta, pos_offset)` does
-   1-D rotate_half. If the model uses a different rotation (interleaved
-   pairs, mRoPE, 2D vision RoPE), you need a new kernel.
-3. **Attention** — `sdpa_decode` / `sdpa_prefill` handle Llama-style
-   GQA with causal masking. If the model uses non-causal attention
-   (vision tower) or a different head layout, you need a new kernel.
-4. **Activation** — `silu` is built-in. For GELU-tanh, you need a new
-   kernel. For SwiGLU, it's `silu(gate) * up` composed from `silu` +
-   `mul`.
-5. **QK-norm** — Don't add a new op. Reshape `[seq, heads, head_dim]` to
-   `[seq * heads, head_dim]` and call `rms_norm` with the 128-d weight.
-6. **Bias addition** — Linear layers with bias need `add_bias` (broadcast
-   a `[cols]` vector over `[rows, cols]`). Llama doesn't have biases;
-   Qwen3-VL vision does.
+Separate reusable mathematics from execution state. A runtime may own device
+weights, caches, workspaces, CUDA graphs, and shape-specific preparation. A
+prepared object must bind every shape or condition that changes allocation,
+dispatch, or captured execution.
 
-The bar for adding a new kernel: **is there any way to express this with
-existing kernels + a reshape?** If yes, don't add the kernel.
+For VLA models, include state shape, image/grid structure, masks, action horizon,
+action width, embodiment/category selection, and stochastic input shape where
+they affect execution.
 
-## Verification recipe
+### Registration and public integration
 
-Set the local HuggingFace model directories used by the reference and debug
-tools. When running a single `--only` target, only its corresponding variable
-is required.
+Register the loader under stable model identifiers. Ensure the normal
+`AutoModel` or `VlaRuntime` entry point can load the checkpoint; a private
+example binary is not a deployment integration.
 
-```bash
-export APXINF_TINYLLAMA_MODEL_DIR=/path/to/TinyLlama-1.1B-Chat-v1.0
-export APXINF_QWEN3VL_MODEL_DIR=/path/to/Qwen3-VL-2B-Instruct
-```
+Expose Python policy support only after the Rust runtime contract is stable.
+Keep preprocessing and postprocessing outside the low-level runtime.
 
-### 1. Write an HF reference dump script
+## YAGNI and refactoring
 
-`scripts/hf_reference_dump.py` loads the model in HuggingFace
-transformers, runs a fixed prompt, and saves intermediate activations +
-greedy tokens as `.npz` files under `tests/<model>_reference/`.
+Apply YAGNI when any of these is true:
 
-Capture:
-- Input token IDs
-- Post-embedding (last position)
-- Per-layer hidden state at layers 0 / mid / last (last position only —
-  keeps files small)
-- Post-final-norm
-- Full logits (last position)
-- First 10 greedy token IDs
+- only one maintained model needs the behavior;
+- the apparent commonality is based on names rather than identical semantics;
+- a second model is still experimental or its shapes and lifecycle are unknown;
+- the proposed abstraction would add optional fields, family branches, or a
+  configuration language for hypothetical users;
+- copying keeps failures local and makes reference comparison easier.
 
-Use bf16 for the HF model and dump activations as f32 (numpy doesn't
-have native bf16 — **never label bf16 bytes as `'<f2'` in .npy files,
-that's float16, a different format**).
+In those cases, keep the implementation in the model directory. Duplication is
+an explicit temporary design choice, not an invitation to hide it in the
+backend.
 
-### 2. Diff ApxInf's output against the reference
+Consider refactoring only when:
 
-Write an example binary (`crates/apxinf-model/examples/<model>_check.rs`)
-that loads the model, runs the forward, and either:
-- Saves intermediate tensors as `.npy` for Python comparison, or
-- Directly compares greedy tokens against the reference.
+- at least two maintained models contain the same stable semantics;
+- both implementations have independent correctness evidence;
+- the shared dependency direction is model → model-neutral helper/backend;
+- the extracted API has fewer concepts than either caller and needs no
+  model-family switch;
+- changes to one copy repeatedly require the identical change in the other.
 
-The correctness gate: **first 10 greedy tokens must exactly match HF.**
+Extract the smallest proven seam. Good candidates are pure tensor
+transformations, checkpoint utilities with identical formats, or genuinely
+model-neutral operators. Schedules, layer topology, workspace layouts, and
+precision dispatch normally remain model-specific until repeated evidence says
+otherwise.
 
-### 3. Debug per-layer, not end-to-end
+## Kernel decisions
 
-If the final output is wrong, dump intermediate states at every layer and
-compare against HF. A max_abs divergence at layer 0 tells you the bug is
-in embedding/RoPE/QK-norm. A divergence that starts at layer 5 tells you
-the bug is in attention or MLP. End-to-end token comparison is too weak
-to localize bugs.
+Try existing operators and reshapes first. A missing dtype, layout, shape, mask,
+or semantic variant may require backend work, but the new API must be
+model-neutral. Follow [Adding New Kernels](adding-new-kernels.md) and return to
+the original model references for operator replay.
 
-## Gotchas we hit
+## Verification
 
-1. **`.npy` dtype mismatch.** Writing bf16 bytes with `'descr': '<f2'`
-   (numpy float16) silently corrupts every value — bf16 and float16 have
-   different exponent/mantissa layouts. Always write f32 (`'<f4'`) for
-   debug dumps.
-2. **`__shfl_xor_sync` with full mask deadlocks on partial warps.** If
-   some threads exit a strided loop early, the remaining threads calling
-   `__shfl_xor_sync(0xffffffff, ...)` hang. Fix: make the loop non-strided
-   (all threads iterate every element) or use `__activemask()` for the
-   reduction.
-3. **Tied embeddings need a transposed copy.** `token_embedding` is
-   `[vocab, hidden]`; the lm_head matmul needs `[hidden, vocab]`. Cache
-   the transpose at load time — doing it per forward is catastrophic
-   (622 MB for Qwen3-VL).
-4. **mRoPE position IDs are not linear.** Image tokens share 2D grid
-   positions, so after the image the linear position diverges from the
-   mRoPE position by `rope_delta`. Decode tokens must use
-   `linear_pos + rope_delta` for RoPE, or generation diverges after the
-   first token.
-5. **`--features cuda` is not on `apxinf-cuda`.** The crate always builds
-   against CUDA. Run tests as `cargo test -p apxinf-cuda` (no flags).
-6. **Kernel launchers must not call `cudaStreamSynchronize`.** It breaks
-   CUDA Graph capture and slows the non-graph path. Push sync to the
-   caller boundary.
-7. **Deepstack injection is at LLM layers 0, 1, 2 — not at the vision
-   `deepstack_visual_indexes` [5, 11, 17].** The vision indexes specify
-   which VISION blocks produce the embeddings; the LLM injection is at
-   the first N LLM layers (where N = number of deepstack embeddings).
+Verify progressively:
 
-## Layering rules
+1. configuration and checkpoint identity;
+2. every weight transformation;
+3. representative operator and layer checkpoints;
+4. full deterministic output against the reference;
+5. registered Rust loading path;
+6. Python policy or serving path when in scope;
+7. requested device and precision combinations;
+8. latency and memory, reported separately from correctness.
 
-1. **Trait is the floor; concrete types are the ceiling.** Portable
-   models use `dyn Backend`. Specialized models can downcast to
-   `CudaBackend` for extra perf (e.g. batched GEMM).
-2. **Layering is strict: model → backend, never backend → model.** The
-   `DecodeGraphConfig` (primitives) + `DecodeGraphWeights` (`&Tensor`
-   refs) pattern exists so the backend runs a decode without importing
-   model types.
-3. **Verify against reference every step, not at the end.** Per-layer
-   dumps catch bugs in one step; final-token comparison is too weak.
-4. **Reuse the primitives; don't re-invent them per model.** QK-norm is
-   `rms_norm` on a reshape. The bar for adding a new kernel: is there any
-   way to express this with existing kernels + a reshape?
-5. **BF16 is storage/compute default; fp32 is for reductions and
-   sampling.** Weights: bf16. Activations: bf16. RMSNorm variance sum:
-   fp32 accumulator. Final logits: fp32 (for greedy + sampling precision).
+Temporary capture and replay programs belong in the private port workspace.
+Commit only maintained product tests or examples whose purpose remains after
+the port is complete.
 
-## Concrete example
+## Completion criteria
 
-The Qwen3-VL port is the reference implementation. See:
-- `crates/apxinf-model/src/qwen3vl/` — the four-file recipe (+ vision)
-- `crates/apxinf-model/examples/multimodal_check.rs` — verification tool
-- `scripts/hf_reference_dump.py` — reference dump script
-- `doc/20260619-qwen3vl/results.md` — verification numbers
-- `doc/20260619-qwen3vl/notes.md` — live diary of decisions + bugs
+The model has its own directory, uses the correct runtime contract, respects the
+model/backend boundary, loads through the maintained registry, passes declared
+numerical tolerances through the public path, reports unsupported cases
+clearly, and introduces no speculative shared abstraction.

@@ -102,11 +102,16 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
 
+fn is_cutlass_sm89_family(arch: &str) -> bool {
+    matches!(arch, "sm_89")
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(nvtx_v2)");
     println!("cargo:rustc-check-cfg=cfg(nvtx_v3)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_fmha)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_gemm)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_bf16_sm89)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
@@ -256,6 +261,7 @@ fn main() {
             // the stable C ABI.
             let mut kernel_files = vec![
                 std::path::Path::new(&adapters_dir).join("core_kernels_adapter.cu"),
+                std::path::Path::new(&adapters_dir).join("sampling_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("static_bf16_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("w8a8_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("custom_kernels.cu"),
@@ -275,10 +281,13 @@ fn main() {
             let cutlass_bf16_operator = cutlass_root.join("bf16_gemm_sm100.cu");
             let cutlass_bf16_dual_operator = cutlass_root.join("bf16_dual_geglu_sm100.cu");
             let cutlass_bf16_header = cutlass_root.join("bf16_operators_sm100.h");
+            let cutlass_bf16_sm89_operator = cutlass_root.join("bf16_gemm_sm89.cu");
+            let cutlass_bf16_sm89_header = cutlass_root.join("bf16_operators_sm89.h");
             let cutlass_int8_operator = cutlass_root.join("w8a8_gemm_sm80.cu");
             let cutlass_fmha = std::path::Path::new(&adapters_dir).join("cutlass_fmha_adapter.cu");
             let cutlass_gemm = std::path::Path::new(&adapters_dir).join("cutlass_fp8_adapter.cu");
             let cutlass_bf16 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_adapter.cu");
+            let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
@@ -316,6 +325,28 @@ fn main() {
                 println!("cargo:rustc-cfg=apxinf_cutlass_gemm");
                 println!("cargo:rustc-cfg=apxinf_cutlass_fmha");
                 emit_rerun_if_changed_tree(&cutlass_root);
+            }
+
+            if cutlass_arch.as_deref().is_some_and(is_cutlass_sm89_family) {
+                let cutlass = cutlass_root.join("include");
+                let cutlass_utils = cutlass_root.join("tools/util/include");
+                assert!(
+                    cutlass_bf16_sm89_operator.is_file()
+                        && cutlass_bf16_sm89_header.is_file()
+                        && cutlass_bf16_sm89.is_file()
+                        && cutlass.is_dir()
+                        && cutlass_utils.is_dir(),
+                    "CUTLASS BF16 SM89 adapter or headers are missing under {}",
+                    cutlass_root.display()
+                );
+                cutlass_includes.extend([cutlass_root.clone(), cutlass, cutlass_utils]);
+                kernel_files.extend([
+                    cutlass_bf16_sm89_operator.clone(),
+                    cutlass_bf16_sm89.clone(),
+                ]);
+                println!("cargo:rustc-cfg=apxinf_cutlass_bf16_sm89");
+                emit_rerun_if_changed_tree(&cutlass_root);
+                emit_rerun_if_changed_tree(std::path::Path::new(&adapters_dir));
             }
 
             let mut cutlass_int8_includes = Vec::new();
@@ -378,6 +409,16 @@ fn main() {
                     fa2_f16_hdim96,
                     fa2_f16_hdim256,
                 ]);
+                if fa2_sm80 {
+                    let fa2_split_hdim256 =
+                        fa2_root.join("flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu");
+                    assert!(
+                        fa2_split_hdim256.is_file(),
+                        "vendored FlashAttention-2 split-KV source is incomplete under {}",
+                        fa2_root.display()
+                    );
+                    fa2_sources.push(fa2_split_hdim256);
+                }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
                     let direct_operator = cutlass_root.join("fa2_f16_e4m3_sm100.cu");
@@ -430,6 +471,8 @@ fn main() {
                         || entry == &cutlass_fp8_dual_operator
                         || entry == &cutlass_bf16_operator
                         || entry == &cutlass_bf16_dual_operator
+                        || entry == &cutlass_bf16_sm89_operator
+                        || entry == &cutlass_bf16_sm89
                         || entry == &cutlass_gemm
                         || entry == &cutlass_bf16
                     {
@@ -450,6 +493,8 @@ fn main() {
                         || entry == &cutlass_fp8_dual_operator
                         || entry == &cutlass_bf16_operator
                         || entry == &cutlass_bf16_dual_operator
+                        || entry == &cutlass_bf16_sm89_operator
+                        || entry == &cutlass_bf16_sm89
                         || entry == &cutlass_gemm
                         || entry == &cutlass_bf16
                     {
@@ -483,6 +528,9 @@ fn main() {
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2",
                         ]);
+                        if fa2_sm80 {
+                            cmd.arg("-DAPXINF_FA2_SM80=1");
+                        }
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }

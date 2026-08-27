@@ -16,6 +16,7 @@ nvtx = []
 apxinf-core = { path = "../apxinf-core" }
 thiserror = "1"
 half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
 serde_json = "1"
 
 [build-dependencies]

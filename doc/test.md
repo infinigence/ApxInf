@@ -237,7 +237,7 @@ Model ready.
 Prompt: Once upon a time
 Prompt tokens: [9682, 682, 451, 825]
 
-Generating 50 tokens...
+Generating up to 50 tokens...
 
 Output: Once upon a time...
 ```
@@ -246,5 +246,9 @@ Output: Once upon a time...
 
 - The model runs on CPU by default
 - Build with `--features cuda` and select `--device cuda` for NVIDIA GPU inference
-- Uses greedy decoding (argmax) for token selection
-- Output quality can be improved with temperature/top-p sampling (not yet implemented)
+- Loads model defaults from `generation_config.json`; missing settings retain
+  deterministic greedy compatibility behavior. `--generation-config apxinf`
+  ignores model defaults.
+- `--sample` enables backend sampling with temperature, top-k, top-p,
+  repetition/frequency/presence penalties, and a reproducible seed. On CUDA,
+  the logits pipeline stays on the GPU and returns only the sampled result.

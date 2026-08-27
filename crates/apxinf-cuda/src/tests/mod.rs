@@ -1,6 +1,7 @@
 mod bf16;
 mod fp8;
 mod operators;
+mod sampling;
 mod w8a8;
 
 /// Serializes tests that configure large dynamic shared memory on the GPU.

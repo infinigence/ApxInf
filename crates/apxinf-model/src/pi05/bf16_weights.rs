@@ -14,6 +14,9 @@ pub struct Bf16LinearWeights {
     /// Optional auto-mode `[gate256,up256]` matrix. The primary tensor remains
     /// plain for every non-dual route and for the explicit control mode.
     pub bf16_dual_geglu_auto_interleaved: Option<Tensor>,
+    /// Optional `[gate,up]` column-pair layout consumed by the SM89 CUTLASS
+    /// visitor GeGLU epilogue.
+    pub bf16_sm89_geglu_interleaved: Option<Tensor>,
     pub bias: Option<Tensor>,
 }
 
@@ -77,6 +80,17 @@ impl Bf16LinearWeights {
             } else {
                 None
             };
+        let bf16_sm89_geglu_interleaved = if allow_dual_layout
+            && linears.len() == 2
+            && bf16_dual_geglu_mode != Bf16DualGeGluMode::Off
+        {
+            Some(bf16_to_device(
+                &interleave_gate_up_host(&linears[0].weight, &linears[1].weight, 1)?,
+                backend,
+            )?)
+        } else {
+            None
+        };
         let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
             None
         } else if linears.iter().all(|linear| linear.bias.is_some()) {
@@ -96,6 +110,7 @@ impl Bf16LinearWeights {
             weight,
             bf16_dual_geglu_interleaved,
             bf16_dual_geglu_auto_interleaved,
+            bf16_sm89_geglu_interleaved,
             bias,
         })
     }

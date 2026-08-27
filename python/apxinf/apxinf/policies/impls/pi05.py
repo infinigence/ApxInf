@@ -64,6 +64,8 @@ from ...processors.transforms import (
     RGB,
     TOKEN_IDS,
     Unnormalize,
+    has_key,
+    lookup_key,
 )
 from ..registry import register_policy
 
@@ -115,6 +117,8 @@ class Pi05Policy:
             "num_views": model.num_views,
             "image_size": [model.image_size, model.image_size],
             "image_keys": list(self.image_keys),
+            "state_key": self.state_key,
+            "prompt_key": self.prompt_key,
             "discrete_state": self.discrete_state,
             "state_normalized": state_normalized,
             "input_pipeline": input_pipeline.names,
@@ -139,30 +143,44 @@ class Pi05Policy:
     ) -> Tuple[Pipeline, Pipeline]:
         """Assemble the default ``(input_pipeline, output_pipeline)`` from parts.
 
-        pi05 runs the exact camera set the checkpoint declares (``model.num_views``,
-        parsed from the config's ``input_features``). The task's ``image_keys`` must
-        name precisely those cameras — no more, no fewer. Absent cameras are never
-        sent, so there is no padding: the model runs the real view shape directly.
+        pi05 runs the exact camera set the model was loaded for
+        (``model.num_views``, parsed from the config's ``input_features``). The
+        task's ``image_keys`` must name precisely those cameras — no more, no
+        fewer. Absent cameras are never sent, so there is no padding: the model
+        runs the real view shape directly.
+
+        A deployment with *fewer* cameras than the checkpoint declares is served
+        by loading with ``num_views=`` (``--num-views`` on the server), which
+        drops the trailing view slots at load time rather than zero-filling them
+        per request.
         """
         image_keys = tuple(image_keys)
         if len(image_keys) != model.num_views:
+            fix = (
+                f"load with num_views={len(image_keys)} to serve fewer cameras "
+                "than the checkpoint declares"
+                if len(image_keys) < model.num_views
+                else "a checkpoint cannot serve more cameras than it was trained on"
+            )
             raise ValueError(
                 f"Pi05Policy: model expects {model.num_views} camera views but "
                 f"{len(image_keys)} image_keys were given: {image_keys}. Supply "
-                f"exactly the checkpoint's cameras (real views only, no padding)."
+                f"exactly the loaded model's cameras (real views only, no "
+                f"padding), or {fix}."
             )
         image_pipeline = image_pipeline or Pipeline(
             [("parse", ParseImage()), ("resize", ResizeWithPad(model.image_size))]
         )
-        noise = noise or GaussianNoise(model.action_horizon, model.action_dim)
-
-        input_pipeline = Pipeline(
-            [
-                ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
-                ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
-                ("sample_noise", SampleNoise(noise)),
-            ]
-        )
+        input_steps = [
+            ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
+            ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
+        ]
+        # The default leaves noise absent so the binding fills the stable latent
+        # buffer with its backend-native generator. Supplying an explicit sampler
+        # preserves the old host-generated/custom-processor path.
+        if noise is not None:
+            input_steps.append(("sample_noise", SampleNoise(noise)))
+        input_pipeline = Pipeline(input_steps)
         output_pipeline = Pipeline(
             [
                 ("trim", Trim(unnormalizer.width)),
@@ -194,6 +212,7 @@ class Pi05Policy:
         image_keys: Sequence[str] = _DEFAULT_IMAGE_KEYS,
         prompt_key: str = _PROMPT_KEY,
         state_key: str = _STATE_KEY,
+        num_views: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Pi05Policy":
         """Build the **default** policy from a checkpoint directory.
@@ -216,6 +235,13 @@ class Pi05Policy:
         ``norm_stats[state_norm_key]`` to map raw state to ``[-1, 1]`` before it is
         discretized into the prompt.
 
+        ``num_views`` loads the checkpoint for fewer cameras than it declares, for
+        a deployment that has fewer. It must equal ``len(image_keys)``. This drops
+        the trailing view slots at load time instead of zero-filling them per
+        request, which is numerically equivalent to openpi's padding + masking
+        (a masked view is excluded from attention, occupies no RoPE position, and
+        the vision tower has no per-slot parameters) and skips their patch tokens.
+
         For a **fully custom** pre/post chain, do not funnel it through here:
         build the parts yourself and use :meth:`default_pipelines` +
         :meth:`__init__` (or mutate ``policy.input_pipeline`` after construction).
@@ -233,6 +259,8 @@ class Pi05Policy:
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
+                **({"num_views": int(num_views)} if num_views is not None else {}),
+                sampling_seed=int(seed),
             )
         elif action_horizon is not None and int(action_horizon) != int(model.action_horizon):
             # A pre-built model carries its own horizon; silently ignoring the
@@ -241,6 +269,14 @@ class Pi05Policy:
                 f"Pi05Policy.from_pretrained: action_horizon={action_horizon} conflicts "
                 f"with the supplied model's horizon {model.action_horizon}; pass the "
                 f"override to the model constructor instead"
+            )
+        elif num_views is not None and num_views != model.num_views:
+            # An already-loaded handle has its view count baked in; silently
+            # ignoring the argument would serve a different shape than requested.
+            raise ValueError(
+                f"Pi05Policy.from_pretrained: num_views={num_views} but the model "
+                f"passed in was loaded with {model.num_views}; pass num_views to "
+                "the load call instead"
             )
 
         tokenizer = PromptTokenizer(
@@ -252,14 +288,15 @@ class Pi05Policy:
         state_normalizer = (
             Normalizer.from_norm_stats(model_dir, key=state_norm_key) if discrete_state else None
         )
-        noise = GaussianNoise(model.action_horizon, model.action_dim, seed=seed)
+        reset_sampling = getattr(model, "reset_sampling", None)
+        if callable(reset_sampling):
+            reset_sampling(int(seed))
 
         input_pipeline, output_pipeline = cls.default_pipelines(
             model,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
             image_pipeline=image_pipeline,
-            noise=noise,
             state_normalizer=state_normalizer,
             image_keys=image_keys,
             state_key=state_key,
@@ -318,7 +355,9 @@ class Pi05Policy:
         width = int(action_dim) if action_dim is not None else int(model.action_dim)
         # Identity quantile map: with eps=0, unnormalize is (x + 1) * 1 + (-1) == x.
         unnormalizer = Unnormalizer(q01=[-1.0] * width, q99=[1.0] * width, dims=width, eps=0.0)
-        noise = GaussianNoise(model.action_horizon, model.action_dim, seed=seed)
+        reset_sampling = getattr(model, "reset_sampling", None)
+        if callable(reset_sampling):
+            reset_sampling(int(seed))
 
         if image_keys is None:
             image_keys = _synthetic_image_keys(model.num_views)
@@ -327,7 +366,6 @@ class Pi05Policy:
             model,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
-            noise=noise,
             image_keys=image_keys,
         )
         return cls(
@@ -343,31 +381,51 @@ class Pi05Policy:
 
     # --- inference ---------------------------------------------------------
 
-    def infer(self, observation: Mapping[str, Any]) -> dict:
+    def infer(self, observation: Mapping[str, Any], *, noise: Optional[np.ndarray] = None) -> dict:
         """Run pre-pipeline -> model -> post-pipeline on one raw observation dict.
 
         Returns ``actions`` (unnormalized ``float32`` ``[horizon, action_dim]``),
-        ``normalized_actions`` (the model's raw output), ``token_ids``, ``noise``,
-        and a ``timing`` dict distinguishing pure-model from end-to-end latency.
+        ``normalized_actions`` (the model's raw output), ``token_ids``, the
+        caller-provided ``noise`` (or ``None`` for internal sampling), and a
+        ``timing`` dict distinguishing pure-model from end-to-end latency.
+
+        ``noise`` is optional. An explicit keyword wins over ``observation["noise"]``
+        and over a custom input-pipeline sampler. If all are absent, the bare model
+        generates standard-normal noise directly in its device buffer.
         """
         started = time.perf_counter()
         if not isinstance(observation, Mapping):
             raise TypeError(f"observation must be a mapping, got {type(observation)!r}")
         self._require_keys(observation)
 
-        prompt = observation[self.prompt_key]
+        prompt = lookup_key(observation, self.prompt_key)
         if not isinstance(prompt, str):
             raise TypeError(f"{self.prompt_key} must be a string, got {type(prompt)!r}")
 
-        # pre: obs dict -> model inputs (rgb / token_ids / noise)
+        # pre: obs dict -> model inputs (rgb / token_ids / optional noise)
         data = self.input_pipeline({OBSERVATION: observation, PROMPT: prompt})
         rgb = data[RGB]
         token_ids = data[TOKEN_IDS]
-        noise = data[NOISE]
+        selected_noise = noise
+        if selected_noise is None:
+            selected_noise = observation.get(NOISE)
+        if selected_noise is None:
+            selected_noise = data.get(NOISE)
+        if selected_noise is not None:
+            selected_noise = np.ascontiguousarray(selected_noise, dtype=np.float32)
+            expected_noise = (self.model.action_horizon, self.model.action_dim)
+            if selected_noise.shape != expected_noise:
+                raise ValueError(
+                    f"noise shape {selected_noise.shape}, expected {expected_noise}"
+                )
+            if not np.isfinite(selected_noise).all():
+                raise ValueError("noise must contain only finite values")
 
         # model: the policy's own middle step (not a pipeline stage)
         model_started = time.perf_counter()
-        normalized = np.asarray(self.model.infer_rgb(rgb, "nhwc", token_ids, noise), dtype=np.float32)
+        normalized = np.asarray(
+            self.model.infer_rgb(rgb, "nhwc", token_ids, selected_noise), dtype=np.float32
+        )
         model_ms = (time.perf_counter() - model_started) * 1000.0
 
         expected = (self.model.action_horizon, self.model.action_dim)
@@ -390,7 +448,7 @@ class Pi05Policy:
             "actions": actions,
             "normalized_actions": normalized,
             "token_ids": token_ids,
-            "noise": noise,
+            "noise": selected_noise,
             "timing": {"model_ms": model_ms, "total_ms": total_ms},
             "metadata": self.metadata,
         }
@@ -415,13 +473,29 @@ class Pi05Policy:
     # --- helpers -----------------------------------------------------------
 
     def _require_keys(self, observation: Mapping[str, Any]) -> None:
+        """Reject an observation the configured pipeline cannot read.
+
+        Only the *configured* keys are required; any extra key the client sends
+        is ignored (openpi behaves the same). Each is resolved through
+        :func:`~apxinf.processors.transforms.lookup_key`, so a nested
+        ``{"images": {"cam_high": ...}}`` layout satisfies ``"images/cam_high"``.
+        The error names the served keys, because a key mismatch is the single
+        most common integration failure and the client cannot see our config
+        except through ``metadata``.
+        """
         required = list(self.image_keys) + [self.prompt_key]
         if self.discrete_state:
             # State is only mandatory when it is actually injected into the prompt.
             required.append(self.state_key)
-        missing = [key for key in required if key not in observation]
+        missing = [key for key in required if not has_key(observation, key)]
         if missing:
-            raise KeyError(f"Pi05Policy.infer: missing observation keys: {missing}")
+            raise KeyError(
+                f"Pi05Policy.infer: missing observation keys: {missing}. "
+                f"This policy serves image_keys={list(self.image_keys)}, "
+                f"prompt_key={self.prompt_key!r}"
+                + (f", state_key={self.state_key!r}" if self.discrete_state else "")
+                + f"; the observation has {sorted(observation)}."
+            )
 
     @staticmethod
     def _find_step(pipeline: Pipeline, name: str):

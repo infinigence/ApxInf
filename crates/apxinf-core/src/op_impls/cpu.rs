@@ -1,10 +1,24 @@
 //! CPU backend implementation.
 
-use crate::{Backend, Device, Error, Graph, Result, Tensor};
+use crate::{
+    Backend, Device, Error, Graph, NormalGenerator, Result, SamplingBackend,
+    Tensor, TokenSampler, TokenSamplingSpec,
+};
 use crate::kv_cache::{CpuKVCache, KvCache};
+use crate::sampling::{CpuNormalGenerator, CpuTokenSampler};
 
 /// CPU backend — all ops execute synchronously on the host.
 pub struct CpuBackend;
+
+impl SamplingBackend for CpuBackend {
+    fn create_token_sampler(&self, spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
+        Ok(Box::new(CpuTokenSampler::new(spec)?))
+    }
+
+    fn create_normal_generator(&self, output: Tensor) -> Result<Box<dyn NormalGenerator>> {
+        Ok(Box::new(CpuNormalGenerator::new(output)?))
+    }
+}
 
 impl Backend for CpuBackend {
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {

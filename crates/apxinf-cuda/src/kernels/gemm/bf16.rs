@@ -461,6 +461,7 @@ pub fn gemm_bf16_geglu_fused(
     packed_weight: &Tensor,
     bf16_dual_geglu_interleaved: bool,
     bf16_dual_geglu_auto_interleaved: Option<&Tensor>,
+    bf16_sm89_geglu_interleaved: Option<&Tensor>,
 ) -> Result<Option<Tensor>> {
     if activation.dtype() != DType::BF16 || packed_weight.dtype() != DType::BF16 {
         return Err(Error::Other(format!(
@@ -523,6 +524,66 @@ pub fn gemm_bf16_geglu_fused(
             got: selected_weight.device(),
         });
     }
+    if ctx.caps().sm == 89
+        && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048))
+    {
+        let Some(sm89_weight) = bf16_sm89_geglu_interleaved else {
+            return Ok(None);
+        };
+        if sm89_weight.dtype() != DType::BF16 || sm89_weight.shape().dims() != b {
+            return Err(Error::Other(format!(
+                "BF16 SM89 GeGLU selected weight must be BF16 {b:?}, got {} {:?}",
+                sm89_weight.dtype(),
+                sm89_weight.shape().dims()
+            )));
+        }
+        if sm89_weight.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: sm89_weight.device(),
+            });
+        }
+
+        #[cfg(not(apxinf_cutlass_bf16_sm89))]
+        return Err(Error::Other(
+            "BF16 SM89 fused GeGLU requires the SM89 CUTLASS adapter build".into(),
+        ));
+
+        #[cfg(apxinf_cutlass_bf16_sm89)]
+        {
+            let n = full_n / 2;
+            let output = output_buffer(
+                ctx,
+                m.checked_mul(n)
+                    .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+                    .ok_or_else(|| Error::Other("BF16 SM89 fused GeGLU output size overflow".into()))?,
+            )?;
+            let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+            let weight_buffer = CudaBuffer::from_tensor(sm89_weight).map_err(Error::Cuda)?;
+            let status = unsafe {
+                ffi::apxinf_static_cutlass_bf16_interleaved_geglu_sm89(
+                    activation_buffer.ptr(),
+                    weight_buffer.ptr(),
+                    output.ptr(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    full_n as i32,
+                    0,
+                    ctx.stream().handle(),
+                )
+            };
+            if status != 0 {
+                return Err(Error::Cuda(format!(
+                    "BF16 SM89 interleaved GeGLU rejected [{m},{n},{k}] ({status})"
+                )));
+            }
+            return Ok(Some(
+                output.into_tensor(Shape::new(vec![m, n]), DType::BF16),
+            ));
+        }
+    }
+
     if !bf16_split_evt && !bf16_dual_geglu {
         return Ok(None);
     }

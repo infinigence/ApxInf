@@ -121,7 +121,19 @@ extern "C" {
         output_scale: f32,
         stream: cudaStream_t,
     ) -> i32;
-    #[cfg(apxinf_cutlass_gemm)]
+    #[cfg(apxinf_cutlass_bf16_sm89)]
+    pub fn apxinf_static_cutlass_bf16_interleaved_geglu_sm89(
+        activation: *const c_void,
+        interleaved_weight: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        full_n: i32,
+        tactic: i32,
+        stream: cudaStream_t,
+    ) -> i32;
+    #[cfg(any(apxinf_cutlass_gemm, apxinf_cutlass_bf16_sm89))]
     pub fn apxinf_static_cutlass_bf16_gemm_geglu(
         activation: *const c_void,
         packed_weight: *const c_void,
