@@ -7,7 +7,6 @@
     "method": "cold_l2_exact_shape",
     "name": "pi05_cutlass_tune"
   },
-  "kernel_build_id": "kb1-5c8c12913a9206958668d721742d5168",
   "measurement": {
     "benchmark_iterations": 30,
     "eviction_buffer_bytes": 134217728,

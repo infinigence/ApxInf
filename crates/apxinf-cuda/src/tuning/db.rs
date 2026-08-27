@@ -191,7 +191,6 @@ impl TuningDb {
 
 fn validate_v1_header(header: &TuningDbHeader) -> Result<()> {
     let missing = [
-        ("kernel_build_id", header.kernel_build_id.as_deref()),
         ("device_name", header.device_name.as_deref()),
         ("cuda_version", header.cuda_version.as_deref()),
         ("cublas_version", header.cublas_version.as_deref()),
@@ -682,6 +681,15 @@ mod tests {
 
         let wrong_cublas = TuningDb::from_json_str(&database("12.6", "12.7")).unwrap();
         assert!(wrong_cublas.build_store(&caps(87), &versions()).is_err());
+    }
+
+    #[test]
+    fn accepts_v1_header_without_kernel_build_id() {
+        let db = TuningDb::from_json_str(
+            r#"{"schema":"apxinf.cuda.tuning.v1","device_name":"test","sm":87,"cuda_version":"12.6","cublas_version":"12.6.4","tactics":{}}"#,
+        )
+        .unwrap();
+        assert!(db.build_store(&caps(87), &versions()).is_ok());
     }
 
     #[test]
