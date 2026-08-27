@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
-    #[cfg(apxinf_fa2_f16_sm100)]
+    #[cfg(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80))]
     pub fn apxinf_static_fa2_f16(
         q: *const c_void,
         k: *const c_void,
@@ -19,6 +19,7 @@ extern "C" {
         kv_heads: i32,
         head_dim: i32,
         softmax_scale: f32,
+        is_causal: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 
@@ -36,6 +37,7 @@ extern "C" {
         kv_heads: i32,
         head_dim: i32,
         softmax_scale: f32,
+        is_causal: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 }

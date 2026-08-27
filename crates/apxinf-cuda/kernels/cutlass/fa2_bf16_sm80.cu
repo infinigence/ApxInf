@@ -25,7 +25,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
                  const void* q, const void* k, const void* v, void* output,
                  void* softmax_lse, int batch, int query_tokens,
                  int key_tokens, int query_heads, int kv_heads, int head_dim,
-                 float softmax_scale) {
+                 float softmax_scale, bool is_causal) {
   params = {};
   params.is_bf16 = is_bf16;
   params.q_ptr = const_cast<void*>(q);
@@ -67,7 +67,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
   params.p_dropout_in_uint8_t = 255;
   params.rp_dropout = 1.0f;
 
-  params.is_causal = false;
+  params.is_causal = is_causal;
   params.window_size_left = -1;
   params.window_size_right = -1;
   params.is_seqlens_k_cumulative = true;
@@ -83,7 +83,7 @@ int fa2(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
-    cudaStream_t stream) {
+    bool is_causal, cudaStream_t stream) {
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       softmax_lse == nullptr || batch <= 0 || query_tokens <= 0 ||
       key_tokens <= 0 || query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
@@ -94,11 +94,20 @@ int fa2(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
+              is_causal);
   if (head_dim <= 96) {
-    FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
+    if (is_causal) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 96, true>(params, stream);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
+    }
   } else {
-    FLASH_NAMESPACE::run_mha_fwd_<Element, 256, false>(params, stream);
+    if (is_causal) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 256, true>(params, stream);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 256, false>(params, stream);
+    }
   }
   return static_cast<int>(cudaSuccess);
 }
@@ -107,20 +116,22 @@ int fa2_bf16(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
-    cudaStream_t stream) {
+    int is_causal, cudaStream_t stream) {
   return fa2<cutlass::bfloat16_t>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
-      query_heads, kv_heads, head_dim, softmax_scale, stream);
+      query_heads, kv_heads, head_dim, softmax_scale, is_causal != 0,
+      stream);
 }
 
 int fa2_f16(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
-    cudaStream_t stream) {
+    int is_causal, cudaStream_t stream) {
   return fa2<cutlass::half_t>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
-      query_heads, kv_heads, head_dim, softmax_scale, stream);
+      query_heads, kv_heads, head_dim, softmax_scale, is_causal != 0,
+      stream);
 }
 
 }  // namespace apxinf::cuda::cutlass_ops

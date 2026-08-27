@@ -882,3 +882,128 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+
+extern "C" {
+    pub fn apxinf_qwen_dequant_w4a16_bf16(
+        packed: *const c_void, scale: *const c_void, zp: *const c_void,
+        out: *mut c_void, out_dim: i32, in_dim: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_embed_gather_f16(
+        table: *const c_void, ids: *const c_void, out: *mut c_void,
+        tokens: i64, hidden: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_mul_bf16(
+        a: *const c_void, b: *const c_void, out: *mut c_void,
+        n: i64, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_silu_bf16(
+        a: *const c_void, out: *mut c_void, n: i64, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_sigmoid_mul_bf16(
+        a: *const c_void, b: *const c_void, out: *mut c_void,
+        n: i64, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_accum_bf16(
+        dst: *mut c_void, src: *const c_void, n: i64, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_rms_norm_bf16(
+        x: *const c_void, w: *const c_void, out: *mut c_void,
+        rows: i32, cols: i32, eps: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_qg_split_bf16(
+        qg: *const c_void, q: *mut c_void, gate: *mut c_void,
+        total: i64, heads: i32, hd: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_partial_rope_bf16(
+        x: *mut c_void, cos: *const c_void, sin: *const c_void, pairs: i64,
+        heads: i32, hd: i32, half: i32, pos0: *const c_void, stream: cudaStream_t,) -> cudaError_t;
+    pub fn apxinf_qwen_conv_silu_bf16(
+        x: *const c_void, w: *const c_void, out: *mut c_void,
+        l: i32, conv_dim: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_delta_recurrence_bf16(
+        q: *const c_void, k: *const c_void, v: *const c_void,
+        beta: *const c_void, g: *const c_void,
+        state: *mut c_void, out: *mut c_void,
+        l: i32, nv: i32, kd: i32, vd: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_attention_bf16(
+        q: *const c_void, k: *const c_void, v: *const c_void, gate: *const c_void,
+        out: *mut c_void, l: i32, heads: i32, kv_heads: i32, hd: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+
+extern "C" {
+    pub fn apxinf_qwen_conv_split_bf16(
+        conv: *const c_void, q: *mut c_void, k: *mut c_void, v: *mut c_void,
+        l: i32, nk: i32, nv: i32, kd: i32, vd: i32, conv_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_l2norm_bf16(
+        x: *const c_void, out: *mut c_void, rows: i32, cols: i32,
+        eps: f32, scale: f32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_qwen_gemm_w4a16_bf16(
+        a: *const c_void, packed: *const c_void, scale: *const c_void,
+        zp: *const c_void, c: *mut c_void,
+        m: i32, n: i32, k: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_beta_g_bf16(
+        a: *const c_void, b: *const c_void, a_log: *const c_void,
+        dt_bias: *const c_void, beta: *mut c_void, g: *mut c_void,
+        total: i32, nv: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_qwen_copy_bf16(
+        src: *const c_void, dst: *mut c_void, n: i64, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_attention_decode_bf16(
+        q: *const c_void, kcache: *const c_void, vcache: *const c_void,
+        gate: *const c_void, out: *mut c_void,
+        seq_ptr: *const c_void, heads: i32, kvheads: i32, hd: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_attention_decode_bf16_v2(
+        q: *const c_void, kcache: *const c_void, vcache: *const c_void,
+        gate: *const c_void, out: *mut c_void,
+        seq_ptr: *const c_void, heads: i32, kvheads: i32, hd: i32,
+        pacc: *mut c_void, pml: *mut c_void, split: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_conv_step_silu_bf16(
+        cur: *const c_void, hist: *mut c_void, w: *const c_void, out: *mut c_void,
+        conv_dim: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen_delta_step_bf16(
+        q: *const c_void, k: *const c_void, v: *const c_void,
+        beta: *const c_void, g: *const c_void, state: *mut c_void,
+        out: *mut c_void, nv: i32, kd: i32, vd: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_qwen_copy_at_bf16(
+        src: *const c_void, dst_base: *mut c_void, pos_ptr: *const c_void,
+        stride_elems: i32, n: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_qwen_gemm_w4a16_m1_bf16(
+        a: *const c_void, packed: *const c_void, scale: *const c_void,
+        zp: *const c_void, c: *mut c_void, n: i32, k: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_qwen_gemm_f16(
+        a: *const c_void, b: *const c_void, c: *mut c_void,
+        m: i32, n: i32, k: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
+}

@@ -8,6 +8,7 @@ pub mod llm_trait;
 pub mod registry;
 pub mod auto;
 pub mod profiling;
+pub mod qwen35;
 pub mod pi05;
 pub mod qwen3vl;
 pub mod vla;

@@ -11,7 +11,7 @@ pub mod device_caps;
 /// - GPU matmul via cuBLAS
 /// - `CudaBackend` implementing the portable `Backend` trait
 mod ffi;
-mod graph;
+pub mod graph;
 pub mod kernels;
 pub mod kv_cache;
 pub mod nvtx;
