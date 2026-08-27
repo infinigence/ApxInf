@@ -10,6 +10,7 @@ use super::contracts::{
 use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::uninitialized_buffer;
 
 /// Apply RoPE into caller-owned storage using a device-resident position.
 #[allow(clippy::too_many_arguments)]
@@ -107,6 +108,124 @@ pub fn apply_mrope_bf16_into(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn apply_tmrope_bf16_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    output: &CudaBuffer,
+    head_dim: usize,
+    heads: usize,
+    theta: f32,
+    sections: [usize; 3],
+    positions: CudaDeviceAddress,
+) -> Result<()> {
+    require_finite("decode TMRoPE", &[theta])?;
+    if head_dim == 0
+        || head_dim % 2 != 0
+        || sections.iter().sum::<usize>() != head_dim / 2
+        || theta <= 0.0
+    {
+        return Err(Error::Other(
+            "decode TMRoPE received invalid head dimension, sections, or theta".into(),
+        ));
+    }
+    let bytes = checked_bytes(DType::BF16, &[heads, head_dim], "decode TMRoPE")?;
+    require_buffers(
+        ctx,
+        "decode TMRoPE",
+        &[("input", input, bytes), ("output", output, bytes)],
+    )?;
+    require_address(ctx, "decode TMRoPE", "positions", positions, 12)?;
+    check_cuda(unsafe {
+        ffi::apxinf_rope_tmrope_bf16(
+            input.ptr(),
+            output.ptr(),
+            head_dim as u32,
+            heads as u32,
+            1,
+            theta,
+            positions.ptr(),
+            sections[0] as u32,
+            sections[1] as u32,
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// Apply decode TMRoPE to K while publishing K and unchanged V directly to
+/// their persistent cache slot.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_tmrope_kv_write_bf16(
+    ctx: &CudaContext,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    k_cache: &CudaBuffer,
+    v_cache: &CudaBuffer,
+    head_dim: usize,
+    kv_heads: usize,
+    max_seq_len: usize,
+    theta: f32,
+    sections: [usize; 3],
+    positions: CudaDeviceAddress,
+    cache_position: CudaDeviceAddress,
+) -> Result<()> {
+    require_finite("decode TMRoPE KV write", &[theta])?;
+    if head_dim == 0
+        || head_dim % 2 != 0
+        || sections.iter().sum::<usize>() != head_dim / 2
+        || theta <= 0.0
+    {
+        return Err(Error::Other(
+            "decode TMRoPE KV write received invalid dimensions, sections, or theta".into(),
+        ));
+    }
+    let input_bytes = checked_bytes(
+        DType::BF16,
+        &[kv_heads, head_dim],
+        "decode TMRoPE KV write",
+    )?;
+    let cache_bytes = checked_bytes(
+        DType::BF16,
+        &[kv_heads, max_seq_len, head_dim],
+        "decode TMRoPE KV write",
+    )?;
+    require_buffers(
+        ctx,
+        "decode TMRoPE KV write",
+        &[
+            ("K", k, input_bytes),
+            ("V", v, input_bytes),
+            ("K cache", k_cache, cache_bytes),
+            ("V cache", v_cache, cache_bytes),
+        ],
+    )?;
+    require_address(ctx, "decode TMRoPE KV write", "positions", positions, 12)?;
+    require_address(
+        ctx,
+        "decode TMRoPE KV write",
+        "cache position",
+        cache_position,
+        4,
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rope_tmrope_kv_write_bf16(
+            k.ptr(),
+            v.ptr(),
+            k_cache.ptr(),
+            v_cache.ptr(),
+            head_dim as u32,
+            kv_heads as u32,
+            max_seq_len as u32,
+            theta,
+            positions.ptr(),
+            sections[0] as u32,
+            sections[1] as u32,
+            cache_position.ptr(),
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// Apply BF16 RoPE to K and write it directly to KV cache.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_k_write_cache_bf16(
@@ -169,7 +288,7 @@ pub fn apply(
     let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -226,7 +345,7 @@ pub fn apply_mrope(
     let dims = input.shape().dims();
     let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     if input.dtype() != DType::BF16 {
         return Err(Error::Other("rope_mrope: only BF16 supported".into()));
@@ -256,6 +375,48 @@ pub fn apply_mrope(
     ))
 }
 
+/// Qwen2.5-Omni contiguous-section TMRoPE (BF16).
+pub fn apply_tmrope(
+    ctx: &CudaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &CudaBuffer,
+) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 || sections.iter().sum::<usize>() != head_dim / 2 {
+        return Err(Error::Other("rope_tmrope: invalid BF16 input or sections".into()));
+    }
+    let dims = input.shape().dims();
+    let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
+    if pos_ids.len() != seq_len * 3 * 4 {
+        return Err(Error::Other("rope_tmrope: position buffer length mismatch".into()));
+    }
+    let output = uninitialized_buffer(ctx, input.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rope_tmrope_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            head_dim as u32,
+            n_heads as u32,
+            seq_len as u32,
+            theta,
+            pos_ids.ptr(),
+            sections[0] as u32,
+            sections[1] as u32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// Vision 2D-RoPE (bf16). `input` `[seq, heads, head_dim]`; `pos_ids` flat
 /// u32 slice of length `seq * 2` (h, w per token). head_dim=64 for Qwen3-VL.
 pub fn apply_vision_2d(
@@ -272,7 +433,7 @@ pub fn apply_vision_2d(
     let device_id = ctx.device_id();
     let dims = input.shape().dims();
     let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
-    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, input.size_in_bytes())?;
     unsafe {
         let res = ffi::apxinf_rope_vision_2d_bf16(
             gpu_ptr(input)?,
@@ -308,7 +469,7 @@ pub fn apply_batched(
     let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {

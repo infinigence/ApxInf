@@ -9,6 +9,7 @@ use super::contracts::{
 use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::uninitialized_buffer;
 
 pub fn lookup_into(
     ctx: &CudaContext,
@@ -76,7 +77,7 @@ pub fn lookup(
 
     let out_shape = Shape::new(vec![seq_len, embed_dim]);
     let out_bytes = out_shape.numel() * table.dtype().size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match table.dtype() {

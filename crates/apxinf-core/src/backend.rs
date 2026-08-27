@@ -26,6 +26,13 @@ pub trait Backend: SamplingBackend {
     /// Element-wise multiply.
     fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor>;
 
+    /// Fused SiLU(gate) * up. Backends may override this complete-write
+    /// boundary; the default preserves composition and numerical order.
+    fn silu_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+        let activated = self.silu(gate)?;
+        self.mul(&activated, up)
+    }
+
     /// Scale by scalar: output = input * factor
     fn scale(&self, input: &Tensor, factor: f32) -> Result<Tensor>;
 
@@ -51,6 +58,15 @@ pub trait Backend: SamplingBackend {
                   _theta: f32, _sections: [usize; 3], _pos_ids: &[u32]) -> Result<Tensor> {
         let _ = input;
         Err(crate::Error::Other("rope_mrope: not supported on this backend".into()))
+    }
+
+    /// Qwen2.5-Omni TMRoPE. Unlike Qwen3-VL's interleaved pair-axis
+    /// assignment, T/H/W own contiguous full-dimension sections. Paired
+    /// rotate-half dimensions may consequently use different axes.
+    fn rope_tmrope(&self, input: &Tensor, _n_heads: usize, _head_dim: usize,
+                   _theta: f32, _sections: [usize; 3], _pos_ids: &[u32]) -> Result<Tensor> {
+        let _ = input;
+        Err(crate::Error::Other("rope_tmrope: not supported on this backend".into()))
     }
 
     /// LayerNorm with weight + bias (Qwen3-VL vision tower).
@@ -102,6 +118,29 @@ pub trait Backend: SamplingBackend {
     fn vision_sdpa(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
                    _seq_len: usize, _n_heads: usize, _head_dim: usize) -> Result<Tensor> {
         Err(crate::Error::Other("vision_sdpa: not supported on this backend".into()))
+    }
+
+    /// Non-causal attention constrained to processor/model-owned groups.
+    /// Query `i` may attend to key `j` exactly when `group_ids[i] ==
+    /// group_ids[j]`. This represents windowed vision attention without
+    /// smuggling a model-specific window schedule into the backend.
+    fn grouped_sdpa(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
+                    _seq_len: usize, _n_heads: usize, _head_dim: usize,
+                    _group_ids: &[u32]) -> Result<Tensor> {
+        Err(crate::Error::Other("grouped_sdpa: not supported on this backend".into()))
+    }
+
+    /// Lower a `[frames, channels]` sequence into contiguous convolution
+    /// patches `[out_frames, channels * kernel]`. A model composes this one
+    /// kernel with the ordinary matmul and bias primitives.
+    fn im2col1d(&self, _input: &Tensor, _kernel: usize, _stride: usize,
+                _padding: usize) -> Result<Tensor> {
+        Err(crate::Error::Other("im2col1d: not supported on this backend".into()))
+    }
+
+    /// Average-pool a `[frames, channels]` sequence along its frame axis.
+    fn avg_pool1d(&self, _input: &Tensor, _kernel: usize, _stride: usize) -> Result<Tensor> {
+        Err(crate::Error::Other("avg_pool1d: not supported on this backend".into()))
     }
 
     /// Embedding lookup: table[ids] -> output [seq_len, embed_dim]

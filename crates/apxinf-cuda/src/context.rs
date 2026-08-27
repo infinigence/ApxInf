@@ -73,7 +73,18 @@ impl CudaContext {
     }
 
     pub fn synchronize(&self) -> Result<(), String> {
-        unsafe { ffi::check_cuda(ffi::cudaStreamSynchronize(self.stream.handle())) }
+        unsafe {
+            let stream_status = ffi::cudaStreamSynchronize(self.stream.handle());
+            // Consume the thread-local runtime error after recording the
+            // stream result. The current request still receives the original
+            // failure, but a recoverable OOM cannot poison the next request.
+            let last_status = ffi::cudaGetLastError();
+            if stream_status != ffi::CUDA_SUCCESS {
+                ffi::check_cuda(stream_status)
+            } else {
+                ffi::check_cuda(last_status)
+            }
+        }
     }
 }
 

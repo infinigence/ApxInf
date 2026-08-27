@@ -262,6 +262,17 @@ extern "C" cudaError_t apxinf_static_qkv_split_bias_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_gqa_qkv_split_bias_bf16(
+    const void* qkv, const void* bias, void* q, void* k, void* v,
+    int tokens, int q_width, int kv_width, cudaStream_t stream) {
+  gqa_qkv_split_bias_bf16_kernel<<<tokens, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
+      static_cast<__nv_bfloat16*>(v), tokens, q_width, kv_width);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_mqa_bf16(
     const void* q, const void* k, const void* v, void* output,
     int query_tokens, int key_tokens, int heads, int head_dim,

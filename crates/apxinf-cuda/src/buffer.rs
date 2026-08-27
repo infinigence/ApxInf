@@ -31,6 +31,16 @@ impl CudaDeviceAddress {
 
 struct CudaAllocation {
     ptr: *mut c_void,
+    release: AllocationRelease,
+}
+
+#[derive(Clone, Copy)]
+enum AllocationRelease {
+    Synchronous,
+    StreamOrdered {
+        stream: ffi::cudaStream_t,
+        device: usize,
+    },
 }
 
 // SAFETY: this allocation is released through the CUDA runtime and its raw
@@ -42,7 +52,15 @@ impl Drop for CudaAllocation {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
-                let _ = ffi::cudaFree(self.ptr);
+                match self.release {
+                    AllocationRelease::Synchronous => {
+                        let _ = ffi::cudaFree(self.ptr);
+                    }
+                    AllocationRelease::StreamOrdered { stream, device } => {
+                        let _ = ffi::cudaSetDevice(device as i32);
+                        let _ = ffi::cudaFreeAsync(self.ptr, stream);
+                    }
+                }
             }
         }
     }
@@ -71,7 +89,10 @@ impl CudaBuffer {
         unsafe {
             ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
         }
-        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation {
+            ptr,
+            release: AllocationRelease::Synchronous,
+        });
         Ok(Self {
             ptr,
             len: num_bytes,
@@ -87,6 +108,53 @@ impl CudaBuffer {
             ffi::check_cuda(ffi::cudaMemset(buf.ptr, 0, num_bytes))?;
         }
         Ok(buf)
+    }
+
+    /// Allocate from CUDA's stream-ordered memory pool. The final owner
+    /// enqueues its matching free on the same stream, after every previously
+    /// submitted consumer of the buffer.
+    pub fn alloc_stream_ordered(
+        num_bytes: usize,
+        device: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<Self, String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            ffi::check_cuda(ffi::cudaMallocAsync(&mut ptr, num_bytes, stream.handle()))?;
+        }
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation {
+            ptr,
+            release: AllocationRelease::StreamOrdered {
+                stream: stream.handle(),
+                device,
+            },
+        });
+        Ok(Self {
+            ptr,
+            len: num_bytes,
+            device,
+            owner,
+        })
+    }
+
+    pub fn alloc_zeros_stream_ordered(
+        num_bytes: usize,
+        device: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<Self, String> {
+        let buffer = Self::alloc_stream_ordered(num_bytes, device, stream)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                buffer.ptr,
+                0,
+                num_bytes,
+                stream.handle(),
+            ))?;
+        }
+        Ok(buffer)
     }
 
     /// Allocate and zero-fill asynchronously on the given stream.
@@ -115,6 +183,25 @@ impl CudaBuffer {
         }
     }
 
+    /// Enqueue a host-to-device copy on a caller-owned stream. The caller
+    /// must keep `src` alive until that stream reaches the copy.
+    pub fn copy_from_host_async(
+        &self,
+        src: &[u8],
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        assert!(src.len() <= self.len, "source exceeds buffer size");
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream.handle(),
+            ))
+        }
+    }
+
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<(), String> {
         assert!(dst.len() <= self.len, "destination exceeds buffer size");
@@ -128,6 +215,12 @@ impl CudaBuffer {
         }
     }
 
+    /// Synchronously fill this allocation. Persistent state such as a KV
+    /// cache uses this at a request boundary, where replacing the allocation
+    /// would be both slower and non-atomic under OOM.
+    pub fn memset(&self, value: u8) -> Result<(), String> {
+        unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, i32::from(value), self.len)) }
+    }
     /// Raw device pointer for crate-internal launch code.
     pub(crate) fn ptr(&self) -> *mut c_void {
         self.ptr
@@ -197,7 +290,7 @@ impl CudaBuffer {
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
-    pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
+    pub fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);
         let handle = GpuStorageHandle {
             ptr: self.ptr as usize,
@@ -305,6 +398,21 @@ impl HostMappedBuffer {
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Read one device-published u32 after the owning CUDA stream has been
+    /// synchronized. The volatile load prevents the compiler from reusing a
+    /// value written by the host before graph replay.
+    pub fn read_u32(&self) -> Result<u32, String> {
+        if self.len < std::mem::size_of::<u32>() {
+            return Err(format!(
+                "mapped buffer is {} bytes, need {}",
+                self.len,
+                std::mem::size_of::<u32>()
+            ));
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(unsafe { std::ptr::read_volatile(self.host_ptr as *const u32) })
     }
 
     pub fn address_at(&self, byte_offset: usize, len: usize) -> Result<CudaDeviceAddress, String> {

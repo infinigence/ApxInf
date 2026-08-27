@@ -8,11 +8,13 @@ use super::contracts::{checked_bytes, require_buffers, require_finite};
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
+use crate::workspace::uninitialized_buffer;
 
 pub use bf16::{
     autotune_cublaslt_bf16, gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused,
-    Bf16AutotuneResult,
+    install_cublaslt_bf16_tactics, write_bf16, Bf16AutotuneResult, Bf16CublasLtTactic,
 };
+#[cfg(apxinf_cutlass_gemm)]
 pub use fp8::autotune_cutlass_gemm_f16 as autotune_cutlass_fp8;
 #[cfg(test)]
 pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
@@ -44,15 +46,17 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
             },
         });
     }
+    if activation.dtype() == DType::BF16 {
+        return bf16::gemm_bf16(ctx, activation, weight);
+    }
     let output_shape = activation.shape().matmul_shape(weight.shape())?;
     let m = activation.shape().dims()[activation.ndim() - 2];
     let k = activation.shape().dims()[activation.ndim() - 1];
     let n = weight.shape().dims()[weight.ndim() - 1];
-    let output = CudaBuffer::alloc_zeros(
+    let output = uninitialized_buffer(
+        ctx,
         output_shape.numel() * activation.dtype().size_in_bytes(),
-        ctx.device_id(),
-    )
-    .map_err(Error::Cuda)?;
+    )?;
     let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     ctx.cublas()
@@ -95,6 +99,9 @@ pub fn write(
             ("output", output, checked_bytes(dtype, &[m, n], "GEMM")?),
         ],
     )?;
+    if dtype == DType::BF16 && beta == 0.0 {
+        return bf16::write_bf16(ctx, a, b, output, m, n, k, alpha);
+    }
     ctx.cublas()
         .gemm(dtype, m, n, k, alpha, a, b, beta, output)
         .map_err(apxinf_core::Error::Cuda)

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use apxinf_core::{Backend, CpuBackend, Device, Result, Tensor};
 use apxinf_loader::ModelConfig;
 use apxinf_model::{
-    register, Action, AutoModel, GenerationOptions, GenerationRequest, ImageInput, InferenceSpec,
-    LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel, PreparedInference, SamplingMode,
-    VlaRequest, VlaRuntime,
+    register, Action, AudioInput, AutoModel, GenerationOptions, GenerationRequest, ImageInput,
+    InferenceSpec, LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel,
+    PreparedInference, SamplingMode, VlaRequest, VlaRuntime,
 };
 
 #[derive(Default)]
@@ -118,7 +118,7 @@ impl LlmTrait for VisionModel {
     }
 
     fn capabilities(&self) -> LlmCapabilities {
-        LlmCapabilities { image: true }
+        LlmCapabilities::VISION
     }
 
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
@@ -144,6 +144,32 @@ impl LlmTrait for VisionModel {
     fn vocab_size(&self) -> usize {
         4
     }
+}
+
+#[test]
+fn text_only_model_rejects_audio_before_prewarm_or_forward() {
+    let features = Tensor::from_f32(vec![4, 2], &[0.0; 8]).unwrap();
+    let mask = Tensor::from_f32(vec![1, 4], &[1.0; 4]).unwrap();
+    let lengths = [4];
+    let token_counts = [2];
+    let mut model = TextOnlyModel::default();
+
+    let error = match model.generate_streaming(
+        LlmInput::with_audio(
+            &[151647, 151646, 151646, 151648],
+            AudioInput::new(&features, &mask, &lengths, &token_counts),
+        ),
+        1,
+        |_| {},
+        None,
+    ) {
+        Ok(_) => panic!("text-only model accepted audio input"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("does not support audio input"));
+    assert!(model.forward_calls.is_empty());
+    assert!(model.prewarm_calls.is_empty());
 }
 
 #[test]
@@ -456,4 +482,42 @@ fn load_model_unifies_detected_and_explicit_model_selection() {
         .contains("missing_override_model"));
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn qwen25_omni_rejects_non_bf16_load_modes_before_checkpoint_access() {
+    use apxinf_model::{validate_qwen25_omni_load_options, ModelPrecision};
+
+    let fp8 = LoadOptions {
+        precision: ModelPrecision::Fp8,
+        ..LoadOptions::default()
+    };
+    assert!(validate_qwen25_omni_load_options(Device::Cuda(0), &fp8)
+        .unwrap_err()
+        .to_string()
+        .contains("BF16"));
+
+    let f32 = LoadOptions {
+        text_weight_dtype: Some(apxinf_core::DType::F32),
+        ..LoadOptions::default()
+    };
+    assert!(validate_qwen25_omni_load_options(Device::Cuda(0), &f32)
+        .unwrap_err()
+        .to_string()
+        .contains("BF16"));
+
+    assert!(
+        validate_qwen25_omni_load_options(Device::Cpu, &LoadOptions::default())
+            .unwrap_err()
+            .to_string()
+            .contains("CUDA")
+    );
+}
+
+#[test]
+fn builtin_registry_owns_exact_qwen25_omni_model_type() {
+    apxinf_model::register_builtin_models();
+    let names = apxinf_model::list();
+    assert!(names.contains(&"qwen2_5_omni"));
+    assert!(!names.contains(&"qwen25_omni"));
 }

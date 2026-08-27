@@ -9,6 +9,7 @@ use super::contracts::{
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::uninitialized_buffer;
 
 /// Allocation-free SiLU into caller-owned decode storage.
 pub fn silu_into(
@@ -81,13 +82,133 @@ pub fn silu_mul_bf16_into(
     })
 }
 
+/// Exact fused BF16 SiLU(gate) * up into caller-owned decode storage.
+pub fn silu_mul_separate_bf16_into(
+    ctx: &CudaContext,
+    gate: &CudaBuffer,
+    up: &CudaBuffer,
+    output: &CudaBuffer,
+    count: usize,
+) -> Result<()> {
+    let bytes = checked_bytes(DType::BF16, &[count], "separate decode SiLU multiply")?;
+    require_buffers(
+        ctx,
+        "separate decode SiLU multiply",
+        &[
+            ("gate", gate, bytes),
+            ("up", up, bytes),
+            ("output", output, bytes),
+        ],
+    )?;
+    let count = u32::try_from(count)
+        .map_err(|_| Error::Other("separate decode SiLU multiply exceeds u32 elements".into()))?;
+    check_cuda(unsafe {
+        ffi::apxinf_silu_mul_separate_bf16(
+            gate.ptr(),
+            up.ptr(),
+            output.ptr(),
+            count,
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// Exact fused BF16 SiLU(gate) * up for separate, shape-identical tensors.
+pub fn silu_mul(ctx: &CudaContext, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 || gate.shape() != up.shape() {
+        return Err(Error::Other(
+            "separate SiLU multiply requires shape-identical BF16 tensors".into(),
+        ));
+    }
+    let count = u32::try_from(gate.numel())
+        .map_err(|_| Error::Other("separate SiLU multiply exceeds u32 elements".into()))?;
+    let bytes = checked_bytes(DType::BF16, &[gate.numel()], "separate SiLU multiply")?;
+    let gate_buffer = CudaBuffer::from_tensor(gate).map_err(Error::Cuda)?;
+    let up_buffer = CudaBuffer::from_tensor(up).map_err(Error::Cuda)?;
+    let output = uninitialized_buffer(ctx, bytes)?;
+    require_buffers(
+        ctx,
+        "separate SiLU multiply",
+        &[
+            ("gate", &gate_buffer, bytes),
+            ("up", &up_buffer, bytes),
+            ("output", &output, bytes),
+        ],
+    )?;
+    silu_mul_separate_bf16_into(ctx, &gate_buffer, &up_buffer, &output, count as usize)?;
+    Ok(make_gpu_tensor(
+        gate.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Exact BF16 SiLU/multiply for row-major `[rows, 2 * intermediate]` input.
+pub fn silu_mul_packed_rows_exact(
+    ctx: &CudaContext,
+    gate_up: &Tensor,
+    intermediate: usize,
+) -> Result<Tensor> {
+    let dims = gate_up.shape().dims();
+    let rows = dims.first().copied().unwrap_or(0);
+    let packed_intermediate = intermediate
+        .checked_mul(2)
+        .ok_or_else(|| Error::Other("packed row SiLU multiply width overflow".into()))?;
+    if gate_up.dtype() != DType::BF16
+        || rows == 0
+        || intermediate == 0
+        || dims != [rows, packed_intermediate]
+    {
+        return Err(Error::Other(
+            "packed row SiLU multiply requires BF16 [rows, 2 * intermediate] input".into(),
+        ));
+    }
+    let count = rows
+        .checked_mul(intermediate)
+        .ok_or_else(|| Error::Other("packed row SiLU multiply size overflow".into()))?;
+    let bytes = checked_bytes(DType::BF16, &[count], "packed row SiLU multiply")?;
+    let packed_bytes = bytes
+        .checked_mul(2)
+        .ok_or_else(|| Error::Other("packed row SiLU multiply byte size overflow".into()))?;
+    let gate_up = CudaBuffer::from_tensor(gate_up).map_err(Error::Cuda)?;
+    let output = uninitialized_buffer(ctx, bytes)?;
+    require_buffers(
+        ctx,
+        "packed row SiLU multiply",
+        &[
+            ("gate_up", &gate_up, packed_bytes),
+            ("output", &output, bytes),
+        ],
+    )?;
+    let rows = u32::try_from(rows)
+        .map_err(|_| Error::Other("packed row SiLU multiply rows exceed u32".into()))?;
+    let intermediate = u32::try_from(intermediate)
+        .map_err(|_| Error::Other("packed row SiLU multiply width exceeds u32".into()))?;
+    check_cuda(unsafe {
+        ffi::apxinf_silu_mul_packed_rows_exact_bf16(
+            gate_up.ptr(),
+            output.ptr(),
+            rows,
+            intermediate,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows as usize, intermediate as usize]),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// SiLU (Swish) activation on CUDA.
 pub fn silu(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let device_id = ctx.device_id();
     let count = input.numel() as u32;
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -117,10 +238,14 @@ pub fn gelu_tanh(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     }
     let device_id = ctx.device_id();
     let count = input.numel() as u32;
-    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, input.size_in_bytes())?;
     unsafe {
-        let res =
-            ffi::apxinf_gelu_tanh_bf16(gpu_ptr(input)?, out_buf.ptr(), count, ctx.stream().handle());
+        let res = ffi::apxinf_gelu_tanh_bf16(
+            gpu_ptr(input)?,
+            out_buf.ptr(),
+            count,
+            ctx.stream().handle(),
+        );
         ffi::check_cuda(res).map_err(Error::Cuda)?;
     }
     Ok(make_gpu_tensor(

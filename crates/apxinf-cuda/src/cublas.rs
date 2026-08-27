@@ -134,7 +134,7 @@ impl CublasHandle {
 
     /// Strided batched GEMM: batch_count independent GEMMs with fixed strides.
     ///
-    /// A: [batch_count, m, k] with stride `stride_a` (bytes), B: [batch_count, k, n] with stride `stride_b`,
+    /// A: [batch_count, m, k] with element stride `stride_a`, B: [batch_count, k, n] with element stride `stride_b`,
     /// C: [batch_count, m, n] with stride `stride_c`.
     /// All matrices are row-major. Uses the same column-major swap trick as `gemm()`.
     pub fn batched_gemm(
@@ -215,6 +215,105 @@ impl CublasHandle {
                         c.ptr() as *mut c_void,
                         cuda_type,
                         n_i,
+                        stride_c,
+                        batch_count,
+                        ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        -1,
+                    ))
+                }
+            }
+            DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+        }
+    }
+
+    /// Strided batched GEMM with explicit transpose and row-stride contracts.
+    /// Strides between batch matrices are expressed in elements; a zero
+    /// stride broadcasts one matrix across every batch member.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gemm_ex(
+        &self,
+        dtype: DType,
+        transa: CublasTranspose,
+        transb: CublasTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        stride_a: i64,
+        b: &CudaBuffer,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        let m_i = m as i32;
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let transa = transa.raw();
+        let transb = transb.raw();
+
+        match dtype {
+            DType::F32 => unsafe {
+                ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                    self.handle,
+                    transb,
+                    transa,
+                    n_i,
+                    m_i,
+                    k_i,
+                    &alpha as *const f32 as *const c_void,
+                    b.ptr(),
+                    ffi::cudaDataType_t::CUDA_R_32F,
+                    ldb,
+                    stride_b,
+                    a.ptr(),
+                    ffi::cudaDataType_t::CUDA_R_32F,
+                    lda,
+                    stride_a,
+                    &beta as *const f32 as *const c_void,
+                    c.ptr() as *mut c_void,
+                    ffi::cudaDataType_t::CUDA_R_32F,
+                    ldc,
+                    stride_c,
+                    batch_count,
+                    ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    -1,
+                ))
+            },
+            DType::F16 | DType::BF16 => {
+                let cuda_type = if dtype == DType::F16 {
+                    ffi::cudaDataType_t::CUDA_R_16F
+                } else {
+                    ffi::cudaDataType_t::CUDA_R_16BF
+                };
+                let alpha_bytes = alpha.to_ne_bytes();
+                let beta_bytes = beta.to_ne_bytes();
+                unsafe {
+                    ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                        self.handle,
+                        transb,
+                        transa,
+                        n_i,
+                        m_i,
+                        k_i,
+                        alpha_bytes.as_ptr() as *const c_void,
+                        b.ptr(),
+                        cuda_type,
+                        ldb,
+                        stride_b,
+                        a.ptr(),
+                        cuda_type,
+                        lda,
+                        stride_a,
+                        beta_bytes.as_ptr() as *const c_void,
+                        c.ptr() as *mut c_void,
+                        cuda_type,
+                        ldc,
                         stride_c,
                         batch_count,
                         ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,

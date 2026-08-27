@@ -45,6 +45,12 @@ pub const cudaHostAllocWriteCombined: u32 = 4;
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
+    pub fn cudaMallocAsync(
+        devPtr: *mut *mut c_void,
+        size: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn cudaFreeAsync(devPtr: *mut c_void, stream: cudaStream_t) -> cudaError_t;
 
     /// Allocate page-locked (pinned) host memory. With `cudaHostAllocMapped`
     /// the buffer is also directly accessible from the GPU via

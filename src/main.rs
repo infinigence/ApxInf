@@ -3,13 +3,16 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
-    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
+    AudioInput, AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
     LoadOptions, SamplingMode,
 };
-use apxinf_tokenizer::{Tokenizer, ChatMessage};
+use apxinf_tokenizer::{ChatMessage, Tokenizer};
+use clap::{Parser, Subcommand};
+
+#[cfg(feature = "cuda")]
+mod qwen25_omni_server;
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -36,6 +39,10 @@ enum Commands {
         /// prompt. Only for qwen3_vl models.
         #[arg(long)]
         image: Option<PathBuf>,
+
+        /// Path to one WAV file for Qwen2.5-Omni audio understanding.
+        #[arg(long, conflicts_with = "image")]
+        audio: Option<PathBuf>,
 
         /// Maximum new tokens to generate
         #[arg(long)]
@@ -103,6 +110,20 @@ enum Commands {
         dtype: String,
     },
 
+    /// Start the serialized Qwen2.5-Omni text-output service.
+    Serve {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8001)]
+        port: u16,
+        #[arg(long, default_value_t = 32768)]
+        max_model_len: usize,
+        #[arg(long)]
+        enable_multimodal: bool,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -115,6 +136,7 @@ fn main() {
             model,
             prompt,
             image,
+            audio,
             max_tokens,
             sample,
             greedy,
@@ -139,6 +161,7 @@ fn main() {
                 &model,
                 &prompt,
                 image.as_ref(),
+                audio.as_ref(),
                 max_tokens,
                 !no_eos_stop,
                 system.as_deref(),
@@ -158,6 +181,32 @@ fn main() {
             ) {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+        Commands::Serve {
+            model,
+            host,
+            port,
+            max_model_len,
+            enable_multimodal,
+        } => {
+            #[cfg(feature = "cuda")]
+            {
+                let result = if enable_multimodal {
+                    qwen25_omni_server::serve(&model, &host, port, max_model_len)
+                } else {
+                    Err("Qwen2.5-Omni serve requires --enable-multimodal".into())
+                };
+                if let Err(error) = result {
+                    eprintln!("Server failed: {error}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (model, host, port, max_model_len, enable_multimodal);
+                eprintln!("The native Qwen2.5-Omni server requires an ApxInf CUDA build");
+                std::process::exit(2);
             }
         }
         Commands::Test => {
@@ -181,6 +230,7 @@ fn run_generate(
     model_dir: &PathBuf,
     prompt: &str,
     image_path: Option<&PathBuf>,
+    audio_path: Option<&PathBuf>,
     max_tokens: Option<usize>,
     eos_stop: bool,
     system_prompt: Option<&str>,
@@ -203,8 +253,13 @@ fn run_generate(
 
     let model_name = AutoModel::detect_model_name(model_dir)
         .map_err(|error| format!("Failed to detect model type: {error}"))?;
-    if image_path.is_some() && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl") {
+    if image_path.is_some()
+        && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl" | "qwen2_5_omni")
+    {
         return Err(format!("Model `{model_name}` does not support image input"));
+    }
+    if audio_path.is_some() && model_name != "qwen2_5_omni" {
+        return Err(format!("Model `{model_name}` does not support audio input"));
     }
 
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -220,7 +275,7 @@ fn run_generate(
 
     // Model-specific processors turn raw media into tensors, while generation
     // itself always receives the model-neutral LlmInput request.
-    let (tokens, prepared_image) = if let Some(image_path) = image_path {
+    let (tokens, prepared_image, prepared_audio) = if let Some(image_path) = image_path {
         println!("Preprocessing image via the Hugging Face processor...");
         let (data, shape, grid, tokens) =
             preprocess_image(model_dir, image_path, prompt, system_prompt)
@@ -233,11 +288,25 @@ fn run_generate(
         );
         let pixels = Tensor::from_bf16(shape, &data)
             .map_err(|error| format!("Invalid processor output: {error}"))?;
-        (tokens, Some((pixels, vec![grid])))
+        (tokens, Some((pixels, vec![grid])), None)
+    } else if let Some(audio_path) = audio_path {
+        println!("Preprocessing WAV audio via the Hugging Face processor...");
+        let (features, feature_shape, mask, mask_shape, length, token_count, tokens) =
+            preprocess_audio(model_dir, audio_path, prompt, system_prompt)
+                .map_err(|error| format!("Audio preprocessing failed: {error}"))?;
+        let features = Tensor::from_bf16(feature_shape, &features)
+            .map_err(|error| format!("Invalid audio features: {error}"))?;
+        let mask = Tensor::from_bf16(mask_shape, &mask)
+            .map_err(|error| format!("Invalid audio attention mask: {error}"))?;
+        (
+            tokens,
+            None,
+            Some((features, mask, vec![length], vec![token_count])),
+        )
     } else {
         let tokens = encode_prompt(&tok, prompt, system_prompt)
             .map_err(|error| format!("Failed to encode prompt: {error}"))?;
-        (tokens, None)
+        (tokens, None, None)
     };
 
     let text_weight_dtype = match dtype.to_ascii_lowercase().as_str() {
@@ -262,25 +331,36 @@ fn run_generate(
         ..LoadOptions::default()
     };
 
-    println!("Loading {model_name} from {:?}... (dtype: {dtype})", model_dir);
+    println!(
+        "Loading {model_name} from {:?}... (dtype: {dtype})",
+        model_dir
+    );
     let mut model = AutoModel::load_model(device, model_dir, &options)
         .map_err(|error| format!("Failed to load model: {error}"))?;
-    if prepared_image.is_some() {
+    if prepared_image.is_some() || prepared_audio.is_some() {
         match model.text_capabilities() {
-            Ok(capabilities) if capabilities.image => {}
+            Ok(capabilities)
+                if (prepared_image.is_none() || capabilities.image)
+                    && (prepared_audio.is_none() || capabilities.audio) => {}
             Ok(_) => {
-                return Err(format!("Model `{model_name}` does not support image input"))
+                return Err(format!(
+                    "Model `{model_name}` does not support requested media"
+                ))
             }
             Err(error) => return Err(format!("Cannot generate with this model: {error}")),
         }
     }
     println!("Model ready.");
 
-    let input = match prepared_image.as_ref() {
-        Some((pixels, grids)) => {
+    let input = match (prepared_image.as_ref(), prepared_audio.as_ref()) {
+        (Some((pixels, grids)), None) => {
             LlmInput::with_image(&tokens, ImageInput::new(pixels, grids))
         }
-        None => LlmInput::text(&tokens),
+        (None, Some((features, mask, lengths, counts))) => {
+            LlmInput::with_audio(&tokens, AudioInput::new(features, mask, lengths, counts))
+        }
+        (None, None) => LlmInput::text(&tokens),
+        (Some(_), Some(_)) => unreachable!("clap rejects simultaneous image and audio"),
     };
 
     let configured_eos = model
@@ -358,7 +438,9 @@ fn encode_prompt(
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(prompt));
-        tokenizer.encode_chat(&messages).map_err(|error| error.to_string())
+        tokenizer
+            .encode_chat(&messages)
+            .map_err(|error| error.to_string())
     } else {
         tokenizer.encode(prompt).map_err(|error| error.to_string())
     }
@@ -375,10 +457,8 @@ fn preprocess_image(
     use std::process::Command;
 
     let suffix = std::process::id();
-    let pixel_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
-    let metadata_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
+    let pixel_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
+    let metadata_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
     let script = r#"
 import json
 import sys
@@ -387,7 +467,7 @@ from transformers import AutoProcessor
 from PIL import Image
 
 model_dir, image_path, prompt, system, pixel_path, metadata_path = sys.argv[1:]
-processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
+processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True, use_fast=False)
 image = Image.open(image_path).convert("RGB")
 messages = []
 if system:
@@ -451,16 +531,13 @@ with open(metadata_path, "w") as output:
     let grid = [
         grid_values[0]
             .as_u64()
-            .ok_or_else(|| "processor grid T is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid T is not an integer".to_string())? as u32,
         grid_values[1]
             .as_u64()
-            .ok_or_else(|| "processor grid H is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid H is not an integer".to_string())? as u32,
         grid_values[2]
             .as_u64()
-            .ok_or_else(|| "processor grid W is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid W is not an integer".to_string())? as u32,
     ];
     let tokens = metadata
         .get("tokens")
@@ -482,9 +559,7 @@ with open(metadata_path, "w") as output:
 }
 
 /// Read a NumPy v1 f32 array and convert it to bf16.
-fn read_npy_f32_to_bf16(
-    path: &std::path::Path,
-) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
+fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     use std::io::Read;
 
     let mut file =
@@ -525,9 +600,7 @@ fn read_npy_f32_to_bf16(
     }
     let data = raw
         .chunks_exact(4)
-        .map(|bytes| {
-            half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap()))
-        })
+        .map(|bytes| half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap())))
         .collect();
     Ok((shape, data))
 }
@@ -558,6 +631,147 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>, String> {
     }
     Ok(shape)
 }
+type PreparedAudio = (
+    Vec<half::bf16>,
+    Vec<usize>,
+    Vec<half::bf16>,
+    Vec<usize>,
+    u32,
+    u32,
+    Vec<u32>,
+);
+
+fn preprocess_audio(
+    model_dir: &PathBuf,
+    audio_path: &PathBuf,
+    prompt: &str,
+    system_prompt: Option<&str>,
+) -> Result<PreparedAudio, String> {
+    use std::process::Command;
+
+    if audio_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("audio input must be a WAV file".into());
+    }
+    let suffix = std::process::id();
+    let feature_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-audio.npy"));
+    let mask_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-audio-mask.npy"));
+    let metadata_path =
+        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-audio-metadata.json"));
+    let script = r#"
+import json
+import sys
+import numpy as np
+import soundfile as sf
+from scipy.signal import resample_poly
+from transformers import AutoProcessor
+
+model_dir, audio_path, prompt, system, feature_path, mask_path, metadata_path = sys.argv[1:]
+processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True, use_fast=False)
+audio, sampling_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+if audio.ndim == 2:
+    audio = audio.mean(axis=1)
+if not np.isfinite(audio).all() or audio.size == 0:
+    raise ValueError("WAV must contain finite nonempty audio")
+if sampling_rate != 16000:
+    from math import gcd
+    divisor = gcd(int(sampling_rate), 16000)
+    audio = resample_poly(audio, 16000 // divisor, int(sampling_rate) // divisor).astype(np.float32)
+messages = []
+if system:
+    messages.append({"role":"system","content":[{"type":"text","text":system}]})
+messages.append({"role":"user","content":[
+    {"type":"audio","audio":audio},
+    {"type":"text","text":prompt},
+]})
+inputs = processor.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+    sampling_rate=16000,
+)
+features = inputs["input_features"][0].cpu().numpy().astype(np.float32)
+if features.shape[0] == 128:
+    features = features.T
+mask = inputs.get("feature_attention_mask")
+if mask is None:
+    mask = np.ones((features.shape[0],), dtype=np.float32)
+else:
+    mask = mask[0].cpu().numpy().astype(np.float32).reshape(-1)[:features.shape[0]]
+valid_frames = int(mask.sum())
+if valid_frames <= 0 or valid_frames > features.shape[0]:
+    raise ValueError("processor returned an invalid feature attention mask")
+features = features[:valid_frames]
+mask = np.ones((valid_frames,), dtype=np.float32)
+tokens = inputs["input_ids"][0].cpu().numpy().astype(np.int64).tolist()
+token_count = sum(token == 151646 for token in tokens)
+np.save(feature_path, features)
+np.save(mask_path, mask)
+with open(metadata_path, "w") as output:
+    json.dump({"tokens":tokens,"feature_length":int(features.shape[0]),"token_count":token_count}, output)
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(model_dir)
+        .arg(audio_path)
+        .arg(prompt)
+        .arg(system_prompt.unwrap_or(""))
+        .arg(&feature_path)
+        .arg(&mask_path)
+        .arg(&metadata_path)
+        .output()
+        .map_err(|error| format!("python3: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "python audio preprocessing failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let metadata_raw = std::fs::read_to_string(&metadata_path)
+        .map_err(|error| format!("read {}: {error}", metadata_path.display()))?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_raw)
+        .map_err(|error| format!("parse {}: {error}", metadata_path.display()))?;
+    let tokens = metadata["tokens"]
+        .as_array()
+        .ok_or_else(|| "audio processor returned no tokens".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|token| u32::try_from(token).ok())
+                .ok_or_else(|| "audio processor returned an invalid token".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let feature_length = metadata["feature_length"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "audio processor returned invalid feature_length".to_string())?;
+    let token_count = metadata["token_count"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "audio processor returned invalid token_count".to_string())?;
+    let (feature_shape, features) = read_npy_f32_to_bf16(&feature_path)?;
+    let (mask_shape, mask) = read_npy_f32_to_bf16(&mask_path)?;
+    let _ = std::fs::remove_file(&feature_path);
+    let _ = std::fs::remove_file(&mask_path);
+    let _ = std::fs::remove_file(&metadata_path);
+    Ok((
+        features,
+        feature_shape,
+        mask,
+        mask_shape,
+        feature_length,
+        token_count,
+        tokens,
+    ))
+}
+
 fn run_test() {
     println!("apxinf — LLM inference engine (test mode)");
     println!();
@@ -613,7 +827,10 @@ fn cuda_test() {
     let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
     let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0].iter().map(|x| x / (1.0 + (-x).exp())).collect();
+    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
+        .iter()
+        .map(|x| x / (1.0 + (-x).exp()))
+        .collect();
     println!("[CUDA] silu: {:?}", silu_data);
 
     // Add test
@@ -647,7 +864,8 @@ fn cuda_test() {
     println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
 
     // RoPE test
-    let rope_input = Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
+    let rope_input =
+        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
     let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
     let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
     let rope_cpu = transfers::to_cpu(&rope_out).unwrap();

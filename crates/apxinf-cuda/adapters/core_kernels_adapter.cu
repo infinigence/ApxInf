@@ -22,6 +22,16 @@
 #include "../kernels/custom/selection.cuh"
 #include "../kernels/custom/fused.cuh"
 
+static dim3 apxinf_row_split_grid(uint32_t x_blocks, uint32_t rows)
+{
+    constexpr uint32_t kMaxGridY = 65535;
+    uint32_t grid_z = static_cast<uint32_t>(
+        (static_cast<uint64_t>(rows) + kMaxGridY - 1) / kMaxGridY);
+    uint32_t grid_y = static_cast<uint32_t>(
+        (static_cast<uint64_t>(rows) + grid_z - 1) / grid_z);
+    return dim3(x_blocks, grid_y, grid_z);
+}
+
 extern "C" cudaError_t apxinf_rms_norm_f32(
     const void* input, const void* weight, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
@@ -127,7 +137,7 @@ extern "C" cudaError_t apxinf_attention_softmax_f32(
     const void* scores, void* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    dim3 grid = apxinf_row_split_grid(1, rows);
     dim3 block(BLOCK_SIZE, 1, 1);
     attention_softmax_f32_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const float*)scores, (float*)output, cols, rows, kv_offset, n_heads);
@@ -215,6 +225,35 @@ extern "C" cudaError_t apxinf_silu_mul_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_silu_mul_separate_bf16(
+    const void* gate, const void* up, void* output, uint32_t count, void* stream)
+{
+    if (gate == nullptr || up == nullptr || output == nullptr)
+        return cudaErrorInvalidConfiguration;
+    dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    silu_mul_separate_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)gate, (const __nv_bfloat16*)up,
+        (__nv_bfloat16*)output, count);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_silu_mul_packed_rows_exact_bf16(
+    const void* gate_up, void* output, uint32_t rows, uint32_t inter,
+    void* stream)
+{
+    if (gate_up == nullptr || output == nullptr || rows == 0 || inter == 0)
+        return cudaErrorInvalidConfiguration;
+    uint64_t count = static_cast<uint64_t>(rows) * inter;
+    uint64_t blocks = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (blocks == 0 || blocks > 0xffffffffULL)
+        return cudaErrorInvalidConfiguration;
+    silu_mul_packed_rows_exact_bf16_kernel<<<
+        static_cast<uint32_t>(blocks), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)gate_up, (__nv_bfloat16*)output, rows, inter);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_rms_norm_bf16(
     const void* input, const void* weight, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
@@ -238,7 +277,21 @@ extern "C" cudaError_t apxinf_rms_norm_add_bf16(
     dim3 grid(rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     size_t smem = cols * sizeof(float);
-    rms_norm_add_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
+    rms_norm_add_bf16_kernel<false><<<grid, block, smem, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)x_inout, (const __nv_bfloat16*)delta,
+        (const __nv_bfloat16*)weight, (__nv_bfloat16*)output,
+        cols, rows, eps);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rms_norm_add_exact_bf16(
+    void* x_inout, const void* delta, const void* weight, void* output,
+    uint32_t cols, uint32_t rows, float eps, void* stream)
+{
+    dim3 grid(rows, 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    size_t smem = cols * sizeof(float);
+    rms_norm_add_bf16_kernel<true><<<grid, block, smem, (cudaStream_t)stream>>>(
         (__nv_bfloat16*)x_inout, (const __nv_bfloat16*)delta,
         (const __nv_bfloat16*)weight, (__nv_bfloat16*)output,
         cols, rows, eps);
@@ -327,12 +380,91 @@ extern "C" cudaError_t apxinf_rope_batched_bf16(
 
 extern "C" cudaError_t apxinf_attention_softmax_bf16(
     const void* scores, void* output,
-    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads, void* stream)
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads,
+    float score_scale, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    dim3 grid = apxinf_row_split_grid(1, rows);
     dim3 block(BLOCK_SIZE, 1, 1);
     attention_softmax_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
+        cols, rows, kv_offset, n_heads, score_scale, 0);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_attention_softmax_bf16_gqa_packed(
+    const void* scores, void* output,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads,
+    uint32_t gqa_ratio, float score_scale, void* stream)
+{
+    if (gqa_ratio == 0 || n_heads % gqa_ratio != 0)
+        return cudaErrorInvalidConfiguration;
+    dim3 grid = apxinf_row_split_grid(1, rows);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    attention_softmax_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
+        cols, rows, kv_offset, n_heads, score_scale, gqa_ratio);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_attention_softmax_bf16_scale_in_place(
+    void* scores_output,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads,
+    uint32_t gqa_ratio, float score_scale, void* stream)
+{
+    if (scores_output == nullptr || gqa_ratio == 0 || n_heads % gqa_ratio != 0)
+        return cudaErrorInvalidConfiguration;
+    dim3 grid = apxinf_row_split_grid(1, rows);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    attention_softmax_bf16_scale_in_place_kernel<<<
+        grid, block, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)scores_output, cols, rows, kv_offset, n_heads,
+        score_scale, gqa_ratio);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_attention_softmax_bf16_exp_cache(
+    const void* scores, void* output,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads, void* stream)
+{
+    dim3 grid = apxinf_row_split_grid(1, rows);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+    attention_softmax_bf16_exp_cache_kernel<<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
+        cols, rows, kv_offset, n_heads);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_attention_softmax_bf16_scaled_exp_cache(
+    const void* scores, void* output,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads,
+    float score_scale, void* stream)
+{
+    if (scores == nullptr || output == nullptr || cols == 0 || cols > 4096 ||
+        rows <= n_heads || n_heads == 0 || rows % n_heads != 0 ||
+        !(score_scale > 0.0f))
+        return cudaErrorInvalidConfiguration;
+    dim3 grid = apxinf_row_split_grid(1, rows);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+    attention_softmax_bf16_scaled_exp_cache_kernel<<<
+        grid, block, shared_bytes, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
+        cols, rows, kv_offset, n_heads, score_scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_attention_softmax_bf16_global_exp_cache(
+    const void* scores, void* output, void* numerators,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads,
+    void* stream)
+{
+    dim3 grid = apxinf_row_split_grid(1, rows);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    cudaStream_t s = (cudaStream_t)stream;
+    attention_softmax_bf16_exp_global_cache_kernel<<<grid, block, 0, s>>>(
+        (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
+        (float*)numerators,
         cols, rows, kv_offset, n_heads);
     return cudaGetLastError();
 }
@@ -490,19 +622,127 @@ extern "C" cudaError_t apxinf_rope_vision_2d_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_rope_tmrope_bf16(
+    const void* input, void* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float theta, const void* pos_ids, uint32_t sec_t, uint32_t sec_h,
+    void* stream)
+{
+    dim3 grid((head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE, n_heads, seq_len);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    rope_tmrope_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)input, (__nv_bfloat16*)output,
+        head_dim, n_heads, seq_len, theta, (const uint32_t*)pos_ids,
+        sec_t, sec_h);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rope_tmrope_kv_write_bf16(
+    const void* k_in, const void* v_in, void* k_cache, void* v_cache,
+    uint32_t head_dim, uint32_t n_kv_heads, uint32_t max_seq_len,
+    float theta, const void* pos_ids, uint32_t sec_t, uint32_t sec_h,
+    const void* cache_pos, void* stream)
+{
+    dim3 grid((head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE, n_kv_heads, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    rope_tmrope_kv_write_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)k_in, (const __nv_bfloat16*)v_in,
+        (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
+        head_dim, n_kv_heads, max_seq_len, theta,
+        (const uint32_t*)pos_ids, sec_t, sec_h,
+        (const uint32_t*)cache_pos);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     const void* q, const void* k, const void* v, void* out,
     uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)
 {
-    // Only head_dim=64 (Qwen3-VL vision) is supported; the kernel uses a
-    // 32-thread / 2-element-per-thread layout.
-    if (head_dim != 64) return cudaErrorInvalidConfiguration;
+    if (head_dim == 0 || head_dim > 128) return cudaErrorInvalidConfiguration;
     dim3 grid(seq_len, n_heads, 1);
     dim3 block(32, 1, 1);
     size_t smem = (seq_len + 1) * sizeof(float);
     vision_sdpa_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
-        (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale);
+        (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale, nullptr);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_grouped_sdpa_bf16(
+    const void* q, const void* k, const void* v, void* out,
+    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale,
+    const void* group_ids, void* stream)
+{
+    if (head_dim == 0 || head_dim > 128 || group_ids == nullptr)
+        return cudaErrorInvalidConfiguration;
+    dim3 grid(seq_len, n_heads, 1);
+    dim3 block(32, 1, 1);
+    size_t smem = (seq_len + 1) * sizeof(float);
+    vision_sdpa_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v,
+        (__nv_bfloat16*)out, seq_len, n_heads, head_dim, scale,
+        (const uint32_t*)group_ids);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_grouped_indexed_sdpa_bf16(
+    const void* q, const void* k, const void* v, void* out,
+    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale,
+    const void* group_ids, const void* group_offsets,
+    const void* group_indices, uint32_t group_count, void* stream)
+{
+    if (head_dim == 0 || head_dim > 128 || group_count == 0 ||
+        group_ids == nullptr || group_offsets == nullptr || group_indices == nullptr)
+        return cudaErrorInvalidConfiguration;
+    dim3 grid(seq_len, n_heads, 1);
+    dim3 block(32, 1, 1);
+    size_t smem = (seq_len + 1) * sizeof(float);
+    vision_grouped_indexed_sdpa_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k,
+        (const __nv_bfloat16*)v, (__nv_bfloat16*)out,
+        seq_len, n_heads, head_dim, scale,
+        (const uint32_t*)group_ids, (const uint32_t*)group_offsets,
+        (const uint32_t*)group_indices, group_count);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_pack_grouped_qkv_bf16(
+    const void* q, const void* k, const void* v,
+    void* packed_q, void* packed_k, void* packed_v,
+    const void* group_indices, uint32_t rows, uint32_t row_elements,
+    void* stream)
+{
+    if (q == nullptr || k == nullptr || v == nullptr || packed_q == nullptr ||
+        packed_k == nullptr || packed_v == nullptr || group_indices == nullptr ||
+        rows == 0 || row_elements == 0 || row_elements % 8 != 0)
+        return cudaErrorInvalidConfiguration;
+    uint32_t vectors_per_row = row_elements / 8;
+    uint64_t vector_count = static_cast<uint64_t>(rows) * vectors_per_row;
+    uint64_t blocks = (vector_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (blocks == 0 || blocks > 0xffffffffULL) return cudaErrorInvalidConfiguration;
+    vision_pack_grouped_qkv_bf16_kernel<<<
+        static_cast<uint32_t>(blocks), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+        (const uint4*)q, (const uint4*)k, (const uint4*)v,
+        (uint4*)packed_q, (uint4*)packed_k, (uint4*)packed_v,
+        (const uint32_t*)group_indices, rows, vectors_per_row);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_unpack_grouped_rows_bf16(
+    const void* packed, void* output, const void* group_indices,
+    uint32_t rows, uint32_t row_elements, void* stream)
+{
+    if (packed == nullptr || output == nullptr || group_indices == nullptr ||
+        rows == 0 || row_elements == 0 || row_elements % 8 != 0)
+        return cudaErrorInvalidConfiguration;
+    uint32_t vectors_per_row = row_elements / 8;
+    uint64_t vector_count = static_cast<uint64_t>(rows) * vectors_per_row;
+    uint64_t blocks = (vector_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (blocks == 0 || blocks > 0xffffffffULL) return cudaErrorInvalidConfiguration;
+    vision_unpack_grouped_rows_bf16_kernel<<<
+        static_cast<uint32_t>(blocks), BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+        (const uint4*)packed, (uint4*)output,
+        (const uint32_t*)group_indices, rows, vectors_per_row);
     return cudaGetLastError();
 }
 
@@ -534,11 +774,13 @@ extern "C" cudaError_t apxinf_flash_attn_decode_bf16(
 }
 
 extern "C" cudaError_t apxinf_argmax_bf16(
-    const void* logits, uint32_t n, void* out, void* stream)
+    const void* logits, uint32_t n, void* partials, void* out, void* stream)
 {
     cudaStream_t s = (cudaStream_t)stream;
-    // One block of 256 threads — vocab (32k) / 256 = 128 elems/thread.
-    argmax_bf16_kernel<<<1, 256, 0, s>>>(
-        (const __nv_bfloat16*)logits, n, (uint32_t*)out);
+    argmax_bf16_partials_kernel<<<APXINF_ARGMAX_PARTIAL_BLOCKS, 256, 0, s>>>(
+        (const __nv_bfloat16*)logits, n, (ArgmaxPair*)partials);
+    argmax_pair_final_kernel<<<1, 256, 0, s>>>(
+        (const ArgmaxPair*)partials, APXINF_ARGMAX_PARTIAL_BLOCKS,
+        (uint32_t*)out);
     return cudaGetLastError();
 }

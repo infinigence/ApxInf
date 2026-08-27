@@ -1,5 +1,5 @@
 /// Supported data types for tensor elements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DType {
     F32,
     F16,

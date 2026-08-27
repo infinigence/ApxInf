@@ -4,10 +4,12 @@ use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
 use crate::tuning::{
-    DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TacticBackend,
-    TuningDType,
+    DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, GemmTuningRecord, ScaleMode,
+    TacticBackend, TacticId, TacticStore, TuningDType,
 };
+#[cfg(apxinf_cutlass_bf16_sm89)]
 use crate::workspace::output_buffer;
+use crate::workspace::uninitialized_buffer;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Bf16AutotuneResult {
@@ -16,6 +18,15 @@ pub struct Bf16AutotuneResult {
     pub vendor_ms: f64,
     pub cublaslt_default_ms: f64,
     pub cublaslt_best_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16CublasLtTactic {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub heuristic_rank: i32,
+    pub milliseconds: f64,
 }
 
 struct CudaEventPair {
@@ -287,6 +298,73 @@ fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey 
     }
 }
 
+/// Install an exact BF16 cuBLASLt tactic set before model execution or graph
+/// capture. The immutable TacticStore owns selection; the C ABI owns prepared
+/// plans and their fixed workspace.
+pub fn install_cublaslt_bf16_tactics(
+    ctx: &CudaContext,
+    tactics: &[Bf16CublasLtTactic],
+) -> Result<()> {
+    if tactics.is_empty() {
+        return Err(Error::Other(
+            "BF16 cuBLASLt tactic set must not be empty".into(),
+        ));
+    }
+    if !crate::workspace::may_prepare_native_resources() {
+        return Err(Error::Other(
+            "BF16 cuBLASLt tactics must be installed before graph execution".into(),
+        ));
+    }
+    let records = tactics
+        .iter()
+        .map(|tactic| {
+            if !(0..64).contains(&tactic.heuristic_rank)
+                || tactic.m == 0
+                || tactic.n == 0
+                || tactic.k == 0
+                || !tactic.milliseconds.is_finite()
+                || tactic.milliseconds <= 0.0
+            {
+                return Err(Error::Other(format!(
+                    "invalid BF16 cuBLASLt tactic {tactic:?}"
+                )));
+            }
+            Ok(GemmTuningRecord {
+                key: tuning_key(ctx, tactic.m, tactic.n, tactic.k),
+                tactic: TacticId {
+                    backend: TacticBackend::CublasLt,
+                    value: tactic.heuristic_rank,
+                },
+                milliseconds: Some(tactic.milliseconds),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let store = TacticStore::from_gemm_records(records)?;
+    if let Some(installed) = crate::tuning::installed() {
+        if installed != &store {
+            return Err(Error::Other(
+                "a different CUDA tactic store is already installed".into(),
+            ));
+        }
+    }
+    for tactic in tactics {
+        set_cublaslt_gemm_heuristic(tactic.m, tactic.n, tactic.k, tactic.heuristic_rank)?;
+        unsafe {
+            ffi::check_cublas(ffi::apxinf_static_prepare_bf16_gemm(
+                tactic.m as i32,
+                tactic.n as i32,
+                tactic.k as i32,
+            ))
+            .map_err(Error::Cuda)?;
+        }
+    }
+    if crate::tuning::installed().is_some() {
+        Ok(())
+    } else {
+        crate::tuning::install(store)
+    }
+}
+
 pub(crate) fn set_cublaslt_gemm_heuristic(
     m: usize,
     n: usize,
@@ -351,6 +429,73 @@ pub(crate) fn set_cublaslt_gemm_split_custom(
     ffi::check_cublas(status).map_err(Error::Cuda)
 }
 
+/// Physical BF16 GEMM into caller-owned storage.
+#[allow(clippy::too_many_arguments)]
+pub fn write_bf16(
+    ctx: &CudaContext,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+) -> Result<()> {
+    let persisted_tactic = crate::tuning::lookup_gemm_exact(&tuning_key(ctx, m, n, k));
+    let use_split_serial = persisted_tactic
+        .is_some_and(|tactic| tactic.backend == TacticBackend::CublasLtCustomSplitSerial);
+    let use_persisted_cublaslt = persisted_tactic.is_some_and(|tactic| {
+        matches!(
+            tactic.backend,
+            TacticBackend::CublasLt
+                | TacticBackend::CublasLtCustom
+                | TacticBackend::CublasLtCustomSplitSerial
+        )
+    });
+    if use_persisted_cublaslt {
+        if crate::workspace::may_prepare_native_resources() {
+            unsafe {
+                let status = if use_split_serial {
+                    ffi::apxinf_static_prepare_bf16_gemm_split(m as i32, n as i32, k as i32)
+                } else {
+                    ffi::apxinf_static_prepare_bf16_gemm(m as i32, n as i32, k as i32)
+                };
+                ffi::check_cublas(status).map_err(Error::Cuda)?;
+            }
+        }
+        unsafe {
+            let status = if use_split_serial {
+                crate::ffi::apxinf_static_bf16_gemm_split(
+                    activation.ptr(),
+                    weight.ptr(),
+                    output.ptr(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    alpha,
+                    ctx.stream().handle(),
+                )
+            } else {
+                crate::ffi::apxinf_static_bf16_gemm(
+                    activation.ptr(),
+                    weight.ptr(),
+                    output.ptr(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    alpha,
+                    ctx.stream().handle(),
+                )
+            };
+            crate::ffi::check_cublas(status).map_err(Error::Cuda)?;
+        }
+        return Ok(());
+    }
+    ctx.cublas()
+        .gemm(DType::BF16, m, n, k, alpha, activation, weight, 0.0, output)
+        .map_err(Error::Cuda)
+}
+
 /// Physical BF16 GEMM contract: `[M,K] @ [K,N] -> [M,N]`.
 pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if activation.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
@@ -383,72 +528,10 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
     }
 
     let (m, k, n) = (activation_shape[0], activation_shape[1], weight_shape[1]);
-    let output = output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let output = uninitialized_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
-    let persisted_tactic = crate::tuning::lookup_gemm_exact(&tuning_key(ctx, m, n, k));
-    let use_split_serial = persisted_tactic
-        .is_some_and(|tactic| tactic.backend == TacticBackend::CublasLtCustomSplitSerial);
-    let use_persisted_cublaslt = persisted_tactic.is_some_and(|tactic| {
-        matches!(
-            tactic.backend,
-            TacticBackend::CublasLt
-                | TacticBackend::CublasLtCustom
-                | TacticBackend::CublasLtCustomSplitSerial
-        )
-    });
-    if use_persisted_cublaslt {
-        if crate::workspace::may_prepare_native_resources() {
-            unsafe {
-                let status = if use_split_serial {
-                    ffi::apxinf_static_prepare_bf16_gemm_split(m as i32, n as i32, k as i32)
-                } else {
-                    ffi::apxinf_static_prepare_bf16_gemm(m as i32, n as i32, k as i32)
-                };
-                ffi::check_cublas(status).map_err(Error::Cuda)?;
-            }
-        }
-        unsafe {
-            let status = if use_split_serial {
-                crate::ffi::apxinf_static_bf16_gemm_split(
-                    activation.ptr(),
-                    weight.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    ctx.stream().handle(),
-                )
-            } else {
-                crate::ffi::apxinf_static_bf16_gemm(
-                    activation.ptr(),
-                    weight.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    ctx.stream().handle(),
-                )
-            };
-            crate::ffi::check_cublas(status).map_err(Error::Cuda)?;
-        }
-        return Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16));
-    }
-    ctx.cublas()
-        .gemm(
-            DType::BF16,
-            m,
-            n,
-            k,
-            1.0,
-            &activation,
-            &weight,
-            0.0,
-            &output,
-        )
-        .map_err(Error::Cuda)?;
+    write_bf16(ctx, &activation, &weight, &output, m, n, k, 1.0)?;
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
@@ -524,9 +607,7 @@ pub fn gemm_bf16_geglu_fused(
             got: selected_weight.device(),
         });
     }
-    if ctx.caps().sm == 89
-        && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048))
-    {
+    if ctx.caps().sm == 89 && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048)) {
         let Some(sm89_weight) = bf16_sm89_geglu_interleaved else {
             return Ok(None);
         };
@@ -556,7 +637,9 @@ pub fn gemm_bf16_geglu_fused(
                 ctx,
                 m.checked_mul(n)
                     .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                    .ok_or_else(|| Error::Other("BF16 SM89 fused GeGLU output size overflow".into()))?,
+                    .ok_or_else(|| {
+                        Error::Other("BF16 SM89 fused GeGLU output size overflow".into())
+                    })?,
             )?;
             let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
             let weight_buffer = CudaBuffer::from_tensor(sm89_weight).map_err(Error::Cuda)?;

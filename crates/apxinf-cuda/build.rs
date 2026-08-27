@@ -47,6 +47,7 @@ fn computed_kernel_build_id(
     target_arch: &str,
     nvcc_arch: Option<&str>,
     cutlass_arch: Option<&str>,
+    operator_set: &str,
 ) -> String {
     let mut hash = FNV1A_128_OFFSET;
     for value in [
@@ -55,6 +56,7 @@ fn computed_kernel_build_id(
         target_arch,
         nvcc_arch.unwrap_or("native"),
         cutlass_arch.unwrap_or("native"),
+        operator_set,
     ] {
         hash_bytes(&mut hash, value.as_bytes());
         hash_bytes(&mut hash, &[0]);
@@ -114,10 +116,13 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_bf16_sm89)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_vision_sm80)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_causal_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_direct_e4m3_sm100)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
+    println!("cargo:rerun-if-env-changed=APXINF_CUDA_OPERATOR_SET");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
@@ -245,12 +250,26 @@ fn main() {
             }
             let nvcc_arch = Some(selection.nvcc_arch);
             let cutlass_arch = Some(selection.cutlass_arch);
+            let operator_set = match env::var("APXINF_CUDA_OPERATOR_SET") {
+                Err(env::VarError::NotPresent) => "full".to_string(),
+                Ok(value) if value == "core" || value == "core-fa2" || value == "full" => value,
+                Ok(value) => panic!(
+                    "APXINF_CUDA_OPERATOR_SET must be core, core-fa2 or full, got `{value}`"
+                ),
+                Err(env::VarError::NotUnicode(_)) => {
+                    panic!("APXINF_CUDA_OPERATOR_SET must be UTF-8")
+                }
+            };
+            let build_full_operators = operator_set == "full";
+            let build_fa2_operators = build_full_operators || operator_set == "core-fa2";
+            let fa2_bf16_hdim96_only = operator_set == "core-fa2";
             let kernel_build_id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
                 computed_kernel_build_id(
                     std::path::Path::new(&manifest_dir),
                     &arch_for_target,
                     nvcc_arch.as_deref(),
                     cutlass_arch.as_deref(),
+                    &operator_set,
                 )
             });
             emit_kernel_build_id(&kernel_build_id);
@@ -290,7 +309,9 @@ fn main() {
             let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
             let mut cutlass_includes = Vec::new();
-            if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
+            if build_full_operators
+                && cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family)
+            {
                 let fmha = cutlass_root.join("fmha");
                 let cutlass = cutlass_root.join("include");
                 let cutlass_utils = cutlass_root.join("tools/util/include");
@@ -350,7 +371,7 @@ fn main() {
             }
 
             let mut cutlass_int8_includes = Vec::new();
-            if nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family) {
+            if build_full_operators && nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family) {
                 let cutlass = cutlass_root.join("include");
                 let cutlass_utils = cutlass_root.join("tools/util/include");
                 let extensions = cutlass_root.join("extensions");
@@ -383,10 +404,14 @@ fn main() {
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
             let mut fa2_includes = Vec::new();
-            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
-            let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
+            let fa2_sm80 =
+                build_fa2_operators && nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
+            let fa2_f16_sm100 = build_full_operators
+                && nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
             if fa2_sm80 || fa2_f16_sm100 {
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
+                let fa2_hdim128_causal =
+                    fa2_root.join("flash_attn/flash_fwd_hdim128_bf16_causal_sm80.cu");
                 let fa2_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_bf16_sm80.cu");
                 let fa2_f16_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_fp16.cu");
                 let fa2_f16_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_fp16.cu");
@@ -402,22 +427,36 @@ fn main() {
                     "vendored FlashAttention-2 sources are incomplete under {}",
                     fa2_root.display()
                 );
-                fa2_sources.extend([
-                    fa2_wrapper.clone(),
-                    fa2_hdim96,
-                    fa2_hdim256,
-                    fa2_f16_hdim96,
-                    fa2_f16_hdim256,
-                ]);
                 if fa2_sm80 {
-                    let fa2_split_hdim256 =
-                        fa2_root.join("flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu");
                     assert!(
-                        fa2_split_hdim256.is_file(),
-                        "vendored FlashAttention-2 split-KV source is incomplete under {}",
+                        fa2_hdim128_causal.is_file(),
+                        "vendored causal FlashAttention-2 source is missing under {}",
                         fa2_root.display()
                     );
-                    fa2_sources.push(fa2_split_hdim256);
+                }
+                if fa2_bf16_hdim96_only {
+                    fa2_sources.extend([fa2_wrapper.clone(), fa2_hdim96]);
+                } else {
+                    fa2_sources.extend([
+                        fa2_wrapper.clone(),
+                        fa2_hdim96,
+                        fa2_hdim256,
+                        fa2_f16_hdim96,
+                        fa2_f16_hdim256,
+                    ]);
+                    if fa2_sm80 {
+                        let fa2_split_hdim256 =
+                            fa2_root.join("flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu");
+                        assert!(
+                            fa2_split_hdim256.is_file(),
+                            "vendored FlashAttention-2 split-KV source is incomplete under {}",
+                            fa2_root.display()
+                        );
+                        fa2_sources.push(fa2_split_hdim256);
+                    }
+                }
+                if fa2_sm80 {
+                    fa2_sources.push(fa2_hdim128_causal);
                 }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
@@ -438,7 +477,12 @@ fn main() {
                 fa2_includes.extend([fa2_root.clone(), fa2_cutlass]);
                 kernel_files.extend(fa2_sources.iter().cloned());
                 if fa2_sm80 {
-                    println!("cargo:rustc-cfg=apxinf_fa2_sm80");
+                    println!("cargo:rustc-cfg=apxinf_fa2_causal_sm80");
+                    if fa2_bf16_hdim96_only {
+                        println!("cargo:rustc-cfg=apxinf_fa2_vision_sm80");
+                    } else {
+                        println!("cargo:rustc-cfg=apxinf_fa2_sm80");
+                    }
                 }
                 emit_rerun_if_changed_tree(&fa2_root);
             }
@@ -528,8 +572,13 @@ fn main() {
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2",
                         ]);
-                        if fa2_sm80 {
+                        if fa2_bf16_hdim96_only {
+                            cmd.arg("-DAPXINF_FA2_BF16_HDIM96_ONLY=1");
+                        } else if fa2_sm80 {
                             cmd.arg("-DAPXINF_FA2_SM80=1");
+                        }
+                        if fa2_sm80 {
+                            cmd.arg("-DAPXINF_FA2_CAUSAL_HDIM128=1");
                         }
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));

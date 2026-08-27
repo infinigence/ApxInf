@@ -2,10 +2,101 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 
-use super::contracts::gpu_ptr;
+use super::contracts::{gpu_ptr, make_gpu_tensor};
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::output_buffer;
+
+pub fn im2col1d_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if input.dtype() != DType::BF16 || dims.len() != 2 || kernel == 0 || stride == 0 {
+        return Err(Error::Other(
+            "im2col1d: expected rank-2 BF16 input and positive kernel/stride".into(),
+        ));
+    }
+    let (frames, channels) = (dims[0], dims[1]);
+    let padded = frames
+        .checked_add(2 * padding)
+        .ok_or_else(|| Error::Other("im2col1d: padded length overflow".into()))?;
+    if padded < kernel {
+        return Err(Error::Other("im2col1d: kernel exceeds padded input".into()));
+    }
+    let output_frames = (padded - kernel) / stride + 1;
+    let shape = apxinf_core::Shape::new(vec![output_frames, channels * kernel]);
+    let output = output_buffer(
+        ctx,
+        output_frames * channels * kernel * DType::BF16.size_in_bytes(),
+    )?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_im2col1d_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            frames as i32,
+            channels as i32,
+            kernel as i32,
+            stride as i32,
+            padding as i32,
+            output_frames as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        shape,
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+pub fn avg_pool1d_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    kernel: usize,
+    stride: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if input.dtype() != DType::BF16
+        || dims.len() != 2
+        || kernel == 0
+        || stride == 0
+        || dims[0] < kernel
+    {
+        return Err(Error::Other("avg_pool1d: invalid BF16 input or parameters".into()));
+    }
+    let (frames, channels) = (dims[0], dims[1]);
+    let output_frames = (frames - kernel) / stride + 1;
+    let output = output_buffer(
+        ctx,
+        output_frames * channels * DType::BF16.size_in_bytes(),
+    )?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_avg_pool1d_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            frames as i32,
+            channels as i32,
+            kernel as i32,
+            stride as i32,
+            output_frames as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        apxinf_core::Shape::new(vec![output_frames, channels]),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
 /// Memory layout of a fixed-shape batch of RGB `uint8` images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageLayout {

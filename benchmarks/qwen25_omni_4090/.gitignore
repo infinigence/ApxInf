@@ -1,0 +1,14 @@
+# Generated experiment evidence stays on the experiment host. Keep only the
+# reviewed aggregate records below in source control.
+profiles/
+results/*
+!results/apxinf-vs-vllm-omni-0.26.0.json
+!results/omni-packed-mlp-acceptance-summary.json
+!results/promotion-grouped-varlen-fa2.json
+!results/promotion-m1-packed-mlp.json
+!results/promotion-m1-gemv-tactics.json
+!results/promotion-short-exact-residual-norm.json
+!results/promotion-short-w32-attention.json
+!results/promotion-fused-qkv-prelude.json
+!results/promotion-pack8-residual-rmsnorm.json
+!results/promotion-scaled-exp-cache-prefill.json

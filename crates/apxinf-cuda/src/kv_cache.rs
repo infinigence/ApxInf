@@ -19,7 +19,6 @@ pub struct CudaKVCache {
     head_dim: usize,
     max_seq_len: usize,
     seq_len: usize,
-    device_id: usize,
 }
 
 impl CudaKVCache {
@@ -48,7 +47,6 @@ impl CudaKVCache {
             head_dim,
             max_seq_len,
             seq_len: 0,
-            device_id,
         })
     }
 
@@ -127,13 +125,11 @@ impl KvCache for CudaKVCache {
 
     fn clear(&mut self) -> apxinf_core::Result<()> {
         self.seq_len = 0;
-        let layer_bytes =
-            self.n_kv_heads * self.max_seq_len * self.head_dim * std::mem::size_of::<f32>();
-        for buf in &mut self.k_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
+        for buffer in &self.k_buffers {
+            buffer.memset(0).map_err(Error::Cuda)?;
         }
-        for buf in &mut self.v_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
+        for buffer in &self.v_buffers {
+            buffer.memset(0).map_err(Error::Cuda)?;
         }
         Ok(())
     }

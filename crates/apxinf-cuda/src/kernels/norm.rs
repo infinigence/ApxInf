@@ -9,6 +9,7 @@ use super::contracts::{
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::uninitialized_buffer;
 
 /// RMS normalization into caller-owned storage.
 #[allow(clippy::too_many_arguments)]
@@ -106,6 +107,50 @@ pub fn residual_add_rms_bf16_into(
     })
 }
 
+/// Bit-exact composition of BF16 residual add followed by BF16 RMSNorm.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rms_exact_bf16_into(
+    ctx: &CudaContext,
+    residual: &CudaBuffer,
+    delta: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    cols: usize,
+    rows: usize,
+    eps: f32,
+) -> Result<()> {
+    require_finite("exact residual RMSNorm", &[eps])?;
+    if eps <= 0.0 {
+        return Err(Error::Other(
+            "exact residual RMSNorm epsilon must be positive".into(),
+        ));
+    }
+    let matrix = checked_bytes(DType::BF16, &[rows, cols], "exact residual RMSNorm")?;
+    let weight_size = checked_bytes(DType::BF16, &[cols], "exact residual RMSNorm")?;
+    require_buffers(
+        ctx,
+        "exact residual RMSNorm",
+        &[
+            ("residual", residual, matrix),
+            ("delta", delta, matrix),
+            ("weight", weight, weight_size),
+            ("output", output, matrix),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rms_norm_add_exact_bf16(
+            residual.ptr(),
+            delta.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            cols as u32,
+            rows as u32,
+            eps,
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// RMS normalization on CUDA. Dispatches on `input.dtype()`.
 pub fn rms(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let device_id = ctx.device_id();
@@ -118,7 +163,7 @@ pub fn rms(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Resu
     };
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -173,7 +218,7 @@ pub fn layer(
     } else {
         dims[dims.len() - 1]
     };
-    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let out_buf = uninitialized_buffer(ctx, input.size_in_bytes())?;
     unsafe {
         let res = ffi::apxinf_layer_norm_bf16(
             gpu_ptr(input)?,

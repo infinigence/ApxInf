@@ -3,6 +3,38 @@
 // Copyright 2026 apxinf contributors.
 // Pure CUDA operators grouped by physical operation; launch policy lives under adapters/.
 
+__global__ void im2col1d_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int frames, int channels, int kernel, int stride, int padding,
+    int output_frames) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t count = static_cast<int64_t>(output_frames) * channels * kernel;
+  if (index >= count) return;
+  int tap = static_cast<int>(index % kernel);
+  int channel = static_cast<int>((index / kernel) % channels);
+  int output_frame = static_cast<int>(index / (static_cast<int64_t>(kernel) * channels));
+  int input_frame = output_frame * stride + tap - padding;
+  output[index] = input_frame >= 0 && input_frame < frames
+      ? input[static_cast<int64_t>(input_frame) * channels + channel]
+      : __float2bfloat16(0.0f);
+}
+
+__global__ void avg_pool1d_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    int frames, int channels, int kernel, int stride, int output_frames) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t count = static_cast<int64_t>(output_frames) * channels;
+  if (index >= count) return;
+  int channel = static_cast<int>(index % channels);
+  int output_frame = static_cast<int>(index / channels);
+  float sum = 0.0f;
+  for (int tap = 0; tap < kernel; ++tap) {
+    sum += __bfloat162float(
+        input[static_cast<int64_t>(output_frame * stride + tap) * channels + channel]);
+  }
+  output[index] = __float2bfloat16(sum / static_cast<float>(kernel));
+}
+
 template <bool kNhwc>
 __global__ void rgb_u8_to_patches_e4m3_kernel(
     const uint8_t* images, __nv_fp8_e4m3* patches, int views,
@@ -95,6 +127,4 @@ __global__ void rgb_u8_to_patches_bf16_kernel(
     patches[output_index] = __float2bfloat16(normalized);
   }
 }
-
-
 

@@ -1,6 +1,7 @@
 //! Persistent CUDA graph workspace and deterministic sub-allocation.
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 
 use apxinf_core::{DType, Error, Result};
 
@@ -205,11 +206,50 @@ pub(crate) fn may_prepare_native_resources() -> bool {
     PREPARING.with(Cell::get) || ACTIVE_WORKSPACE.with(|active| active.get().is_null())
 }
 
+fn stream_ordered_alloc_enabled() -> Result<bool> {
+    static ENABLED: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ENABLED
+        .get_or_init(|| match std::env::var("APXINF_STREAM_ORDERED_ALLOC") {
+            Err(std::env::VarError::NotPresent) => Ok(false),
+            Ok(value) if value == "0" => Ok(false),
+            Ok(value) if value == "1" => Ok(true),
+            Ok(value) => Err(format!(
+                "APXINF_STREAM_ORDERED_ALLOC must be 0 or 1, got `{value}`"
+            )),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err("APXINF_STREAM_ORDERED_ALLOC must be UTF-8".into())
+            }
+        })
+        .clone()
+        .map_err(Error::Other)
+}
+
+pub(crate) fn uninitialized_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
+    ACTIVE_WORKSPACE.with(|active| {
+        let workspace = active.get();
+        if workspace.is_null() {
+            if stream_ordered_alloc_enabled()? {
+                CudaBuffer::alloc_stream_ordered(bytes, ctx.device_id(), ctx.stream())
+                    .map_err(Error::Cuda)
+            } else {
+                CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)
+            }
+        } else {
+            unsafe { &*workspace }.allocate(bytes, ctx.device_id())
+        }
+    })
+}
+
 pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
         if workspace.is_null() {
-            CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
+            if stream_ordered_alloc_enabled()? {
+                CudaBuffer::alloc_zeros_stream_ordered(bytes, ctx.device_id(), ctx.stream())
+                    .map_err(Error::Cuda)
+            } else {
+                CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
+            }
         } else {
             unsafe { &*workspace }.allocate(bytes, ctx.device_id())
         }
