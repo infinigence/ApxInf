@@ -2,7 +2,6 @@
   "cublas_version": "12.6.1",
   "cuda_version": "12.6",
   "device_name": "Orin",
-  "kernel_build_id": "kb1-9cfe595e65bb10dcf7998ffc43d97a9b",
   "records": [
     {
       "candidates": {

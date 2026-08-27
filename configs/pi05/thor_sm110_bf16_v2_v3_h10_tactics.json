@@ -2,7 +2,6 @@
   "cublas_version": "13.0",
   "cuda_version": "13.0",
   "device_name": "NVIDIA Thor",
-  "kernel_build_id": "kb1-5c8c12913a9206958668d721742d5168",
   "records": [
     {
       "candidates": {
