@@ -27,6 +27,10 @@ impl CudaDeviceAddress {
     pub fn device(self) -> usize {
         self.device
     }
+
+    pub fn is_aligned(self, alignment: usize) -> bool {
+        alignment.is_power_of_two() && (self.ptr as usize) % alignment == 0
+    }
 }
 
 struct CudaAllocation {
@@ -321,23 +325,38 @@ impl HostMappedBuffer {
     /// Publish one mapped u32 value to the device without exposing host raw
     /// pointers to model code.
     pub fn write_u32(&self, value: u32) -> Result<(), String> {
-        self.write_u32s(&[value])
+        self.write_u32s_at(0, &[value])
     }
 
     pub fn write_u32s(&self, values: &[u32]) -> Result<(), String> {
+        self.write_u32s_at(0, values)
+    }
+
+    /// Publish u32 values beginning at `index` without a CUDA transfer. The
+    /// mapped allocation has a stable device address suitable for graph replay.
+    pub fn write_u32s_at(&self, index: usize, values: &[u32]) -> Result<(), String> {
+        let offset = index
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "mapped u32 write offset overflow".to_string())?;
         let bytes = values
             .len()
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| "mapped u32 write size overflow".to_string())?;
-        if self.len < bytes {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| "mapped u32 write range overflow".to_string())?;
+        if self.len < end {
             return Err(format!(
-                "mapped buffer is {} bytes, need {}",
-                self.len, bytes
+                "mapped buffer is {} bytes, write range is [{offset}..{end}]",
+                self.len
             ));
         }
         unsafe {
-            for (index, value) in values.iter().copied().enumerate() {
-                std::ptr::write_volatile((self.host_ptr as *mut u32).add(index), value);
+            for (value_index, value) in values.iter().copied().enumerate() {
+                std::ptr::write_volatile(
+                    (self.host_ptr as *mut u32).add(index + value_index),
+                    value,
+                );
             }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

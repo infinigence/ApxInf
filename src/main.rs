@@ -72,7 +72,7 @@ enum Commands {
         port: u16,
 
         /// Maximum total sequence length the service accepts (prompt + completion)
-        #[arg(long, default_value_t = 32768)]
+        #[arg(long, default_value_t = 65_664)]
         max_model_len: usize,
 
         /// Model revision reported by /health

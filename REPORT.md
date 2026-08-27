@@ -282,6 +282,43 @@ python3 benchmarks/qwen38_4090/evaluation/run_evaluation.py \
 - hidden correctness、正式 1 warm-up + 5 repeats/CV、32K+、C4/C8 和图像能力仍未本地验证。
 - 回滚 paired GEMM：还原 `qwen35.cuh`、`custom_kernels.cu`、`ffi/custom.rs`、`kernels/quantization.rs` 与 `qwen35/cuda.rs` 中本节对应改动，然后按 §10 重新构建。服务协议改动可独立还原 `src/serve.rs` 与 `src/main.rs`。
 
+## 12. 2026-08-26 发布版本（iterations 33-35）
+
+### 12.1 本轮变更
+
+| 变更 | 位置 | 证据 |
+|---|---|---|
+| K128xN128 Marlin M1 decode 默认（`APXINF_MARLIN_M1_SHAPE=k64n128` 可选更快形状，`k128n64` 诊断） | `crates/apxinf-cuda/adapters/marlin_adapter.cu` | iterate_report_34.md：K64xN128 在 4 轮并发 A/B 中 TPOT 降 0.45-0.49%，但其 1K 输出处于冻结参考近 tie，随 GPU 时钟/温度翻转；发布默认采用全观测稳定的 K128xN128 |
+| GQA6 shared-KV decode attention 默认（`APXINF_GQA_GROUP=0` 回滚） | `crates/apxinf-cuda/kernels/custom/qwen35.cuh`、`crates/apxinf-model/src/qwen35/cuda.rs` | iterate_report_33.md：8K decode attention 0.777 ms/次 |
+| 位置安全 full-layer decode graph 默认（`APXINF_FULL_LAYER_GRAPH=0` 回滚） | `crates/apxinf-model/src/qwen35/cuda.rs` | iterate_report_33.md：32,640-token 上下文精确通过 |
+| 双 warp GDN prefill recurrence 默认（`APXINF_PREFILL_GDN_WARPS=0` 回滚，`3`/`4` 诊断） | `crates/apxinf-cuda/kernels/custom/qwen35.cuh`、`crates/apxinf-model/src/qwen35/cuda.rs` | iterate_report_35.md：canonical prefill 提升 1.69-2.36%，recurrence kernel 降 4.8% |
+
+### 12.2 发布测量（`iterate35-default`，public_calibration，0 warm-up / 1 repeat）
+
+| Cell | TTFT | Prefill | TPOT | Decode | Peak VRAM |
+|---|---:|---:|---:|---:|---:|
+| text-perf-1024 | 0.6254 s | 1,637.5 tok/s | 24.203 ms | 41.32 tok/s | 22,138 MiB |
+| text-perf-2048 | 1.2728 s | 1,609.1 tok/s | 25.750 ms | 38.84 tok/s | 22,138 MiB |
+| text-perf-4096 | 2.6283 s | 1,558.4 tok/s | 28.837 ms | 34.68 tok/s | 22,138 MiB |
+| text-perf-8192 | 5.4278 s | 1,509.3 tok/s | 35.002 ms | 28.57 tok/s | 22,138 MiB |
+| text-perf-16384 | 11.4096 s | 1,436.0 tok/s | 47.331 ms | 21.13 tok/s | 22,138 MiB |
+
+- 正确性：公开 6/6；frozen trajectory 256/256；协议与 reliability 全通过；请求成功率 1.0。
+- 长上下文：32,640 prompt + 128 output 精确通过（`context-32640-retrieval-early` 输出 SHA `5a66bd3b...b03b`）。
+- 与本地 vLLM 对照：最佳比值 1K prefill 0.590x、1K decode 0.835x；**1.2x 目标未达成**，详见 iterate_report_33/34/35.md。
+
+### 12.3 负控制与回滚
+
+- 每个新默认都有环境变量回滚开关（见 12.1 表），且回滚路径在 A/B 矩阵中作为 control 实测。
+- iteration 36 的三 tile GDN 实验（`APXINF_PREFILL_GDN_WARPS=3`）未完成验证，**不包含在发布源码中**；发布源码的 `PREFILL_GDN_WARPS` 仅接受 `0|2|4`。
+- `python3 benchmarks/qwen38_4090/evaluation/test.py check` 在发布源码上输出 `assignment checks passed`。
+
+### 12.4 已知限制
+
+- 1.2x vLLM 吞吐目标未达成；剩余瓶颈为 Marlin 投影与 prefill recurrence（Nsight 剖析见 iterate_report_35.md）。
+- 上下文上限 32,768（含 128 输出预算）；>32K、C4/C8 多请求与图像能力未实现（README 加分项，后续工作）。
+
 ---
+
 
 *本报告不含模型权重、凭据、机器地址或未公开评测数据。*

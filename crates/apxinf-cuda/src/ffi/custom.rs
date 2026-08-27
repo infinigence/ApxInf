@@ -4,6 +4,18 @@ use std::ffi::c_void;
 
 use super::cuda::{cudaError_t, cudaStream_t};
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MarlinAwqU4G32V1Projection {
+    pub marlin_qweight: *const c_void,
+    pub scales_bf16: *const c_void,
+    pub zero_points_u4: *const c_void,
+    pub output: *mut c_void,
+    pub padded_output: *mut c_void,
+    pub logical_n: i32,
+    pub padded_n: i32,
+}
+
 extern "C" {
     pub fn apxinf_static_evict_l2(
         buffer: *mut c_void,
@@ -46,6 +58,80 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    /// Repack row-major AWQ U4 qweight into the standalone Marlin layout.
+    pub fn apxinf_marlin_awq_u4_g32_v1_repack(
+        awq_qweight: *const c_void,
+        marlin_qweight: *mut c_void,
+        padded_k: i32,
+        padded_n: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    /// Reconstruct one logical output-row tile in canonical compressed-tensors
+    /// U4/BF16/U4 layout from the persistent Marlin representation.
+    pub fn apxinf_marlin_awq_u4_g32_v1_inverse_raw_rows(
+        marlin_qweight: *const c_void,
+        scales_bf16: *const c_void,
+        zero_points_u4: *const c_void,
+        raw_qweight: *mut c_void,
+        raw_scales_bf16: *mut c_void,
+        raw_zero_points_u4: *mut c_void,
+        logical_k: i32,
+        padded_n: i32,
+        padded_k: i32,
+        source_n_offset: i32,
+        row_start: i32,
+        row_count: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    /// Directly reconstruct logical row-major BF16 weights from Marlin layout.
+    pub fn apxinf_marlin_awq_u4_g32_v1_dequant_bf16(
+        marlin_qweight: *const c_void,
+        scales_bf16: *const c_void,
+        zero_points_u4: *const c_void,
+        dense_bf16: *mut c_void,
+        logical_n: i32,
+        logical_k: i32,
+        padded_n: i32,
+        padded_k: i32,
+        source_n_offset: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+
+    /// BF16 x asymmetric U4 group-32 Marlin GEMM. The activation and output
+    /// use physical strides `padded_k` and `padded_n`, respectively.
+    pub fn apxinf_marlin_awq_u4_g32_v1_gemm_bf16(
+        activation: *const c_void,
+        marlin_qweight: *const c_void,
+        scales_bf16: *const c_void,
+        zero_points_u4: *const c_void,
+        output: *mut c_void,
+        workspace: *mut c_void,
+        m: i32,
+        logical_n: i32,
+        logical_k: i32,
+        padded_n: i32,
+        padded_k: i32,
+        sms: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    /// Enqueue two to four independent Marlin projections sharing one physical
+    /// activation and one sequentially reused lock workspace.
+    pub fn apxinf_marlin_awq_u4_g32_v1_gemm_batch_bf16(
+        activation: *const c_void,
+        projections: *const MarlinAwqU4G32V1Projection,
+        projection_count: i32,
+        workspace: *mut c_void,
+        m: i32,
+        logical_k: i32,
+        padded_k: i32,
+        sms: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_qwen35_conv_silu(
         input: *const c_void,
         weight: *const c_void,
@@ -67,6 +153,8 @@ extern "C" {
         vdim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_qwen35_prepare_delta_step() -> cudaError_t;
+
     pub fn apxinf_qwen35_delta_step(
         qkv: *const c_void,
         qk_norm: *const c_void,
@@ -81,6 +169,108 @@ extern "C" {
         v_heads: i32,
         kdim: i32,
         vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_prefill_delta_step(
+        qkv: *const c_void,
+        qk_norm: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        recurrent: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_prepare_prefill_delta_step_4w(
+        supported: *mut i32,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_prefill_delta_step_4w(
+        qkv: *const c_void,
+        qk_norm: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        recurrent: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_prepare_prefill_delta_step_2w(
+        supported: *mut i32,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_prefill_delta_step_2w(
+        qkv: *const c_void,
+        qk_norm: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        recurrent: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_prepare_norm_delta_gated(supported: *mut i32) -> cudaError_t;
+
+    pub fn apxinf_qwen35_norm_delta_gated(
+        qkv: *const c_void,
+        qk_out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        z: *const c_void,
+        norm_weight: *const c_void,
+        recurrent: *mut c_void,
+        delta_out: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_prepare_packed_delta_gated(supported: *mut i32) -> cudaError_t;
+
+    pub fn apxinf_qwen35_packed_delta_gated(
+        qkv: *const c_void,
+        conv_weight: *const c_void,
+        conv_state: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        z: *const c_void,
+        norm_weight: *const c_void,
+        recurrent: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        k_heads: i32,
+        v_heads: i32,
+        kdim: i32,
+        vdim: i32,
+        conv_kernel: i32,
+        eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 
@@ -123,6 +313,24 @@ extern "C" {
         max_seq_len: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_qwen35_qk_norm_rope_append(
+        q_gate: *const c_void,
+        q_norm_w: *const c_void,
+        k_in: *const c_void,
+        k_norm_w: *const c_void,
+        q_out: *mut c_void,
+        gate_out: *mut c_void,
+        k_cache: *mut c_void,
+        seq: i32,
+        heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn apxinf_qwen35_sigmoid_mul(
         gate: *const c_void,
@@ -147,13 +355,92 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-    pub fn apxinf_qwen35_dequant_w4a16_bf16_row(
+    pub fn apxinf_qwen35_flash_decode_gated_256(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        scale: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_dequant_w4a16_bf16_rows(
         weight_packed: *const c_void,
         weight_scale: *const c_void,
         weight_zero_point: *const c_void,
         dense: *mut c_void,
         in_cols: i32,
         out_cols: i32,
+        groups: i32,
+        row_start: i32,
+        row_count: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_flash_decode_gated_256_split(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        partials: *mut c_void,
+        scale: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_flash_decode_gated_256_split_2w(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        partials: *mut c_void,
+        scale: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_flash_decode_gated_256_split_1w(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        partials: *mut c_void,
+        scale: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_flash_decode_gated_256_gqa(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        partials: *mut c_void,
+        scale: f32,
+        position: *const u32,
+        max_seq_len: i32,
+        group: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_dequant_w4a16_bf16_pair_rows(
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        dense0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        dense1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
         groups: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -968,11 +1255,23 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-    /// Argmax over [n] bf16 logits → writes the winning index to `out` (u32).
-    /// Typically `out` is a host-mapped u32 so the CPU reads it zero-copy.
-    pub fn apxinf_argmax_bf16(
+    /// Exact single-launch argmax over `[n]` bf16 logits.
+    pub fn apxinf_argmax_bf16_single_launch(
         logits: *const c_void,
         n: u32,
+        partials: *mut c_void,
+        partial_capacity: u32,
+        arrivals: *mut c_void,
+        out: *mut c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    /// Exact multi-block argmax over `[n]` bf16 logits.
+    pub fn apxinf_argmax_bf16_parallel(
+        logits: *const c_void,
+        n: u32,
+        partials: *mut c_void,
+        partial_capacity: u32,
         out: *mut c_void,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -1060,12 +1359,50 @@ extern "C" {
         head_dim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_qwen35_scale_out_gated(
+        pv: *const c_void,
+        l: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        seq: i32,
+        heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn apxinf_qwen35_transpose_kt(
         k: *const c_void,
         kt: *mut c_void,
         visible: i32,
         head_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_multi(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        weight_packed2: *const c_void,
+        weight_scale2: *const c_void,
+        weight_zero_point2: *const c_void,
+        output2: *mut c_void,
+        out_cols2: i32,
+        weight_packed3: *const c_void,
+        weight_scale3: *const c_void,
+        weight_zero_point3: *const c_void,
+        output3: *mut c_void,
+        out_cols3: i32,
+        projection_count: i32,
+        in_cols: i32,
+        groups: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 
@@ -1077,6 +1414,150 @@ extern "C" {
         output: *mut c_void,
         in_cols: i32,
         out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_qkv_10240x5120(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_qkv_sched(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        mode: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_gate_up_silu(
+        activation: *const c_void,
+        gate_packed: *const c_void,
+        gate_scale: *const c_void,
+        gate_zero_point: *const c_void,
+        up_packed: *const c_void,
+        up_scale: *const c_void,
+        up_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_cache_hint(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_store_alt_single(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_vector_mma(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_scale_epilogue(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_tile_alt(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_meta_shared(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_persistent(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_repacked_v1(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        padded_out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_w4_transform_cache(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        padded_out_cols: i32,
         groups: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
@@ -1095,6 +1576,372 @@ extern "C" {
         out_cols1: i32,
         in_cols: i32,
         groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_occupancy(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_store_alt(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_coarsen(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_warp(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_reg(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_vector_mma(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_meta(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_weight_stage(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_alt(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_6w(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_prefetch(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_act(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_shared(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_reuse(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_cache(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_tc_pair_2w(
+        activation: *const c_void,
+        weight_packed0: *const c_void,
+        weight_scale0: *const c_void,
+        weight_zero_point0: *const c_void,
+        output0: *mut c_void,
+        out_cols0: i32,
+        weight_packed1: *const c_void,
+        weight_scale1: *const c_void,
+        weight_zero_point1: *const c_void,
+        output1: *mut c_void,
+        out_cols1: i32,
+        in_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_fast_raw(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    /// Raw group-32 W4 prefill candidate. `rows` accepts 2..=2048; the CUDA
+    /// adapter rejects unsupported geometry without changing the public ABI.
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_native(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_fast_repacked_v1(
+        activation: *const c_void,
+        weight_qwords: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        padded_out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_packed_raw(
+        activation: *const c_void,
+        weight_packed: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_packed_repacked_v1(
+        activation: *const c_void,
+        weight_qwords: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        padded_out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_gemm_w4a16_bf16_prefill_repacked_v1(
+        activation: *const c_void,
+        weight_qwords: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        in_cols: i32,
+        out_cols: i32,
+        padded_out_cols: i32,
+        groups: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_qwen35_dequant_w4a16_bf16_rows_repacked_v1(
+        weight_qwords: *const c_void,
+        weight_scale: *const c_void,
+        weight_zero_point: *const c_void,
+        dense: *mut c_void,
+        in_cols: i32,
+        out_cols: i32,
+        groups: i32,
+        row_start: i32,
+        row_count: i32,
+        padded_out_cols: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 

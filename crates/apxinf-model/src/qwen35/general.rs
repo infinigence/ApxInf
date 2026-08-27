@@ -2,9 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
+use apxinf_loader::compressed_tensors::{
+    quantize_bf16_marlin_awq_u4_g32_v1, repack_w4_marlin_awq_u4_g32_v1,
+    repack_w4_marlin_awq_u4_g32_v1_concat, repack_w4_n64_k16_v1,
+    W4_MARLIN_AWQ_U4_G32_V1_SUFFIX, W4_TRANSFORM_CACHE_SUFFIX,
+};
 use apxinf_loader::ModelConfig;
 
-use crate::llm_trait::{LlmCapabilities, LlmTrait};
+use crate::llm_trait::{DraftBlockResult, LlmCapabilities, LlmTrait};
 
 use super::{LayerKind, Qwen35Config};
 
@@ -25,6 +30,26 @@ pub struct GeneralQwen35 {
 struct LinearAttentionState {
     conv: Vec<f32>,
     recurrent: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+fn marlin_projection_role(prefix: &str) -> Option<&'static str> {
+    // Fixed APXINF_MARLIN_ROLES names: qkv, q, k, v, o, out, gate, up, down.
+    let layer = prefix.strip_prefix("model.language_model.layers.")?;
+    let (layer_index, projection) = layer.split_once('.')?;
+    layer_index.parse::<usize>().ok()?;
+    match projection {
+        "linear_attn.in_proj_qkv" => Some("qkv"),
+        "self_attn.q_proj" => Some("q"),
+        "self_attn.k_proj" => Some("k"),
+        "self_attn.v_proj" => Some("v"),
+        "self_attn.o_proj" => Some("o"),
+        "linear_attn.out_proj" => Some("out"),
+        "mlp.gate_proj" => Some("gate"),
+        "mlp.up_proj" => Some("up"),
+        "mlp.down_proj" => Some("down"),
+        _ => None,
+    }
 }
 
 impl GeneralQwen35 {
@@ -75,18 +100,194 @@ impl GeneralQwen35 {
         if !backend.device().is_gpu() {
             return Ok(HashMap::new());
         }
+        let quantized_lm_head = std::env::var("APXINF_LM_HEAD_W4")
+            .map_or(true, |value| value != "0");
         let mut device_tensors = HashMap::new();
         for (name, tensor) in tensors {
-            let cache = name == "model.language_model.embed_tokens.weight"
-                || name == "lm_head.weight"
-                || name.ends_with(".weight_packed")
+            let compressed = name.ends_with(".weight_packed")
                 || name.ends_with(".weight_scale")
-                || name.ends_with(".weight_zero_point")
-                || (name.ends_with(".weight") && tensor.shape().dims().len() == 2);
-            if !cache || !matches!(tensor.dtype(), DType::BF16 | DType::I32) {
+                || name.ends_with(".weight_zero_point");
+            let cache = name == "model.language_model.embed_tokens.weight"
+                || (name == "lm_head.weight" && !quantized_lm_head)
+                || (name != "lm_head.weight"
+                    && name.ends_with(".weight")
+                    && tensor.shape().dims().len() == 2);
+            if cache && !compressed && matches!(tensor.dtype(), DType::BF16 | DType::I32) {
+                device_tensors.insert(name.clone(), backend.to_device(tensor)?);
+            }
+        }
+        if quantized_lm_head {
+            let dense = tensors.get("lm_head.weight")
+                .ok_or_else(|| Error::Other("qwen3_5 weights: missing lm_head.weight".into()))?;
+            let quantized = quantize_bf16_marlin_awq_u4_g32_v1(dense)
+                .map_err(Error::Other)?
+                .ok_or_else(|| Error::Other("qwen3_5 LM head W4 requires a 2-D BF16 group-32-compatible matrix".into()))?;
+            let suffix = W4_MARLIN_AWQ_U4_G32_V1_SUFFIX;
+            device_tensors.insert(
+                format!("lm_head.weight_packed.{suffix}"),
+                backend.to_device(&quantized.packed)?,
+            );
+            device_tensors.insert(
+                format!("lm_head.weight_scale.{suffix}"),
+                backend.to_device(&quantized.scale)?,
+            );
+            device_tensors.insert(
+                format!("lm_head.weight_zero_point.{suffix}"),
+                backend.to_device(&quantized.zero_point)?,
+            );
+        }
+        let fused_raw_mlp = std::env::var_os("APXINF_MLP_FUSED_RAW")
+            .is_some_and(|value| value == "1");
+        let marlin = std::env::var("APXINF_MARLIN").map_or(true, |value| value != "0");
+        let marlin_roles = match std::env::var("APXINF_MARLIN_ROLES") {
+            Ok(value) if value.trim() == "all" => None,
+            Ok(value) => Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|role| !role.is_empty())
+                    .map(str::to_owned)
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            Err(_) => Some(
+                ["q", "k", "v", "o", "out", "gate", "up", "down"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        };
+        let transform_cache = std::env::var_os("APXINF_W4_TRANSFORM_CACHE")
+            .is_some_and(|value| value == "1");
+        let prefixes: Vec<String> = tensors
+            .keys()
+            .filter(|name| name.ends_with(".weight_packed"))
+            .map(|name| name.trim_end_matches(".weight_packed").to_owned())
+            .collect();
+        // Same-activation Marlin groups use one physical N-concatenated
+        // allocation. Members are deliberately skipped below: cloned tensors
+        // share the backend allocation, while Gemm records its logical slice.
+        let mut combined_members = std::collections::HashSet::new();
+        if marlin && std::env::var_os("APXINF_MARLIN_CONCAT").is_some_and(|value| value == "1") {
+            let prefix_set = prefixes.iter().map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            if std::env::var("APXINF_MARLIN_CONCAT_QKV").map_or(true, |value| value != "0") {
+                for q in prefixes.iter().filter(|prefix| prefix.ends_with(".self_attn.q_proj")) {
+                    let base = q.trim_end_matches("q_proj");
+                    let k = format!("{base}k_proj");
+                    let v = format!("{base}v_proj");
+                    let selected = [q.as_str(), k.as_str(), v.as_str()].iter().all(|prefix| {
+                        prefix_set.contains(prefix)
+                            && marlin_roles.as_ref().is_none_or(|roles| {
+                                marlin_projection_role(prefix).is_some_and(|role| roles.contains(role))
+                            })
+                    });
+                    if selected {
+                        if let Some((repacked, _)) = repack_w4_marlin_awq_u4_g32_v1_concat(
+                            tensors, &[q, &k, &v],
+                        ).map_err(Error::Other)? {
+                            let combined = format!("{base}qkv_concat");
+                            let suffix = W4_MARLIN_AWQ_U4_G32_V1_SUFFIX;
+                            device_tensors.insert(format!("{combined}.weight_packed.{suffix}"), backend.to_device(&repacked.packed)?);
+                            device_tensors.insert(format!("{combined}.weight_scale.{suffix}"), backend.to_device(&repacked.scale)?);
+                            device_tensors.insert(format!("{combined}.weight_zero_point.{suffix}"), backend.to_device(&repacked.zero_point)?);
+                            combined_members.extend([q.clone(), k, v]);
+                        }
+                    }
+                }
+            }
+            if !fused_raw_mlp
+                && std::env::var("APXINF_MARLIN_CONCAT_GATE_UP").map_or(true, |value| value != "0")
+            {
+                for gate in prefixes.iter().filter(|prefix| prefix.ends_with(".mlp.gate_proj")) {
+                    let base = gate.trim_end_matches("gate_proj");
+                    let up = format!("{base}up_proj");
+                    let selected = [gate.as_str(), up.as_str()].iter().all(|prefix| {
+                        prefix_set.contains(prefix)
+                            && marlin_roles.as_ref().is_none_or(|roles| {
+                                marlin_projection_role(prefix).is_some_and(|role| roles.contains(role))
+                            })
+                    });
+                    if selected {
+                        if let Some((repacked, _)) = repack_w4_marlin_awq_u4_g32_v1_concat(
+                            tensors, &[gate, &up],
+                        ).map_err(Error::Other)? {
+                            let combined = format!("{base}gate_up_concat");
+                            let suffix = W4_MARLIN_AWQ_U4_G32_V1_SUFFIX;
+                            device_tensors.insert(format!("{combined}.weight_packed.{suffix}"), backend.to_device(&repacked.packed)?);
+                            device_tensors.insert(format!("{combined}.weight_scale.{suffix}"), backend.to_device(&repacked.scale)?);
+                            device_tensors.insert(format!("{combined}.weight_zero_point.{suffix}"), backend.to_device(&repacked.zero_point)?);
+                            combined_members.extend([gate.clone(), up]);
+                        }
+                    }
+                }
+            }
+        }
+        for prefix in prefixes {
+            if combined_members.contains(&prefix) {
                 continue;
             }
-            device_tensors.insert(name.clone(), backend.to_device(tensor)?);
+            let raw_names = [
+                format!("{prefix}.weight_packed"),
+                format!("{prefix}.weight_scale"),
+                format!("{prefix}.weight_zero_point"),
+            ];
+            let raw = raw_names
+                .iter()
+                .map(|name| tensors.get(name))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    Error::Other(format!("qwen3_5 W4 fallback missing tensors for {prefix}"))
+                })?;
+            let role = marlin_projection_role(&prefix);
+            let role_selected = (!fused_raw_mlp || !matches!(role, Some("gate" | "up")))
+                && marlin_roles.as_ref().is_none_or(|roles| {
+                    role.is_some_and(|role| roles.contains(role))
+                });
+            if marlin && role_selected {
+                if let Some(repacked) = repack_w4_marlin_awq_u4_g32_v1(tensors, &prefix)
+                    .map_err(Error::Other)?
+                    .filter(|weight| weight.metadata.padded_cols % 128 == 0
+                        && weight.metadata.padded_rows % 64 == 0)
+                {
+                    let suffix = W4_MARLIN_AWQ_U4_G32_V1_SUFFIX;
+                    device_tensors.insert(
+                        format!("{prefix}.weight_packed.{suffix}"),
+                        backend.to_device(&repacked.packed)?,
+                    );
+                    device_tensors.insert(
+                        format!("{prefix}.weight_scale.{suffix}"),
+                        backend.to_device(&repacked.scale)?,
+                    );
+                    device_tensors.insert(
+                        format!("{prefix}.weight_zero_point.{suffix}"),
+                        backend.to_device(&repacked.zero_point)?,
+                    );
+                    continue;
+                }
+            }
+            if !marlin && transform_cache {
+                if let Some(repacked) = repack_w4_n64_k16_v1(tensors, &prefix)
+                    .map_err(Error::Other)?
+                {
+                    let suffix = W4_TRANSFORM_CACHE_SUFFIX;
+                    device_tensors.insert(
+                        format!("{prefix}.weight_packed.{suffix}"),
+                        backend.to_device(&repacked.packed)?,
+                    );
+                    device_tensors.insert(
+                        format!("{prefix}.weight_scale.{suffix}"),
+                        backend.to_device(&repacked.scale)?,
+                    );
+                    device_tensors.insert(
+                        format!("{prefix}.weight_zero_point.{suffix}"),
+                        backend.to_device(&repacked.zero_point)?,
+                    );
+                    continue;
+                }
+            }
+            for (name, tensor) in raw_names.iter().zip(raw.iter()) {
+                device_tensors.insert(name.clone(), backend.to_device(tensor)?);
+            }
         }
         Ok(device_tensors)
     }
@@ -649,12 +850,46 @@ impl LlmTrait for GeneralQwen35 {
         self.forward_with_hook(token_ids, start_pos, |_, _| {})
     }
 
+    fn prefill_token(&mut self, input: crate::llm_trait::LlmInput<'_>) -> Option<Result<u32>> {
+        if input.image.is_some() {
+            return None;
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &mut self.cuda {
+            return Some(cuda.prefill_token(input.token_ids));
+        }
+        None
+    }
+
     fn decode_token(&mut self, token: u32, pos: u32) -> Option<Result<u32>> {
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &mut self.cuda {
             return Some(cuda.decode_token(token, pos));
         }
         let _ = (token, pos);
+        None
+    }
+
+    fn decode_draft_block(
+        &mut self,
+        current_token: u32,
+        start_pos: u32,
+        draft: &[u32],
+        verified: &mut Vec<u32>,
+    ) -> Option<Result<DraftBlockResult>> {
+        // Default-off until measured. Unsupported configurations return None
+        // without touching state, preserving the ordinary token loop fallback.
+        if std::env::var_os("APXINF_PROMPT_LOOKUP").is_none_or(|value| value != "1") {
+            return None;
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &mut self.cuda {
+            if !cuda.draft_block_supported() {
+                return None;
+            }
+            return Some(cuda.decode_draft_block(current_token, start_pos, draft, verified));
+        }
+        let _ = (current_token, start_pos, draft, verified);
         None
     }
 

@@ -41,6 +41,7 @@ pub const cudaHostAllocDefault: u32 = 0;
 pub const cudaHostAllocPortable: u32 = 1;
 pub const cudaHostAllocMapped: u32 = 2;
 pub const cudaHostAllocWriteCombined: u32 = 4;
+pub const cudaEventDisableTiming: u32 = 2;
 
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
@@ -97,8 +98,14 @@ extern "C" {
     pub fn cudaStreamSynchronize(stream: cudaStream_t) -> cudaError_t;
 
     pub fn cudaEventCreate(event: *mut cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventCreateWithFlags(event: *mut cudaEvent_t, flags: u32) -> cudaError_t;
     pub fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
+    pub fn cudaStreamWaitEvent(
+        stream: cudaStream_t,
+        event: cudaEvent_t,
+        flags: u32,
+    ) -> cudaError_t;
     pub fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventElapsedTime(
         milliseconds: *mut f32,

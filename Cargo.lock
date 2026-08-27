@@ -106,6 +106,7 @@ dependencies = [
  "byteorder",
  "half",
  "memmap2",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

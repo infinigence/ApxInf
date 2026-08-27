@@ -135,6 +135,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_gemm)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_marlin_awq_u4_g32_v1)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
@@ -258,6 +259,9 @@ fn main() {
                 std::path::Path::new(&adapters_dir).join("cublas_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("cublaslt_adapter.cu"),
             ];
+            let marlin_adapter =
+                std::path::Path::new(&adapters_dir).join("marlin_adapter.cu");
+            let marlin_root = std::path::Path::new(&kernels_dir).join("marlin");
             assert!(
                 kernel_files.iter().all(|path| path.is_file()),
                 "one or more required CUDA adapters are missing under {adapters_dir}"
@@ -321,6 +325,19 @@ fn main() {
                 kernel_files.push(cutlass_int8.clone());
                 println!("cargo:rustc-cfg=apxinf_cutlass_int8_sm80");
                 emit_rerun_if_changed_tree(&extensions);
+            }
+            if nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family) {
+                assert!(
+                    marlin_adapter.is_file()
+                        && marlin_root.join("marlin_template.h").is_file()
+                        && marlin_root.join("marlin_awq_u4_g32_kernels.cuh").is_file()
+                        && marlin_root.join("core/scalar_type.hpp").is_file(),
+                    "vendored standalone Marlin sources are incomplete under {}",
+                    marlin_root.display()
+                );
+                kernel_files.push(marlin_adapter.clone());
+                println!("cargo:rustc-cfg=apxinf_marlin_awq_u4_g32_v1");
+                emit_rerun_if_changed_tree(&marlin_root);
             }
 
             let fa2_root = cutlass_root.join("fa2");
@@ -389,6 +406,7 @@ fn main() {
                 let custom_newest =
                     newest_mtime(&std::path::Path::new(&kernels_dir).join("custom"));
                 let cutlass_newest = newest_mtime(std::path::Path::new(&cutlass_root));
+                let marlin_newest = newest_mtime(&marlin_root);
                 for entry in &kernel_files {
                     println!("cargo:rerun-if-changed={}", entry.display());
                     let stem = entry.file_stem().unwrap().to_string_lossy().to_string();
@@ -404,11 +422,15 @@ fn main() {
                         if obj_mtime < src_mtime {
                             stale = true;
                         }
-                        let is_cutlass_family = entry == &cutlass_fmha
-                            || entry == &cutlass_gemm
-                            || entry == &cutlass_int8
-                            || fa2_sources.contains(entry);
-                        let dep = if is_cutlass_family { cutlass_newest } else { custom_newest };
+                        let dep = if entry == &marlin_adapter {
+                            marlin_newest
+                        } else {
+                            let is_cutlass_family = entry == &cutlass_fmha
+                                || entry == &cutlass_gemm
+                                || entry == &cutlass_int8
+                                || fa2_sources.contains(entry);
+                            if is_cutlass_family { cutlass_newest } else { custom_newest }
+                        };
                         if let Some(dep) = dep {
                             if obj_mtime < dep {
                                 stale = true;
@@ -445,6 +467,9 @@ fn main() {
                         if std::path::Path::new(include).exists() {
                             cmd.arg(format!("-I{include}"));
                         }
+                    }
+                    if entry == &marlin_adapter {
+                        cmd.arg("--expt-relaxed-constexpr");
                     }
                     if entry == &cutlass_fmha || entry == &cutlass_gemm {
                         cmd.arg("--expt-relaxed-constexpr");

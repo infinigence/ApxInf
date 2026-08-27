@@ -66,6 +66,20 @@ impl LlmCapabilities {
     pub const VISION: Self = Self { image: true };
 }
 
+/// Result metadata for an exact greedy draft-block decode.
+///
+/// `consumed_draft` is the number of draft positions evaluated. The verified
+/// output contains one ordinary greedy token for each consumed position.
+/// `accepted_prefix` is the number of leading draft tokens equal to those
+/// outputs. A mismatch, when present, is the final consumed position; otherwise
+/// the entire draft was accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftBlockResult {
+    pub consumed_draft: usize,
+    pub accepted_prefix: usize,
+}
+
+
 /// Common interface for all LLM implementations.
 pub trait LlmTrait {
     /// Load model weights and configure for the given device.
@@ -96,6 +110,14 @@ pub trait LlmTrait {
         self.forward(input.token_ids, 0)
     }
 
+    /// Optional greedy prefill fast path returning only the first token id.
+    /// Implementations must use the same logits and strict argmax semantics as
+    /// [`Self::prefill`].
+    fn prefill_token(&mut self, _input: LlmInput<'_>) -> Option<Result<u32>> {
+        None
+    }
+
+
     /// Reset state for a new generation.
     fn reset(&mut self);
 
@@ -112,12 +134,32 @@ pub trait LlmTrait {
         None
     }
 
+    /// Optionally verify a proposed block with the model's exact serial greedy
+    /// decode path.
+    ///
+    /// `current_token` has already been emitted and is decoded at `start_pos`.
+    /// Implementations append the resulting greedy tokens to `verified` and
+    /// leave model state exactly as the same sequence of [`Self::decode_token`]
+    /// calls. They stop after the first mismatch or after consuming the whole
+    /// draft. Returning `None` means unsupported and must not mutate state.
+    ///
+    /// For `Some`, `verified.len() == consumed_draft`. A mismatch has
+    /// `accepted_prefix + 1 == consumed_draft`; a full match has
+    /// `accepted_prefix == consumed_draft == draft.len()`.
+    fn decode_draft_block(
+        &mut self,
+        _current_token: u32,
+        _start_pos: u32,
+        _draft: &[u32],
+        _verified: &mut Vec<u32>,
+    ) -> Option<Result<DraftBlockResult>> {
+        None
+    }
+
     /// Vocabulary size (used by default generate_streaming for argmax).
     fn vocab_size(&self) -> usize;
 
-    /// Ergonomic, statically typed streaming entrypoint. Models that replace
-    /// the shared greedy algorithm should override `generate_streaming_dyn`
-    /// so the same behavior is visible through `AutoModel`.
+    /// Ergonomic, statically typed streaming entrypoint.
     fn generate_streaming(
         &mut self,
         input: LlmInput<'_>,
@@ -131,9 +173,22 @@ pub trait LlmTrait {
         generate_streaming(self, input, max_new_tokens, on_token, eos_token_id)
     }
 
-    /// Object-safe entry used by `AutoModel`. The vtable dispatch happens
-    /// once for the complete request; the concrete model then owns the whole
-    /// prefill/decode loop rather than paying model dispatch per token.
+    /// Generate into reusable caller-owned storage.
+    fn generate_streaming_into(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        generated: &mut Vec<u32>,
+        on_token: impl FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<GenerationProfile>
+    where
+        Self: Sized,
+    {
+        generate_streaming_into(self, input, max_new_tokens, generated, on_token, eos_token_id)
+    }
+
+    /// Object-safe entry used by `AutoModel`.
     fn generate_streaming_dyn(
         &mut self,
         input: LlmInput<'_>,
@@ -143,19 +198,49 @@ pub trait LlmTrait {
     ) -> Result<(Vec<u32>, GenerationProfile)> {
         generate_streaming(self, input, max_new_tokens, on_token, eos_token_id)
     }
+
+    /// Object-safe reusable-storage entry used by `AutoModel` and services.
+    fn generate_streaming_into_dyn(
+        &mut self,
+        input: LlmInput<'_>,
+        max_new_tokens: usize,
+        generated: &mut Vec<u32>,
+        on_token: &mut dyn FnMut(u32),
+        eos_token_id: Option<u32>,
+    ) -> Result<GenerationProfile> {
+        generate_streaming_into(self, input, max_new_tokens, generated, on_token, eos_token_id)
+    }
 }
 
-/// Run the shared greedy generation loop for a concrete model or
-/// `dyn LlmTrait`. Most callers use [`LlmTrait::generate_streaming`] or
-/// [`crate::LoadedModel::generate_streaming`]; this function contains the one
-/// canonical generation algorithm.
+
+/// Run the shared greedy loop and return owned output storage.
 pub fn generate_streaming<M, F>(
     model: &mut M,
     input: LlmInput<'_>,
     max_new_tokens: usize,
-    mut on_token: F,
+    on_token: F,
     eos_token_id: Option<u32>,
 ) -> Result<(Vec<u32>, GenerationProfile)>
+where
+    M: LlmTrait + ?Sized,
+    F: FnMut(u32),
+{
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let profile = generate_streaming_into(
+        model, input, max_new_tokens, &mut generated, on_token, eos_token_id,
+    )?;
+    Ok((generated, profile))
+}
+
+/// Run the canonical greedy loop into reusable caller-owned output storage.
+pub fn generate_streaming_into<M, F>(
+    model: &mut M,
+    input: LlmInput<'_>,
+    max_new_tokens: usize,
+    generated: &mut Vec<u32>,
+    mut on_token: F,
+    eos_token_id: Option<u32>,
+) -> Result<GenerationProfile>
 where
     M: LlmTrait + ?Sized,
     F: FnMut(u32),
@@ -164,70 +249,135 @@ where
     if prompt_tokens.is_empty() {
         return Err(Error::Other("generate_streaming: empty prompt".into()));
     }
-    // Reject unsupported media before graph prewarm or any model forward.
     if input.image.is_some() && !model.capabilities().image {
         return Err(Error::Other(
             "this model does not support image input".into(),
         ));
     }
 
+    generated.clear();
+    generated.reserve(max_new_tokens);
+
+    let prompt_lookup = std::env::var("APXINF_PROMPT_LOOKUP").as_deref() == Ok("1");
+    if prompt_lookup && max_new_tokens == 0 {
+        let mut profile = GenerationProfile::new();
+        profile.finalize(prompt_tokens.len(), 0);
+        return Ok(profile);
+    }
+
     let mut profile = GenerationProfile::new();
-    let mut generated = Vec::with_capacity(max_new_tokens);
     let vocab_size = model.vocab_size();
 
-    // Each generation starts from scratch: the engine is reused across many
-    // requests, and full-attention KV caches plus linear-attention recurrent
-    // states must never leak between them.
     model.reset();
-
-    // Pre-capture any decode graphs (CUDA) BEFORE prefill so the per-token
-    // TPOT below is pure graph replay — keeps capture/instantiate cost in
-    // setup (TTFT bucket), not in the steady-state TPOT measurement.
     model.prewarm_decode(prompt_tokens.len(), max_new_tokens);
-    // Prefill: process the entire prompt
-    let logits = model.prefill(input)?;
+    let next_token = match model.prefill_token(input) {
+        Some(result) => result?,
+        None => {
+            let logits = model.prefill(input)?;
+            argmax_last_row(&logits, prompt_tokens.len(), vocab_size)?
+        }
+    };
     profile.record_first_token();
 
-    let next_token = argmax_last_row(&logits, prompt_tokens.len(), vocab_size)?;
     generated.push(next_token);
     on_token(next_token);
 
     if eos_token_id == Some(next_token) {
         profile.finalize(prompt_tokens.len(), generated.len());
-        return Ok((generated, profile));
+        return Ok(profile);
     }
 
-    // Decode: one token at a time
     let prompt_len = prompt_tokens.len();
     let mut current_token = next_token;
-    let perf = std::env::var("APXINF_PERF")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let perf = std::env::var_os("APXINF_PERF").is_some();
     let mut t_fwd = std::time::Duration::ZERO;
     let mut t_am = std::time::Duration::ZERO;
     let mut t_cb = std::time::Duration::ZERO;
-    for i in 0..max_new_tokens.saturating_sub(1) {
-        let pos = (prompt_len + i) as u32;
-        // GPU-argmax fast path: skip full-logits D2H + CPU scan.
-        if let Some(Ok(tok)) = model.decode_token(current_token, pos) {
-            current_token = tok;
-            generated.push(current_token);
-            on_token(current_token);
-            if eos_token_id == Some(current_token) {
-                break;
+    let (lookup_ngram, lookup_block) = if prompt_lookup {
+        (
+            prompt_lookup_env_usize("APXINF_PROMPT_LOOKUP_NGRAM", 8),
+            prompt_lookup_env_usize("APXINF_PROMPT_LOOKUP_BLOCK", 8).min(8),
+        )
+    } else {
+        (0, 0)
+    };
+    let scratch_capacity = lookup_block.min(max_new_tokens.saturating_sub(1));
+    let mut draft = Vec::with_capacity(scratch_capacity);
+    let mut verified = Vec::with_capacity(scratch_capacity);
+
+    while generated.len() < max_new_tokens {
+        let pos = (prompt_len + generated.len() - 1) as u32;
+        let remaining = max_new_tokens - generated.len();
+        let mut used_block = false;
+
+        if prompt_lookup && lookup_ngram != 0 && lookup_block != 0 {
+            fill_prompt_lookup_draft(
+                prompt_tokens,
+                generated,
+                lookup_ngram,
+                lookup_block.min(remaining),
+                eos_token_id,
+                &mut draft,
+            );
+            if !draft.is_empty() {
+                verified.clear();
+                if let Some(result) = model.decode_draft_block(
+                    current_token,
+                    pos,
+                    &draft,
+                    &mut verified,
+                ) {
+                    let result = result?;
+                    validate_draft_block_result(&draft, &verified, result)?;
+                    for &token in &verified {
+                        generated.push(token);
+                        current_token = token;
+                        if perf {
+                            let t0 = std::time::Instant::now();
+                            on_token(token);
+                            t_cb += t0.elapsed();
+                        } else {
+                            on_token(token);
+                        }
+                        if eos_token_id == Some(token) {
+                            break;
+                        }
+                    }
+                    used_block = true;
+                }
             }
+        }
+
+        if eos_token_id == Some(current_token) {
+            break;
+        }
+        if used_block {
             continue;
         }
-        let t0 = std::time::Instant::now();
-        let logits = model.forward(&[current_token], pos)?;
-        t_fwd += t0.elapsed();
-        let t1 = std::time::Instant::now();
-        current_token = argmax_last_row(&logits, 1, vocab_size)?;
-        t_am += t1.elapsed();
+
+        match model.decode_token(current_token, pos) {
+            Some(result) => current_token = result?,
+            None if perf => {
+                let t0 = std::time::Instant::now();
+                let logits = model.forward(std::slice::from_ref(&current_token), pos)?;
+                t_fwd += t0.elapsed();
+                let t1 = std::time::Instant::now();
+                current_token = argmax_last_row(&logits, 1, vocab_size)?;
+                t_am += t1.elapsed();
+            }
+            None => {
+                let logits = model.forward(std::slice::from_ref(&current_token), pos)?;
+                current_token = argmax_last_row(&logits, 1, vocab_size)?;
+            }
+        }
         generated.push(current_token);
-        let t2 = std::time::Instant::now();
-        on_token(current_token);
-        t_cb += t2.elapsed();
+        if perf {
+            let t0 = std::time::Instant::now();
+            on_token(current_token);
+            t_cb += t0.elapsed();
+        } else {
+            on_token(current_token);
+        }
         if eos_token_id == Some(current_token) {
             break;
         }
@@ -243,8 +393,88 @@ where
     }
 
     profile.finalize(prompt_len, generated.len());
-    Ok((generated, profile))
+    Ok(profile)
 }
+fn prompt_lookup_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn history_token(prompt: &[u32], generated: &[u32], index: usize) -> u32 {
+    if index < prompt.len() {
+        prompt[index]
+    } else {
+        generated[index - prompt.len()]
+    }
+}
+
+fn fill_prompt_lookup_draft(
+    prompt: &[u32],
+    generated: &[u32],
+    max_ngram: usize,
+    max_draft: usize,
+    eos_token_id: Option<u32>,
+    draft: &mut Vec<u32>,
+) {
+    draft.clear();
+    let history_len = prompt.len() + generated.len();
+    let largest_ngram = max_ngram.min(history_len.saturating_sub(1));
+
+    for ngram in (1..=largest_ngram).rev() {
+        let suffix_start = history_len - ngram;
+        for candidate_start in 0..suffix_start {
+            if candidate_start + ngram >= history_len {
+                continue;
+            }
+            let matches = (0..ngram).all(|offset| {
+                history_token(prompt, generated, candidate_start + offset)
+                    == history_token(prompt, generated, suffix_start + offset)
+            });
+            if !matches {
+                continue;
+            }
+
+            let available = history_len - (candidate_start + ngram);
+            for offset in 0..max_draft.min(available) {
+                let token = history_token(prompt, generated, candidate_start + ngram + offset);
+                draft.push(token);
+                if eos_token_id == Some(token) {
+                    break;
+                }
+            }
+            return;
+        }
+    }
+}
+
+fn validate_draft_block_result(
+    draft: &[u32],
+    verified: &[u32],
+    result: DraftBlockResult,
+) -> Result<()> {
+    let shape_valid = result.consumed_draft != 0
+        && result.consumed_draft <= draft.len()
+        && verified.len() == result.consumed_draft
+        && result.accepted_prefix <= result.consumed_draft;
+    let prefix_valid = shape_valid
+        && verified[..result.accepted_prefix] == draft[..result.accepted_prefix];
+    let completion_valid = shape_valid
+        && if result.accepted_prefix == result.consumed_draft {
+            result.consumed_draft == draft.len()
+        } else {
+            result.accepted_prefix + 1 == result.consumed_draft
+                && verified[result.accepted_prefix] != draft[result.accepted_prefix]
+        };
+    if !prefix_valid || !completion_valid {
+        return Err(Error::Other(
+            "decode_draft_block returned inconsistent metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn argmax_last_row(logits: &Tensor, seq_len: usize, vocab_size: usize) -> Result<u32> {
     #[cfg(feature = "cuda")]
     let logits = if logits.device().is_gpu() {

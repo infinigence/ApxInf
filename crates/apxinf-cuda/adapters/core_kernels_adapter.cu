@@ -229,6 +229,7 @@ extern "C" cudaError_t apxinf_rms_norm_bf16(
     return cudaGetLastError();
 }
 
+
 extern "C" cudaError_t apxinf_rms_norm_add_bf16(
     void* x_inout, const void* delta, const void* weight, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
@@ -244,6 +245,7 @@ extern "C" cudaError_t apxinf_rms_norm_add_bf16(
         cols, rows, eps);
     return cudaGetLastError();
 }
+
 
 extern "C" cudaError_t apxinf_softmax_bf16(
     const void* input, void* output, uint32_t cols, uint32_t rows, void* stream)
@@ -533,12 +535,51 @@ extern "C" cudaError_t apxinf_flash_attn_decode_bf16(
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t apxinf_argmax_bf16(
-    const void* logits, uint32_t n, void* out, void* stream)
+extern "C" cudaError_t apxinf_argmax_bf16_single_launch(
+    const void* logits, uint32_t n, void* partials,
+    uint32_t partial_capacity, void* arrivals, void* out, void* stream)
 {
+    // This kernel's last-block protocol is deliberately bounded: every block
+    // must have a dedicated partial and one warp must be able to scan the block
+    // set with a short strided loop. Callers fall back to the established
+    // two-launch implementation outside this geometry.
+    if (n == 0 || partial_capacity == 0 || partial_capacity > 128 ||
+        arrivals == nullptr) return cudaErrorInvalidValue;
+    constexpr uint32_t kThreads = 256;
+    constexpr uint32_t kMaxBlocks = 128;
+    uint32_t blocks = (n + kThreads - 1) / kThreads;
+    if (blocks > partial_capacity) blocks = partial_capacity;
+    if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+    argmax_bf16_single_launch_kernel<<<blocks, kThreads, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)logits, n, (ArgmaxBf16Pair*)partials,
+        (uint32_t*)arrivals, (uint32_t*)out);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_argmax_bf16_parallel(
+    const void* logits, uint32_t n, void* partials,
+    uint32_t partial_capacity, void* out, void* stream)
+{
+    if (n == 0 || partial_capacity == 0) return cudaErrorInvalidValue;
     cudaStream_t s = (cudaStream_t)stream;
-    // One block of 256 threads — vocab (32k) / 256 = 128 elems/thread.
-    argmax_bf16_kernel<<<1, 256, 0, s>>>(
-        (const __nv_bfloat16*)logits, n, (uint32_t*)out);
+    constexpr uint32_t kThreads = 256;
+    constexpr uint32_t kMaxBlocks = 128;
+    uint32_t blocks = (n + kThreads - 1) / kThreads;
+    if (blocks > partial_capacity) blocks = partial_capacity;
+    if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+    argmax_bf16_partials_kernel<<<blocks, kThreads, 0, s>>>(
+        (const __nv_bfloat16*)logits, n, (ArgmaxBf16Pair*)partials);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    // The partial stage is capped at 128 entries. One warp handles that full
+    // reduction with strided loads; retain the 256-thread fallback if a caller
+    // advertises a larger partial-capacity contract in the future.
+    if (blocks <= 128 && partial_capacity <= 128) {
+        argmax_bf16_finalize_warp_kernel<<<1, 32, 0, s>>>(
+            (const ArgmaxBf16Pair*)partials, blocks, (uint32_t*)out);
+    } else {
+        argmax_bf16_finalize_kernel<<<1, kThreads, 0, s>>>(
+            (const ArgmaxBf16Pair*)partials, blocks, (uint32_t*)out);
+    }
     return cudaGetLastError();
 }

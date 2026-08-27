@@ -2,6 +2,7 @@
 // Static E4M3 helpers for the static inference Thor inference path.
 
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -555,7 +556,6 @@ extern "C" int apxinf_static_prepare_bf16_gemm(
     return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
   return static_cast<int>(prepare_bf16_gemm_plan(ShapeKey{m, n, k}));
 }
-
 extern "C" int apxinf_static_set_cublaslt_bf16_gemm_heuristic(
     int m, int n, int k, int heuristic_rank) {
   if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||

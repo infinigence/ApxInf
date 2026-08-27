@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use apxinf_core::{DType, Error, Result, Tensor};
+use apxinf_loader::compressed_tensors::{W4KernelLayout, W4LayoutMetadata};
 
 use super::{LayerKind, Qwen35Config};
 
@@ -12,6 +13,7 @@ pub struct CompressedLinearWeight {
     pub packed_shape: Vec<usize>,
     pub scale_shape: Vec<usize>,
     pub zero_point_shape: Vec<usize>,
+    pub kernel_layout: W4LayoutMetadata,
 }
 
 #[derive(Clone, Debug)]
@@ -126,13 +128,44 @@ fn read_compressed_linear(
             "{prefix}.weight_zero_point shape {zero_point_shape:?} does not match scale groups {scale_shape:?}"
         )));
     }
+    let padded_rows = rows.div_ceil(64) * 64;
+    let group_size = if scale_shape[1] == 0 { 0 } else { cols / scale_shape[1] };
+    let eligible = scale_shape[1] != 0
+        && cols % scale_shape[1] == 0
+        && group_size == 32
+        && cols % 128 == 0;
+    let padded_rows = if eligible { padded_rows } else { rows };
+    let packed_bytes = padded_rows * cols.div_ceil(8) * 4;
+    let scale_bytes = padded_rows * scale_shape[1] * 2;
+    let zero_point_bytes = padded_rows.div_ceil(8) * scale_shape[1] * 4;
+    let source_total_bytes = packed.size_in_bytes() + scale.size_in_bytes()
+        + zero_point.size_in_bytes();
     Ok(CompressedLinearWeight {
         prefix: prefix.to_owned(),
         rows,
         cols,
         packed_shape,
-        scale_shape,
+        scale_shape: scale_shape.clone(),
         zero_point_shape,
+        kernel_layout: W4LayoutMetadata {
+            layout: if eligible {
+                W4KernelLayout::RepackedN64K16V1
+            } else {
+                W4KernelLayout::RawCompressedTensors
+            },
+            version: u32::from(eligible),
+            logical_rows: rows,
+            logical_cols: cols,
+            padded_rows,
+            padded_cols: cols,
+            group_size,
+            groups: scale_shape[1],
+            packed_bytes,
+            scale_bytes,
+            zero_point_bytes,
+            total_bytes: packed_bytes + scale_bytes + zero_point_bytes,
+            source_total_bytes,
+        },
     })
 }
 
@@ -281,5 +314,9 @@ mod tests {
             .compressed_linears
             .iter()
             .any(|linear| linear.prefix.ends_with("linear_attn.in_proj_z")));
+        assert!(manifest.compressed_linears.iter().all(|linear| {
+            linear.kernel_layout.layout == W4KernelLayout::RawCompressedTensors
+                && linear.kernel_layout.additional_device_bytes() == 0
+        }));
     }
 }
