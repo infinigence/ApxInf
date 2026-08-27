@@ -2,7 +2,6 @@
   "cublas_version": "12.8.4",
   "cuda_version": "12.8",
   "device_name": "NVIDIA GeForce RTX 4090",
-  "kernel_build_id": "kb1-cbd5c74a0104746104ab8ab6b5380f71",
   "records": [
     {
       "candidates": {
