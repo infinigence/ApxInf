@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use apxinf_core::{Backend, CpuBackend, Device, Result, Tensor};
 use apxinf_loader::ModelConfig;
+use apxinf_model::vla::VlaDimensions;
 use apxinf_model::{
     register, Action, AutoModel, GenerationOptions, GenerationRequest, ImageInput, InferenceSpec,
     LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel, PreparedInference, SamplingMode,
@@ -74,9 +75,15 @@ fn load_generation_config_test_model(
     Ok(LoadedModel::text(Box::new(TextOnlyModel::default())))
 }
 
-struct DummyVlaModel;
+struct DummyVlaModel {
+    dimensions: VlaDimensions,
+}
 
 impl VlaRuntime for DummyVlaModel {
+    fn dimensions(&self) -> VlaDimensions {
+        self.dimensions
+    }
+
     fn infer(&self, _request: &VlaRequest<'_>) -> Result<Action> {
         unreachable!("generation-config routing test does not run VLA inference")
     }
@@ -94,9 +101,18 @@ fn load_generation_config_test_vla(
     _path: &Path,
     _device: Device,
     _backend: Arc<dyn Backend>,
-    _options: &LoadOptions,
+    options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    Ok(LoadedModel::Vla(Box::new(DummyVlaModel)))
+    Ok(LoadedModel::Vla(Box::new(DummyVlaModel {
+        dimensions: VlaDimensions {
+            action_horizon: options.action_horizon.unwrap_or(10),
+            action_dim: 7,
+            num_views: 2,
+            image_size: 224,
+            patch_size: 14,
+            max_token_len: 200,
+        },
+    })))
 }
 
 #[derive(Default)]
@@ -423,8 +439,23 @@ fn vla_loads_do_not_read_generation_config() {
         load_generation_config_test_vla,
     );
 
-    let model = AutoModel::load_model(Device::Cpu, &dir, &LoadOptions::default()).unwrap();
+    let options = LoadOptions {
+        action_horizon: Some(12),
+        ..LoadOptions::default()
+    };
+    let model = AutoModel::load_model(Device::Cpu, &dir, &options).unwrap();
     assert!(model.generation_defaults().is_err());
+    assert_eq!(
+        model.vla_dimensions().unwrap(),
+        VlaDimensions {
+            action_horizon: 12,
+            action_dim: 7,
+            num_views: 2,
+            image_size: 224,
+            patch_size: 14,
+            max_token_len: 200,
+        }
+    );
 
     std::fs::remove_dir_all(dir).unwrap();
 }

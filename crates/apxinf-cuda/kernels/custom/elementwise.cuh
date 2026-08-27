@@ -63,6 +63,24 @@ __global__ void mul_bf16_kernel(
 }
 
 
+// Multiply a matrix by the gate third of one packed `[scale, shift, gate]`
+// style row. The BF16 output is deliberately materialized so a following
+// residual add observes the same dtype boundary as two unfused tensor ops.
+__global__ void style_gate_mul_bf16_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* style,
+    __nv_bfloat16* output, int64_t count, int cols) {
+  int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int col = static_cast<int>(index % cols);
+    output[index] = __float2bfloat16_rn(
+        __bfloat162float(input[index]) *
+        __bfloat162float(style[2 * cols + col]));
+  }
+}
+
+
 
 // ── Scale (bf16) ──────────────────────────────────────────────────────────
 
@@ -180,5 +198,4 @@ __global__ void bias_position_bf16_kernel(
     output[index] = __float2bfloat16(value);
   }
 }
-
 

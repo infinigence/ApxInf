@@ -5,10 +5,10 @@ them; any object of the right shape satisfies them. They are the stable anchor
 points other layers code against:
 
 * :class:`BareModel` — the model-side contract (L1 bare inference) a policy
-  consumes, i.e. the subset of a ``apxinf_py.Model`` handle it relies on.
+  consumes, i.e. the subset of a native ``apxinf_py.Model`` handle it relies on.
 * :class:`Policy` — the L2 contract (``obs dict -> result dict``) every
-  model-specific policy satisfies (``Pi05Policy`` today; e.g. a future
-  ``GrootPolicy``). Downstream consumers (the websocket server, the
+  model-specific policy satisfies (``Pi05Policy`` and ``Dm05Policy`` today).
+  Downstream consumers (transport servers, the
   :class:`~apxinf.policies.auto.AutoPolicy` registry, a lerobot adaptor) code
   against this, never a concrete class.
 

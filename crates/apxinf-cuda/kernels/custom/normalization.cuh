@@ -208,6 +208,34 @@ __global__ void rms_norm_bf16_kernel(
   }
 }
 
+
+// RMSNorm with an explicit FP32 affine offset. The raw checkpoint weight is
+// kept in BF16 and promoted before `offset + weight`, so callers can preserve
+// conventions such as Gemma's `(1 + weight.float())` without rounding the
+// combined scale back to BF16 before the normalized multiply.
+__global__ void rms_norm_affine_bf16_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* raw_weight,
+    __nv_bfloat16* output, int rows, int cols, float eps,
+    float weight_offset) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  float square_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value =
+        __bfloat162float(input[static_cast<int64_t>(row) * cols + col]);
+    square_sum += value * value;
+  }
+  const float inverse_rms =
+      rsqrtf(block_sum(square_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    const float scale =
+        weight_offset + __bfloat162float(raw_weight[col]);
+    output[index] = __float2bfloat16_rn(
+        __bfloat162float(input[index]) * inverse_rms * scale);
+  }
+}
+
 __global__ void layer_norm_bf16_kernel(
     const __nv_bfloat16* input, const __nv_bfloat16* weight,
     const __nv_bfloat16* bias, __nv_bfloat16* output,
@@ -254,6 +282,5 @@ __global__ void ada_rms_norm_bf16_kernel(
         __bfloat162float(style[cols + col]));
   }
 }
-
 
 

@@ -8,7 +8,7 @@ import numpy.typing as npt
 __version__: str
 
 class Model:
-    """A loaded pi05 model handle exposing L0/L1 bare-model inference."""
+    """A loaded VLA model handle exposing L0/L1 bare-model inference."""
 
     @staticmethod
     def load(
@@ -35,13 +35,43 @@ class Model:
         """
         ...
 
-    def infer_patches(
+    @staticmethod
+    def random(
+        model: str,
+        device: str = ...,
+        precision: str = ...,
+        num_views: int = ...,
+        image_size: int = ...,
+        action_horizon: int = ...,
+        action_dim: int = ...,
+        num_flow_steps: int = ...,
+        max_token_len: int = ...,
+        calibration: str | None = ...,
+        tactics: str | None = ...,
+        seed: int = ...,
+        sampling_seed: int = ...,
+    ) -> "Model":
+        """Build a checkpoint-free PI0.5 runtime with deterministic weights."""
+        ...
+
+    def _infer_patches(
         self,
         patches: npt.NDArray[np.float32],
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
-        """L0: infer from pre-computed patches. Returns normalized-domain action."""
+        """Private L0 path for consistency tests."""
+        ...
+
+    def _infer_patches_seeded(
+        self,
+        patches: npt.NDArray[np.float32],
+        token_ids: npt.NDArray[np.uint32],
+        seed: int,
+        sequence: int = ...,
+        draw: int = ...,
+    ) -> npt.NDArray[np.float32]:
+        """Private seeded L0 path for consistency tests."""
         ...
 
     def infer_rgb(
@@ -49,10 +79,24 @@ class Model:
         rgb_u8: npt.NDArray[np.uint8],
         layout: str,
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
         """L1: infer from resized RGB uint8. Returns normalized-domain action."""
         ...
+
+    def infer_rgb_seeded(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        layout: str,
+        token_ids: npt.NDArray[np.uint32],
+        seed: int,
+        sequence: int = ...,
+        draw: int = ...,
+    ) -> npt.NDArray[np.float32]:
+        """Seeded L1 path using the runtime's device-side normal generator."""
+        ...
+
+    def reset_sampling(self, seed: int | None = ...) -> None: ...
 
     @property
     def device(self) -> str: ...

@@ -111,6 +111,69 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_embedding_scaled_bf16(
+        table: *const c_void,
+        ids: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        width: i32,
+        vocab_size: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rms_norm_affine_bf16(
+        input: *const c_void,
+        raw_weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        weight_offset: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rope_precomputed_bf16(
+        input: *const c_void,
+        cosine: *const c_void,
+        sine: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_style_gate_mul_bf16(
+        input: *const c_void,
+        style: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_sinusoidal_time_embedding_bf16(
+        times: *const c_void,
+        output: *mut c_void,
+        steps: i32,
+        dimension: i32,
+        min_period: f32,
+        max_period: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rope_tables_bf16(
+        positions: *const c_void,
+        cosine: *mut c_void,
+        sine: *mut c_void,
+        tokens: i32,
+        head_dim: i32,
+        theta: f32,
+        linear_factor: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_static_mqa_flash_f16(
         q: *const c_void,
         prefix_k: *const c_void,

@@ -5,11 +5,182 @@ use apxinf_core::{DType, Error, Result, Shape, Tensor};
 pub use super::attention::QkvTensors;
 use super::contracts::{
     bf16_output, check_cuda, checked_bytes, f16_output, gpu_ptr, make_gpu_tensor, matrix_shape,
-    optional_ptr, require_address, require_buffers, require_finite, unsupported_dtype,
+    matrix_tensor, optional_ptr, require_address, require_buffers, require_finite,
+    unsupported_dtype,
 };
 use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
+
+/// Device-resident cosine and sine tensors for half-split RoPE.
+#[derive(Debug, Clone)]
+pub struct RopeTables {
+    pub cosine: Tensor,
+    pub sine: Tensor,
+}
+
+/// Apply half-split RoPE using caller-provided BF16 cosine and sine tensors.
+///
+/// `input` is contiguous `[tokens, heads, head_dim]`; `cosine` and `sine` are
+/// `[tokens, head_dim]`. Owning the metadata outside the kernel supports
+/// arbitrary position schedules and scaling conventions while keeping the
+/// device operation model-neutral and graph-capturable.
+pub fn apply_precomputed_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    cosine: &Tensor,
+    sine: &Tensor,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if input.dtype() != DType::BF16
+        || cosine.dtype() != DType::BF16
+        || sine.dtype() != DType::BF16
+        || dims.len() != 3
+        || dims[0] == 0
+        || dims[1] == 0
+        || dims[2] == 0
+        || dims[2] % 2 != 0
+        || cosine.shape().dims() != [dims[0], dims[2]]
+        || sine.shape() != cosine.shape()
+        || input.device() != apxinf_core::Device::Cuda(ctx.device_id())
+        || cosine.device() != input.device()
+        || sine.device() != input.device()
+    {
+        return Err(Error::Other(
+            "precomputed RoPE expects CUDA BF16 input [tokens,heads,head_dim] and cosine/sine [tokens,head_dim]"
+                .into(),
+        ));
+    }
+    let tokens = i32::try_from(dims[0])
+        .map_err(|_| Error::Other("precomputed RoPE token count exceeds i32".into()))?;
+    let heads = i32::try_from(dims[1])
+        .map_err(|_| Error::Other("precomputed RoPE head count exceeds i32".into()))?;
+    let head_dim = i32::try_from(dims[2])
+        .map_err(|_| Error::Other("precomputed RoPE head dimension exceeds i32".into()))?;
+    let output = bf16_output(ctx, dims[0] * dims[1], dims[2])?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rope_precomputed_bf16(
+            gpu_ptr(input)?,
+            gpu_ptr(cosine)?,
+            gpu_ptr(sine)?,
+            output.ptr(),
+            tokens,
+            heads,
+            head_dim,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Build `[sin, cos]` sinusoidal embeddings for a BF16 scalar schedule.
+///
+/// Frequency construction and transcendental evaluation happen on the CUDA
+/// device in FP32; only the final `[steps, dimension]` output is rounded to
+/// BF16. This avoids substituting host-libm results for a CUDA reference.
+pub fn sinusoidal_time_embedding_bf16(
+    ctx: &CudaContext,
+    times: &Tensor,
+    dimension: usize,
+    min_period: f32,
+    max_period: f32,
+) -> Result<Tensor> {
+    require_finite("sinusoidal time embedding", &[min_period, max_period])?;
+    let dims = times.shape().dims();
+    if times.dtype() != DType::BF16
+        || dims.len() != 1
+        || dims[0] == 0
+        || dimension == 0
+        || dimension % 2 != 0
+        || min_period <= 0.0
+        || max_period < min_period
+        || times.device() != apxinf_core::Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(
+            "sinusoidal time embedding expects CUDA BF16 times [steps], positive ordered periods, and a non-zero even dimension"
+                .into(),
+        ));
+    }
+    let steps = i32::try_from(dims[0])
+        .map_err(|_| Error::Other("time embedding step count exceeds i32".into()))?;
+    let dimension_i32 = i32::try_from(dimension)
+        .map_err(|_| Error::Other("time embedding dimension exceeds i32".into()))?;
+    let output = bf16_output(ctx, dims[0], dimension)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_sinusoidal_time_embedding_bf16(
+            gpu_ptr(times)?,
+            output.ptr(),
+            steps,
+            dimension_i32,
+            min_period,
+            max_period,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, dims[0], dimension, output))
+}
+
+/// Build BF16 half-split RoPE cosine/sine tables from explicit positions.
+///
+/// `linear_factor` divides inverse frequency (`1.0` is ordinary RoPE). All
+/// frequency, angle, and transcendental work runs in CUDA FP32 before one BF16
+/// table store, avoiding CPU-libm substitution.
+pub fn rope_tables_bf16(
+    ctx: &CudaContext,
+    positions: &CudaBuffer,
+    tokens: usize,
+    head_dim: usize,
+    theta: f32,
+    linear_factor: f32,
+) -> Result<RopeTables> {
+    require_finite("RoPE tables", &[theta, linear_factor])?;
+    let positions_bytes = tokens
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| Error::Other("RoPE position byte size overflow".into()))?;
+    if tokens == 0
+        || head_dim == 0
+        || head_dim % 2 != 0
+        || theta <= 0.0
+        || linear_factor <= 0.0
+        || positions.device() != ctx.device_id()
+        || positions.len() < positions_bytes
+    {
+        return Err(Error::Other(
+            "RoPE tables require device u32 positions, positive theta/factor, and a non-zero even head dimension"
+                .into(),
+        ));
+    }
+    let tokens_i32 = i32::try_from(tokens)
+        .map_err(|_| Error::Other("RoPE table token count exceeds i32".into()))?;
+    let head_dim_i32 = i32::try_from(head_dim)
+        .map_err(|_| Error::Other("RoPE table head dimension exceeds i32".into()))?;
+    let cosine = bf16_output(ctx, tokens, head_dim)?;
+    let sine = bf16_output(ctx, tokens, head_dim)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rope_tables_bf16(
+            positions.ptr(),
+            cosine.ptr(),
+            sine.ptr(),
+            tokens_i32,
+            head_dim_i32,
+            theta,
+            linear_factor,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(RopeTables {
+        cosine: matrix_tensor(ctx, tokens, head_dim, cosine),
+        sine: matrix_tensor(ctx, tokens, head_dim, sine),
+    })
+}
 
 /// Apply RoPE into caller-owned storage using a device-resident position.
 #[allow(clippy::too_many_arguments)]

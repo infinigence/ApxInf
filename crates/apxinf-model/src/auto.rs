@@ -15,7 +15,7 @@ use crate::llm_trait::{
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
+use crate::vla::{Action, InferenceSpec, PreparedInference, VlaDimensions, VlaRequest, VlaRuntime};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +46,12 @@ pub struct LoadOptions {
     pub text_weight_dtype: Option<DType>,
     pub calibration_path: Option<PathBuf>,
     pub tuning_path: Option<PathBuf>,
+    /// Optional VLA action-chunk length override. Model loaders validate the
+    /// requested horizon against their own architecture contract.
+    pub action_horizon: Option<usize>,
+    /// Optional deployed camera count. Model loaders decide whether fewer
+    /// views preserve the checkpoint's positional and masking semantics.
+    pub num_views: Option<usize>,
     /// Explicit architecture config, overriding any on-disk `config.json`.
     pub config: Option<Pi05Config>,
     /// When set, load deterministic random weights instead of a checkpoint.
@@ -90,6 +96,13 @@ impl LoadedModel {
             Self::Vla(model) => Ok(&**model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
         }
+    }
+
+    /// Return the model-independent VLA shape contract.
+    pub fn vla_dimensions(&self) -> Result<VlaDimensions> {
+        let dimensions = self.vla()?.dimensions();
+        dimensions.validate()?;
+        Ok(dimensions)
     }
 
     pub fn forward(&mut self, token_ids: &[u32], start_pos: u32) -> Result<Tensor> {

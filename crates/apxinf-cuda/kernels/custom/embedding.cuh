@@ -74,4 +74,26 @@ __global__ void embedding_bf16_kernel(
 }
 
 
+// Explicitly scaled BF16 embedding. The caller owns the scale's dtype
+// semantics; for example, Gemma-style runtimes pass sqrt(width) after rounding
+// that scalar to the checkpoint activation dtype. Keeping the scalar explicit
+// avoids silently imposing one model family's scaling convention here.
+__global__ void embedding_scaled_bf16_kernel(
+    const __nv_bfloat16* table, const uint32_t* ids, __nv_bfloat16* output,
+    int tokens, int width, int vocab_size, float scale) {
+  const int64_t count = static_cast<int64_t>(tokens) * width;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int token = static_cast<int>(index / width);
+    const int col = static_cast<int>(index % width);
+    const uint32_t id = ids[token];
+    output[index] = id < static_cast<uint32_t>(vocab_size)
+        ? __float2bfloat16_rn(
+              __bfloat162float(table[static_cast<int64_t>(id) * width + col]) *
+              scale)
+        : __float2bfloat16_rn(0.0f);
+  }
+}
+
 

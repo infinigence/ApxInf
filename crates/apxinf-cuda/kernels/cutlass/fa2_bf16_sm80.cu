@@ -152,7 +152,7 @@ int fa2(
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       softmax_lse == nullptr || batch <= 0 || query_tokens <= 0 ||
       key_tokens <= 0 || query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      head_dim > 256 || query_heads % kv_heads != 0) {
+      head_dim > 256 || head_dim % 8 != 0 || query_heads % kv_heads != 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
 
@@ -179,7 +179,8 @@ int fa2_splitkv(
       softmax_lse == nullptr || softmax_lse_accum == nullptr ||
       o_accum == nullptr || batch <= 0 || query_tokens <= 0 ||
       key_tokens <= 0 || query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      head_dim > 256 || query_heads % kv_heads != 0 || num_sms <= 0) {
+      head_dim > 256 || head_dim % 8 != 0 || query_heads % kv_heads != 0 ||
+      num_sms <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
 
@@ -216,6 +217,36 @@ int fa2_bf16(
   return fa2<cutlass::bfloat16_t>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+int fa2_bf16_causal(
+    const void* q, const void* k, const void* v, void* output,
+    void* softmax_lse, int batch, int query_tokens, int key_tokens,
+    int query_heads, int kv_heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
+      softmax_lse == nullptr || batch <= 0 || query_tokens <= 0 ||
+      key_tokens < query_tokens || query_heads <= 0 || kv_heads <= 0 ||
+      head_dim <= 0 || head_dim > 256 || head_dim % 8 != 0 ||
+      query_heads % kv_heads != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, true, q, k, v, output, softmax_lse, batch,
+              query_tokens, key_tokens, query_heads, kv_heads, head_dim,
+              softmax_scale);
+  params.is_causal = true;
+  params.window_size_left = -1;
+  params.window_size_right = 0;
+  if (head_dim <= 96) {
+    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 96, true>(
+        params, stream);
+  } else {
+    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, true>(
+        params, stream);
+  }
+  return static_cast<int>(cudaSuccess);
 }
 
 #if defined(APXINF_FA2_SM80)

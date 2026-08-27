@@ -8,7 +8,23 @@ extern "C" int apxinf_static_fa2_bf16(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
+  if (head_dim <= 0 || head_dim > 256 || head_dim % 8 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
   return apxinf::cuda::cutlass_ops::fa2_bf16(
+      q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
+      query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+extern "C" int apxinf_static_fa2_bf16_causal(
+    const void* q, const void* k, const void* v, void* output,
+    void* softmax_lse, int batch, int query_tokens, int key_tokens,
+    int query_heads, int kv_heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  if (head_dim <= 0 || head_dim > 256 || head_dim % 8 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  return apxinf::cuda::cutlass_ops::fa2_bf16_causal(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }
@@ -19,6 +35,9 @@ extern "C" int apxinf_static_fa2_bf16_splitkv(
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
     int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+  if (head_dim <= 0 || head_dim > 256 || head_dim % 8 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
   return apxinf::cuda::cutlass_ops::fa2_bf16_splitkv(
       q, k, v, output, softmax_lse, softmax_lse_accum, o_accum, batch,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
@@ -31,6 +50,9 @@ extern "C" int apxinf_static_fa2_f16(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
+  if (head_dim <= 0 || head_dim > 256 || head_dim % 8 != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
   return apxinf::cuda::cutlass_ops::fa2_f16(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);

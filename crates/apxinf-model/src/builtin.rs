@@ -19,6 +19,8 @@ pub fn register_builtin_models() {
     registry::register("qwen3vl", load_qwen3vl);
 
     #[cfg(feature = "cuda")]
+    crate::dm05::register_builtin();
+    #[cfg(feature = "cuda")]
     crate::pi05::register_builtin();
 }
 fn load_llama(

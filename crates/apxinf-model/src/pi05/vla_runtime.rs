@@ -5,16 +5,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use half::{bf16, f16};
 use apxinf_core::{
-    Backend, DType, Device, Error, NormalGenerator, Result, SamplingBackend,
-    Tensor,
+    Backend, DType, Device, Error, NormalGenerator, Result, SamplingBackend, Tensor,
 };
+use half::{bf16, f16};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation,
-    PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
+    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
+    VisionObservation, VlaDimensions, VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
@@ -240,11 +239,10 @@ impl GraphVariant {
         patches: Option<&Tensor>,
     ) -> Result<()> {
         match (&observation.vision, self) {
-            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph
-                .update_inputs_without_noise(
-                    patches.expect("validated patches"),
-                    &observation.token_ids,
-                ),
+            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph.update_inputs_without_noise(
+                patches.expect("validated patches"),
+                &observation.token_ids,
+            ),
             (VisionObservation::Patches(_), Self::Bf16(graph)) => graph
                 .update_inputs_without_noise(
                     patches.expect("validated patches"),
@@ -255,12 +253,15 @@ impl GraphVariant {
                     patches.expect("validated patches"),
                     &observation.token_ids,
                 ),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
+            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
+            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
+            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
         }
     }
 }
@@ -491,9 +492,7 @@ impl Pi05VlaRuntime {
         let noise = self
             .backend
             .to_device(&Tensor::zeros(noise_shape(&self.config), dtype))?;
-        let normal_generator = self
-            .backend
-            .create_normal_generator(noise.clone())?;
+        let normal_generator = self.backend.create_normal_generator(noise.clone())?;
         let token_ids = DeviceBuffer::alloc_zeros(spec.token_count * 4, cuda.device_id())
             .map_err(Error::Cuda)?;
 
@@ -530,6 +529,17 @@ impl Pi05VlaRuntime {
 }
 
 impl VlaRuntime for Pi05VlaRuntime {
+    fn dimensions(&self) -> VlaDimensions {
+        VlaDimensions {
+            action_horizon: self.config.action_horizon,
+            action_dim: self.config.action_dim,
+            num_views: self.config.num_views,
+            image_size: self.config.image_size,
+            patch_size: self.config.patch_size,
+            max_token_len: self.config.max_token_len,
+        }
+    }
+
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
         let observation = request.observation;
         observation.validate()?;
@@ -562,13 +572,27 @@ pub(super) fn load_registered(
     let cuda = &*backend;
     let root = artifact_root(path);
     let config_path = root.join("config.json");
-    let config = Arc::new(if let Some(cfg) = options.config.clone() {
+    let mut config = if let Some(cfg) = options.config.clone() {
         cfg
     } else if config_path.is_file() {
         Pi05Config::from_json_file(&config_path)?
     } else {
         Pi05Config::default()
-    });
+    };
+    if let Some(action_horizon) = options.action_horizon {
+        config.action_horizon = action_horizon;
+    }
+    if let Some(num_views) = options.num_views {
+        if num_views == 0 || num_views > config.num_views {
+            return Err(Error::Other(format!(
+                "PI0.5 num_views={num_views} must be in 1..={} for this checkpoint",
+                config.num_views
+            )));
+        }
+        config.num_views = num_views;
+    }
+    config.validate()?;
+    let config = Arc::new(config);
     let synthetic = options.synthetic;
     let host_weights = match synthetic {
         Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,

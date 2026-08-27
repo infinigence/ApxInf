@@ -571,6 +571,199 @@ The evaluator is resumable: completed task/trial rows in the JSONL ledger are
 skipped on the next run. If the evaluator and server are on different machines,
 replace `127.0.0.1` with the server's reachable IP address.
 
+## DM05-libero native HTTP deployment
+
+DM05-libero is implemented as an isolated native Rust `VlaRuntime` under
+`crates/apxinf-model/src/dm05/` and loads through the normal
+`AutoModel -> LoadedModel::Vla` path. ApxInf owns the BF16 weights, Gemma3
+vision/language/action graph, ten-step denoising schedule, CUDA execution, Python
+policy, and serial HTTP transport. The pinned OpenDM revision is used only as a
+private numerical reference; serving does not import OpenDM, PyTorch, or Triton
+and has no external-runtime fallback.
+
+The first supported deployment cell is:
+
+```text
+model       Dexmal/DM05-libero@25a8e0d38a8eaeaae41a44d7b4a2378fd8ce1088
+reference   dexmal/opendm@e41e501bb82e9c3cb8138c0fb4687faa5f98c690
+hardware    one RTX 4090 / SM89 CUDA GPU
+precision   native BF16
+request     B=1, two ordered 448x448 images, required 8D Franka state field
+sampling    10 diffusion steps; explicit 10x32 latent or ApxInf-native RNG
+output      finite float32 LIBERO actions with shape 10x7
+transport   POST /v1/infer, concurrency 1
+```
+
+The 8D state is validated for wire compatibility but is intentionally not
+consumed by this pinned checkpoint: the official LIBERO configuration has
+`add_state=False`. The current output is therefore not state-conditioned, and
+the qualification below does not establish dynamic-state behavior.
+
+Download the immutable model revision. A Hugging Face mirror may be selected
+without changing the checkpoint identity:
+
+```bash
+python3 -m pip install -U "huggingface_hub[cli]"
+export HF_ENDPOINT=https://hf-mirror.com              # optional
+export APXINF_DM05_MODEL=/path/to/DM05-libero
+hf download Dexmal/DM05-libero \
+  --revision 25a8e0d38a8eaeaae41a44d7b4a2378fd8ce1088 \
+  --local-dir "$APXINF_DM05_MODEL"
+sha256sum \
+  "$APXINF_DM05_MODEL/chat_template.jinja" \
+  "$APXINF_DM05_MODEL/config.json" \
+  "$APXINF_DM05_MODEL/generation_config.json" \
+  "$APXINF_DM05_MODEL/model.safetensors" \
+  "$APXINF_DM05_MODEL/norm_stats.json" \
+  "$APXINF_DM05_MODEL/processor_config.json" \
+  "$APXINF_DM05_MODEL/tokenizer.json" \
+  "$APXINF_DM05_MODEL/tokenizer_config.json"
+```
+
+Before constructing the processor or GPU runtime, the policy verifies
+the complete snapshot surface used by model and processor construction:
+
+| file | exact bytes | SHA-256 |
+|---|---:|---|
+| `chat_template.jinja` | 1,532 | `7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4` |
+| `config.json` | 6,795 | `43b2a56ed9c79c3068849caa0a140458515e654d34ae0b06bb0bbb3ef4dd0f80` |
+| `generation_config.json` | 204 | `640dbc106facaf0fb90980b5e182ce0c1fcfad6e88da14737578b5b65cb42f7a` |
+| `model.safetensors` | 11,658,431,136 | `575d0d8e0f75822e95f7adf3a5e62a7c331da0b82e6fc3efeea19ef1b927353f` |
+| `norm_stats.json` | 1,900 | `06382f26d9f9fdba10ee2dba77783ec8c31e6a6dcb348806583cb6217e18303b` |
+| `processor_config.json` | 560 | `9eb2e8baf401c81b1517343d1dfc799a4c1b2238acaece111fe68f5fbe3a8d57` |
+| `tokenizer.json` | 33,384,567 | `daab2354f8a74e70d70b4d1f804939b68a8c9624dd06cb7858e52dd8970e9726` |
+| `tokenizer_config.json` | 715 | `eb28e3a9807f77cd74dce1b8aed91884621c0302941794470c5a46f884462615` |
+
+Build the CUDA binding and install the Python policy in a Python 3.10 or newer
+virtual environment. The `dm05` extra pins the processor stack; OpenDM,
+PyTorch, and Triton are deliberately absent.
+
+```bash
+export APXINF_DM05_VENV=/path/to/apxinf-dm05-py310
+python3.10 -m venv "$APXINF_DM05_VENV"
+. "$APXINF_DM05_VENV/bin/activate"
+
+python3 -m pip install -U pip maturin
+APXINF_CUDA_ARCH=sm_89 CUDA_PATH=/usr/local/cuda \
+  maturin develop --release --features cuda -m crates/apxinf-py/Cargo.toml
+python3 -m pip install -e 'python/apxinf[dm05]'
+python3 scripts/dm05_http_server.py \
+  --model-dir "$APXINF_DM05_MODEL" \
+  --precision bf16 --device cuda:0 \
+  --host 0.0.0.0 --port 7891
+```
+
+The native path is singular and fail-closed. `Dm05Policy -> apxinf.Model ->
+AutoModel -> Dm05VlaRuntime` owns the checkpoint and execution. The loader
+accepts only BF16, `H=10`, exactly two views, SM89, and the verified single
+`model.safetensors` file. Unsupported architecture, checkpoint surface, tensor,
+shape, dtype, device, mask, or precision returns an error; it never falls back
+to another framework.
+
+`sampling.seed` drives ApxInf's deterministic
+`apxinf-philox-box-muller-v1` generator. It is distribution-compatible standard
+normal noise, but the same integer does not reproduce PyTorch CUDA's random
+tensor. For reference comparison, send the exact 10x32 latent through the
+top-level `noise` field; this is an ApxInf extension to the OpenDM-shaped HTTP
+request and is the canonical numerical replay path.
+
+### RTX 4090 native qualification
+
+The native implementation is qualified independently of the superseded
+external OpenDM/Triton adapter. Measurements from that removed implementation
+are not evidence for this Rust runtime and are intentionally not reproduced
+here.
+
+GPU-qualified runtime source `becab8d` (the following commit changes only this
+qualification text) produced this evidence on the RTX 4090 / SM89 cell:
+
+- the full CUDA build, including regular, split-KV, and causal BF16 FA2
+  translation units, compiles with `APXINF_CUDA_ARCH=sm_89`;
+- configuration and all 1,473 BF16 checkpoint tensors are fail-closed and fully
+  owned by the loader;
+- model-neutral CUDA tests cover exact embedding/RoPE/time/Euler boundaries,
+  noncausal regular/split-KV GQA, bottom-right causal GQA, device consistency,
+  finite outputs, and unsupported shapes;
+- three private OpenDM e41 captures retain the original LIBERO fixture and
+  official demo frames 0 and 14, including exact input latents, processor
+  tensors, selected intermediate tensors, and final normalized/LIBERO actions.
+
+Using the exact same explicit BF16 latent in OpenDM, eager native, and CUDA
+Graph native execution produced:
+
+| fixture | prefix | max abs | RMSE | relative L2 | cosine | graph vs eager |
+|---|---:|---:|---:|---:|---:|---:|
+| official demo frame 0 | 557 | 0.005615 | 0.000871 | 0.004665 | 0.999989 | exact |
+| official demo frame 14 | 559 | 0.006836 | 0.001252 | 0.006104 | 0.999982 | exact |
+| frozen LIBERO request | 564 | 0.005859 | 0.001096 | 0.005872 | 0.999983 | exact |
+
+The initially proposed near-bitwise limits (`max_abs <= 5e-4`,
+`RMSE <= 1e-4`) failed and are reported as failed: both limits are smaller than
+one BF16 output bin, so they require effectively bitwise identity across
+different GEMM/attention kernels. The explicit BF16 representability
+interpretation (`max_abs <= 1/128`, `RMSE <= 0.0015`, `relative L2 <= 0.008`,
+`cosine >= 0.999`) passed all three fixtures. This distinction is deliberate;
+the BF16 result must not be described as bitwise OpenDM equivalence.
+
+For prefix 557/559/564, the graph used 8.83/8.85/8.89 GB of its
+8.97/8.99/9.04 GB checked arena. Peak process GPU memory was 19,261 MiB. The
+frozen request's retained 12-request HTTP result was 111.950 ms p50,
+112.319 ms p95, and 0.191% population CV; internal model p50 was 93.493 ms.
+
+Same-host descriptive controls on the same request shape measured 143.645 ms
+p50 for the removed `cbbd8cb` external combined path and 692.658 ms p50 for the
+pinned official OpenDM e41 path. Native was respectively 22.06% and 83.84%
+lower latency (1.28x and 6.19x faster). A five-pair post-warmup screen against
+the removed combined path was positive 5/5. These are cross-source deployment
+comparisons, not per-kernel causal estimates; generated samples remain outside
+the product repository.
+
+```bash
+curl -fsS http://127.0.0.1:7891/health
+curl -fsS http://127.0.0.1:7891/v1/infer \
+  -H 'Content-Type: application/json' --data @request.json
+```
+
+```json
+{
+  "observation": {
+    "prompt": "pick up the black bowl and place it on the plate",
+    "state": [0, 0, 0, 0, 0, 0, 0, 0],
+    "images": {"1": "<base64-head>", "2": "<base64-left-wrist>"},
+    "robot_type": "Franka"
+  },
+  "sampling": {"num_steps": 10, "seed": 7}
+}
+```
+
+For canonical reference replay, add top-level `"noise": [[...], ...]` with
+exactly 10 rows and 32 finite values per row. When `noise` is present,
+`sampling.seed` is reported for request identity but does not generate the
+latent.
+
+Checkpoint and license boundary: the weights are not vendored in ApxInf. The
+Hugging Face metadata for the pinned `Dexmal/DM05-libero` revision declares
+`license: gemma`; users must obtain and use the weights under that license.
+ApxInf source code remains Apache-2.0.
+
+### Official LIBERO rollout status
+
+This qualification did not run OpenDM's official closed-loop LIBERO evaluation.
+That evaluation is intentionally delegated to ApxInf maintainers: run
+`dexbotic-benchmark` with 50 trials per task across `libero_spatial`,
+`libero_goal`, `libero_object`, and `libero_10`, then retain the resulting
+`results.json`, configuration, logs, and rollout videos. Those simulator
+rollouts exercise changing images, repeated replanning, robot interaction, and
+task completion; the pinned checkpoint still validates but does not consume
+the state field because `add_state=False`. The frozen HTTP request and bitwise
+oracle checks above do not replace closed-loop evaluation.
+
+Accordingly, this PR makes no claim that it reproduces, preserves, or improves
+the reported 99.0% LIBERO task-success rate. Its deterministic fixture and
+RTX 4090 latency receipts cover serving correctness and performance only;
+maintainers should use official rollout artifacts to decide task-success
+acceptance.
+
 ## License
 
 ApxInf is licensed under the [Apache License 2.0](LICENSE). Vendored third-party

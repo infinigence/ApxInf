@@ -2,6 +2,49 @@
 
 use apxinf_core::{Error, Result, RngKey, Tensor};
 
+/// Model-independent dimensions exposed by every VLA runtime.
+///
+/// These values describe the bare observation-to-action contract used by
+/// bindings and policy layers. Architecture-specific configuration remains in
+/// the owning model directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VlaDimensions {
+    pub action_horizon: usize,
+    pub action_dim: usize,
+    pub num_views: usize,
+    pub image_size: usize,
+    pub patch_size: usize,
+    pub max_token_len: usize,
+}
+
+impl VlaDimensions {
+    pub fn validate(&self) -> Result<()> {
+        if self.action_horizon == 0
+            || self.action_dim == 0
+            || self.num_views == 0
+            || self.image_size == 0
+            || self.patch_size == 0
+            || self.max_token_len == 0
+        {
+            return Err(Error::Other(format!(
+                "VLA dimensions must be non-zero, got {self:?}"
+            )));
+        }
+        if self.image_size % self.patch_size != 0 {
+            return Err(Error::Other(format!(
+                "VLA image size {} is not divisible by patch size {}",
+                self.image_size, self.patch_size
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn patches_per_view(&self) -> usize {
+        let side = self.image_size / self.patch_size;
+        side * side
+    }
+}
+
 /// Memory layout for an RGB `u8` observation batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageLayout {
@@ -136,6 +179,10 @@ pub trait PreparedInference {
 /// The boxed return keeps this trait object-safe so `LoadedModel::Vla` can
 /// directly hold heterogeneous model runtimes.
 pub trait VlaRuntime {
+    /// Return the bare-model shape contract independently of model-family
+    /// configuration types.
+    fn dimensions(&self) -> VlaDimensions;
+
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 
@@ -200,5 +247,25 @@ mod tests {
             InitialLatent::Generate { rng: actual } => assert_eq!(actual, rng),
             InitialLatent::Provided(_) => panic!("generated latent requires a caller tensor"),
         }
+    }
+
+    #[test]
+    fn vla_dimensions_validate_model_independent_shape_contract() {
+        let dimensions = VlaDimensions {
+            action_horizon: 10,
+            action_dim: 32,
+            num_views: 2,
+            image_size: 224,
+            patch_size: 14,
+            max_token_len: 200,
+        };
+        dimensions.validate().unwrap();
+        assert_eq!(dimensions.patches_per_view(), 256);
+
+        let invalid = VlaDimensions {
+            patch_size: 15,
+            ..dimensions
+        };
+        assert!(invalid.validate().is_err());
     }
 }

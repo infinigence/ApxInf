@@ -1,4 +1,16 @@
-# Serving pi05 over the OpenPI websocket protocol
+# Serving ApxInf VLA policies
+
+DM05-libero uses a separate serial JSON endpoint owned by
+`Dm05HttpService`: `GET /health` (or `/healthz`) and `POST /v1/infer`. Start it
+with `scripts/dm05_http_server.py`; the root README's **DM05-libero HTTP
+deployment** section defines the pinned model/reference identity, native build,
+request schema, RNG boundary, and checkpoint license boundary. The policy loads
+the Rust `Dm05VlaRuntime` through `apxinf.Model`; OpenDM is reference-only and is
+never imported at serving time. The required 8D state field is validated but not
+consumed because the pinned checkpoint has `add_state=False`. The transport
+calls only the policy contract and does not import model internals itself.
+
+## Serving PI0.5 over the OpenPI websocket protocol
 
 Run a pi05 checkpoint on the ApxInf engine and expose it through an
 **OpenPI-compatible websocket**, so any unmodified upstream `openpi_client` can

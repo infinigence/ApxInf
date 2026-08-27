@@ -220,6 +220,57 @@ pub fn rms_bf16(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) ->
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+/// BF16 RMSNorm followed by an affine scale formed in FP32 as
+/// `weight_offset + raw_weight`.
+///
+/// Unlike precomputing the full scale into a BF16 tensor, this preserves the
+/// checkpoint weight's BF16 value while deferring the offset addition until
+/// the FP32 normalization boundary.
+pub fn rms_affine_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    raw_weight: &Tensor,
+    eps: f32,
+    weight_offset: f32,
+) -> Result<Tensor> {
+    require_finite("affine RMSNorm", &[eps, weight_offset])?;
+    if eps <= 0.0 {
+        return Err(Error::Other(
+            "affine RMSNorm epsilon must be positive".into(),
+        ));
+    }
+    let (rows, cols) = matrix_shape(input, "affine RMSNorm")?;
+    if input.dtype() != DType::BF16
+        || raw_weight.dtype() != DType::BF16
+        || raw_weight.shape().dims() != [cols]
+        || input.device() != apxinf_core::Device::Cuda(ctx.device_id())
+        || raw_weight.device() != input.device()
+    {
+        return Err(Error::Other(
+            "affine RMSNorm expects CUDA BF16 [rows,cols] input and BF16 [cols] raw weight".into(),
+        ));
+    }
+    let rows_i32 = i32::try_from(rows)
+        .map_err(|_| Error::Other("affine RMSNorm row count exceeds i32".into()))?;
+    let cols_i32 = i32::try_from(cols)
+        .map_err(|_| Error::Other("affine RMSNorm column count exceeds i32".into()))?;
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rms_norm_affine_bf16(
+            gpu_ptr(input)?,
+            gpu_ptr(raw_weight)?,
+            output.ptr(),
+            rows_i32,
+            cols_i32,
+            eps,
+            weight_offset,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
 pub fn layer_bf16(
     ctx: &CudaContext,
     input: &Tensor,

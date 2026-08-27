@@ -1,6 +1,7 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -15,6 +16,7 @@ namespace {
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
 #include "../kernels/custom/preprocess.cuh"
+#include "../kernels/custom/rope.cuh"
 #include "../kernels/custom/attention.cuh"
 #include "../kernels/custom/normalization.cuh"
 #include "../kernels/custom/activation.cuh"
@@ -130,6 +132,115 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_e4m3(
         static_cast<__nv_fp8_e4m3*>(patches), views, image_size, patch_size,
         1.0f / scale);
   }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_embedding_scaled_bf16(
+    const void* table, const void* ids, void* output, int tokens, int width,
+    int vocab_size, float scale, cudaStream_t stream) {
+  if (table == nullptr || ids == nullptr || output == nullptr || tokens <= 0 ||
+      width <= 0 || vocab_size <= 0 || !std::isfinite(scale)) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(tokens) * width;
+  int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  embedding_scaled_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(table),
+      static_cast<const uint32_t*>(ids),
+      static_cast<__nv_bfloat16*>(output), tokens, width, vocab_size, scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rms_norm_affine_bf16(
+    const void* input, const void* raw_weight, void* output, int rows,
+    int cols, float eps, float weight_offset, cudaStream_t stream) {
+  if (input == nullptr || raw_weight == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0 || !(eps > 0.0f) || !std::isfinite(eps) ||
+      !std::isfinite(weight_offset)) {
+    return cudaErrorInvalidValue;
+  }
+  rms_norm_affine_bf16_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(raw_weight),
+      static_cast<__nv_bfloat16*>(output), rows, cols, eps, weight_offset);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rope_precomputed_bf16(
+    const void* input, const void* cosine, const void* sine, void* output,
+    int tokens, int heads, int head_dim, cudaStream_t stream) {
+  if (input == nullptr || cosine == nullptr || sine == nullptr ||
+      output == nullptr || tokens <= 0 || heads <= 0 || head_dim <= 0 ||
+      head_dim % 2 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t pairs =
+      static_cast<int64_t>(tokens) * heads * (head_dim / 2);
+  int blocks = static_cast<int>((pairs + kThreads - 1) / kThreads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  rope_precomputed_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(cosine),
+      static_cast<const __nv_bfloat16*>(sine),
+      static_cast<__nv_bfloat16*>(output), tokens, heads, head_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_style_gate_mul_bf16(
+    const void* input, const void* style, void* output, int rows, int cols,
+    cudaStream_t stream) {
+  if (input == nullptr || style == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  style_gate_mul_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(style),
+      static_cast<__nv_bfloat16*>(output), count, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_sinusoidal_time_embedding_bf16(
+    const void* times, void* output, int steps, int dimension,
+    float min_period, float max_period, cudaStream_t stream) {
+  if (times == nullptr || output == nullptr || steps <= 0 || dimension <= 0 ||
+      dimension % 2 != 0 || !(min_period > 0.0f) ||
+      !(max_period >= min_period) || !std::isfinite(min_period) ||
+      !std::isfinite(max_period)) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count =
+      static_cast<int64_t>(steps) * (dimension / 2);
+  int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  sinusoidal_time_embedding_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(times),
+      static_cast<__nv_bfloat16*>(output), steps, dimension, min_period,
+      max_period);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rope_tables_bf16(
+    const void* positions, void* cosine, void* sine, int tokens,
+    int head_dim, float theta, float linear_factor, cudaStream_t stream) {
+  if (positions == nullptr || cosine == nullptr || sine == nullptr ||
+      tokens <= 0 || head_dim <= 0 || head_dim % 2 != 0 || !(theta > 0.0f) ||
+      !(linear_factor > 0.0f) || !std::isfinite(theta) ||
+      !std::isfinite(linear_factor)) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(tokens) * (head_dim / 2);
+  int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  rope_tables_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const uint32_t*>(positions),
+      static_cast<__nv_bfloat16*>(cosine),
+      static_cast<__nv_bfloat16*>(sine), tokens, head_dim, theta,
+      linear_factor);
   return cudaGetLastError();
 }
 

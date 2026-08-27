@@ -7,7 +7,8 @@ into a **stable** outer layer and a **volatile** inner one:
 * :mod:`~apxinf.policies.base` — the :class:`Policy` / :class:`BareModel` contracts.
 * :mod:`~apxinf.policies.registry` — the ``model_type -> policy class`` registry.
 * :mod:`~apxinf.policies.auto` — :class:`AutoPolicy`, dispatch by ``config.json`` type.
-* :mod:`~apxinf.policies.impls` — the concrete per-model policies (``pi05``, ...),
+* :mod:`~apxinf.policies.impls` — the concrete per-model policies (``pi05``,
+  ``dm05``, ...),
   the only part that grows as models are added.
 
 Importing this package imports :mod:`~apxinf.policies.impls`, whose modules
@@ -28,7 +29,7 @@ from .base import BareModel, Policy
 from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
-from .impls import Pi05Policy
+from .impls import Dm05Policy, Pi05Policy
 
 __all__ = [
     "Policy",
@@ -38,5 +39,5 @@ __all__ = [
     "get_policy",
     "available_policies",
     "Pi05Policy",
+    "Dm05Policy",
 ]
-

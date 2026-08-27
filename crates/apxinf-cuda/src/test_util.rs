@@ -57,12 +57,12 @@ pub fn upload_fp32_as_bf16(
     ))
 }
 
-/// Download a bf16 GPU tensor and upcast to fp32 on host.
-pub fn download_bf16_as_fp32(tensor: &Tensor) -> Result<Vec<f32>> {
+/// Download the exact little-endian BF16 storage bytes from a GPU tensor.
+pub fn download_bf16_bytes(tensor: &Tensor) -> Result<Vec<u8>> {
     assert_eq!(
         tensor.dtype(),
         DType::BF16,
-        "download_bf16_as_fp32: expected BF16 tensor"
+        "download_bf16_bytes: expected BF16 tensor"
     );
     let handle = tensor
         .storage()
@@ -74,18 +74,32 @@ pub fn download_bf16_as_fp32(tensor: &Tensor) -> Result<Vec<f32>> {
         crate::ffi::check_cuda(crate::ffi::cudaDeviceSynchronize())
             .map_err(apxinf_core::Error::Cuda)?;
     }
-    let mut host_bytes = vec![0u8; handle.len];
+    let expected_bytes = tensor
+        .numel()
+        .checked_mul(DType::BF16.size_in_bytes())
+        .expect("BF16 tensor byte size overflow");
+    assert_eq!(
+        handle.len, expected_bytes,
+        "download_bf16_bytes: storage length does not match tensor shape"
+    );
+    let mut host_bytes = vec![0u8; expected_bytes];
     unsafe {
         crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
             host_bytes.as_mut_ptr() as *mut std::ffi::c_void,
             handle.ptr as *const std::ffi::c_void,
-            handle.len,
+            expected_bytes,
             crate::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
         ))
         .map_err(apxinf_core::Error::Cuda)?;
     }
 
-    // Interpret bytes as bf16 and upcast
+    Ok(host_bytes)
+}
+
+/// Download a bf16 GPU tensor and upcast to fp32 on host.
+pub fn download_bf16_as_fp32(tensor: &Tensor) -> Result<Vec<f32>> {
+    let host_bytes = download_bf16_bytes(tensor)?;
+    // Interpret bytes as bf16 and upcast.
     let numel = tensor.numel();
     let mut out = Vec::with_capacity(numel);
     for i in 0..numel {
@@ -124,6 +138,10 @@ pub fn assert_bf16_close(actual: &[f32], expected: &[f32], abs_tol: f32, rel_tol
     let mut n_bad = 0usize;
 
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            a.is_finite() && e.is_finite(),
+            "assert_bf16_close: non-finite value at index {i}: actual={a}, expected={e}"
+        );
         let abs_err = (a - e).abs();
         let tol = abs_tol + rel_tol * e.abs();
         if abs_err > tol {

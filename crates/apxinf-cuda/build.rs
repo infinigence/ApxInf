@@ -287,7 +287,8 @@ fn main() {
             let cutlass_fmha = std::path::Path::new(&adapters_dir).join("cutlass_fmha_adapter.cu");
             let cutlass_gemm = std::path::Path::new(&adapters_dir).join("cutlass_fp8_adapter.cu");
             let cutlass_bf16 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_adapter.cu");
-            let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
+            let cutlass_bf16_sm89 =
+                std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
@@ -379,6 +380,7 @@ fn main() {
 
             let fa2_root = cutlass_root.join("fa2");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
+            let fa2_bf16_causal = cutlass_root.join("fa2_bf16_causal_sm80.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
@@ -393,6 +395,7 @@ fn main() {
                 let fa2_cutlass = fa2_root.join("cutlass/include");
                 assert!(
                     fa2_operator.is_file()
+                        && fa2_bf16_causal.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
                         && fa2_hdim256.is_file()
@@ -404,6 +407,7 @@ fn main() {
                 );
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
+                    fa2_bf16_causal,
                     fa2_hdim96,
                     fa2_hdim256,
                     fa2_f16_hdim96,

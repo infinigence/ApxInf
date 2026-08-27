@@ -8,10 +8,9 @@ Three layers, kept deliberately decoupled:
   input, with no GPU / no Rust dependency, so it unit-tests offline.
   Robot-specific steps (varying by robot body, not by model) live under
   :mod:`apxinf.processors.robots`.
-* **policies** — the **L2** layer (:mod:`apxinf.policies`).
-  :class:`~apxinf.policies.impls.pi05.Pi05Policy` composes a pre pipeline + a
-  bare-model handle (L1) + a post pipeline into a single
-  ``infer(obs_dict, noise=None) -> {actions, timing, ...}`` call.
+* **policies** — the **L2** layer (:mod:`apxinf.policies`). PI0.5 composes a pre
+  pipeline + native bare-model handle + post pipeline; DM05 owns its exact
+  Gemma3 processor contract around a native Rust ``VlaRuntime`` handle.
   :class:`~apxinf.policies.auto.AutoPolicy` dispatches a checkpoint to its concrete
   policy by ``config.json`` model type; :class:`~apxinf.policies.base.Policy` is
   the structural contract they all satisfy.
@@ -22,8 +21,8 @@ Three layers, kept deliberately decoupled:
 * **bindings** — :class:`Model` re-exports the ``apxinf_py`` PyO3 handle (L1
   bare-model inference; an internal L0 patches path exists but is private). It is
   the single public surface; you never import ``apxinf_py`` directly.
-* :mod:`apxinf.serving` — the websocket policy server (a thin, model-agnostic
-  transport shell over any :class:`Policy`, with an openpi-compatible wire).
+* :mod:`apxinf.serving` — independent transport shells: the OpenPI-compatible
+  websocket and DM05's serial ``POST /v1/infer`` HTTP wire.
   Imported only on demand (``from apxinf.serving import WebsocketPolicyServer``)
   so its ``msgpack`` / ``websockets`` deps stay out of offline processor use.
 
@@ -34,7 +33,7 @@ policy's ``from_pretrained`` pull in the ``apxinf_py`` binding.
 from __future__ import annotations
 
 from . import processors
-from .policies import AutoPolicy, Pi05Policy, Policy
+from .policies import AutoPolicy, Dm05Policy, Pi05Policy, Policy
 from .robots import (
     ROBOT_PRESETS,
     RobotPreset,
@@ -60,6 +59,7 @@ __all__ = [
     "Policy",
     # L2 policies
     "Pi05Policy",
+    "Dm05Policy",
     "AutoPolicy",
     # robot adapters
     "build_unitree_g1_policy",

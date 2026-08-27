@@ -20,6 +20,120 @@ pub struct QkvTensors {
     pub v: Tensor,
 }
 
+/// Mask semantics supported by the graph-safe BF16 GQA contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionMask {
+    /// Every query may attend to every key.
+    None,
+    /// Bottom-right aligned causal attention, matching FlashAttention when
+    /// `key_tokens >= query_tokens`.
+    Causal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GqaShape {
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+#[cfg(apxinf_fa2_sm80)]
+#[derive(Clone, Copy)]
+struct Fa2ShapeI32 {
+    batches: i32,
+    query_tokens: i32,
+    key_tokens: i32,
+    query_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+}
+
+#[cfg(apxinf_fa2_sm80)]
+#[allow(clippy::too_many_arguments)]
+fn validate_fa2_shape(
+    ctx: &CudaContext,
+    batches: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<Fa2ShapeI32> {
+    if ctx.caps().compute_major < 8
+        || [
+            batches,
+            query_tokens,
+            key_tokens,
+            query_heads,
+            kv_heads,
+            head_dim,
+        ]
+        .contains(&0)
+        || query_heads % kv_heads != 0
+        || head_dim > 256
+        || head_dim % 8 != 0
+    {
+        return Err(Error::Other(format!(
+            "BF16 FA2 requires compute capability >= 8, non-zero dimensions, divisible heads, and head_dim divisible by 8 in 1..=256; got SM{}, B={batches}, Q={query_tokens}, K={key_tokens}, Hq={query_heads}, Hkv={kv_heads}, D={head_dim}",
+            ctx.caps().sm
+        )));
+    }
+    let checked = |name: &str, value: usize| {
+        i32::try_from(value).map_err(|_| Error::Other(format!("BF16 FA2 {name} exceeds i32")))
+    };
+    Ok(Fa2ShapeI32 {
+        batches: checked("batch count", batches)?,
+        query_tokens: checked("query token count", query_tokens)?,
+        key_tokens: checked("key token count", key_tokens)?,
+        query_heads: checked("query head count", query_heads)?,
+        kv_heads: checked("KV head count", kv_heads)?,
+        head_dim: checked("head dimension", head_dim)?,
+    })
+}
+
+fn validate_gqa_bf16(q: &Tensor, k: &Tensor, v: &Tensor, mask: AttentionMask) -> Result<GqaShape> {
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+    {
+        return Err(Error::Other("GQA expects BF16 Q/K/V tensors".into()));
+    }
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape().dims() != k_shape
+        || q_shape
+            .iter()
+            .chain(k_shape)
+            .any(|dimension| *dimension == 0)
+        || q_shape[2] != k_shape[2]
+        || q_shape[1] % k_shape[1] != 0
+        || q_shape[2] > 256
+        || q_shape[2] % 8 != 0
+    {
+        return Err(Error::Other(format!(
+            "GQA expects Q [query_tokens,query_heads,head_dim] and matching K/V [key_tokens,kv_heads,head_dim] with divisible heads and head_dim divisible by 8 in 1..=256; got q={q_shape:?}, k={k_shape:?}, v={:?}",
+            v.shape().dims()
+        )));
+    }
+    if mask == AttentionMask::Causal && q_shape[0] > k_shape[0] {
+        return Err(Error::Other(format!(
+            "causal GQA requires key_tokens >= query_tokens, got {} < {}",
+            k_shape[0], q_shape[0]
+        )));
+    }
+    Ok(GqaShape {
+        query_tokens: q_shape[0],
+        key_tokens: k_shape[0],
+        query_heads: q_shape[1],
+        kv_heads: k_shape[1],
+        head_dim: q_shape[2],
+    })
+}
+
 fn tensor_slice(
     tensor: &Tensor,
     byte_offset: usize,
@@ -553,6 +667,15 @@ fn fa2_attention(
     kv_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
+    let ffi_shape = validate_fa2_shape(
+        ctx,
+        batches,
+        query_tokens,
+        key_tokens,
+        query_heads,
+        kv_heads,
+        head_dim,
+    )?;
     let output = output_buffer(ctx, q.size_in_bytes())?;
     let lse_elements = batches
         .checked_mul(query_heads)
@@ -573,12 +696,77 @@ fn fa2_attention(
             gpu_ptr(v)?,
             output.ptr(),
             softmax_lse.ptr(),
-            batches as i32,
-            query_tokens as i32,
-            key_tokens as i32,
-            query_heads as i32,
-            kv_heads as i32,
-            head_dim as i32,
+            ffi_shape.batches,
+            ffi_shape.query_tokens,
+            ffi_shape.key_tokens,
+            ffi_shape.query_heads,
+            ffi_shape.kv_heads,
+            ffi_shape.head_dim,
+            (head_dim as f32).sqrt().recip(),
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        q.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+#[cfg(apxinf_fa2_sm80)]
+#[allow(clippy::too_many_arguments)]
+fn fa2_attention_causal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    query_tokens: usize,
+    key_tokens: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let ffi_shape = validate_fa2_shape(
+        ctx,
+        batches,
+        query_tokens,
+        key_tokens,
+        query_heads,
+        kv_heads,
+        head_dim,
+    )?;
+    if query_tokens > key_tokens {
+        return Err(Error::Other(format!(
+            "causal BF16 FA2 requires key_tokens >= query_tokens, got {key_tokens} < {query_tokens}"
+        )));
+    }
+    let output = output_buffer(ctx, q.size_in_bytes())?;
+    let lse_elements = batches
+        .checked_mul(query_heads)
+        .and_then(|value| value.checked_mul(query_tokens))
+        .ok_or_else(|| Error::Other("causal BF16 GQA LSE size overflow".into()))?;
+    let softmax_lse = output_buffer(
+        ctx,
+        lse_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::Other("causal BF16 GQA LSE byte size overflow".into()))?,
+    )?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_fa2_bf16_causal(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            softmax_lse.ptr(),
+            ffi_shape.batches,
+            ffi_shape.query_tokens,
+            ffi_shape.key_tokens,
+            ffi_shape.query_heads,
+            ffi_shape.kv_heads,
+            ffi_shape.head_dim,
             (head_dim as f32).sqrt().recip(),
             ctx.stream().handle(),
         ))
@@ -603,10 +791,7 @@ fn fa2_splitkv_enabled(
     if std::env::var_os("APXINF_DISABLE_FA2_SPLITKV").is_some() {
         return false;
     }
-    query_tokens <= 64
-        && key_tokens > query_tokens
-        && query_heads > kv_heads
-        && head_dim == 256
+    query_tokens <= 64 && key_tokens > query_tokens && query_heads > kv_heads && head_dim == 256
 }
 
 #[cfg(apxinf_fa2_sm80)]
@@ -623,6 +808,15 @@ fn fa2_attention_splitkv(
     kv_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
+    let ffi_shape = validate_fa2_shape(
+        ctx,
+        batches,
+        query_tokens,
+        key_tokens,
+        query_heads,
+        kv_heads,
+        head_dim,
+    )?;
     let output = output_buffer(ctx, q.size_in_bytes())?;
     let lse_elements = batches
         .checked_mul(query_heads)
@@ -674,14 +868,15 @@ fn fa2_attention_splitkv(
             softmax_lse.ptr(),
             softmax_lse_accum.ptr(),
             o_accum.ptr(),
-            batches as i32,
-            query_tokens as i32,
-            key_tokens as i32,
-            query_heads as i32,
-            kv_heads as i32,
-            head_dim as i32,
+            ffi_shape.batches,
+            ffi_shape.query_tokens,
+            ffi_shape.key_tokens,
+            ffi_shape.query_heads,
+            ffi_shape.kv_heads,
+            ffi_shape.head_dim,
             (head_dim as f32).sqrt().recip(),
-            ctx.caps().multiprocessor_count as i32,
+            i32::try_from(ctx.caps().multiprocessor_count)
+                .map_err(|_| Error::Other("BF16 FA2 multiprocessor count exceeds i32".into()))?,
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;
@@ -692,6 +887,89 @@ fn fa2_attention_splitkv(
         ctx.device_id(),
         output,
     ))
+}
+
+/// Graph-safe BF16 grouped-query attention over contiguous token-major Q/K/V.
+///
+/// Q is `[query_tokens, query_heads, head_dim]`; K and V are
+/// `[key_tokens, kv_heads, head_dim]`. SM80-family builds dispatch to the
+/// vendored FlashAttention-2 implementation. Unsupported builds fail closed;
+/// this function never drops the requested causal semantics.
+pub fn gqa_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: AttentionMask,
+) -> Result<Tensor> {
+    let shape = validate_gqa_bf16(q, k, v, mask)?;
+    let expected_device = Device::Cuda(ctx.device_id());
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.device() != expected_device)
+    {
+        return Err(Error::Other(format!(
+            "GQA expects Q/K/V on {expected_device}"
+        )));
+    }
+
+    #[cfg(apxinf_fa2_sm80)]
+    {
+        if mask == AttentionMask::Causal {
+            return fa2_attention_causal(
+                ctx,
+                q,
+                k,
+                v,
+                1,
+                shape.query_tokens,
+                shape.key_tokens,
+                shape.query_heads,
+                shape.kv_heads,
+                shape.head_dim,
+            );
+        }
+        if fa2_splitkv_enabled(
+            shape.query_tokens,
+            shape.key_tokens,
+            shape.query_heads,
+            shape.kv_heads,
+            shape.head_dim,
+        ) {
+            return fa2_attention_splitkv(
+                ctx,
+                q,
+                k,
+                v,
+                1,
+                shape.query_tokens,
+                shape.key_tokens,
+                shape.query_heads,
+                shape.kv_heads,
+                shape.head_dim,
+            );
+        }
+        return fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            1,
+            shape.query_tokens,
+            shape.key_tokens,
+            shape.query_heads,
+            shape.kv_heads,
+            shape.head_dim,
+        );
+    }
+
+    #[cfg(not(apxinf_fa2_sm80))]
+    {
+        let _ = shape;
+        Err(Error::Other(
+            "BF16 GQA requires an SM80-family FlashAttention-2 build".into(),
+        ))
+    }
 }
 
 #[cfg(apxinf_cutlass_fmha)]
@@ -1365,4 +1643,63 @@ pub fn mqa_f16_e4m3_522(
     Err(Error::Other(
         "FA2 direct E4M3 requires an SM100-family FA2 build".into(),
     ))
+}
+
+#[cfg(test)]
+mod gqa_contract_tests {
+    use super::*;
+
+    fn tensor(shape: Vec<usize>, dtype: DType) -> Tensor {
+        Tensor::zeros(shape, dtype)
+    }
+
+    #[test]
+    fn accepts_target_bf16_gqa_geometry() {
+        let q = tensor(vec![10, 8, 256], DType::BF16);
+        let k = tensor(vec![574, 4, 256], DType::BF16);
+        let v = tensor(vec![574, 4, 256], DType::BF16);
+        let shape = validate_gqa_bf16(&q, &k, &v, AttentionMask::None).unwrap();
+        assert_eq!(
+            shape,
+            GqaShape {
+                query_tokens: 10,
+                key_tokens: 574,
+                query_heads: 8,
+                kv_heads: 4,
+                head_dim: 256,
+            }
+        );
+        assert!(validate_gqa_bf16(&q, &k, &v, AttentionMask::Causal).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_heads_dtype_shape_and_causal_alignment() {
+        let q = tensor(vec![10, 8, 256], DType::BF16);
+        let good_k = tensor(vec![574, 4, 256], DType::BF16);
+        let good_v = tensor(vec![574, 4, 256], DType::BF16);
+
+        let bad_heads = tensor(vec![574, 3, 256], DType::BF16);
+        assert!(validate_gqa_bf16(&q, &bad_heads, &bad_heads, AttentionMask::None).is_err());
+
+        let bad_dtype = tensor(vec![574, 4, 256], DType::F32);
+        assert!(validate_gqa_bf16(&q, &bad_dtype, &bad_dtype, AttentionMask::None).is_err());
+
+        let bad_v = tensor(vec![573, 4, 256], DType::BF16);
+        assert!(validate_gqa_bf16(&q, &good_k, &bad_v, AttentionMask::None).is_err());
+
+        let too_wide = tensor(vec![10, 8, 258], DType::BF16);
+        let too_wide_k = tensor(vec![574, 4, 258], DType::BF16);
+        assert!(
+            validate_gqa_bf16(&too_wide, &too_wide_k, &too_wide_k, AttentionMask::None,).is_err()
+        );
+
+        let unaligned = tensor(vec![10, 8, 255], DType::BF16);
+        let unaligned_k = tensor(vec![574, 4, 255], DType::BF16);
+        assert!(
+            validate_gqa_bf16(&unaligned, &unaligned_k, &unaligned_k, AttentionMask::None).is_err()
+        );
+
+        let long_q = tensor(vec![575, 8, 256], DType::BF16);
+        assert!(validate_gqa_bf16(&long_q, &good_k, &good_v, AttentionMask::Causal).is_err());
+    }
 }

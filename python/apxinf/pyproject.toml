@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "apxinf"
 version = "0.1.0"
-description = "ApxInf Python frontend: numpy processor library + L2 Pi05Policy."
+description = "ApxInf Python frontend: processor library and VLA policy/serving layer."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 # The processor library is pure numpy/PIL/sentencepiece with no GPU / no Rust
@@ -23,6 +23,18 @@ tokenizer = ["sentencepiece>=0.1.99"]
 policy = ["apxinf-py>=0.1.0"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+# Native DM05 uses the PyO3 VLA runtime; Python retains only exact Gemma3
+# tokenization plus fixed image preprocessing and action postprocessing.
+# Its pinned Transformers dependency requires Python >=3.10; installing this
+# extra on Python 3.9 therefore fails dependency resolution without dropping
+# base-package Python 3.9 support.
+dm05 = [
+    "apxinf-py>=0.1.0",
+    "opencv-python-headless>=4.8",
+    "jinja2>=3.1",
+    "transformers==5.3.0",
+    "tokenizers==0.22.1",
+]
 # The lerobot adapter (apxinf.adapters.lerobot) returns torch tensors, and its
 # build_inference_frame delegates to lerobot's own build_dataset_frame. lerobot
 # itself is deliberately *not* pinned here: the adapter is built against a moving
