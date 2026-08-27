@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use minijinja::Environment;
 use apxinf_core::{Error, Result};
+use minijinja::{Environment, Error as JinjaError, ErrorKind, State, Value};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer as HfTokenizer;
 
@@ -66,7 +66,8 @@ impl Tokenizer {
             .map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
 
         // Try to load tokenizer_config.json from same directory
-        let config_path = path_ref.parent()
+        let config_path = path_ref
+            .parent()
             .map(|p| p.join("tokenizer_config.json"))
             .unwrap_or_else(|| path_ref.with_extension("config.json"));
 
@@ -82,12 +83,17 @@ impl Tokenizer {
         // Store chat template separately (we'll create env on demand)
         let chat_template = config.chat_template.clone();
 
-        Ok(Self { inner, config, chat_template })
+        Ok(Self {
+            inner,
+            config,
+            chat_template,
+        })
     }
 
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.inner
+        let encoding = self
+            .inner
             .encode(text, false)
             .map_err(|e| Error::Other(format!("tokenizer encode: {e}")))?;
         Ok(encoding.get_ids().to_vec())
@@ -121,9 +127,12 @@ impl Tokenizer {
         }
 
         // Fallback: search vocabulary for common EOS tokens
-        self.inner.get_vocab(true)
+        self.inner
+            .get_vocab(true)
             .iter()
-            .find(|(token, _)| *token == "</s>" || *token == "<|eot_id|>" || *token == "<|end_of_text|>")
+            .find(|(token, _)| {
+                *token == "</s>" || *token == "<|eot_id|>" || *token == "<|end_of_text|>"
+            })
             .map(|(_, &id)| id)
     }
 
@@ -143,7 +152,8 @@ impl Tokenizer {
         }
 
         // Fallback: search vocabulary for common BOS tokens
-        self.inner.get_vocab(true)
+        self.inner
+            .get_vocab(true)
             .iter()
             .find(|(token, _)| *token == "<s>" || *token == "<|begin_of_text|>")
             .map(|(_, &id)| id)
@@ -164,25 +174,39 @@ impl Tokenizer {
 
         // Create environment and template on demand
         let mut env = Environment::new();
+        env.set_unknown_method_callback(python_string_method);
         env.add_template("chat", template_str)
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
-        let tmpl = env.get_template("chat")
+        let tmpl = env
+            .get_template("chat")
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
         // Build template context
-        let bos = self.config.bos_token.clone()
-            .or_else(|| self.inner.get_vocab(true)
-                .iter()
-                .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
-                .map(|(t, _)| t.clone()))
+        let bos = self
+            .config
+            .bos_token
+            .clone()
+            .or_else(|| {
+                self.inner
+                    .get_vocab(true)
+                    .iter()
+                    .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
+                    .map(|(t, _)| t.clone())
+            })
             .unwrap_or_default();
 
-        let eos = self.config.eos_token.clone()
-            .or_else(|| self.inner.get_vocab(true)
-                .iter()
-                .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
-                .map(|(t, _)| t.clone()))
+        let eos = self
+            .config
+            .eos_token
+            .clone()
+            .or_else(|| {
+                self.inner
+                    .get_vocab(true)
+                    .iter()
+                    .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
+                    .map(|(t, _)| t.clone())
+            })
             .unwrap_or_default();
 
         // Create context as serde Value (map)
@@ -193,7 +217,8 @@ impl Tokenizer {
             "add_generation_prompt": true,
         });
 
-        let result = tmpl.render(context)
+        let result = tmpl
+            .render(context)
             .map_err(|e| Error::Other(format!("template render error: {e}")))?;
 
         // Jinja2 in Python strips whitespace around control blocks, but minijinja doesn't.
@@ -224,9 +249,42 @@ impl Tokenizer {
     /// Convenience method that applies template and encodes the result.
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let prompt = self.apply_chat_template(messages)?;
-        println!("Formatted prompt:\n{}", prompt);
         self.encode(&prompt)
     }
+}
+
+fn python_string_method(
+    _state: &State,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> std::result::Result<Value, JinjaError> {
+    if !matches!(method, "startswith" | "endswith") {
+        return Err(JinjaError::from(ErrorKind::UnknownMethod));
+    }
+    let source = value.as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string receiver"),
+        )
+    })?;
+    if args.len() != 1 {
+        return Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires exactly one argument"),
+        ));
+    }
+    let needle = args[0].as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string argument"),
+        )
+    })?;
+    Ok(Value::from(if method == "startswith" {
+        source.starts_with(needle)
+    } else {
+        source.ends_with(needle)
+    }))
 }
 
 #[cfg(test)]
@@ -244,5 +302,22 @@ mod tests {
 
         let system = ChatMessage::system("You are helpful");
         assert_eq!(system.role, "system");
+    }
+
+    #[test]
+    fn test_qwen_python_string_methods() {
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(python_string_method);
+        env.add_template(
+            "qwen",
+            "{{ value.startswith('tool') }}|{{ value.endswith('call') }}",
+        )
+        .unwrap();
+        let rendered = env
+            .get_template("qwen")
+            .unwrap()
+            .render(serde_json::json!({"value":"tool_call"}))
+            .unwrap();
+        assert_eq!(rendered, "true|true");
     }
 }

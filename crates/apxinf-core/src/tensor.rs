@@ -94,15 +94,44 @@ impl Tensor {
     pub fn from_f16(shape: impl Into<Shape>, data: &[f16]) -> Result<Self> {
         let shape = shape.into();
         if data.len() != shape.numel() {
-            return Err(Error::DataLengthMismatch { expected: shape.numel() * 2, got: data.len() * 2 });
+            return Err(Error::DataLengthMismatch {
+                expected: shape.numel() * 2,
+                got: data.len() * 2,
+            });
         }
         let bytes: Vec<u8> = bytemuck::cast_slice(data).to_vec();
-        Ok(Self { shape, dtype: DType::F16, device: Device::Cpu, storage: Storage::cpu_from_bytes(bytes) })
+        Ok(Self {
+            shape,
+            dtype: DType::F16,
+            device: Device::Cpu,
+            storage: Storage::cpu_from_bytes(bytes),
+        })
     }
 
     /// Create a tensor containing raw CUDA-compatible E4M3 bytes.
     pub fn from_f8_e4m3(shape: impl Into<Shape>, data: &[u8]) -> Result<Self> {
         Self::from_raw(shape.into(), DType::F8E4M3, Device::Cpu, data.to_vec())
+    }
+
+    /// Create a tensor from signed 32-bit integers without changing their
+    /// bit representation. Packed INT4 checkpoints use this container dtype.
+    pub fn from_i32(shape: impl Into<Shape>, data: &[i32]) -> Result<Self> {
+        Self::from_raw(
+            shape.into(),
+            DType::I32,
+            Device::Cpu,
+            bytemuck::cast_slice(data).to_vec(),
+        )
+    }
+
+    /// Create a tensor from signed 64-bit integers.
+    pub fn from_i64(shape: impl Into<Shape>, data: &[i64]) -> Result<Self> {
+        Self::from_raw(
+            shape.into(),
+            DType::I64,
+            Device::Cpu,
+            bytemuck::cast_slice(data).to_vec(),
+        )
     }
 
     // ── Accessors ───────────────────────────────────────────────────
@@ -178,6 +207,18 @@ impl Tensor {
         Ok(self.storage.as_cpu().unwrap())
     }
 
+    pub fn as_i32(&self) -> Result<&[i32]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I32)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
+    pub fn as_i64(&self) -> Result<&[i64]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I64)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
     /// Convert data to f32 regardless of stored dtype (copies if bf16).
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         self.ensure_cpu()?;
@@ -185,7 +226,12 @@ impl Tensor {
             DType::F32 => Ok(self.as_f32()?.to_vec()),
             DType::F16 => Ok(self.as_f16()?.iter().map(|x| x.to_f32()).collect()),
             DType::BF16 => Ok(self.as_bf16()?.iter().map(|x| x.to_f32()).collect()),
-            DType::F8E4M3 => Err(Error::Other("raw E4M3 conversion requires an explicit quantization scale".into())),
+            DType::F8E4M3 => Err(Error::Other(
+                "raw E4M3 conversion requires an explicit quantization scale".into(),
+            )),
+            DType::I32 | DType::I64 => Err(Error::Other(
+                "integer tensor conversion requires an explicit semantic operation".into(),
+            )),
         }
     }
 
@@ -288,12 +334,7 @@ impl Tensor {
             let a_off = batch_idx * m * k;
             let b_off = batch_idx * k * n;
             let o_off = batch_idx * m * n;
-            crate::ops::sgemm(
-                m, k, n,
-                &a[a_off..],
-                &b[b_off..],
-                &mut out[o_off..],
-            );
+            crate::ops::sgemm(m, k, n, &a[a_off..], &b[b_off..], &mut out[o_off..]);
         }
 
         Tensor::from_f32(out_shape, &out)
@@ -418,6 +459,9 @@ mod tests {
     #[test]
     fn test_display() {
         let t = Tensor::zeros(vec![2, 3], DType::F32);
-        assert_eq!(format!("{t}"), "Tensor(shape=[2, 3], dtype=f32, device=cpu)");
+        assert_eq!(
+            format!("{t}"),
+            "Tensor(shape=[2, 3], dtype=f32, device=cpu)"
+        );
     }
 }

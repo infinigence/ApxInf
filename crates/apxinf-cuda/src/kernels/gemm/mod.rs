@@ -1,5 +1,8 @@
 mod bf16;
 mod fp8;
+mod marlin;
+mod w4a16;
+mod w8a16;
 mod w8a8;
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
@@ -22,9 +25,19 @@ pub use fp8::{
     install_tuning_dbs, native_fp8_gemm_supported as native_fp8_supported, ColdL2TuningMetadata,
     CublasLtAlgorithmTiming, CutlassTacticTiming, Fp8WeightView,
 };
+pub use marlin::{
+    w4a16_marlin_write, MarlinPreparedWeight, MarlinW4A16WeightView, MarlinWorkspace,
+};
+pub use w4a16::{
+    gemm_w4a16_m8_write as w4a16_m8_write, gemv_w4a16 as w4a16, gemv_w4a16_write as w4a16_write,
+    gemv_w4a16_write_direct as w4a16_write_direct, W4A16Layout, W4A16WeightView,
+};
+pub use w8a16::{gemv_w8a16_write as w8a16_write, W8A16WeightView};
 #[cfg(test)]
 pub(crate) use w8a8::gemm_w8a8_with_preference;
-pub use w8a8::{gemm_w8a8 as w8a8, W8A8Layout, W8A8ScaleMode, W8A8WeightView};
+pub use w8a8::{
+    gemm_w8a8 as w8a8, gemm_w8a8_write as w8a8_write, W8A8Layout, W8A8ScaleMode, W8A8WeightView,
+};
 
 pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if activation.dtype() != weight.dtype() {

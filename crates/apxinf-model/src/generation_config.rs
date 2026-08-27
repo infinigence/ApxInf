@@ -33,10 +33,9 @@ pub struct GenerationOptions {
     pub return_logprob: Option<bool>,
 }
 
-/// Complete, normalized execution settings. This is deliberately crate-local:
-/// callers submit [`GenerationOptions`], while the runtime consumes this type.
+/// Complete, normalized execution settings consumed by model runtimes.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ResolvedGenerationOptions {
+pub struct ResolvedGenerationOptions {
     pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
     pub sampling: TokenSamplingParams,
@@ -132,7 +131,7 @@ impl GenerationOptions {
         Ok(config.into_options())
     }
 
-    pub(crate) fn resolve(&self) -> Result<ResolvedGenerationOptions> {
+    pub fn resolve(&self) -> Result<ResolvedGenerationOptions> {
         let complete = Self::apxinf_defaults().overlay(self);
         let max_new_tokens = complete.max_new_tokens.expect("framework default");
         let eos_token_ids = complete.eos_token_ids.expect("framework default");
@@ -220,6 +219,10 @@ impl GenerationConfigSource {
             "apxinf" => Self::ApxInf,
             path => Self::Path(PathBuf::from(path)),
         }
+    }
+
+    pub fn load(&self, model_path: &Path) -> Result<GenerationOptions> {
+        load_generation_options(model_path, self)
     }
 }
 

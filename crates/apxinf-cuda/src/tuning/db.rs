@@ -447,6 +447,7 @@ fn parse_dtype(value: &str, label: &str) -> Result<TuningDType> {
         "f8e4m3" => Ok(TuningDType::F8E4M3),
         "i8" => Ok(TuningDType::I8),
         "i32" => Ok(TuningDType::I32),
+        "i64" => Ok(TuningDType::I64),
         value => invalid_field(label, "dtype", value),
     }
 }

@@ -128,6 +128,52 @@ impl CudaBuffer {
         }
     }
 
+    /// Copy between device buffers on a caller-owned stream without
+    /// synchronizing. Both buffers keep their allocations alive through the
+    /// enqueued copy.
+    pub fn copy_from_device_async(
+        &self,
+        source: &Self,
+        bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if self.device != source.device {
+            return Err(format!(
+                "CUDA device copy crosses devices {} -> {}",
+                source.device, self.device
+            ));
+        }
+        if bytes > self.len || bytes > source.len {
+            return Err(format!(
+                "CUDA device copy of {bytes} bytes exceeds source/destination {}/{}",
+                source.len, self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))
+        }
+    }
+
+    /// Fill the allocation on a caller-owned stream without synchronizing.
+    /// Benchmark harnesses use this to evict cache outside their timed region;
+    /// graph/runtime code can use it for stable-address buffer reset.
+    pub fn memset_async(&self, value: u8, stream: &crate::CudaStream) -> Result<(), String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                i32::from(value),
+                self.len,
+                stream.handle(),
+            ))
+        }
+    }
+
     /// Raw device pointer for crate-internal launch code.
     pub(crate) fn ptr(&self) -> *mut c_void {
         self.ptr
@@ -197,7 +243,10 @@ impl CudaBuffer {
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
-    pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
+    /// Turn this allocation or bounds-checked view into a Tensor while
+    /// preserving the allocation owner.  Views therefore remain zero-copy and
+    /// keep their parent storage alive.
+    pub fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);
         let handle = GpuStorageHandle {
             ptr: self.ptr as usize,

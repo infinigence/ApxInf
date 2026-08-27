@@ -494,9 +494,8 @@ extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     const void* q, const void* k, const void* v, void* out,
     uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)
 {
-    // Only head_dim=64 (Qwen3-VL vision) is supported; the kernel uses a
-    // 32-thread / 2-element-per-thread layout.
-    if (head_dim != 64) return cudaErrorInvalidConfiguration;
+    // Qwen3-VL uses 64; Qwen3.5/Qwen3.8 uses 72.
+    if (head_dim != 64 && head_dim != 72) return cudaErrorInvalidConfiguration;
     dim3 grid(seq_len, n_heads, 1);
     dim3 block(32, 1, 1);
     size_t smem = (seq_len + 1) * sizeof(float);
@@ -523,6 +522,12 @@ extern "C" cudaError_t apxinf_flash_attn_decode_bf16(
             (const uint32_t*)pos_ptr);
     } else if (head_dim == 128) {
         flash_attn_decode_bf16_splitk_kernel<128, SPLITK_WARPS><<<grid, block, 0, s>>>(
+            (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache,
+            (const __nv_bfloat16*)v_cache, (__nv_bfloat16*)out,
+            n_heads, n_kv_heads, bucket_kv_len, max_seq_len, scale,
+            (const uint32_t*)pos_ptr);
+    } else if (head_dim == 256) {
+        flash_attn_decode_bf16_splitk_kernel<256, SPLITK_WARPS><<<grid, block, 0, s>>>(
             (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache,
             (const __nv_bfloat16*)v_cache, (__nv_bfloat16*)out,
             n_heads, n_kv_heads, bucket_kv_len, max_seq_len, scale,

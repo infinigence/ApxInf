@@ -2,18 +2,21 @@
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 
 namespace {
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
+#include "../kernels/custom/w4a16.cuh"
+#include "../kernels/custom/w8a16.cuh"
+#include "../kernels/custom/qwen35_common.cuh"
+#include "../kernels/custom/qwen35_gdn.cuh"
+#include "../kernels/custom/qwen35_attention.cuh"
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/attention.cuh"
 #include "../kernels/custom/normalization.cuh"
@@ -22,26 +25,6 @@ namespace {
 #include "../kernels/custom/elementwise.cuh"
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
-}  // namespace
-
-namespace {
-
-// Resolve the validated action Ada packed8 route before CUDA graph capture.
-// Auto enables it only for the exact supported shape.
-const int kActionAdaPacked8Mode = [] {
-    const char* value = std::getenv("APXINF_PI05_ACTION_ADA_PACKED8");
-    if (value == nullptr || std::strcmp(value, "auto") == 0) {
-      return 2;
-    }
-    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0) {
-      return 0;
-    }
-    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0) {
-      return 1;
-    }
-    return -1;
-  }();
-
 }  // namespace
 
 extern "C" cudaError_t apxinf_static_evict_l2(
@@ -56,6 +39,627 @@ extern "C" cudaError_t apxinf_static_evict_l2(
   blocks = blocks > 4096 ? 4096 : blocks;
   l2_cache_evict_kernel<<<blocks, threads, 0, stream>>>(
       static_cast<volatile uint32_t*>(buffer), bytes / sizeof(uint32_t), seed);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_rmsnorm_offset_bf16(
+    const void* input, const void* weight, void* output, int rows, int columns,
+    float epsilon, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || output == nullptr ||
+      rows < 1 || rows > 8 || columns != 5120 || !(epsilon > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_rmsnorm_offset_bf16_kernel<<<rows, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), columns, epsilon);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_residual_add_rmsnorm_offset_bf16(
+    void* residual, const void* delta, const void* weight, void* output,
+    int rows, int columns, float epsilon, cudaStream_t stream) {
+  if (residual == nullptr || delta == nullptr || weight == nullptr ||
+      output == nullptr || rows < 1 || rows > 64 || columns != 5120 ||
+      !(epsilon > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared_bytes = static_cast<size_t>(columns) * sizeof(float);
+  qwen35_residual_add_rmsnorm_offset_bf16_kernel<<<
+      rows, 256, shared_bytes, stream>>>(
+      static_cast<__nv_bfloat16*>(residual),
+      static_cast<const __nv_bfloat16*>(delta),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), columns, epsilon);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_attention_prepare_bf16(
+    const void* q_projection, const void* k_projection,
+    const void* v_projection, const void* q_norm_weight,
+    const void* k_norm_weight, void* query, void* key, void* value,
+    void* gate, const void* position, cudaStream_t stream) {
+  if (q_projection == nullptr || k_projection == nullptr ||
+      v_projection == nullptr || q_norm_weight == nullptr ||
+      k_norm_weight == nullptr || query == nullptr || key == nullptr ||
+      value == nullptr || gate == nullptr || position == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_attention_prepare_bf16_kernel<<<28, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q_projection),
+      static_cast<const __nv_bfloat16*>(k_projection),
+      static_cast<const __nv_bfloat16*>(v_projection),
+      static_cast<const __nv_bfloat16*>(q_norm_weight),
+      static_cast<const __nv_bfloat16*>(k_norm_weight),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value),
+      static_cast<__nv_bfloat16*>(gate),
+      static_cast<const uint32_t*>(position));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_attention_prepare_m8_bf16(
+    const void* q_projection, const void* k_projection,
+    const void* v_projection, const void* q_norm_weight,
+    const void* k_norm_weight, void* query, void* key, void* value,
+    void* gate, const void* positions, int tokens, cudaStream_t stream) {
+  if (q_projection == nullptr || k_projection == nullptr ||
+      v_projection == nullptr || q_norm_weight == nullptr ||
+      k_norm_weight == nullptr || query == nullptr || key == nullptr ||
+      value == nullptr || gate == nullptr || positions == nullptr ||
+      tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_attention_prepare_m8_bf16_kernel<<<tokens * 28, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q_projection),
+      static_cast<const __nv_bfloat16*>(k_projection),
+      static_cast<const __nv_bfloat16*>(v_projection),
+      static_cast<const __nv_bfloat16*>(q_norm_weight),
+      static_cast<const __nv_bfloat16*>(k_norm_weight),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value),
+      static_cast<__nv_bfloat16*>(gate),
+      static_cast<const uint32_t*>(positions), tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_attention_gate_bf16(
+    const void* input, const void* gate, void* output, int count,
+    cudaStream_t stream) {
+  if (input == nullptr || gate == nullptr || output == nullptr ||
+      count < 6144 || count > 8 * 6144 || count % 6144 != 0)
+    return cudaErrorInvalidValue;
+  qwen35_attention_gate_bf16_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<__nv_bfloat16*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_kv_quantize_bf16_e4m3(
+    const void* input, void* output, void* scales, uint32_t rows,
+    uint32_t head_dim, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || scales == nullptr ||
+      rows == 0 || head_dim == 0 || head_dim > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  kv_cache_quantize_bf16_e4m3_kernel<<<rows, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<__nv_fp8_e4m3*>(output), static_cast<float*>(scales),
+      rows, head_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_kv_append_bf16_e4m3(
+    void* cache, void* scales, const void* new_data, uint32_t n_kv_heads,
+    uint32_t head_dim, uint32_t max_seq_len, uint32_t seq_len,
+    uint32_t append_len, cudaStream_t stream) {
+  if (cache == nullptr || scales == nullptr || new_data == nullptr ||
+      n_kv_heads == 0 || head_dim == 0 || head_dim > 1024 ||
+      append_len == 0 || seq_len > max_seq_len ||
+      append_len > max_seq_len - seq_len) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 grid(n_kv_heads, append_len, 1);
+  kv_cache_append_bf16_e4m3_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<__nv_fp8_e4m3*>(cache), static_cast<float*>(scales),
+      static_cast<const __nv_bfloat16*>(new_data), n_kv_heads, head_dim,
+      max_seq_len, seq_len, append_len);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_kv_append_decode_bf16_e4m3(
+    void* cache, void* scales, const void* new_data, uint32_t n_kv_heads,
+    uint32_t head_dim, uint32_t max_seq_len, const void* position,
+    cudaStream_t stream) {
+  if (cache == nullptr || scales == nullptr || new_data == nullptr ||
+      position == nullptr || n_kv_heads == 0 || head_dim == 0 ||
+      head_dim > 1024 || max_seq_len == 0) {
+    return cudaErrorInvalidValue;
+  }
+  kv_cache_append_decode_bf16_e4m3_kernel<<<n_kv_heads, 256, 0, stream>>>(
+      static_cast<__nv_fp8_e4m3*>(cache), static_cast<float*>(scales),
+      static_cast<const __nv_bfloat16*>(new_data), n_kv_heads, head_dim,
+      max_seq_len, static_cast<const uint32_t*>(position));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t
+apxinf_static_qwen35_attention_flash_split_cta_e4m3(
+    const void* query, const void* key_cache, const void* key_scales,
+    const void* value_cache, const void* value_scales, void* partial_max,
+    void* partial_sum, void* partial_accumulator, void* output,
+    int split_count, int bucket_kv_len, int max_seq_len, float scale,
+    const void* position, cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || key_scales == nullptr ||
+      value_cache == nullptr || value_scales == nullptr ||
+      partial_max == nullptr || partial_sum == nullptr ||
+      partial_accumulator == nullptr || output == nullptr ||
+      position == nullptr || split_count < 2 || split_count > 16 ||
+      (split_count & (split_count - 1)) != 0 || bucket_kv_len <= 0 ||
+      bucket_kv_len > max_seq_len || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 stage_grid(24, split_count, 1);
+  qwen35_attention_flash_split_cta_e4m3_kernel<<<
+      stage_grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_fp8_e4m3*>(key_cache),
+      static_cast<const float*>(key_scales),
+      static_cast<const __nv_fp8_e4m3*>(value_cache),
+      static_cast<const float*>(value_scales),
+      static_cast<float*>(partial_max), static_cast<float*>(partial_sum),
+      static_cast<float*>(partial_accumulator), split_count, bucket_kv_len,
+      max_seq_len, scale, static_cast<const uint32_t*>(position), 1);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  dim3 reduce_grid(24, 1, 1);
+  qwen35_attention_flash_split_cta_reduce_bf16_kernel<<<
+      reduce_grid, 256, 0, stream>>>(
+      static_cast<const float*>(partial_max),
+      static_cast<const float*>(partial_sum),
+      static_cast<const float*>(partial_accumulator),
+      static_cast<__nv_bfloat16*>(output), split_count, 1);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t
+apxinf_static_qwen35_attention_flash_split_cta_m8_e4m3(
+    const void* query, const void* key_cache, const void* key_scales,
+    const void* value_cache, const void* value_scales, void* partial_max,
+    void* partial_sum, void* partial_accumulator, void* output,
+    int split_count, int bucket_kv_len, int max_seq_len, float scale,
+    const void* positions, int tokens, cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || key_scales == nullptr ||
+      value_cache == nullptr || value_scales == nullptr ||
+      partial_max == nullptr || partial_sum == nullptr ||
+      partial_accumulator == nullptr || output == nullptr ||
+      positions == nullptr || tokens < 1 || tokens > 8 ||
+      split_count < 2 || split_count > 16 ||
+      (split_count & (split_count - 1)) != 0 || bucket_kv_len <= 0 ||
+      bucket_kv_len > max_seq_len || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 stage_grid(24, split_count, tokens);
+  qwen35_attention_flash_split_cta_e4m3_kernel<<<
+      stage_grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_fp8_e4m3*>(key_cache),
+      static_cast<const float*>(key_scales),
+      static_cast<const __nv_fp8_e4m3*>(value_cache),
+      static_cast<const float*>(value_scales),
+      static_cast<float*>(partial_max), static_cast<float*>(partial_sum),
+      static_cast<float*>(partial_accumulator), split_count, bucket_kv_len,
+      max_seq_len, scale, static_cast<const uint32_t*>(positions), tokens);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  dim3 reduce_grid(24, tokens, 1);
+  qwen35_attention_flash_split_cta_reduce_bf16_kernel<<<
+      reduce_grid, 256, 0, stream>>>(
+      static_cast<const float*>(partial_max),
+      static_cast<const float*>(partial_sum),
+      static_cast<const float*>(partial_accumulator),
+      static_cast<__nv_bfloat16*>(output), split_count, tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t
+apxinf_static_qwen35_attention_flash_split_cta_m8_shared_q4_e4m3(
+    const void* query, const void* key_cache, const void* key_scales,
+    const void* value_cache, const void* value_scales, void* partial_max,
+    void* partial_sum, void* partial_accumulator, void* output,
+    int split_count, int bucket_kv_len, int max_seq_len, float scale,
+    const void* positions, int tokens, cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || key_scales == nullptr ||
+      value_cache == nullptr || value_scales == nullptr ||
+      partial_max == nullptr || partial_sum == nullptr ||
+      partial_accumulator == nullptr || output == nullptr ||
+      positions == nullptr || tokens != 8 || split_count != 16 ||
+      bucket_kv_len <= 0 || bucket_kv_len > max_seq_len ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 stage_grid(24, split_count, 2);
+  qwen35_attention_flash_split_cta_m8_shared_q4_e4m3_kernel<<<
+      stage_grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_fp8_e4m3*>(key_cache),
+      static_cast<const float*>(key_scales),
+      static_cast<const __nv_fp8_e4m3*>(value_cache),
+      static_cast<const float*>(value_scales),
+      static_cast<float*>(partial_max), static_cast<float*>(partial_sum),
+      static_cast<float*>(partial_accumulator), split_count, bucket_kv_len,
+      max_seq_len, scale, static_cast<const uint32_t*>(positions));
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  dim3 reduce_grid(24, tokens, 1);
+  qwen35_attention_flash_split_cta_reduce_bf16_kernel<<<
+      reduce_grid, 256, 0, stream>>>(
+      static_cast<const float*>(partial_max),
+      static_cast<const float*>(partial_sum),
+      static_cast<const float*>(partial_accumulator),
+      static_cast<__nv_bfloat16*>(output), split_count, tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_attention_flash_split_cta_bf16(
+    const void* query, const void* key_cache, const void* value_cache,
+    void* partial_max, void* partial_sum, void* partial_accumulator,
+    void* output, int split_count, int bucket_kv_len, int max_seq_len,
+    float scale, const void* position, cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      partial_max == nullptr || partial_sum == nullptr ||
+      partial_accumulator == nullptr || output == nullptr ||
+      position == nullptr || split_count < 2 || split_count > 16 ||
+      (split_count & (split_count - 1)) != 0 || bucket_kv_len <= 0 ||
+      bucket_kv_len > max_seq_len || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 stage_grid(24, split_count, 1);
+  qwen35_attention_flash_split_cta_bf16_kernel<<<
+      stage_grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key_cache),
+      static_cast<const __nv_bfloat16*>(value_cache),
+      static_cast<float*>(partial_max), static_cast<float*>(partial_sum),
+      static_cast<float*>(partial_accumulator), split_count, bucket_kv_len,
+      max_seq_len, scale, static_cast<const uint32_t*>(position), 1);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  dim3 reduce_grid(24, 1, 1);
+  qwen35_attention_flash_split_cta_reduce_bf16_kernel<<<
+      reduce_grid, 256, 0, stream>>>(
+      static_cast<const float*>(partial_max),
+      static_cast<const float*>(partial_sum),
+      static_cast<const float*>(partial_accumulator),
+      static_cast<__nv_bfloat16*>(output), split_count, 1);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_attention_flash_split_cta_m8_bf16(
+    const void* query, const void* key_cache, const void* value_cache,
+    void* partial_max, void* partial_sum, void* partial_accumulator,
+    void* output, int split_count, int bucket_kv_len, int max_seq_len,
+    float scale, const void* positions, int tokens, cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      partial_max == nullptr || partial_sum == nullptr ||
+      partial_accumulator == nullptr || output == nullptr ||
+      positions == nullptr || tokens < 1 || tokens > 8 ||
+      split_count < 2 || split_count > 16 ||
+      (split_count & (split_count - 1)) != 0 || bucket_kv_len <= 0 ||
+      bucket_kv_len > max_seq_len || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  dim3 stage_grid(24, split_count, tokens);
+  qwen35_attention_flash_split_cta_bf16_kernel<<<
+      stage_grid, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key_cache),
+      static_cast<const __nv_bfloat16*>(value_cache),
+      static_cast<float*>(partial_max), static_cast<float*>(partial_sum),
+      static_cast<float*>(partial_accumulator), split_count, bucket_kv_len,
+      max_seq_len, scale, static_cast<const uint32_t*>(positions), tokens);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  dim3 reduce_grid(24, tokens, 1);
+  qwen35_attention_flash_split_cta_reduce_bf16_kernel<<<
+      reduce_grid, 256, 0, stream>>>(
+      static_cast<const float*>(partial_max),
+      static_cast<const float*>(partial_sum),
+      static_cast<const float*>(partial_accumulator),
+      static_cast<__nv_bfloat16*>(output), split_count, tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_w8a16_gemv_bf16(
+    const void* activation, const void* weight, const void* scales,
+    void* output, int input_dim, int output_dim, cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || scales == nullptr ||
+      output == nullptr || input_dim <= 0 || output_dim <= 0 ||
+      input_dim % 8 != 0 || output_dim % 8 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kRowsPerBlock = 8;
+  const size_t shared_bytes =
+      static_cast<size_t>(input_dim) * sizeof(__nv_bfloat16) +
+      kRowsPerBlock * sizeof(float);
+  w8a16_gemv_bf16_kernel<<<
+      output_dim / kRowsPerBlock, 256, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int8_t*>(weight), static_cast<const float*>(scales),
+      static_cast<__nv_bfloat16*>(output), input_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_bf16(
+    const void* query, const void* key, const void* value, const void* g,
+    const void* beta, void* recurrent_state, void* output, int heads,
+    int key_dim, int value_dim, cudaStream_t stream) {
+  if (query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || recurrent_state == nullptr || output == nullptr ||
+      heads != 48 || key_dim != 128 || value_dim != 128) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_recurrent_bf16_kernel<<<heads, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key),
+      static_cast<const __nv_bfloat16*>(value), static_cast<const float*>(g),
+      static_cast<const float*>(beta), static_cast<float*>(recurrent_state),
+      static_cast<__nv_bfloat16*>(output));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_conv4_silu_bf16(
+    const void* input, const void* weight, void* conv_state, void* output,
+    int channels, int kernel_size, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || conv_state == nullptr ||
+      output == nullptr || channels != 10240 || kernel_size != 4) {
+    return cudaErrorInvalidValue;
+  }
+  const int blocks = (channels + 255) / 256;
+  qwen35_gdn_conv4_silu_bf16_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(conv_state),
+      static_cast<__nv_bfloat16*>(output), channels);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_prepare_bf16(
+    const void* convolved_qkv, const void* a, const void* b,
+    const void* a_log, const void* dt_bias, void* query, void* key,
+    void* value, void* g, void* beta, cudaStream_t stream) {
+  if (convolved_qkv == nullptr || a == nullptr || b == nullptr ||
+      a_log == nullptr || dt_bias == nullptr || query == nullptr ||
+      key == nullptr || value == nullptr || g == nullptr || beta == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_prepare_bf16_kernel<<<48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(convolved_qkv),
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const __nv_bfloat16*>(b),
+      static_cast<const __nv_bfloat16*>(a_log),
+      static_cast<const __nv_bfloat16*>(dt_bias),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value), static_cast<float*>(g),
+      static_cast<float*>(beta));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_gated_rmsnorm_bf16(
+    const void* input, const void* gate, const void* weight, void* output,
+    int heads, int dimension, float epsilon, cudaStream_t stream) {
+  if (input == nullptr || gate == nullptr || weight == nullptr ||
+      output == nullptr || heads != 48 || dimension != 128 ||
+      !(epsilon > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_gated_rmsnorm_bf16_kernel<<<heads, dimension, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), epsilon);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_conv4_prepare_bf16(
+    const void* projected_qkv, const void* conv_weight, void* conv_state,
+    const void* projected_ab, const void* a_log, const void* dt_bias,
+    void* a_output, void* b_output, void* query, void* key, void* value,
+    void* g, void* beta, cudaStream_t stream) {
+  if (projected_qkv == nullptr || conv_weight == nullptr ||
+      conv_state == nullptr || projected_ab == nullptr || a_log == nullptr ||
+      dt_bias == nullptr || a_output == nullptr || b_output == nullptr ||
+      query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_conv4_prepare_bf16_kernel<<<40, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(projected_qkv),
+      static_cast<const __nv_bfloat16*>(conv_weight),
+      static_cast<__nv_bfloat16*>(conv_state),
+      static_cast<const __nv_bfloat16*>(projected_ab),
+      static_cast<const __nv_bfloat16*>(a_log),
+      static_cast<const __nv_bfloat16*>(dt_bias),
+      static_cast<__nv_bfloat16*>(a_output),
+      static_cast<__nv_bfloat16*>(b_output),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value), static_cast<float*>(g),
+      static_cast<float*>(beta));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_conv4_prepare_m8_bf16(
+    const void* projected_qkv, const void* conv_weight, void* conv_state,
+    const void* projected_ab, const void* a_log, const void* dt_bias,
+    void* a_output, void* b_output, void* query, void* key, void* value,
+    void* g, void* beta, int tokens, cudaStream_t stream) {
+  if (projected_qkv == nullptr || conv_weight == nullptr ||
+      conv_state == nullptr || projected_ab == nullptr || a_log == nullptr ||
+      dt_bias == nullptr || a_output == nullptr || b_output == nullptr ||
+      query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_conv4_prepare_m8_bf16_kernel<<<40, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(projected_qkv),
+      static_cast<const __nv_bfloat16*>(conv_weight),
+      static_cast<__nv_bfloat16*>(conv_state),
+      static_cast<const __nv_bfloat16*>(projected_ab),
+      static_cast<const __nv_bfloat16*>(a_log),
+      static_cast<const __nv_bfloat16*>(dt_bias),
+      static_cast<__nv_bfloat16*>(a_output),
+      static_cast<__nv_bfloat16*>(b_output),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value), static_cast<float*>(g),
+      static_cast<float*>(beta), tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_m8_bf16(
+    const void* query, const void* key, const void* value, const void* g,
+    const void* beta, void* recurrent_state, void* output, int tokens,
+    cudaStream_t stream) {
+  if (query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || recurrent_state == nullptr || output == nullptr ||
+      tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_recurrent_m8_bf16_kernel<<<48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key),
+      static_cast<const __nv_bfloat16*>(value), static_cast<const float*>(g),
+      static_cast<const float*>(beta), static_cast<float*>(recurrent_state),
+      static_cast<__nv_bfloat16*>(output), tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_m8_hybrid_bf16(
+    const void* query, const void* key, const void* value, const void* g,
+    const void* beta, void* recurrent_state, void* output, int tokens,
+    cudaStream_t stream) {
+  if (query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || recurrent_state == nullptr || output == nullptr ||
+      tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_recurrent_m8_hybrid_bf16_kernel<<<48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key),
+      static_cast<const __nv_bfloat16*>(value), static_cast<const float*>(g),
+      static_cast<const float*>(beta), static_cast<float*>(recurrent_state),
+      static_cast<__nv_bfloat16*>(output), tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_recurrent_m8_hybrid_pairnorm_bf16(
+    const void* query, const void* key, const void* value, const void* g,
+    const void* beta, void* recurrent_state, void* output, int tokens,
+    cudaStream_t stream) {
+  if (query == nullptr || key == nullptr || value == nullptr || g == nullptr ||
+      beta == nullptr || recurrent_state == nullptr || output == nullptr ||
+      tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_recurrent_m8_hybrid_pairnorm_bf16_kernel<<<48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(key),
+      static_cast<const __nv_bfloat16*>(value), static_cast<const float*>(g),
+      static_cast<const float*>(beta), static_cast<float*>(recurrent_state),
+      static_cast<__nv_bfloat16*>(output), tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_qwen35_gdn_gated_rmsnorm_m8_bf16(
+    const void* input, const void* gate, const void* weight, void* output,
+    float epsilon, int tokens, cudaStream_t stream) {
+  if (input == nullptr || gate == nullptr || weight == nullptr ||
+      output == nullptr || !(epsilon > 0.0f) || tokens < 1 || tokens > 8) {
+    return cudaErrorInvalidValue;
+  }
+  qwen35_gdn_gated_rmsnorm_m8_bf16_kernel<<<
+      tokens * 48, 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), epsilon, tokens);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_w4a16_gemv_bf16(
+    const void* activation, const void* packed, const void* scales,
+    const void* packed_zero_points, void* output, int input_dim,
+    int output_dim, int group_size, cudaStream_t stream) {
+  if (activation == nullptr || packed == nullptr || scales == nullptr ||
+      packed_zero_points == nullptr || output == nullptr || input_dim <= 0 ||
+      output_dim <= 0 || group_size != 32 || input_dim % 32 != 0 ||
+      output_dim % 8 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kThreads = 256;
+  constexpr int kRowsPerBlock = 8;
+  const int blocks = (output_dim + kRowsPerBlock - 1) / kRowsPerBlock;
+  w4a16_gemv_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(packed),
+      static_cast<const __nv_bfloat16*>(scales),
+      static_cast<const int32_t*>(packed_zero_points),
+      static_cast<__nv_bfloat16*>(output), input_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_w4a16_gemv_bf16_staged(
+    const void* activation, const void* packed, const void* scales,
+    const void* packed_zero_points, void* output, int input_dim,
+    int output_dim, int group_size, cudaStream_t stream) {
+  if (activation == nullptr || packed == nullptr || scales == nullptr ||
+      packed_zero_points == nullptr || output == nullptr || input_dim <= 0 ||
+      output_dim <= 0 || group_size != 32 || input_dim % 32 != 0 ||
+      output_dim % 8 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kThreads = 256;
+  constexpr int kRowsPerBlock = 8;
+  const int groups = input_dim / group_size;
+  const size_t shared_bytes =
+      static_cast<size_t>(input_dim) * sizeof(__nv_bfloat16) +
+      static_cast<size_t>(kRowsPerBlock * groups) * sizeof(__nv_bfloat16) +
+      static_cast<size_t>(groups) * sizeof(int32_t);
+  const int blocks = output_dim / kRowsPerBlock;
+  w4a16_gemv_bf16_staged_kernel<<<
+      blocks, kThreads, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(packed),
+      static_cast<const __nv_bfloat16*>(scales),
+      static_cast<const int32_t*>(packed_zero_points),
+      static_cast<__nv_bfloat16*>(output), input_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_w4a16_gemm_m8_bf16(
+    const void* activation, const void* packed, const void* scales,
+    const void* packed_zero_points, void* output, int tokens, int input_dim,
+    int output_dim, int group_size, cudaStream_t stream) {
+  if (activation == nullptr || packed == nullptr || scales == nullptr ||
+      packed_zero_points == nullptr || output == nullptr || tokens < 1 ||
+      tokens > 8 || input_dim <= 0 || output_dim <= 0 || group_size != 32 ||
+      input_dim % 32 != 0 || output_dim % 8 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kThreads = 256;
+  constexpr int kRowsPerBlock = 8;
+  const int blocks = output_dim / kRowsPerBlock;
+  w4a16_gemm_m8_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(activation),
+      static_cast<const int32_t*>(packed),
+      static_cast<const __nv_bfloat16*>(scales),
+      static_cast<const int32_t*>(packed_zero_points),
+      static_cast<__nv_bfloat16*>(output), tokens, input_dim, output_dim);
   return cudaGetLastError();
 }
 
@@ -370,25 +974,6 @@ extern "C" cudaError_t apxinf_static_ada_gate_residual_rms_norm_quant_f16_e4m3(
     const void* norm_style, void* hidden, void* normalized, int rows, int cols,
     float eps, float scale, cudaStream_t stream) {
   if (rows <= 0 || cols <= 0 || !(scale > 0.0f)) return cudaErrorInvalidValue;
-  const int packed8_mode = kActionAdaPacked8Mode;
-  if (packed8_mode < 0) return cudaErrorInvalidValue;
-  const bool packed8_exact_shape = rows == 10 && cols == 1024;
-  if (packed8_mode == 1 && !packed8_exact_shape) return cudaErrorInvalidValue;
-  if (packed8_mode != 0 && packed8_exact_shape) {
-    if (!std::isfinite(scale) ||
-        projection == nullptr || residual == nullptr || gate_style == nullptr ||
-        norm_style == nullptr || hidden == nullptr || normalized == nullptr) {
-      return cudaErrorInvalidValue;
-    }
-    ada_gate_residual_rms_norm_quant_f16_e4m3_packed8_kernel
-        <<<rows, 256, 0, stream>>>(
-            static_cast<const half*>(projection),
-            static_cast<const half*>(residual),
-            static_cast<const half*>(gate_style),
-            static_cast<const half*>(norm_style), static_cast<half*>(hidden),
-            static_cast<__nv_fp8_e4m3*>(normalized), eps, 1.0f / scale);
-    return cudaGetLastError();
-  }
   ada_gate_residual_rms_norm_quant_f16_e4m3_kernel<<<rows, 256, 0, stream>>>(
       static_cast<const half*>(projection), static_cast<const half*>(residual),
       static_cast<const half*>(gate_style), static_cast<const half*>(norm_style),

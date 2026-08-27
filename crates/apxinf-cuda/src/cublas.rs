@@ -129,6 +129,9 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!(
+                "plain cuBLAS GEMM does not accept integer storage {dtype}"
+            )),
         }
     }
 
@@ -223,6 +226,9 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!(
+                "plain cuBLAS batched GEMM does not accept integer storage {dtype}"
+            )),
         }
     }
 
@@ -329,6 +335,9 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I32 | DType::I64 => Err(format!(
+                "plain cuBLAS GEMM does not accept integer storage {dtype}"
+            )),
         }
     }
 

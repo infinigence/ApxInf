@@ -37,6 +37,32 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
   return scratch[0];
 }
 
+__device__ __forceinline__ float2 block_sum_pair(
+    float left, float right, float* scratch) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int warps = blockDim.x >> 5;
+  left = warp_sum(left);
+  right = warp_sum(right);
+  if (lane == 0) {
+    scratch[warp] = left;
+    scratch[warps + warp] = right;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    left = lane < warps ? scratch[lane] : 0.0f;
+    right = lane < warps ? scratch[warps + lane] : 0.0f;
+    left = warp_sum(left);
+    right = warp_sum(right);
+    if (lane == 0) {
+      scratch[0] = left;
+      scratch[1] = right;
+    }
+  }
+  __syncthreads();
+  return make_float2(scratch[0], scratch[1]);
+}
+
 __device__ __forceinline__ float block_max(float value, float* scratch) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;

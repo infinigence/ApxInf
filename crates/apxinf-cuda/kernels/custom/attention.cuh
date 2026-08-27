@@ -231,8 +231,9 @@ __global__ void attention_softmax_decode_bf16_kernel(
 // Output:  [seq_len, n_heads * head_dim] bf16
 //
 // Non-causal: every query attends to every key. One block per (head, query).
-// 32 threads (= 1 warp); each thread handles 2 head_dim elements so head_dim
-// up to 64 fits in a single warp and the dot-product reduction uses __shfl.
+// 32 threads (= 1 warp); each thread handles strided head_dim elements. The
+// current contract covers head_dim 64 and 72, so at most three values live in
+// registers per thread and the dot-product reduction still uses __shfl.
 //
 // IMPORTANT: all 32 threads must reach every __shfl_xor_sync call (full mask
 // 0xffffffff). The inner loops are therefore non-strided — every thread
@@ -250,23 +251,30 @@ __global__ void vision_sdpa_bf16_kernel(
     uint32_t qi   = blockIdx.x;
     if (qi >= seq_len) return;
     int tid = threadIdx.x;       // 0..31
-    int half = head_dim / 2;     // 32 for head_dim=64
-    int d0 = tid;                // first element this thread owns
-    int d1 = tid + half;         // second element
+    constexpr int kMaxElementsPerThread = 3;
+    int dimensions[kMaxElementsPerThread];
+    float query_values[kMaxElementsPerThread];
+    int dimension_count = 0;
 
     extern __shared__ float smem[];
     float* scores = smem;        // [seq_len] + 1 scratch slot
 
     const __nv_bfloat16* q_row = q  + qi * n_heads * head_dim + head * head_dim;
-    float q0 = __bfloat162float(q_row[d0]);
-    float q1 = __bfloat162float(q_row[d1]);
+    for (uint32_t dimension = tid; dimension < head_dim; dimension += 32u) {
+        dimensions[dimension_count] = static_cast<int>(dimension);
+        query_values[dimension_count] = __bfloat162float(q_row[dimension]);
+        dimension_count++;
+    }
 
     // Phase 1: scores[ki] = (Q[qi] · K[ki]) * scale. All threads iterate
     // every ki so the shfl reduction stays converged.
     for (uint32_t ki = 0; ki < seq_len; ki++) {
         const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
-        float dot = q0 * __bfloat162float(k_row[d0])
-                  + q1 * __bfloat162float(k_row[d1]);
+        float dot = 0.0f;
+        for (int slot = 0; slot < dimension_count; slot++) {
+            dot += query_values[slot] *
+                __bfloat162float(k_row[dimensions[slot]]);
+        }
         for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
         if (tid == 0) scores[ki] = dot * scale;
     }
@@ -299,18 +307,21 @@ __global__ void vision_sdpa_bf16_kernel(
     for (uint32_t ki = tid; ki < seq_len; ki += 32u) scores[ki] *= inv_sum;
     __syncthreads();
 
-    // Phase 3: out[qi, head, d0|d1] = sum_k scores[k] * V[k, head, d0|d1].
-    // All threads iterate every ki (d0/d1 differ per thread so no divergence).
-    float acc0 = 0.0f, acc1 = 0.0f;
+    // Phase 3: out[qi, head, d] = sum_k scores[k] * V[k, head, d].
+    // All threads iterate every ki; owned dimensions differ per thread.
+    float accumulators[kMaxElementsPerThread] = {0.0f, 0.0f, 0.0f};
     for (uint32_t ki = 0; ki < seq_len; ki++) {
         float s = scores[ki];
         const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
-        acc0 += s * __bfloat162float(v_row[d0]);
-        acc1 += s * __bfloat162float(v_row[d1]);
+        for (int slot = 0; slot < dimension_count; slot++) {
+            accumulators[slot] +=
+                s * __bfloat162float(v_row[dimensions[slot]]);
+        }
     }
     __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
-    out_row[d0] = __float2bfloat16(acc0);
-    out_row[d1] = __float2bfloat16(acc1);
+    for (int slot = 0; slot < dimension_count; slot++) {
+        out_row[dimensions[slot]] = __float2bfloat16(accumulators[slot]);
+    }
 }
 
 
@@ -870,6 +881,5 @@ __global__ void mha_bf16_kernel(
         __float2bfloat16(accumulator);
   }
 }
-
 
 

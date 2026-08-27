@@ -368,7 +368,7 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
 
 /// Non-causal full attention for the vision tower. Q/K/V each
 /// `[seq, n_heads, head_dim]` bf16; returns `[seq, n_heads * head_dim]`.
-/// head_dim must be 64 (Qwen3-VL-2B vision).
+/// head_dim must be 64 (Qwen3-VL) or 72 (Qwen3.5/Qwen3.8).
 pub fn vision(
     ctx: &CudaContext,
     q: &Tensor,
@@ -381,33 +381,45 @@ pub fn vision(
     if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
         return Err(Error::Other("vision_sdpa: only BF16 supported".into()));
     }
-    if head_dim != 64 {
-        return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
+    if !matches!(head_dim, 64 | 72) {
+        return Err(Error::Other(
+            "vision_sdpa: head_dim must be 64 or 72".into(),
+        ));
     }
-    let device_id = ctx.device_id();
-    let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
-            gpu_ptr(q)?,
-            gpu_ptr(k)?,
-            gpu_ptr(v)?,
-            out_buf.ptr(),
-            seq_len as u32,
-            n_heads as u32,
-            head_dim as u32,
-            scale,
-            ctx.stream().handle(),
-        );
-        ffi::check_cuda(res).map_err(Error::Cuda)?;
+    #[cfg(apxinf_fa2_sm80)]
+    {
+        return fa2_attention(
+            ctx, q, k, v, 1, seq_len, seq_len, n_heads, n_heads, head_dim,
+        )?
+        .reshape(vec![seq_len, n_heads * head_dim]);
     }
-    Ok(make_gpu_tensor(
-        Shape::new(vec![seq_len, n_heads * head_dim]),
-        DType::BF16,
-        device_id,
-        out_buf,
-    ))
+    #[cfg(not(apxinf_fa2_sm80))]
+    {
+        let device_id = ctx.device_id();
+        let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
+        let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        unsafe {
+            let res = ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            );
+            ffi::check_cuda(res).map_err(Error::Cuda)?;
+        }
+        Ok(make_gpu_tensor(
+            Shape::new(vec![seq_len, n_heads * head_dim]),
+            DType::BF16,
+            device_id,
+            out_buf,
+        ))
+    }
 }
 
 /// Causal attention mask on CUDA. Dispatches on dtype.
@@ -603,10 +615,7 @@ fn fa2_splitkv_enabled(
     if std::env::var_os("APXINF_DISABLE_FA2_SPLITKV").is_some() {
         return false;
     }
-    query_tokens <= 64
-        && key_tokens > query_tokens
-        && query_heads > kv_heads
-        && head_dim == 256
+    query_tokens <= 64 && key_tokens > query_tokens && query_heads > kv_heads && head_dim == 256
 }
 
 #[cfg(apxinf_fa2_sm80)]

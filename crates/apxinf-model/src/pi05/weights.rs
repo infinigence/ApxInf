@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use half::bf16;
 use apxinf_core::{DType, Error, Result, Tensor};
+use half::bf16;
 
 use super::{GemmaVariantConfig, Pi05Config};
 
@@ -550,6 +550,10 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
             }
             Tensor::from_f8_e4m3(vec![cols, rows], &dst)
         }
+        DType::I32 | DType::I64 => Err(Error::Other(format!(
+            "π0.5 linear weight cannot use integer storage {}",
+            tensor.dtype()
+        ))),
     }
 }
 
@@ -579,6 +583,10 @@ fn add_one(tensor: Tensor) -> Result<Tensor> {
         DType::F8E4M3 => Err(Error::Other(
             "π0.5 RMSNorm parameters cannot be stored as unscaled FP8".into(),
         )),
+        DType::I32 | DType::I64 => Err(Error::Other(format!(
+            "π0.5 RMSNorm parameters cannot use integer storage {}",
+            tensor.dtype()
+        ))),
     }
 }
 
