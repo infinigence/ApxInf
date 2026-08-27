@@ -1,8 +1,8 @@
 //! Native-BF16 π0.5 transformer-layer execution.
 
 use super::backend::{kernels, Context};
-use kernels::{activation, attention, embedding, fused, gemm, norm, rope};
 use apxinf_core::{Result, Tensor};
+use kernels::{activation, attention, embedding, fused, gemm, norm, rope};
 
 use super::{
     Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Bf16LinearWeights,
@@ -65,7 +65,8 @@ pub fn language_layer_bf16(
     let gate_up = gemm::bf16(ctx, &fused.normalized, &weights.gate_up.weight)?;
     let activated = activation::geglu_bf16(ctx, &gate_up)?;
     let projected = gemm::bf16(ctx, &activated, &weights.down.weight)?;
-    let hidden = fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden =
+        fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -179,7 +180,8 @@ pub fn vision_layer_bf16(
         layer_norm_eps,
     )?;
     let qkv = gemm::bf16(ctx, &normalized, &weights.qkv.weight)?;
-    let qkv = attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
+    let qkv =
+        attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
     let attention = attention::mha_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
     let projection = gemm::bf16(ctx, &attention, &weights.output.weight)?;

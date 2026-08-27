@@ -45,7 +45,7 @@ fn sgemm_naive(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]
 
 #[cfg(feature = "accelerate")]
 fn sgemm_accelerate(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    use cblas::{Layout, Transpose, sgemm as cblas_sgemm};
+    use cblas::{sgemm as cblas_sgemm, Layout, Transpose};
 
     // Our data is row-major; CBLAS uses column-major by default.
     // Row-major C = A @ B  is equivalent to  column-major C^T = B^T @ A^T
@@ -55,17 +55,17 @@ fn sgemm_accelerate(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut 
             Layout::RowMajor,
             Transpose::None,
             Transpose::None,
-            m as i32,        // M of output
-            n as i32,        // N of output
-            k as i32,        // K (shared dim)
-            1.0,             // alpha
-            a,               // A: [M, K] row-major
-            k as i32,        // lda (stride of row in A)
-            b,               // B: [K, N] row-major
-            n as i32,        // ldb (stride of row in B)
-            0.0,             // beta
-            c,               // C: [M, N] row-major
-            n as i32,        // ldc (stride of row in C)
+            m as i32, // M of output
+            n as i32, // N of output
+            k as i32, // K (shared dim)
+            1.0,      // alpha
+            a,        // A: [M, K] row-major
+            k as i32, // lda (stride of row in A)
+            b,        // B: [K, N] row-major
+            n as i32, // ldb (stride of row in B)
+            0.0,      // beta
+            c,        // C: [M, N] row-major
+            n as i32, // ldc (stride of row in C)
         );
     }
 }
@@ -74,7 +74,7 @@ fn sgemm_accelerate(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut 
 
 #[cfg(all(feature = "openblas", not(feature = "accelerate")))]
 fn sgemm_openblas(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    use cblas::{Layout, Transpose, sgemm as cblas_sgemm};
+    use cblas::{sgemm as cblas_sgemm, Layout, Transpose};
 
     // Same row-major CBLAS call as Accelerate — the cblas crate provides a
     // uniform API; the only difference is the linked library underneath.

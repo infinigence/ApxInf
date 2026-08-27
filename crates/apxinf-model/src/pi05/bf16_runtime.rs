@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use super::backend::{kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
 use half::bf16 as HalfBf16;
 use kernels::{activation, cache, elementwise, embedding, gemm, norm, preprocess};
-use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
 
 use super::{
     action_layer_bf16, language_layer_bf16, sinusoidal_time_embedding, vision_layer_bf16,
@@ -257,7 +257,11 @@ impl Pi05Bf16CudaRuntime {
 
     fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
         let hidden = gemm::bf16(self.ctx(), time_embedding, &self.weights.time_mlp_in.weight)?;
-        let hidden = activation::bias_silu_bf16(self.ctx(), &hidden, self.weights.time_mlp_in.bias.as_ref())?;
+        let hidden = activation::bias_silu_bf16(
+            self.ctx(),
+            &hidden,
+            self.weights.time_mlp_in.bias.as_ref(),
+        )?;
         let output = gemm::bf16(self.ctx(), &hidden, &self.weights.time_mlp_out.weight)?;
         activation::bias_silu_bf16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
     }
@@ -313,7 +317,8 @@ impl Pi05Bf16CudaRuntime {
             return Err(Error::Other("π0.5 BF16 prefix/style depth mismatch".into()));
         }
         let hidden = gemm::bf16(self.ctx(), state, &self.weights.action_in.weight)?;
-        let mut hidden = elementwise::bias_bf16(self.ctx(), &hidden, self.weights.action_in.bias.as_ref())?;
+        let mut hidden =
+            elementwise::bias_bf16(self.ctx(), &hidden, self.weights.action_in.bias.as_ref())?;
         let mut attention_normalized = None;
         for index in 0..self.config.action_expert.depth {
             let layer = &self.weights.action_layers[index];
@@ -344,7 +349,8 @@ impl Pi05Bf16CudaRuntime {
             Error::Other("π0.5 action expert must contain at least one layer".into())
         })?;
         let velocity = gemm::bf16(self.ctx(), &hidden, &self.weights.action_out.weight)?;
-        let velocity = elementwise::bias_bf16(self.ctx(), &velocity, self.weights.action_out.bias.as_ref())?;
+        let velocity =
+            elementwise::bias_bf16(self.ctx(), &velocity, self.weights.action_out.bias.as_ref())?;
         elementwise::euler_update_bf16(self.ctx(), state, &velocity, dt)
     }
 

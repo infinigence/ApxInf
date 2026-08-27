@@ -20,36 +20,81 @@ impl LlamaWeights {
         for i in 0..config.n_layers {
             let prefix = format!("model.layers.{i}");
             layers.push(TransformerLayer {
-                attn_norm_weight: tensors.remove(&format!("{prefix}.input_layernorm.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.input_layernorm.weight")))?,
-                wq: transpose_weight(&tensors.remove(&format!("{prefix}.self_attn.q_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.self_attn.q_proj.weight")))?)?,
-                wk: transpose_weight(&tensors.remove(&format!("{prefix}.self_attn.k_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.self_attn.k_proj.weight")))?)?,
-                wv: transpose_weight(&tensors.remove(&format!("{prefix}.self_attn.v_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.self_attn.v_proj.weight")))?)?,
-                wo: transpose_weight(&tensors.remove(&format!("{prefix}.self_attn.o_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.self_attn.o_proj.weight")))?)?,
-                ffn_norm_weight: tensors.remove(&format!("{prefix}.post_attention_layernorm.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.post_attention_layernorm.weight")))?,
-                w_gate: transpose_weight(&tensors.remove(&format!("{prefix}.mlp.gate_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.mlp.gate_proj.weight")))?)?,
-                w_up: transpose_weight(&tensors.remove(&format!("{prefix}.mlp.up_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.mlp.up_proj.weight")))?)?,
-                w_down: transpose_weight(&tensors.remove(&format!("{prefix}.mlp.down_proj.weight"))
-                    .ok_or_else(|| Error::Other(format!("missing {prefix}.mlp.down_proj.weight")))?)?,
+                attn_norm_weight: tensors
+                    .remove(&format!("{prefix}.input_layernorm.weight"))
+                    .ok_or_else(|| {
+                        Error::Other(format!("missing {prefix}.input_layernorm.weight"))
+                    })?,
+                wq: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.self_attn.q_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.self_attn.q_proj.weight"))
+                        })?,
+                )?,
+                wk: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.self_attn.k_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.self_attn.k_proj.weight"))
+                        })?,
+                )?,
+                wv: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.self_attn.v_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.self_attn.v_proj.weight"))
+                        })?,
+                )?,
+                wo: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.self_attn.o_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.self_attn.o_proj.weight"))
+                        })?,
+                )?,
+                ffn_norm_weight: tensors
+                    .remove(&format!("{prefix}.post_attention_layernorm.weight"))
+                    .ok_or_else(|| {
+                        Error::Other(format!("missing {prefix}.post_attention_layernorm.weight"))
+                    })?,
+                w_gate: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.mlp.gate_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.mlp.gate_proj.weight"))
+                        })?,
+                )?,
+                w_up: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.mlp.up_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.mlp.up_proj.weight"))
+                        })?,
+                )?,
+                w_down: transpose_weight(
+                    &tensors
+                        .remove(&format!("{prefix}.mlp.down_proj.weight"))
+                        .ok_or_else(|| {
+                            Error::Other(format!("missing {prefix}.mlp.down_proj.weight"))
+                        })?,
+                )?,
                 qkv_packed: None,
                 gate_up_packed: None,
             });
         }
 
-        let lm_head = tensors.remove("lm_head.weight")
+        let lm_head = tensors
+            .remove("lm_head.weight")
             .ok_or_else(|| Error::Other("missing lm_head.weight".into()))?;
 
-        let embed_raw = tensors.remove("model.embed_tokens.weight")
+        let embed_raw = tensors
+            .remove("model.embed_tokens.weight")
             .ok_or_else(|| Error::Other("missing model.embed_tokens.weight".into()))?;
-        let embed_is_zeros = embed_raw.to_f32_vec()
-            .map(|d| d.iter().all(|&v| v == 0.0)).unwrap_or(false);
+        let embed_is_zeros = embed_raw
+            .to_f32_vec()
+            .map(|d| d.iter().all(|&v| v == 0.0))
+            .unwrap_or(false);
         let token_embedding = if embed_is_zeros && embed_raw.shape() == lm_head.shape() {
             lm_head.clone()
         } else {
@@ -59,7 +104,8 @@ impl LlamaWeights {
         Ok(LlamaWeights {
             token_embedding,
             layers,
-            output_norm_weight: tensors.remove("model.norm.weight")
+            output_norm_weight: tensors
+                .remove("model.norm.weight")
                 .ok_or_else(|| Error::Other("missing model.norm.weight".into()))?,
             output_weight: transpose_weight(&lm_head)?,
         })
@@ -97,7 +143,10 @@ fn transpose_weight(tensor: &Tensor) -> Result<Tensor> {
         return Ok(tensor.clone());
     }
     if dims.len() != 2 {
-        return Err(Error::Other(format!("transpose_weight expected 1D or 2D tensor, got {}D", dims.len())));
+        return Err(Error::Other(format!(
+            "transpose_weight expected 1D or 2D tensor, got {}D",
+            dims.len()
+        )));
     }
     let [rows, cols] = [dims[0], dims[1]];
     match tensor.dtype() {
@@ -121,6 +170,8 @@ fn transpose_weight(tensor: &Tensor) -> Result<Tensor> {
             }
             Tensor::from_bf16(vec![cols, rows], &out)
         }
-        dtype => Err(Error::Other(format!("Llama weight transpose does not support {dtype}"))),
+        dtype => Err(Error::Other(format!(
+            "Llama weight transpose does not support {dtype}"
+        ))),
     }
 }

@@ -1,7 +1,7 @@
 //! Backend abstraction trait and Graph trait for execution capture/replay.
 
-use crate::{Device, Result, Tensor};
 use crate::kv_cache::KvCache;
+use crate::{Device, Result, Tensor};
 
 /// Backend-agnostic interface for tensor compute and device management.
 ///
@@ -35,8 +35,14 @@ pub trait Backend {
 
     /// Rotary Position Embedding (half-split / Llama-style).
     /// input shape: [seq_len, n_heads, head_dim]
-    fn rope(&self, input: &Tensor, n_heads: usize, head_dim: usize,
-            theta: f32, pos_offset: u32) -> Result<Tensor>;
+    fn rope(
+        &self,
+        input: &Tensor,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        pos_offset: u32,
+    ) -> Result<Tensor>;
 
     /// Multimodal (3-D) RoPE for Qwen3-VL. `pos_ids` is a flat u32 slice of
     /// length `seq_len * 3` holding `(t, h, w)` per token; `sections` is
@@ -47,26 +53,44 @@ pub trait Backend {
     /// dtype and we don't want to smuggle bytes through a F32 tensor).
     ///
     /// Default: `Err(Unsupported)`. CUDA overrides.
-    fn rope_mrope(&self, input: &Tensor, _n_heads: usize, _head_dim: usize,
-                  _theta: f32, _sections: [usize; 3], _pos_ids: &[u32]) -> Result<Tensor> {
+    fn rope_mrope(
+        &self,
+        input: &Tensor,
+        _n_heads: usize,
+        _head_dim: usize,
+        _theta: f32,
+        _sections: [usize; 3],
+        _pos_ids: &[u32],
+    ) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("rope_mrope: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "rope_mrope: not supported on this backend".into(),
+        ))
     }
 
     /// LayerNorm with weight + bias (Qwen3-VL vision tower).
     /// `input` shape `[..., cols]`; `weight` and `bias` shape `[cols]`.
     /// Default: `Err(Unsupported)`. CUDA overrides.
-    fn layer_norm(&self, input: &Tensor, _weight: &Tensor, _bias: &Tensor,
-                  _eps: f32) -> Result<Tensor> {
+    fn layer_norm(
+        &self,
+        input: &Tensor,
+        _weight: &Tensor,
+        _bias: &Tensor,
+        _eps: f32,
+    ) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("layer_norm: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "layer_norm: not supported on this backend".into(),
+        ))
     }
 
     /// GELU with tanh approximation (Qwen3-VL vision MLP).
     /// Default: `Err(Unsupported)`. CUDA overrides.
     fn gelu_tanh(&self, input: &Tensor) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("gelu_tanh: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "gelu_tanh: not supported on this backend".into(),
+        ))
     }
 
     /// Broadcast-add a `[cols]` bias vector over rows of a `[rows, cols]`
@@ -74,17 +98,27 @@ pub trait Backend {
     /// Default: `Err(Unsupported)`. CUDA overrides.
     fn add_bias(&self, input: &Tensor, _bias: &Tensor) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("add_bias: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "add_bias: not supported on this backend".into(),
+        ))
     }
 
     /// Vision 2D-RoPE for Qwen3-VL's ViT. `pos_ids` is a flat u32 slice of
     /// length `seq_len * 2` holding `(h, w)` per token; head_dim is 64 and
     /// the first half of freq pairs uses h, the second half uses w.
     /// Default: `Err(Unsupported)`. CUDA overrides.
-    fn rope_vision_2d(&self, input: &Tensor, _n_heads: usize, _head_dim: usize,
-                      _theta: f32, _pos_ids: &[u32]) -> Result<Tensor> {
+    fn rope_vision_2d(
+        &self,
+        input: &Tensor,
+        _n_heads: usize,
+        _head_dim: usize,
+        _theta: f32,
+        _pos_ids: &[u32],
+    ) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("rope_vision_2d: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "rope_vision_2d: not supported on this backend".into(),
+        ))
     }
 
     /// Concatenate 2D tensors along the column axis (dim 1).
@@ -93,15 +127,26 @@ pub trait Backend {
     /// QKV and Gate/Up weight matrices for the fused GEMM path.
     /// Default: `Err(Unsupported)`. CUDA overrides (D2D memcpy).
     fn concat_2d(&self, _tensors: &[&Tensor]) -> Result<Tensor> {
-        Err(crate::Error::Other("concat_2d: not supported on this backend".into()))
+        Err(crate::Error::Other(
+            "concat_2d: not supported on this backend".into(),
+        ))
     }
 
     /// Non-causal full attention for the vision tower. Q/K/V each
     /// `[seq, n_heads, head_dim]`; returns `[seq, n_heads * head_dim]`.
     /// Default: `Err(Unsupported)`. CUDA overrides.
-    fn vision_sdpa(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
-                   _seq_len: usize, _n_heads: usize, _head_dim: usize) -> Result<Tensor> {
-        Err(crate::Error::Other("vision_sdpa: not supported on this backend".into()))
+    fn vision_sdpa(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _seq_len: usize,
+        _n_heads: usize,
+        _head_dim: usize,
+    ) -> Result<Tensor> {
+        Err(crate::Error::Other(
+            "vision_sdpa: not supported on this backend".into(),
+        ))
     }
 
     /// Embedding lookup: table[ids] -> output [seq_len, embed_dim]
@@ -113,29 +158,56 @@ pub trait Backend {
     /// Scaled dot-product attention (decode: seq_len=1).
     /// q: [1, n_heads, head_dim]
     /// Returns: [1, n_heads * head_dim]
-    fn sdpa_decode(&self, q: &Tensor, kv: &mut dyn KvCache,
-                   layer_idx: usize, n_heads: usize, n_kv_heads: usize,
-                   head_dim: usize, kv_len: usize, max_seq_len: usize) -> Result<Tensor>;
+    fn sdpa_decode(
+        &self,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        max_seq_len: usize,
+    ) -> Result<Tensor>;
 
     /// Scaled dot-product attention (prefill: seq_len>1).
     /// q: [seq_len, n_heads, head_dim]
-    fn sdpa_prefill(&self, q: &Tensor, kv: &mut dyn KvCache,
-                    layer_idx: usize, n_heads: usize, n_kv_heads: usize,
-                    head_dim: usize, kv_len: usize, max_seq_len: usize) -> Result<Tensor>;
+    fn sdpa_prefill(
+        &self,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        max_seq_len: usize,
+    ) -> Result<Tensor>;
 
     // ── KV Cache ─────────────────────────────────────────────────────
 
     /// Create a new KV cache for n_layers layers.
-    fn create_kv_cache(&self, n_layers: usize, n_kv_heads: usize,
-                       head_dim: usize, max_seq_len: usize) -> Box<dyn KvCache>;
+    fn create_kv_cache(
+        &self,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Box<dyn KvCache>;
 
     /// Append K/V data for a layer into the cache.
     ///
     /// This is on the Backend (not just KvCache) because GPU backends need
     /// access to their stream/context to encode the append kernel.
     /// k, v: [append_len, n_kv_heads, head_dim]
-    fn kv_append(&self, kv: &mut dyn KvCache, layer_idx: usize,
-                 k: &Tensor, v: &Tensor, append_len: usize) -> Result<()>;
+    fn kv_append(
+        &self,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        k: &Tensor,
+        v: &Tensor,
+        append_len: usize,
+    ) -> Result<()>;
 
     // ── Execution control ────────────────────────────────────────────
 
@@ -182,7 +254,9 @@ pub enum RopeKind {
 
 impl RopeKind {
     /// Backward-compatible default for models that don't know about mRoPE.
-    pub fn one_d(theta: f32) -> Self { RopeKind::OneD { theta } }
+    pub fn one_d(theta: f32) -> Self {
+        RopeKind::OneD { theta }
+    }
 }
 
 /// A captured execution graph that can be replayed.

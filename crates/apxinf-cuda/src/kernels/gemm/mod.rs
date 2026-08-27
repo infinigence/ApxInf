@@ -2,7 +2,7 @@ mod bf16;
 mod fp8;
 mod w8a8;
 
-use apxinf_core::{DType, Device, Error, Result, Tensor};
+use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::contracts::{checked_bytes, require_buffers, require_finite};
 use crate::buffer::CudaBuffer;
@@ -67,6 +67,68 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
         )
         .map_err(Error::Cuda)?;
     Ok(output.into_tensor(output_shape, activation.dtype()))
+}
+
+/// Multiply a BF16 activation by a checkpoint-layout BF16 matrix.
+///
+/// Checkpoint tensors are row-major `[out_features, in_features]`; this
+/// helper computes `activation @ weight^T` directly through cuBLAS and avoids
+/// allocating a transposed model copy.
+pub fn project_checkpoint_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    checkpoint_weight: &Tensor,
+) -> Result<Tensor> {
+    if activation.dtype() != DType::BF16
+        || checkpoint_weight.dtype() != DType::BF16
+        || activation.device() != Device::Cuda(ctx.device_id())
+        || checkpoint_weight.device() != Device::Cuda(ctx.device_id())
+        || activation.shape().dims().len() != 2
+        || checkpoint_weight.shape().dims().len() != 2
+    {
+        return Err(Error::Other(
+            "checkpoint BF16 projection requires CUDA BF16 rank-2 tensors".into(),
+        ));
+    }
+    let rows = activation.shape().dims()[0];
+    let in_features = activation.shape().dims()[1];
+    let out_features = checkpoint_weight.shape().dims()[0];
+    if rows == 0
+        || in_features == 0
+        || out_features == 0
+        || checkpoint_weight.shape().dims()[1] != in_features
+    {
+        return Err(Error::Other(format!(
+            "checkpoint BF16 projection shape mismatch: activation {:?}, weight {:?}",
+            activation.shape().dims(),
+            checkpoint_weight.shape().dims()
+        )));
+    }
+    let output_bytes = rows
+        .checked_mul(out_features)
+        .and_then(|value| value.checked_mul(DType::BF16.size_in_bytes()))
+        .ok_or_else(|| Error::Other("checkpoint BF16 projection output overflow".into()))?;
+    let output = CudaBuffer::alloc_zeros(output_bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(checkpoint_weight).map_err(Error::Cuda)?;
+    write_ex(
+        ctx,
+        DType::BF16,
+        CublasTranspose::None,
+        CublasTranspose::Transpose,
+        rows,
+        out_features,
+        in_features,
+        1.0,
+        &activation_buffer,
+        in_features as i32,
+        &weight_buffer,
+        in_features as i32,
+        0.0,
+        &output,
+        out_features as i32,
+    )?;
+    Ok(output.into_tensor(Shape::new(vec![rows, out_features]), DType::BF16))
 }
 
 /// Row-major `A[M,K] @ B[K,N]` into caller-owned storage.

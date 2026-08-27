@@ -1,0 +1,198 @@
+{
+  "fixtures": {
+    "config_path": "fixtures/qwen35-metadata/config.json",
+    "config_sha256": "fece2915d4c8ad4c10877622f04ea5e01cd3ae38768ce5c1edb700dd1de290f6",
+    "index_path": "fixtures/qwen35-metadata/model.safetensors.index.json",
+    "index_sha256": "82b1bf79f5b61333e83da17ec3bf89c9f178e29395a14c6b3ce3bbc474e1ead8"
+  },
+  "memory_ledger": {
+    "concurrency_state_bytes": {
+      "C1_at_1024": 218103808,
+      "C4_at_1024": 872415232,
+      "C8_at_1024": 1744830464
+    },
+    "exclusions": [
+      "allocator and fragmentation overhead",
+      "activations and workspaces",
+      "CUDA Graph pools",
+      "vision and MTP temporary buffers",
+      "per-tensor category byte totals absent from committed SafeTensors headers"
+    ],
+    "full_attention_kv": {
+      "assumptions": {
+        "dtype_bytes": 2,
+        "full_attention_layers": 16,
+        "head_dim": 256,
+        "k_and_v": 2,
+        "kv_heads": 4
+      },
+      "context_bytes_per_request": {
+        "131072": 8589934592,
+        "196608": 12884901888,
+        "262016": 17171480576,
+        "32768": 2147483648,
+        "65536": 4294967296
+      },
+      "derived_bytes_per_token_per_request": 65536
+    },
+    "linear_attention_recurrent_state": {
+      "assumptions": {
+        "dtype_bytes": 4,
+        "key_head_dim": 128,
+        "linear_attention_layers": 48,
+        "value_head_dim": 128,
+        "value_heads": 48
+      },
+      "derived_bytes_per_layer_per_request": 3145728,
+      "derived_bytes_per_request": 150994944
+    },
+    "model_files": {
+      "exact_total_bytes": 21017689808,
+      "exact_total_gib": 19.574249,
+      "source": "model.safetensors.index.json metadata.total_size"
+    }
+  },
+  "model": {
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "image_token_id": 248056,
+    "model_type": "qwen3_5",
+    "text": {
+      "count": 64,
+      "full_attention_interval": 4,
+      "hidden_size": 5120,
+      "intermediate_size": 17408,
+      "layer_type_counts": {
+        "full_attention": 16,
+        "linear_attention": 48
+      },
+      "layer_types_present": [
+        "full_attention",
+        "linear_attention"
+      ],
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 48,
+      "linear_value_head_dim": 128,
+      "mamba_ssm_dtype": "float32",
+      "max_position_embeddings": 262144,
+      "vocab_size": 248320
+    }
+  },
+  "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+  "quantization": {
+    "bits": 4,
+    "directional_examples": {
+      "weight_packed": [
+        "[1024, 640] I32; 8 int4 along K for hidden_size=5120"
+      ],
+      "weight_scale": [
+        "[1024, 160] BF16; group_size=32 along K"
+      ],
+      "weight_zero_point": [
+        "[128, 160] I32; 8 int4 along N for output_size=1024"
+      ]
+    },
+    "format": "pack-quantized",
+    "group_size": 32,
+    "packing": "asymmetric pack-quantized; direction differs by tensor kind",
+    "symmetric": false
+  },
+  "schema": "apxinf.member3.shape-inventory.v1",
+  "tensors": {
+    "count": 2396,
+    "language_layer_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63
+    ],
+    "packed_weight_count": 399,
+    "prefix_counts": {
+      "embed_tokens": 1,
+      "language_model.layers": 2045,
+      "lm_head": 1,
+      "mtp": 15,
+      "other": 1,
+      "visual": 333
+    },
+    "quantization_name_counts": {
+      "not_quantization_metadata": 800,
+      "packed_weight": 399,
+      "weight_scale": 399,
+      "weight_shape_metadata": 399,
+      "weight_zero_point": 399
+    },
+    "shard_count": 5,
+    "shards": {
+      "model-00001-of-00005.safetensors": 1,
+      "model-00002-of-00005.safetensors": 345,
+      "model-00003-of-00005.safetensors": 715,
+      "model-00004-of-00005.safetensors": 736,
+      "model-00005-of-00005.safetensors": 599
+    }
+  },
+  "warnings": [
+    "No model weights were read or downloaded.",
+    "Per-tensor shapes and dtypes require SafeTensors headers; do not infer byte totals from names alone."
+  ]
+}

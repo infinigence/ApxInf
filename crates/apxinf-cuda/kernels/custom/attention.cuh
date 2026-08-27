@@ -194,6 +194,80 @@ __global__ void attention_softmax_bf16_kernel(
     }
 }
 
+// Row-cooperative causal softmax.
+//
+// The kernel above has every thread of every block scan the entire valid row
+// twice (once for the max, once for the exponential sum), so the row is
+// rescanned 256 times per block and by `ceil(cols/256)` blocks. At prefill
+// scale that dominates everything: measured on the pinned checkpoint at
+// rows=12288, cols=16384 with a realistic kv_offset, softmax alone accounted
+// for ~2.08 s of a 2.08 s `sdpa` call, while both GEMMs together took ~11 us.
+//
+// Here one block owns one row: the 256 threads split the row, reduce the max
+// and the sum through shared memory, and then each thread writes only its own
+// slice. Total work per row drops from 512 full scans to two partitioned
+// passes.
+//
+// Numerics: the max reduction is exact regardless of order. The exponential
+// sum changes association (partitioned partial sums combined in a tree rather
+// than one sequential accumulation), which is the same class of FP32
+// reassociation as the accepted prefill GEMM path — outputs are compared at
+// reduction tolerance, and end-to-end functional correctness is re-verified.
+__global__ void attention_softmax_bf16_rowwise_kernel(
+    const __nv_bfloat16* scores, __nv_bfloat16* output,
+    uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads)
+{
+    __shared__ float reduction[256];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t seq_pos = row / n_heads;
+    const uint32_t valid_cols = min(seq_pos + kv_offset + 1, cols);
+    const uint64_t base = static_cast<uint64_t>(row) * cols;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t threads = blockDim.x;
+
+    float local_max = -INFINITY;
+    for (uint32_t c = tid; c < valid_cols; c += threads) {
+        local_max = fmaxf(local_max, __bfloat162float(scores[base + c]));
+    }
+    reduction[tid] = local_max;
+    __syncthreads();
+    for (uint32_t stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_val = reduction[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (uint32_t c = tid; c < valid_cols; c += threads) {
+        local_sum += expf(__bfloat162float(scores[base + c]) - max_val);
+    }
+    reduction[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] += reduction[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float sum_exp = reduction[0];
+    __syncthreads();
+
+    // Each thread rewrites exactly the elements it read, so writing in place
+    // is safe: no thread depends on another thread's source elements here.
+    for (uint32_t c = tid; c < cols; c += threads) {
+        if (c < valid_cols) {
+            const float x = __bfloat162float(scores[base + c]);
+            output[base + c] = __float2bfloat16(expf(x - max_val) / sum_exp);
+        } else {
+            output[base + c] = __float2bfloat16(0.0f);
+        }
+    }
+}
+
 
 
 __global__ void attention_softmax_decode_bf16_kernel(
@@ -311,6 +385,104 @@ __global__ void vision_sdpa_bf16_kernel(
     __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
     out_row[d0] = __float2bfloat16(acc0);
     out_row[d1] = __float2bfloat16(acc1);
+}
+
+
+
+// ── Vision SDPA (bf16) — wide variant for head_dim > 64 ─────────────────
+//
+// Same structure as `vision_sdpa_bf16_kernel`, but each of the 32 threads
+// owns up to VISION_SDPA_MAX_D_PER_THREAD strided elements (d = tid + j*32),
+// supporting any even head_dim up to 32 * VISION_SDPA_MAX_D_PER_THREAD.
+// For head_dim == 64 this degenerates to exactly the two-element layout of
+// the narrow kernel with the same accumulation order (q[tid]*k[tid] then
+// q[tid+32]*k[tid+32]), so the two kernels are bit-identical there.
+//
+// The per-thread arrays are indexed only by the unrolled compile-time loop
+// variable, so they stay in registers (a dynamic index would spill to local
+// memory — measured 17% slower on this codebase).
+
+#define VISION_SDPA_MAX_D_PER_THREAD 4
+
+__global__ void vision_sdpa_bf16_wide_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out,
+    uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale)
+{
+    uint32_t head = blockIdx.y;
+    uint32_t qi   = blockIdx.x;
+    if (qi >= seq_len) return;
+    int tid = threadIdx.x;       // 0..31
+
+    extern __shared__ float smem[];
+    float* scores = smem;        // [seq_len] + 1 scratch slot
+
+    const __nv_bfloat16* q_row = q + qi * n_heads * head_dim + head * head_dim;
+    float qv[VISION_SDPA_MAX_D_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < VISION_SDPA_MAX_D_PER_THREAD; j++) {
+        int d = tid + j * 32;
+        qv[j] = (d < (int)head_dim) ? __bfloat162float(q_row[d]) : 0.0f;
+    }
+
+    // Phase 1: scores[ki] = (Q[qi] . K[ki]) * scale. All threads iterate
+    // every ki so the shfl reduction stays converged.
+    for (uint32_t ki = 0; ki < seq_len; ki++) {
+        const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int j = 0; j < VISION_SDPA_MAX_D_PER_THREAD; j++) {
+            int d = tid + j * 32;
+            if (d < (int)head_dim) dot += qv[j] * __bfloat162float(k_row[d]);
+        }
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+        if (tid == 0) scores[ki] = dot * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: softmax (max -> exp -> sum -> normalize).
+    float max_val = -INFINITY;
+    for (uint32_t ki = tid; ki < seq_len; ki += 32u)
+        max_val = fmaxf(max_val, scores[ki]);
+    unsigned mask = __activemask();
+    for (int off = 16; off > 0; off >>= 1)
+        max_val = fmaxf(max_val, __shfl_xor_sync(mask, max_val, off));
+    if (tid == 0) scores[seq_len] = max_val;
+    __syncthreads();
+    max_val = scores[seq_len];
+
+    float sum = 0.0f;
+    for (uint32_t ki = tid; ki < seq_len; ki += 32u) {
+        float e = expf(scores[ki] - max_val);
+        scores[ki] = e;
+        sum += e;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(mask, sum, off);
+    if (tid == 0) scores[seq_len] = sum;
+    __syncthreads();
+    float inv_sum = 1.0f / scores[seq_len];
+    for (uint32_t ki = tid; ki < seq_len; ki += 32u) scores[ki] *= inv_sum;
+    __syncthreads();
+
+    // Phase 3: out[qi, head, d] = sum_k scores[k] * V[k, head, d].
+    float acc[VISION_SDPA_MAX_D_PER_THREAD];
+#pragma unroll
+    for (int j = 0; j < VISION_SDPA_MAX_D_PER_THREAD; j++) acc[j] = 0.0f;
+    for (uint32_t ki = 0; ki < seq_len; ki++) {
+        float s = scores[ki];
+        const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
+#pragma unroll
+        for (int j = 0; j < VISION_SDPA_MAX_D_PER_THREAD; j++) {
+            int d = tid + j * 32;
+            if (d < (int)head_dim) acc[j] += s * __bfloat162float(v_row[d]);
+        }
+    }
+    __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
+#pragma unroll
+    for (int j = 0; j < VISION_SDPA_MAX_D_PER_THREAD; j++) {
+        int d = tid + j * 32;
+        if (d < (int)head_dim) out_row[d] = __float2bfloat16(acc[j]);
+    }
 }
 
 

@@ -192,10 +192,7 @@ fn auto_model_detects_the_registry_name_from_hugging_face_config() {
 
 #[test]
 fn load_model_unifies_detected_and_explicit_model_selection() {
-    let dir = std::env::temp_dir().join(format!(
-        "apxinf-unified-load-test-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("apxinf-unified-load-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.json"),
@@ -215,7 +212,9 @@ fn load_model_unifies_detected_and_explicit_model_selection() {
     let override_error = AutoModel::load_model(Device::Cpu, &dir, &options)
         .err()
         .expect("an unregistered override model should fail");
-    assert!(override_error.to_string().contains("missing_override_model"));
+    assert!(override_error
+        .to_string()
+        .contains("missing_override_model"));
 
     std::fs::remove_dir_all(dir).unwrap();
 }

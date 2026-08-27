@@ -48,6 +48,27 @@ impl Drop for CudaAllocation {
     }
 }
 
+/// Stream-ordered allocation (`cudaMallocAsync` pool). Freeing on the legacy
+/// default stream orders the release after all in-flight work on blocking
+/// streams, so consumers of the buffer never race the free.
+struct CudaStreamOrderedAllocation {
+    ptr: *mut c_void,
+}
+
+// SAFETY: same as CudaAllocation.
+unsafe impl Send for CudaStreamOrderedAllocation {}
+unsafe impl Sync for CudaStreamOrderedAllocation {}
+
+impl Drop for CudaStreamOrderedAllocation {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = ffi::cudaFreeAsync(self.ptr, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 /// Owns a block of GPU memory. Automatically freed on drop.
 #[derive(Clone)]
 pub struct CudaBuffer {
@@ -72,6 +93,49 @@ impl CudaBuffer {
             ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
         }
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
+        Ok(Self {
+            ptr,
+            len: num_bytes,
+            device,
+            owner,
+        })
+    }
+
+    /// Allocate `num_bytes` from the stream-ordered pool (`cudaMallocAsync`).
+    /// A synchronous `cudaMalloc` implicitly synchronizes the device, which
+    /// turns a 320-buffer session clone into ~330 ms of stalls; the pooled
+    /// allocation is submitted in stream order at microsecond cost. The free
+    /// is stream-ordered too (see `CudaStreamOrderedAllocation`).
+    pub fn alloc_async(
+        num_bytes: usize,
+        device: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<Self, String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        // Keep freed memory in the pool instead of returning it to the OS
+        // (the default release threshold is 0, which would make every
+        // realloc as slow as a cold cudaMalloc).
+        static POOL_INIT: std::sync::Once = std::sync::Once::new();
+        POOL_INIT.call_once(|| unsafe {
+            const CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
+            let mut pool: *mut c_void = std::ptr::null_mut();
+            if ffi::cudaDeviceGetDefaultMemPool(&mut pool, device as i32) == 0 {
+                let mut threshold: u64 = u64::MAX;
+                let _ = ffi::cudaMemPoolSetAttribute(
+                    pool,
+                    CUDA_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &mut threshold as *mut u64 as *mut c_void,
+                );
+            }
+        });
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            ffi::check_cuda(ffi::cudaMallocAsync(&mut ptr, num_bytes, stream.handle()))?;
+        }
+        let owner: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(CudaStreamOrderedAllocation { ptr });
         Ok(Self {
             ptr,
             len: num_bytes,
@@ -124,6 +188,86 @@ impl CudaBuffer {
                 self.ptr,
                 dst.len(),
                 ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            ))
+        }
+    }
+
+    /// Allocate a new buffer of the same size and copy this buffer's device
+    /// contents into it (deep clone).
+    pub fn try_clone(&self) -> Result<Self, String> {
+        let clone = Self::alloc(self.len, self.device)?;
+        clone.copy_from_device(self)?;
+        Ok(clone)
+    }
+
+    /// Deep clone with a stream-ordered copy. A synchronous `cudaMemcpy`
+    /// fences the whole stream, which turns a multi-buffer state clone into
+    /// hundreds of serial fences; callers clone every buffer asynchronously
+    /// and synchronize once at the end.
+    pub fn try_clone_async(&self, stream: &crate::CudaStream) -> Result<Self, String> {
+        let clone = Self::alloc_async(self.len, self.device, stream)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                clone.ptr,
+                self.ptr,
+                self.len,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))?;
+        }
+        Ok(clone)
+    }
+
+    /// Stream-ordered device-to-device copy of `source` into this buffer.
+    pub fn copy_from_device_async(
+        &self,
+        source: &CudaBuffer,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if source.device != self.device {
+            return Err(format!(
+                "device-to-device copy across devices ({} -> {})",
+                source.device, self.device
+            ));
+        }
+        if source.len > self.len {
+            return Err(format!(
+                "device copy source ({} bytes) exceeds destination ({} bytes)",
+                source.len, self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                source.len,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))
+        }
+    }
+
+    /// Copy `source` into this buffer device-to-device. Both buffers must be
+    /// on the same device and `source` must not exceed this buffer.
+    pub fn copy_from_device(&self, source: &CudaBuffer) -> Result<(), String> {
+        if source.device != self.device {
+            return Err(format!(
+                "device-to-device copy across devices ({} -> {})",
+                source.device, self.device
+            ));
+        }
+        if source.len > self.len {
+            return Err(format!(
+                "device copy source ({} bytes) exceeds destination ({} bytes)",
+                source.len, self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpy(
+                self.ptr,
+                source.ptr,
+                source.len,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
             ))
         }
     }

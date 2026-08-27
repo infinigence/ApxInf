@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use half::{bf16, f16};
 use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
+use half::{bf16, f16};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
@@ -549,11 +549,15 @@ pub(super) fn load_registered(
             } else {
                 let calibration_path = calibration_path.ok_or_else(|| {
                     Error::Other(
-                        "FP8 PI0.5 requires LoadOptions.calibration_path or calibration.json".into(),
+                        "FP8 PI0.5 requires LoadOptions.calibration_path or calibration.json"
+                            .into(),
                     )
                 })?;
                 let calibration = StaticFp8Calibration::from_json_file(&calibration_path)?;
-                Arc::new(Pi05ActivationScales::from_calibration(&config, &calibration)?)
+                Arc::new(Pi05ActivationScales::from_calibration(
+                    &config,
+                    &calibration,
+                )?)
             };
             // A checkpoint-free synthetic load relies on the kernel's tactic
             // fallback, so a tuning database is only required for real FP8 runs.

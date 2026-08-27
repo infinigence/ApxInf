@@ -15,6 +15,8 @@ pub mod gemm;
 pub mod norm;
 pub mod preprocess;
 pub mod quantization;
+pub mod qwen35_gdn;
+pub mod qwen35_w4;
 pub mod rope;
 
 pub use crate::workspace::GraphWorkspace;

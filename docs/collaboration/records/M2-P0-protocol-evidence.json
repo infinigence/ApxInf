@@ -1,0 +1,283 @@
+{
+  "base_url": "http://127.0.0.1:18001",
+  "captured_at": "2026-08-23T06:44:46.736166+00:00",
+  "commit": "c1e05b72d6e6c762ad153fde589e5a73c91fcabd",
+  "initial_health": {
+    "elapsed_ms": 3.503,
+    "request_body": "",
+    "request_method": "GET",
+    "request_path": "/health",
+    "response": {
+      "capabilities": {
+        "multimodal": false,
+        "pretokenized_input_ids": true,
+        "token_id_output": true
+      },
+      "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+      "fallback_active": false,
+      "max_model_len": 32768,
+      "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+      "parallel_requests": 1,
+      "status": "ok",
+      "stub": true,
+      "vocab_size": 248320
+    },
+    "status_code": 200
+  },
+  "max_model_len": 32768,
+  "passed": true,
+  "rows": [
+    {
+      "body": "{not-json",
+      "elapsed_ms": 0.66,
+      "id": "malformed_json",
+      "mode": "raw",
+      "passed": true,
+      "request_body": "{not-json",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "malformed JSON: key must be a string at line 1 column 2",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.527,
+      "id": "empty_input_ids",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "input_ids must not be empty",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          -1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.503,
+      "id": "negative_token_id",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[-1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "token id -1 is outside model vocabulary [0, 248320)",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          4294967295
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.475,
+      "id": "out_of_vocabulary_token_id",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[4294967295],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "token id 4294967295 is outside model vocabulary [0, 248320)",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.1
+      },
+      "elapsed_ms": 0.458,
+      "id": "unsupported_temperature",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.1}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "temperature must be exactly 0 for greedy generation",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 32768,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.459,
+      "id": "over_budget",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":32768,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "prompt tokens 1 plus max_new_tokens 32768 exceed max_model_len 32768",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "images": [
+          "x"
+        ],
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.415,
+      "id": "unsupported_modality_field",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"images\":[\"x\"],\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "unsupported field `images`",
+          "type": "invalid_request"
+        }
+      },
+      "status_code": 400
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.385,
+      "id": "valid_short_nostream_request",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1,2,3,4,5,6,7,8],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "output_ids": [
+          7
+        ],
+        "request_id": "req-1",
+        "type": "result",
+        "usage": {
+          "completion_tokens": 1,
+          "prompt_tokens": 8,
+          "total_tokens": 9
+        }
+      },
+      "status_code": 200
+    },
+    {
+      "elapsed_ms": 0.342,
+      "id": "health_after_invalid_requests",
+      "method": "GET",
+      "passed": true,
+      "path": "/health",
+      "request_body": "",
+      "request_method": "GET",
+      "request_path": "/health",
+      "response": {
+        "capabilities": {
+          "multimodal": false,
+          "pretokenized_input_ids": true,
+          "token_id_output": true
+        },
+        "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+        "fallback_active": false,
+        "max_model_len": 32768,
+        "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+        "parallel_requests": 1,
+        "status": "ok",
+        "stub": true,
+        "vocab_size": 248320
+      },
+      "status_code": 200
+    },
+    {
+      "elapsed_ms": 0.329,
+      "id": "health_contract_identity",
+      "method": "GET",
+      "passed": true,
+      "path": "/health",
+      "request_body": "",
+      "request_method": "GET",
+      "request_path": "/health",
+      "response": {
+        "capabilities": {
+          "multimodal": false,
+          "pretokenized_input_ids": true,
+          "token_id_output": true
+        },
+        "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+        "fallback_active": false,
+        "max_model_len": 32768,
+        "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+        "parallel_requests": 1,
+        "status": "ok",
+        "stub": true,
+        "vocab_size": 248320
+      },
+      "status_code": 200
+    }
+  ],
+  "schema": "apxinf.protocol-gates.v1"
+}

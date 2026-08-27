@@ -226,6 +226,140 @@ impl CublasHandle {
         }
     }
 
+    /// FP32 row-major strided-batched GEMM with transpose controls.
+    /// Strides are measured in FP32 elements, as required by cuBLAS.
+    pub fn batched_gemm_ex_f32(
+        &self,
+        transa: CublasTranspose,
+        transb: CublasTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        stride_a: i64,
+        b: &CudaBuffer,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        if m == 0 || n == 0 || k == 0 || batch_count <= 0 {
+            return Err("FP32 batched GEMM dimensions must be non-zero".into());
+        }
+        if stride_a < 0 || stride_b < 0 || stride_c < 0 {
+            return Err("FP32 batched GEMM strides must be non-negative".into());
+        }
+        let m_i = i32::try_from(m).map_err(|_| "GEMM m exceeds i32".to_string())?;
+        let n_i = i32::try_from(n).map_err(|_| "GEMM n exceeds i32".to_string())?;
+        let k_i = i32::try_from(k).map_err(|_| "GEMM k exceeds i32".to_string())?;
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                self.handle,
+                transb.raw(),
+                transa.raw(),
+                n_i,
+                m_i,
+                k_i,
+                alpha_bytes.as_ptr() as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldb,
+                stride_b,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_32F,
+                lda,
+                stride_a,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                stride_c,
+                batch_count,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                -1,
+            ))
+        }
+    }
+
+    /// Row-major strided-batched GEMM with transpose controls for F32, F16
+    /// and BF16 operands (FP32 accumulate). Strides are in elements. A zero
+    /// stride broadcasts the same matrix across the batch, which cuBLAS
+    /// permits for read-only operands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batched_gemm_ex(
+        &self,
+        dtype: DType,
+        transa: CublasTranspose,
+        transb: CublasTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        stride_a: i64,
+        b: &CudaBuffer,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        if m == 0 || n == 0 || k == 0 || batch_count <= 0 {
+            return Err("batched GEMM dimensions must be non-zero".into());
+        }
+        if stride_a < 0 || stride_b < 0 || stride_c < 0 {
+            return Err("batched GEMM strides must be non-negative".into());
+        }
+        let cuda_type = match dtype {
+            DType::F32 => ffi::cudaDataType_t::CUDA_R_32F,
+            DType::F16 => ffi::cudaDataType_t::CUDA_R_16F,
+            DType::BF16 => ffi::cudaDataType_t::CUDA_R_16BF,
+            DType::F8E4M3 => return Err("use kernels::gemm::fp8 for FP8 operands".into()),
+        };
+        let m_i = i32::try_from(m).map_err(|_| "GEMM m exceeds i32".to_string())?;
+        let n_i = i32::try_from(n).map_err(|_| "GEMM n exceeds i32".to_string())?;
+        let k_i = i32::try_from(k).map_err(|_| "GEMM k exceeds i32".to_string())?;
+        let alpha_bytes = alpha.to_ne_bytes();
+        let beta_bytes = beta.to_ne_bytes();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmStridedBatchedEx(
+                self.handle,
+                transb.raw(),
+                transa.raw(),
+                n_i,
+                m_i,
+                k_i,
+                alpha_bytes.as_ptr() as *const c_void,
+                b.ptr(),
+                cuda_type,
+                ldb,
+                stride_b,
+                a.ptr(),
+                cuda_type,
+                lda,
+                stride_a,
+                beta_bytes.as_ptr() as *const c_void,
+                c.ptr() as *mut c_void,
+                cuda_type,
+                ldc,
+                stride_c,
+                batch_count,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                -1,
+            ))
+        }
+    }
+
     /// Extended GEMM with transpose control, using cublasGemmEx.
     ///
     /// Computes C = alpha * op(A) @ op(B) + beta * C

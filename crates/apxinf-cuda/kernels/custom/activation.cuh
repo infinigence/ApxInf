@@ -33,6 +33,17 @@ __global__ void silu_bf16_kernel(
     output[gid] = __float2bfloat16(y);
 }
 
+// ── Sigmoid (bf16) ───────────────────────────────────────────────────────
+
+__global__ void sigmoid_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    float x = __bfloat162float(input[gid]);
+    output[gid] = __float2bfloat16(1.0f / (1.0f + expf(-x)));
+}
+
 
 
 // ── Fused SiLU + Mul (bf16) — reads gate and up from a single packed ────
@@ -69,6 +80,27 @@ __global__ void gelu_tanh_bf16_kernel(
     const float kAlpha = 0.044715f;
     float inner = kBeta * (x + kAlpha * x * x * x);
     float y = 0.5f * x * (1.0f + tanhf(inner));
+    output[gid] = __float2bfloat16(y);
+}
+
+
+
+// ── GELU (exact erf form, bf16) — Qwen3.5 vision patch merger ────────────
+//
+// PyTorch's default `nn.GELU()` (approximate='none'):
+//     y = 0.5 * x * (1 + erf(x / sqrt(2)))
+// The vision blocks use the tanh form above (hidden_act="gelu_pytorch_tanh"),
+// but `Qwen3VLVisionPatchMerger.act_fn` is `nn.GELU()` — the exact form.
+
+__global__ void gelu_erf_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    float x = __bfloat162float(input[gid]);
+    // 1/sqrt(2) ~= 0.7071067811865476
+    const float kInvSqrt2 = 0.7071067811865476f;
+    float y = 0.5f * x * (1.0f + erff(x * kInvSqrt2));
     output[gid] = __float2bfloat16(y);
 }
 

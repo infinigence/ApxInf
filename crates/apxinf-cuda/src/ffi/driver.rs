@@ -3,6 +3,12 @@
 pub type CUdevice = i32;
 pub type CUresult = i32;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CUuuid {
+    pub bytes: [u8; 16],
+}
+
 pub const CUDA_DRIVER_SUCCESS: CUresult = 0;
 
 // ── CUDA Driver API (device identity only) ─────────────────────────
@@ -10,6 +16,7 @@ pub const CUDA_DRIVER_SUCCESS: CUresult = 0;
 extern "C" {
     pub fn cuInit(flags: u32) -> CUresult;
     pub fn cuDeviceGet(device: *mut CUdevice, ordinal: i32) -> CUresult;
+    pub fn cuDeviceGetUuid(uuid: *mut CUuuid, device: CUdevice) -> CUresult;
     pub fn cuDeviceGetName(name: *mut std::ffi::c_char, len: i32, device: CUdevice) -> CUresult;
     pub fn cuGetErrorString(error: CUresult, message: *mut *const std::ffi::c_char) -> CUresult;
 }

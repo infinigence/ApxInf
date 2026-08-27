@@ -50,7 +50,11 @@ pub struct Qwen3VLVisionConfig {
 impl Qwen3VLVisionConfig {
     pub fn head_dim(&self) -> usize {
         // HF: head_dim = hidden_size // num_heads (= 64 for Qwen3-VL-2B).
-        if self.head_dim != 0 { self.head_dim } else { self.hidden_size / self.num_heads }
+        if self.head_dim != 0 {
+            self.head_dim
+        } else {
+            self.hidden_size / self.num_heads
+        }
     }
 }
 
@@ -82,11 +86,14 @@ impl Qwen3VLConfig {
         }
 
         let rope_scaling = &tc["rope_scaling"];
-        let section = rope_scaling["mrope_section"].as_array()
-            .ok_or_else(|| Error::Other("qwen3vl config: missing rope_scaling.mrope_section".into()))?;
+        let section = rope_scaling["mrope_section"].as_array().ok_or_else(|| {
+            Error::Other("qwen3vl config: missing rope_scaling.mrope_section".into())
+        })?;
         if section.len() != 3 {
             return Err(Error::Other(format!(
-                "qwen3vl config: mrope_section must be [T,H,W] (3 entries), got {}", section.len())));
+                "qwen3vl config: mrope_section must be [T,H,W] (3 entries), got {}",
+                section.len()
+            )));
         }
         let mrope_section = [
             section[0].as_u64().unwrap_or(24) as usize,
@@ -103,7 +110,8 @@ impl Qwen3VLConfig {
             n_kv_heads: tc["num_key_value_heads"].as_u64().unwrap_or(8) as usize,
             head_dim: tc["head_dim"].as_u64().unwrap_or(128) as usize,
             vocab_size: tc["vocab_size"].as_u64().unwrap_or(151936) as usize,
-            max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(262144) as usize,
+            max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(262144)
+                as usize,
             rms_norm_eps: tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             rope_theta: tc["rope_theta"].as_f64().unwrap_or(5_000_000.0) as f32,
             mrope_section,
@@ -112,20 +120,31 @@ impl Qwen3VLConfig {
         };
 
         let vc = &v["vision_config"];
-        let dvi = vc["deepstack_visual_indexes"].as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect())
+        let dvi = vc["deepstack_visual_indexes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as usize)
+                    .collect()
+            })
             .unwrap_or_else(|| vec![5, 11, 17]);
         let vision = Qwen3VLVisionConfig {
             depth: vc["depth"].as_u64().unwrap_or(24) as usize,
             hidden_size: vc["hidden_size"].as_u64().unwrap_or(1024) as usize,
             intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(4096) as usize,
             num_heads: vc["num_heads"].as_u64().unwrap_or(16) as usize,
-            head_dim: vc.get("head_dim").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(0),
+            head_dim: vc
+                .get("head_dim")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(0),
             patch_size: vc["patch_size"].as_u64().unwrap_or(16) as usize,
             temporal_patch_size: vc["temporal_patch_size"].as_u64().unwrap_or(2) as usize,
             in_channels: vc["in_channels"].as_u64().unwrap_or(3) as usize,
             spatial_merge_size: vc["spatial_merge_size"].as_u64().unwrap_or(2) as usize,
-            num_position_embeddings: vc["num_position_embeddings"].as_u64().unwrap_or(2304) as usize,
+            num_position_embeddings: vc["num_position_embeddings"].as_u64().unwrap_or(2304)
+                as usize,
             out_hidden_size: vc["out_hidden_size"].as_u64().unwrap_or(2048) as usize,
             deepstack_visual_indexes: dvi,
         };

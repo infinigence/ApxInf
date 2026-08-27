@@ -1,4 +1,4 @@
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use apxinf_core::{Backend, DType, Error, KvCache, Result, Shape, Tensor};
 
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
@@ -398,6 +398,111 @@ fn kv_cache_append_bf16_writes_correct_slot() {
             }
         }
     }
+}
+
+#[test]
+fn dynamic_kv_cache_accepts_bf16_attention_after_append() {
+    let backend = crate::CudaBackend::new(0).unwrap();
+    let ctx = backend.context();
+    let mut cache = crate::CudaKVCache::new(0, 1, 1, 4, 2).unwrap();
+    let key = upload_fp32_as_bf16(ctx, &[1.0, 0.0, 0.0, 0.0], vec![1, 1, 4]).unwrap();
+    let value = upload_fp32_as_bf16(ctx, &[2.0, 3.0, 4.0, 5.0], vec![1, 1, 4]).unwrap();
+    cache.append(ctx, 0, &key, &value, 1).unwrap();
+    cache.advance(1);
+
+    let query = upload_fp32_as_bf16(ctx, &[1.0, 0.0, 0.0, 0.0], vec![1, 1, 4]).unwrap();
+    let output = backend
+        .sdpa_decode(&query, &mut cache, 0, 1, 1, 4, 1, 2)
+        .unwrap();
+    assert_eq!(output.shape().dims(), &[1, 4]);
+    assert_eq!(output.dtype(), DType::BF16);
+}
+
+/// Restores the batched-SDPA selector on drop.
+struct BatchedSdpaGuard;
+
+impl BatchedSdpaGuard {
+    fn set(value: &str) -> Self {
+        std::env::set_var("APXINF_Q35_BATCHED_SDPA", value);
+        Self
+    }
+}
+
+impl Drop for BatchedSdpaGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("APXINF_Q35_BATCHED_SDPA");
+    }
+}
+
+#[test]
+fn batched_sdpa_prefill_matches_per_row_loop_at_checkpoint_shape() {
+    use apxinf_core::Backend as _;
+    // Real Qwen3.5 full-attention geometry (smaller kv budget): 24 query
+    // heads, 4 KV heads, head_dim 256, a 5-row prefill appended after 3
+    // existing KV rows so kv_offset and causal masking are both exercised.
+    let backend = crate::CudaBackend::new(0).unwrap();
+    let ctx = backend.context();
+    let (n_heads, n_kv_heads, head_dim) = (24usize, 4usize, 256usize);
+    let (existing, rows, max_seq) = (3usize, 5usize, 16usize);
+    let kv_len = existing + rows;
+
+    let deterministic = |count: usize, salt: usize| -> Vec<f32> {
+        (0..count)
+            .map(|index| (((index * 37 + salt * 101) % 61) as f32) * 0.03125 - 0.9375)
+            .collect()
+    };
+
+    let run = |flag: &str| -> Vec<f32> {
+        let _guard = BatchedSdpaGuard::set(flag);
+        let mut cache = crate::CudaKVCache::new(0, 1, n_kv_heads, head_dim, max_seq).unwrap();
+        let old_k = upload_fp32_as_bf16(
+            ctx,
+            &deterministic(existing * n_kv_heads * head_dim, 1),
+            vec![existing, n_kv_heads, head_dim],
+        )
+        .unwrap();
+        let old_v = upload_fp32_as_bf16(
+            ctx,
+            &deterministic(existing * n_kv_heads * head_dim, 2),
+            vec![existing, n_kv_heads, head_dim],
+        )
+        .unwrap();
+        cache.append(ctx, 0, &old_k, &old_v, existing).unwrap();
+        cache.advance(existing);
+        let new_k = upload_fp32_as_bf16(
+            ctx,
+            &deterministic(rows * n_kv_heads * head_dim, 3),
+            vec![rows, n_kv_heads, head_dim],
+        )
+        .unwrap();
+        let new_v = upload_fp32_as_bf16(
+            ctx,
+            &deterministic(rows * n_kv_heads * head_dim, 4),
+            vec![rows, n_kv_heads, head_dim],
+        )
+        .unwrap();
+        cache.append(ctx, 0, &new_k, &new_v, rows).unwrap();
+        let query = upload_fp32_as_bf16(
+            ctx,
+            &deterministic(rows * n_heads * head_dim, 5),
+            vec![rows, n_heads, head_dim],
+        )
+        .unwrap();
+        let output = backend
+            .sdpa_prefill(
+                &query, &mut cache, 0, n_heads, n_kv_heads, head_dim, kv_len, max_seq,
+            )
+            .unwrap();
+        assert_eq!(output.shape().dims(), &[rows, n_heads * head_dim]);
+        download_bf16_as_fp32(&output).unwrap()
+    };
+
+    let per_row = run("0");
+    let batched = run("1");
+    // Identical GEMM shapes per (row, head); batching must not change results
+    // beyond BF16 output rounding of an FP32 accumulation. Require bit
+    // equality: the per-batch GEMMs see exactly the same operands.
+    assert_eq!(per_row, batched);
 }
 
 // ── Decode-pos kernel variants (rope_decode, attn_softmax_decode, kv_cache_append_decode) ──
@@ -948,6 +1053,160 @@ fn vision_sdpa_bf16_matches_reference() {
     let t_v = upload_fp32_as_bf16(&ctx, &v, vec![seq, n_heads, head_dim]).unwrap();
     let out = vision(&ctx, &t_q, &t_k, &t_v, seq, n_heads, head_dim).unwrap();
     assert_bf16_close_reduction(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+/// Non-causal SDPA reference used by the wide-kernel tests below.
+fn vision_sdpa_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut expected = vec![0.0f32; seq * n_heads * head_dim];
+    for h in 0..n_heads {
+        for qi in 0..seq {
+            let mut scores = vec![0.0f32; seq];
+            let mut mx = f32::NEG_INFINITY;
+            for ki in 0..seq {
+                let mut s = 0.0;
+                for d in 0..head_dim {
+                    s += q[qi * n_heads * head_dim + h * head_dim + d]
+                        * k[ki * n_heads * head_dim + h * head_dim + d];
+                }
+                s *= scale;
+                scores[ki] = s;
+                mx = mx.max(s);
+            }
+            let mut sum = 0.0;
+            for score in scores.iter_mut() {
+                *score = (*score - mx).exp();
+                sum += *score;
+            }
+            for score in scores.iter_mut() {
+                *score /= sum;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0.0;
+                for ki in 0..seq {
+                    acc += scores[ki] * v[ki * n_heads * head_dim + h * head_dim + d];
+                }
+                expected[qi * n_heads * head_dim + h * head_dim + d] = acc;
+            }
+        }
+    }
+    expected
+}
+
+/// The wide vision SDPA kernel at the Qwen3.5 vision head_dim (72), where
+/// each thread owns three strided elements, against the fp32 reference.
+/// seq=40 also exercises the strided softmax loops past one warp.
+#[test]
+fn vision_sdpa_bf16_wide_matches_reference_at_head_dim_72() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (seq, n_heads, head_dim) = (40usize, 3usize, 72usize);
+    let q: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.011 - 0.4).sin())
+        .collect();
+    let k: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.017).cos())
+        .collect();
+    let v: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.005).tanh())
+        .collect();
+    let expected = vision_sdpa_reference(&q, &k, &v, seq, n_heads, head_dim);
+
+    let t_q = upload_fp32_as_bf16(&ctx, &q, vec![seq, n_heads, head_dim]).unwrap();
+    let t_k = upload_fp32_as_bf16(&ctx, &k, vec![seq, n_heads, head_dim]).unwrap();
+    let t_v = upload_fp32_as_bf16(&ctx, &v, vec![seq, n_heads, head_dim]).unwrap();
+    let out = vision(&ctx, &t_q, &t_k, &t_v, seq, n_heads, head_dim).unwrap();
+    assert_bf16_close_reduction(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+/// At head_dim=64 the wide kernel must reproduce the narrow kernel's output
+/// byte for byte: the per-thread element order (tid, then tid+32) and the
+/// reduction order are identical, so any difference is a logic bug.
+#[test]
+fn vision_sdpa_bf16_wide_bit_matches_narrow_kernel_at_head_dim_64() {
+    use crate::kernels::attention::vision_wide_for_test;
+
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (seq, n_heads, head_dim) = (37usize, 2usize, 64usize);
+    let q: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.009 - 0.2).sin())
+        .collect();
+    let k: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.021).cos())
+        .collect();
+    let v: Vec<f32> = (0..seq * n_heads * head_dim)
+        .map(|i| (i as f32 * 0.004 - 0.1).tanh())
+        .collect();
+
+    let t_q = upload_fp32_as_bf16(&ctx, &q, vec![seq, n_heads, head_dim]).unwrap();
+    let t_k = upload_fp32_as_bf16(&ctx, &k, vec![seq, n_heads, head_dim]).unwrap();
+    let t_v = upload_fp32_as_bf16(&ctx, &v, vec![seq, n_heads, head_dim]).unwrap();
+
+    let narrow = vision(&ctx, &t_q, &t_k, &t_v, seq, n_heads, head_dim).unwrap();
+    let wide = vision_wide_for_test(&ctx, &t_q, &t_k, &t_v, seq, n_heads, head_dim).unwrap();
+
+    let narrow_bits: Vec<u16> = download_bf16_as_fp32(&narrow)
+        .unwrap()
+        .iter()
+        .map(|v| half::bf16::from_f32(*v).to_bits())
+        .collect();
+    let wide_bits: Vec<u16> = download_bf16_as_fp32(&wide)
+        .unwrap()
+        .iter()
+        .map(|v| half::bf16::from_f32(*v).to_bits())
+        .collect();
+    assert_eq!(narrow_bits, wide_bits);
+}
+
+/// Exact-erf GELU against a double-precision reference (Abramowitz-Stegun
+/// 7.1.26 has |error| < 1.5e-7, far below BF16 resolution).
+#[test]
+fn gelu_erf_bf16_matches_reference() {
+    use crate::kernels::activation::gelu_erf;
+
+    fn erf_ref(x: f64) -> f64 {
+        let sign = if x < 0.0 { -1.0 } else { 1.0 };
+        let x = x.abs();
+        let t = 1.0 / (1.0 + 0.3275911 * x);
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t
+                * (-x * x).exp();
+        sign * y
+    }
+
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let input: Vec<f32> = (-40..40).map(|i| (i as f32) * 0.2).collect();
+    let expected: Vec<f32> = input
+        .iter()
+        .map(|&x| {
+            let x = x as f64;
+            (0.5 * x * (1.0 + erf_ref(x / std::f64::consts::SQRT_2))) as f32
+        })
+        .collect();
+
+    let bf_in = upload_fp32_as_bf16(&ctx, &input, vec![input.len()]).unwrap();
+    let out = gelu_erf(&ctx, &bf_in).unwrap();
+    assert_bf16_close_elementwise(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+/// Odd head_dims and >128 are rejected instead of silently corrupted.
+#[test]
+fn vision_sdpa_rejects_unsupported_head_dims() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (seq, n_heads) = (2usize, 1usize);
+    for bad in [71usize, 130usize] {
+        let data: Vec<f32> = vec![0.1; seq * n_heads * bad];
+        let t = upload_fp32_as_bf16(&ctx, &data, vec![seq, n_heads, bad]).unwrap();
+        assert!(vision(&ctx, &t, &t, &t, seq, n_heads, bad).is_err());
+    }
 }
 
 // ── concat_2d (fused weight packing) ─────────────────────────────

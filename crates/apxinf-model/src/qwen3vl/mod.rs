@@ -4,18 +4,20 @@
 //! and bf16-first.
 
 pub mod config;
-pub mod weights;
-pub mod vision_weights;
-pub mod vision;
-pub mod general;
 #[cfg(feature = "cuda")]
 pub mod decode_graph;
+pub mod general;
+pub mod vision;
+pub mod vision_weights;
+pub mod weights;
 
 pub use config::Qwen3VLConfig;
-pub use weights::Qwen3VLTextWeights;
-pub use vision_weights::Qwen3VLVisionWeights;
-pub use vision::VisionOutput;
-pub use general::GeneralQwen3VL;
 #[cfg(feature = "cuda")]
-pub use decode_graph::{Qwen3VLDecodeGraph, Qwen3VLDecodeGraphConfig,
-                       Qwen3VLDecodeGraphWeights, Qwen3VLDecodeLayerWeights};
+pub use decode_graph::{
+    Qwen3VLDecodeGraph, Qwen3VLDecodeGraphConfig, Qwen3VLDecodeGraphWeights,
+    Qwen3VLDecodeLayerWeights,
+};
+pub use general::GeneralQwen3VL;
+pub use vision::VisionOutput;
+pub use vision_weights::Qwen3VLVisionWeights;
+pub use weights::Qwen3VLTextWeights;

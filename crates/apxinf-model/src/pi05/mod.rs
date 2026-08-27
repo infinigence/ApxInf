@@ -68,9 +68,7 @@ pub use int8_runtime::{
 };
 #[cfg(feature = "cuda")]
 pub use int8_weights::Int8LinearWeights;
-pub use math::{
-    discretize_state, euler_flow_step, pi05_prompt, sinusoidal_time_embedding,
-};
+pub use math::{discretize_state, euler_flow_step, pi05_prompt, sinusoidal_time_embedding};
 #[cfg(feature = "cuda")]
 pub use runtime::{
     upload_time_embeddings, Pi05ActivationScales, Pi05CapturedGraph, Pi05CudaRuntime,

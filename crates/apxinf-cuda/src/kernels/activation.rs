@@ -110,6 +110,54 @@ pub fn silu(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Elementwise sigmoid gate for Qwen3.5's attention output gate.
+pub fn sigmoid(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    let device_id = ctx.device_id();
+    if input.device() != apxinf_core::Device::Cuda(device_id) || input.dtype() != DType::BF16 {
+        return Err(Error::Other("sigmoid expects a CUDA BF16 tensor".into()));
+    }
+    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let count = input.numel() as u32;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_sigmoid_bf16(
+            gpu_ptr(input)?,
+            out_buf.ptr(),
+            count,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        device_id,
+        out_buf,
+    ))
+}
+
+/// Exact (erf-form) GELU (bf16), matching PyTorch's default `nn.GELU()`.
+/// The Qwen3.5 vision patch merger uses this form; the vision block MLPs
+/// use the tanh approximation below.
+pub fn gelu_erf(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 {
+        return Err(Error::Other("gelu_erf: only BF16 supported".into()));
+    }
+    let device_id = ctx.device_id();
+    let count = input.numel() as u32;
+    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    unsafe {
+        let res =
+            ffi::apxinf_gelu_erf_bf16(gpu_ptr(input)?, out_buf.ptr(), count, ctx.stream().handle());
+        ffi::check_cuda(res).map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        device_id,
+        out_buf,
+    ))
+}
+
 /// GELU with tanh approximation (bf16). Element-wise.
 pub fn gelu_tanh(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     if input.dtype() != DType::BF16 {
@@ -119,8 +167,12 @@ pub fn gelu_tanh(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let count = input.numel() as u32;
     let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
     unsafe {
-        let res =
-            ffi::apxinf_gelu_tanh_bf16(gpu_ptr(input)?, out_buf.ptr(), count, ctx.stream().handle());
+        let res = ffi::apxinf_gelu_tanh_bf16(
+            gpu_ptr(input)?,
+            out_buf.ptr(),
+            count,
+            ctx.stream().handle(),
+        );
         ffi::check_cuda(res).map_err(Error::Cuda)?;
     }
     Ok(make_gpu_tensor(

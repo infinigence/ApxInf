@@ -10,6 +10,51 @@ use crate::tuning::{
 use crate::CudaBackend;
 
 #[test]
+fn bf16_checkpoint_weight_projection_uses_transposed_operand() {
+    let backend = CudaBackend::new(0).unwrap();
+    let activation = backend
+        .to_device(
+            &Tensor::from_bf16(
+                vec![1, 3],
+                &[
+                    bf16::from_f32(1.0),
+                    bf16::from_f32(2.0),
+                    bf16::from_f32(3.0),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let checkpoint_weight = backend
+        .to_device(
+            &Tensor::from_bf16(
+                vec![2, 3],
+                &[
+                    bf16::from_f32(1.0),
+                    bf16::from_f32(0.0),
+                    bf16::from_f32(1.0),
+                    bf16::from_f32(0.0),
+                    bf16::from_f32(2.0),
+                    bf16::from_f32(0.0),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let output = crate::kernels::gemm::project_checkpoint_bf16(
+        backend.context(),
+        &activation,
+        &checkpoint_weight,
+    )
+    .unwrap();
+    assert_eq!(output.shape().dims(), [1, 2]);
+    assert_eq!(
+        backend.to_cpu(&output).unwrap().to_f32_vec().unwrap(),
+        vec![4.0, 4.0]
+    );
+}
+
+#[test]
 fn persisted_bf16_cublaslt_tactic_matches_vendor() {
     const M: usize = 10;
     const N: usize = 32;
