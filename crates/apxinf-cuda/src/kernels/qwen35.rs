@@ -505,6 +505,51 @@ pub fn attention_decode_bf16_into(
     .map_err(Error::Cuda)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_split_bf16_into(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    kcache: &CudaBuffer,
+    vcache: &CudaBuffer,
+    gate: &CudaBuffer,
+    out: &CudaBuffer,
+    seq: &CudaBuffer,
+    pacc: &CudaBuffer,
+    pml: &CudaBuffer,
+    heads: usize,
+    kv_heads: usize,
+    hd: usize,
+    split: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "q", dev, q, heads * hd * 2)?;
+    need(ctx, "kcache", dev, kcache, 1)?;
+    need(ctx, "vcache", dev, vcache, 1)?;
+    need(ctx, "gate", dev, gate, heads * hd * 2)?;
+    need(ctx, "out", dev, out, heads * hd * 2)?;
+    need(ctx, "seq", dev, seq, 4)?;
+    need(ctx, "pacc", dev, pacc, heads * split * hd * 4)?;
+    need(ctx, "pml", dev, pml, heads * split * 2 * 4)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_attention_decode_bf16_v2(
+            q.ptr(),
+            kcache.ptr(),
+            vcache.ptr(),
+            gate.ptr(),
+            out.ptr(),
+            seq.ptr(),
+            heads as i32,
+            kv_heads as i32,
+            hd as i32,
+            pacc.ptr(),
+            pml.ptr(),
+            split as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}
+
 pub fn conv_step_silu_bf16_into(
     ctx: &CudaContext,
     cur: &CudaBuffer,

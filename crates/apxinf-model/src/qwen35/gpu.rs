@@ -10,6 +10,7 @@
 #![cfg(feature = "cuda")]
 
 use half::{bf16, f16};
+use rayon::prelude::*;
 
 use apxinf_core::DType;
 use apxinf_cuda::graph::{begin as graph_begin, end as graph_end, CaptureMode, CapturedGraph};
@@ -20,6 +21,7 @@ use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Wei
 
 const MAX_LEN: usize = 16384; // parallel prefill length cap (workspace)
 const MAX_SEQ: usize = 17408; // total sequence cap (rope + KV cache)
+const ATTN_SPLIT: usize = 32; // decode attention KV split (fixed for CUDA graph)
 
 static PF_OPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PF_DEQ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -142,6 +144,8 @@ struct Workspace {
     mlp_down: CudaBuffer,
     logits: CudaBuffer,
     w_deq: CudaBuffer,
+    attn_partial: CudaBuffer,
+    attn_partial_ml: CudaBuffer,
 }
 
 fn bf16_bytes(v: &[bf16]) -> Vec<u8> {
@@ -342,6 +346,8 @@ impl CudaQwen35 {
             mlp_down: n(MAX_LEN * hidden * 2)?,
             logits: n(vocab * 2)?,
             w_deq: n(inter * hidden * 2)?,
+            attn_partial: n(heads * ATTN_SPLIT * head_dim * 4)?,
+            attn_partial_ml: n(heads * ATTN_SPLIT * head_dim * 2 * 4)?,
         };
 
         let embed_f16: Vec<f16> = w
@@ -540,7 +546,7 @@ fn full_layer_decode(&self, layer: &GpuFull) -> Result<(), String> {
     k::partial_rope_bf16_inplace(&self.ctx, &self.ws.kn, &self.rope_cos, &self.rope_sin, self.kv_heads, self.kv_heads, hd, self.rotary_half, MAX_SEQ, &self.pos_dev).map_err(|e| e.to_string())?;
     k::copy_at_bf16(&self.ctx, &self.ws.kn, &layer.kv_k, &self.pos_dev, self.kv_heads * hd, self.kv_heads * hd).map_err(|e| e.to_string())?;
     k::copy_at_bf16(&self.ctx, &self.ws.attn_v, &layer.kv_v, &self.pos_dev, self.kv_heads * hd, self.kv_heads * hd).map_err(|e| e.to_string())?;
-    k::attention_decode_bf16_into(&self.ctx, &self.ws.q, &layer.kv_k, &layer.kv_v, &self.ws.gate, &self.ws.attn_out, &self.pos_dev, self.heads, self.kv_heads, hd).map_err(|e| e.to_string())?;
+    k::attention_decode_split_bf16_into(&self.ctx, &self.ws.q, &layer.kv_k, &layer.kv_v, &self.ws.gate, &self.ws.attn_out, &self.pos_dev, &self.ws.attn_partial, &self.ws.attn_partial_ml, self.heads, self.kv_heads, hd, ATTN_SPLIT).map_err(|e| e.to_string())?;
     self.gemm_q4(&layer.wo, 1, &self.ws.attn_out, &self.ws.o_out)?;
     k::accum_bf16_into(&self.ctx, &self.ws.x, &self.ws.o_out, self.hidden).map_err(|e| e.to_string())?;
     self.mlp_run(&layer.mlp, &layer.post_norm_w, 1)
@@ -613,17 +619,23 @@ pub fn prefill_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
     let t_emb0 = std::time::Instant::now();
     let vocab_rows = self.embed.len() / self.hidden;
     let row_bytes = self.hidden * 2;
-    let mut host_x = vec![0u8; l * row_bytes];
-    for (t, id) in ids.iter().enumerate() {
-        let row = *id as usize;
-        if row >= vocab_rows {
+    for id in ids.iter() {
+        if (*id as usize) >= vocab_rows {
             return Err(format!("token id {id} out of range"));
         }
-        let src_row = &self.embed[row * self.hidden..(row + 1) * self.hidden];
-        unsafe {
-            let sb = std::slice::from_raw_parts(src_row.as_ptr() as *const u8, row_bytes);
-            host_x[t * row_bytes..t * row_bytes + row_bytes].copy_from_slice(sb);
-        }
+    }
+    let mut host_x = vec![0u8; l * row_bytes];
+    {
+        let embed = &self.embed;
+        let hidden = self.hidden;
+        host_x.par_chunks_mut(row_bytes).enumerate().for_each(|(t, dst)| {
+            let row = ids[t] as usize;
+            let src_row = &embed[row * hidden..(row + 1) * hidden];
+            unsafe {
+                let sb = std::slice::from_raw_parts(src_row.as_ptr() as *const u8, row_bytes);
+                dst.copy_from_slice(sb);
+            }
+        });
     }
     if prof { self.ctx.synchronize()?; }
     let emb_host_ns = t_emb0.elapsed().as_nanos();

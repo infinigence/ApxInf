@@ -983,3 +983,106 @@ __global__ void qwen_embed_gather_f16_kernel(
     out[e] = __float2half(__bfloat162float(table[(int64_t)id * hidden + c]));
   }
 }
+
+// ---- split-KV single-token attention (FlashDecoding-style, graph-safe) --
+// Grid: heads*split blocks of 256 threads (8 warps). Each block scans one
+// contiguous KV chunk with per-warp online softmax, combines the 8 warps in
+// shared memory and writes one (m, l, acc) partial. A second kernel merges
+// the split partials per head and applies the output gate. Fixed split keeps
+// the launch config constant so decode stays CUDA-graph capturable.
+template <int ELEM>
+__global__ void qwen_attention_decode_split_bf16_kernel(
+    const __half* q, const __half* kcache, const __half* vcache,
+    float* pacc, float* pml,
+    const int* seq_ptr, int heads, int kvheads, int hd, int split) {
+  const int h = blockIdx.x / split;
+  const int sp = blockIdx.x - h * split;
+  const int seq = *seq_ptr + 1;
+  const int chunk = (seq + split - 1) / split;
+  const int s0 = sp * chunk;
+  int s1 = s0 + chunk;
+  if (s1 > seq) s1 = seq;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const long long hoff = (long long)h * hd;
+  const float scale = rsqrtf((float)hd);
+
+  float qv[ELEM];
+  #pragma unroll
+  for (int j = 0; j < ELEM; j++) qv[j] = q35_bf16(q, hoff + lane * ELEM + j);
+
+  float acc[ELEM];
+  #pragma unroll
+  for (int j = 0; j < ELEM; j++) acc[j] = 0.0f;
+  float m = -1e30f, l = 0.0f;
+
+  if (s0 < s1) {
+    const int kh = h / (heads / kvheads);
+    for (int s = s0 + warp; s < s1; s += 8) {
+      const long long row = ((long long)s * kvheads + kh) * hd + lane * ELEM;
+      float kdot = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < ELEM; j++) kdot += qv[j] * q35_bf16(kcache, row + j);
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        kdot += __shfl_xor_sync(0xffffffffu, kdot, off);
+      const float dot = kdot * scale;
+      const float m_new = fmaxf(m, dot);
+      const float p = __expf(dot - m_new);
+      const float corr = __expf(m - m_new);
+      l = fmaf(l, corr, p);
+      #pragma unroll
+      for (int j = 0; j < ELEM; j++)
+        acc[j] = fmaf(acc[j], corr, p * q35_bf16(vcache, row + j));
+      m = m_new;
+    }
+  }
+
+  __shared__ float sm_m[8];
+  __shared__ float sm_l[8];
+  __shared__ float sm_acc[8][256];
+  if (lane == 0) { sm_m[warp] = m; sm_l[warp] = l; }
+  #pragma unroll
+  for (int j = 0; j < ELEM; j++) sm_acc[warp][lane * ELEM + j] = acc[j];
+  __syncthreads();
+
+  const int t = threadIdx.x;
+  if (t < hd) {
+    float M = -1e30f;
+    #pragma unroll
+    for (int w = 0; w < 8; w++) M = fmaxf(M, sm_m[w]);
+    float num = 0.0f, den = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < 8; w++) {
+      const float sc = __expf(sm_m[w] - M);
+      den += sm_l[w] * sc;
+      num += sm_acc[w][t] * sc;
+    }
+    pacc[(long long)blockIdx.x * hd + t] = num;
+    if (t == 0) {
+      pml[(long long)blockIdx.x * 2] = M;
+      pml[(long long)blockIdx.x * 2 + 1] = den;
+    }
+  }
+}
+
+__global__ void qwen_attention_decode_reduce_bf16_kernel(
+    const float* pacc, const float* pml, const __half* gate, __half* out,
+    int split, int hd) {
+  const int h = blockIdx.x;
+  const int t = threadIdx.x;
+  if (t >= hd) return;
+  float M = -1e30f;
+  for (int sp = 0; sp < split; sp++)
+    M = fmaxf(M, pml[((long long)h * split + sp) * 2]);
+  float num = 0.0f, den = 0.0f;
+  for (int sp = 0; sp < split; sp++) {
+    const float sc = __expf(pml[((long long)h * split + sp) * 2] - M);
+    den += pml[((long long)h * split + sp) * 2 + 1] * sc;
+    num += pacc[((long long)h * split + sp) * (long long)hd + t] * sc;
+  }
+  const float val = num / den;
+  const float gv = q35_bf16(gate, (long long)h * hd + t);
+  const float sig = 1.0f / (1.0f + expf(-gv));
+  out[(long long)h * hd + t] = q35_b16(val * sig);
+}

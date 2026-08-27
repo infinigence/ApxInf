@@ -689,6 +689,37 @@ extern "C" cudaError_t apxinf_qwen_attention_decode_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_qwen_attention_decode_bf16_v2(
+    const void* q, const void* kcache, const void* vcache, const void* gate,
+    void* out, const void* seq_ptr, int heads, int kvheads, int hd,
+    void* pacc, void* pml, int split, cudaStream_t stream) {
+  if (heads <= 0 || kvheads <= 0 || hd <= 0 || split <= 0 || split > 64)
+    return cudaErrorInvalidValue;
+  dim3 grid((unsigned)(heads * split));
+  if (hd == 256) {
+    qwen_attention_decode_split_bf16_kernel<8><<<grid, 256, 0, stream>>>(
+        static_cast<const __half*>(q), static_cast<const __half*>(kcache),
+        static_cast<const __half*>(vcache), static_cast<float*>(pacc),
+        static_cast<float*>(pml), static_cast<const int*>(seq_ptr),
+        heads, kvheads, hd, split);
+  } else if (hd == 128) {
+    qwen_attention_decode_split_bf16_kernel<4><<<grid, 256, 0, stream>>>(
+        static_cast<const __half*>(q), static_cast<const __half*>(kcache),
+        static_cast<const __half*>(vcache), static_cast<float*>(pacc),
+        static_cast<float*>(pml), static_cast<const int*>(seq_ptr),
+        heads, kvheads, hd, split);
+  } else {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  qwen_attention_decode_reduce_bf16_kernel<<<heads, 256, 0, stream>>>(
+      static_cast<const float*>(pacc), static_cast<const float*>(pml),
+      static_cast<const __half*>(gate), static_cast<__half*>(out),
+      split, hd);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_qwen_conv_step_silu_bf16(
     const void* cur, void* hist, const void* w, void* out,
     int conv_dim, cudaStream_t stream) {

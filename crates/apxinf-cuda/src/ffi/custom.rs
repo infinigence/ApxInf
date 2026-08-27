@@ -970,6 +970,12 @@ extern "C" {
         gate: *const c_void, out: *mut c_void,
         seq_ptr: *const c_void, heads: i32, kvheads: i32, hd: i32, stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_qwen_attention_decode_bf16_v2(
+        q: *const c_void, kcache: *const c_void, vcache: *const c_void,
+        gate: *const c_void, out: *mut c_void,
+        seq_ptr: *const c_void, heads: i32, kvheads: i32, hd: i32,
+        pacc: *mut c_void, pml: *mut c_void, split: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_qwen_conv_step_silu_bf16(
         cur: *const c_void, hist: *mut c_void, w: *const c_void, out: *mut c_void,
         conv_dim: i32, stream: cudaStream_t,
