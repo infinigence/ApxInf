@@ -653,3 +653,27 @@ pub fn gemm_w4a16_m1_bf16(
     })
     .map_err(Error::Cuda)
 }
+
+pub fn embed_gather_f16(
+    ctx: &CudaContext,
+    table: &CudaBuffer,
+    ids: &CudaBuffer,
+    out: &CudaBuffer,
+    tokens: usize,
+    hidden: usize,
+) -> Result<()> {
+    let dev = ctx.device_id();
+    need(ctx, "ids", dev, ids, tokens * 4)?;
+    need(ctx, "out", dev, out, tokens * hidden * 2)?;
+    ffi::check_cuda(unsafe {
+        ffi::apxinf_qwen_embed_gather_f16(
+            table.ptr(),
+            ids.ptr(),
+            out.ptr(),
+            tokens as i64,
+            hidden as i32,
+            ctx.stream().handle(),
+        )
+    })
+    .map_err(Error::Cuda)
+}

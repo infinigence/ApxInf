@@ -889,6 +889,10 @@ extern "C" {
         packed: *const c_void, scale: *const c_void, zp: *const c_void,
         out: *mut c_void, out_dim: i32, in_dim: i32, stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_qwen_embed_gather_f16(
+        table: *const c_void, ids: *const c_void, out: *mut c_void,
+        tokens: i64, hidden: i32, stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_qwen_mul_bf16(
         a: *const c_void, b: *const c_void, out: *mut c_void,
         n: i64, stream: cudaStream_t,

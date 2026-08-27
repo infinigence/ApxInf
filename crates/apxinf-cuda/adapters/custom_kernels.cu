@@ -418,11 +418,9 @@ extern "C" cudaError_t apxinf_qwen_dequant_w4a16_bf16(
     const void* packed, const void* scale, const void* zp, void* out,
     int out_dim, int in_dim, cudaStream_t stream) {
   if (out_dim <= 0 || in_dim <= 0) return cudaErrorInvalidValue;
-  int64_t total = (int64_t)out_dim * in_dim;
-  int threads = 256;
-  int64_t blocks64 = (total + threads - 1) / threads;
-  int blocks = blocks64 > (1 << 20) ? (1 << 20) : (int)blocks64;
-  qwen_dequant_w4a16_bf16_kernel<<<blocks, threads, 0, stream>>>(
+  dim3 dq_block(32, 8);
+  dim3 dq_grid((out_dim + 31) / 32, (in_dim + 31) / 32);
+  qwen_dequant_w4a16_bf16_kernel_v2<<<dq_grid, dq_block, 0, stream>>>(
       static_cast<const int32_t*>(packed),
       static_cast<const __half*>(scale),
       static_cast<const int32_t*>(zp),
@@ -544,6 +542,35 @@ extern "C" cudaError_t apxinf_qwen_delta_recurrence_bf16(
     int L, int nv, int kd, int vd, cudaStream_t stream) {
   if (L <= 0 || nv <= 0 || kd <= 0 || vd <= 0) return cudaErrorInvalidValue;
   if (vd > 128 || kd % DR_KDCHUNK != 0) return cudaErrorInvalidValue;
+  if (kd % 32 == 0 && kd <= 512) {
+    dim3 b2(256);
+    dim3 g2(nv, (vd + 7) / 8);
+    const __half* qh = static_cast<const __half*>(q);
+    const __half* kh = static_cast<const __half*>(k);
+    const __half* vh = static_cast<const __half*>(v);
+    const __half* bh = static_cast<const __half*>(beta);
+    const __half* gh = static_cast<const __half*>(g);
+    float* st = static_cast<float*>(state);
+    __half* oh = static_cast<__half*>(out);
+    switch (kd / 32) {
+      case 2:
+        qwen_delta_recurrence_bf16_kernel_v3<2><<<g2, b2, 0, stream>>>(qh, kh, vh, bh, gh, st, oh, L, nv, vd);
+        return cudaGetLastError();
+      case 4:
+        qwen_delta_recurrence_bf16_kernel_v3<4><<<g2, b2, 0, stream>>>(qh, kh, vh, bh, gh, st, oh, L, nv, vd);
+        return cudaGetLastError();
+      case 8:
+        qwen_delta_recurrence_bf16_kernel_v3<8><<<g2, b2, 0, stream>>>(qh, kh, vh, bh, gh, st, oh, L, nv, vd);
+        return cudaGetLastError();
+      case 16:
+        qwen_delta_recurrence_bf16_kernel_v3<16><<<g2, b2, 0, stream>>>(qh, kh, vh, bh, gh, st, oh, L, nv, vd);
+        return cudaGetLastError();
+      default:
+        break;
+    }
+    qwen_delta_recurrence_bf16_kernel_v2<<<g2, b2, 0, stream>>>(qh, kh, vh, bh, gh, st, oh, L, nv, kd, vd);
+    return cudaGetLastError();
+  }
   dim3 block(vd, DR_KDCHUNK);
   qwen_delta_recurrence_bf16_kernel<<<nv, block, 0, stream>>>(
       static_cast<const __half*>(q),
@@ -733,3 +760,18 @@ extern "C" cudaError_t apxinf_qwen_gemm_f16(
   return cudaGetLastError();
 }
 
+
+extern "C" cudaError_t apxinf_qwen_embed_gather_f16(
+    const void* table, const void* ids, void* out,
+    int64_t tokens, int hidden, cudaStream_t stream) {
+  if (tokens <= 0 || hidden <= 0) return cudaErrorInvalidValue;
+  int64_t count = tokens * hidden;
+  int threads = 256;
+  int64_t blocks64 = (count + threads - 1) / threads;
+  int blocks = blocks64 > (1 << 20) ? (1 << 20) : (int)blocks64;
+  qwen_embed_gather_f16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(table),
+      static_cast<const uint32_t*>(ids),
+      static_cast<__half*>(out), count, hidden);
+  return cudaGetLastError();
+}

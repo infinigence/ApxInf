@@ -817,3 +817,169 @@ __global__ void qwen_gemm_w4a16_m1_bf16_kernel(
   int n = n0 + tid;
   if (n < N) c[n] = __float2half(acc);
 }
+
+// ── v2 dequant: 32x32 tiled transpose, coalesced writes ─────────────────
+// Block (32,8): x = i offset, y*4+r = o offset. Values staged transposed in
+// shared memory so both the packed read and the [in,out] write are coalesced.
+__global__ void qwen_dequant_w4a16_bf16_kernel_v2(
+    const int32_t* packed, const __half* scale, const int32_t* zp,
+    __half* out, int out_dim, int in_dim) {
+  __shared__ float tile[32][33]; // [i_off][o_off], padded (no bank conflicts)
+  int o0 = blockIdx.x * 32;
+  int i0 = blockIdx.y * 32;
+  int x = threadIdx.x;
+  int y = threadIdx.y;
+  int groups = in_dim / 32;
+  int i = i0 + x;
+  bool iok = i < in_dim;
+  #pragma unroll
+  for (int r = 0; r < 4; r++) {
+    int o = o0 + y * 4 + r;
+    float val = 0.0f;
+    if (o < out_dim && iok) {
+      int g = i >> 5;
+      int j8 = i & 7;
+      int zpv = ((zp[(o >> 3) * groups + g] >> (4 * (o & 7))) & 0xF) - 8;
+      int w4 = ((packed[(int64_t)o * (in_dim >> 3) + (i >> 3)] >> (4 * j8)) & 0xF) - 8;
+      float sv = __half2float(scale[(int64_t)o * groups + g]);
+      val = sv * ((float)w4 - (float)zpv);
+    }
+    tile[x][y * 4 + r] = val;
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int r = 0; r < 4; r++) {
+    int iw = i0 + y * 4 + r;
+    int ow = o0 + x;
+    if (iw < in_dim && ow < out_dim) {
+      out[(int64_t)iw * out_dim + ow] = __float2half(tile[y * 4 + r][x]);
+    }
+  }
+}
+
+// ── GatedDeltaNet recurrence v2: warp-per-(head, column), register state ─
+// Requires kd % 32 == 0 && kd <= 512. grid = (nv, ceil(vd/8)), block = 256.
+// Each warp owns one state column j of head h; its kd slice (4 floats per
+// lane at kd=128) lives in registers for the whole sequence, and the two
+// kd reductions use warp shuffles (no __syncthreads in the time loop).
+__global__ void qwen_delta_recurrence_bf16_kernel_v2(
+    const __half* q, const __half* k, const __half* v,
+    const __half* beta, const __half* g,
+    float* state, __half* out,
+    int L, int nv, int kd, int vd) {
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int h = blockIdx.x;
+  int j = blockIdx.y * 8 + warp;
+  if (h >= nv || j >= vd) return;
+  int nchunk = kd >> 5;
+  float* S = state + (int64_t)h * kd * vd;
+  float s[16];
+  float kreg[16];
+  for (int c = 0; c < nchunk; c++) s[c] = 0.0f;
+
+  for (int t = 0; t < L; t++) {
+    int64_t th = (int64_t)t * nv + h;
+    float decay = expf(__half2float(g[th]));
+    float bt = __half2float(beta[th]);
+    float vt = __half2float(v[th * vd + j]);
+    float pkv = 0.0f;
+    for (int c = 0; c < nchunk; c++) {
+      int kk = lane + (c << 5);
+      float kv = __half2float(k[th * kd + kk]);
+      kreg[c] = kv;
+      s[c] *= decay;
+      pkv += s[c] * kv;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) pkv += __shfl_xor_sync(0xffffffffu, pkv, off);
+    float delta = (vt - pkv) * bt;
+    float po = 0.0f;
+    for (int c = 0; c < nchunk; c++) {
+      int kk = lane + (c << 5);
+      s[c] += kreg[c] * delta;
+      po += s[c] * __half2float(q[th * kd + kk]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) po += __shfl_xor_sync(0xffffffffu, po, off);
+    if (lane == 0) out[th * vd + j] = __float2half(po);
+  }
+  for (int c = 0; c < nchunk; c++) {
+    int kk = lane + (c << 5);
+    S[(int64_t)kk * vd + j] = s[c];
+  }
+}
+
+// v3: fully-register-resident recurrence. NCHUNK = kd/32 must be a compile-time
+// constant so that the per-warp state s[] stays in registers (v2 indexed s[]
+// with a runtime bound and spilled to local memory).
+template <int NCHUNK>
+__global__ void qwen_delta_recurrence_bf16_kernel_v3(
+    const __half* __restrict__ q, const __half* __restrict__ k,
+    const __half* __restrict__ v, const __half* __restrict__ beta,
+    const __half* __restrict__ g,
+    float* __restrict__ state, __half* __restrict__ out,
+    int L, int nv, int vd) {
+  constexpr int KD = 32 * NCHUNK;
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int h = blockIdx.x;
+  int j = blockIdx.y * 8 + warp;
+  if (h >= nv || j >= vd) return;
+  float s[NCHUNK];
+  #pragma unroll
+  for (int c = 0; c < NCHUNK; c++) s[c] = 0.0f;
+
+  const __half* kp = k + h * KD;
+  const __half* qp = q + h * KD;
+  const __half* vp = v + h * vd + j;
+  const __half* gp = g + h;
+  const __half* bp = beta + h;
+  const long long sk = (long long)nv * KD;
+  const long long sv = (long long)nv * vd;
+  const long long nvvd = (long long)nv * vd;
+
+  for (int t = 0; t < L; t++) {
+    float decay = expf(__half2float(*gp));
+    float bt = __half2float(*bp);
+    float vt = __half2float(*vp);
+    float kreg[NCHUNK];
+    float pkv = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; c++) {
+      float kv = __half2float(kp[c * 32 + lane]);
+      kreg[c] = kv;
+      s[c] = s[c] * decay;
+      pkv += s[c] * kv;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) pkv += __shfl_xor_sync(0xffffffffu, pkv, off);
+    float delta = (vt - pkv) * bt;
+    float po = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < NCHUNK; c++) {
+      s[c] += kreg[c] * delta;
+      po += s[c] * __half2float(qp[c * 32 + lane]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) po += __shfl_xor_sync(0xffffffffu, po, off);
+    if (lane == 0) out[(long long)t * nvvd + h * vd + j] = __float2half(po);
+    kp += sk; qp += sk; vp += sv; gp += nv; bp += nv;
+  }
+  float* S = state + (long long)h * KD * vd;
+  #pragma unroll
+  for (int c = 0; c < NCHUNK; c++) S[(long long)(c * 32 + lane) * vd + j] = s[c];
+}
+
+// ── embedding gather: bf16 table -> f16 rows (no scaling) ───────────────
+__global__ void qwen_embed_gather_f16_kernel(
+    const __nv_bfloat16* table, const uint32_t* ids, __half* out,
+    int64_t count, int hidden) {
+  for (int64_t e = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+       e < count; e += (int64_t)gridDim.x * blockDim.x) {
+    int t = (int)(e / hidden);
+    int c = (int)(e % hidden);
+    uint32_t id = ids[t];
+    out[e] = __float2half(__bfloat162float(table[(int64_t)id * hidden + c]));
+  }
+}

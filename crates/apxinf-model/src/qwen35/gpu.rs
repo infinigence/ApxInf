@@ -21,6 +21,14 @@ use crate::qwen35::weights::{Bf16Mat, LayerWeights, MatKind, Q4Linear, Qwen35Wei
 const MAX_LEN: usize = 16384; // parallel prefill length cap (workspace)
 const MAX_SEQ: usize = 17408; // total sequence cap (rope + KV cache)
 
+static PF_OPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PF_DEQ_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PF_GEMM_Q4_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PF_GEMM_F16_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PF_GEMM_DENSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PF_RECUR_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
 struct GpuQ4 {
     packed: CudaBuffer,
     scale: CudaBuffer,
@@ -98,7 +106,7 @@ pub struct CudaQwen35 {
     rope_sin: CudaBuffer,
     layers: Vec<GpuLayer>,
     ws: Workspace,
-    embed: Vec<bf16>,
+    embed: Vec<f16>, // host embedding table pre-converted to f16 (fast gather)
     seq_len: usize,
     pos_dev: CudaBuffer,      // [1] u32 absolute position (graph-safe)
     token_embed: CudaBuffer,  // [hidden] staging for the input token
@@ -336,6 +344,13 @@ impl CudaQwen35 {
             w_deq: n(inter * hidden * 2)?,
         };
 
+        let embed_f16: Vec<f16> = w
+            .embed
+            .data
+            .iter()
+            .map(|x| f16::from_f32(x.to_f32()))
+            .collect();
+
         Ok(Self {
             ctx,
             hidden,
@@ -358,7 +373,7 @@ impl CudaQwen35 {
             rope_sin,
             layers,
             ws,
-            embed: w.embed.data,
+            embed: embed_f16,
             seq_len: 0,
             pos_dev,
             token_embed,
@@ -368,14 +383,24 @@ impl CudaQwen35 {
     }
 
     fn gemm(&self, m: usize, n: usize, kk: usize, a: &CudaBuffer, b: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
-        self.ctx.cublas().gemm(DType::F16, m, n, kk, 1.0f32, a, b, 0.0f32, c)
+        let ops = PF_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        if ops { self.ctx.synchronize()?; }
+        let t0 = std::time::Instant::now();
+        let r = self.ctx.cublas().gemm(DType::F16, m, n, kk, 1.0f32, a, b, 0.0f32, c);
+        if ops { self.ctx.synchronize()?; PF_GEMM_F16_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+        r
     }
 
     /// Dense fp16 GEMM with deterministic accumulation order (matches the
     /// w4a16 kernel), used where decode(m=1) and prefill(m=l) must agree
     /// bit-for-bit: linear_attn.in_a / in_b and Dense out_proj.
     fn gemm_dense(&self, m: usize, n: usize, kk: usize, a: &CudaBuffer, b: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
-        k::gemm_f16(&self.ctx, a, b, c, m, n, kk).map_err(|e| e.to_string())
+        let ops = PF_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        if ops { self.ctx.synchronize()?; }
+        let t0 = std::time::Instant::now();
+        let r = k::gemm_f16(&self.ctx, a, b, c, m, n, kk).map_err(|e| e.to_string());
+        if ops { self.ctx.synchronize()?; PF_GEMM_DENSE_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+        r
     }
 
     fn gemm_q4(&self, q: &GpuQ4, m: usize, a: &CudaBuffer, c: &CudaBuffer) -> Result<(), String> {
@@ -385,9 +410,16 @@ impl CudaQwen35 {
             return k::gemm_w4a16_m1_bf16(&self.ctx, a, &q.packed, &q.scale, &q.zp, c, q.out, q.inp)
                 .map_err(|e| e.to_string());
         }
+        let ops = PF_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        if ops { self.ctx.synchronize()?; }
+        let t0 = std::time::Instant::now();
         k::dequant_w4a16_bf16_into(&self.ctx, &q.packed, &q.scale, &q.zp, &self.ws.w_deq, q.out, q.inp)
             .map_err(|e| e.to_string())?;
-        self.ctx.cublas().gemm(DType::F16, m, q.out, q.inp, 1.0f32, a, &self.ws.w_deq, 0.0f32, c)
+        if ops { self.ctx.synchronize()?; PF_DEQ_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+        let t1 = std::time::Instant::now();
+        let r = self.ctx.cublas().gemm(DType::F16, m, q.out, q.inp, 1.0f32, a, &self.ws.w_deq, 0.0f32, c);
+        if ops { self.ctx.synchronize()?; PF_GEMM_Q4_NS.fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+        r
     }
 
     fn rms(&self, x: &CudaBuffer, w: &CudaBuffer, out: &CudaBuffer, rows: usize, cols: usize) -> Result<(), String> {
@@ -463,7 +495,13 @@ fn linear_layer_prefill(&self, layer: &GpuLinear, l: usize, layer_idx: usize) ->
     let qscale = 1.0f32 / (self.kd as f32).sqrt();
     self.l2norm(&self.ws.qh, &self.ws.qh, l * self.nv, self.kd, qscale)?;
     self.l2norm(&self.ws.kh, &self.ws.kh, l * self.nv, self.kd, 1.0f32)?;
-    k::delta_recurrence_bf16_into(&self.ctx, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, &self.ws.beta, &self.ws.g, &layer.state, &self.ws.o_delta, l, self.nv, self.kd, self.vd).map_err(|e| e.to_string())?;
+    {
+        let ops = PF_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        if ops { self.ctx.synchronize()?; }
+        let t0 = std::time::Instant::now();
+        k::delta_recurrence_bf16_into(&self.ctx, &self.ws.qh, &self.ws.kh, &self.ws.v_delta, &self.ws.beta, &self.ws.g, &layer.state, &self.ws.o_delta, l, self.nv, self.kd, self.vd).map_err(|e| e.to_string())?;
+        if ops { self.ctx.synchronize()?; PF_RECUR_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+    }
     self.rms(&self.ws.o_delta, &layer.norm_w, &self.ws.o_delta, l * self.nv, self.vd)?;
     k::silu_bf16_into(&self.ctx, &self.ws.z, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
     k::mul_bf16_into(&self.ctx, &self.ws.o_delta, &self.ws.z, &self.ws.z, l * self.nv * self.vd).map_err(|e| e.to_string())?;
@@ -563,23 +601,42 @@ pub fn prefill_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
     if l == 0 || l > MAX_LEN {
         return Err(format!("unsupported prefill length {l} (max {MAX_LEN})"));
     }
-    self.seq_len = 0;
-    self.pos_dev.copy_from_host(&0u32.to_le_bytes())?;
-    let mut host_x = vec![0u8; l * self.hidden * 2];
-    for (t, id) in ids.iter().enumerate() {
-        let row = *id as usize;
-        if row >= self.embed.len() / self.hidden {
-            return Err(format!("token id {id} out of range"));
-        }
-        for j in 0..self.hidden {
-            let src = f16::from_f32(self.embed[row * self.hidden + j].to_f32());
-            host_x[(t * self.hidden + j) * 2..(t * self.hidden + j) * 2 + 2]
-                .copy_from_slice(&src.to_le_bytes());
+    let prof = std::env::var_os("Q35_PROF").is_some();
+    if prof {
+        PF_OPS.store(true, std::sync::atomic::Ordering::Relaxed);
+        for c in [&PF_DEQ_NS, &PF_GEMM_Q4_NS, &PF_GEMM_F16_NS, &PF_GEMM_DENSE_NS, &PF_RECUR_NS] {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    self.seq_len = 0;
+    self.pos_dev.copy_from_host(&0u32.to_le_bytes())?;
+    let t_emb0 = std::time::Instant::now();
+    let vocab_rows = self.embed.len() / self.hidden;
+    let row_bytes = self.hidden * 2;
+    let mut host_x = vec![0u8; l * row_bytes];
+    for (t, id) in ids.iter().enumerate() {
+        let row = *id as usize;
+        if row >= vocab_rows {
+            return Err(format!("token id {id} out of range"));
+        }
+        let src_row = &self.embed[row * self.hidden..(row + 1) * self.hidden];
+        unsafe {
+            let sb = std::slice::from_raw_parts(src_row.as_ptr() as *const u8, row_bytes);
+            host_x[t * row_bytes..t * row_bytes + row_bytes].copy_from_slice(sb);
+        }
+    }
+    if prof { self.ctx.synchronize()?; }
+    let emb_host_ns = t_emb0.elapsed().as_nanos();
+    let t_h2d0 = std::time::Instant::now();
     self.ws.x.copy_from_host(&host_x)?;
+    if prof { self.ctx.synchronize()?; }
+    let emb_h2d_ns = t_h2d0.elapsed().as_nanos();
     let zeros = vec![0u8; 3 * self.conv_dim * 2];
+    let mut full_ns = 0u128;
+    let mut lin_ns = 0u128;
     for i in 0..self.n_layers {
+        if prof { self.ctx.synchronize()?; }
+        let t0 = std::time::Instant::now();
         match &self.layers[i] {
             GpuLayer::Full(fl) => self.full_layer_prefill(fl, l)?,
             GpuLayer::Linear(li) => {
@@ -587,13 +644,34 @@ pub fn prefill_logits(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
                 self.linear_layer_prefill(li, l, i)?;
             }
         }
+        if prof {
+            self.ctx.synchronize()?;
+            let dt = t0.elapsed().as_nanos();
+            if matches!(&self.layers[i], GpuLayer::Full(_)) { full_ns += dt; } else { lin_ns += dt; }
+        }
         if std::env::var_os("Q35_DUMP").is_some() {
             let mut bytes = vec![0u8; l * self.hidden * 2];
             let _ = self.ws.x.copy_to_host(&mut bytes);
             let _ = std::fs::write(format!("/tmp/gpu_x_{i}.bin"), &bytes);
         }
     }
+    if prof { self.ctx.synchronize()?; }
+    let t_lg0 = std::time::Instant::now();
     self.apply_logits(l)?;
+    if prof {
+        self.ctx.synchronize()?;
+        let lg_ns = t_lg0.elapsed().as_nanos();
+        let deq = PF_DEQ_NS.load(std::sync::atomic::Ordering::Relaxed);
+        let gq4 = PF_GEMM_Q4_NS.load(std::sync::atomic::Ordering::Relaxed);
+        let gf16 = PF_GEMM_F16_NS.load(std::sync::atomic::Ordering::Relaxed);
+        let gden = PF_GEMM_DENSE_NS.load(std::sync::atomic::Ordering::Relaxed);
+        let rec = PF_RECUR_NS.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[prof-pf] l={} emb_host={:.2}ms emb_h2d={:.2}ms full={:.2}ms lin={:.2}ms logits={:.2}ms",
+            l, emb_host_ns as f64 / 1e6, emb_h2d_ns as f64 / 1e6, full_ns as f64 / 1e6, lin_ns as f64 / 1e6, lg_ns as f64 / 1e6);
+        eprintln!("[prof-pf-ops] dequant={:.2}ms gemm_q4={:.2}ms gemm_f16={:.2}ms gemm_dense={:.2}ms recurrence={:.2}ms",
+            deq as f64 / 1e6, gq4 as f64 / 1e6, gf16 as f64 / 1e6, gden as f64 / 1e6, rec as f64 / 1e6);
+        PF_OPS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     self.ctx.synchronize()?;
     self.seq_len = l;
     self.read_logits()
@@ -609,9 +687,10 @@ pub fn decode_logits(&mut self, token: u32) -> Result<Vec<f32>, String> {
         return Err(format!("token id {token} out of range"));
     }
     let mut host_x = vec![0u8; self.hidden * 2];
-    for j in 0..self.hidden {
-        let src = f16::from_f32(self.embed[row * self.hidden + j].to_f32());
-        host_x[j * 2..j * 2 + 2].copy_from_slice(&src.to_le_bytes());
+    unsafe {
+        let src_row = &self.embed[row * self.hidden..(row + 1) * self.hidden];
+        let sb = std::slice::from_raw_parts(src_row.as_ptr() as *const u8, self.hidden * 2);
+        host_x.copy_from_slice(sb);
     }
     // publish dynamic graph inputs (embedding + absolute position)
     self.token_embed.copy_from_host(&host_x)?;
