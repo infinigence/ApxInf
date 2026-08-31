@@ -8,9 +8,8 @@ use crate::device_caps::CudaDeviceCaps;
 use super::key::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TuningDType,
 };
-use super::store::{
-    decode_cublaslt_custom_tactic, GemmTuningRecord, TacticBackend, TacticId, TacticStore,
-};
+use super::store::{GemmTuningRecord, TacticStore};
+use super::tactic::{decode_cublaslt_custom_tactic, TacticBackend, TacticId};
 
 pub const TUNING_SCHEMA_V1: &str = "apxinf.cuda.tuning.v1";
 

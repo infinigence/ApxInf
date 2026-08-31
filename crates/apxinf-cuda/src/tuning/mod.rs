@@ -1,6 +1,7 @@
 mod db;
 mod key;
 mod store;
+mod tactic;
 
 use std::sync::OnceLock;
 
@@ -10,9 +11,9 @@ pub use db::{TuningDb, TuningDbHeader, TUNING_SCHEMA_V1};
 pub use key::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TuningDType,
 };
-pub use store::{
-    decode_cublaslt_custom_tactic, CublasLtCustomConfig, GemmTuningRecord, TacticBackend, TacticId,
-    TacticStore,
+pub use store::{GemmTuningRecord, TacticStore};
+pub use tactic::{
+    decode_cublaslt_custom_tactic, CublasLtCustomConfig, TacticBackend, TacticCandidate, TacticId,
 };
 
 /// Deterministic identity of the CUDA kernel build inputs and target arch.
