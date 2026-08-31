@@ -5,16 +5,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use half::{bf16, f16};
 use apxinf_core::{
-    Backend, DType, Device, Error, NormalGenerator, Result, SamplingBackend,
-    Tensor,
+    Backend, DType, Device, Error, NormalGenerator, Result, SamplingBackend, Tensor,
 };
+use half::{bf16, f16};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation,
-    PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
+    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
+    VisionObservation, VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
@@ -240,11 +239,10 @@ impl GraphVariant {
         patches: Option<&Tensor>,
     ) -> Result<()> {
         match (&observation.vision, self) {
-            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph
-                .update_inputs_without_noise(
-                    patches.expect("validated patches"),
-                    &observation.token_ids,
-                ),
+            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph.update_inputs_without_noise(
+                patches.expect("validated patches"),
+                &observation.token_ids,
+            ),
             (VisionObservation::Patches(_), Self::Bf16(graph)) => graph
                 .update_inputs_without_noise(
                     patches.expect("validated patches"),
@@ -255,12 +253,15 @@ impl GraphVariant {
                     patches.expect("validated patches"),
                     &observation.token_ids,
                 ),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => graph
-                .update_raw_image_inputs_without_noise(bytes, &observation.token_ids),
+            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
+            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
+            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => {
+                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            }
         }
     }
 }
@@ -285,6 +286,7 @@ pub struct Pi05PreparedInference {
     runtime: RuntimeVariant,
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
+    tuning_generation: u64,
 }
 
 impl Pi05PreparedInference {
@@ -391,6 +393,13 @@ impl PreparedInference for Pi05PreparedInference {
     }
 
     fn run(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        if matches!(&self.strategy, ExecStrategy::Graph(_))
+            && self.backend.context().tuning().generation() != self.tuning_generation
+        {
+            return Err(Error::Other(
+                "prepared PI0.5 graph is stale after a tactic update; prepare it again".into(),
+            ));
+        }
         let observation = request.observation;
         observation.validate()?;
         if !self.spec.matches(observation) {
@@ -472,6 +481,51 @@ where
 }
 
 impl Pi05VlaRuntime {
+    fn build_eager(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
+        spec.validate()?;
+        if spec.token_count > self.config.max_token_len {
+            return Err(Error::Other(format!(
+                "PI0.5 token count {} exceeds maximum {}",
+                spec.token_count, self.config.max_token_len
+            )));
+        }
+        let cuda = &*self.backend;
+        let raw_rgb = spec.image_layout.is_some();
+        let patches = self.backend.to_device(&Tensor::zeros(
+            patch_shape(&self.config),
+            self.runtime.captured_patch_dtype(raw_rgb),
+        ))?;
+        let noise = self.backend.to_device(&Tensor::zeros(
+            noise_shape(&self.config),
+            self.runtime.input_dtype(),
+        ))?;
+        let normal_generator = self.backend.create_normal_generator(noise.clone())?;
+        let token_ids = DeviceBuffer::alloc_zeros(spec.token_count * 4, cuda.device_id())
+            .map_err(Error::Cuda)?;
+        let raw_images = if raw_rgb {
+            Some(
+                DeviceBuffer::alloc_zeros(image_bytes(&self.config), cuda.device_id())
+                    .map_err(Error::Cuda)?,
+            )
+        } else {
+            None
+        };
+        Ok(Pi05PreparedInference {
+            spec: *spec,
+            backend: Arc::clone(&self.backend),
+            config: Arc::clone(&self.config),
+            runtime: self.runtime.clone(),
+            strategy: ExecStrategy::Eager(EagerInputs {
+                patches,
+                raw_images,
+                noise,
+                token_ids,
+            }),
+            normal_generator: RefCell::new(normal_generator),
+            tuning_generation: cuda.context().tuning().generation(),
+        })
+    }
+
     fn build_prepared(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
         spec.validate()?;
         if spec.token_count > self.config.max_token_len {
@@ -491,9 +545,7 @@ impl Pi05VlaRuntime {
         let noise = self
             .backend
             .to_device(&Tensor::zeros(noise_shape(&self.config), dtype))?;
-        let normal_generator = self
-            .backend
-            .create_normal_generator(noise.clone())?;
+        let normal_generator = self.backend.create_normal_generator(noise.clone())?;
         let token_ids = DeviceBuffer::alloc_zeros(spec.token_count * 4, cuda.device_id())
             .map_err(Error::Cuda)?;
 
@@ -525,6 +577,7 @@ impl Pi05VlaRuntime {
             runtime: self.runtime.clone(),
             strategy,
             normal_generator: RefCell::new(normal_generator),
+            tuning_generation: cuda.context().tuning().generation(),
         })
     }
 }
@@ -534,8 +587,30 @@ impl VlaRuntime for Pi05VlaRuntime {
         let observation = request.observation;
         observation.validate()?;
         let spec = observation.inference_spec();
+        let generation = self.backend.context().tuning().generation();
+        let needs_prepare =
+            self.prepared
+                .borrow()
+                .as_ref()
+                .map_or(true, |(cached_spec, prepared)| {
+                    *cached_spec != spec || prepared.tuning_generation != generation
+                });
+        if needs_prepare && self.backend.context().tuning().mode() == tuning::TuningMode::AutoTune {
+            // Only this eager traversal sees the real request. GEMM tuning is
+            // suppressed during the later placeholder prepare traversal.
+            let eager = self.build_eager(&spec)?;
+            let tuned_output = eager.run(request)?;
+            self.backend.synchronize()?;
+            drop(tuned_output);
+        }
         let prepared = {
             let mut cache = self.prepared.borrow_mut();
+            if cache.as_ref().is_some_and(|(cached_spec, prepared)| {
+                *cached_spec != spec
+                    || prepared.tuning_generation != self.backend.context().tuning().generation()
+            }) {
+                drop(cache.take());
+            }
             cached_or_build(&mut cache, spec, || self.build_prepared(&spec))?
         };
         prepared.run(request)
@@ -581,23 +656,11 @@ pub(super) fn load_registered(
             .then(|| existing(root.join("calibration.json")))
             .flatten()
     });
-    let tuning_path = options.tuning_path.clone().or_else(|| {
-        (synthetic.is_none())
-            .then(|| existing(root.join("tactics.json")))
-            .flatten()
-    });
     let precision = resolve_precision(
         options.precision,
         cuda.context().caps().sm,
-        calibration_path.is_some() && tuning_path.is_some(),
+        calibration_path.is_some(),
     );
-    let tuning_database = tuning_path
-        .as_deref()
-        .map(tuning::TuningDb::from_json_file)
-        .transpose()?;
-    if let Some(database) = tuning_database.as_ref() {
-        kernels::gemm::install_tuning_db(cuda.context(), database)?;
-    }
 
     let runtime = match precision {
         ModelPrecision::Fp8 => {
@@ -616,15 +679,6 @@ pub(super) fn load_registered(
                     &calibration,
                 )?)
             };
-            // A checkpoint-free synthetic load relies on the kernel's tactic
-            // fallback, so a tuning database is only required for real FP8 runs.
-            if synthetic.is_none() {
-                tuning_database.as_ref().ok_or_else(|| {
-                    Error::Other(
-                        "FP8 PI0.5 requires LoadOptions.tuning_path or tactics.json".into(),
-                    )
-                })?;
-            }
             let weights = Arc::new(StaticFp8Pi05Weights::from_host(
                 &host_weights,
                 &*backend,
@@ -685,10 +739,10 @@ pub(super) fn load_registered(
 fn resolve_precision(
     requested: ModelPrecision,
     sm: u32,
-    has_fp8_artifacts: bool,
+    has_fp8_calibration: bool,
 ) -> ModelPrecision {
     match requested {
-        ModelPrecision::Auto if sm >= 100 && has_fp8_artifacts => ModelPrecision::Fp8,
+        ModelPrecision::Auto if sm >= 100 && has_fp8_calibration => ModelPrecision::Fp8,
         ModelPrecision::Auto if (80..100).contains(&sm) => ModelPrecision::W8A8,
         ModelPrecision::Auto => ModelPrecision::Bf16,
         explicit => explicit,

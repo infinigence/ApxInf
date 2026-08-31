@@ -488,19 +488,32 @@ impl Pi05Int8CudaRuntime {
             self.config.cuda_graph_workspace_bytes_int8(token_count)?,
             self.ctx().device_id(),
         )?;
-        let eager_output = kernels::prepare_with_workspace(&workspace, || {
-            self.infer_captured_inputs(
-                &patches,
-                raw_images.as_ref(),
-                raw_image_layout,
-                token_ids,
-                token_count,
-                noise,
-                &styles,
-            )
-        })?;
-        backend.synchronize()?;
-        drop(eager_output);
+        let mut stable = false;
+        for _ in 0..4 {
+            let generation = self.ctx().tuning().generation();
+            let eager_output = kernels::prepare_with_workspace(&workspace, || {
+                self.infer_captured_inputs(
+                    &patches,
+                    raw_images.as_ref(),
+                    raw_image_layout,
+                    token_ids,
+                    token_count,
+                    noise,
+                    &styles,
+                )
+            })?;
+            backend.synchronize()?;
+            drop(eager_output);
+            if self.ctx().tuning().generation() == generation {
+                stable = true;
+                break;
+            }
+        }
+        if !stable {
+            return Err(Error::Other(
+                "GEMM tactic store did not stabilize before PI0.5 INT8 graph capture".into(),
+            ));
+        }
 
         backend.begin_capture()?;
         let output = match kernels::with_workspace(&workspace, || {

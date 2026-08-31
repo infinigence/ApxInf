@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use apxinf_core::{Error, Result};
 
@@ -44,6 +48,7 @@ struct ParsedGemmRecord {
     epilogue: Epilogue,
     workspace_limit: usize,
     tactic: TacticId,
+    implementation_version: Option<u32>,
     milliseconds: Option<f64>,
 }
 
@@ -124,6 +129,49 @@ impl TuningDb {
         TacticStore::from_gemm_records(self.build_records(caps, versions)?)
     }
 
+    pub fn header_for_cuda(
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+    ) -> TuningDbHeader {
+        TuningDbHeader {
+            schema: TUNING_SCHEMA_V1.into(),
+            // Kept as diagnostic provenance only. Compatibility is checked
+            // per provider through `implementation_version` below.
+            kernel_build_id: Some(super::KERNEL_BUILD_ID.into()),
+            device_name: Some(caps.device_name.clone()),
+            sm: Some(caps.sm),
+            cuda_version: Some(major_minor(&versions.cuda)),
+            cublas_version: Some(major_minor(&versions.cublas)),
+        }
+    }
+
+    /// Merge one exact winner with the latest on-disk database while holding
+    /// an inter-process lock, then atomically replace the JSON file.
+    pub fn merge_record_atomic(
+        path: &Path,
+        header: &TuningDbHeader,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+        record: GemmTuningRecord,
+    ) -> Result<TacticStore> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::Other(format!(
+                "create tuning directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let _lock = DatabaseLock::acquire(path)?;
+        let mut store = if path.is_file() {
+            Self::from_json_file(path)?.build_store(caps, versions)?
+        } else {
+            TacticStore::default()
+        };
+        store.upsert_gemm(record);
+        write_store_atomic(path, header, &store)?;
+        Ok(store)
+    }
+
     /// Materialize device-specific physical records. Callers loading several
     /// databases can merge their resulting stores before the one-time install.
     pub fn build_records(
@@ -131,15 +179,6 @@ impl TuningDb {
         caps: &CudaDeviceCaps,
         versions: &CudaLibraryVersions,
     ) -> Result<Vec<GemmTuningRecord>> {
-        if self.header.schema == TUNING_SCHEMA_V1
-            && self.header.device_name.as_deref() != Some(caps.device_name.as_str())
-        {
-            return Err(Error::Other(format!(
-                "tuning database targets GPU `{}`, current device is `{}`",
-                self.header.device_name.as_deref().unwrap_or("<missing>"),
-                caps.device_name
-            )));
-        }
         if let Some(sm) = self.header.sm {
             if sm != caps.sm {
                 return Err(Error::Other(format!(
@@ -148,24 +187,43 @@ impl TuningDb {
                 )));
             }
         }
-        if let Some(expected) = self.header.kernel_build_id.as_deref() {
-            let actual = super::KERNEL_BUILD_ID;
-            if expected != actual {
-                return Err(Error::Other(format!(
-                    "tuning database kernel build `{expected}` != current `{actual}`"
-                )));
-            }
-        }
-        validate_version("CUDA", self.header.cuda_version.as_deref(), &versions.cuda)?;
-        validate_version(
-            "cuBLAS",
+        // Device name and the global build id are provenance. They must not
+        // invalidate unrelated providers. SM and the schema are the
+        // database-wide compatibility boundary; library and kernel contract
+        // changes are rejected record-by-record below.
+        let cuda_compatible =
+            versions_compatible(self.header.cuda_version.as_deref(), versions.cuda.as_str());
+        let cublas_compatible = versions_compatible(
             self.header.cublas_version.as_deref(),
-            &versions.cublas,
-        )?;
+            versions.cublas.as_str(),
+        );
         let device = DeviceFingerprint::from(caps);
         Ok(self
             .records
             .iter()
+            .filter(|record| {
+                let implementation_compatible =
+                    record.implementation_version.map_or(true, |version| {
+                        version == record.tactic.backend.implementation_version()
+                    });
+                let library_compatible = match record.tactic.backend {
+                    TacticBackend::Cutlass
+                    | TacticBackend::CutlassFp8DualGeGlu
+                    | TacticBackend::CutlassBf16DualGeGluM522
+                    | TacticBackend::CutlassBf16DualGeGluM533 => cuda_compatible,
+                    TacticBackend::CublasLt
+                    | TacticBackend::CublasLtCustom
+                    | TacticBackend::CublasLtCustomBias
+                    | TacticBackend::CublasLtCustomSplitSerial
+                    | TacticBackend::CublasLtCustomSplitGeGluCutlass
+                    | TacticBackend::CublasLtCustomSplitGeGluCutlass2SmAuto
+                    | TacticBackend::CublasLtCustomSplitGeGluCutlass2SmStage3
+                    | TacticBackend::CublasLtCustomSplitGeGluCutlassM522Explicit2Sm
+                    | TacticBackend::CublasLtCustomSplitGeGluCutlassBf16
+                    | TacticBackend::Vendor => cuda_compatible && cublas_compatible,
+                };
+                implementation_compatible && library_compatible
+            })
             .map(|record| GemmTuningRecord {
                 key: GemmTuningKey {
                     op: record.op,
@@ -182,9 +240,164 @@ impl TuningDb {
                     workspace_limit: record.workspace_limit,
                 },
                 tactic: record.tactic,
+                implementation_version: record.implementation_version,
                 milliseconds: record.milliseconds,
             })
             .collect())
+    }
+}
+
+fn major_minor(version: &str) -> String {
+    version.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+fn versions_compatible(expected: Option<&str>, actual: &str) -> bool {
+    expected.map_or(true, |expected| {
+        major_minor(expected) == major_minor(actual)
+    })
+}
+
+fn write_store_atomic(path: &Path, header: &TuningDbHeader, store: &TacticStore) -> Result<()> {
+    let mut records = store.gemm_records().collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        (
+            left.key.op as u8,
+            left.key.device.sm,
+            left.key.device.multiprocessor_count,
+            left.key.m,
+            left.key.n,
+            left.key.k,
+            left.key.activation_dtype as u8,
+            left.key.weight_dtype as u8,
+            left.key.output_dtype as u8,
+            left.key.layout as u8,
+            left.key.scale_mode as u8,
+            left.key.epilogue as u8,
+        )
+            .cmp(&(
+                right.key.op as u8,
+                right.key.device.sm,
+                right.key.device.multiprocessor_count,
+                right.key.m,
+                right.key.n,
+                right.key.k,
+                right.key.activation_dtype as u8,
+                right.key.weight_dtype as u8,
+                right.key.output_dtype as u8,
+                right.key.layout as u8,
+                right.key.scale_mode as u8,
+                right.key.epilogue as u8,
+            ))
+            .then_with(|| left.key.workspace_limit.cmp(&right.key.workspace_limit))
+            .then_with(|| (left.tactic.backend as u8).cmp(&(right.tactic.backend as u8)))
+            .then_with(|| left.tactic.value.cmp(&right.tactic.value))
+    });
+    let records = records
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "key": super::report::key_json(&record.key),
+                "tactic": {
+                    "backend": super::report::backend_name(record.tactic.backend),
+                    "id": record.tactic.value,
+                    "implementation_version": record
+                        .implementation_version
+                        .unwrap_or_else(|| record.tactic.backend.implementation_version()),
+                },
+                "milliseconds": record.milliseconds,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut root = serde_json::json!({
+        "schema": header.schema,
+        "device_name": header.device_name,
+        "sm": header.sm,
+        "cuda_version": header.cuda_version,
+        "cublas_version": header.cublas_version,
+        "records": records,
+    });
+    if let Some(build_id) = header.kernel_build_id.as_deref() {
+        root["kernel_build_id"] = serde_json::json!(build_id);
+    }
+    write_json_atomic(path, &root)
+}
+
+pub(crate) fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        Error::Other(format!(
+            "create tuning directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tactics.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| Error::Other(format!("create {}: {error}", temporary.display())))?;
+        serde_json::to_writer_pretty(&mut file, value)
+            .map_err(|error| Error::Other(format!("encode {}: {error}", path.display())))?;
+        file.write_all(b"\n")
+            .and_then(|_| file.sync_all())
+            .map_err(|error| Error::Other(format!("flush {}: {error}", temporary.display())))?;
+        fs::rename(&temporary, path).map_err(|error| {
+            Error::Other(format!(
+                "replace {} with {}: {error}",
+                path.display(),
+                temporary.display()
+            ))
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub(crate) struct DatabaseLock {
+    path: PathBuf,
+}
+
+impl DatabaseLock {
+    pub(crate) fn acquire(database: &Path) -> Result<Self> {
+        let path = database.with_extension("json.lock");
+        for _ in 0..200 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id()).map_err(|error| {
+                        Error::Other(format!("write tuning lock {}: {error}", path.display()))
+                    })?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(Error::Other(format!(
+                        "create tuning lock {}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        Err(Error::Other(format!(
+            "timed out waiting for tuning lock {}",
+            path.display()
+        )))
+    }
+}
+
+impl Drop for DatabaseLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -213,46 +426,6 @@ fn validate_v1_header(header: &TuningDbHeader) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn validate_version(kind: &str, expected: Option<&str>, actual: &str) -> Result<()> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let expected = version_components(expected).ok_or_else(|| {
-        Error::Other(format!(
-            "tuning database has invalid {kind} version `{expected}`"
-        ))
-    })?;
-    let actual_components = version_components(actual).ok_or_else(|| {
-        Error::Other(format!(
-            "runtime returned invalid {kind} version `{actual}`"
-        ))
-    })?;
-    if actual_components.starts_with(&expected) {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "tuning database targets {kind} {}, current runtime is {actual}",
-            expected
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
-        )))
-    }
-}
-
-fn version_components(value: &str) -> Option<Vec<u32>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    value
-        .split('.')
-        .map(str::parse)
-        .collect::<std::result::Result<_, _>>()
-        .ok()
 }
 
 fn parse_v1_records(value: &serde_json::Value) -> Result<Vec<ParsedGemmRecord>> {
@@ -330,6 +503,12 @@ fn parse_v1_record(index: usize, value: &serde_json::Value) -> Result<ParsedGemm
             backend,
             value: tactic,
         },
+        implementation_version: record
+            .get("tactic")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|tactic| tactic.get("implementation_version"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok()),
         milliseconds: record
             .get("milliseconds")
             .and_then(serde_json::Value::as_f64),
@@ -368,12 +547,21 @@ fn parse_legacy_tactics(value: &serde_json::Value) -> Result<Vec<ParsedGemmRecor
             output_dtype: TuningDType::F16,
             layout: GemmLayout::RowMajor,
             scale_mode: ScaleMode::PerTensor,
-            epilogue: Epilogue::None,
+            // The legacy custom-bias records were measured on PI0.5's
+            // language down projection, whose physical contract includes
+            // both bias and residual. Preserve that meaning during migration
+            // instead of letting the record shadow a plain GEMM.
+            epilogue: if backend == TacticBackend::CublasLtCustomBias {
+                Epilogue::BiasResidual
+            } else {
+                Epilogue::None
+            },
             workspace_limit: usize::MAX,
             tactic: TacticId {
                 backend,
                 value: tactic,
             },
+            implementation_version: None,
             milliseconds: value
                 .get("milliseconds")
                 .and_then(serde_json::Value::as_f64),
@@ -529,7 +717,7 @@ fn validate_tactic(key: &str, backend: TacticBackend, tactic: i32) -> Result<()>
         TacticBackend::CutlassFp8DualGeGlu
         | TacticBackend::CutlassBf16DualGeGluM522
         | TacticBackend::CutlassBf16DualGeGluM533 => tactic == 0,
-        TacticBackend::Vendor => tactic >= 0,
+        TacticBackend::Vendor => tactic == 0,
     };
     if valid {
         Ok(())
@@ -572,6 +760,31 @@ mod tests {
     use super::*;
     use crate::device_caps::CudaArchFamily;
 
+    fn record(m: usize, tactic: i32, milliseconds: f64) -> GemmTuningRecord {
+        GemmTuningRecord {
+            key: GemmTuningKey {
+                op: GemmOp::Fp8F16,
+                device: DeviceFingerprint::from(&caps(87)),
+                m,
+                n: 1024,
+                k: 1024,
+                activation_dtype: TuningDType::F8E4M3,
+                weight_dtype: TuningDType::F8E4M3,
+                output_dtype: TuningDType::F16,
+                layout: GemmLayout::RowMajor,
+                scale_mode: ScaleMode::PerTensor,
+                epilogue: Epilogue::None,
+                workspace_limit: usize::MAX,
+            },
+            tactic: TacticId {
+                backend: TacticBackend::Cutlass,
+                value: tactic,
+            },
+            implementation_version: Some(TacticBackend::Cutlass.implementation_version()),
+            milliseconds: Some(milliseconds),
+        }
+    }
+
     fn caps(sm: u32) -> CudaDeviceCaps {
         CudaDeviceCaps {
             device_name: "test".into(),
@@ -602,6 +815,17 @@ mod tests {
         assert!(store
             .gemm_records()
             .all(|record| format!("{:?}", record.key).find("pi05").is_none()));
+    }
+
+    #[test]
+    fn migrates_legacy_custom_bias_as_bias_residual() {
+        let db = TuningDb::from_json_str(
+            r#"{"device":"Thor sm_110","tactics":{"fp8_f16_m522_n2048_k16384":{"backend":"cublaslt_custom_bias","tactic":18926998}}}"#,
+        )
+        .unwrap();
+        let store = db.build_store(&caps(110), &versions()).unwrap();
+        let record = store.gemm_records().next().unwrap();
+        assert_eq!(record.key.epilogue, Epilogue::BiasResidual);
     }
 
     #[test]
@@ -639,7 +863,7 @@ mod tests {
                         "epilogue":"bias",
                         "workspace_limit":4096
                     }},
-                    "tactic":{{"backend":"vendor","id":3}},
+                    "tactic":{{"backend":"vendor","id":0}},
                     "milliseconds":0.04
                 }}]
             }}"#,
@@ -665,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_declared_cuda_and_cublas_versions() {
+    fn treats_cuda_and_cublas_versions_as_provenance() {
         let database = |cuda: &str, cublas: &str| {
             format!(
                 r#"{{"schema":"apxinf.cuda.tuning.v1","kernel_build_id":"{}","device_name":"test","sm":87,"cuda_version":"{cuda}","cublas_version":"{cublas}","tactics":{{}}}}"#,
@@ -676,10 +900,16 @@ mod tests {
         assert!(compatible.build_store(&caps(87), &versions()).is_ok());
 
         let wrong_cuda = TuningDb::from_json_str(&database("13.0", "12.6.4")).unwrap();
-        assert!(wrong_cuda.build_store(&caps(87), &versions()).is_err());
+        assert!(wrong_cuda
+            .build_store(&caps(87), &versions())
+            .unwrap()
+            .is_empty());
 
         let wrong_cublas = TuningDb::from_json_str(&database("12.6", "12.7")).unwrap();
-        assert!(wrong_cublas.build_store(&caps(87), &versions()).is_err());
+        assert!(wrong_cublas
+            .build_store(&caps(87), &versions())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -689,6 +919,121 @@ mod tests {
         )
         .unwrap();
         assert!(db.build_store(&caps(87), &versions()).is_ok());
+    }
+
+    #[test]
+    fn kernel_build_id_is_provenance_only() {
+        let db = TuningDb::from_json_str(
+            r#"{
+                "schema":"apxinf.cuda.tuning.v1",
+                "kernel_build_id":"a-different-build",
+                "device_name":"test",
+                "sm":87,
+                "cuda_version":"12.6",
+                "cublas_version":"12.6.4",
+                "records":[
+                    {"key":{"op":"fp8_f16","m":8,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cutlass","id":0,"implementation_version":1},"milliseconds":0.1}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(db.build_store(&caps(87), &versions()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn implementation_version_invalidates_only_stale_records() {
+        let db = TuningDb::from_json_str(
+            r#"{
+                "schema":"apxinf.cuda.tuning.v1",
+                "device_name":"test",
+                "sm":87,
+                "cuda_version":"12.6",
+                "cublas_version":"12.6.4",
+                "records":[
+                    {"key":{"op":"fp8_f16","m":8,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cublaslt","id":0,"implementation_version":2},"milliseconds":0.1},
+                    {"key":{"op":"fp8_f16","m":9,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cutlass","id":0,"implementation_version":1},"milliseconds":0.1}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store = db.build_store(&caps(87), &versions()).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.gemm_records().next().unwrap().tactic.backend,
+            TacticBackend::Cutlass
+        );
+    }
+
+    #[test]
+    fn atomic_merge_appends_new_keys_and_deduplicates_existing_keys() {
+        let directory = std::env::temp_dir().join(format!(
+            "apxinf-tuning-db-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join("tactics.json");
+        let caps = caps(87);
+        let versions = versions();
+        let header = TuningDb::header_for_cuda(&caps, &versions);
+
+        assert_eq!(
+            TuningDb::merge_record_atomic(&path, &header, &caps, &versions, record(8, 1, 0.2))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            TuningDb::merge_record_atomic(&path, &header, &caps, &versions, record(9, 2, 0.3))
+                .unwrap()
+                .len(),
+            2
+        );
+        let merged =
+            TuningDb::merge_record_atomic(&path, &header, &caps, &versions, record(8, 3, 0.1))
+                .unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.lookup_gemm_exact(&record(8, 0, 0.0).key),
+            Some(TacticId {
+                backend: TacticBackend::Cutlass,
+                value: 3,
+            })
+        );
+
+        let persisted = TuningDb::from_json_file(&path).unwrap();
+        assert_eq!(
+            persisted.header.kernel_build_id.as_deref(),
+            Some(super::super::KERNEL_BUILD_ID)
+        );
+        assert_eq!(persisted.build_store(&caps, &versions).unwrap().len(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn library_change_invalidates_only_the_affected_provider_records() {
+        let db = TuningDb::from_json_str(
+            r#"{
+                "schema":"apxinf.cuda.tuning.v1",
+                "device_name":"old name",
+                "sm":87,
+                "cuda_version":"12.6",
+                "cublas_version":"13.0",
+                "records":[
+                    {"key":{"op":"fp8_f16","m":8,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cublaslt","id":0,"implementation_version":1},"milliseconds":0.1},
+                    {"key":{"op":"fp8_f16","m":9,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cutlass","id":0,"implementation_version":1},"milliseconds":0.1}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let store = db.build_store(&caps(87), &versions()).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.gemm_records().next().unwrap().tactic.backend,
+            TacticBackend::Cutlass
+        );
     }
 
     #[test]

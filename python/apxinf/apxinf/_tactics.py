@@ -1,4 +1,4 @@
-"""PI0.5 tactic routing for source-checkout Python deployments."""
+"""Hardware tactic-database routing for source-checkout deployments."""
 
 from __future__ import annotations
 
@@ -7,11 +7,10 @@ from pathlib import Path
 
 
 _DEFAULT_TACTICS = {
-    (87, "bf16"): "orin_sm87_bf16_v2_v3_h10_tactics.json",
-    (89, "bf16"): "rtx4090_sm89_bf16_v2_v3_h10_tactics.json",
-    (101, "fp8"): "thor_u_cutlass_tactics.json",
-    (110, "bf16"): "thor_sm110_bf16_v2_v3_h10_tactics.json",
-    (110, "fp8"): "thor_sm110_fp8_native_v2_v3_h10_tactics.json",
+    87: "orin-sm87",
+    89: "rtx4090-sm89",
+    101: "thor-sm101",
+    110: "thor-sm110",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[3]
 
@@ -53,6 +52,7 @@ def resolve_pi05_tactics(
     *,
     model_dir: Path | None = None,
     override: Path | None = None,
+    allow_missing: bool = False,
 ) -> Path | None:
     """Resolve explicit, checkpoint-local, then source-tree PI0.5 tactics."""
     if override is not None:
@@ -62,10 +62,10 @@ def resolve_pi05_tactics(
         if checkpoint_tactics.is_file():
             return checkpoint_tactics
     sm = cuda_sm(device)
-    filename = _DEFAULT_TACTICS.get((sm, precision))
-    if filename is None:
+    directory = _DEFAULT_TACTICS.get(sm)
+    if directory is None:
         return None
-    path = _SOURCE_ROOT / "configs" / "pi05" / filename
-    if not path.is_file():
-        raise FileNotFoundError(f"default tactics for SM{sm} {precision} are missing: {path}")
+    path = _SOURCE_ROOT / "configs" / "tuning" / "nvidia" / directory / "tactics.json"
+    if not path.is_file() and not allow_missing:
+        raise FileNotFoundError(f"default tactics for SM{sm} are missing: {path}")
     return path

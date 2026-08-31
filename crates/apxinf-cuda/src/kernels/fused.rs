@@ -8,11 +8,39 @@ use super::contracts::{
 };
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::tuning::{
+    DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TacticBackend,
+    TuningDType,
+};
 pub struct ResidualNormTensors {
     pub hidden: Tensor,
     pub normalized: Tensor,
 }
 use crate::workspace::{fp8_emulation_required, may_prepare_native_resources, output_buffer};
+
+pub(crate) fn fp8_fused_tuning_key(
+    ctx: &CudaContext,
+    m: usize,
+    n: usize,
+    k: usize,
+    output_dtype: TuningDType,
+    epilogue: Epilogue,
+) -> GemmTuningKey {
+    GemmTuningKey {
+        op: GemmOp::Fp8F16,
+        device: DeviceFingerprint::from(ctx.caps()),
+        m,
+        n,
+        k,
+        activation_dtype: TuningDType::F8E4M3,
+        weight_dtype: TuningDType::F8E4M3,
+        output_dtype,
+        layout: GemmLayout::RowMajor,
+        scale_mode: ScaleMode::PerTensor,
+        epilogue,
+        workspace_limit: usize::MAX,
+    }
+}
 
 /// FP8 GEMM with an FP16 bias epilogue and a graph-safe fallback.
 pub fn gemm_bias_fp8(
@@ -343,6 +371,36 @@ pub fn try_fp8_gemm_bias_f16(
         )));
     }
     let (m, k, n) = (a[0], a[1], b[1]);
+    let key = fp8_fused_tuning_key(ctx, m, n, k, TuningDType::F16, Epilogue::Bias);
+    let plan = super::gemm::resolve_fused_fp8_plan(
+        ctx,
+        &key,
+        DType::F16,
+        1.0,
+        || unsafe {
+            ffi::check_cublas(ffi::apxinf_static_prepare_fp8_gemm_bias_f16(
+                gpu_ptr(bias)?,
+                m as i32,
+                n as i32,
+                k as i32,
+            ))
+            .map_err(Error::Cuda)
+        },
+        |candidate_output| unsafe {
+            ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bias_f16(
+                gpu_ptr(activation)?,
+                gpu_ptr(weight)?,
+                gpu_ptr(bias)?,
+                candidate_output.ptr(),
+                m as i32,
+                n as i32,
+                k as i32,
+                activation_scale * weight_scale,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        },
+    )?;
     let output = f16_output(ctx, m, n)?;
     if may_prepare_native_resources() {
         let status = unsafe {
@@ -354,6 +412,9 @@ pub fn try_fp8_gemm_bias_f16(
             )
         };
         if status != ffi::CUBLAS_STATUS_SUCCESS {
+            if plan.tactic.backend != TacticBackend::Vendor {
+                ctx.gemm_plans().fallback(ctx, &key)?;
+            }
             return Ok(None);
         }
     }
@@ -371,6 +432,9 @@ pub fn try_fp8_gemm_bias_f16(
         )
     };
     if status != ffi::CUBLAS_STATUS_SUCCESS {
+        if plan.tactic.backend != TacticBackend::Vendor {
+            ctx.gemm_plans().fallback(ctx, &key)?;
+        }
         return Ok(None);
     }
     Ok(Some(make_gpu_tensor(
@@ -416,6 +480,38 @@ pub fn try_fp8_gemm_bias_gelu_e4m3(
         )));
     }
     let (m, k, n) = (a[0], a[1], b[1]);
+    let key = fp8_fused_tuning_key(ctx, m, n, k, TuningDType::F8E4M3, Epilogue::BiasGelu);
+    let plan = super::gemm::resolve_fused_fp8_plan(
+        ctx,
+        &key,
+        DType::F8E4M3,
+        output_scale,
+        || unsafe {
+            ffi::check_cublas(ffi::apxinf_static_prepare_fp8_gemm_bias_gelu_e4m3(
+                gpu_ptr(bias)?,
+                m as i32,
+                n as i32,
+                k as i32,
+                output_scale,
+            ))
+            .map_err(Error::Cuda)
+        },
+        |candidate_output| unsafe {
+            ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bias_gelu_e4m3(
+                gpu_ptr(activation)?,
+                gpu_ptr(weight)?,
+                gpu_ptr(bias)?,
+                candidate_output.ptr(),
+                m as i32,
+                n as i32,
+                k as i32,
+                activation_scale * weight_scale,
+                output_scale,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        },
+    )?;
     let output = output_buffer(ctx, m * n)?;
     if may_prepare_native_resources() {
         let status = unsafe {
@@ -428,6 +524,9 @@ pub fn try_fp8_gemm_bias_gelu_e4m3(
             )
         };
         if status != ffi::CUBLAS_STATUS_SUCCESS {
+            if plan.tactic.backend != TacticBackend::Vendor {
+                ctx.gemm_plans().fallback(ctx, &key)?;
+            }
             return Ok(None);
         }
     }
@@ -448,6 +547,9 @@ pub fn try_fp8_gemm_bias_gelu_e4m3(
     if status != ffi::CUBLAS_STATUS_SUCCESS {
         #[cfg(test)]
         eprintln!("fused FP8 GELU GEMM returned cuBLAS status {status}");
+        if plan.tactic.backend != TacticBackend::Vendor {
+            ctx.gemm_plans().fallback(ctx, &key)?;
+        }
         return Ok(None);
     }
     Ok(Some(make_gpu_tensor(
@@ -496,11 +598,42 @@ pub fn try_fp8_gemm_bias_residual_f16(
         )));
     }
     let (m, k, n) = (a[0], a[1], b[1]);
-    let output = output_buffer(ctx, m * n * DType::F16.size_in_bytes())?;
     let bias_pointer = match bias {
         Some(value) => gpu_ptr(value)?,
         None => std::ptr::null(),
     };
+    let key = fp8_fused_tuning_key(ctx, m, n, k, TuningDType::F16, Epilogue::BiasResidual);
+    let plan = super::gemm::resolve_fused_fp8_plan(
+        ctx,
+        &key,
+        DType::F16,
+        1.0,
+        || unsafe {
+            ffi::check_cublas(ffi::apxinf_static_prepare_fp8_gemm_bias_residual_f16(
+                bias_pointer,
+                m as i32,
+                n as i32,
+                k as i32,
+            ))
+            .map_err(Error::Cuda)
+        },
+        |candidate_output| unsafe {
+            ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bias_residual_f16(
+                gpu_ptr(activation)?,
+                gpu_ptr(weight)?,
+                bias_pointer,
+                gpu_ptr(residual)?,
+                candidate_output.ptr(),
+                m as i32,
+                n as i32,
+                k as i32,
+                activation_scale * weight_scale,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        },
+    )?;
+    let output = output_buffer(ctx, m * n * DType::F16.size_in_bytes())?;
     if may_prepare_native_resources() {
         let status = unsafe {
             ffi::apxinf_static_prepare_fp8_gemm_bias_residual_f16(
@@ -511,6 +644,9 @@ pub fn try_fp8_gemm_bias_residual_f16(
             )
         };
         if status != ffi::CUBLAS_STATUS_SUCCESS {
+            if plan.tactic.backend != TacticBackend::Vendor {
+                ctx.gemm_plans().fallback(ctx, &key)?;
+            }
             return Ok(None);
         }
     }
@@ -531,6 +667,9 @@ pub fn try_fp8_gemm_bias_residual_f16(
     if status != ffi::CUBLAS_STATUS_SUCCESS {
         #[cfg(test)]
         eprintln!("fused FP8 residual GEMM returned cuBLAS status {status}");
+        if plan.tactic.backend != TacticBackend::Vendor {
+            ctx.gemm_plans().fallback(ctx, &key)?;
+        }
         return Ok(None);
     }
     Ok(Some(make_gpu_tensor(

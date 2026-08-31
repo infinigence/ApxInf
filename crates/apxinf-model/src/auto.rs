@@ -46,6 +46,9 @@ pub struct LoadOptions {
     pub text_weight_dtype: Option<DType>,
     pub calibration_path: Option<PathBuf>,
     pub tuning_path: Option<PathBuf>,
+    /// Enable online GEMM autotuning from real inference requests. When false,
+    /// missing records resolve once to a safe inference fallback.
+    pub autotune: bool,
     /// Explicit architecture config, overriding any on-disk `config.json`.
     pub config: Option<Pi05Config>,
     /// When set, load deterministic random weights instead of a checkpoint.
@@ -229,6 +232,10 @@ impl AutoModel {
 
         register_builtin_models();
         let backend = create_backend(device)?;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
+            configure_cuda_tuning(cuda, path, options)?;
+        }
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
             Device::Cpu => None,
@@ -259,4 +266,51 @@ impl AutoModel {
         }
         Ok(loaded)
     }
+}
+
+#[cfg(feature = "cuda")]
+fn configure_cuda_tuning(
+    cuda: &apxinf_cuda::CudaBackend,
+    model_path: &Path,
+    options: &LoadOptions,
+) -> Result<()> {
+    use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
+
+    let default_paths = TuningPaths::for_cuda("configs/tuning", cuda.context().caps());
+    let model_root = if model_path.is_dir() {
+        model_path
+    } else {
+        model_path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let legacy_path = model_root.join("tactics.json");
+    let selected = match options.tuning_path.as_ref() {
+        Some(path) if path.is_file() => Some(path.clone()),
+        Some(_) if options.autotune => None,
+        Some(path) => Some(path.clone()),
+        None => default_paths
+            .tactics
+            .is_file()
+            .then(|| default_paths.tactics.clone())
+            .or_else(|| legacy_path.is_file().then_some(legacy_path)),
+    };
+    let database = selected
+        .as_deref()
+        .map(TuningDb::from_json_file)
+        .transpose()?;
+    let paths = options
+        .tuning_path
+        .clone()
+        .map(TuningPaths::from_tactics)
+        .unwrap_or(default_paths);
+    let mode = if options.autotune {
+        TuningMode::AutoTune
+    } else {
+        TuningMode::Inference
+    };
+    apxinf_cuda::kernels::gemm::configure_tuning(
+        cuda.context(),
+        mode,
+        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
+        Some(paths),
+    )
 }

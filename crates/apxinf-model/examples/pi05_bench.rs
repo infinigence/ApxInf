@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! pi05_bench <checkpoint-or-index|random> --dtype {bf16,fp8,int8}
-//!     [--calibration <json|uniform:SCALE>] [--tactics <json>]
+//!     [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune]
 //!     [--views N] [--image-size N] [--action-horizon N] [--action-dim N]
 //!     [--num-flow-steps N] [--max-token-len N]            (random-only overrides)
 //!     [--token-count T] [--iterations N] [--seed N]
@@ -658,6 +658,7 @@ struct Args {
     dtype: Dtype,
     calibration: Option<String>,
     tactics: Option<String>,
+    autotune: bool,
     views: Option<usize>,
     image_size: Option<usize>,
     action_horizon: Option<usize>,
@@ -689,6 +690,7 @@ impl Args {
         let mut dtype: Option<Dtype> = None;
         let mut calibration = None;
         let mut tactics = None;
+        let mut autotune = false;
         let mut views = None;
         let mut image_size = None;
         let mut action_horizon = None;
@@ -716,6 +718,7 @@ impl Args {
                     calibration = Some(expect_value(raw, &mut index, "--calibration")?)
                 }
                 "--tactics" => tactics = Some(expect_value(raw, &mut index, "--tactics")?),
+                "--autotune" => autotune = true,
                 "--views" => views = Some(expect_value(raw, &mut index, "--views")?.parse()?),
                 "--image-size" => {
                     image_size = Some(expect_value(raw, &mut index, "--image-size")?.parse()?)
@@ -782,6 +785,7 @@ impl Args {
             dtype,
             calibration,
             tactics,
+            autotune,
             views,
             image_size,
             action_horizon,
@@ -806,7 +810,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(&raw).map_err(|error| {
         format!(
             "{error}\nusage: {} <checkpoint-or-index|random> --dtype {{bf16,fp8,int8}} \
-             [--calibration <json|uniform:SCALE>] [--tactics <json>] [--views N] \
+             [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune] [--views N] \
              [--image-size N] [--action-horizon N] [--action-dim N] [--num-flow-steps N] \
              [--max-token-len N] [--token-count T] [--iterations N] [--seed N] \
              [--image-input patches|nhwc|nchw] [--reference <json>] [--min-cosine C] \
@@ -852,13 +856,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "a raw-image fixture cannot be validated against the zero-input reference".into(),
         );
     }
-    // BF16 and FP8 both use the exact-shape GEMM tactic store. Calibration is
-    // FP8-only, while the current INT8 path has no persisted tactic database.
+    // All GEMM precisions share the hardware tactic database; calibration is
+    // still specific to FP8 activations.
     if dtype != Dtype::Fp8 && args.calibration.is_some() {
         return Err("--calibration only applies to --dtype fp8".into());
-    }
-    if dtype == Dtype::Int8 && args.tactics.is_some() {
-        return Err("--tactics only applies to --dtype bf16 or fp8".into());
     }
 
     let config = if random {
@@ -903,10 +904,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BF16/FP8 tactics are optional: kernels retain their fallback route when no
     // tuning DB is installed. Supplying the production DB is required for a
     // benchmark that claims production routing.
-    if let Some(path) = args.tactics.as_ref() {
-        let tuning = apxinf_cuda::tuning::TuningDb::from_json_file(Path::new(path))?;
-        apxinf_cuda::kernels::gemm::install_tuning_db(backend.context(), &tuning)?;
-    }
+    let tuning_paths = args
+        .tactics
+        .as_deref()
+        .map(apxinf_cuda::tuning::TuningPaths::from_tactics)
+        .unwrap_or_else(|| {
+            apxinf_cuda::tuning::TuningPaths::for_cuda("configs/tuning", backend.context().caps())
+        });
+    let tuning = if tuning_paths.tactics.is_file() {
+        Some(apxinf_cuda::tuning::TuningDb::from_json_file(
+            &tuning_paths.tactics,
+        )?)
+    } else {
+        None
+    };
+    let tuning_mode = if args.autotune {
+        apxinf_cuda::tuning::TuningMode::AutoTune
+    } else {
+        apxinf_cuda::tuning::TuningMode::Inference
+    };
+    apxinf_cuda::kernels::gemm::configure_tuning(
+        backend.context(),
+        tuning_mode,
+        tuning.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
+        Some(tuning_paths),
+    )?;
 
     if random {
         eprintln!(

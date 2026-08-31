@@ -4,8 +4,8 @@ use apxinf_core::{Backend, Tensor};
 use half::bf16;
 
 use crate::tuning::{
-    lookup_gemm_exact, DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode,
-    TacticBackend, TuningDType,
+    DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TacticBackend,
+    TacticMatch, TuningDType,
 };
 use crate::CudaBackend;
 
@@ -50,7 +50,13 @@ fn persisted_bf16_cublaslt_tactic_matches_vendor() {
         epilogue: Epilogue::None,
         workspace_limit: usize::MAX,
     };
-    let tactic = lookup_gemm_exact(&key).expect("missing exact BF16 test tactic");
+    let resolved = backend
+        .context()
+        .tuning()
+        .lookup_gemm(&key)
+        .expect("missing exact BF16 test tactic");
+    assert_eq!(resolved.source, TacticMatch::Exact);
+    let tactic = resolved.tactic;
     assert_eq!(tactic.backend, TacticBackend::CublasLt);
     let actual = crate::kernels::gemm::bf16(backend.context(), &activation, &weight).unwrap();
 

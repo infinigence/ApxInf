@@ -35,6 +35,36 @@ pub struct TacticCandidate {
     pub tactic: TacticId,
 }
 
+impl TacticBackend {
+    /// Only provider identities whose meaning is shape-generic may be reused
+    /// through a bucket. Fully specified and fused tactics remain exact-only.
+    pub const fn bucket_eligible(self) -> bool {
+        matches!(self, Self::Cutlass | Self::CublasLt | Self::Vendor)
+    }
+
+    /// Compatibility revision for the provider implementation represented by
+    /// this backend. Bump only the affected family when its launch contract or
+    /// generated kernel changes; unrelated source edits keep all winners.
+    pub const fn implementation_version(self) -> u32 {
+        match self {
+            Self::Cutlass => 1,
+            Self::CublasLt => 1,
+            Self::CublasLtCustom => 1,
+            Self::CublasLtCustomBias => 1,
+            Self::CublasLtCustomSplitSerial => 1,
+            Self::CublasLtCustomSplitGeGluCutlass => 1,
+            Self::CublasLtCustomSplitGeGluCutlass2SmAuto => 1,
+            Self::CublasLtCustomSplitGeGluCutlass2SmStage3 => 1,
+            Self::CublasLtCustomSplitGeGluCutlassM522Explicit2Sm => 1,
+            Self::CutlassFp8DualGeGlu => 1,
+            Self::CutlassBf16DualGeGluM522 => 1,
+            Self::CutlassBf16DualGeGluM533 => 1,
+            Self::CublasLtCustomSplitGeGluCutlassBf16 => 1,
+            Self::Vendor => 1,
+        }
+    }
+}
+
 /// Decoded representation of a compact `cublaslt_custom` tactic id.
 ///
 /// Algorithm id 66, split-K=1, reduction=none, swizzle=0, and inner-shape=0

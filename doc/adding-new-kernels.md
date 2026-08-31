@@ -578,30 +578,43 @@ When adding persisted GEMM tactics, inspect and update as needed:
 
 ```text
 crates/apxinf-cuda/src/tuning/key.rs
+crates/apxinf-cuda/src/tuning/tactic.rs
 crates/apxinf-cuda/src/tuning/db.rs
 crates/apxinf-cuda/src/tuning/store.rs
+crates/apxinf-cuda/src/tuning/session.rs
+crates/apxinf-cuda/src/tuning/engine.rs
+crates/apxinf-cuda/src/tuning/report.rs
 crates/apxinf-cuda/src/tuning/mod.rs
-crates/apxinf-cuda/src/kernels/gemm/fp8.rs
-the corresponding tuning generator/tool
+crates/apxinf-cuda/src/kernels/gemm/plan.rs
+crates/apxinf-cuda/src/kernels/gemm/providers/
+the corresponding GEMM execution module
 ```
 
-Verify `GemmOp`, epilogue, layout, legal backend/tactic ranges, lookup semantics, and the database header. The database must also match the device name, SM, kernel build ID, and CUDA/cuBLAS versions. The current tuning store is installed globally; do not assume that a process can freely install multiple different stores.
+Verify `GemmOp`, epilogue, layout, legal backend/tactic ranges, lookup semantics,
+and the database header. Hardware databases live at
+`configs/tuning/<vendor>/<hardware>/tactics.json`. The schema and SM are hard
+compatibility boundaries. CUDA/cuBLAS versions selectively invalidate records
+that depend on those libraries. `kernel_build_id` is provenance only; a changed
+provider contract is invalidated through that provider's
+`implementation_version`. Each runtime owns its own `TuningSession`.
 
 Tuning workflow:
 
 ```text
 enumerate legal tactics
+→ execute into temporary output
+→ compare with the safe reference
 → warm up
 → time with CUDA events
-→ have the tuning tool or an independent test validate every tactic
 → select the fastest correct tactic
-→ persist backend + tactic ID
-→ look up according to backend rules
-  cuBLASLt: exact
-  CUTLASS: exact → compatible bucket → default
+→ atomically persist the Exact winner and report
+→ look up Exact → compatible Bucket → safe default
 ```
 
-The current low-level autotune APIs mainly measure time and reject tactics that fail to launch. They do not prove numerical correctness. The tuning tool or an independent test must explicitly compare every candidate against a reference.
+Autotuning runs only in an explicitly configured `AUTO_TUNE` session. An
+`INFERENCE` session never benchmarks or modifies the database. Resolve and
+prepare a plan before CUDA Graph capture; steady-state replay must not enter
+the executor, tuning store, provider, or mode-selection path.
 
 ## 10. Integrate the Model Runtime and Executor
 
@@ -631,8 +644,8 @@ Quantized models also need an artifact workflow:
 ```text
 generate and validate calibration data
 → convert and validate quantized weights, scale mode, and physical layout
-→ generate tactics on the target hardware and current kernel build
-→ verify artifacts against weights, device fingerprint, SM, build ID, and library versions
+→ generate tactics on the target hardware
+→ verify artifacts against weights, SM, provider implementation version, and relevant library versions
 → install the tuning store
 → create the runtime for the selected precision
 ```

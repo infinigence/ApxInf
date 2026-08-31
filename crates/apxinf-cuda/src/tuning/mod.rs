@@ -1,47 +1,25 @@
 mod db;
+mod engine;
 mod key;
+mod report;
 mod session;
 mod store;
 mod tactic;
 
-use std::sync::OnceLock;
-
-use apxinf_core::{Error, Result};
-
 pub use db::{TuningDb, TuningDbHeader, TUNING_SCHEMA_V1};
+pub(crate) use engine::outputs_are_close;
+pub use engine::{AutoTuneConfig, AutoTuneEngine, CandidateMeasurement, TuningOutcome};
 pub use key::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TuningDType,
 };
+pub use report::outcome_json;
 pub use session::{ResolvedTactic, TacticMatch, TuningMode, TuningPaths, TuningSession};
 pub use store::{GemmTuningRecord, TacticStore};
 pub use tactic::{
     decode_cublaslt_custom_tactic, CublasLtCustomConfig, TacticBackend, TacticCandidate, TacticId,
 };
 
-/// Deterministic identity of the CUDA kernel build inputs and target arch.
-/// Persisted tuning data must carry this exact value.
+/// Diagnostic identity of the CUDA kernel build inputs and target arch.
+/// It is recorded in reports but is intentionally not part of the hardware
+/// database path; unrelated source changes must not invalidate all tactics.
 pub const KERNEL_BUILD_ID: &str = env!("APXINF_KERNEL_BUILD_ID");
-
-static TACTIC_STORE: OnceLock<TacticStore> = OnceLock::new();
-
-pub fn install(store: TacticStore) -> Result<()> {
-    match TACTIC_STORE.set(store) {
-        Ok(()) => Ok(()),
-        Err(store) if TACTIC_STORE.get() == Some(&store) => Ok(()),
-        Err(_) => Err(Error::Other(
-            "a different CUDA tactic store is already installed".into(),
-        )),
-    }
-}
-
-pub fn installed() -> Option<&'static TacticStore> {
-    TACTIC_STORE.get()
-}
-
-pub fn lookup_gemm(key: &GemmTuningKey) -> Option<TacticId> {
-    installed()?.lookup_gemm(key)
-}
-
-pub fn lookup_gemm_exact(key: &GemmTuningKey) -> Option<TacticId> {
-    installed()?.lookup_gemm_exact(key)
-}

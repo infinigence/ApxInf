@@ -141,11 +141,16 @@ thread_local std::unordered_map<ResidualKey, ResidualPlan, ResidualHash>
 thread_local std::unordered_map<ResidualKey, ResidualPlan, ResidualHash>
     g_bias_plans;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_cublaslt_ranks;
+thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_bias_ranks;
+thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_gelu_ranks;
+thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_residual_ranks;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_bf16_ranks;
 thread_local std::unordered_map<ShapeKey, CustomAlgoConfig, ShapeHash>
     g_fp8_custom_algorithms;
 thread_local std::unordered_map<ShapeKey, CustomAlgoConfig, ShapeHash>
     g_fp8_bias_custom_algorithms;
+thread_local std::unordered_map<ShapeKey, CustomAlgoConfig, ShapeHash>
+    g_fp8_residual_custom_algorithms;
 thread_local std::unordered_map<ShapeKey, CustomAlgoConfig, ShapeHash>
     g_bf16_custom_algorithms;
 thread_local std::unordered_map<ShapeKey, CustomAlgoConfig, ShapeHash>
@@ -195,11 +200,28 @@ void invalidate_fp8_shape_plans(const ShapeKey& key) {
     destroy_plan(&plan_it->second);
     g_plans.erase(plan_it);
   }
+}
+
+void invalidate_fp8_split_plans(const ShapeKey& key) {
   auto split_it = g_fp8_split_plans.find(key);
   if (split_it != g_fp8_split_plans.end()) {
     destroy_plan(&split_it->second);
     g_fp8_split_plans.erase(split_it);
   }
+}
+
+void invalidate_fp8_bias_plans(const ShapeKey& key) {
+  for (auto it = g_bias_plans.begin(); it != g_bias_plans.end();) {
+    if (it->first.shape == key) {
+      destroy_residual_plan(&it->second);
+      it = g_bias_plans.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void invalidate_fp8_residual_plans(const ShapeKey& key) {
   for (auto it = g_residual_plans.begin(); it != g_residual_plans.end();) {
     if (it->first.shape == key) {
       destroy_residual_plan(&it->second);
@@ -208,10 +230,13 @@ void invalidate_fp8_shape_plans(const ShapeKey& key) {
       ++it;
     }
   }
-  for (auto it = g_bias_plans.begin(); it != g_bias_plans.end();) {
+}
+
+void invalidate_fp8_gelu_plans(const ShapeKey& key) {
+  for (auto it = g_gelu_plans.begin(); it != g_gelu_plans.end();) {
     if (it->first.shape == key) {
-      destroy_residual_plan(&it->second);
-      it = g_bias_plans.erase(it);
+      destroy_gelu_plan(&it->second);
+      it = g_gelu_plans.erase(it);
     } else {
       ++it;
     }
@@ -500,7 +525,8 @@ cublasStatus_t make_split_plan(
   return status;
 }
 
-cublasStatus_t make_gelu_plan(const ShapeKey& key, FusedGeluPlan* plan) {
+cublasStatus_t make_gelu_plan(
+    const ShapeKey& key, FusedGeluPlan* plan, int heuristic_rank = 0) {
   cublasStatus_t status = cublasLtMatmulDescCreate(
       &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -556,15 +582,16 @@ cublasStatus_t make_gelu_plan(const ShapeKey& key, FusedGeluPlan* plan) {
     cublasLtMatmulPreferenceDestroy(preference);
     return status;
   }
-  cublasLtMatmulHeuristicResult_t result{};
+  const int requested = heuristic_rank + 1;
+  std::vector<cublasLtMatmulHeuristicResult_t> results(requested);
   int returned = 0;
   status = cublasLtMatmulAlgoGetHeuristic(
       g_lt, plan->operation, plan->weight, plan->activation, plan->c,
-      plan->d, preference, 1, &result, &returned);
+      plan->d, preference, requested, results.data(), &returned);
   cublasLtMatmulPreferenceDestroy(preference);
-  if (status == CUBLAS_STATUS_SUCCESS && returned == 1 &&
-      result.state == CUBLAS_STATUS_SUCCESS) {
-    plan->algorithm = result.algo;
+  if (status == CUBLAS_STATUS_SUCCESS && returned > heuristic_rank &&
+      results[heuristic_rank].state == CUBLAS_STATUS_SUCCESS) {
+    plan->algorithm = results[heuristic_rank].algo;
     plan->has_algorithm = true;
   } else if (status == CUBLAS_STATUS_SUCCESS) {
     status = CUBLAS_STATUS_NOT_SUPPORTED;
@@ -573,7 +600,8 @@ cublasStatus_t make_gelu_plan(const ShapeKey& key, FusedGeluPlan* plan) {
 }
 
 cublasStatus_t make_residual_plan(
-    const ShapeKey& key, ResidualPlan* plan, int heuristic_rank = 0) {
+    const ShapeKey& key, ResidualPlan* plan, int heuristic_rank = 0,
+    const CustomAlgoConfig* custom = nullptr) {
   cublasStatus_t status = cublasLtMatmulDescCreate(
       &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -620,12 +648,11 @@ cublasStatus_t make_residual_plan(
       &bias_pointer, sizeof(bias_pointer));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
-  auto custom_it = g_fp8_bias_custom_algorithms.find(key);
-  if (custom_it != g_fp8_bias_custom_algorithms.end()) {
+  if (custom != nullptr) {
     status = configure_custom_algorithm(
         plan->operation, plan->weight, plan->activation, plan->output,
         CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16F,
-        custom_it->second, &plan->algorithm);
+        *custom, &plan->algorithm);
     if (status == CUBLAS_STATUS_SUCCESS) plan->has_algorithm = true;
     return status;
   }
@@ -729,7 +756,10 @@ cublasStatus_t prepare_gelu_plan(const GeluKey& key, float output_scale) {
   auto it = g_gelu_plans.find(key);
   if (it == g_gelu_plans.end()) {
     FusedGeluPlan plan;
-    status = make_gelu_plan(key.shape, &plan);
+    int heuristic_rank = 0;
+    auto rank_it = g_fp8_gelu_ranks.find(key.shape);
+    if (rank_it != g_fp8_gelu_ranks.end()) heuristic_rank = rank_it->second;
+    status = make_gelu_plan(key.shape, &plan, heuristic_rank);
     if (status != CUBLAS_STATUS_SUCCESS) {
       destroy_gelu_plan(&plan);
       return status;
@@ -754,7 +784,15 @@ cublasStatus_t prepare_residual_plan(const ResidualKey& key) {
   auto it = g_residual_plans.find(key);
   if (it == g_residual_plans.end()) {
     ResidualPlan plan;
-    status = make_residual_plan(key.shape, &plan, 0);
+    int heuristic_rank = 0;
+    auto rank_it = g_fp8_residual_ranks.find(key.shape);
+    if (rank_it != g_fp8_residual_ranks.end()) heuristic_rank = rank_it->second;
+    const CustomAlgoConfig* custom = nullptr;
+    auto custom_it = g_fp8_residual_custom_algorithms.find(key.shape);
+    if (custom_it != g_fp8_residual_custom_algorithms.end()) {
+      custom = &custom_it->second;
+    }
+    status = make_residual_plan(key.shape, &plan, heuristic_rank, custom);
     if (status != CUBLAS_STATUS_SUCCESS) {
       destroy_residual_plan(&plan);
       return status;
@@ -775,9 +813,14 @@ cublasStatus_t prepare_bias_plan(const ResidualKey& key) {
   if (it == g_bias_plans.end()) {
     ResidualPlan plan;
     int heuristic_rank = 0;
-    auto rank_it = g_cublaslt_ranks.find(key.shape);
-    if (rank_it != g_cublaslt_ranks.end()) heuristic_rank = rank_it->second;
-    status = make_residual_plan(key.shape, &plan, heuristic_rank);
+    auto rank_it = g_fp8_bias_ranks.find(key.shape);
+    if (rank_it != g_fp8_bias_ranks.end()) heuristic_rank = rank_it->second;
+    const CustomAlgoConfig* custom = nullptr;
+    auto custom_it = g_fp8_bias_custom_algorithms.find(key.shape);
+    if (custom_it != g_fp8_bias_custom_algorithms.end()) {
+      custom = &custom_it->second;
+    }
+    status = make_residual_plan(key.shape, &plan, heuristic_rank, custom);
     if (status != CUBLAS_STATUS_SUCCESS) {
       destroy_residual_plan(&plan);
       return status;
@@ -1298,10 +1341,34 @@ extern "C" int apxinf_static_set_cublaslt_gemm_heuristic(
       heuristic_rank >= 64) return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
   ShapeKey key{m, n, k};
   g_fp8_custom_algorithms.erase(key);
-  g_fp8_bias_custom_algorithms.erase(key);
-  g_fp8_split_custom_algorithms.erase(key);
   g_cublaslt_ranks[key] = heuristic_rank;
   invalidate_fp8_shape_plans(key);
+  return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+}
+
+extern "C" int apxinf_static_set_cublaslt_fp8_fused_heuristic(
+    int m, int n, int k, int epilogue, int heuristic_rank) {
+  if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||
+      heuristic_rank >= 64) return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  ShapeKey key{m, n, k};
+  switch (epilogue) {
+    case 1:
+      g_fp8_bias_custom_algorithms.erase(key);
+      g_fp8_bias_ranks[key] = heuristic_rank;
+      invalidate_fp8_bias_plans(key);
+      break;
+    case 2:
+      g_fp8_gelu_ranks[key] = heuristic_rank;
+      invalidate_fp8_gelu_plans(key);
+      break;
+    case 3:
+      g_fp8_residual_custom_algorithms.erase(key);
+      g_fp8_residual_ranks[key] = heuristic_rank;
+      invalidate_fp8_residual_plans(key);
+      break;
+    default:
+      return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  }
   return static_cast<int>(CUBLAS_STATUS_SUCCESS);
 }
 
@@ -1315,8 +1382,6 @@ extern "C" int apxinf_static_set_cublaslt_fp8_gemm_custom(
   }
   ShapeKey key{m, n, k};
   g_cublaslt_ranks.erase(key);
-  g_fp8_bias_custom_algorithms.erase(key);
-  g_fp8_split_custom_algorithms.erase(key);
   g_fp8_custom_algorithms[key] =
       CustomAlgoConfig{tile_id, custom_option, stages_id, cluster_shape_id};
   invalidate_fp8_shape_plans(key);
@@ -1337,12 +1402,9 @@ extern "C" int apxinf_static_set_cublaslt_fp8_gemm_split_custom(
     return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
   }
   ShapeKey key{m, n, k};
-  g_cublaslt_ranks.erase(key);
-  g_fp8_custom_algorithms.erase(key);
-  g_fp8_bias_custom_algorithms.erase(key);
   g_fp8_split_custom_algorithms[key] =
       CustomAlgoConfig{tile_id, custom_option, stages_id, cluster_shape_id};
-  invalidate_fp8_shape_plans(key);
+  invalidate_fp8_split_plans(key);
   cublasStatus_t status = prepare_split_gemm_plan(key, false);
   if (status != CUBLAS_STATUS_SUCCESS) {
     g_fp8_split_custom_algorithms.erase(key);
@@ -1351,7 +1413,7 @@ extern "C" int apxinf_static_set_cublaslt_fp8_gemm_split_custom(
 }
 
 extern "C" int apxinf_static_set_cublaslt_fp8_gemm_bias_custom(
-    int m, int n, int k, int tile_id, int custom_option,
+    int m, int n, int k, int epilogue, int tile_id, int custom_option,
     int stages_id, int cluster_shape_id) {
   if (m <= 0 || n <= 0 || k <= 0 || tile_id <= 0 || tile_id >= 1024 ||
       custom_option < 0 || custom_option >= 8 || stages_id <= 0 ||
@@ -1361,21 +1423,29 @@ extern "C" int apxinf_static_set_cublaslt_fp8_gemm_bias_custom(
   cublasStatus_t status = initialize();
   if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
   ShapeKey key{m, n, k};
-  g_cublaslt_ranks.erase(key);
-  g_fp8_custom_algorithms.erase(key);
-  g_fp8_split_custom_algorithms.erase(key);
-  g_fp8_bias_custom_algorithms[key] =
+  auto* ranks = epilogue == 1 ? &g_fp8_bias_ranks
+                              : epilogue == 3 ? &g_fp8_residual_ranks : nullptr;
+  auto* configs = epilogue == 1 ? &g_fp8_bias_custom_algorithms
+                                : epilogue == 3 ? &g_fp8_residual_custom_algorithms : nullptr;
+  if (ranks == nullptr || configs == nullptr)
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  ranks->erase(key);
+  (*configs)[key] =
       CustomAlgoConfig{tile_id, custom_option, stages_id, cluster_shape_id};
-  invalidate_fp8_shape_plans(key);
+  if (epilogue == 1) {
+    invalidate_fp8_bias_plans(key);
+  } else {
+    invalidate_fp8_residual_plans(key);
+  }
 
   // Validate the fully specified algorithm against the exact fused-bias
   // descriptor during startup. Unsupported configs fail closed before graph
   // capture; the real bias pointer is bound when its cached plan is prepared.
   ResidualPlan validation_plan;
-  status = make_residual_plan(key, &validation_plan);
+  status = make_residual_plan(key, &validation_plan, 0, &configs->at(key));
   destroy_residual_plan(&validation_plan);
   if (status != CUBLAS_STATUS_SUCCESS) {
-    g_fp8_bias_custom_algorithms.erase(key);
+    configs->erase(key);
   }
   return static_cast<int>(status);
 }

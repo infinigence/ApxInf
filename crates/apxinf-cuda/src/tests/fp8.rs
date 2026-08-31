@@ -15,6 +15,55 @@ use crate::kernels::quantization::*;
 use crate::workspace::{prepare_with_workspace, with_workspace, GraphWorkspace};
 use crate::{CudaArchFamily, CudaBackend};
 
+#[test]
+fn thor_database_resolves_custom_bias_residual_plan() {
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 110 {
+        return;
+    }
+    let key = crate::kernels::fused::fp8_fused_tuning_key(
+        backend.context(),
+        522,
+        2048,
+        16384,
+        crate::tuning::TuningDType::F16,
+        crate::tuning::Epilogue::BiasResidual,
+    );
+    let tactic = crate::tuning::TacticId {
+        backend: crate::tuning::TacticBackend::CublasLtCustomBias,
+        value: 18_926_998,
+    };
+    let store = crate::tuning::TacticStore::from_gemm_records([crate::tuning::GemmTuningRecord {
+        key: key.clone(),
+        tactic,
+        implementation_version: Some(tactic.backend.implementation_version()),
+        milliseconds: Some(0.144243),
+    }])
+    .unwrap();
+    backend
+        .context()
+        .install_tuning(crate::tuning::TuningSession::inference(store))
+        .unwrap();
+    let plan = backend
+        .context()
+        .gemm_plans()
+        .resolve(
+            backend.context(),
+            &key,
+            crate::tuning::TacticId {
+                backend: crate::tuning::TacticBackend::Vendor,
+                value: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(plan.source, crate::kernels::gemm::PlanSource::Exact);
+    assert_eq!(
+        plan.tactic.backend,
+        crate::tuning::TacticBackend::CublasLtCustomBias
+    );
+    assert_eq!(plan.tactic, tactic);
+}
+
 fn gpu_ptr(tensor: &Tensor) -> Result<*mut std::ffi::c_void> {
     Ok(CudaBuffer::from_tensor(tensor)
         .map_err(apxinf_core::Error::Cuda)?
@@ -517,6 +566,53 @@ fn fused_fp8_bias_matches_decomposed_path() {
         max_abs <= 0.01,
         "fused bias GEMM max abs error is {max_abs}"
     );
+}
+
+#[test]
+fn fused_fp8_bias_autotune_publishes_one_exact_key() {
+    const M: usize = 64;
+    const N: usize = 192;
+    const K: usize = 128;
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().arch_family != CudaArchFamily::Sm100 {
+        return;
+    }
+    crate::kernels::gemm::configure_tuning(
+        backend.context(),
+        crate::tuning::TuningMode::AutoTune,
+        &[],
+        None,
+    )
+    .unwrap();
+    let activation = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![M, K], &vec![0x38; M * K]).unwrap())
+        .unwrap();
+    let weight = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![K, N], &vec![0x30; K * N]).unwrap())
+        .unwrap();
+    let bias = backend
+        .to_device(&Tensor::from_f16(vec![N], &vec![f16::from_f32(0.25); N]).unwrap())
+        .unwrap();
+
+    try_fp8_gemm_bias_f16(backend.context(), &activation, &weight, &bias, 1.0, 1.0)
+        .unwrap()
+        .expect("Thor must expose the fused FP8 bias epilogue");
+    let key = crate::kernels::fused::fp8_fused_tuning_key(
+        backend.context(),
+        M,
+        N,
+        K,
+        crate::tuning::TuningDType::F16,
+        crate::tuning::Epilogue::Bias,
+    );
+    let first_generation = backend.context().tuning().generation();
+    assert_eq!(first_generation, 1);
+    assert!(backend.context().tuning().lookup_gemm_exact(&key).is_some());
+
+    try_fp8_gemm_bias_f16(backend.context(), &activation, &weight, &bias, 1.0, 1.0)
+        .unwrap()
+        .expect("cached fused FP8 bias plan must remain runnable");
+    assert_eq!(backend.context().tuning().generation(), first_generation);
 }
 
 #[test]

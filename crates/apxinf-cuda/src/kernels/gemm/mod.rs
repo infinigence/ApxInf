@@ -1,5 +1,7 @@
 mod bf16;
 mod fp8;
+mod plan;
+mod providers;
 mod w8a8;
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
@@ -8,23 +10,50 @@ use super::contracts::{checked_bytes, require_buffers, require_finite};
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
+use crate::tuning::{TacticStore, TuningDb, TuningMode, TuningPaths, TuningSession};
 
-pub use bf16::{
-    autotune_cublaslt_bf16, gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused,
-    Bf16AutotuneResult,
-};
-pub use fp8::autotune_cutlass_gemm_f16 as autotune_cutlass_fp8;
+pub(crate) use fp8::resolve_fused_plan as resolve_fused_fp8_plan;
+pub(crate) use plan::GemmPlanCache;
+pub use plan::{PlanSource, PreparedGemmPlan};
+
+pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
 #[cfg(test)]
 pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
 pub use fp8::{
-    autotune_cublaslt_gemm_f16 as autotune_cublaslt_fp8, cold_l2_tuning_metadata, exact_fp8_tactic,
-    gemm_fp8 as fp8, gemm_fp8_geglu_fused as fp8_geglu_fused, install_tuning_db,
-    install_tuning_dbs, native_fp8_gemm_supported as native_fp8_supported, ColdL2TuningMetadata,
-    CublasLtAlgorithmTiming, CutlassTacticTiming, Fp8WeightView,
+    exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_geglu_fused as fp8_geglu_fused,
+    native_fp8_gemm_supported as native_fp8_supported, Fp8WeightView,
 };
 #[cfg(test)]
 pub(crate) use w8a8::gemm_w8a8_with_preference;
 pub use w8a8::{gemm_w8a8 as w8a8, W8A8Layout, W8A8ScaleMode, W8A8WeightView};
+
+/// Validate and install a read-only tactic database before graph capture.
+pub fn install_tuning_db(ctx: &CudaContext, database: &TuningDb) -> Result<()> {
+    install_tuning_dbs(ctx, std::slice::from_ref(database))
+}
+
+/// Validate and merge databases before installing one runtime-owned session.
+pub fn install_tuning_dbs(ctx: &CudaContext, databases: &[TuningDb]) -> Result<()> {
+    configure_tuning(ctx, TuningMode::Inference, databases, None)
+}
+
+/// Configure tuning before model preparation. Provider-native plans are
+/// created lazily only for keys reached by the real workload, then retained by
+/// `GemmPlanCache`; a growing hardware database adds no unrelated startup work.
+pub fn configure_tuning(
+    ctx: &CudaContext,
+    mode: TuningMode,
+    databases: &[TuningDb],
+    paths: Option<TuningPaths>,
+) -> Result<()> {
+    let stores = databases
+        .iter()
+        .map(|database| database.build_store(ctx.caps(), ctx.library_versions()))
+        .collect::<Result<Vec<_>>>()?;
+    let store = TacticStore::merge(stores)?;
+    ctx.install_tuning(TuningSession::new(mode, store, paths))
+        .map_err(Error::Other)
+}
 
 pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if activation.dtype() != weight.dtype() {

@@ -26,7 +26,6 @@ mod int8_weights;
 mod math;
 #[cfg(feature = "cuda")]
 mod runtime;
-mod schedule;
 mod static_bf16_weights;
 #[cfg(feature = "cuda")]
 mod static_int8_weights;
@@ -74,7 +73,6 @@ pub use runtime::{
     upload_time_embeddings, Pi05ActivationScales, Pi05CapturedGraph, Pi05CudaRuntime,
     Pi05ImageLayout, PrefixKvCache,
 };
-pub use schedule::{GemmShape, Pi05ExecutionSchedule, Pi05Stage};
 pub use static_bf16_weights::{
     Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceLayerNorm, Bf16DeviceVisionBlock,
     StaticBf16Pi05Weights,

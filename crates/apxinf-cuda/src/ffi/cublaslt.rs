@@ -182,6 +182,13 @@ extern "C" {
         k: i32,
         heuristic_rank: i32,
     ) -> cublasStatus_t;
+    pub fn apxinf_static_set_cublaslt_fp8_fused_heuristic(
+        m: i32,
+        n: i32,
+        k: i32,
+        epilogue: i32,
+        heuristic_rank: i32,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_set_cublaslt_fp8_gemm_custom(
         m: i32,
         n: i32,
@@ -204,6 +211,7 @@ extern "C" {
         m: i32,
         n: i32,
         k: i32,
+        epilogue: i32,
         tile_id: i32,
         custom_option: i32,
         stages_id: i32,

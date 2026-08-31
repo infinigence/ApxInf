@@ -205,6 +205,13 @@ pub(crate) fn may_prepare_native_resources() -> bool {
     PREPARING.with(Cell::get) || ACTIVE_WORKSPACE.with(|active| active.get().is_null())
 }
 
+/// Whether execution is the synthetic eager traversal used only to prepare a
+/// graph workspace. Autotuning must wait for a real request instead of using
+/// these placeholder inputs.
+pub(crate) fn is_preparing_workspace() -> bool {
+    PREPARING.with(Cell::get)
+}
+
 pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();

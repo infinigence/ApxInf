@@ -19,14 +19,6 @@ default = []
 cuda = ["dep:apxinf-cuda"]
 
 [[example]]
-name = "pi05_bf16_tune"
-required-features = ["cuda"]
-
-[[example]]
-name = "pi05_cutlass_tune"
-required-features = ["cuda"]
-
-[[example]]
 name = "pi05_bench"
 required-features = ["cuda"]
 

@@ -2,13 +2,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use apxinf_core::{Error, Result};
 
+use crate::context::CudaLibraryVersions;
 use crate::device_caps::CudaDeviceCaps;
 
-use super::{GemmTuningKey, GemmTuningRecord, TacticId, TacticStore};
+use super::{GemmTuningKey, GemmTuningRecord, TacticId, TacticStore, TuningDb, TuningOutcome};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TuningMode {
@@ -46,6 +47,19 @@ impl TuningPaths {
             directory,
         }
     }
+
+    pub fn from_tactics(path: impl Into<PathBuf>) -> Self {
+        let tactics = path.into();
+        let directory = tactics
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Self {
+            report: directory.join("tuning_report.json"),
+            directory,
+            tactics,
+        }
+    }
 }
 
 /// Control-plane state owned by one CUDA runtime. GEMM plans retain the
@@ -54,6 +68,7 @@ impl TuningPaths {
 pub struct TuningSession {
     mode: TuningMode,
     store: RwLock<TacticStore>,
+    tune_lock: Mutex<()>,
     generation: AtomicU64,
     paths: Option<TuningPaths>,
 }
@@ -63,6 +78,7 @@ impl TuningSession {
         Self {
             mode,
             store: RwLock::new(store),
+            tune_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
             paths,
         }
@@ -93,13 +109,64 @@ impl TuningSession {
                 source: TacticMatch::Exact,
             })
             .or_else(|| {
-                store
-                    .lookup_gemm_bucket(key)
-                    .map(|tactic| ResolvedTactic {
-                        tactic,
-                        source: TacticMatch::Bucket,
-                    })
+                store.lookup_gemm_bucket(key).map(|tactic| ResolvedTactic {
+                    tactic,
+                    source: TacticMatch::Bucket,
+                })
             })
+    }
+
+    pub fn lookup_gemm_exact(&self, key: &GemmTuningKey) -> Option<TacticId> {
+        self.store.read().ok()?.lookup_gemm_exact(key)
+    }
+
+    /// Tune one exact miss from the real operands which triggered it. Calls
+    /// for the same runtime are serialized because native provider plan maps
+    /// are mutated while candidates are evaluated.
+    pub(crate) fn tune_gemm(
+        &self,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+        key: &GemmTuningKey,
+        tune: impl FnOnce(Option<TacticId>) -> Result<TuningOutcome>,
+    ) -> Result<ResolvedTactic> {
+        if self.mode != TuningMode::AutoTune {
+            return self.lookup_gemm(key).ok_or_else(|| {
+                Error::Other("cannot tune a missing tactic in INFERENCE mode".into())
+            });
+        }
+        let _guard = self
+            .tune_lock
+            .lock()
+            .map_err(|_| Error::Other("CUDA autotune lock is poisoned".into()))?;
+        if let Some(tactic) = self.lookup_gemm_exact(key) {
+            return Ok(ResolvedTactic {
+                tactic,
+                source: TacticMatch::Exact,
+            });
+        }
+        let preferred = self
+            .store
+            .read()
+            .map_err(|_| Error::Other("CUDA tactic store lock is poisoned".into()))?
+            .lookup_gemm_bucket(key);
+        let outcome = tune(preferred)?;
+        if outcome.winner.key != *key {
+            return Err(Error::Other(
+                "autotune outcome key does not match the requested GEMM".into(),
+            ));
+        }
+        self.publish_gemm_persisted(caps, versions, outcome.winner.clone())?;
+        if let Some(paths) = self.paths.as_ref() {
+            super::report::append_outcome(&paths.report, caps, versions, &outcome)?;
+        }
+        let tactic = self.lookup_gemm_exact(key).ok_or_else(|| {
+            Error::Other("persisted GEMM winner is missing after publication".into())
+        })?;
+        Ok(ResolvedTactic {
+            tactic,
+            source: TacticMatch::Exact,
+        })
     }
 
     pub fn snapshot(&self) -> Result<TacticStore> {
@@ -127,6 +194,38 @@ impl TuningSession {
         }
         Ok(changed)
     }
+
+    /// Publish and durably merge a winner into the hardware database. The
+    /// latest file is re-read while locked so concurrent model processes do
+    /// not discard one another's newly discovered exact keys.
+    pub fn publish_gemm_persisted(
+        &self,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+        record: GemmTuningRecord,
+    ) -> Result<bool> {
+        if self.mode != TuningMode::AutoTune {
+            return Err(Error::Other(
+                "cannot publish a tactic in INFERENCE mode".into(),
+            ));
+        }
+        let Some(paths) = self.paths.as_ref() else {
+            return self.publish_gemm(record);
+        };
+        let header = TuningDb::header_for_cuda(caps, versions);
+        let merged =
+            TuningDb::merge_record_atomic(&paths.tactics, &header, caps, versions, record)?;
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| Error::Other("CUDA tactic store lock is poisoned".into()))?;
+        if *store == merged {
+            return Ok(false);
+        }
+        *store = merged;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
 }
 
 fn hardware_directory_name(caps: &CudaDeviceCaps) -> String {
@@ -135,6 +234,8 @@ fn hardware_directory_name(caps: &CudaDeviceCaps) -> String {
         "thor".to_owned()
     } else if lower.contains("orin") {
         "orin".to_owned()
+    } else if lower.contains("4090") {
+        "rtx4090".to_owned()
     } else {
         lower
             .strip_prefix("nvidia ")
@@ -161,8 +262,7 @@ mod tests {
     use super::*;
     use crate::device_caps::CudaArchFamily;
     use crate::tuning::{
-        DeviceFingerprint, Epilogue, GemmLayout, GemmOp, ScaleMode, TacticBackend,
-        TuningDType,
+        DeviceFingerprint, Epilogue, GemmLayout, GemmOp, ScaleMode, TacticBackend, TuningDType,
     };
 
     fn caps(name: &str, sm: u32) -> CudaDeviceCaps {
@@ -203,6 +303,7 @@ mod tests {
                 backend: TacticBackend::Cutlass,
                 value: 3,
             },
+            implementation_version: Some(TacticBackend::Cutlass.implementation_version()),
             milliseconds: Some(0.1),
         }
     }
@@ -218,6 +319,14 @@ mod tests {
             paths.report,
             Path::new("configs/tuning/nvidia/thor-sm110/tuning_report.json")
         );
+        assert_eq!(
+            TuningPaths::for_cuda("configs/tuning", &caps("NVIDIA Jetson Orin", 87)).tactics,
+            Path::new("configs/tuning/nvidia/orin-sm87/tactics.json")
+        );
+        assert_eq!(
+            TuningPaths::for_cuda("configs/tuning", &caps("NVIDIA GeForce RTX 4090", 89)).tactics,
+            Path::new("configs/tuning/nvidia/rtx4090-sm89/tactics.json")
+        );
     }
 
     #[test]
@@ -231,6 +340,9 @@ mod tests {
         let session = TuningSession::new(TuningMode::AutoTune, TacticStore::default(), None);
         assert!(session.publish_gemm(record()).unwrap());
         assert_eq!(session.generation(), 1);
-        assert_eq!(session.lookup_gemm(&key()).unwrap().source, TacticMatch::Exact);
+        assert_eq!(
+            session.lookup_gemm(&key()).unwrap().source,
+            TacticMatch::Exact
+        );
     }
 }

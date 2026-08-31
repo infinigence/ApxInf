@@ -202,6 +202,7 @@ class Pi05Policy:
         precision: str = "auto",
         calibration=None,
         tactics=None,
+        autotune: bool = False,
         tokenizer_path=None,
         norm_key: str = "actions",
         action_dim: Optional[int] = None,
@@ -262,6 +263,7 @@ class Pi05Policy:
                 precision,
                 model_dir=model_dir,
                 override=Path(tactics) if tactics is not None else None,
+                allow_missing=bool(autotune),
             )
             model = apxinf_py.Model.load(
                 model_name,
@@ -270,6 +272,7 @@ class Pi05Policy:
                 precision=precision,
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
+                autotune=bool(autotune),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
                 **({"num_views": int(num_views)} if num_views is not None else {}),
                 sampling_seed=int(seed),

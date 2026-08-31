@@ -73,9 +73,8 @@ pi05/
   weights.rs             source checkpoint representation
   *_weights.rs           device/precision-specific weight forms
   math.rs                model mathematics without device ownership
-  schedule.rs            denoising/execution schedule
   *_executor.rs          one precision's layer composition
-  *_runtime.rs           device state, workspace and captured execution
+  *_runtime.rs           device state, denoising schedule, workspace and captured execution
   vla_runtime.rs         VlaRuntime adapter and registered loader
 ```
 

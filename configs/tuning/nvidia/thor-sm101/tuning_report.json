@@ -1,0 +1,533 @@
+{
+  "schema": "apxinf.cuda.tuning-report.v1",
+  "device_name": "Thor-U",
+  "sm": 101,
+  "cuda_version": "12.8",
+  "cublas_version": "12.8",
+  "kernel_build_id": null,
+  "imported_from": [
+    "configs/pi05/thor_u_cutlass_tactics.json"
+  ],
+  "runs": [
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 1,
+        "n": 1024,
+        "k": 1024,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.00736072
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 1,
+        "n": 3072,
+        "k": 1024,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.01091888
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 10,
+        "n": 1024,
+        "k": 32,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 1,
+        "milliseconds": 0.00692892
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 10,
+        "n": 1024,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.00931704
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 10,
+        "n": 1024,
+        "k": 4096,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.01331924
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 10,
+        "n": 2560,
+        "k": 1024,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.01065000
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 10,
+        "n": 8192,
+        "k": 1024,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 0,
+        "milliseconds": 0.01817964
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 512,
+        "n": 1152,
+        "k": 1152,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.01335628
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 512,
+        "n": 1152,
+        "k": 4304,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.03371000
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 512,
+        "n": 2048,
+        "k": 1152,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.01734072
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 512,
+        "n": 3456,
+        "k": 1152,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.02552484
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 512,
+        "n": 4304,
+        "k": 1152,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.02962332
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 522,
+        "n": 2048,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.02965184
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 522,
+        "n": 2048,
+        "k": 16384,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.18187408
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 522,
+        "n": 2560,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.03473816
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 522,
+        "n": 32768,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.45566592
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 712,
+        "n": 2048,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.02965188
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 712,
+        "n": 2048,
+        "k": 16384,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.19733924
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 712,
+        "n": 2560,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.03585224
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    },
+    {
+      "key": {
+        "op": "fp8_f16",
+        "device": {
+          "sm": 101,
+          "multiprocessor_count": 14
+        },
+        "m": 712,
+        "n": 32768,
+        "k": 2048,
+        "activation_dtype": "f8e4m3",
+        "weight_dtype": "f8e4m3",
+        "output_dtype": "f16",
+        "layout": "row_major",
+        "scale_mode": "per_tensor",
+        "epilogue": "none",
+        "workspace_limit": 18446744073709551615
+      },
+      "winner": {
+        "backend": "cutlass",
+        "id": 4,
+        "milliseconds": 0.44603852
+      },
+      "candidates": [],
+      "legacy_workloads": []
+    }
+  ]
+}

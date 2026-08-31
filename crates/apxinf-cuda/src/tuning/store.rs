@@ -3,12 +3,18 @@ use std::collections::HashMap;
 use apxinf_core::{Error, Result};
 
 use super::key::{GemmBucketKey, GemmTuningKey};
-use super::tactic::{TacticBackend, TacticId};
+use super::tactic::TacticId;
+
+#[cfg(test)]
+use super::tactic::TacticBackend;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GemmTuningRecord {
     pub key: GemmTuningKey,
     pub tactic: TacticId,
+    /// Missing on legacy records, which remain accepted. Newly generated
+    /// records carry the selected provider family's compatibility revision.
+    pub implementation_version: Option<u32>,
     pub milliseconds: Option<f64>,
 }
 
@@ -25,9 +31,11 @@ impl TacticStore {
         let mut bucket_gemm: HashMap<GemmBucketKey, GemmTuningRecord> = HashMap::new();
         for record in records {
             if let Some(existing) = exact_gemm.get(&record.key) {
-                if existing.tactic != record.tactic {
+                if existing.tactic != record.tactic
+                    && (existing.milliseconds.is_none() || record.milliseconds.is_none())
+                {
                     return Err(Error::Other(format!(
-                        "conflicting tuning records for {:?}",
+                        "conflicting unmeasured tuning records for {:?}",
                         record.key
                     )));
                 }
@@ -36,6 +44,9 @@ impl TacticStore {
                 }
             }
             exact_gemm.insert(record.key.clone(), record.clone());
+            if !record.tactic.backend.bucket_eligible() {
+                continue;
+            }
             let bucket = record.key.bucket();
             match bucket_gemm.get(&bucket) {
                 Some(existing) if !is_faster(&record, existing) => {}
@@ -50,8 +61,9 @@ impl TacticStore {
         })
     }
 
-    /// Merge records loaded from several validated databases. Identical exact
-    /// records are deduplicated; conflicting tactics for one physical key fail.
+    /// Merge records loaded from validated databases. Identical exact records
+    /// are deduplicated; measured conflicts keep the faster winner, while an
+    /// unmeasured conflict is rejected because it has no ordering evidence.
     pub fn merge(stores: impl IntoIterator<Item = Self>) -> Result<Self> {
         Self::from_gemm_records(
             stores
@@ -80,8 +92,10 @@ impl TacticStore {
     /// Add or replace one exact winner and rebuild the derived bucket index.
     /// Returns whether the store changed.
     pub fn upsert_gemm(&mut self, record: GemmTuningRecord) -> bool {
-        if self.exact_gemm.get(&record.key) == Some(&record) {
-            return false;
+        if let Some(existing) = self.exact_gemm.get(&record.key) {
+            if existing == &record || !is_faster(&record, existing) {
+                return false;
+            }
         }
         self.exact_gemm.insert(record.key.clone(), record);
         self.rebuild_buckets();
@@ -103,6 +117,9 @@ impl TacticStore {
     fn rebuild_buckets(&mut self) {
         self.bucket_gemm.clear();
         for record in self.exact_gemm.values() {
+            if !record.tactic.backend.bucket_eligible() {
+                continue;
+            }
             let bucket = record.key.bucket();
             match self.bucket_gemm.get(&bucket) {
                 Some(existing) if !is_faster(record, existing) => {}
@@ -154,6 +171,7 @@ mod tests {
                 backend: TacticBackend::Cutlass,
                 value,
             },
+            implementation_version: Some(TacticBackend::Cutlass.implementation_version()),
             milliseconds: Some(milliseconds),
         }
     }
@@ -168,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_deduplicates_equal_records_and_rejects_conflicts() {
+    fn merge_deduplicates_and_keeps_the_fastest_measured_winner() {
         let left = TacticStore::from_gemm_records([record(10, 1, 0.03)]).unwrap();
         let right = TacticStore::from_gemm_records([record(10, 1, 0.01)]).unwrap();
         let merged = TacticStore::merge([left, right]).unwrap();
@@ -176,7 +194,8 @@ mod tests {
 
         let left = TacticStore::from_gemm_records([record(10, 1, 0.03)]).unwrap();
         let conflict = TacticStore::from_gemm_records([record(10, 2, 0.01)]).unwrap();
-        assert!(TacticStore::merge([left, conflict]).is_err());
+        let merged = TacticStore::merge([left, conflict]).unwrap();
+        assert_eq!(merged.lookup_gemm_exact(&key(10)).unwrap().value, 2);
     }
 
     #[test]
@@ -186,5 +205,6 @@ mod tests {
         assert_eq!(store.lookup_gemm_exact(&key(10)).unwrap().value, 4);
         assert_eq!(store.lookup_gemm_bucket(&key(11)).unwrap().value, 4);
         assert!(!store.upsert_gemm(record(10, 4, 0.02)));
+        assert!(!store.upsert_gemm(record(10, 5, 0.04)));
     }
 }

@@ -1,9 +1,13 @@
 //! CUDA device and stream context.
 
+use std::sync::{Arc, RwLock};
+
 use crate::cublas::CublasHandle;
 use crate::device_caps::CudaDeviceCaps;
 use crate::ffi;
+use crate::kernels::gemm::GemmPlanCache;
 use crate::stream::CudaStream;
+use crate::tuning::{TacticStore, TuningSession};
 
 /// CUDA libraries whose versions constrain persisted tuning results.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +36,8 @@ pub struct CudaContext {
     cublas: CublasHandle,
     caps: CudaDeviceCaps,
     library_versions: CudaLibraryVersions,
+    tuning: RwLock<Arc<TuningSession>>,
+    gemm_plans: GemmPlanCache,
 }
 
 impl CudaContext {
@@ -53,6 +59,8 @@ impl CudaContext {
             cublas,
             caps,
             library_versions,
+            tuning: RwLock::new(Arc::new(TuningSession::inference(TacticStore::default()))),
+            gemm_plans: GemmPlanCache::default(),
         })
     }
 
@@ -70,6 +78,29 @@ impl CudaContext {
     }
     pub fn library_versions(&self) -> &CudaLibraryVersions {
         &self.library_versions
+    }
+
+    /// Runtime-owned tuning state. Cloning the `Arc` is limited to prepare
+    /// paths; captured graph replay never calls this method.
+    pub fn tuning(&self) -> Arc<TuningSession> {
+        self.tuning
+            .read()
+            .expect("CUDA tuning session lock is poisoned")
+            .clone()
+    }
+
+    /// Install the mode and immutable tactic snapshot before model prepare.
+    pub fn install_tuning(&self, session: TuningSession) -> Result<(), String> {
+        *self
+            .tuning
+            .write()
+            .map_err(|_| "CUDA tuning session lock is poisoned".to_string())? = Arc::new(session);
+        self.gemm_plans.clear().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn gemm_plans(&self) -> &GemmPlanCache {
+        &self.gemm_plans
     }
 
     pub fn synchronize(&self) -> Result<(), String> {

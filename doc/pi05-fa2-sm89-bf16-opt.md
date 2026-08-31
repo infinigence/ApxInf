@@ -147,8 +147,9 @@ Thor / SM100-family behavior is isolated:
   `APXINF_FA2_SM80`, so SM100 builds do not require the split-KV BF16 symbol;
 - the extra split-KV graph scratch is added only when runtime device caps report
   `CudaArchFamily::Sm80`;
-- only `configs/pi05/rtx4090_sm89_bf16_v2_v3_h10_tactics.json` was retuned.
-  Thor tactics files were not changed.
+- only the RTX 4090 records now stored in
+  `configs/tuning/nvidia/rtx4090-sm89/tactics.json` were retuned. Thor records
+  were not changed.
 
 The same optimization principle applies to other platforms: whenever the Pi0.5
 action decoder has a small query length and long KV cache, a split-KV attention

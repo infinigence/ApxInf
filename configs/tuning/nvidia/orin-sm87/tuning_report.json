@@ -1,16 +1,15 @@
 {
-  "cublas_version": "12.6.1",
-  "cuda_version": "12.6",
+  "schema": "apxinf.cuda.tuning-report.v1",
   "device_name": "Orin",
-  "records": [
+  "sm": 87,
+  "cuda_version": "12.6",
+  "cublas_version": "12.6.1",
+  "kernel_build_id": null,
+  "imported_from": [
+    "configs/pi05/orin_sm87_bf16_v2_v3_h10_tactics.json"
+  ],
+  "runs": [
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.020280536264181137,
-        "cublaslt_best_rank": 14,
-        "cublaslt_default_ms": 0.020502401515841484,
-        "cublaslt_returned_algorithms": 15,
-        "vendor_ms": 0.020409599939982096
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -22,10 +21,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.020280536264181137,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 14,
+        "milliseconds": 0.020280536264181137
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.020280536264181137,
+        "cublaslt_best_rank": 14,
+        "cublaslt_default_ms": 0.020502401515841484,
+        "cublaslt_returned_algorithms": 15,
+        "vendor_ms": 0.020409599939982096
+      },
+      "legacy_profiles": [
         "2v/t10/time.mlp_in",
         "2v/t10/time.mlp_out",
         "2v/t21/time.mlp_in",
@@ -42,20 +56,9 @@
         "3v/t50/time.mlp_out",
         "3v/t200/time.mlp_in",
         "3v/t200/time.mlp_out"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 14
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.049890123307704926,
-        "cublaslt_best_rank": 4,
-        "cublaslt_default_ms": 0.052005331963300705,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.052195199951529506
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -67,10 +70,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.049890123307704926,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.049890123307704926
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.049890123307704926,
+        "cublaslt_best_rank": 4,
+        "cublaslt_default_ms": 0.052005331963300705,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.052195199951529506
+      },
+      "legacy_profiles": [
         "2v/t10/action.ada_style",
         "2v/t21/action.ada_style",
         "2v/t50/action.ada_style",
@@ -79,20 +97,9 @@
         "3v/t21/action.ada_style",
         "3v/t50/action.ada_style",
         "3v/t200/action.ada_style"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 4
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.011157335713505745,
-        "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.011157335713505745,
-        "cublaslt_returned_algorithms": 1,
-        "vendor_ms": 0.011081600127120813
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -104,10 +111,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.011081600127120813,
-      "profiles": [
+      "winner": {
+        "backend": "vendor",
+        "id": 0,
+        "milliseconds": 0.011081600127120813
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.011157335713505745,
+        "cublaslt_best_rank": 0,
+        "cublaslt_default_ms": 0.011157335713505745,
+        "cublaslt_returned_algorithms": 1,
+        "vendor_ms": 0.011081600127120813
+      },
+      "legacy_profiles": [
         "2v/t10/action.output",
         "2v/t21/action.output",
         "2v/t50/action.output",
@@ -116,20 +138,9 @@
         "3v/t21/action.output",
         "3v/t50/action.output",
         "3v/t200/action.output"
-      ],
-      "tactic": {
-        "backend": "vendor",
-        "id": 0
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.0074965329840779305,
-        "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.009891198948025703,
-        "cublaslt_returned_algorithms": 6,
-        "vendor_ms": 0.009833599968502919
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -141,10 +152,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.0074965329840779305,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 1,
+        "milliseconds": 0.0074965329840779305
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.0074965329840779305,
+        "cublaslt_best_rank": 1,
+        "cublaslt_default_ms": 0.009891198948025703,
+        "cublaslt_returned_algorithms": 6,
+        "vendor_ms": 0.009833599968502919
+      },
+      "legacy_profiles": [
         "2v/t10/action.input",
         "2v/t21/action.input",
         "2v/t50/action.input",
@@ -153,20 +179,9 @@
         "3v/t21/action.input",
         "3v/t50/action.input",
         "3v/t200/action.input"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 1
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.034938666969537735,
-        "cublaslt_best_rank": 4,
-        "cublaslt_default_ms": 0.04842773452401161,
-        "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.048749866584936775
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -178,10 +193,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.034938666969537735,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.034938666969537735
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.034938666969537735,
+        "cublaslt_best_rank": 4,
+        "cublaslt_default_ms": 0.04842773452401161,
+        "cublaslt_returned_algorithms": 7,
+        "vendor_ms": 0.048749866584936775
+      },
+      "legacy_profiles": [
         "2v/t10/action.attention_out",
         "2v/t21/action.attention_out",
         "2v/t50/action.attention_out",
@@ -190,20 +220,9 @@
         "3v/t21/action.attention_out",
         "3v/t50/action.attention_out",
         "3v/t200/action.attention_out"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 4
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.06356373429298401,
-        "cublaslt_best_rank": 5,
-        "cublaslt_default_ms": 0.0741589367389679,
-        "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.07384426668286323
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -215,10 +234,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.06356373429298401,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 5,
+        "milliseconds": 0.06356373429298401
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.06356373429298401,
+        "cublaslt_best_rank": 5,
+        "cublaslt_default_ms": 0.0741589367389679,
+        "cublaslt_returned_algorithms": 7,
+        "vendor_ms": 0.07384426668286323
+      },
+      "legacy_profiles": [
         "2v/t10/action.down",
         "2v/t21/action.down",
         "2v/t50/action.down",
@@ -227,20 +261,9 @@
         "3v/t21/action.down",
         "3v/t50/action.down",
         "3v/t200/action.down"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 5
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.043978672474622726,
-        "cublaslt_best_rank": 4,
-        "cublaslt_default_ms": 0.04410773515701294,
-        "cublaslt_returned_algorithms": 5,
-        "vendor_ms": 0.04435840000708898
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -252,10 +275,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.043978672474622726,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.043978672474622726
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.043978672474622726,
+        "cublaslt_best_rank": 4,
+        "cublaslt_default_ms": 0.04410773515701294,
+        "cublaslt_returned_algorithms": 5,
+        "vendor_ms": 0.04435840000708898
+      },
+      "legacy_profiles": [
         "2v/t10/action.qkv",
         "2v/t21/action.qkv",
         "2v/t50/action.qkv",
@@ -264,20 +302,9 @@
         "3v/t21/action.qkv",
         "3v/t50/action.qkv",
         "3v/t200/action.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 4
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.11004374176263809,
-        "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 0.11004374176263809,
-        "cublaslt_returned_algorithms": 7,
-        "vendor_ms": 0.11040533358852068
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -289,10 +316,25 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.11004374176263809,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 0,
+        "milliseconds": 0.11004374176263809
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.11004374176263809,
+        "cublaslt_best_rank": 0,
+        "cublaslt_default_ms": 0.11004374176263809,
+        "cublaslt_returned_algorithms": 7,
+        "vendor_ms": 0.11040533358852068
+      },
+      "legacy_profiles": [
         "2v/t10/action.gate_up",
         "2v/t21/action.gate_up",
         "2v/t50/action.gate_up",
@@ -301,13 +343,31 @@
         "3v/t21/action.gate_up",
         "3v/t50/action.gate_up",
         "3v/t200/action.gate_up"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 0
-      }
+      ]
     },
     {
+      "key": {
+        "activation_dtype": "bf16",
+        "epilogue": "none",
+        "k": 588,
+        "layout": "row_major",
+        "m": 512,
+        "n": 1152,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
+      },
+      "winner": {
+        "backend": "vendor",
+        "id": 0,
+        "milliseconds": 0.06495466753840447
+      },
       "candidates": {
         "cublaslt_best_ms": 0.0651135966181755,
         "cublaslt_best_rank": 0,
@@ -315,10 +375,18 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.06495466753840447
       },
+      "legacy_profiles": [
+        "2v/t10/vision.patch",
+        "2v/t21/vision.patch",
+        "2v/t50/vision.patch",
+        "2v/t200/vision.patch"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 588,
+        "k": 1152,
         "layout": "row_major",
         "m": 512,
         "n": 1152,
@@ -326,21 +394,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.06495466753840447,
-      "profiles": [
-        "2v/t10/vision.patch",
-        "2v/t21/vision.patch",
-        "2v/t50/vision.patch",
-        "2v/t200/vision.patch"
-      ],
-      "tactic": {
-        "backend": "vendor",
-        "id": 0
-      }
-    },
-    {
+      "winner": {
+        "backend": "cublaslt",
+        "id": 1,
+        "milliseconds": 0.06203306466341019
+      },
       "candidates": {
         "cublaslt_best_ms": 0.06203306466341019,
         "cublaslt_best_rank": 1,
@@ -348,39 +412,14 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.07494826689362526
       },
-      "key": {
-        "activation_dtype": "bf16",
-        "epilogue": "none",
-        "k": 1152,
-        "layout": "row_major",
-        "m": 512,
-        "n": 1152,
-        "op": "bf16",
-        "output_dtype": "bf16",
-        "scale_mode": "none",
-        "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
-      },
-      "milliseconds": 0.06203306466341019,
-      "profiles": [
+      "legacy_profiles": [
         "2v/t10/vision.attention_out",
         "2v/t21/vision.attention_out",
         "2v/t50/vision.attention_out",
         "2v/t200/vision.attention_out"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 1
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.1811562478542328,
-        "cublaslt_best_rank": 2,
-        "cublaslt_default_ms": 0.19317331910133362,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.19310186554988226
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -392,28 +431,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.1811562478542328,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 2,
+        "milliseconds": 0.1811562478542328
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.1811562478542328,
+        "cublaslt_best_rank": 2,
+        "cublaslt_default_ms": 0.19317331910133362,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.19310186554988226
+      },
+      "legacy_profiles": [
         "2v/t10/vision.fc2",
         "2v/t21/vision.fc2",
         "2v/t50/vision.fc2",
         "2v/t200/vision.fc2"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 2
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.07815147191286087,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.13742509484291077,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.1379263997077942
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -425,28 +468,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.07815147191286087,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 7,
+        "milliseconds": 0.07815147191286087
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.07815147191286087,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.13742509484291077,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.1379263997077942
+      },
+      "legacy_profiles": [
         "2v/t10/vision.projector",
         "2v/t21/vision.projector",
         "2v/t50/vision.projector",
         "2v/t200/vision.projector"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 7
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.1363210678100586,
-        "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.16361278295516968,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.1636693333586057
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -458,28 +505,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.1363210678100586,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 3,
+        "milliseconds": 0.1363210678100586
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.1363210678100586,
+        "cublaslt_best_rank": 3,
+        "cublaslt_default_ms": 0.16361278295516968,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.1636693333586057
+      },
+      "legacy_profiles": [
         "2v/t10/vision.qkv",
         "2v/t21/vision.qkv",
         "2v/t50/vision.qkv",
         "2v/t200/vision.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 3
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.16870294511318207,
-        "cublaslt_best_rank": 3,
-        "cublaslt_default_ms": 0.2031295895576477,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.20364373326301574
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -491,21 +542,54 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.16870294511318207,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 3,
+        "milliseconds": 0.16870294511318207
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.16870294511318207,
+        "cublaslt_best_rank": 3,
+        "cublaslt_default_ms": 0.2031295895576477,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.20364373326301574
+      },
+      "legacy_profiles": [
         "2v/t10/vision.fc1",
         "2v/t21/vision.fc1",
         "2v/t50/vision.fc1",
         "2v/t200/vision.fc1"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 3
-      }
+      ]
     },
     {
+      "key": {
+        "activation_dtype": "bf16",
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 522,
+        "n": 2048,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
+      },
+      "winner": {
+        "backend": "cublaslt",
+        "id": 7,
+        "milliseconds": 0.17826135456562042
+      },
       "candidates": {
         "cublaslt_best_ms": 0.17826135456562042,
         "cublaslt_best_rank": 7,
@@ -513,10 +597,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.18543573369582494
       },
+      "legacy_profiles": [
+        "2v/t10/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 522,
         "n": 2048,
@@ -524,18 +613,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.17826135456562042,
-      "profiles": [
-        "2v/t10/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
-    },
-    {
+        "id": 6,
+        "milliseconds": 1.21048104763031
+      },
       "candidates": {
         "cublaslt_best_ms": 1.21048104763031,
         "cublaslt_best_rank": 6,
@@ -543,29 +631,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 1.924450127283732
       },
+      "legacy_profiles": [
+        "2v/t10/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 522,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.21048104763031,
-      "profiles": [
-        "2v/t10/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 6
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 0.22926504909992218
+      },
       "candidates": {
         "cublaslt_best_ms": 0.22926504909992218,
         "cublaslt_best_rank": 4,
@@ -573,29 +665,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.4067637344201406
       },
+      "legacy_profiles": [
+        "2v/t10/language.qkv"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
         "m": 522,
-        "n": 2560,
+        "n": 32768,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.22926504909992218,
-      "profiles": [
-        "2v/t10/language.qkv"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 1,
+        "milliseconds": 2.726210355758667
+      },
       "candidates": {
         "cublaslt_best_ms": 2.726210355758667,
         "cublaslt_best_rank": 1,
@@ -603,29 +699,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 4.486395708719889
       },
+      "legacy_profiles": [
+        "2v/t10/language.gate_up"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
-        "m": 522,
-        "n": 32768,
+        "m": 533,
+        "n": 2048,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 2.726210355758667,
-      "profiles": [
-        "2v/t10/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 1
-      }
-    },
-    {
+        "id": 6,
+        "milliseconds": 0.17778030037879944
+      },
       "candidates": {
         "cublaslt_best_ms": 0.17778030037879944,
         "cublaslt_best_rank": 6,
@@ -633,10 +733,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.18924053410689037
       },
+      "legacy_profiles": [
+        "2v/t21/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 533,
         "n": 2048,
@@ -644,18 +749,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.17778030037879944,
-      "profiles": [
-        "2v/t21/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 6
-      }
-    },
-    {
+        "id": 6,
+        "milliseconds": 1.2163445949554443
+      },
       "candidates": {
         "cublaslt_best_ms": 1.2163445949554443,
         "cublaslt_best_rank": 6,
@@ -663,29 +767,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 1.9403541366259256
       },
+      "legacy_profiles": [
+        "2v/t21/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 533,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.2163445949554443,
-      "profiles": [
-        "2v/t21/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 6
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 0.23032423853874207
+      },
       "candidates": {
         "cublaslt_best_ms": 0.23032423853874207,
         "cublaslt_best_rank": 4,
@@ -693,29 +801,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.4081226656834284
       },
+      "legacy_profiles": [
+        "2v/t21/language.qkv"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
         "m": 533,
-        "n": 2560,
+        "n": 32768,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.23032423853874207,
-      "profiles": [
-        "2v/t21/language.qkv"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 0,
+        "milliseconds": 2.746675968170166
+      },
       "candidates": {
         "cublaslt_best_ms": 2.746675968170166,
         "cublaslt_best_rank": 0,
@@ -723,29 +835,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 2.7475807825724283
       },
+      "legacy_profiles": [
+        "2v/t21/language.gate_up"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
-        "m": 533,
-        "n": 32768,
+        "m": 562,
+        "n": 2048,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 2.746675968170166,
-      "profiles": [
-        "2v/t21/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 0
-      }
-    },
-    {
+        "id": 6,
+        "milliseconds": 0.17883947491645813
+      },
       "candidates": {
         "cublaslt_best_ms": 0.17883947491645813,
         "cublaslt_best_rank": 6,
@@ -753,10 +869,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.19464960147937138
       },
+      "legacy_profiles": [
+        "2v/t50/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 562,
         "n": 2048,
@@ -764,18 +885,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.17883947491645813,
-      "profiles": [
-        "2v/t50/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 6
-      }
-    },
-    {
+        "id": 6,
+        "milliseconds": 1.2015348672866821
+      },
       "candidates": {
         "cublaslt_best_ms": 1.2015348672866821,
         "cublaslt_best_rank": 6,
@@ -783,29 +903,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 1.9808159947395325
       },
+      "legacy_profiles": [
+        "2v/t50/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 562,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.2015348672866821,
-      "profiles": [
-        "2v/t50/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 6
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 0.23134933412075043
+      },
       "candidates": {
         "cublaslt_best_ms": 0.23134933412075043,
         "cublaslt_best_rank": 4,
@@ -813,36 +937,11 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.41090773542722064
       },
-      "key": {
-        "activation_dtype": "bf16",
-        "epilogue": "none",
-        "k": 2048,
-        "layout": "row_major",
-        "m": 562,
-        "n": 2560,
-        "op": "bf16",
-        "output_dtype": "bf16",
-        "scale_mode": "none",
-        "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
-      },
-      "milliseconds": 0.23134933412075043,
-      "profiles": [
+      "legacy_profiles": [
         "2v/t50/language.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 4
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 2.690230369567871,
-        "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 2.690230369567871,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 2.693720555305481
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -854,25 +953,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 2.690230369567871,
-      "profiles": [
-        "2v/t50/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 0
-      }
+        "id": 0,
+        "milliseconds": 2.690230369567871
+      },
+      "candidates": {
+        "cublaslt_best_ms": 2.690230369567871,
+        "cublaslt_best_rank": 0,
+        "cublaslt_default_ms": 2.690230369567871,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 2.693720555305481
+      },
+      "legacy_profiles": [
+        "2v/t50/language.gate_up"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.1801130622625351,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.2116992175579071,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.21172159959872563
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -884,25 +987,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.1801130622625351,
-      "profiles": [
-        "2v/t200/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 0.1801130622625351
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.1801130622625351,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.2116992175579071,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.21172159959872563
+      },
+      "legacy_profiles": [
+        "2v/t200/language.attention_out"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 1.267266035079956,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 2.4204938411712646,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 2.4216074705123902
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -914,25 +1021,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.267266035079956,
-      "profiles": [
-        "2v/t200/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 1.267266035079956
+      },
+      "candidates": {
+        "cublaslt_best_ms": 1.267266035079956,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 2.4204938411712646,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 2.4216074705123902
+      },
+      "legacy_profiles": [
+        "2v/t200/language.down"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.23762564361095428,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.2552458643913269,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.25565333167711896
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -944,25 +1055,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.23762564361095428,
-      "profiles": [
-        "2v/t200/language.qkv"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 0.23762564361095428
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.23762564361095428,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.2552458643913269,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.25565333167711896
+      },
+      "legacy_profiles": [
+        "2v/t200/language.qkv"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 2.775639533996582,
-        "cublaslt_best_rank": 5,
-        "cublaslt_default_ms": 2.8793532848358154,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 2.88797120253245
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -974,25 +1089,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 2.775639533996582,
-      "profiles": [
-        "2v/t200/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 5
-      }
+        "id": 5,
+        "milliseconds": 2.775639533996582
+      },
+      "candidates": {
+        "cublaslt_best_ms": 2.775639533996582,
+        "cublaslt_best_rank": 5,
+        "cublaslt_default_ms": 2.8793532848358154,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 2.88797120253245
+      },
+      "legacy_profiles": [
+        "2v/t200/language.gate_up"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.07355199754238129,
-        "cublaslt_best_rank": 1,
-        "cublaslt_default_ms": 0.08504854887723923,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.0851072000960509
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1004,28 +1123,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.07355199754238129,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 1,
+        "milliseconds": 0.07355199754238129
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.07355199754238129,
+        "cublaslt_best_rank": 1,
+        "cublaslt_default_ms": 0.08504854887723923,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.0851072000960509
+      },
+      "legacy_profiles": [
         "3v/t10/vision.patch",
         "3v/t21/vision.patch",
         "3v/t50/vision.patch",
         "3v/t200/vision.patch"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 1
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.0773482620716095,
-        "cublaslt_best_rank": 6,
-        "cublaslt_default_ms": 0.10027306526899338,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.09948693340023358
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1037,28 +1160,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.0773482620716095,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 6,
+        "milliseconds": 0.0773482620716095
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.0773482620716095,
+        "cublaslt_best_rank": 6,
+        "cublaslt_default_ms": 0.10027306526899338,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.09948693340023358
+      },
+      "legacy_profiles": [
         "3v/t10/vision.attention_out",
         "3v/t21/vision.attention_out",
         "3v/t50/vision.attention_out",
         "3v/t200/vision.attention_out"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 6
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.237881600856781,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.309609591960907,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.3097472021977107
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1070,28 +1197,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.237881600856781,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 7,
+        "milliseconds": 0.237881600856781
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.237881600856781,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.309609591960907,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.3097472021977107
+      },
+      "legacy_profiles": [
         "3v/t10/vision.fc2",
         "3v/t21/vision.fc2",
         "3v/t50/vision.fc2",
         "3v/t200/vision.fc2"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 7
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.11477013677358627,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.14336107671260834,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.14351786623398463
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1103,28 +1234,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.11477013677358627,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 7,
+        "milliseconds": 0.11477013677358627
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.11477013677358627,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.14336107671260834,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.14351786623398463
+      },
+      "legacy_profiles": [
         "3v/t10/vision.projector",
         "3v/t21/vision.projector",
         "3v/t50/vision.projector",
         "3v/t200/vision.projector"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 7
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.198200523853302,
-        "cublaslt_best_rank": 4,
-        "cublaslt_default_ms": 0.2421461045742035,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.24178560028473536
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1136,28 +1271,32 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.198200523853302,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.198200523853302
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.198200523853302,
+        "cublaslt_best_rank": 4,
+        "cublaslt_default_ms": 0.2421461045742035,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.24178560028473536
+      },
+      "legacy_profiles": [
         "3v/t10/vision.qkv",
         "3v/t21/vision.qkv",
         "3v/t50/vision.qkv",
         "3v/t200/vision.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 4
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.2477664053440094,
-        "cublaslt_best_rank": 5,
-        "cublaslt_default_ms": 0.29932159185409546,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.3002549340327581
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1169,21 +1308,54 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.2477664053440094,
-      "profiles": [
+      "winner": {
+        "backend": "cublaslt",
+        "id": 5,
+        "milliseconds": 0.2477664053440094
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.2477664053440094,
+        "cublaslt_best_rank": 5,
+        "cublaslt_default_ms": 0.29932159185409546,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.3002549340327581
+      },
+      "legacy_profiles": [
         "3v/t10/vision.fc1",
         "3v/t21/vision.fc1",
         "3v/t50/vision.fc1",
         "3v/t200/vision.fc1"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 5
-      }
+      ]
     },
     {
+      "key": {
+        "activation_dtype": "bf16",
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 778,
+        "n": 2048,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
+      },
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.2224874645471573
+      },
       "candidates": {
         "cublaslt_best_ms": 0.2224874645471573,
         "cublaslt_best_rank": 4,
@@ -1191,10 +1363,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.23450453480084738
       },
+      "legacy_profiles": [
+        "3v/t10/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 778,
         "n": 2048,
@@ -1202,18 +1379,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.2224874645471573,
-      "profiles": [
-        "3v/t10/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 1.51486074924469
+      },
       "candidates": {
         "cublaslt_best_ms": 1.51486074924469,
         "cublaslt_best_rank": 4,
@@ -1221,29 +1397,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 2.635203202565511
       },
+      "legacy_profiles": [
+        "3v/t10/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 778,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.51486074924469,
-      "profiles": [
-        "3v/t10/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 5,
+        "milliseconds": 0.27757543325424194
+      },
       "candidates": {
         "cublaslt_best_ms": 0.27757543325424194,
         "cublaslt_best_rank": 5,
@@ -1251,29 +1431,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.29292053282260894
       },
+      "legacy_profiles": [
+        "3v/t10/language.qkv"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
         "m": 778,
-        "n": 2560,
+        "n": 32768,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.27757543325424194,
-      "profiles": [
-        "3v/t10/language.qkv"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 5
-      }
-    },
-    {
+        "id": 0,
+        "milliseconds": 3.310112953186035
+      },
       "candidates": {
         "cublaslt_best_ms": 3.310112953186035,
         "cublaslt_best_rank": 0,
@@ -1281,29 +1465,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 3.325986131032308
       },
+      "legacy_profiles": [
+        "3v/t10/language.gate_up"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
-        "m": 778,
-        "n": 32768,
+        "m": 789,
+        "n": 2048,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 3.310112953186035,
-      "profiles": [
-        "3v/t10/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 0
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 0.22168108820915222
+      },
       "candidates": {
         "cublaslt_best_ms": 0.22168108820915222,
         "cublaslt_best_rank": 4,
@@ -1311,10 +1499,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.23554773380359015
       },
+      "legacy_profiles": [
+        "3v/t21/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 789,
         "n": 2048,
@@ -1322,18 +1515,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.22168108820915222,
-      "profiles": [
-        "3v/t21/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 1.5144553184509277
+      },
       "candidates": {
         "cublaslt_best_ms": 1.5144553184509277,
         "cublaslt_best_rank": 4,
@@ -1341,29 +1533,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 2.6844618638356526
       },
+      "legacy_profiles": [
+        "3v/t21/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 789,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.5144553184509277,
-      "profiles": [
-        "3v/t21/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 5,
+        "milliseconds": 0.27764692902565
+      },
       "candidates": {
         "cublaslt_best_ms": 0.27764692902565,
         "cublaslt_best_rank": 5,
@@ -1371,29 +1567,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.29199253420035043
       },
+      "legacy_profiles": [
+        "3v/t21/language.qkv"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
         "m": 789,
-        "n": 2560,
+        "n": 32768,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.27764692902565,
-      "profiles": [
-        "3v/t21/language.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 5
-      }
-    },
-    {
+      "winner": {
+        "backend": "vendor",
+        "id": 0,
+        "milliseconds": 3.333339738845825
+      },
       "candidates": {
         "cublaslt_best_ms": 3.3379104137420654,
         "cublaslt_best_rank": 0,
@@ -1401,29 +1601,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 3.333339738845825
       },
+      "legacy_profiles": [
+        "3v/t21/language.gate_up"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
-        "m": 789,
-        "n": 32768,
+        "m": 818,
+        "n": 2048,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 3.333339738845825,
-      "profiles": [
-        "3v/t21/language.gate_up"
-      ],
-      "tactic": {
-        "backend": "vendor",
-        "id": 0
-      }
-    },
-    {
+      "winner": {
+        "backend": "cublaslt",
+        "id": 4,
+        "milliseconds": 0.22303465008735657
+      },
       "candidates": {
         "cublaslt_best_ms": 0.22303465008735657,
         "cublaslt_best_rank": 4,
@@ -1431,10 +1635,15 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.23712640007336935
       },
+      "legacy_profiles": [
+        "3v/t50/language.attention_out"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 2048,
+        "k": 16384,
         "layout": "row_major",
         "m": 818,
         "n": 2048,
@@ -1442,18 +1651,17 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.22303465008735657,
-      "profiles": [
-        "3v/t50/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 4,
+        "milliseconds": 1.5116106271743774
+      },
       "candidates": {
         "cublaslt_best_ms": 1.5116106271743774,
         "cublaslt_best_rank": 4,
@@ -1461,29 +1669,33 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 2.777837880452474
       },
+      "legacy_profiles": [
+        "3v/t50/language.down"
+      ]
+    },
+    {
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
-        "k": 16384,
+        "k": 2048,
         "layout": "row_major",
         "m": 818,
-        "n": 2048,
+        "n": 2560,
         "op": "bf16",
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.5116106271743774,
-      "profiles": [
-        "3v/t50/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 4
-      }
-    },
-    {
+        "id": 5,
+        "milliseconds": 0.27860477566719055
+      },
       "candidates": {
         "cublaslt_best_ms": 0.27860477566719055,
         "cublaslt_best_rank": 5,
@@ -1491,36 +1703,11 @@
         "cublaslt_returned_algorithms": 8,
         "vendor_ms": 0.2931189348300298
       },
-      "key": {
-        "activation_dtype": "bf16",
-        "epilogue": "none",
-        "k": 2048,
-        "layout": "row_major",
-        "m": 818,
-        "n": 2560,
-        "op": "bf16",
-        "output_dtype": "bf16",
-        "scale_mode": "none",
-        "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
-      },
-      "milliseconds": 0.27860477566719055,
-      "profiles": [
+      "legacy_profiles": [
         "3v/t50/language.qkv"
-      ],
-      "tactic": {
-        "backend": "cublaslt",
-        "id": 5
-      }
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 3.3684439659118652,
-        "cublaslt_best_rank": 0,
-        "cublaslt_default_ms": 3.3684439659118652,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 3.3645962476730347
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1532,25 +1719,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 3.3645962476730347,
-      "profiles": [
-        "3v/t50/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "vendor",
-        "id": 0
-      }
+        "id": 0,
+        "milliseconds": 3.3645962476730347
+      },
+      "candidates": {
+        "cublaslt_best_ms": 3.3684439659118652,
+        "cublaslt_best_rank": 0,
+        "cublaslt_default_ms": 3.3684439659118652,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 3.3645962476730347
+      },
+      "legacy_profiles": [
+        "3v/t50/language.gate_up"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.24060480296611786,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.25457388162612915,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.2547103981177012
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1562,25 +1753,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.24060480296611786,
-      "profiles": [
-        "3v/t200/language.attention_out"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 0.24060480296611786
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.24060480296611786,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.25457388162612915,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.2547103981177012
+      },
+      "legacy_profiles": [
+        "3v/t200/language.attention_out"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 1.6749345064163208,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 3.279991388320923,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 3.279645880063375
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1592,25 +1787,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 1.6749345064163208,
-      "profiles": [
-        "3v/t200/language.down"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 1.6749345064163208
+      },
+      "candidates": {
+        "cublaslt_best_ms": 1.6749345064163208,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 3.279991388320923,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 3.279645880063375
+      },
+      "legacy_profiles": [
+        "3v/t200/language.down"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 0.29696428775787354,
-        "cublaslt_best_rank": 7,
-        "cublaslt_default_ms": 0.3145813047885895,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 0.31439360082149503
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1622,25 +1821,29 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 0.29696428775787354,
-      "profiles": [
-        "3v/t200/language.qkv"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 7
-      }
+        "id": 7,
+        "milliseconds": 0.29696428775787354
+      },
+      "candidates": {
+        "cublaslt_best_ms": 0.29696428775787354,
+        "cublaslt_best_rank": 7,
+        "cublaslt_default_ms": 0.3145813047885895,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 0.31439360082149503
+      },
+      "legacy_profiles": [
+        "3v/t200/language.qkv"
+      ]
     },
     {
-      "candidates": {
-        "cublaslt_best_ms": 3.724682092666626,
-        "cublaslt_best_rank": 5,
-        "cublaslt_default_ms": 3.798823595046997,
-        "cublaslt_returned_algorithms": 8,
-        "vendor_ms": 3.8055253267288207
-      },
       "key": {
         "activation_dtype": "bf16",
         "epilogue": "none",
@@ -1652,34 +1855,27 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615
+        "workspace_limit": 18446744073709551615,
+        "device": {
+          "sm": 87,
+          "multiprocessor_count": 16
+        }
       },
-      "milliseconds": 3.724682092666626,
-      "profiles": [
-        "3v/t200/language.gate_up"
-      ],
-      "tactic": {
+      "winner": {
         "backend": "cublaslt",
-        "id": 5
-      }
+        "id": 5,
+        "milliseconds": 3.724682092666626
+      },
+      "candidates": {
+        "cublaslt_best_ms": 3.724682092666626,
+        "cublaslt_best_rank": 5,
+        "cublaslt_default_ms": 3.798823595046997,
+        "cublaslt_returned_algorithms": 8,
+        "vendor_ms": 3.8055253267288207
+      },
+      "legacy_profiles": [
+        "3v/t200/language.gate_up"
+      ]
     }
-  ],
-  "schema": "apxinf.cuda.tuning.v1",
-  "sm": 87,
-  "tuning_policy": {
-    "benchmark_iterations": 30,
-    "cache_state": "cold_l2",
-    "max_cublaslt_algorithms": 64,
-    "token_counts": [
-      10,
-      21,
-      50,
-      200
-    ],
-    "views": [
-      2,
-      3
-    ],
-    "warmup_iterations": 10
-  }
+  ]
 }

@@ -1,22 +1,14 @@
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
+use half::bf16;
 
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
 use crate::tuning::{
-    DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TacticBackend,
-    TuningDType,
+    AutoTuneConfig, AutoTuneEngine, CandidateMeasurement, DeviceFingerprint, Epilogue, GemmLayout,
+    GemmOp, GemmTuningKey, ScaleMode, TacticBackend, TacticId, TuningDType, TuningOutcome,
 };
 use crate::workspace::output_buffer;
-
-#[derive(Clone, Copy, Debug)]
-pub struct Bf16AutotuneResult {
-    pub heuristic_rank: i32,
-    pub returned_algorithms: i32,
-    pub vendor_ms: f64,
-    pub cublaslt_default_ms: f64,
-    pub cublaslt_best_ms: f64,
-}
 
 struct CudaEventPair {
     start: ffi::cudaEvent_t,
@@ -128,148 +120,6 @@ impl ColdL2Evictor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn benchmark_vendor_bf16(
-    ctx: &CudaContext,
-    activation: &CudaBuffer,
-    weight: &CudaBuffer,
-    output: &CudaBuffer,
-    m: usize,
-    n: usize,
-    k: usize,
-    warmup_iterations: usize,
-    benchmark_iterations: usize,
-) -> Result<f64> {
-    let mut evictor = ColdL2Evictor::new(ctx)?;
-    for _ in 0..warmup_iterations {
-        evictor.evict(ctx)?;
-        ctx.cublas()
-            .gemm(DType::BF16, m, n, k, 1.0, activation, weight, 0.0, output)
-            .map_err(Error::Cuda)?;
-    }
-    unsafe {
-        ffi::check_cuda(ffi::cudaStreamSynchronize(ctx.stream().handle())).map_err(Error::Cuda)?;
-    }
-    let events = CudaEventPair::new()?;
-    let mut milliseconds = 0.0;
-    for _ in 0..benchmark_iterations {
-        milliseconds += events.measure(ctx, &mut evictor, || {
-            ctx.cublas()
-                .gemm(DType::BF16, m, n, k, 1.0, activation, weight, 0.0, output)
-                .map_err(Error::Cuda)
-        })?;
-    }
-    Ok(milliseconds / benchmark_iterations as f64)
-}
-
-/// Cold-L2 exact-shape comparison of the production cuBLAS path and
-/// cuBLASLt heuristic candidates. Autotuning must run before graph capture.
-pub fn autotune_cublaslt_bf16(
-    ctx: &CudaContext,
-    activation: &Tensor,
-    weight: &Tensor,
-    max_algorithms: i32,
-    warmup_iterations: usize,
-    benchmark_iterations: usize,
-) -> Result<Bf16AutotuneResult> {
-    if max_algorithms <= 0 || max_algorithms > 64 {
-        return Err(Error::Other(format!(
-            "BF16 cuBLASLt max_algorithms must be in 1..=64, got {max_algorithms}"
-        )));
-    }
-    if benchmark_iterations == 0 {
-        return Err(Error::Other(
-            "BF16 autotune benchmark_iterations must be positive".into(),
-        ));
-    }
-    if activation.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
-        return Err(Error::Other(format!(
-            "BF16 autotune expects BF16 operands, got {} and {}",
-            activation.dtype(),
-            weight.dtype()
-        )));
-    }
-    let a = activation.shape().dims();
-    let b = weight.shape().dims();
-    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
-        return Err(Error::Other(format!(
-            "BF16 autotune shape mismatch: {a:?} @ {b:?}"
-        )));
-    }
-    let expected_device = Device::Cuda(ctx.device_id());
-    if activation.device() != expected_device || weight.device() != expected_device {
-        return Err(Error::DeviceMismatch {
-            expected: expected_device,
-            got: if activation.device() != expected_device {
-                activation.device()
-            } else {
-                weight.device()
-            },
-        });
-    }
-
-    let (m, k, n) = (a[0], a[1], b[1]);
-    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-    let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
-    let output = CudaBuffer::alloc_zeros(
-        m.checked_mul(n)
-            .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-            .ok_or_else(|| Error::Other("BF16 autotune output size overflow".into()))?,
-        ctx.device_id(),
-    )
-    .map_err(Error::Cuda)?;
-    let vendor_ms = benchmark_vendor_bf16(
-        ctx,
-        &activation,
-        &weight,
-        &output,
-        m,
-        n,
-        k,
-        warmup_iterations,
-        benchmark_iterations,
-    )?;
-    let mut did_tune = 0i32;
-    let mut returned_algorithms = 0i32;
-    let mut best_rank = -1i32;
-    let mut default_ms = 0.0f32;
-    let mut best_ms = 0.0f32;
-    unsafe {
-        ffi::check_cublas(ffi::apxinf_static_autotune_cublaslt_bf16_gemm(
-            activation.ptr(),
-            weight.ptr(),
-            output.ptr(),
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            max_algorithms,
-            warmup_iterations as i32,
-            benchmark_iterations as i32,
-            &mut did_tune,
-            &mut returned_algorithms,
-            &mut best_rank,
-            &mut default_ms,
-            &mut best_ms,
-            ctx.stream().handle(),
-        ))
-        .map_err(Error::Cuda)?;
-    }
-    if best_rank < 0 || returned_algorithms <= 0 {
-        return Err(Error::Other(
-            "BF16 cuBLASLt autotune returned no usable algorithm".into(),
-        ));
-    }
-    let _ = did_tune;
-    Ok(Bf16AutotuneResult {
-        heuristic_rank: best_rank,
-        returned_algorithms,
-        vendor_ms,
-        cublaslt_default_ms: f64::from(default_ms),
-        cublaslt_best_ms: f64::from(best_ms),
-    })
-}
-
 fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey {
     GemmTuningKey {
         op: GemmOp::Bf16,
@@ -285,6 +135,143 @@ fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey 
         epilogue: Epilogue::None,
         workspace_limit: usize::MAX,
     }
+}
+
+fn copy_bf16_output(output: &CudaBuffer, elements: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0u8; elements * DType::BF16.size_in_bytes()];
+    output.copy_to_host(&mut bytes).map_err(Error::Cuda)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|value| bf16::from_bits(u16::from_ne_bytes([value[0], value[1]])).to_f32())
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_tactic_bf16(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    tactic: TacticId,
+) -> Result<()> {
+    match tactic.backend {
+        TacticBackend::Vendor => ctx
+            .cublas()
+            .gemm(
+                DType::BF16,
+                key.m,
+                key.n,
+                key.k,
+                1.0,
+                activation,
+                weight,
+                0.0,
+                output,
+            )
+            .map_err(Error::Cuda),
+        TacticBackend::CublasLt => unsafe {
+            ffi::check_cublas(ffi::apxinf_static_bf16_gemm(
+                activation.ptr(),
+                weight.ptr(),
+                output.ptr(),
+                key.m as i32,
+                key.n as i32,
+                key.k as i32,
+                1.0,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        },
+        _ => Err(Error::Other(format!(
+            "BF16 online autotune cannot execute {tactic:?}"
+        ))),
+    }
+}
+
+fn prepare_tactic_bf16(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
+    super::providers::prepare(key, tactic)
+}
+
+fn autotune_request_bf16(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    preferred: Option<TacticId>,
+) -> Result<TuningOutcome> {
+    let elements = key
+        .m
+        .checked_mul(key.n)
+        .ok_or_else(|| Error::Other("BF16 autotune output size overflow".into()))?;
+    let bytes = elements
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("BF16 autotune output size overflow".into()))?;
+    let reference_output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    prepare_tactic_bf16(
+        key,
+        TacticId {
+            backend: TacticBackend::Vendor,
+            value: 0,
+        },
+    )?;
+    launch_tactic_bf16(
+        ctx,
+        key,
+        activation,
+        weight,
+        &reference_output,
+        TacticId {
+            backend: TacticBackend::Vendor,
+            value: 0,
+        },
+    )?;
+    ctx.synchronize().map_err(Error::Cuda)?;
+    let reference = copy_bf16_output(&reference_output, elements)?;
+    drop(reference_output);
+
+    let output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let events = CudaEventPair::new()?;
+    let mut evictor = ColdL2Evictor::new(ctx)?;
+    let engine = AutoTuneEngine::new(AutoTuneConfig::default())?;
+    let candidates = super::providers::candidates(key, 64)
+        .into_iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.tactic.backend,
+                TacticBackend::Vendor | TacticBackend::CublasLt
+            )
+        });
+    engine.tune_with_preferred(key, preferred, candidates, |candidate, config| {
+        prepare_tactic_bf16(key, candidate.tactic)?;
+        launch_tactic_bf16(ctx, key, activation, weight, &output, candidate.tactic)?;
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let actual = copy_bf16_output(&output, elements)?;
+        let correct = crate::tuning::outputs_are_close(&reference, &actual, 0.01, 0.9999);
+        if !correct {
+            return Ok(CandidateMeasurement {
+                tactic: candidate.tactic,
+                milliseconds: None,
+                correct: false,
+            });
+        }
+        for _ in 0..config.warmup_iterations {
+            evictor.evict(ctx)?;
+            launch_tactic_bf16(ctx, key, activation, weight, &output, candidate.tactic)?;
+        }
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let mut milliseconds = 0.0;
+        for _ in 0..config.benchmark_iterations {
+            milliseconds += events.measure(ctx, &mut evictor, || {
+                launch_tactic_bf16(ctx, key, activation, weight, &output, candidate.tactic)
+            })?;
+        }
+        Ok(CandidateMeasurement {
+            tactic: candidate.tactic,
+            milliseconds: Some(milliseconds / config.benchmark_iterations as f64),
+            correct: true,
+        })
+    })
 }
 
 pub(crate) fn set_cublaslt_gemm_heuristic(
@@ -351,6 +338,17 @@ pub(crate) fn set_cublaslt_gemm_split_custom(
     ffi::check_cublas(status).map_err(Error::Cuda)
 }
 
+pub(crate) fn prepare_cublaslt_gemm(m: usize, n: usize, k: usize, split: bool) -> Result<()> {
+    let status = unsafe {
+        if split {
+            ffi::apxinf_static_prepare_bf16_gemm_split(m as i32, n as i32, k as i32)
+        } else {
+            ffi::apxinf_static_prepare_bf16_gemm(m as i32, n as i32, k as i32)
+        }
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
 /// Physical BF16 GEMM contract: `[M,K] @ [K,N] -> [M,N]`.
 pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if activation.dtype() != DType::BF16 || weight.dtype() != DType::BF16 {
@@ -386,55 +384,60 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
     let output = output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
-    let persisted_tactic = crate::tuning::lookup_gemm_exact(&tuning_key(ctx, m, n, k));
-    let use_split_serial = persisted_tactic
-        .is_some_and(|tactic| tactic.backend == TacticBackend::CublasLtCustomSplitSerial);
-    let use_persisted_cublaslt = persisted_tactic.is_some_and(|tactic| {
-        matches!(
-            tactic.backend,
-            TacticBackend::CublasLt
-                | TacticBackend::CublasLtCustom
-                | TacticBackend::CublasLtCustomSplitSerial
-        )
-    });
+    let key = tuning_key(ctx, m, n, k);
+    let plan = ctx.gemm_plans().resolve_or_tune(
+        ctx,
+        &key,
+        super::plan::default_bf16_tactic(),
+        |preferred| autotune_request_bf16(ctx, &key, &activation, &weight, preferred),
+    )?;
+    let use_split_serial = plan.tactic.backend == TacticBackend::CublasLtCustomSplitSerial;
+    let use_persisted_cublaslt = matches!(
+        plan.tactic.backend,
+        TacticBackend::CublasLt
+            | TacticBackend::CublasLtCustom
+            | TacticBackend::CublasLtCustomSplitSerial
+    );
     if use_persisted_cublaslt {
-        if crate::workspace::may_prepare_native_resources() {
+        let tuned_result = (|| -> Result<()> {
             unsafe {
                 let status = if use_split_serial {
-                    ffi::apxinf_static_prepare_bf16_gemm_split(m as i32, n as i32, k as i32)
+                    crate::ffi::apxinf_static_bf16_gemm_split(
+                        activation.ptr(),
+                        weight.ptr(),
+                        output.ptr(),
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        1.0,
+                        ctx.stream().handle(),
+                    )
                 } else {
-                    ffi::apxinf_static_prepare_bf16_gemm(m as i32, n as i32, k as i32)
+                    crate::ffi::apxinf_static_bf16_gemm(
+                        activation.ptr(),
+                        weight.ptr(),
+                        output.ptr(),
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        1.0,
+                        ctx.stream().handle(),
+                    )
                 };
                 ffi::check_cublas(status).map_err(Error::Cuda)?;
             }
+            Ok(())
+        })();
+        match tuned_result {
+            Ok(()) => return Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16)),
+            Err(error) => {
+                eprintln!(
+                    "[apxinf] BF16 tactic {:?} failed for {key:?}: {error}; using vendor fallback",
+                    plan.tactic
+                );
+                ctx.gemm_plans().fallback(ctx, &key)?;
+            }
         }
-        unsafe {
-            let status = if use_split_serial {
-                crate::ffi::apxinf_static_bf16_gemm_split(
-                    activation.ptr(),
-                    weight.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    ctx.stream().handle(),
-                )
-            } else {
-                crate::ffi::apxinf_static_bf16_gemm(
-                    activation.ptr(),
-                    weight.ptr(),
-                    output.ptr(),
-                    m as i32,
-                    n as i32,
-                    k as i32,
-                    1.0,
-                    ctx.stream().handle(),
-                )
-            };
-            crate::ffi::check_cublas(status).map_err(Error::Cuda)?;
-        }
-        return Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16));
     }
     ctx.cublas()
         .gemm(
@@ -490,7 +493,26 @@ pub fn gemm_bf16_geglu_fused(
     }
 
     let (m, k, full_n) = (a[0], a[1], b[1]);
-    let fused_tactic = crate::tuning::lookup_gemm_exact(&tuning_key(ctx, m, full_n, k));
+    let key = tuning_key(ctx, m, full_n, k);
+    // Do not cache Bucket/Default from this optional fused probe. On an exact
+    // miss the caller falls back to the plain GEMM API, which must retain the
+    // opportunity to run AUTO_TUNE for this physical key.
+    let Some(exact_tactic) = ctx.tuning().lookup_gemm_exact(&key) else {
+        return Ok(None);
+    };
+    let fused_backend = matches!(
+        exact_tactic.backend,
+        TacticBackend::CublasLtCustomSplitGeGluCutlassBf16
+            | TacticBackend::CutlassBf16DualGeGluM522
+            | TacticBackend::CutlassBf16DualGeGluM533
+    );
+    if !fused_backend {
+        return Ok(None);
+    }
+    let plan = ctx
+        .gemm_plans()
+        .resolve(ctx, &key, super::plan::default_bf16_tactic())?;
+    let fused_tactic = (plan.source == super::plan::PlanSource::Exact).then_some(plan.tactic);
     let bf16_split_evt = fused_tactic
         .is_some_and(|tactic| tactic.backend == TacticBackend::CublasLtCustomSplitGeGluCutlassBf16);
     let bf16_dual_geglu_expected_m = fused_tactic.and_then(|tactic| match tactic.backend {
@@ -524,9 +546,7 @@ pub fn gemm_bf16_geglu_fused(
             got: selected_weight.device(),
         });
     }
-    if ctx.caps().sm == 89
-        && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048))
-    {
+    if ctx.caps().sm == 89 && ((full_n, k) == (8192, 1024) || (full_n, k) == (32768, 2048)) {
         let Some(sm89_weight) = bf16_sm89_geglu_interleaved else {
             return Ok(None);
         };
@@ -556,7 +576,9 @@ pub fn gemm_bf16_geglu_fused(
                 ctx,
                 m.checked_mul(n)
                     .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
-                    .ok_or_else(|| Error::Other("BF16 SM89 fused GeGLU output size overflow".into()))?,
+                    .ok_or_else(|| {
+                        Error::Other("BF16 SM89 fused GeGLU output size overflow".into())
+                    })?,
             )?;
             let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
             let weight_buffer = CudaBuffer::from_tensor(sm89_weight).map_err(Error::Cuda)?;
@@ -657,16 +679,6 @@ pub fn gemm_bf16_geglu_fused(
         )?;
         let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
         let weight_buffer = CudaBuffer::from_tensor(selected_weight).map_err(Error::Cuda)?;
-        if crate::workspace::may_prepare_native_resources() {
-            unsafe {
-                ffi::check_cublas(ffi::apxinf_static_prepare_bf16_gemm_split(
-                    m as i32,
-                    full_n as i32,
-                    k as i32,
-                ))
-                .map_err(Error::Cuda)?;
-            }
-        }
         unsafe {
             ffi::check_cublas(ffi::apxinf_static_bf16_gemm_split_first(
                 activation_buffer.ptr(),
