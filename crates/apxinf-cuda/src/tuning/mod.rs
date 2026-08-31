@@ -1,5 +1,6 @@
 mod db;
 mod key;
+mod session;
 mod store;
 mod tactic;
 
@@ -11,6 +12,7 @@ pub use db::{TuningDb, TuningDbHeader, TUNING_SCHEMA_V1};
 pub use key::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TuningDType,
 };
+pub use session::{ResolvedTactic, TacticMatch, TuningMode, TuningPaths, TuningSession};
 pub use store::{GemmTuningRecord, TacticStore};
 pub use tactic::{
     decode_cublaslt_custom_tactic, CublasLtCustomConfig, TacticBackend, TacticCandidate, TacticId,

@@ -71,6 +71,23 @@ impl TacticStore {
         self.exact_gemm.get(key).map(|record| record.tactic)
     }
 
+    pub fn lookup_gemm_bucket(&self, key: &GemmTuningKey) -> Option<TacticId> {
+        self.bucket_gemm
+            .get(&key.bucket())
+            .map(|record| record.tactic)
+    }
+
+    /// Add or replace one exact winner and rebuild the derived bucket index.
+    /// Returns whether the store changed.
+    pub fn upsert_gemm(&mut self, record: GemmTuningRecord) -> bool {
+        if self.exact_gemm.get(&record.key) == Some(&record) {
+            return false;
+        }
+        self.exact_gemm.insert(record.key.clone(), record);
+        self.rebuild_buckets();
+        true
+    }
+
     pub fn gemm_records(&self) -> impl Iterator<Item = &GemmTuningRecord> {
         self.exact_gemm.values()
     }
@@ -81,6 +98,19 @@ impl TacticStore {
 
     pub fn is_empty(&self) -> bool {
         self.exact_gemm.is_empty()
+    }
+
+    fn rebuild_buckets(&mut self) {
+        self.bucket_gemm.clear();
+        for record in self.exact_gemm.values() {
+            let bucket = record.key.bucket();
+            match self.bucket_gemm.get(&bucket) {
+                Some(existing) if !is_faster(record, existing) => {}
+                _ => {
+                    self.bucket_gemm.insert(bucket, record.clone());
+                }
+            }
+        }
     }
 }
 
@@ -147,5 +177,14 @@ mod tests {
         let left = TacticStore::from_gemm_records([record(10, 1, 0.03)]).unwrap();
         let conflict = TacticStore::from_gemm_records([record(10, 2, 0.01)]).unwrap();
         assert!(TacticStore::merge([left, conflict]).is_err());
+    }
+
+    #[test]
+    fn upsert_replaces_exact_and_rebuilds_bucket() {
+        let mut store = TacticStore::from_gemm_records([record(10, 1, 0.03)]).unwrap();
+        assert!(store.upsert_gemm(record(10, 4, 0.02)));
+        assert_eq!(store.lookup_gemm_exact(&key(10)).unwrap().value, 4);
+        assert_eq!(store.lookup_gemm_bucket(&key(11)).unwrap().value, 4);
+        assert!(!store.upsert_gemm(record(10, 4, 0.02)));
     }
 }
