@@ -23,7 +23,12 @@ from apxinf.adapters.lerobot import (
     IdentityProcessor,
     observation_to_apxinf,
 )
-from apxinf.processors import ProcessorStep, PromptTokenizer, Unnormalizer
+from apxinf.processors import (
+    GaussianNoise,
+    ProcessorStep,
+    PromptTokenizer,
+    Unnormalizer,
+)
 
 HORIZON = 10
 MODEL_DIM = 32
@@ -78,6 +83,12 @@ def build_policy() -> Pi05Policy:
         unnormalizer=Unnormalizer(
             q01=[-1.0] * LIBERO_DIM, q99=[1.0] * LIBERO_DIM, dims=LIBERO_DIM, eps=0.0
         ),
+        # Host-side noise, which the mock echoes back as the chunk. The queueing
+        # tests below need two things this gives them: rows that differ from each
+        # other (so "did the queue advance?" is answerable) and an RNG that moves
+        # per call (so "was it re-inferred?" is answerable). Without it the mock
+        # returns a constant chunk and those assertions cannot fail.
+        noise=GaussianNoise(HORIZON, MODEL_DIM, seed=0),
         image_keys=APXINF_KEYS,
     )
     return Pi05Policy(

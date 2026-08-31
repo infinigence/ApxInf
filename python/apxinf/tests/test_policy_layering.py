@@ -270,7 +270,9 @@ def test_reorder_independent_pre_steps_is_identical():
 
     model, in_pipe, out_pipe = make_parts()
     reordered = in_pipe.reorder(["tokenize", "image_stack"])
-    policy = Pi05Policy(model, input_pipeline=reordered, output_pipeline=out_pipe)
+    policy = Pi05Policy(
+        model, input_pipeline=reordered, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
     np.testing.assert_array_equal(policy.infer(obs)["actions"], baseline)
 
 
@@ -286,7 +288,9 @@ def test_insert_passthrough_step_does_not_change_result():
 
     model, in_pipe, out_pipe = make_parts()
     injected = in_pipe.insert_after("image_stack", ("noop", Passthrough()))
-    policy = Pi05Policy(model, input_pipeline=injected, output_pipeline=out_pipe)
+    policy = Pi05Policy(
+        model, input_pipeline=injected, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
     assert policy.metadata["input_pipeline"] == ["image_stack", "noop", "tokenize"]
     np.testing.assert_array_equal(policy.infer(obs)["actions"], baseline)
 
@@ -298,8 +302,11 @@ def test_explicit_host_sampler_remains_pluggable():
         tokenizer=ConstTokenizer(),
         unnormalizer=make_quantile_unnormalizer(),
         noise=GaussianNoise(HORIZON, MODEL_DIM, seed=7),
+        image_keys=DEFAULT_KEYS,
     )
-    policy = Pi05Policy(model, input_pipeline=in_pipe, output_pipeline=out_pipe)
+    policy = Pi05Policy(
+        model, input_pipeline=in_pipe, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    )
     assert policy.metadata["input_pipeline"] == ["image_stack", "tokenize", "sample_noise"]
     result = policy.infer(make_obs())
     assert result["noise"] is not None
@@ -312,7 +319,9 @@ def test_default_vs_explicitly_built_pipeline_are_bit_identical():
     default = build_policy().infer(obs)
 
     model, in_pipe, out_pipe = make_parts()
-    explicit = Pi05Policy(model, input_pipeline=in_pipe, output_pipeline=out_pipe).infer(obs)
+    explicit = Pi05Policy(
+        model, input_pipeline=in_pipe, output_pipeline=out_pipe, image_keys=DEFAULT_KEYS
+    ).infer(obs)
     np.testing.assert_array_equal(default["actions"], explicit["actions"])
     np.testing.assert_array_equal(default["normalized_actions"], explicit["normalized_actions"])
     np.testing.assert_array_equal(default["token_ids"], explicit["token_ids"])

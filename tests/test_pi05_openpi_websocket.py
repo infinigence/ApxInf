@@ -27,6 +27,9 @@ from apxinf.serving.websocket import health_check  # noqa: E402
 HORIZON = 10
 MODEL_DIM = 32
 LIBERO_DIM = 7
+# The wire keys a LIBERO client puts on the socket. The model layer no longer
+# guesses them, so the test has to name them the way a real deployment does.
+LIBERO_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
 IMAGE_SIZE = 224
 NUM_VIEWS = 2
 
@@ -79,12 +82,16 @@ def build_policy() -> Pi05Policy:
     q99 = q01 + 2
     model = MockModel()
     input_pipeline, output_pipeline = Pi05Policy.default_pipelines(
-        model, tokenizer=ConstTokenizer(), unnormalizer=Unnormalizer(q01=q01, q99=q99)
+        model,
+        tokenizer=ConstTokenizer(),
+        unnormalizer=Unnormalizer(q01=q01, q99=q99),
+        image_keys=LIBERO_IMAGE_KEYS,
     )
     return Pi05Policy(
         model,
         input_pipeline=input_pipeline,
         output_pipeline=output_pipeline,
+        image_keys=LIBERO_IMAGE_KEYS,
         metadata={"precision": "int8", "protocol": "openpi.websocket_policy"},
     )
 
