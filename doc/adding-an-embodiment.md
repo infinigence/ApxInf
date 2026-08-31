@@ -294,6 +294,8 @@ MY_ARM = Embodiment(
     name="myarm",
     num_cameras=2,
     action_dim=7,               # None keeps full width when an encode step truncates
+    state_dim=8,                # how wide norm_stats["state"] has to be
+    action_width=7,             # how wide norm_stats["actions"] has to be
     builder=build_my_robot_policy,   # omit for the stock policy
     builder_kwargs={},          # constants the builder always receives
 )
@@ -331,6 +333,26 @@ duplicate wire keys and more keys than there are view slots;
 with the body's. Slot names are *derived* from `image_keys` in order, so "base +
 right wrist" is not expressible at all — a checkpoint fills view slots from 0 up,
 and the only way to spell "wrist camera only" is to put it in slot 0.
+
+**Fill in `state_dim` and `action_width`.** They are the only thing that lets
+the startup preflight (Step 6) tell your robot's `norm_stats.json` from some
+other robot's — leave them `None` and that check silently does nothing. They are
+two fields rather than one because a robot's state and action spaces need not
+match: LIBERO is 8-dim state / 7-dim EEF-delta action. `action_width` exists
+separately from `action_dim` because the two answer different questions —
+`action_dim` is a *loading* knob ("trim the model down to this"), `action_width`
+is a fact about the body ("this is how many columns its actions have"). A preset
+whose encode step owns the 32→N truncation sets `action_dim=None`, and `None` is
+not a width: G1 declares `action_dim=None, action_width=16`.
+
+**Set `norm_dtype="float64"` in `builder_kwargs` if the checkpoint came from
+openpi.** openpi parses `norm_stats.json` into float64 and never demotes it, so
+its whole chain runs in float64 whatever dtype the robot sends. Ours follows the
+input. The difference is ~1e-7 and invisible on the output side, but a robot that
+discretizes state into its prompt compares the normalized value against bin edges
+1/128 apart, and an element near an edge crosses it — different prompt, different
+tokens, different rollout. It is a per-body flag rather than a global default so
+that presets nobody has re-benchmarked keep their existing numbers exactly.
 
 Add an entry to `ROBOT_ALIASES` if a deployment already says something else in
 its launch scripts; a rename should not break a running system.
@@ -372,6 +394,33 @@ run on CPU with a mock model — no GPU, no checkpoint:
 python3 tests/test_robot_presets.py          # no GPU needed
 ```
 
+### Step 6 — check the preflight refuses the wrong checkpoint
+
+A preset and a checkpoint directory are two independent claims about the same
+robot, and until the preflight existed nothing compared them. `--robot myarm`
+pointed at another robot's checkpoint loads, serves, and returns well-shaped
+actions in a plausible numeric range that mean nothing; the only symptom is that
+the model "got worse". Run it against your checkpoint before you serve it:
+
+```bash
+python3 scripts/openpi_metadata_to_apxinf.py --model-dir "$CKPT" --robot <preset>
+```
+
+It reads the checkpoint's `norm_stats.json` widths and tokenizer, and — when the
+checkpoint carries openpi's `metadata.pt` — cross-checks your preset field by
+field against openpi's own serialized `TrainConfig` (camera wire keys,
+`discrete_state_input`, `adapt_to_pi`, `use_delta_joint_actions`,
+`action_horizon`, `max_token_len`). Exit status is 1 on any fatal finding, so it
+can gate a deployment. The same directory checks run inside
+`pi05_openpi_websocket_server.py` **before** the weights load, and refuse to
+start; `--skip-preflight` overrides that, and exists only to reproduce a
+known-bad configuration deliberately.
+
+Add cases to `tests/test_preflight.py` if your robot has a width rule the generic
+checks miss. The check that matters most is the boring one: a *correct*
+checkpoint must produce zero fatal findings, or operators will learn to pass
+`--skip-preflight` by reflex.
+
 ## Verification recipe
 
 Offline first, then one GPU pass. In order, because each step localizes a
@@ -380,20 +429,24 @@ different class of bug:
 ```bash
 # 1. contract + plumbing, CPU only, mock model
 python3 tests/test_robot_presets.py
+python3 -m pytest tests/test_preflight.py
 
-# 2. real checkpoint, native contract
+# 2. does the checkpoint agree with the preset? (seconds; no weights loaded)
+python3 scripts/openpi_metadata_to_apxinf.py --model-dir "$CKPT" --robot <preset>
+
+# 3. real checkpoint, native contract
 python3 scripts/pi05_openpi_websocket_server.py \
   --model-dir "$CKPT" --robot <preset> --precision bf16 --port 8000
 #    -> read the "serving robot=..." line; assert every field
 
-# 3. real transport, unmodified openpi client
+# 4. real transport, unmodified openpi client
 #    -> assert actions.shape == (meta["action_horizon"], meta["action_dim"])
 #    -> assert np.isfinite(actions).all()
 
-# 4. wrong-dialect rejection: send another preset's keys; it must raise
+# 5. wrong-dialect rejection: send another preset's keys; it must raise
 ```
 
-Step 3's shape assertion should read the shape **off the metadata**, not off a
+Step 4's shape assertion should read the shape **off the metadata**, not off a
 constant. A hard-coded expected shape tests your memory of the checkpoint rather
 than the server.
 

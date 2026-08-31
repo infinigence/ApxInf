@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import pathlib
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -46,7 +48,13 @@ os.environ["no_proxy"] = "127.0.0.1,localhost"
 
 from apxinf import Pi05Policy  # noqa: E402
 from apxinf.policies.base import ComposablePolicy  # noqa: E402
-from apxinf.processors import Pipeline, ProcessorStep, PromptTokenizer, Unnormalizer  # noqa: E402
+from apxinf.processors import (  # noqa: E402
+    Normalizer,
+    Pipeline,
+    ProcessorStep,
+    PromptTokenizer,
+    Unnormalizer,
+)
 from apxinf import conventions as conventions_module  # noqa: E402
 from apxinf.conventions import (  # noqa: E402
     CONVENTIONS,
@@ -1186,6 +1194,157 @@ class StateKeyIsRequiredWhenItIsReadTest(unittest.TestCase):
         )
         self.assertIsNone(stateless.metadata["state_key"])
         self.assertFalse(stateless.metadata["discrete_state"])
+
+
+class NormalizationDtypeTest(unittest.TestCase):
+    """A G1 checkpoint has to be normalized in float64, the way openpi does it.
+
+    openpi parses ``norm_stats.json`` with the stdlib JSON decoder and keeps the
+    result in float64. Subtracting a float64 ``q01`` from a robot's float32 state
+    promotes, so openpi's whole G1 chain -- normalize the state, discretize it
+    into the prompt, unnormalize the action -- runs in float64 whatever the robot
+    sent. Ours follows the input dtype unless told otherwise.
+
+    The gap is ~3e-7. On the output side that is nothing: a joint angle nobody
+    can measure. On the *input* side the very next operation compares the
+    normalized state against bin edges 1/128 apart, so an element sitting near
+    one lands in a different bin, writes a different number into the prompt
+    string, produces different token ids, and sends the rollout somewhere else.
+
+    Under the robot/model split the pin is not something the adapter reaches in
+    and applies -- it is a load flag the body declares (``norm_dtype`` in
+    :attr:`Embodiment.builder_kwargs`) and the model's loader honours. These
+    tests cover that as two links plus the reason it is load-bearing:
+    the preset asks for it, ``from_pretrained`` applies it, and float32 really
+    does cross a bin edge.
+    """
+
+    # --- link 1: the body declares it, and the loader accepts the keyword -----
+
+    def test_the_g1_preset_asks_the_loader_for_float64(self) -> None:
+        captured: dict = {}
+
+        def load(model_dir, *, model_type=None, **kwargs):
+            # Bind against the real signature, as UnitreeG1AdapterTest does: a
+            # flag the preset spells but ``from_pretrained`` does not accept is a
+            # TypeError the first time anyone serves a G1 checkpoint, and a
+            # kwargs-swallowing mock would never show it.
+            inspect.signature(Pi05Policy.from_pretrained).bind(model_dir, **kwargs)
+            captured.update(kwargs)
+            return _StubComposable()
+
+        with mock.patch.object(
+            robot_adapter, "AutoPolicy", types.SimpleNamespace(from_pretrained=load)
+        ):
+            build_robot_policy("unitree_g1", "/nowhere")
+
+        self.assertEqual(captured.get("norm_dtype"), "float64")
+
+    def test_libero_does_not_ask_for_it(self) -> None:
+        # The pin is scoped to the body that needs it. LIBERO's numbers are
+        # unchanged by this work, and a global default would have moved them.
+        self.assertNotIn("norm_dtype", get_robot_preset("franka_libero").builder_kwargs)
+
+    # --- link 2: the loader turns the flag into pinned normalizers ------------
+
+    def _checkpoint(self) -> pathlib.Path:
+        path = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(path, ignore_errors=True))
+        (path / "norm_stats.json").write_text(
+            json.dumps(
+                {
+                    "norm_stats": {
+                        "actions": {
+                            "q01": [-1.0] * MODEL_DIM,
+                            "q99": [1.0] * MODEL_DIM,
+                            "mean": [0.0] * MODEL_DIM,
+                            "std": [1.0] * MODEL_DIM,
+                        },
+                        "state": {
+                            "q01": [-1.0] * G1_ROBOT_DIM,
+                            "q99": [1.0] * G1_ROBOT_DIM,
+                            "mean": [0.0] * G1_ROBOT_DIM,
+                            "std": [1.0] * G1_ROBOT_DIM,
+                        },
+                    }
+                }
+            )
+        )
+        (path / "tokenizer.model").write_bytes(b"not a real sentencepiece model")
+        return path
+
+    def _load(self, **kwargs) -> Pi05Policy:
+        """Run the real ``from_pretrained``, stubbing only the tokenizer.
+
+        Everything the pin touches -- reading norm_stats, building both
+        normalizers, assembling the pipelines -- is the shipped code path. Only
+        SentencePiece is replaced, because it is the one step that needs a real
+        binary model file and it has nothing to do with dtypes.
+        """
+        with mock.patch.object(pi05_module, "PromptTokenizer", lambda *a, **k: RecordingTokenizer()):
+            return Pi05Policy.from_pretrained(
+                self._checkpoint(),
+                model=MockModel(num_views=len(G1_CAMERAS)),
+                discrete_state=True,
+                state_key=G1_STATE_KEY,
+                image_keys=G1_CAMERAS,
+                **kwargs,
+            )
+
+    def test_norm_dtype_pins_both_normalizers(self) -> None:
+        policy = self._load(norm_dtype="float64")
+        self.assertEqual(
+            policy.input_pipeline["tokenize"].state_normalizer.dtype, np.dtype("float64")
+        )
+        self.assertEqual(
+            policy.output_pipeline["unnormalize"].unnormalizer.dtype, np.dtype("float64")
+        )
+
+    def test_the_default_still_follows_the_input(self) -> None:
+        # Without the flag nothing is pinned, so this work changes no numbers for
+        # any checkpoint that does not ask -- which is what keeps LIBERO's
+        # float32 results bit-identical.
+        policy = self._load()
+        self.assertIsNone(policy.input_pipeline["tokenize"].state_normalizer.dtype)
+        self.assertIsNone(policy.output_pipeline["unnormalize"].unnormalizer.dtype)
+
+    # --- why it is load-bearing ----------------------------------------------
+
+    def test_float32_normalization_lands_in_a_different_bin(self) -> None:
+        """The reason for the pin, stated as a number rather than an assertion of faith."""
+        from apxinf.processors import discretize_state
+
+        rng = np.random.default_rng(11)
+        q01 = rng.uniform(-2.6, -0.4, G1_ROBOT_DIM)
+        q99 = q01 + rng.uniform(0.7, 4.1, G1_ROBOT_DIM)
+
+        # States that normalize *onto the bin edges*, by inverting openpi's
+        # normalize. Uniformly sampled states would not show anything: a 3e-7
+        # shift only changes a bin for an element already within 3e-7 of an edge
+        # 1/128 apart, which is a ~4e-5 chance each. That rarity is not safety --
+        # a G1 has 16 joints polled at 30 Hz, so "one in 25000 elements" is a
+        # corrupted prompt every minute or so, on a random joint, with no symptom
+        # other than the rollout going somewhere else.
+        edges = np.linspace(-1.0, 1.0, 257)[:-1]
+        targets = np.resize(edges, (edges.size // G1_ROBOT_DIM, G1_ROBOT_DIM))
+        states = (q01 + (targets + 1.0) / 2.0 * (q99 - q01 + 1e-6)).astype(np.float32)
+
+        pinned = Normalizer(q01=q01, q99=q99, dims=G1_ROBOT_DIM, dtype="float64")
+        loose = Normalizer(q01=q01, q99=q99, dims=G1_ROBOT_DIM)
+
+        wide = np.stack([pinned(s) for s in states])
+        narrow = np.stack([loose(s) for s in states])
+        self.assertEqual(wide.dtype, np.float64)
+        self.assertEqual(narrow.dtype, np.float32, "the unpinned default follows the input")
+
+        # openpi's own arithmetic, for the record: float64 stats promote the state.
+        reference = (states - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        np.testing.assert_array_equal(wide, reference)
+
+        moved = int((discretize_state(wide) != discretize_state(narrow)).sum())
+        self.assertGreater(
+            moved, 0, "if float32 never crossed a bin edge the pin would be cosmetic"
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ and a ``build_*`` factory here, then register both in :mod:`apxinf.robots.preset
 
 from __future__ import annotations
 
+from .preflight import Finding, check_checkpoint, format_findings
 from .presets import (
     ROBOT_PRESETS,
     VIEW_SLOTS,
@@ -43,4 +44,7 @@ __all__ = [
     "get_robot_preset",
     "register_robot_preset",
     "build_robot_policy",
+    "Finding",
+    "check_checkpoint",
+    "format_findings",
 ]

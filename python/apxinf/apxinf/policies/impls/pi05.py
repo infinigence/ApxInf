@@ -271,6 +271,7 @@ class Pi05Policy:
         seed: int = 0,
         discrete_state: bool = False,
         state_norm_key: str = "state",
+        norm_dtype: Optional[str] = None,
         image_pipeline: Optional[Pipeline] = None,
         image_keys: Optional[Sequence[str]] = None,
         prompt_key: str = _PROMPT_KEY,
@@ -305,6 +306,16 @@ class Pi05Policy:
         discretized into the prompt, and ``state_key`` becomes **required** —
         there is no dataset-neutral name to fall back to, and guessing one would
         drop proprioception silently.
+
+        ``norm_dtype`` pins the dtype both normalizers compute in; the default
+        follows the input, so a float32 observation is normalized in float32.
+        ``"float64"`` reproduces openpi, which parses ``norm_stats.json`` into
+        float64 and never demotes it. The difference is ~1e-7 either way and is
+        invisible on the output side, but on the input side normalization feeds
+        the state discretizer, whose bins are 1/128 apart: an element near a bin
+        edge crosses it, and the prompt — hence the entire rollout — changes.
+        A checkpoint whose statistics came from openpi wants ``"float64"``; the
+        preset table sets it per embodiment.
 
         ``num_views`` loads the checkpoint for fewer cameras than it declares, for
         a deployment that has fewer. It must equal ``len(image_keys)``. This drops
@@ -387,10 +398,14 @@ class Pi05Policy:
         unnormalizer = (
             unnormalizer
             if unnormalizer is not None
-            else Unnormalizer.from_norm_stats(model_dir, key=norm_key, dims=action_dim)
+            else Unnormalizer.from_norm_stats(
+                model_dir, key=norm_key, dims=action_dim, dtype=norm_dtype
+            )
         )
         state_normalizer = (
-            Normalizer.from_norm_stats(model_dir, key=state_norm_key) if discrete_state else None
+            Normalizer.from_norm_stats(model_dir, key=state_norm_key, dtype=norm_dtype)
+            if discrete_state
+            else None
         )
         reset_sampling = getattr(model, "reset_sampling", None)
         if callable(reset_sampling):

@@ -72,6 +72,7 @@ from .. import conventions
 from ..conventions import Convention
 from ..policies.auto import AutoPolicy
 from ..policies.base import VIEW_SLOTS, Policy
+from ..processors.robots.unitree_g1 import G1_ROBOT_DIM
 from .unitree_g1 import build_unitree_g1_policy
 
 __all__ = [
@@ -109,6 +110,18 @@ class Embodiment:
     #: Deployable action width. ``None`` keeps the model's full vector — correct
     #: when a robot output step does the truncation itself (G1's 32→16 encode).
     action_dim: Optional[int] = None
+    #: Width of this body's state vector, i.e. how wide ``norm_stats["state"]``
+    #: has to be. A fact about the hardware, so it does not follow
+    #: :attr:`action_dim`: a robot's state and action spaces need not match
+    #: (Franka under LIBERO has 8-dim state and a 7-dim EEF-delta action).
+    #: ``None`` means this body makes no claim and the check is skipped.
+    state_dim: Optional[int] = None
+    #: Width of this body's action vector, i.e. how wide ``norm_stats["actions"]``
+    #: has to be. Distinct from :attr:`action_dim`, which is a *loading* knob
+    #: saying what to trim the model down to: the G1 declares ``action_dim=None``
+    #: because ``UnitreeG1EncodeActions`` owns the truncation, but its actions are
+    #: still 16 wide and its statistics must be. ``None`` skips the check.
+    action_width: Optional[int] = None
     #: Factory that loads the checkpoint and wires this robot's pre/post steps.
     builder: Callable[..., Policy] = _build_generic
     #: Extra keyword arguments the builder always receives.
@@ -119,6 +132,20 @@ class Embodiment:
             raise ValueError(
                 f"Embodiment {self.name!r}: num_cameras={self.num_cameras} is outside "
                 f"1..{len(VIEW_SLOTS)}, the view slots {VIEW_SLOTS} a checkpoint fills"
+            )
+        if (
+            self.action_dim is not None
+            and self.action_width is not None
+            and self.action_dim > self.action_width
+        ):
+            # Trimming is a slice of the statistics, so it cannot ask for more
+            # columns than the body's actions have. Getting this pair backwards
+            # would make the preflight check the wrong width and pass a
+            # checkpoint that the unnormalizer then fails on, mid-serve.
+            raise ValueError(
+                f"Embodiment {self.name!r}: action_dim={self.action_dim} trims wider "
+                f"than action_width={self.action_width}, but action_width is how many "
+                "columns this body's actions (and its norm_stats) have"
             )
 
     @property
@@ -200,6 +227,14 @@ class RobotPreset:
         return self.embodiment.action_dim
 
     @property
+    def state_dim(self) -> Optional[int]:
+        return self.embodiment.state_dim
+
+    @property
+    def action_width(self) -> Optional[int]:
+        return self.embodiment.action_width
+
+    @property
     def builder(self) -> Callable[..., Policy]:
         return self.embodiment.builder
 
@@ -261,18 +296,36 @@ class RobotPreset:
 #: Franka Emika Panda, 7-DoF arm + parallel gripper, 2-camera rig. Its whole port
 #: is a table row: the checkpoint already emits absolute actions at the deployable
 #: width, so no robot pre/post step is needed and the generic builder serves it.
-FRANKA = Embodiment(name="franka", num_cameras=2, action_dim=7)
+#: ``state_dim`` is 8 rather than 7 — LIBERO records EEF pose + gripper on the
+#: state side and 6 EEF deltas + gripper on the action side.
+FRANKA = Embodiment(name="franka", num_cameras=2, action_dim=7, state_dim=8, action_width=7)
 
 #: Unitree G1 humanoid: dual-arm + 2 dexterous hands, 16 DoF laid out
 #: ``[L-arm 7, L-gripper 1, R-arm 7, R-gripper 1]``, 3 cameras. ``action_dim``
 #: stays ``None`` because ``UnitreeG1EncodeActions`` does the 32→16 truncation
-#: after delta→absolute has seen the full-width action.
+#: after delta→absolute has seen the full-width action; ``action_width`` is still
+#: 16, because that is how wide the body's actions and its statistics are.
 UNITREE_G1_BODY = Embodiment(
     name="unitree_g1",
     num_cameras=3,
     action_dim=None,
+    state_dim=G1_ROBOT_DIM,
+    action_width=G1_ROBOT_DIM,
     builder=build_unitree_g1_policy,
-    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
+    builder_kwargs={
+        "use_delta_joint_actions": True,
+        "adapt_to_pi": True,
+        # openpi parses norm_stats.json into float64 and never demotes it, so its
+        # whole G1 chain — normalize state, discretize it into the prompt,
+        # unnormalize the action — runs in float64. Ours follows the input dtype
+        # (float32) unless told otherwise. The output-side gap is ~2e-7 rad and
+        # harmless, but on the input side the very next thing after normalizing
+        # is a comparison against bin edges 1/128 apart: an element sitting near
+        # an edge lands in a different bin, which changes the prompt text, the
+        # token ids, and the whole rollout. Match openpi rather than explain the
+        # divergence later.
+        "norm_dtype": "float64",
+    },
 )
 
 #: --- deployable pairings -----------------------------------------------------

@@ -616,14 +616,15 @@ pub(super) fn load_registered(
                     &calibration,
                 )?)
             };
-            // A checkpoint-free synthetic load relies on the kernel's tactic
-            // fallback, so a tuning database is only required for real FP8 runs.
-            if synthetic.is_none() {
-                tuning_database.as_ref().ok_or_else(|| {
-                    Error::Other(
-                        "FP8 PI0.5 requires LoadOptions.tuning_path or tactics.json".into(),
-                    )
-                })?;
+            // No tuning database is fatal: the FP8 GEMM falls back to a
+            // shape-heuristic tactic. Warn on real weights, where an untuned
+            // tactic is a silent latency regression rather than a wrong answer.
+            if synthetic.is_none() && tuning_database.is_none() {
+                eprintln!(
+                    "[apxinf] FP8 PI0.5 running without a GEMM tactic database \
+                     (no LoadOptions.tuning_path, no tactics.json in the checkpoint); \
+                     using heuristic tactics, expect lower throughput"
+                );
             }
             let weights = Arc::new(StaticFp8Pi05Weights::from_host(
                 &host_weights,

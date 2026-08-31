@@ -214,7 +214,12 @@ class Tokenize(ProcessorStep):
             observation = _require(data, self.observation_key, "Tokenize")
             state = lookup_key(observation, self.state_key, None)
             if self.state_normalizer is not None and state is not None:
-                state = self.state_normalizer(np.asarray(state, dtype=np.float32))
+                # No dtype coercion: the state only ever reaches the model as
+                # prompt tokens, and openpi normalizes/discretizes it in whatever
+                # dtype its own transforms produced (float64 for adapt_to_pi
+                # robots). Forcing float32 here shifts values by ~1e-7, which is
+                # enough to land on the other side of a discretization bin edge.
+                state = self.state_normalizer(np.asarray(state))
             data[TOKEN_IDS] = self.tokenizer(prompt, state=state)
         else:
             data[TOKEN_IDS] = self.tokenizer(prompt)

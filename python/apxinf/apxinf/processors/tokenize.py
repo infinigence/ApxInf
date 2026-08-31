@@ -9,7 +9,7 @@ State injection (proprioception) is a **reserved** capability, matching the Rust
 ``pi05_prompt`` / ``discretize_state`` path but **off by default** so behavior is
 identical to the current serving link. When ``discrete_state=True`` the prompt
 becomes ``"Task: {task}, State: {s0 s1 ...};\nAction: "`` with the state
-discretized to ``0..=255`` — see :func:`discretize_state`. sentencepiece is
+discretized to ``-1..=255`` — see :func:`discretize_state`. sentencepiece is
 imported lazily so the rest of the processor library stays importable without it.
 """
 
@@ -24,16 +24,46 @@ from .base import ProcessorStep
 __all__ = ["PromptTokenizer", "SyntheticTokenizer", "discretize_state", "build_prompt"]
 
 
-def discretize_state(state: Sequence[float]) -> np.ndarray:
-    """Discretize a normalized state to ``uint8`` bins in ``0..=255``.
+#: The 256 bin edges openpi discretizes against, ``linspace(-1, 1, 257)[:-1]``.
+#: Every edge is ``-1 + i/128``, exact in binary floating point, so a comparison
+#: against one is exact — which is the whole reason :func:`discretize_state`
+#: compares instead of computing an index.
+_BIN_EDGES = np.linspace(-1.0, 1.0, 256 + 1)[:-1]
 
-    Matches NumPy ``digitize(state, linspace(-1, 1, 257)[:-1]) - 1`` with
-    saturation, i.e. the Rust ``discretize_state``:
-    ``clamp(floor((v + 1) * 128), 0, 255)``.
+
+def discretize_state(state: Sequence[float]) -> np.ndarray:
+    """Discretize a normalized state into the pi05 prompt's integer bins.
+
+    Reproduces NumPy ``digitize(state, linspace(-1, 1, 257)[:-1]) - 1``
+    *exactly*, including its **signed underflow bin**: ``digitize`` returns ``0``
+    for ``v < -1``, so the bin is ``-1``. openpi writes that ``-1`` verbatim into
+    the prompt (``models/tokenizer.py``), so it is a value the model saw during
+    training and must not be clamped away — hence ``int16``, not ``uint8``.
+    Values ``>= 1`` do saturate, to ``255``.
+
+    Normalized state *does* leave ``[-1, 1]`` on real hardware, because q01/q99
+    come from the training split; on the customer's own G1 validation set 7 of
+    3200 elements underflow. Clamping them to ``0`` changes the prompt string,
+    hence the token ids, hence the whole rollout.
+
+    Implemented as a search over the edges rather than the arithmetic
+    ``floor((v + 1) * 128)``, because that expression is not equal to
+    ``digitize`` for every input. Adding ``1.0`` to a value just under an edge in
+    ``[-1, -0.5)`` moves it into a coarser binade and the sum rounds *up* onto
+    the edge, putting it one bin too high::
+
+        v = nextafter(-0.4921875, -inf)     # one ulp below bin edge 65
+        v + 1.0 == 0.5078125                # exactly, by round-half-to-even
+        floor((v + 1.0) * 128) == 65        # wrong
+        digitize(v, edges) - 1  == 64       # right
+
+    ``searchsorted(..., side="right")`` is what ``digitize`` calls for increasing
+    bins, so this is the same comparison openpi makes, with no arithmetic on
+    ``v`` to round.
     """
     values = np.asarray(state, dtype=np.float64)
-    bins = np.floor((values + 1.0) * 128.0)
-    return np.clip(bins, 0, 255).astype(np.uint8)
+    bins = np.searchsorted(_BIN_EDGES, values, side="right") - 1
+    return bins.astype(np.int16)
 
 
 def _clean_task(prompt: str) -> str:

@@ -66,8 +66,14 @@ def _joint_flip_mask() -> np.ndarray:
 
     All ``+1`` in the integrator's file (a documented placeholder). Kept as the
     hook for real left/right mirror calibration.
+
+    Integer dtype on purpose, matching openpi's ``np.array([1, 1, ...])``: these
+    are exact signs, and the ``int64 * float32 -> float64`` promotion is what
+    puts openpi's whole G1 input chain in float64. Reproducing it is what makes
+    our discretized prompt bit-identical to theirs (see
+    :func:`~apxinf.processors.tokenize.discretize_state`).
     """
-    return np.ones(G1_ROBOT_DIM, dtype=np.float32)
+    return np.ones(G1_ROBOT_DIM, dtype=np.int64)
 
 
 def _gripper_to_angular(value: np.ndarray) -> np.ndarray:
@@ -122,7 +128,11 @@ class UnitreeG1DecodeState(ProcessorStep):
         raw = lookup_key(observation, self.state_key, None)
         if raw is None:
             return data
-        state = np.asarray(raw, dtype=np.float32) * _joint_flip_mask()
+        raw = np.asarray(raw)
+        # Promote to at least float32 before the flip so an integer state cannot
+        # be truncated by the gripper clip (openpi has no such guard). The int64
+        # flip mask then promotes the product to float64, matching openpi.
+        state = raw.astype(np.result_type(raw.dtype, np.float32), copy=False) * _joint_flip_mask()
         idx = list(_GRIPPER_INDICES)
         state[idx] = _gripper_to_angular(state[idx])
         data[self.observation_key] = set_key(observation, self.state_key, state)
@@ -149,9 +159,13 @@ class UnitreeG1AbsoluteActions(ProcessorStep):
         state = lookup_key(observation, self.state_key, None)
         if state is None:
             return data
-        actions = np.asarray(data[ACTIONS], dtype=np.float32).copy()
-        state = np.asarray(state, dtype=np.float32)[:G1_ROBOT_DIM]
-        offset = np.where(G1_DELTA_MASK, state, 0.0)
+        # Both operands keep their own dtype: openpi's output chain is float64
+        # end to end (its stats are float64 and its flip mask is int64), so
+        # coercing either side to float32 here would reintroduce the ~2e-7
+        # divergence the rest of the G1 path was aligned to remove (A15).
+        actions = np.array(data[ACTIONS], copy=True)
+        state = np.asarray(state)[:G1_ROBOT_DIM]
+        offset = np.where(G1_DELTA_MASK, state, state.dtype.type(0))
         actions[:, :G1_ROBOT_DIM] = actions[:, :G1_ROBOT_DIM] + offset
         data[ACTIONS] = actions
         return data
@@ -165,7 +179,13 @@ class UnitreeG1EncodeActions(ProcessorStep):
     """
 
     def __call__(self, data: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        actions = np.asarray(data[ACTIONS], dtype=np.float32)[:, :G1_ROBOT_DIM] * _joint_flip_mask()
+        # No dtype coercion, in either direction. The +-1 flip is exact in any
+        # float dtype, but the int64 mask promotes a float32 input to float64 --
+        # which is precisely what openpi's ``_encode_actions`` does, so its G1
+        # server puts float64 actions on the wire. Matching that keeps the two
+        # servers' outputs comparable bit for bit (A15); an openpi G1 client
+        # reads the dtype off the msgpack payload either way.
+        actions = np.asarray(data[ACTIONS])[:, :G1_ROBOT_DIM] * _joint_flip_mask()
         idx = list(_GRIPPER_INDICES)
         actions[:, idx] = _gripper_from_angular(actions[:, idx])
         data[ACTIONS] = np.ascontiguousarray(actions)

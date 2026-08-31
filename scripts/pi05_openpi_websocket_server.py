@@ -47,6 +47,7 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
 from apxinf import Pi05Policy  # noqa: E402
+from apxinf.robots.preflight import FAIL, WARN, check_checkpoint, format_findings  # noqa: E402
 from apxinf.robots.presets import (  # noqa: E402
     ROBOT_PRESETS,
     available_robots,
@@ -187,6 +188,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="start even if the checkpoint contradicts the --robot preset. The "
+        "preflight compares norm_stats widths and the tokenizer against the "
+        "preset; every mismatch it reports is one that produces confidently "
+        "wrong actions instead of an error. Use only to reproduce a known-bad "
+        "deployment on purpose.",
+    )
     return parser.parse_args()
 
 
@@ -291,6 +301,34 @@ def main() -> None:
             metadata={**metadata, "robot": preset.name, "robot_steps": False},
         )
     else:
+        # Refuse a checkpoint that contradicts the preset *before* spending a
+        # minute loading 7 GB of weights. A G1 checkpoint served with LIBERO
+        # norm_stats runs to completion and emits actions of the right shape in
+        # the right numeric range that mean nothing -- the only symptom is
+        # "accuracy regressed", which is indistinguishable from a model problem
+        # until someone diffs the two pipelines by hand.
+        findings = check_checkpoint(
+            args.model_dir,
+            preset.name,
+            norm_key=args.norm_key,
+            discrete_state=discrete_state,
+            image_keys=image_keys,
+            action_dim=args.action_dim,
+            tokenizer_path=args.tokenizer,
+        )
+        fatal = [f for f in findings if f.level == FAIL]
+        if fatal and not args.skip_preflight:
+            raise SystemExit(
+                f"preflight: {args.model_dir} does not match --robot {preset.name}\n"
+                + format_findings(findings, include_info=False)
+                + "\n\nPass --skip-preflight to serve it anyway (the actions will be wrong)."
+            )
+        for finding in findings:
+            level = logging.ERROR if finding.level == FAIL else (
+                logging.WARNING if finding.level == WARN else logging.INFO
+            )
+            logging.log(level, "preflight %s", finding)
+
         logging.info(
             "loading %s policy in-process from %s as robot=%s",
             args.precision,
