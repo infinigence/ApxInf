@@ -255,7 +255,7 @@ def train_config_facts(payload: Mapping[str, Any]) -> Dict[str, Any]:
             arch[field] = value
     # ``num_steps`` is the flow-matching Euler step count. Upstream openpi does
     # not serialize it (it is DEFAULT_NUM_FLOW_STEPS by construction, which is
-    # also the loader's default); the RLinf fork does.
+    # also the loader's default); some forks do.
     num_steps = _as_int(model.get("num_steps"))
     if num_steps is not None:
         arch["num_flow_steps"] = num_steps

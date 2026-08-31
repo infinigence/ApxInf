@@ -45,6 +45,7 @@ This module registers ``Pi05Policy`` under ``model_type="pi05"`` so
 
 from __future__ import annotations
 
+import logging
 import time
 import warnings
 from pathlib import Path
@@ -53,6 +54,13 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from ..._tactics import resolve_pi05_tactics
+from ...checkpoints import (
+    CheckpointError,
+    detect_checkpoint,
+    has_layout_metadata,
+    require_norm_stats,
+    resolve_tokenizer,
+)
 from ..base import VIEW_SLOTS, BareModel
 from ...processors import (
     GaussianNoise,
@@ -84,6 +92,8 @@ from ...processors.transforms import (
 from ..registry import register_policy
 
 __all__ = ["Pi05Policy"]
+
+_LOGGER = logging.getLogger("apxinf.policies.pi05")
 
 #: ``prompt`` is openpi's *protocol*-level name for the instruction field — every
 #: dialect on this wire uses it — so unlike the camera and state keys it is not
@@ -277,6 +287,9 @@ class Pi05Policy:
         prompt_key: str = _PROMPT_KEY,
         state_key: Optional[str] = None,
         num_views: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        asset_id: Optional[str] = None,
+        norm_stats=None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> "Pi05Policy":
         """Build the **default** policy from a checkpoint directory.
@@ -329,6 +342,19 @@ class Pi05Policy:
         A checkpoint-local ``tactics.json`` takes precedence over source-tree
         defaults, so normal Python and serving callers share the same routing.
 
+        ``checkpoint_format`` / ``asset_id`` / ``norm_stats`` control how the
+        directory is read (see :mod:`apxinf.checkpoints`). By default the layout
+        is detected: an openpi PyTorch export declares its architecture in
+        ``metadata.pt`` and keeps its statistics under
+        ``assets/<asset_id>/norm_stats.json``, and both are picked up without any
+        flag. ``checkpoint_format`` pins the answer instead of sniffing it,
+        ``asset_id`` overrides the one the checkpoint names (for assets moved
+        after export), and ``norm_stats`` is an explicit path that outranks every
+        convention. The first two make detection strict — an unreadable layout
+        raises rather than falling back — because both assert that the directory
+        *has* a layout. ``norm_stats`` does not: it names a single file, so it
+        also works on a flat directory that declares nothing about itself.
+
         For a **fully custom** pre/post chain, do not funnel it through here:
         build the parts yourself and use :meth:`default_pipelines` +
         :meth:`__init__` (or mutate ``policy.input_pipeline`` after construction).
@@ -352,6 +378,27 @@ class Pi05Policy:
                 f"supplied unnormalizer's width {unnormalizer.width}; the injected map "
                 "already sets the deployable width, so pass only one"
             )
+
+        # Read the directory's own account of itself before touching a weight.
+        # A hand-assembled flat directory (model.safetensors + norm_stats.json,
+        # nothing that says what it is) predates this layer and still loads:
+        # detection has nothing to work with there, so it is skipped rather than
+        # turned into a hard failure. Naming a format or an asset_id does assert
+        # a real layout, so detection runs and its errors propagate. ``norm_stats``
+        # deliberately does not: it names one file, not a directory shape, and it
+        # is exactly what a flat directory needs when its statistics live
+        # elsewhere.
+        layout = None
+        if checkpoint_format or asset_id or has_layout_metadata(model_dir):
+            layout = detect_checkpoint(
+                model_dir,
+                checkpoint_format=checkpoint_format,
+                asset_id=asset_id,
+                norm_stats=norm_stats,
+            )
+            for note in layout.notes:
+                _LOGGER.info("checkpoint %s: %s", model_dir, note)
+
         if model is None:
             import apxinf_py  # lazy: processor-only users never import the binding
 
@@ -362,6 +409,7 @@ class Pi05Policy:
                 model_dir=model_dir,
                 override=Path(tactics) if tactics is not None else None,
             )
+            config_json = layout.config_json_text() if layout is not None else None
             model = apxinf_py.Model.load(
                 model_name,
                 ckpt,
@@ -369,6 +417,10 @@ class Pi05Policy:
                 precision=precision,
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
+                # An openpi export has no config.json, so without this the Rust
+                # loader silently ran Pi05Config::default(). The constants come
+                # from the checkpoint's own metadata.pt.
+                **({"config_json": config_json} if config_json else {}),
                 **({"action_horizon": int(action_horizon)} if action_horizon else {}),
                 **({"num_views": int(num_views)} if num_views is not None else {}),
                 sampling_seed=int(seed),
@@ -395,15 +447,33 @@ class Pi05Policy:
             max_token_len=model.max_token_len if hasattr(model, "max_token_len") else 200,
             discrete_state=discrete_state,
         )
+        # Resolved once, and only when a file is actually read: an injected
+        # unnormalizer with state dropped is a deliberate no-statistics path, and
+        # demanding the file there would break a stand-in checkpoint run. An
+        # explicit path still works with no layout at all, which is the flat
+        # directory whose statistics were handed over separately.
+        needs_stats = unnormalizer is None or discrete_state
+        if not needs_stats:
+            stats_path = None
+        elif layout is not None:
+            stats_path = require_norm_stats(layout)
+        elif norm_stats is not None:
+            stats_path = Path(norm_stats)
+            if not stats_path.is_file():
+                raise CheckpointError(f"norm_stats path {stats_path} does not exist")
+        else:
+            stats_path = None
         unnormalizer = (
             unnormalizer
             if unnormalizer is not None
             else Unnormalizer.from_norm_stats(
-                model_dir, key=norm_key, dims=action_dim, dtype=norm_dtype
+                model_dir, key=norm_key, dims=action_dim, dtype=norm_dtype, path=stats_path
             )
         )
         state_normalizer = (
-            Normalizer.from_norm_stats(model_dir, key=state_norm_key, dtype=norm_dtype)
+            Normalizer.from_norm_stats(
+                model_dir, key=state_norm_key, dtype=norm_dtype, path=stats_path
+            )
             if discrete_state
             else None
         )
@@ -711,11 +781,11 @@ def _default_image_keys(num_views: int) -> Tuple[str, ...]:
 
 
 def _resolve_tokenizer(model_dir: Path, tokenizer_path) -> Path:
-    if tokenizer_path is not None:
-        return Path(tokenizer_path)
-    candidates = (model_dir / "tokenizer.model", model_dir / "paligemma_tokenizer.model")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    rendered = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"no SentencePiece tokenizer found under {model_dir}; checked {rendered}")
+    """Locate the SentencePiece model: explicit path, ``APXINF_TOKENIZER``, then the dir.
+
+    Delegates to :func:`apxinf.checkpoints.resolve_tokenizer` so the "where do I
+    get this file" message is written once. No pi05 checkpoint ships a tokenizer
+    — openpi downloads it from GCS and LeRobot from a gated HF repo — so the
+    error has to name both sources, and apxinf downloads neither.
+    """
+    return resolve_tokenizer(model_dir, tokenizer_path)

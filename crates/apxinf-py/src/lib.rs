@@ -241,6 +241,15 @@ impl Model {
     /// * `calibration` / `tactics` — optional FP8 calibration / tactics json.
     /// * `sampling_seed` — seed for the implicit device-side noise stream used
     ///   when inference is called without `noise`.
+    /// * `config_json` — the architecture, as a `config.json`-shaped string,
+    ///   for a checkpoint that has no `config.json`. An openpi PyTorch export
+    ///   never carries one: its constants live in `metadata.pt`, which the
+    ///   Python side reads (`apxinf.checkpoints`) and passes through here.
+    ///   Without it such a checkpoint silently loaded at `Pi05Config::default()`,
+    ///   so a chunk length or view count that differed from the default was
+    ///   wrong with no error anywhere. `None` keeps the old behaviour: read
+    ///   `config.json` from the checkpoint directory, else fall back to the
+    ///   default.
     /// * `action_horizon` — override the checkpoint's chunk length. `None`
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
@@ -255,7 +264,7 @@ impl Model {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, action_horizon=None, num_views=None, sampling_seed=0))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, config_json=None, action_horizon=None, num_views=None, sampling_seed=0))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -263,16 +272,19 @@ impl Model {
         precision: &str,
         calibration: Option<PathBuf>,
         tactics: Option<PathBuf>,
+        config_json: Option<&str>,
         action_horizon: Option<usize>,
         num_views: Option<usize>,
         sampling_seed: u64,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
-        let mut config = load_config(&path)?;
         // Only hand the loader an explicit config when the caller actually
-        // overrode something; otherwise it reads `config.json` itself, exactly
-        // as before.
-        let mut overridden = false;
+        // supplied or overrode one; otherwise it reads `config.json` itself,
+        // exactly as before.
+        let (mut config, mut overridden) = match config_json {
+            Some(raw) => (Pi05Config::from_json_str(raw).map_err(runtime_err)?, true),
+            None => (load_config(&path)?, false),
+        };
         if let Some(horizon) = action_horizon {
             config.action_horizon = horizon;
             overridden = true;

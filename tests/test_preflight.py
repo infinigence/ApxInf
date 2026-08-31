@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import pathlib
+import pickle
 import sys
 import tempfile
 import unittest
+import zipfile
 
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "python" / "apxinf"))
@@ -63,6 +65,43 @@ class CheckpointFixture:
 
     def write_tokenizer(self, name: str = "paligemma_tokenizer.model") -> "CheckpointFixture":
         (self.path / name).write_bytes(b"not a real sentencepiece model")
+        return self
+
+    def write_weights(self) -> "CheckpointFixture":
+        """An empty ``model.safetensors``; nothing here reads a weight."""
+        (self.path / "model.safetensors").write_bytes(b"")
+        return self
+
+    def write_metadata_pt(self, *, asset_id: str = "example-asset") -> "CheckpointFixture":
+        """Write an openpi-shaped ``metadata.pt`` the way ``torch.save`` does.
+
+        A zip whose ``<archive>/data.pkl`` member is an ordinary pickle — built
+        by hand so these tests need neither torch nor a real checkpoint.
+        """
+        payload = {
+            "global_step": 1,
+            "config": {
+                "exp_name": "pi05_example",
+                "model": {
+                    "action_dim": 32,
+                    "action_horizon": 50,
+                    "max_token_len": 200,
+                    "discrete_state_input": True,
+                    "pi05": True,
+                },
+                "data": {"assets": {"asset_id": asset_id}},
+            },
+        }
+        with zipfile.ZipFile(self.path / "metadata.pt", "w") as archive:
+            archive.writestr("metadata/data.pkl", pickle.dumps(payload, protocol=2))
+            archive.writestr("metadata/version", "3\n")
+        return self
+
+    def write_asset_stats(self, asset_id: str, **entries) -> "CheckpointFixture":
+        """Statistics where openpi actually writes them: ``assets/<asset_id>/``."""
+        target = self.path / "assets" / asset_id / "norm_stats.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"norm_stats": entries}))
         return self
 
 
@@ -252,6 +291,105 @@ class ReportTest(unittest.TestCase):
 
         self.assertNotIn("[INFO", quiet)
         self.assertIn("[FAIL", quiet)
+
+
+class CheckpointLayoutTest(unittest.TestCase):
+    """An openpi export keeps its statistics under ``assets/<asset_id>/``.
+
+    Reading ``<model_dir>/norm_stats.json`` unconditionally is how a file left
+    behind by an unrelated run got both checked and served. These pin that the
+    preflight now checks the file the loader will actually open.
+    """
+
+    def test_the_asset_path_is_checked_not_the_root_file(self) -> None:
+        # The failure shape: correct statistics where openpi puts them, a
+        # leftover 7-dim LIBERO file in the root. Reading the root one produces
+        # a spurious FAIL here and wrong actions on the robot.
+        ckpt = CheckpointFixture(self, actions=_stats(7), state=_stats(8))
+        ckpt.write_weights().write_metadata_pt(asset_id="example-asset")
+        ckpt.write_asset_stats(
+            "example-asset", actions=_stats(G1_DIM), state=_stats(G1_DIM)
+        )
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1")
+
+        self.assertNotIn(FAIL, _levels(findings, "norm_stats["))
+        chosen = [f for f in findings if f.check == "norm_stats.json"]
+        self.assertEqual([f.level for f in chosen], [INFO])
+        self.assertIn("assets/example-asset/norm_stats.json", chosen[0].detail)
+
+    def test_the_root_fallback_is_a_warning_not_a_silent_success(self) -> None:
+        ckpt = CheckpointFixture(self, actions=_stats(G1_DIM), state=_stats(G1_DIM))
+        ckpt.write_weights().write_metadata_pt(asset_id="example-asset")
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1")
+
+        warned = [f for f in findings if f.check == "norm_stats.json"]
+        self.assertEqual([f.level for f in warned], [WARN])
+        # Both paths, so the operator can see what to go and fetch.
+        self.assertIn("assets/example-asset/norm_stats.json", warned[0].detail)
+        self.assertIn(str(ckpt.path / "norm_stats.json"), warned[0].detail)
+
+    def test_absent_statistics_name_every_path_tried(self) -> None:
+        ckpt = CheckpointFixture(self)
+        ckpt.write_weights().write_metadata_pt(asset_id="example-asset")
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1")
+
+        fatal = [f for f in findings if f.check == "norm_stats.json"]
+        self.assertEqual([f.level for f in fatal], [FAIL])
+        self.assertIn("assets/example-asset/norm_stats.json", fatal[0].detail)
+
+    def test_the_layout_and_asset_id_are_reported(self) -> None:
+        ckpt = CheckpointFixture(self, actions=_stats(G1_DIM), state=_stats(G1_DIM))
+        ckpt.write_weights().write_metadata_pt(asset_id="example-asset")
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1")
+
+        reported = {f.check: f.detail for f in findings}
+        layout = [f.detail for f in findings if f.check == "checkpoint layout"]
+        self.assertIn("openpi_pytorch", layout[0])
+        self.assertIn("example-asset", reported["asset_id"])
+        # The architecture comes out of metadata.pt, which is the only place an
+        # openpi export states it: no config.json exists to read it from.
+        self.assertIn("action_horizon=50", reported["architecture"])
+
+    def test_a_flat_directory_is_still_checked_the_old_way(self) -> None:
+        """No metadata.pt, no config.json: the hand-assembled layout still loads."""
+        ckpt = CheckpointFixture(self, actions=_stats(G1_DIM), state=_stats(G1_DIM))
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1")
+
+        self.assertNotIn(FAIL, _levels(findings, "norm_stats"))
+        self.assertNotIn("checkpoint layout", {f.check for f in findings})
+
+    def test_an_explicit_norm_stats_path_works_without_any_layout(self) -> None:
+        """A flat directory plus --norm-stats: no metadata.pt, no config.json.
+
+        The statistics for a hand-assembled directory often live outside it, so
+        naming the file must not require the directory to declare a layout — and
+        the root file it does have must then be ignored, not checked.
+        """
+        ckpt = CheckpointFixture(self, actions=_stats(7), state=_stats(8))
+        elsewhere = ckpt.path / "elsewhere.json"
+        elsewhere.write_text(
+            json.dumps({"norm_stats": {"actions": _stats(G1_DIM), "state": _stats(G1_DIM)}})
+        )
+
+        findings = check_checkpoint(ckpt.path, "unitree_g1", norm_stats=elsewhere)
+
+        self.assertNotIn(FAIL, _levels(findings, "norm_stats"))
+        chosen = [f for f in findings if f.check == "norm_stats.json"]
+        self.assertIn(str(elsewhere), chosen[0].detail)
+
+    def test_a_missing_explicit_norm_stats_path_is_fatal(self) -> None:
+        ckpt = CheckpointFixture(self, actions=_stats(G1_DIM), state=_stats(G1_DIM))
+
+        findings = check_checkpoint(
+            ckpt.path, "unitree_g1", norm_stats=ckpt.path / "nope.json"
+        )
+
+        self.assertEqual(_levels(findings, "norm_stats.json"), [FAIL])
 
 
 if __name__ == "__main__":

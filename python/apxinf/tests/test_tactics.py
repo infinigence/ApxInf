@@ -94,11 +94,16 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             "default_pipelines",
             return_value=(FakePipeline(), FakePipeline()),
         ):
+            # A real (empty) file: the tokenizer path is checked for existence
+            # now, so a typo'd --tokenizer fails at load instead of inside
+            # SentencePiece. PromptTokenizer itself is mocked out here.
+            tokenizer_path = pathlib.Path(model_dir) / "paligemma_tokenizer.model"
+            tokenizer_path.write_bytes(b"")
             pi05.Pi05Policy.from_pretrained(
                 model_dir,
                 device="cuda:0",
                 precision="bf16",
-                tokenizer_path="unused-tokenizer.model",
+                tokenizer_path=str(tokenizer_path),
             )
 
         resolve.assert_called_once_with(

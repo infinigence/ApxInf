@@ -47,6 +47,7 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
 from apxinf import Pi05Policy  # noqa: E402
+from apxinf.checkpoints import FORMATS as CHECKPOINT_FORMATS  # noqa: E402
 from apxinf.robots.preflight import FAIL, WARN, check_checkpoint, format_findings  # noqa: E402
 from apxinf.robots.presets import (  # noqa: E402
     ROBOT_PRESETS,
@@ -115,12 +116,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        help="policy model_type; default reads MODEL_DIR/config.json (e.g. pi05)",
+        help="policy model_type; default reads MODEL_DIR/config.json, or metadata.pt "
+        "for an openpi export, which has no config.json (e.g. pi05)",
     )
     parser.add_argument(
         "--tokenizer",
         type=pathlib.Path,
-        help="SentencePiece model (auto-detected under MODEL_DIR by default)",
+        help="SentencePiece model (auto-detected under MODEL_DIR, or APXINF_TOKENIZER)",
+    )
+    parser.add_argument(
+        "--ckpt-format",
+        choices=CHECKPOINT_FORMATS,
+        default="auto",
+        help="how to read MODEL_DIR. 'auto' (default) picks openpi_pytorch when a "
+        "metadata.pt is present and lerobot when a config.json is. Pin it when a "
+        "directory carries both and the wrong one wins.",
+    )
+    parser.add_argument(
+        "--asset-id",
+        default=None,
+        help="override the asset_id the checkpoint names, which is what selects "
+        "assets/<asset_id>/norm_stats.json. For assets reorganized after export.",
+    )
+    parser.add_argument(
+        "--norm-stats",
+        type=pathlib.Path,
+        default=None,
+        help="explicit norm_stats.json, outranking every path convention. Required "
+        "for a LeRobot checkpoint, which ships no such file of its own.",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -148,8 +171,9 @@ def parse_args() -> argparse.Namespace:
         "--action-horizon",
         type=int,
         default=None,
-        help="chunk length to serve. Default: the checkpoint's config.json value, "
-        "or 50 with --random-weights. An explicit value outranks the checkpoint "
+        help="chunk length to serve. Default: the checkpoint's own value (config.json, "
+        "or metadata.pt for an openpi export), or 50 with --random-weights. An "
+        "explicit value outranks the checkpoint "
         "(the horizon is a sequence length, not a weight dimension).",
     )
     parser.add_argument(
@@ -315,6 +339,9 @@ def main() -> None:
             image_keys=image_keys,
             action_dim=args.action_dim,
             tokenizer_path=args.tokenizer,
+            checkpoint_format=args.ckpt_format,
+            asset_id=args.asset_id,
+            norm_stats=args.norm_stats,
         )
         fatal = [f for f in findings if f.level == FAIL]
         if fatal and not args.skip_preflight:
@@ -350,6 +377,9 @@ def main() -> None:
             calibration=args.calibration,
             tactics=args.tactics,
             tokenizer_path=args.tokenizer,
+            checkpoint_format=args.ckpt_format,
+            asset_id=args.asset_id,
+            norm_stats=args.norm_stats,
             norm_key=args.norm_key,
             action_horizon=args.action_horizon,
             seed=args.seed,

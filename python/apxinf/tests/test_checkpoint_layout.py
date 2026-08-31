@@ -44,7 +44,7 @@ def write_metadata_pt(path: Path, payload) -> Path:
 
 def openpi_payload(
     *,
-    asset_id="groundwire",
+    asset_id="example-asset",
     repo_id=None,
     images=("cam_high", "cam_left_wrist", "cam_right_wrist"),
     **model_overrides,
@@ -64,11 +64,11 @@ def openpi_payload(
         "global_step": 14002,
         "timestamp": "2025-07-27T17:01:00",
         "config": {
-            "exp_name": "pi05_UnitreeG1_groundwire",
+            "exp_name": "pi05_unitree_g1_example",
             "model": model,
             "data": {
                 "repo_id": repo_id,
-                "assets": {"assets_dir": "/mnt/a/yehua/yangqi/UnitreeG1/", "asset_id": asset_id},
+                "assets": {"assets_dir": "/data/train-assets/", "asset_id": asset_id},
                 "adapt_to_pi": True,
                 "use_delta_joint_actions": True,
                 "default_prompt": "",
@@ -179,7 +179,7 @@ def test_architecture_is_extracted_in_config_json_vocabulary(tmp_path):
 
 
 def test_unnamed_cameras_leave_num_views_to_the_loader():
-    """RLinf's shape: a TrainConfig with no repack image structure at all."""
+    """A TrainConfig whose repack transform names no cameras at all."""
     facts = train_config_facts(openpi_payload(images=()))
     assert facts["image_keys"] == ()
     assert "num_views" not in facts["arch"]
@@ -192,16 +192,16 @@ def test_fork_specific_num_steps_wins_over_the_default():
 
 
 def test_asset_id_comes_from_assets_then_repo_id():
-    explicit = train_config_facts(openpi_payload(asset_id="groundwire", repo_id="x/y"))
+    explicit = train_config_facts(openpi_payload(asset_id="example-asset", repo_id="x/y"))
     assert (explicit["asset_id"], explicit["asset_id_source"]) == (
-        "groundwire",
+        "example-asset",
         "data.assets.asset_id",
     )
 
     # openpi: `asset_id = data.assets.asset_id or data.repo_id`.
-    fallback = train_config_facts(openpi_payload(asset_id=None, repo_id="RLinf/pick_red"))
+    fallback = train_config_facts(openpi_payload(asset_id=None, repo_id="some-org/some-task"))
     assert (fallback["asset_id"], fallback["asset_id_source"]) == (
-        "RLinf/pick_red",
+        "some-org/some-task",
         "data.repo_id",
     )
 
@@ -212,7 +212,7 @@ def test_deployment_facts_are_carried_through():
     assert facts["state_key"] == "observation.state"
     assert facts["adapt_to_pi"] is True
     assert facts["use_delta_joint_actions"] is True
-    assert facts["exp_name"] == "pi05_UnitreeG1_groundwire"
+    assert facts["exp_name"] == "pi05_unitree_g1_example"
     assert facts["global_step"] == 14002
 
 
@@ -230,11 +230,11 @@ def test_an_unsupported_backbone_is_refused():
 
 
 def test_openpi_export_is_detected_from_metadata_pt(tmp_path):
-    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/groundwire/norm_stats.json")
+    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/example-asset/norm_stats.json")
     layout = detect_checkpoint(root)
     assert layout.format == OPENPI_PYTORCH
-    assert layout.asset_id == "groundwire"
-    assert layout.norm_stats == root / "assets/groundwire/norm_stats.json"
+    assert layout.asset_id == "example-asset"
+    assert layout.norm_stats == root / "assets/example-asset/norm_stats.json"
     assert layout.norm_stats_is_fallback is False
     assert json.loads(layout.config_json_text())["num_views"] == 3
 
@@ -250,8 +250,8 @@ def test_lerobot_directory_is_detected_from_config_json(tmp_path):
 
 
 def test_metadata_pt_outranks_a_stale_config_json(tmp_path):
-    """The customer's directory shape: real metadata.pt, hand-added config.json."""
-    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/groundwire/norm_stats.json")
+    """A shipped directory shape: real metadata.pt, hand-added config.json."""
+    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/example-asset/norm_stats.json")
     (root / "config.json").write_text(json.dumps({"type": "pi05", "chunk_size": 10}))
 
     layout = detect_checkpoint(root)
@@ -280,15 +280,15 @@ def test_pinned_format_does_not_fall_back_to_sniffing(tmp_path):
 
 
 def test_slashed_asset_id_becomes_nested_directories(tmp_path):
-    """RLinf's shape: no asset_id, so openpi falls back to repo_id 'org/name'."""
+    """No asset_id, so openpi falls back to repo_id, which is 'org/name'."""
     root = openpi_dir(
         tmp_path / "ckpt",
         asset_id=None,
-        repo_id="RLinf/pick_red",
-        stats_at="assets/RLinf/pick_red/norm_stats.json",
+        repo_id="some-org/some-task",
+        stats_at="assets/some-org/some-task/norm_stats.json",
     )
     layout = detect_checkpoint(root)
-    assert layout.norm_stats == root / "assets/RLinf/pick_red/norm_stats.json"
+    assert layout.norm_stats == root / "assets/some-org/some-task/norm_stats.json"
     assert layout.norm_stats_is_fallback is False
 
 
@@ -296,10 +296,10 @@ def test_asset_path_without_the_assets_prefix_is_accepted(tmp_path):
     root = openpi_dir(
         tmp_path / "ckpt",
         asset_id=None,
-        repo_id="RLinf/pick_red",
-        stats_at="RLinf/pick_red/norm_stats.json",
+        repo_id="some-org/some-task",
+        stats_at="some-org/some-task/norm_stats.json",
     )
-    assert detect_checkpoint(root).norm_stats == root / "RLinf/pick_red/norm_stats.json"
+    assert detect_checkpoint(root).norm_stats == root / "some-org/some-task/norm_stats.json"
 
 
 def test_root_fallback_is_used_and_logged(tmp_path, caplog):
@@ -311,23 +311,23 @@ def test_root_fallback_is_used_and_logged(tmp_path, caplog):
     assert layout.norm_stats == root / "norm_stats.json"
     assert layout.norm_stats_is_fallback is True
     message = caplog.text
-    assert "assets/groundwire/norm_stats.json" in message  # the path that missed
+    assert "assets/example-asset/norm_stats.json" in message  # the path that missed
     assert str(root / "norm_stats.json") in message  # the one actually used
-    assert "groundwire" in message  # the asset_id, so the ask is actionable
+    assert "example-asset" in message  # the asset_id, so the ask is actionable
 
 
 def test_the_asset_path_wins_over_a_root_file(tmp_path):
-    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/groundwire/norm_stats.json")
+    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/example-asset/norm_stats.json")
     (root / "norm_stats.json").write_text(json.dumps(STATS))
 
     layout = detect_checkpoint(root)
-    assert layout.norm_stats == root / "assets/groundwire/norm_stats.json"
+    assert layout.norm_stats == root / "assets/example-asset/norm_stats.json"
     assert layout.norm_stats_is_fallback is False
     assert any("is ignored" in note for note in layout.notes)
 
 
 def test_explicit_path_outranks_every_convention(tmp_path):
-    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/groundwire/norm_stats.json")
+    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/example-asset/norm_stats.json")
     elsewhere = tmp_path / "elsewhere" / "norm_stats.json"
     elsewhere.parent.mkdir()
     elsewhere.write_text(json.dumps(STATS))
@@ -361,7 +361,7 @@ def test_require_norm_stats_names_every_path_and_the_asset_id(tmp_path):
     with pytest.raises(CheckpointError) as excinfo:
         require_norm_stats(detect_checkpoint(root))
     message = str(excinfo.value)
-    for candidate in ("assets/groundwire/norm_stats.json", "groundwire/norm_stats.json"):
+    for candidate in ("assets/example-asset/norm_stats.json", "example-asset/norm_stats.json"):
         assert str(root / candidate) in message
     assert "train_pytorch.py" in message  # where the file comes from
 
@@ -399,3 +399,148 @@ def test_tokenizer_error_says_where_to_get_the_file(tmp_path):
     assert "gs://big_vision/paligemma_tokenizer.model" in message
     assert "APXINF_TOKENIZER" in message
     assert str(root / "paligemma_tokenizer.model") in message
+
+
+# --- the wiring into Pi05Policy.from_pretrained -----------------------------
+#
+# Detection is only worth anything if what it resolves reaches the loader. An
+# openpi export has no config.json, so before this the Rust side fell back to
+# Pi05Config::default() without a word — a checkpoint with a 50-step horizon
+# would have been served at whatever the default happened to be.
+
+
+class _FakeModel:
+    action_horizon = 50
+    action_dim = 32
+    num_views = 3
+    image_size = 224
+    max_token_len = 200
+
+    def reset_sampling(self, seed=None):
+        pass
+
+
+def _load_with_fake_binding(monkeypatch, model_dir, **kwargs):
+    """Run ``from_pretrained`` against a stub binding; return the load kwargs."""
+    import sys
+    import types
+
+    from apxinf.policies.impls import pi05
+
+    captured = {}
+
+    class FakeBindingModel:
+        @staticmethod
+        def load(*args, **load_kwargs):
+            captured.update(load_kwargs)
+            captured["positional"] = args
+            return _FakeModel()
+
+    class FakePipeline:
+        names = []
+
+        def __getitem__(self, name):
+            raise KeyError(name)
+
+    monkeypatch.setitem(sys.modules, "apxinf_py", types.SimpleNamespace(Model=FakeBindingModel))
+    monkeypatch.setattr(pi05, "resolve_pi05_tactics", lambda *a, **k: None)
+    monkeypatch.setattr(pi05, "PromptTokenizer", lambda *a, **k: object())
+    monkeypatch.setattr(
+        pi05.Pi05Policy, "default_pipelines", classmethod(
+            lambda cls, *a, **k: (FakePipeline(), FakePipeline())
+        )
+    )
+    (Path(model_dir) / "paligemma_tokenizer.model").write_bytes(b"sp")
+    pi05.Pi05Policy.from_pretrained(model_dir, device="cuda:0", precision="bf16", **kwargs)
+    return captured
+
+
+def test_metadata_pt_architecture_reaches_the_rust_loader(tmp_path, monkeypatch):
+    root = openpi_dir(
+        tmp_path / "ckpt",
+        stats_at="assets/example-asset/norm_stats.json",
+        action_horizon=50,
+    )
+
+    captured = _load_with_fake_binding(monkeypatch, root, action_dim=16, discrete_state=False)
+
+    config = json.loads(captured["config_json"])
+    assert config["action_horizon"] == 50
+    assert config["action_dim"] == 32
+    assert config["num_views"] == 3
+
+
+def test_a_lerobot_directory_still_lets_the_loader_read_config_json(tmp_path, monkeypatch):
+    """No ``config_json=``: the Rust loader reads config.json itself, as before."""
+    root = lerobot_dir(tmp_path / "ckpt")
+
+    captured = _load_with_fake_binding(monkeypatch, root, action_dim=16, discrete_state=False)
+
+    assert "config_json" not in captured
+
+
+def test_the_asset_path_statistics_are_the_ones_loaded(tmp_path, monkeypatch):
+    """A wrong root file next to correct asset statistics — the delivered shape."""
+    root = openpi_dir(tmp_path / "ckpt", stats_at="assets/example-asset/norm_stats.json")
+    (root / "norm_stats.json").write_text(
+        json.dumps({"actions": {"q01": [-1.0] * 7, "q99": [1.0] * 7}})
+    )
+
+    from apxinf.policies.impls import pi05
+
+    seen = {}
+    original = pi05.Unnormalizer.from_norm_stats
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pi05.Unnormalizer, "from_norm_stats", spy)
+    _load_with_fake_binding(monkeypatch, root, discrete_state=False)
+
+    assert seen["path"] == root / "assets" / "example-asset" / "norm_stats.json"
+
+
+def test_a_flat_directory_loads_with_no_layout_at_all(tmp_path, monkeypatch):
+    """The hand-assembled layout that predates this module must keep working."""
+    root = tmp_path / "flat"
+    root.mkdir()
+    (root / "model.safetensors").write_bytes(b"")
+    (root / "norm_stats.json").write_text(json.dumps(STATS))
+
+    captured = _load_with_fake_binding(monkeypatch, root, discrete_state=False)
+
+    assert "config_json" not in captured
+
+
+def test_explicit_norm_stats_needs_no_layout(tmp_path, monkeypatch):
+    """``--norm-stats`` names one file; it does not assert a directory shape."""
+    root = tmp_path / "flat"
+    root.mkdir()
+    (root / "model.safetensors").write_bytes(b"")
+    elsewhere = tmp_path / "stats.json"
+    elsewhere.write_text(json.dumps(STATS))
+
+    from apxinf.policies.impls import pi05
+
+    seen = {}
+    original = pi05.Unnormalizer.from_norm_stats
+    monkeypatch.setattr(
+        pi05.Unnormalizer,
+        "from_norm_stats",
+        lambda *a, **k: (seen.update(k), original(*a, **k))[1],
+    )
+    _load_with_fake_binding(monkeypatch, root, discrete_state=False, norm_stats=elsewhere)
+
+    assert seen["path"] == elsewhere
+
+
+def test_a_missing_explicit_norm_stats_path_is_refused(tmp_path, monkeypatch):
+    root = tmp_path / "flat"
+    root.mkdir()
+    (root / "model.safetensors").write_bytes(b"")
+
+    with pytest.raises(CheckpointError, match="does not exist"):
+        _load_with_fake_binding(
+            monkeypatch, root, discrete_state=False, norm_stats=tmp_path / "nope.json"
+        )

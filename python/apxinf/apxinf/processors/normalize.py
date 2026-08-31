@@ -36,15 +36,26 @@ _QUANTILE = "quantile"
 _MEAN_STD = "mean_std"
 
 
-def load_norm_stats(model_dir, key: str = "actions") -> dict:
+def load_norm_stats(model_dir=None, key: str = "actions", *, path=None) -> dict:
     """Return the raw stats dict for ``key`` (e.g. ``"actions"``/``"state"``).
 
     Handles both the nested ``{"norm_stats": {...}}`` and flat top-level layouts.
+
+    ``path`` names the file directly and is what callers should pass: an openpi
+    PyTorch export keeps its statistics at ``assets/<asset_id>/norm_stats.json``,
+    not in the checkpoint root, so :func:`apxinf.checkpoints.detect_checkpoint`
+    resolves the path and hands it over here. ``model_dir`` remains for the flat
+    layout — it just means ``<model_dir>/norm_stats.json``.
     """
-    document = json.loads((Path(model_dir) / "norm_stats.json").read_text())
+    if path is None:
+        if model_dir is None:
+            raise TypeError("load_norm_stats needs either model_dir or path")
+        path = Path(model_dir) / "norm_stats.json"
+    path = Path(path)
+    document = json.loads(path.read_text())
     stats = document.get("norm_stats", document)
     if key not in stats:
-        raise KeyError(f"norm_stats.json has no entry {key!r}; keys: {sorted(stats)}")
+        raise KeyError(f"{path} has no entry {key!r}; keys: {sorted(stats)}")
     return stats[key]
 
 
@@ -185,8 +196,8 @@ def _finite(array: np.ndarray, who: str) -> np.ndarray:
     return array
 
 
-def _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype):
-    stats = load_norm_stats(model_dir, key)
+def _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path=None):
+    stats = load_norm_stats(model_dir, key, path=path)
     if mode == _QUANTILE:
         return cls(q01=stats["q01"], q99=stats["q99"], mode=mode, dims=dims, eps=eps, dtype=dtype)
     return cls(mean=stats["mean"], std=stats["std"], mode=mode, dims=dims, eps=eps, dtype=dtype)
@@ -212,8 +223,9 @@ class Unnormalizer(ProcessorStep):
         self.dtype = self._stats.dtype
 
     @classmethod
-    def from_norm_stats(cls, model_dir, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None):
-        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype)
+    def from_norm_stats(cls, model_dir=None, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None, *, path=None):
+        """Build from a ``norm_stats.json``; ``path`` names the file directly."""
+        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path)
 
     @property
     def width(self) -> int:
@@ -250,8 +262,9 @@ class Normalizer(ProcessorStep):
         self.dtype = self._stats.dtype
 
     @classmethod
-    def from_norm_stats(cls, model_dir, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None):
-        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype)
+    def from_norm_stats(cls, model_dir=None, key: str = "actions", mode: str = _QUANTILE, dims=None, eps=1e-6, dtype=None, *, path=None):
+        """Build from a ``norm_stats.json``; ``path`` names the file directly."""
+        return _from_norm_stats(cls, model_dir, key, mode, dims, eps, dtype, path)
 
     @property
     def width(self) -> int:

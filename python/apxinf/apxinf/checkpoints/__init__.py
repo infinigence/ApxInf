@@ -6,7 +6,7 @@ so a directory convention is written down once rather than guessed three times.
 
     from apxinf.checkpoints import detect_checkpoint, require_norm_stats
 
-    layout = detect_checkpoint("~/airs/airs-model")
+    layout = detect_checkpoint(model_dir)
     stats = require_norm_stats(layout)      # raises, naming every path tried
     config_json = layout.config_json_text() # -> apxinf_py.Model.load(config_json=...)
 
@@ -25,6 +25,7 @@ from .layout import (
     CheckpointError,
     CheckpointLayout,
     detect_checkpoint,
+    has_layout_metadata,
     require_norm_stats,
     resolve_tokenizer,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "OPENPI_PYTORCH",
     "TOKENIZER_NAMES",
     "detect_checkpoint",
+    "has_layout_metadata",
     "read_metadata_pt",
     "repack_structure",
     "require_norm_stats",

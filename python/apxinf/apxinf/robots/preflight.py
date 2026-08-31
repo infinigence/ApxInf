@@ -14,10 +14,11 @@ it, phrased as a list of :class:`Finding` s rather than an exception, so a calle
 can report all of them at once instead of fixing them one crash at a time.
 
 **What is checked here** is what can be read from the checkpoint *directory* with
-the standard library: ``norm_stats.json`` widths and keys, and the tokenizer
-file. The richer cross-check against openpi's own ``metadata.pt`` (its serialized
-``TrainConfig``: ``adapt_to_pi``, ``use_delta_joint_actions``, the repack wire
-keys, ``discrete_state_input``) needs torch to unpickle and lives in
+the standard library: which layout it is, where its ``norm_stats.json`` actually
+lives, that file's widths and keys, and the tokenizer. Nothing loads a weight and
+nothing imports torch or the CUDA binding, so these checks run before the
+expensive part of startup — and on a laptop. The richer cross-check against the
+preset's own wire keys and delta convention lives in
 ``scripts/openpi_metadata_to_apxinf.py``, which calls this module and adds to it.
 
 **What is deliberately not checked here** is anything already enforced elsewhere:
@@ -35,6 +36,14 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from .presets import RobotPreset, get_robot_preset
+from ..checkpoints import (
+    CheckpointError,
+    CheckpointLayout,
+    TOKENIZER_NAMES,
+    detect_checkpoint,
+    has_layout_metadata,
+    require_norm_stats,
+)
 
 __all__ = ["Finding", "FAIL", "WARN", "INFO", "check_checkpoint", "format_findings"]
 
@@ -46,11 +55,6 @@ WARN = "WARN"
 INFO = "INFO"
 
 _ORDER = {FAIL: 0, WARN: 1, INFO: 2}
-
-#: Tokenizer filenames :func:`apxinf.policies.impls.pi05._resolve_tokenizer`
-#: looks for. Kept as a literal rather than imported so this module stays
-#: importable without the CUDA binding that ``pi05`` pulls in.
-TOKENIZER_NAMES = ("tokenizer.model", "paligemma_tokenizer.model")
 
 
 @dataclass(frozen=True)
@@ -77,27 +81,105 @@ def _width(stats: dict, key: str) -> Optional[int]:
     return None
 
 
-def _check_norm_stats(
-    model_dir: Path, preset: RobotPreset, *, norm_key: str, discrete_state: bool
-) -> List[Finding]:
-    """The A1 check: are the shipped statistics this robot's statistics?"""
-    path = model_dir / "norm_stats.json"
-    if not path.exists():
-        return [
+def _check_layout(layout: CheckpointLayout) -> List[Finding]:
+    """Report what the directory says it is, before anything reads it.
+
+    The layout decides which ``norm_stats.json`` gets used, so an operator who
+    can see the chosen path can spot the wrong-statistics failure by eye — which
+    is the one failure mode this whole module exists for.
+    """
+    findings = [Finding(INFO, "checkpoint layout", f"{layout.format} ({layout.root})")]
+    if layout.asset_id:
+        findings.append(
             Finding(
-                FAIL,
-                "norm_stats.json",
-                f"missing from {model_dir}",
-                "unnormalization has no statistics to use; ship the file with the checkpoint",
+                INFO,
+                "asset_id",
+                f"{layout.asset_id!r} (from {layout.asset_id_source or 'metadata.pt'})",
             )
-        ]
+        )
+    if layout.arch:
+        rendered = ", ".join(f"{k}={v}" for k, v in sorted(layout.arch.items()))
+        findings.append(Finding(INFO, "architecture", f"from metadata.pt: {rendered}"))
+    for note in layout.notes:
+        findings.append(Finding(INFO, "checkpoint layout", note))
+    return findings
+
+
+def _check_norm_stats(
+    model_dir: Path,
+    preset: RobotPreset,
+    *,
+    norm_key: str,
+    discrete_state: bool,
+    layout: Optional[CheckpointLayout] = None,
+    norm_stats=None,
+) -> List[Finding]:
+    """Are the shipped statistics this robot's statistics?
+
+    ``layout`` supplies the resolved path. An openpi export keeps its statistics
+    under ``assets/<asset_id>/``, so reading ``<model_dir>/norm_stats.json``
+    unconditionally is how the wrong file got checked *and* served: whatever a
+    previous run happened to leave in the root. With no layout — a flat directory
+    that declares nothing — ``norm_stats`` still names the file directly, which
+    is what :meth:`Pi05Policy.from_pretrained` does in the same situation.
+    """
+    findings: List[Finding] = []
+    if layout is not None:
+        try:
+            path = require_norm_stats(layout)
+        except CheckpointError as exc:
+            return [
+                Finding(
+                    FAIL,
+                    "norm_stats.json",
+                    str(exc),
+                    "unnormalization has no statistics to use; ship the file with the "
+                    "checkpoint or point --norm-stats at it",
+                )
+            ]
+        if layout.norm_stats_is_fallback:
+            findings.append(
+                Finding(
+                    WARN,
+                    "norm_stats.json",
+                    f"using the checkpoint root {path} because {layout.norm_stats_tried[0]} "
+                    f"(openpi's path for asset_id={layout.asset_id!r}) does not exist",
+                    "verify these statistics belong to this robot. A file from another "
+                    "run is syntactically valid and unnormalizes silently; the width "
+                    "check below is the only thing that would catch it.",
+                )
+            )
+        else:
+            findings.append(Finding(INFO, "norm_stats.json", str(path)))
+    elif norm_stats is not None:
+        path = Path(norm_stats)
+        if not path.is_file():
+            return [
+                Finding(
+                    FAIL,
+                    "norm_stats.json",
+                    f"--norm-stats {path} does not exist",
+                    "fix the path",
+                )
+            ]
+        findings.append(Finding(INFO, "norm_stats.json", f"{path} (explicit)"))
+    else:
+        path = model_dir / "norm_stats.json"
+        if not path.exists():
+            return [
+                Finding(
+                    FAIL,
+                    "norm_stats.json",
+                    f"missing from {model_dir}",
+                    "unnormalization has no statistics to use; ship the file with the checkpoint",
+                )
+            ]
     try:
         document = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         return [Finding(FAIL, "norm_stats.json", f"unreadable: {exc}", "fix or re-export the file")]
 
     stats = document.get("norm_stats", document)
-    findings: List[Finding] = []
 
     # Width per key against what the preset says the robot is. This is the check
     # that catches a G1 checkpoint carrying LIBERO statistics: 16-dim robot,
@@ -161,7 +243,7 @@ def _check_norm_stats(
 
 
 def _check_tokenizer(model_dir: Path, tokenizer_path) -> List[Finding]:
-    """The A14 check: is there a tokenizer to load, and is it the *same* one?"""
+    """Is there a tokenizer to load, and is it the *same* one both servers use?"""
     if tokenizer_path is not None:
         path = Path(tokenizer_path)
         if not path.exists():
@@ -225,6 +307,9 @@ def check_checkpoint(
     image_keys: Optional[Sequence[str]] = None,
     action_dim: Optional[int] = None,
     tokenizer_path=None,
+    checkpoint_format: Optional[str] = None,
+    asset_id: Optional[str] = None,
+    norm_stats=None,
 ) -> Tuple[Finding, ...]:
     """Check a checkpoint directory against the preset that will serve it.
 
@@ -232,14 +317,57 @@ def check_checkpoint(
     its overrides), not the raw command line, so what is checked is what will
     actually run. Returns findings sorted most-severe first; an empty tuple is
     impossible because passing checks are reported as :data:`INFO`.
+
+    ``checkpoint_format`` / ``asset_id`` / ``norm_stats`` are the same knobs
+    :meth:`~apxinf.policies.impls.pi05.Pi05Policy.from_pretrained` takes, and must
+    be passed through identically — this is a preflight for *that* load, so
+    checking a different file than the one that will be served defeats the point.
     """
     model_dir = Path(model_dir)
     preset = get_robot_preset(robot)
     discrete = preset.discrete_state if discrete_state is None else bool(discrete_state)
     keys = preset.image_keys if image_keys is None else tuple(image_keys)
 
+    # A directory that declares nothing about itself is the hand-assembled flat
+    # layout that predates this check; it still loads, so it is still checked,
+    # just against <model_dir>/norm_stats.json (or --norm-stats, which names one
+    # file rather than asserting a directory shape). A detection failure is
+    # reported rather than raised: preflight's whole contract is to list every
+    # problem. This mirrors Pi05Policy.from_pretrained exactly — a preflight that
+    # resolves a different file than the load would is worse than none.
+    layout: Optional[CheckpointLayout] = None
+    layout_findings: List[Finding] = []
+    if checkpoint_format or asset_id or has_layout_metadata(model_dir):
+        try:
+            layout = detect_checkpoint(
+                model_dir,
+                checkpoint_format=checkpoint_format,
+                asset_id=asset_id,
+                norm_stats=norm_stats,
+            )
+        except CheckpointError as exc:
+            layout_findings.append(
+                Finding(
+                    FAIL,
+                    "checkpoint layout",
+                    str(exc),
+                    "apxinf cannot tell what this directory is, so it cannot tell "
+                    "which files to read; pass --ckpt-format, or fix the directory",
+                )
+            )
+        else:
+            layout_findings.extend(_check_layout(layout))
+
     findings = [
-        *_check_norm_stats(model_dir, preset, norm_key=norm_key, discrete_state=discrete),
+        *layout_findings,
+        *_check_norm_stats(
+            model_dir,
+            preset,
+            norm_key=norm_key,
+            discrete_state=discrete,
+            layout=layout,
+            norm_stats=norm_stats,
+        ),
         *_check_tokenizer(model_dir, tokenizer_path),
         *_check_cameras(preset, keys),
     ]

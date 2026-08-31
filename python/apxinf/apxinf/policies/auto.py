@@ -20,6 +20,7 @@ from typing import Optional
 
 from .base import Policy
 from .registry import available_policies, get_policy
+from ..checkpoints import OPENPI_PYTORCH, CheckpointError, detect_checkpoint
 
 __all__ = ["AutoPolicy"]
 
@@ -55,6 +56,22 @@ class AutoPolicy:
 def _read_model_type(model_dir: Path) -> str:
     config_path = model_dir / "config.json"
     if not config_path.is_file():
+        # An openpi PyTorch export has no config.json at all — its model type
+        # lives in metadata.pt, which is exactly what an openpi_pytorch layout
+        # means. Without this, every such checkpoint had to be served with an
+        # explicit model_type= even though the directory does say what it is.
+        try:
+            layout = detect_checkpoint(model_dir)
+        except CheckpointError as exc:
+            raise FileNotFoundError(
+                f"AutoPolicy: no config.json in {model_dir} and its layout could not "
+                f"be identified ({exc}); pass model_type= explicitly "
+                f"(known: {available_policies()})"
+            ) from exc
+        if layout.format == OPENPI_PYTORCH:
+            # train_config_facts already refused anything that is not pi05
+            # (pi05=False, or a backbone this runtime is not built for).
+            return "pi05"
         raise FileNotFoundError(
             f"AutoPolicy: no config.json in {model_dir}; pass model_type= explicitly "
             f"(known: {available_policies()})"

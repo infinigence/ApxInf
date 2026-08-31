@@ -53,6 +53,7 @@ __all__ = [
     "OPENPI_PYTORCH",
     "TOKENIZER_NAMES",
     "detect_checkpoint",
+    "has_layout_metadata",
     "require_norm_stats",
     "resolve_tokenizer",
 ]
@@ -190,7 +191,7 @@ def _resolve_norm_stats(
         parts = _asset_parts(asset_id)
         # openpi's official convention, written by train_pytorch.py.
         candidates.append(root.joinpath("assets", *parts, NORM_STATS_NAME))
-        # Some forks (RLinf) also drop a copy without the assets/ prefix.
+        # Some exporters also drop a copy without the assets/ prefix.
         candidates.append(root.joinpath(*parts, NORM_STATS_NAME))
     flat = root / NORM_STATS_NAME
     tried = (*candidates, flat)
@@ -207,6 +208,20 @@ def _resolve_norm_stats(
     if flat.is_file():
         return flat, tried, bool(candidates), tuple(notes)
     return None, tried, False, tuple(notes)
+
+
+def has_layout_metadata(model_dir) -> bool:
+    """True when the directory declares its own layout (``metadata.pt``/``config.json``).
+
+    Callers that must keep serving the hand-assembled flat directories that
+    predate this module — ``model.safetensors`` + ``norm_stats.json`` and nothing
+    that says what the checkpoint is — use this to decide whether
+    :func:`detect_checkpoint` has anything to work with. Detection itself refuses
+    to guess, which is right for a real checkpoint and wrong as a hard regression
+    for a directory that used to load.
+    """
+    root = Path(model_dir)
+    return (root / METADATA_NAME).is_file() or (root / CONFIG_NAME).is_file()
 
 
 def detect_checkpoint(
@@ -275,7 +290,7 @@ def detect_checkpoint(
             raise CheckpointError(f"{metadata_pt}: {exc}") from exc
         arch = dict(facts["arch"])
         if has_config:
-            # The customer's directory is exactly this: a hand-added config.json
+            # A shipped directory can be exactly this: a hand-added config.json
             # from a *different* training run sitting next to the real metadata.
             notes.append(
                 f"{config_json} is ignored — for an openpi export metadata.pt is the "

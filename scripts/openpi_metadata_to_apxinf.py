@@ -2,7 +2,7 @@
 """Read an openpi checkpoint's own ``metadata.pt`` and say what apxinf must run.
 
 openpi keeps the serving contract in a Python registry: ``serve_policy.py
---policy.config pi05_UnitreeG1_groundwire`` selects a ``TrainConfig``, and that
+--policy.config <TrainConfig name>`` selects a ``TrainConfig``, and that
 object decides the wire keys, the delta convention, the state handling and the
 action width. When a checkpoint is exported, openpi serializes that
 ``TrainConfig`` into ``metadata.pt`` — so the checkpoint carries its own answer to
@@ -28,11 +28,12 @@ checkpoint. The value here is the assertion, not the transcription.
 
 Usage::
 
-    python scripts/openpi_metadata_to_apxinf.py --model-dir ~/airs/airs-model --robot unitree_g1
+    python scripts/openpi_metadata_to_apxinf.py --model-dir CKPT_DIR --robot unitree_g1
 
 Exit status is 1 when any check is fatal, so it can gate a deployment.
-``metadata.pt`` is optional: without it (or without torch) the checkpoint-
-directory checks still run and the openpi cross-check is reported as skipped.
+``metadata.pt`` is optional: without it the checkpoint-directory checks still run
+and the openpi cross-check is reported as skipped. Nothing here needs torch, CUDA
+or a loaded weight -- it is a seconds-long, laptop-runnable check.
 """
 
 from __future__ import annotations
@@ -47,6 +48,12 @@ _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
 if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
+from apxinf.checkpoints import (  # noqa: E402
+    FORMATS as CHECKPOINT_FORMATS,
+    MetadataError,
+    read_metadata_pt,
+    repack_structure,
+)
 from apxinf.robots.preflight import (  # noqa: E402
     FAIL,
     INFO,
@@ -65,42 +72,25 @@ from apxinf.robots.presets import (  # noqa: E402
 def load_train_config(model_dir: pathlib.Path):
     """Return openpi's serialized ``TrainConfig`` dict, or ``(None, reason)``.
 
-    ``metadata.pt`` is a torch pickle of nested plain dicts plus a couple of
-    openpi/flax sentinel objects, so unpickling needs those packages importable.
-    Both failure modes -- no file, no torch -- are expected in the field and are
-    reported rather than raised: the directory checks are still worth running.
+    Read through :func:`apxinf.checkpoints.read_metadata_pt`, which parses the
+    torch archive with the standard library alone. That matters here: this script
+    is meant to run on a laptop, before anything heavy is installed, and
+    ``metadata.pt`` is 30 kB of nested dicts — needing torch to see them made the
+    check skippable exactly when it was most useful. A missing or unparseable
+    file is still reported rather than raised, because the directory checks are
+    worth running either way.
     """
     path = model_dir / "metadata.pt"
     if not path.exists():
         return None, f"{path} not present (apxinf does not require it)"
     try:
-        import torch
-    except ImportError:
-        return None, "torch is not installed, so metadata.pt cannot be unpickled"
-    try:
-        # weights_only=False: this is a config object graph, not tensors.
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:  # noqa: BLE001 - any unpickle failure is the same story
-        return None, f"{type(exc).__name__}: {exc} (openpi may need to be importable)"
-    config = payload.get("config") if isinstance(payload, dict) else None
+        payload = read_metadata_pt(path)
+    except MetadataError as exc:
+        return None, str(exc)
+    config = payload.get("config")
     if not isinstance(config, dict):
         return None, f"metadata.pt has no 'config' dict (keys: {sorted(payload)})"
     return config, ""
-
-
-def _repack_structure(data: dict) -> dict:
-    """The wire keys openpi's client sends, from ``repack_transforms.inputs``.
-
-    openpi's repack transform is written *inbound*: ``{wire_key: dataset_column}``.
-    Its keys are therefore exactly what the client puts on the network, which is
-    what an apxinf preset's ``slots`` and ``state_key`` have to reproduce.
-    """
-    inputs = (data.get("repack_transforms") or {}).get("inputs") or ()
-    for entry in inputs:
-        structure = entry.get("structure") if isinstance(entry, dict) else None
-        if isinstance(structure, dict):
-            return structure
-    return {}
 
 
 def compare_to_preset(config: dict, robot: str) -> list:
@@ -108,7 +98,7 @@ def compare_to_preset(config: dict, robot: str) -> list:
     preset = get_robot_preset(robot)
     model = config.get("model") or {}
     data = config.get("data") or {}
-    structure = _repack_structure(data)
+    structure = repack_structure(data)
     out = []
 
     exp = config.get("exp_name") or config.get("name")
@@ -174,8 +164,9 @@ def compare_to_preset(config: dict, robot: str) -> list:
                     WARN,
                     label,
                     f"metadata.pt says {value}, apxinf's pi05 path assumes {ours}",
-                    "apxinf reads the real value from config.json at load time; this "
-                    "only flags that the assumption baked into the preset is stale",
+                    "apxinf reads the real value from the checkpoint at load time "
+                    "(config.json, or metadata.pt for an openpi export); this only "
+                    "flags that the assumption baked into the preset is stale",
                 )
             )
         else:
@@ -219,7 +210,7 @@ def compare_to_preset(config: dict, robot: str) -> list:
     if prompt is not None:
         out.append(Finding(INFO, "default_prompt", repr(prompt)))
 
-    # --- where the *real* norm_stats live, which is the A1 question.
+    # --- where the *real* norm_stats live, which is the whole question.
     assets = data.get("assets") or {}
     asset_id, assets_dir = assets.get("asset_id"), assets.get("assets_dir")
     if asset_id or assets_dir:
@@ -266,17 +257,28 @@ def describe_launch(config: dict, robot: str, model_dir: pathlib.Path) -> str:
     return " \\\n".join(flags) + "\n\n" + note
 
 
-def _check_lerobot_config(model_dir: pathlib.Path, robot: str) -> list:
+def _check_lerobot_config(model_dir: pathlib.Path, robot: str, *, authoritative: bool) -> list:
     """Flag a ``config.json`` that describes a different robot than the weights.
 
-    apxinf loads the model shape from this file, so a stale one is not inert: its
-    ``input_features`` decide ``num_views``. Its ``observation.state`` /
-    ``action`` shapes are not read by apxinf at all, which is exactly why a wrong
-    one survives -- but they are the loudest available signal that the file was
-    copied from a different training run.
+    ``authoritative`` says whether apxinf will actually load the model shape from
+    this file. For a LeRobot directory it will, so a stale ``input_features``
+    silently decides ``num_views``. For an openpi export ``metadata.pt`` wins and
+    the file is inert — but a config.json describing a *different* robot sitting
+    next to the weights is still the loudest available signal that the directory
+    was assembled from more than one training run, which is exactly how a wrong
+    ``norm_stats.json`` gets in.
     """
     path = model_dir / "config.json"
     if not path.exists():
+        if not authoritative:
+            return [
+                Finding(
+                    INFO,
+                    "config.json",
+                    "absent, as an openpi PyTorch export always is; the architecture "
+                    "comes from metadata.pt",
+                )
+            ]
         return [Finding(WARN, "config.json", f"missing from {model_dir}")]
     try:
         config = json.loads(path.read_text())
@@ -290,11 +292,15 @@ def _check_lerobot_config(model_dir: pathlib.Path, robot: str) -> list:
     if views and views != preset.num_views:
         out.append(
             Finding(
-                FAIL,
+                FAIL if authoritative else WARN,
                 "config.json num_views",
                 f"{views} VISUAL features, preset {robot!r} sends {preset.num_views}",
                 "apxinf reads the view count from this file, so it decides how many "
-                "camera slots the model has. Pass --num-views to serve fewer.",
+                "camera slots the model has. Pass --num-views to serve fewer."
+                if authoritative
+                else "metadata.pt outranks this file for an openpi export, so this "
+                "does not decide the view count -- but it says the file came from "
+                "another run, so treat everything else in the directory the same way.",
             )
         )
     else:
@@ -342,6 +348,14 @@ def main() -> int:
     )
     parser.add_argument("--norm-key", default="actions")
     parser.add_argument("--tokenizer", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--ckpt-format",
+        choices=CHECKPOINT_FORMATS,
+        default="auto",
+        help="how to read the directory; must match what the server will be given",
+    )
+    parser.add_argument("--asset-id", default=None)
+    parser.add_argument("--norm-stats", type=pathlib.Path, default=None)
     parser.add_argument("--action-dim", type=int, default=None)
     parser.add_argument(
         "--discrete-state", dest="discrete_state", action="store_true", default=None
@@ -362,9 +376,18 @@ def main() -> int:
             discrete_state=args.discrete_state,
             action_dim=args.action_dim,
             tokenizer_path=args.tokenizer,
+            checkpoint_format=args.ckpt_format,
+            asset_id=args.asset_id,
+            norm_stats=args.norm_stats,
         )
     )
-    findings += _check_lerobot_config(model_dir, args.robot)
+    findings += _check_lerobot_config(
+        model_dir,
+        args.robot,
+        # metadata.pt outranks config.json, so the file only decides the
+        # architecture when there is no metadata.pt to outrank it.
+        authoritative=not (model_dir / "metadata.pt").is_file(),
+    )
 
     config, reason = load_train_config(model_dir)
     if config is None:
