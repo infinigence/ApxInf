@@ -25,12 +25,12 @@ Benchmarking PI-0.5 with randomly generated weights.
 ```bash
 python scripts/bench_pi05.py --random-weights --precision bf16 --layer l1 \
   --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 \
-  --warmup 10 --samples 100
+  --warmup 10 --samples 100 --autotune
 ```
 
 ```bash
 python scripts/bench_pi05.py --random-weights --precision fp8 --layer l1 \
-  --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10
+  --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 --autotune
 ```
 
 Reported latency is P50 over 30 samples after 10 warm-up iterations
@@ -42,7 +42,9 @@ Reported latency is P50 over 30 samples after 10 warm-up iterations
 import numpy as np
 from apxinf import AutoPolicy
 
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16", action_dim=7)
+policy = AutoPolicy.from_pretrained(
+    "<path-to-model>", precision="bf16", action_dim=7, autotune=True
+)
 
 result = policy.infer({
     "observation/image":       np.zeros((256, 256, 3), np.uint8),
@@ -65,7 +67,8 @@ raw frames.
 
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --robot franka_libero --precision bf16 --port 8000
+  --model-dir <path-to-model> --robot franka_libero --precision bf16 \
+  --autotune --port 8000
 ```
 
 An unmodified `openpi-client` connects to it:

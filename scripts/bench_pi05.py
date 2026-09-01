@@ -155,6 +155,11 @@ def parse_args() -> argparse.Namespace:
     # Internal escape hatch for tactic generation/debugging. Normal benchmark
     # runs select the repository's validated JSON from CUDA SM + precision.
     p.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--autotune",
+        action="store_true",
+        help="tune missing exact GEMM tactics from the benchmark workload and persist them",
+    )
 
     # Architecture overrides — synthetic shapes. `--action-horizon` is the one
     # knob that also applies to a checkpoint (see below).
@@ -300,9 +305,6 @@ def main() -> None:
         )
     if args.calibration is not None and args.precision != "fp8":
         raise SystemExit("--calibration only applies to --precision fp8")
-    if args.tactics is not None and args.precision == "int8":
-        raise SystemExit("--tactics only applies to --precision bf16 or fp8")
-
     handle = None
     policy = None
     observation = rgb = token_ids = noise = patches = None
@@ -314,7 +316,10 @@ def main() -> None:
             # Random engines bypass Pi05Policy.from_pretrained, so this synthetic
             # benchmark is the sole caller that must resolve the package default.
             tactics = resolve_pi05_tactics(
-                args.device, args.precision, override=args.tactics
+                args.device,
+                args.precision,
+                override=args.tactics,
+                allow_missing=args.autotune,
             )
             if tactics is not None:
                 print(
@@ -338,6 +343,7 @@ def main() -> None:
                 max_token_len=args.max_token_len if args.max_token_len is not None else 200,
                 calibration=calibration,
                 tactics=str(tactics) if tactics is not None else None,
+                autotune=args.autotune,
                 seed=args.seed,
             )
             if "l2" in layers:
@@ -389,6 +395,7 @@ def main() -> None:
                 device=args.device,
                 precision=args.precision,
                 tactics=args.tactics,
+                autotune=args.autotune,
                 action_dim=(args.action_dim or None),
                 action_horizon=args.action_horizon,
             )
@@ -445,6 +452,7 @@ def main() -> None:
         "layers": layers,
         "warmup": args.warmup,
         "samples": args.samples,
+        "autotune": args.autotune,
     }
     if handle is not None:
         result["workload"] = {

@@ -134,6 +134,11 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--autotune",
+        action="store_true",
+        help="tune missing exact GEMM tactics from real requests and persist them",
+    )
+    parser.add_argument(
         "--action-dim",
         type=int,
         default=None,
@@ -214,6 +219,7 @@ def main() -> None:
         "protocol": "openpi.websocket_policy",
         "precision": args.precision,
         "policy": preset.name,
+        "autotune": args.autotune,
     }
     if args.random_weights:
         import apxinf_py  # lazy: only the synthetic path needs the CUDA binding here
@@ -221,7 +227,10 @@ def main() -> None:
         # Random engines bypass Pi05Policy.from_pretrained, so this synthetic
         # server is the sole caller that must resolve the package default.
         tactics = resolve_pi05_tactics(
-            args.device, args.precision, override=args.tactics
+            args.device,
+            args.precision,
+            override=args.tactics,
+            allow_missing=args.autotune,
         )
         if tactics is not None:
             logging.info("using %s tactics for %s: %s", args.precision, args.device, tactics)
@@ -267,6 +276,7 @@ def main() -> None:
             max_token_len=args.max_token_len,
             calibration=calibration,
             tactics=(str(tactics) if tactics is not None else None),
+            autotune=args.autotune,
             seed=args.seed,
         )
         policy = Pi05Policy.from_random(
@@ -299,6 +309,7 @@ def main() -> None:
             precision=args.precision,
             calibration=args.calibration,
             tactics=args.tactics,
+            autotune=args.autotune,
             tokenizer_path=args.tokenizer,
             norm_key=args.norm_key,
             action_horizon=args.action_horizon,
