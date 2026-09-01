@@ -626,6 +626,22 @@ impl Pi05CudaRuntime {
         self.denoise_all_steps(noise, time_embeddings, &prefix)
     }
 
+    /// Run eager inference when RGB preprocessing has already produced
+    /// calibrated E4M3 patch tokens.
+    pub fn infer_fp8_patches(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        noise: &Tensor,
+        time_embeddings: &[Tensor],
+    ) -> Result<Tensor> {
+        let vision = self.encode_vision_fp8_patches(patches)?;
+        let prefix = self.embed_prefix(&vision, token_ids, token_count)?;
+        let prefix = self.prefix_forward(&prefix)?;
+        self.denoise_all_steps(noise, time_embeddings, &prefix)
+    }
+
     fn infer_with_styles(
         &self,
         patches: &Tensor,

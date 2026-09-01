@@ -64,8 +64,16 @@ impl RuntimeVariant {
         token_ids: &DeviceBuffer,
         token_count: usize,
         noise: &Tensor,
+        prequantized_fp8_patches: bool,
     ) -> Result<Tensor> {
         match self {
+            Self::Fp8 {
+                runtime,
+                time_embeddings,
+                ..
+            } if prequantized_fp8_patches => {
+                runtime.infer_fp8_patches(patches, token_ids, token_count, noise, time_embeddings)
+            }
             Self::Fp8 {
                 runtime,
                 time_embeddings,
@@ -341,6 +349,7 @@ impl Pi05PreparedInference {
             &inputs.token_ids,
             self.spec.token_count,
             &inputs.noise,
+            matches!(&observation.vision, VisionObservation::RgbU8 { .. }),
         )?))
     }
 
