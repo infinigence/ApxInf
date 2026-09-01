@@ -465,6 +465,8 @@ impl Model {
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
             token_ids: tokens,
+            state: None,
+            embodiment_id: None,
         };
         match noise {
             Some(noise) => {
@@ -517,6 +519,8 @@ impl Model {
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),
             token_ids: tokens,
+            state: None,
+            embodiment_id: None,
         };
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
     }
@@ -570,6 +574,8 @@ impl Model {
         let observation = Observation {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
+            state: None,
+            embodiment_id: None,
         };
         match noise {
             Some(noise) => {
@@ -626,6 +632,8 @@ impl Model {
         let observation = Observation {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
+            state: None,
+            embodiment_id: None,
         };
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
     }

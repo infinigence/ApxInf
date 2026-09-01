@@ -23,6 +23,10 @@ pub enum VisionObservation {
 pub struct Observation {
     pub vision: VisionObservation,
     pub token_ids: Vec<u32>,
+    /// Optional normalized proprioceptive state.
+    pub state: Option<Tensor>,
+    /// Optional checkpoint-defined embodiment category.
+    pub embodiment_id: Option<u32>,
 }
 
 impl Observation {
@@ -137,7 +141,7 @@ pub trait PreparedInference {
 /// directly hold heterogeneous model runtimes.
 pub trait VlaRuntime {
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
-    fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
+    fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference + '_>>;
 
     /// Run inference and copy the resulting action to host as `f32`.
     ///
@@ -162,6 +166,8 @@ mod tests {
                 layout: ImageLayout::Nhwc,
             },
             token_ids: vec![1, 2, 3],
+            state: None,
+            embodiment_id: None,
         }
     }
 
@@ -180,6 +186,8 @@ mod tests {
         let empty = Observation {
             vision: VisionObservation::Patches(Tensor::zeros((1, 2), DType::F32)),
             token_ids: Vec::new(),
+            state: None,
+            embodiment_id: None,
         };
         assert!(empty.validate().is_err());
     }

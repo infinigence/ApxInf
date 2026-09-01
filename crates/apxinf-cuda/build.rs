@@ -116,6 +116,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_direct_e4m3_sm100)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_tensorrt)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
@@ -272,6 +273,36 @@ fn main() {
                 kernel_files.iter().all(|path| path.is_file()),
                 "one or more required CUDA adapters are missing under {adapters_dir}"
             );
+
+            // TensorRT is optional at build time. Jetson deployment images
+            // provide the headers and runtime, while developer machines (and
+            // CPU-only CI) often do not. Compile the stable C ABI only when a
+            // complete installation is visible; the model loader reports a
+            // precise unsupported-runtime error otherwise.
+            let tensorrt_include_dirs = [
+                "/usr/include".to_string(),
+                format!("/usr/include/{arch}-linux-gnu"),
+                "/usr/include/aarch64-linux-gnu".to_string(),
+                "/usr/local/include".to_string(),
+            ];
+            let tensorrt_header = tensorrt_include_dirs
+                .iter()
+                .find(|dir| std::path::Path::new(dir).join("NvInfer.h").is_file())
+                .cloned();
+            let tensorrt_adapter = std::path::Path::new(&adapters_dir).join("tensorrt_adapter.cpp");
+            let has_tensorrt_library =
+                lib_dirs.iter().any(|dir| {
+                    std::path::Path::new(dir).join("libnvinfer.so").is_file()
+                        || std::path::Path::new(dir).join("libnvinfer.so.10").is_file()
+                }) || std::path::Path::new("/usr/lib/aarch64-linux-gnu/libnvinfer.so").is_file();
+            let has_tensorrt =
+                tensorrt_header.is_some() && has_tensorrt_library && tensorrt_adapter.is_file();
+            if has_tensorrt {
+                kernel_files.push(tensorrt_adapter.clone());
+                println!("cargo:rustc-cfg=apxinf_tensorrt");
+                println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu");
+                println!("cargo:rustc-link-lib=nvinfer");
+            }
 
             let cutlass_root = std::path::Path::new(&kernels_dir).join("cutlass");
             let cutlass_fmha_operator = cutlass_root.join("fmha_sm100.cu");
@@ -488,6 +519,13 @@ fn main() {
                             cmd.arg(format!("-I{include}"));
                         }
                     }
+                    if entry == &tensorrt_adapter {
+                        for include in &tensorrt_include_dirs {
+                            if std::path::Path::new(include).exists() {
+                                cmd.arg(format!("-I{include}"));
+                            }
+                        }
+                    }
                     if entry == &cutlass_fmha
                         || entry == &cutlass_gemm_operator
                         || entry == &cutlass_fp8_dual_operator
@@ -594,6 +632,9 @@ fn main() {
                 println!("cargo:rustc-link-lib=cublasLt");
                 println!("cargo:rustc-link-lib=cublas");
                 println!("cargo:rustc-link-lib=cudart");
+                if has_tensorrt {
+                    println!("cargo:rustc-link-lib=nvinfer");
+                }
                 println!("cargo:rustc-link-lib=stdc++");
             }
         }

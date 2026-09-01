@@ -18,6 +18,11 @@ pub mod nvtx;
 pub mod profiler;
 mod sampling;
 pub mod stream;
+#[cfg(apxinf_tensorrt)]
+pub mod tensorrt;
+#[cfg(not(apxinf_tensorrt))]
+#[path = "tensorrt_stub.rs"]
+pub mod tensorrt;
 pub mod transfers;
 pub mod tuning;
 mod workspace;

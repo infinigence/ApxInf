@@ -5,6 +5,22 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    pub fn apxinf_cast_f32_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_scatter_rows_bf16(
+        source: *const c_void,
+        positions: *const u32,
+        destination: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_static_evict_l2(
         buffer: *mut c_void,
         bytes: usize,

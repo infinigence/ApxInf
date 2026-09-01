@@ -172,7 +172,7 @@ impl LoadedModel {
         self.vla()?.infer_host_f32(request)
     }
 
-    pub fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
+    pub fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference + '_>> {
         self.vla()?.prepare(spec)
     }
 }

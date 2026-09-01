@@ -15,8 +15,8 @@ use std::path::{Component, Path};
 use memmap2::Mmap;
 use serde::Deserialize;
 
-use bytemuck;
 use apxinf_core::{DType, Device, Shape, Tensor};
+use bytemuck;
 
 use crate::config::ModelConfig;
 
@@ -104,6 +104,85 @@ pub fn load_native_path(
     }
 }
 
+/// Load only the named tensors from a SafeTensors file, index, or checkpoint
+/// directory. Large compiled-engine runtimes commonly retain a few glue
+/// weights while the bulk of the checkpoint lives in the engine; reading every
+/// shard would waste both startup time and host memory.
+pub fn load_native_selected_path(
+    path: &Path,
+    names: &[&str],
+) -> Result<HashMap<String, Tensor>, String> {
+    let requested = names.iter().copied().collect::<BTreeSet<_>>();
+    if requested.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let index_path = if path.is_dir() {
+        let index = path.join("model.safetensors.index.json");
+        if index.is_file() {
+            index
+        } else {
+            let model = path.join("model.safetensors");
+            if !model.is_file() {
+                return Err(format!(
+                    "no SafeTensors model or index in {}",
+                    path.display()
+                ));
+            }
+            model
+        }
+    } else {
+        path.to_path_buf()
+    };
+    if index_path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return load_impl_selected(&index_path, false, Some(&requested)).map(|(values, _)| values);
+    }
+    let raw = std::fs::read_to_string(&index_path)
+        .map_err(|error| format!("failed to read {}: {error}", index_path.display()))?;
+    let index: SafetensorsIndex = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "invalid SafeTensors index {}: {error}",
+            index_path.display()
+        )
+    })?;
+    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut by_shard: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for name in &requested {
+        let shard = index
+            .weight_map
+            .get(*name)
+            .ok_or_else(|| format!("tensor `{name}` is not indexed by {}", index_path.display()))?;
+        by_shard.entry(shard).or_default().insert(name);
+    }
+    let mut tensors = HashMap::with_capacity(requested.len());
+    for (shard, shard_names) in by_shard {
+        let shard_path = Path::new(shard);
+        if shard_path.is_absolute()
+            || shard_path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(format!(
+                "unsafe shard path `{shard}` in {}",
+                index_path.display()
+            ));
+        }
+        let (values, _) = load_impl_selected(&parent.join(shard), false, Some(&shard_names))?;
+        tensors.extend(values);
+    }
+    let missing = requested
+        .iter()
+        .filter(|name| !tensors.contains_key(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "selected SafeTensors values are missing: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(tensors)
+}
+
 /// Load all shards named by a Hugging Face `*.safetensors.index.json` file.
 /// Each indexed tensor is checked against the shard in which it was found.
 pub fn load_native_sharded(
@@ -172,6 +251,14 @@ fn load_impl(
     path: &Path,
     upcast_bf16: bool,
 ) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
+    load_impl_selected(path, upcast_bf16, None)
+}
+
+fn load_impl_selected(
+    path: &Path,
+    upcast_bf16: bool,
+    selected: Option<&BTreeSet<&str>>,
+) -> Result<(HashMap<String, Tensor>, HashMap<String, String>), String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("mmap failed: {e}"))? };
 
@@ -214,6 +301,9 @@ fn load_impl(
 
     for (name, value) in &raw {
         if name == "__metadata__" {
+            continue;
+        }
+        if selected.is_some_and(|names| !names.contains(name.as_str())) {
             continue;
         }
 

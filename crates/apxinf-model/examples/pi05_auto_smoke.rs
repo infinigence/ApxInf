@@ -52,6 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             DType::F32,
         )),
         token_ids: vec![0; token_count],
+        state: None,
+        embodiment_id: None,
     };
     let noise = Tensor::zeros(vec![config.action_horizon, config.action_dim], DType::F32);
     let request = VlaRequest::provided(&observation, &noise);

@@ -11,6 +11,60 @@ use crate::context::CudaContext;
 use crate::ffi;
 use crate::workspace::output_buffer;
 
+pub fn cast_f32_to_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    if input.dtype() != DType::F32 || input.device() != apxinf_core::Device::Cuda(ctx.device_id()) {
+        return Err(Error::Other(
+            "f32-to-bf16 cast expects a CUDA f32 tensor on the active device".into(),
+        ));
+    }
+    let output = CudaBuffer::alloc(input.numel() * 2, ctx.device_id()).map_err(Error::Cuda)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_cast_f32_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            input.numel() as i64,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+pub fn scatter_rows_bf16(
+    ctx: &CudaContext,
+    source: &Tensor,
+    positions: &CudaBuffer,
+    destination: &Tensor,
+) -> Result<()> {
+    let (rows, cols) = matrix_shape(source, "BF16 row scatter")?;
+    let destination_dims = destination.shape().dims();
+    if source.dtype() != DType::BF16
+        || destination.dtype() != DType::BF16
+        || destination_dims.len() != 2
+        || destination_dims[1] != cols
+        || positions.len() < rows * std::mem::size_of::<u32>()
+        || positions.device() != ctx.device_id()
+    {
+        return Err(Error::Other("BF16 row scatter shape mismatch".into()));
+    }
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_scatter_rows_bf16(
+            gpu_ptr(source)?,
+            positions.ptr().cast(),
+            gpu_ptr(destination)?,
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 pub fn add_into(
     ctx: &CudaContext,
     dtype: DType,

@@ -2,6 +2,7 @@
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
@@ -11,6 +12,27 @@
 #include <cstring>
 
 namespace {
+
+__global__ void cast_f32_bf16_kernel(const float* input, __nv_bfloat16* output,
+                                     int64_t count) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    output[i] = __float2bfloat16(input[i]);
+  }
+}
+
+__global__ void scatter_rows_bf16_kernel(const __nv_bfloat16* source,
+                                         const uint32_t* positions,
+                                         __nv_bfloat16* destination,
+                                         int rows, int cols) {
+  int64_t count = static_cast<int64_t>(rows) * cols;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int row = static_cast<int>(i / cols);
+    int col = static_cast<int>(i - static_cast<int64_t>(row) * cols);
+    destination[static_cast<int64_t>(positions[row]) * cols + col] = source[i];
+  }
+}
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
@@ -23,6 +45,30 @@ namespace {
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
 }  // namespace
+
+extern "C" cudaError_t apxinf_cast_f32_bf16(
+    const void* input, void* output, int64_t count, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0) return cudaErrorInvalidValue;
+  int blocks = static_cast<int>((count + 255) / 256);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  cast_f32_bf16_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const float*>(input), static_cast<__nv_bfloat16*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_scatter_rows_bf16(
+    const void* source, const uint32_t* positions, void* destination,
+    int rows, int cols, cudaStream_t stream) {
+  if (source == nullptr || positions == nullptr || destination == nullptr ||
+      rows <= 0 || cols <= 0) return cudaErrorInvalidValue;
+  int64_t count = static_cast<int64_t>(rows) * cols;
+  int blocks = static_cast<int>((count + 255) / 256);
+  blocks = blocks > 4096 ? 4096 : blocks;
+  scatter_rows_bf16_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(source), positions,
+      static_cast<__nv_bfloat16*>(destination), rows, cols);
+  return cudaGetLastError();
+}
 
 namespace {
 
