@@ -283,16 +283,7 @@ fn configure_cuda_tuning(
         model_path.parent().unwrap_or_else(|| Path::new("."))
     };
     let legacy_path = model_root.join("tactics.json");
-    let selected = match options.tuning_path.as_ref() {
-        Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
-        None => default_paths
-            .tactics
-            .is_file()
-            .then(|| default_paths.tactics.clone())
-            .or_else(|| legacy_path.is_file().then_some(legacy_path)),
-    };
+    let selected = select_cuda_tuning_database_path(&default_paths.tactics, &legacy_path, options);
     let database = selected
         .as_deref()
         .map(TuningDb::from_json_file)
@@ -313,4 +304,90 @@ fn configure_cuda_tuning(
         database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
         Some(paths),
     )
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn select_cuda_tuning_database_path(
+    default_path: &Path,
+    legacy_path: &Path,
+    options: &LoadOptions,
+) -> Option<PathBuf> {
+    match options.tuning_path.as_ref() {
+        Some(path) if path.is_file() => Some(path.clone()),
+        Some(_) if options.autotune => None,
+        Some(path) => Some(path.clone()),
+        None => default_path
+            .is_file()
+            .then(|| default_path.to_path_buf())
+            .or_else(|| {
+                (options.synthetic.is_none() && legacy_path.is_file())
+                    .then(|| legacy_path.to_path_buf())
+            }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "apxinf-auto-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn synthetic_load_ignores_model_local_legacy_tactics() {
+        let directory = temporary_directory("synthetic-tactics");
+        let default_path = directory.join("missing-hardware-tactics.json");
+        let legacy_path = directory.join("tactics.json");
+        std::fs::write(&legacy_path, "{}").unwrap();
+        let options = LoadOptions {
+            synthetic: Some(SyntheticWeights { seed: 0 }),
+            ..LoadOptions::default()
+        };
+
+        assert_eq!(
+            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
+            None
+        );
+        assert_eq!(
+            select_cuda_tuning_database_path(&default_path, &legacy_path, &LoadOptions::default()),
+            Some(legacy_path)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn synthetic_load_still_uses_hardware_or_explicit_tactics() {
+        let directory = temporary_directory("explicit-tactics");
+        let default_path = directory.join("hardware.json");
+        let legacy_path = directory.join("tactics.json");
+        let explicit_path = directory.join("explicit.json");
+        std::fs::write(&default_path, "{}").unwrap();
+        std::fs::write(&legacy_path, "{}").unwrap();
+        std::fs::write(&explicit_path, "{}").unwrap();
+        let mut options = LoadOptions {
+            synthetic: Some(SyntheticWeights { seed: 0 }),
+            ..LoadOptions::default()
+        };
+
+        assert_eq!(
+            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
+            Some(default_path.clone())
+        );
+        options.tuning_path = Some(explicit_path.clone());
+        assert_eq!(
+            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
+            Some(explicit_path)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

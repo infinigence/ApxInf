@@ -52,6 +52,13 @@ struct ParsedGemmRecord {
     milliseconds: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CompatibilityRejections {
+    total: usize,
+    implementation_version: usize,
+    library_version: usize,
+}
+
 impl TuningDb {
     pub fn from_json_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -187,6 +194,24 @@ impl TuningDb {
                 )));
             }
         }
+        let (records, rejected) = self.build_compatible_records(caps, versions);
+        if rejected.total != 0 {
+            eprintln!(
+                "[apxinf] warning: ignored {} incompatible CUDA tuning record(s) for {} (implementation version mismatch: {}, CUDA/cuBLAS version mismatch: {})",
+                rejected.total,
+                self.header.device_name.as_deref().unwrap_or("unknown device"),
+                rejected.implementation_version,
+                rejected.library_version,
+            );
+        }
+        Ok(records)
+    }
+
+    fn build_compatible_records(
+        &self,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+    ) -> (Vec<GemmTuningRecord>, CompatibilityRejections) {
         // Device name and the global build id are provenance. They must not
         // invalidate unrelated providers. SM and the schema are the
         // database-wide compatibility boundary; library and kernel contract
@@ -198,10 +223,11 @@ impl TuningDb {
             versions.cublas.as_str(),
         );
         let device = DeviceFingerprint::from(caps);
-        Ok(self
+        let mut rejected = CompatibilityRejections::default();
+        let records = self
             .records
             .iter()
-            .filter(|record| {
+            .filter_map(|record| {
                 let implementation_compatible =
                     record.implementation_version.map_or(true, |version| {
                         version == record.tactic.backend.implementation_version()
@@ -222,28 +248,34 @@ impl TuningDb {
                     | TacticBackend::CublasLtCustomSplitGeGluCutlassBf16
                     | TacticBackend::Vendor => cuda_compatible && cublas_compatible,
                 };
-                implementation_compatible && library_compatible
+                if !implementation_compatible || !library_compatible {
+                    rejected.total += 1;
+                    rejected.implementation_version += usize::from(!implementation_compatible);
+                    rejected.library_version += usize::from(!library_compatible);
+                    return None;
+                }
+                Some(GemmTuningRecord {
+                    key: GemmTuningKey {
+                        op: record.op,
+                        device: record.device.unwrap_or(device),
+                        m: record.m,
+                        n: record.n,
+                        k: record.k,
+                        activation_dtype: record.activation_dtype,
+                        weight_dtype: record.weight_dtype,
+                        output_dtype: record.output_dtype,
+                        layout: record.layout,
+                        scale_mode: record.scale_mode,
+                        epilogue: record.epilogue,
+                        workspace_limit: record.workspace_limit,
+                    },
+                    tactic: record.tactic,
+                    implementation_version: record.implementation_version,
+                    milliseconds: record.milliseconds,
+                })
             })
-            .map(|record| GemmTuningRecord {
-                key: GemmTuningKey {
-                    op: record.op,
-                    device: record.device.unwrap_or(device),
-                    m: record.m,
-                    n: record.n,
-                    k: record.k,
-                    activation_dtype: record.activation_dtype,
-                    weight_dtype: record.weight_dtype,
-                    output_dtype: record.output_dtype,
-                    layout: record.layout,
-                    scale_mode: record.scale_mode,
-                    epilogue: record.epilogue,
-                    workspace_limit: record.workspace_limit,
-                },
-                tactic: record.tactic,
-                implementation_version: record.implementation_version,
-                milliseconds: record.milliseconds,
-            })
-            .collect())
+            .collect();
+        (records, rejected)
     }
 }
 
@@ -922,6 +954,24 @@ mod tests {
     }
 
     #[test]
+    fn bundled_orin_and_rtx4090_databases_declare_v1_sm_headers() {
+        for (raw, sm) in [
+            (
+                include_str!("../../../../configs/tuning/nvidia/orin-sm87/tactics.json"),
+                87,
+            ),
+            (
+                include_str!("../../../../configs/tuning/nvidia/rtx4090-sm89/tactics.json"),
+                89,
+            ),
+        ] {
+            let db = TuningDb::from_json_str(raw).unwrap();
+            assert_eq!(db.header.schema, TUNING_SCHEMA_V1);
+            assert_eq!(db.header.sm, Some(sm));
+        }
+    }
+
+    #[test]
     fn kernel_build_id_is_provenance_only() {
         let db = TuningDb::from_json_str(
             r#"{
@@ -961,6 +1011,36 @@ mod tests {
         assert_eq!(
             store.gemm_records().next().unwrap().tactic.backend,
             TacticBackend::Cutlass
+        );
+    }
+
+    #[test]
+    fn summarizes_implementation_and_library_rejections() {
+        let db = TuningDb::from_json_str(
+            r#"{
+                "schema":"apxinf.cuda.tuning.v1",
+                "device_name":"test",
+                "sm":87,
+                "cuda_version":"12.6",
+                "cublas_version":"13.0",
+                "records":[
+                    {"key":{"op":"fp8_f16","m":8,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cublaslt","id":0,"implementation_version":1}},
+                    {"key":{"op":"fp8_f16","m":9,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cutlass","id":0,"implementation_version":2}},
+                    {"key":{"op":"fp8_f16","m":10,"n":1024,"k":1024,"activation_dtype":"f8e4m3","weight_dtype":"f8e4m3","output_dtype":"f16","layout":"row_major","scale_mode":"per_tensor","epilogue":"none"},"tactic":{"backend":"cutlass","id":0,"implementation_version":1}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let (records, rejected) = db.build_compatible_records(&caps(87), &versions());
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            rejected,
+            CompatibilityRejections {
+                total: 2,
+                implementation_version: 1,
+                library_version: 1,
+            }
         );
     }
 

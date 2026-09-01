@@ -653,6 +653,7 @@ fn reference_actions(
 
 /// Parsed command line. `overrides` are architecture fields that only make sense
 /// in random mode (a checkpoint's weights are fixed to its own config).
+#[derive(Debug)]
 struct Args {
     source: String,
     dtype: Dtype,
@@ -772,6 +773,7 @@ impl Args {
 
         let source = source.ok_or("missing <checkpoint-or-index|random> positional argument")?;
         let dtype = dtype.ok_or("missing required --dtype {bf16,fp8,int8}")?;
+        validate_explicit_tactics_path(tactics.as_deref(), autotune)?;
         if iterations == 0 {
             return Err("--iterations must be non-zero".into());
         }
@@ -803,6 +805,18 @@ impl Args {
             noise_bf16_u16le,
         })
     }
+}
+
+fn validate_explicit_tactics_path(tactics: Option<&str>, autotune: bool) -> Result<(), String> {
+    let Some(path) = tactics else {
+        return Ok(());
+    };
+    if autotune || Path::new(path).is_file() {
+        return Ok(());
+    }
+    Err(format!(
+        "explicit --tactics path `{path}` does not exist or is not a file; pass --autotune to create a new database"
+    ))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1210,4 +1224,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(extra: &[&str]) -> Vec<String> {
+        ["pi05_bench", "random", "--dtype", "fp8"]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn missing_explicit_tactics_is_rejected_in_inference_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "apxinf-missing-tactics-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = Args::parse(&arguments(&["--tactics", path.to_str().unwrap()])).unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+        assert!(error.to_string().contains("--autotune"));
+    }
+
+    #[test]
+    fn missing_explicit_tactics_is_allowed_for_autotune_creation() {
+        let path = std::env::temp_dir().join(format!(
+            "apxinf-new-tactics-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parsed = Args::parse(&arguments(&[
+            "--tactics",
+            path.to_str().unwrap(),
+            "--autotune",
+        ]));
+        assert!(parsed.is_ok());
+    }
 }

@@ -104,6 +104,26 @@ impl GemmPlanCache {
         resolved: Option<crate::tuning::ResolvedTactic>,
         generation: u64,
     ) -> Result<PreparedGemmPlan> {
+        self.prepare_and_cache_with(
+            key,
+            default,
+            resolved,
+            generation,
+            crate::workspace::may_prepare_native_resources(),
+            providers::prepare,
+        )
+    }
+
+    fn prepare_and_cache_with(
+        &self,
+        key: &GemmTuningKey,
+        default: TacticId,
+        resolved: Option<crate::tuning::ResolvedTactic>,
+        generation: u64,
+        may_prepare_native_resources: bool,
+        mut prepare: impl FnMut(&GemmTuningKey, TacticId) -> Result<()>,
+    ) -> Result<PreparedGemmPlan> {
+        ensure_native_prepare_allowed(may_prepare_native_resources)?;
         let (selected, source) = match resolved {
             Some(resolved) => (
                 resolved.tactic,
@@ -115,13 +135,13 @@ impl GemmPlanCache {
             None => (default, PlanSource::Default),
         };
 
-        let (tactic, source) = match providers::prepare(key, selected) {
+        let (tactic, source) = match prepare(key, selected) {
             Ok(()) => (selected, source),
             Err(error) if selected != default => {
                 eprintln!(
                     "[apxinf] rejected persisted GEMM tactic {selected:?} for {key:?}: {error}; using default"
                 );
-                providers::prepare(key, default)?;
+                prepare(key, default)?;
                 (default, PlanSource::Default)
             }
             Err(error) => return Err(error),
@@ -142,6 +162,7 @@ impl GemmPlanCache {
     /// Replace a rejected prepared tactic with the provider-independent safe
     /// route so subsequent calls do not retry the failing launch.
     pub fn fallback(&self, ctx: &CudaContext, key: &GemmTuningKey) -> Result<PreparedGemmPlan> {
+        ensure_native_prepare_allowed(crate::workspace::may_prepare_native_resources())?;
         let tactic = TacticId {
             backend: TacticBackend::Vendor,
             value: 0,
@@ -166,6 +187,16 @@ impl GemmPlanCache {
             .map_err(|_| Error::Other("CUDA GEMM plan cache lock is poisoned".into()))?
             .clear();
         Ok(())
+    }
+}
+
+fn ensure_native_prepare_allowed(may_prepare_native_resources: bool) -> Result<()> {
+    if may_prepare_native_resources {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "CUDA GEMM plan cache miss while native resource preparation is disabled (for example during CUDA Graph capture); resolve and prepare all GEMM plans before capture".into(),
+        ))
     }
 }
 
@@ -197,5 +228,47 @@ pub const fn default_bf16_tactic() -> TacticId {
     TacticId {
         backend: TacticBackend::Vendor,
         value: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tuning::{DeviceFingerprint, Epilogue, GemmLayout, GemmOp, ScaleMode, TuningDType};
+
+    fn key() -> GemmTuningKey {
+        GemmTuningKey {
+            op: GemmOp::Bf16,
+            device: DeviceFingerprint {
+                sm: 89,
+                multiprocessor_count: 128,
+            },
+            m: 1,
+            n: 1024,
+            k: 1024,
+            activation_dtype: TuningDType::Bf16,
+            weight_dtype: TuningDType::Bf16,
+            output_dtype: TuningDType::Bf16,
+            layout: GemmLayout::RowMajor,
+            scale_mode: ScaleMode::None,
+            epilogue: Epilogue::None,
+            workspace_limit: usize::MAX,
+        }
+    }
+
+    #[test]
+    fn cache_miss_during_capture_does_not_prepare_provider() {
+        let cache = GemmPlanCache::default();
+        let mut prepare_called = false;
+        let error = cache
+            .prepare_and_cache_with(&key(), default_bf16_tactic(), None, 0, false, |_, _| {
+                prepare_called = true;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(!prepare_called);
+        assert!(error.to_string().contains("plan cache miss"));
+        assert!(error.to_string().contains("before capture"));
     }
 }

@@ -616,6 +616,11 @@ Autotuning runs only in an explicitly configured `AUTO_TUNE` session. An
 prepare a plan before CUDA Graph capture; steady-state replay must not enter
 the executor, tuning store, provider, or mode-selection path.
 
+FP8 inference remains correct when no compatible database record is available:
+the GEMM planner prepares the provider's safe default tactic once before graph
+capture. This fallback may be slower than a tuned hardware database, but it
+must not turn a missing or version-filtered record into an unsafe launch.
+
 ## 10. Integrate the Model Runtime and Executor
 
 Modify the model configuration, weights, runtime/executor, and registration only after the lower-level operators pass their own correctness tests.
