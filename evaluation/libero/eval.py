@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable LIBERO evaluation — dual transport, multi-suite, self-contained.
+r"""Resumable LIBERO evaluation — dual transport, multi-suite, self-contained.
 
 One evaluator for every way of reaching the model and every LIBERO suite:
 
@@ -11,9 +11,9 @@ One evaluator for every way of reaching the model and every LIBERO suite:
 
 Both transports drive the *same* rollout loop through a small :class:`Backend`
 abstraction, so the LIBERO harness (rollout constants, resize-with-pad, the
-resumable fsync'd JSONL ledger, timing split) is shared verbatim. The harness
-used to live in ``scripts/libero_harness.py``; it is inlined here so the script
-is a single self-contained file with no implicit-cwd import.
+resumable fsync'd JSONL ledger, timing split) is shared verbatim. The harness is
+kept self-contained here so both transports execute the exact same rollout and
+ledger implementation.
 
 ``--suite`` selects one LIBERO task suite (``libero_10`` / ``libero_90`` /
 ``libero_spatial`` / ``libero_object`` / ``libero_goal``) or ``all``. The ledger
@@ -25,11 +25,11 @@ Adding a new model needs no change here: register a policy in ``apxinf.policies`
 <name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
 
     # websocket (server already running)
-    python scripts/eval_libero.py --backend websocket --precision bf16 \
+    python -m evaluation.libero.eval --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
 
     # in-process (no server)
-    python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+    python -m evaluation.libero.eval --backend in-process --model-dir /path/ckpt \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -357,7 +357,7 @@ class InProcessBackend:
     def __init__(self, args: argparse.Namespace) -> None:
         # Lazy: importing apxinf pulls in the CUDA binding; websocket-only users
         # never pay for it. Make ``import apxinf`` work from a source checkout.
-        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
         package_dir = repo_root / "python" / "apxinf"
         if package_dir.is_dir() and str(package_dir) not in sys.path:
             sys.path.insert(0, str(package_dir))
