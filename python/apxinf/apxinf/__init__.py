@@ -48,7 +48,7 @@ from .conventions import (
     get_convention,
     register_convention,
 )
-from .policies import AutoPolicy, ComposablePolicy, Pi05Policy, Policy
+from .policies import AutoPolicy, ComposablePolicy, GrootN17Policy, Pi05Policy, Policy
 from .robots import (
     ROBOT_PRESETS,
     Embodiment,
@@ -78,6 +78,7 @@ __all__ = [
     "ComposablePolicy",
     # L2 policies
     "Pi05Policy",
+    "GrootN17Policy",
     "AutoPolicy",
     # robot adapters
     "build_unitree_g1_policy",

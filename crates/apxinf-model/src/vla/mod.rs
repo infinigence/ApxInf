@@ -61,6 +61,8 @@ pub enum InitialLatent<'a> {
 pub struct VlaRequest<'a> {
     pub observation: &'a Observation,
     pub initial_latent: InitialLatent<'a>,
+    /// Optional normalized proprioceptive state for state-conditioned VLAs.
+    pub state: Option<&'a Tensor>,
 }
 
 impl<'a> VlaRequest<'a> {
@@ -68,6 +70,7 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Generate { rng },
+            state: None,
         }
     }
 
@@ -75,7 +78,13 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Provided(latent),
+            state: None,
         }
+    }
+
+    pub const fn with_state(mut self, state: &'a Tensor) -> Self {
+        self.state = Some(state);
+        self
     }
 }
 

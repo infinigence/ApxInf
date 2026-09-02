@@ -251,6 +251,7 @@ __global__ void bias_activation_bf16_kernel(
     if (bias != nullptr) value += __bfloat162float(bias[index % cols]);
     if (activation == 1) value = gelu_tanh(value);
     if (activation == 2) value = value / (1.0f + expf(-value));
+    if (activation == 3) value = fmaxf(value, 0.0f);
     output[index] = __float2bfloat16(value);
   }
 }
@@ -283,6 +284,10 @@ __global__ void bias_activation_bf16_packed2_kernel(
     if (activation == 2) {
       first = first / (1.0f + expf(-first));
       second = second / (1.0f + expf(-second));
+    }
+    if (activation == 3) {
+      first = fmaxf(first, 0.0f);
+      second = fmaxf(second, 0.0f);
     }
     output2[pair_index] = __floats2bfloat162_rn(first, second);
   }
@@ -321,6 +326,10 @@ __global__ void bias_activation_bf16_packed4_kernel(
 #pragma unroll
       for (int i = 0; i < 4; ++i)
         values[i] = values[i] / (1.0f + expf(-values[i]));
+    }
+    if (activation == 3) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) values[i] = fmaxf(values[i], 0.0f);
     }
     output4[quad_index] = Bf16x4{
         __floats2bfloat162_rn(values[0], values[1]),

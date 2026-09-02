@@ -181,4 +181,32 @@ __global__ void bias_position_bf16_kernel(
   }
 }
 
+__global__ void gather_rows_bf16_kernel(
+    const __nv_bfloat16* input, const uint32_t* rows,
+    __nv_bfloat16* output, int64_t count, int cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int output_row = static_cast<int>(index / cols);
+    const int col = static_cast<int>(index % cols);
+    output[index] = input[static_cast<int64_t>(rows[output_row]) * cols + col];
+  }
+}
 
+__global__ void scatter_rows_bf16_kernel(
+    const __nv_bfloat16* updates, const uint32_t* rows,
+    __nv_bfloat16* output, int64_t count, int cols, bool add) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int update_row = static_cast<int>(index / cols);
+    const int col = static_cast<int>(index % cols);
+    const int64_t output_index = static_cast<int64_t>(rows[update_row]) * cols + col;
+    if (add) {
+      output[output_index] = __float2bfloat16(
+          __bfloat162float(output[output_index]) + __bfloat162float(updates[index]));
+    } else {
+      output[output_index] = updates[index];
+    }
+  }
+}

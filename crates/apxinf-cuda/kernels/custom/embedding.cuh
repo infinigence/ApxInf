@@ -57,9 +57,10 @@ __global__ void embedding_f16_kernel(
 
 __global__ void embedding_bf16_kernel(
     const __nv_bfloat16* table, const uint32_t* ids, __nv_bfloat16* output,
-    int tokens, int width, int vocab_size) {
+    int tokens, int width, int vocab_size, bool scale_by_sqrt_width) {
   const int64_t count = static_cast<int64_t>(tokens) * width;
-  const float normalizer = sqrtf(static_cast<float>(width));
+  const float normalizer = scale_by_sqrt_width
+      ? sqrtf(static_cast<float>(width)) : 1.0f;
   int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   for (; index < count; index += stride) {
@@ -72,6 +73,5 @@ __global__ void embedding_bf16_kernel(
         : __float2bfloat16(0.0f);
   }
 }
-
 
 

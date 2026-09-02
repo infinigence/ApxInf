@@ -39,7 +39,7 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-    #[cfg(apxinf_fa2_sm80)]
+    #[cfg(apxinf_fa2_bf16)]
     pub fn apxinf_static_fa2_bf16(
         q: *const c_void,
         k: *const c_void,
@@ -53,6 +53,7 @@ extern "C" {
         kv_heads: i32,
         head_dim: i32,
         softmax_scale: f32,
+        causal: bool,
         stream: cudaStream_t,
     ) -> cudaError_t;
 

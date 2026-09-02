@@ -9,6 +9,7 @@ use super::contracts::{
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::output_buffer;
 
 /// Allocation-free SiLU into caller-owned decode storage.
 pub fn silu_into(
@@ -87,7 +88,7 @@ pub fn silu(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let count = input.numel() as u32;
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -117,7 +118,7 @@ pub fn gelu_tanh(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     }
     let device_id = ctx.device_id();
     let count = input.numel() as u32;
-    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, input.size_in_bytes())?;
     unsafe {
         let res =
             ffi::apxinf_gelu_tanh_bf16(gpu_ptr(input)?, out_buf.ptr(), count, ctx.stream().handle());
@@ -166,6 +167,11 @@ pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>)
 
 pub fn bias_silu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
     bias_activation(ctx, input, value, 2)
+}
+
+/// Broadcast-add an optional BF16 bias and apply ReLU on device.
+pub fn bias_relu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
+    bias_activation(ctx, input, value, 3)
 }
 
 pub fn geglu_bf16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {

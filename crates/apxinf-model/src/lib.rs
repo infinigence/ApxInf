@@ -4,6 +4,7 @@ mod accelerator;
 pub mod builtin;
 pub mod debug;
 mod generation_config;
+pub mod gr00t_n17;
 pub mod llama;
 pub mod llm_trait;
 pub mod registry;
@@ -16,6 +17,7 @@ pub mod vla;
 pub use builtin::register_builtin_models;
 pub use debug::{DebugCapture, DebugConfig};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
+pub use gr00t_n17::GrootN17Config;
 pub use llama::{GeneralLlama, LlamaModel, LlamaWeights, TransformerLayer, KVCache};
 pub use llm_trait::{
     generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationOutput,

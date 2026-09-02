@@ -208,7 +208,7 @@ impl Backend for CudaBackend {
             }
         }
         let out_bytes = rows * total_cols * elem;
-        let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+        let out_buf = crate::workspace::output_buffer(&self.ctx, out_bytes)?;
         let dst_pitch = total_cols * elem;
         let mut col_offset = 0usize;
         for t in tensors {

@@ -335,7 +335,7 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let cols = *dims.last().unwrap();
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -539,7 +539,7 @@ pub fn split_qkv_bias_bf16(
     })
 }
 
-#[cfg(apxinf_fa2_sm80)]
+#[cfg(apxinf_fa2_bf16)]
 #[allow(clippy::too_many_arguments)]
 fn fa2_attention(
     ctx: &CudaContext,
@@ -552,6 +552,7 @@ fn fa2_attention(
     query_heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    causal: bool,
 ) -> Result<Tensor> {
     let output = output_buffer(ctx, q.size_in_bytes())?;
     let lse_elements = batches
@@ -580,6 +581,7 @@ fn fa2_attention(
             kv_heads as i32,
             head_dim as i32,
             (head_dim as f32).sqrt().recip(),
+            causal,
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;
@@ -603,10 +605,7 @@ fn fa2_splitkv_enabled(
     if std::env::var_os("APXINF_DISABLE_FA2_SPLITKV").is_some() {
         return false;
     }
-    query_tokens <= 64
-        && key_tokens > query_tokens
-        && query_heads > kv_heads
-        && head_dim == 256
+    query_tokens <= 64 && key_tokens > query_tokens && query_heads > kv_heads && head_dim == 256
 }
 
 #[cfg(apxinf_fa2_sm80)]
@@ -749,24 +748,25 @@ pub fn mqa_bf16(
             "static inference BF16 MQA shape mismatch".into(),
         ));
     }
-    #[cfg(apxinf_fa2_sm80)]
+    #[cfg(apxinf_fa2_bf16)]
     {
+        #[cfg(apxinf_fa2_sm80)]
         if fa2_splitkv_enabled(q_shape[0], key_tokens, q_shape[1], 1, q_shape[2]) {
             return fa2_attention_splitkv(
                 ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2],
             );
         }
         return fa2_attention(
-            ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2],
+            ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], 1, q_shape[2], false,
         );
     }
-    #[cfg(apxinf_cutlass_fmha)]
+    #[cfg(all(apxinf_cutlass_fmha, not(apxinf_fa2_bf16)))]
     {
         return cublas_mqa_bf16(ctx, q, k, v, key_tokens);
     }
-    #[cfg(all(not(apxinf_fa2_sm80), not(apxinf_cutlass_fmha)))]
+    #[cfg(all(not(apxinf_fa2_bf16), not(apxinf_cutlass_fmha)))]
     let output = output_buffer(ctx, q.size_in_bytes())?;
-    #[cfg(all(not(apxinf_fa2_sm80), not(apxinf_cutlass_fmha)))]
+    #[cfg(all(not(apxinf_fa2_bf16), not(apxinf_cutlass_fmha)))]
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_mqa_bf16(
             gpu_ptr(q)?,
@@ -781,7 +781,7 @@ pub fn mqa_bf16(
         ))
         .map_err(Error::Cuda)?;
     }
-    #[cfg(all(not(apxinf_fa2_sm80), not(apxinf_cutlass_fmha)))]
+    #[cfg(all(not(apxinf_fa2_bf16), not(apxinf_cutlass_fmha)))]
     Ok(make_gpu_tensor(
         q.shape().clone(),
         DType::BF16,
@@ -812,7 +812,7 @@ pub fn mha_bf16(
             "static inference BF16 MHA shape mismatch".into(),
         ));
     }
-    #[cfg(apxinf_fa2_sm80)]
+    #[cfg(apxinf_fa2_bf16)]
     {
         return fa2_attention(
             ctx,
@@ -825,9 +825,10 @@ pub fn mha_bf16(
             shape[1],
             shape[1],
             shape[2],
+            false,
         );
     }
-    #[cfg(apxinf_cutlass_fmha)]
+    #[cfg(all(apxinf_cutlass_fmha, not(apxinf_fa2_bf16)))]
     if tokens_per_batch == 256 && shape[1] == 16 && shape[2] == 72 {
         let output = output_buffer(ctx, q.size_in_bytes())?;
         unsafe {
@@ -878,9 +879,9 @@ pub fn mha_bf16(
             ));
         }
     }
-    #[cfg(not(apxinf_fa2_sm80))]
+    #[cfg(not(apxinf_fa2_bf16))]
     let output = output_buffer(ctx, q.size_in_bytes())?;
-    #[cfg(not(apxinf_fa2_sm80))]
+    #[cfg(not(apxinf_fa2_bf16))]
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_mha_bf16(
             gpu_ptr(q)?,
@@ -895,7 +896,100 @@ pub fn mha_bf16(
         ))
         .map_err(Error::Cuda)?;
     }
-    #[cfg(not(apxinf_fa2_sm80))]
+    #[cfg(not(apxinf_fa2_bf16))]
+    Ok(make_gpu_tensor(
+        q.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Non-causal BF16 multi-head cross attention with distinct query/key lengths.
+pub fn cross_mha_bf16(ctx: &CudaContext, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape() != k.shape()
+        || q_shape[1..] != k_shape[1..]
+        || q_shape[2] > 256
+        || q_shape[0] == 0
+        || k_shape[0] == 0
+    {
+        return Err(Error::Other(
+            "static inference BF16 cross-MHA shape mismatch".into(),
+        ));
+    }
+    #[cfg(apxinf_fa2_bf16)]
+    {
+        return fa2_attention(
+            ctx, q, k, v, 1, q_shape[0], k_shape[0], q_shape[1], k_shape[1], q_shape[2], false,
+        );
+    }
+    #[cfg(not(apxinf_fa2_bf16))]
+    let output = output_buffer(ctx, q.size_in_bytes())?;
+    #[cfg(not(apxinf_fa2_bf16))]
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_cross_mha_bf16(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            q_shape[0] as i32,
+            k_shape[0] as i32,
+            q_shape[1] as i32,
+            q_shape[2] as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    #[cfg(not(apxinf_fa2_bf16))]
+    Ok(make_gpu_tensor(
+        q.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Causal BF16 grouped-query attention for a complete prefill sequence.
+pub fn causal_gqa_bf16(ctx: &CudaContext, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape() != k.shape()
+        || q_shape[0] != k_shape[0]
+        || q_shape[2] != k_shape[2]
+        || q_shape[1] % k_shape[1] != 0
+        || q_shape[2] > 256
+    {
+        return Err(Error::Other(
+            "static inference BF16 causal GQA shape mismatch".into(),
+        ));
+    }
+    let output = output_buffer(ctx, q.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_causal_gqa_bf16(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            q_shape[0] as i32,
+            q_shape[1] as i32,
+            k_shape[1] as i32,
+            q_shape[2] as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
     Ok(make_gpu_tensor(
         q.shape().clone(),
         DType::BF16,

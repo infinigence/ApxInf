@@ -114,6 +114,26 @@ pub fn lookup_bf16(
     ids: &CudaBuffer,
     tokens: usize,
 ) -> Result<Tensor> {
+    lookup_bf16_impl(ctx, table, ids, tokens, true)
+}
+
+/// Raw BF16 embedding lookup without model-specific input scaling.
+pub fn lookup_unscaled_bf16(
+    ctx: &CudaContext,
+    table: &Tensor,
+    ids: &CudaBuffer,
+    tokens: usize,
+) -> Result<Tensor> {
+    lookup_bf16_impl(ctx, table, ids, tokens, false)
+}
+
+fn lookup_bf16_impl(
+    ctx: &CudaContext,
+    table: &Tensor,
+    ids: &CudaBuffer,
+    tokens: usize,
+    scale_by_sqrt_width: bool,
+) -> Result<Tensor> {
     let dims = table.shape().dims();
     if table.dtype() != DType::BF16 || dims.len() != 2 || ids.len() < tokens * 4 || tokens == 0 {
         return Err(Error::Other(
@@ -129,6 +149,7 @@ pub fn lookup_bf16(
             tokens as i32,
             dims[1] as i32,
             dims[0] as i32,
+            scale_by_sqrt_width,
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)?;
