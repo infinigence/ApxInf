@@ -80,6 +80,37 @@ pub fn rgb_u8_to_patches_bf16(
         .map_err(Error::Cuda)
     }
 }
+
+/// GR00T N1.7 two-frame patch packing from already resized 256x256 RGB views.
+pub fn groot_rgb_u8_to_patches_bf16(
+    ctx: &CudaContext,
+    images: &CudaBuffer,
+    patches: &Tensor,
+    views: usize,
+    layout: ImageLayout,
+) -> Result<()> {
+    let expected_bytes = views * 256 * 256 * 3;
+    if views == 0
+        || images.device() != ctx.device_id()
+        || images.len() != expected_bytes
+        || patches.dtype() != DType::BF16
+        || patches.shape().dims() != [views * 256, 1536]
+    {
+        return Err(Error::Other(
+            "GR00T BF16 raw image/preprocessed patch mismatch".into(),
+        ));
+    }
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_groot_rgb_u8_to_patches_bf16(
+            images.ptr(),
+            gpu_ptr(patches)?,
+            views as i32,
+            layout.kernel_value(),
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
 /// Fused static inference image preprocessing for an already resized RGB image batch.
 ///
 /// The input is `uint8` NHWC or NCHW. The output is patch-major E4M3 with

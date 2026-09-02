@@ -114,6 +114,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_bf16_sm89)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_bf16)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_direct_e4m3_sm100)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -287,7 +288,8 @@ fn main() {
             let cutlass_fmha = std::path::Path::new(&adapters_dir).join("cutlass_fmha_adapter.cu");
             let cutlass_gemm = std::path::Path::new(&adapters_dir).join("cutlass_fp8_adapter.cu");
             let cutlass_bf16 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_adapter.cu");
-            let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
+            let cutlass_bf16_sm89 =
+                std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
@@ -386,6 +388,7 @@ fn main() {
             let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
             if fa2_sm80 || fa2_f16_sm100 {
+                println!("cargo:rustc-cfg=apxinf_fa2_bf16");
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
                 let fa2_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_bf16_sm80.cu");
                 let fa2_f16_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_fp16.cu");

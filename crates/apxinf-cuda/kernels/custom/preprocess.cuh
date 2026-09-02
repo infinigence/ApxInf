@@ -96,5 +96,44 @@ __global__ void rgb_u8_to_patches_bf16_kernel(
   }
 }
 
+// GR00T N1.7 stacks two identical temporal frames inside each 16x16 patch.
+// Patch rows follow [coarse_y, coarse_x, sub_y, sub_x], while features follow
+// [channel, time, patch_y, patch_x].
+template <bool kNhwc>
+__global__ void groot_rgb_u8_to_patches_bf16_kernel(
+    const uint8_t* images, __nv_bfloat16* patches, int views) {
+  constexpr int image_size = 256;
+  constexpr int patch_size = 16;
+  constexpr int patches_per_view = 256;
+  constexpr int patch_width = 1536;
+  const int64_t count = static_cast<int64_t>(views) * patches_per_view * patch_width;
+  int64_t output_index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; output_index < count; output_index += stride) {
+    int feature = static_cast<int>(output_index % patch_width);
+    int patch = static_cast<int>((output_index / patch_width) % patches_per_view);
+    const int view = static_cast<int>(output_index / (patch_width * patches_per_view));
+    const int dx = feature % patch_size;
+    feature /= patch_size;
+    const int dy = feature % patch_size;
+    feature /= patch_size;
+    feature /= 2;  // The temporal dimension contains two copies of the same frame.
+    const int channel = feature;
+    const int sub_x = patch % 2;
+    patch /= 2;
+    const int sub_y = patch % 2;
+    patch /= 2;
+    const int coarse_x = patch % 8;
+    const int coarse_y = patch / 8;
+    const int x = (coarse_x * 2 + sub_x) * patch_size + dx;
+    const int y = (coarse_y * 2 + sub_y) * patch_size + dy;
+    const int64_t input_index = kNhwc
+        ? ((static_cast<int64_t>(view) * image_size + y) * image_size + x) * 3 + channel
+        : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) * image_size + x;
+    const float normalized =
+        (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+    patches[output_index] = __float2bfloat16(normalized);
+  }
+}
 
 

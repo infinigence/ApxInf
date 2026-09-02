@@ -338,8 +338,15 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_groot_rgb_u8_to_patches_bf16(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        layout: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     /// BF16 bias/activation epilogue. `activation`: 0=identity, 1=GELU-tanh,
-    /// 2=SiLU.
+    /// 2=SiLU, 3=ReLU.
     pub fn apxinf_static_bias_activation_bf16(
         input: *const c_void,
         bias: *const c_void,
@@ -356,6 +363,7 @@ extern "C" {
         tokens: i32,
         width: i32,
         vocab_size: i32,
+        scale_by_sqrt_width: bool,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_concat_rows_bf16(
@@ -373,6 +381,26 @@ extern "C" {
         output: *mut c_void,
         count: i64,
         dt: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_gather_rows_bf16(
+        input: *const c_void,
+        rows: *const c_void,
+        output: *mut c_void,
+        input_rows: i32,
+        output_rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_scatter_rows_bf16(
+        base: *const c_void,
+        updates: *const c_void,
+        rows: *const c_void,
+        output: *mut c_void,
+        base_rows: i32,
+        update_rows: i32,
+        cols: i32,
+        add: bool,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_geglu_bf16(
@@ -444,6 +472,16 @@ extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_ada_layer_norm_bf16(
+        input: *const c_void,
+        style: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        shift_first: bool,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_ada_gate_residual_bf16(
         projection: *const c_void,
         residual: *const c_void,
@@ -509,6 +547,28 @@ extern "C" {
         tokens_per_batch: i32,
         batches: i32,
         heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_cross_mha_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        query_tokens: i32,
+        key_tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_causal_gqa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
         head_dim: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;

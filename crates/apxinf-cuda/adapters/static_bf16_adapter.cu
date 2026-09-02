@@ -44,6 +44,21 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_groot_rgb_u8_to_patches_bf16(
+    const void* images, void* patches, int views, int layout,
+    cudaStream_t stream) {
+  if (views <= 0 || (layout != 0 && layout != 1)) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(views) * 256 * 1536;
+  if (layout == 0) {
+    groot_rgb_u8_to_patches_bf16_kernel<true><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<__nv_bfloat16*>(patches), views);
+  } else {
+    groot_rgb_u8_to_patches_bf16_kernel<false><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<__nv_bfloat16*>(patches), views);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_bias_activation_bf16(
     const void* input, const void* bias, void* output,
     int rows, int cols, int activation, cudaStream_t stream) {
@@ -81,11 +96,13 @@ extern "C" cudaError_t apxinf_static_bias_activation_bf16(
 
 extern "C" cudaError_t apxinf_static_embedding_bf16(
     const void* table, const void* ids, void* output,
-    int tokens, int width, int vocab_size, cudaStream_t stream) {
+    int tokens, int width, int vocab_size, bool scale_by_sqrt_width,
+    cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(tokens) * width;
   embedding_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(table), static_cast<const uint32_t*>(ids),
-      static_cast<__nv_bfloat16*>(output), tokens, width, vocab_size);
+      static_cast<__nv_bfloat16*>(output), tokens, width, vocab_size,
+      scale_by_sqrt_width);
   return cudaGetLastError();
 }
 
@@ -108,6 +125,34 @@ extern "C" cudaError_t apxinf_static_euler_update_bf16(
       static_cast<const __nv_bfloat16*>(state),
       static_cast<const __nv_bfloat16*>(velocity),
       static_cast<__nv_bfloat16*>(output), count, dt);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_gather_rows_bf16(
+    const void* input, const void* rows, void* output,
+    int input_rows, int output_rows, int cols, cudaStream_t stream) {
+  if (input_rows <= 0 || output_rows <= 0 || cols <= 0) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(output_rows) * cols;
+  gather_rows_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const uint32_t*>(rows),
+      static_cast<__nv_bfloat16*>(output), count, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_scatter_rows_bf16(
+    const void* base, const void* updates, const void* rows, void* output,
+    int base_rows, int update_rows, int cols, bool add, cudaStream_t stream) {
+  if (base_rows <= 0 || update_rows <= 0 || cols <= 0) return cudaErrorInvalidValue;
+  cudaError_t status = cudaMemcpyAsync(
+      output, base, static_cast<size_t>(base_rows) * cols * sizeof(__nv_bfloat16),
+      cudaMemcpyDeviceToDevice, stream);
+  if (status != cudaSuccess) return status;
+  const int64_t count = static_cast<int64_t>(update_rows) * cols;
+  scatter_rows_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(updates),
+      static_cast<const uint32_t*>(rows),
+      static_cast<__nv_bfloat16*>(output), count, cols, add);
   return cudaGetLastError();
 }
 
@@ -210,6 +255,16 @@ extern "C" cudaError_t apxinf_static_ada_rms_norm_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_ada_layer_norm_bf16(
+    const void* input, const void* style, void* output,
+    int rows, int cols, float eps, bool shift_first, cudaStream_t stream) {
+  ada_layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(style),
+      static_cast<__nv_bfloat16*>(output), rows, cols, eps, shift_first);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_ada_gate_residual_bf16(
     const void* projection, const void* residual, const void* style,
     void* output, int rows, int cols, cudaStream_t stream) {
@@ -288,6 +343,33 @@ extern "C" cudaError_t apxinf_static_mha_bf16(
       static_cast<const __nv_bfloat16*>(k),
       static_cast<const __nv_bfloat16*>(v),
       static_cast<__nv_bfloat16*>(output), tokens_per_batch, heads, head_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_cross_mha_bf16(
+    const void* q, const void* k, const void* v, void* output,
+    int query_tokens, int key_tokens, int heads, int head_dim,
+    cudaStream_t stream) {
+  dim3 grid(query_tokens, heads, 1);
+  const size_t shared = static_cast<size_t>(key_tokens + 8) * sizeof(float);
+  cross_mha_bf16_kernel<<<grid, kThreads, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(q),
+      static_cast<const __nv_bfloat16*>(k),
+      static_cast<const __nv_bfloat16*>(v),
+      static_cast<__nv_bfloat16*>(output), query_tokens, key_tokens,
+      heads, head_dim);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_causal_gqa_bf16(
+    const void* q, const void* k, const void* v, void* output,
+    int tokens, int q_heads, int kv_heads, int head_dim, cudaStream_t stream) {
+  const int threads = 128;
+  const size_t shared = static_cast<size_t>(tokens + threads / 32) * sizeof(float);
+  causal_gqa_bf16_kernel<<<dim3(tokens, q_heads), threads, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(q), static_cast<const __nv_bfloat16*>(k),
+      static_cast<const __nv_bfloat16*>(v), static_cast<__nv_bfloat16*>(output),
+      tokens, q_heads, kv_heads, head_dim);
   return cudaGetLastError();
 }
 

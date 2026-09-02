@@ -18,7 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # The prompt tokenizer needs sentencepiece; the golden/layering tests want it too.
-tokenizer = ["sentencepiece>=0.1.99"]
+tokenizer = ["sentencepiece>=0.1.99", "tokenizers>=0.20"]
+groot = ["tokenizers>=0.20", "opencv-python-headless>=4.8"]
 # A live Pi05Policy binds the PyO3 model handle (Phase 1).
 policy = ["apxinf-py>=0.1.0"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.

@@ -33,7 +33,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
                  const void* q, const void* k, const void* v, void* output,
                  void* softmax_lse, int batch, int query_tokens,
                  int key_tokens, int query_heads, int kv_heads, int head_dim,
-                 float softmax_scale) {
+                 float softmax_scale, bool causal) {
   params = {};
   params.is_bf16 = is_bf16;
   params.q_ptr = const_cast<void*>(q);
@@ -75,7 +75,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
   params.p_dropout_in_uint8_t = 255;
   params.rp_dropout = 1.0f;
 
-  params.is_causal = false;
+  params.is_causal = causal;
   params.window_size_left = -1;
   params.window_size_right = -1;
   params.is_seqlens_k_cumulative = true;
@@ -143,7 +143,7 @@ int setup_splitkv(FLASH_NAMESPACE::Flash_fwd_params& params,
 
 namespace apxinf::cuda::cutlass_ops {
 
-template <typename Element>
+template <typename Element, bool IsCausal>
 int fa2(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
@@ -159,11 +159,11 @@ int fa2(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale, IsCausal);
   if (head_dim <= 96) {
-    FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 96, IsCausal>(params, stream);
   } else {
-    FLASH_NAMESPACE::run_mha_fwd_<Element, 256, false>(params, stream);
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 256, IsCausal>(params, stream);
   }
   return static_cast<int>(cudaSuccess);
 }
@@ -186,7 +186,7 @@ int fa2_splitkv(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale, false);
   const int num_splits =
       setup_splitkv(params, softmax_lse_accum, o_accum, num_sms, query_tokens,
                     key_tokens, head_dim, batch, query_heads);
@@ -211,9 +211,14 @@ int fa2_splitkv(
 int fa2_bf16(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
-    int query_heads, int kv_heads, int head_dim, float softmax_scale,
+    int query_heads, int kv_heads, int head_dim, float softmax_scale, bool causal,
     cudaStream_t stream) {
-  return fa2<cutlass::bfloat16_t>(
+  if (causal) {
+    return fa2<cutlass::bfloat16_t, true>(
+        q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
+        query_heads, kv_heads, head_dim, softmax_scale, stream);
+  }
+  return fa2<cutlass::bfloat16_t, false>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }
@@ -236,7 +241,7 @@ int fa2_f16(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
-  return fa2<cutlass::half_t>(
+  return fa2<cutlass::half_t, false>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }

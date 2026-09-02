@@ -871,5 +871,115 @@ __global__ void mha_bf16_kernel(
   }
 }
 
+__global__ void cross_mha_bf16_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, __nv_bfloat16* output,
+    int query_tokens, int key_tokens, int heads, int head_dim) {
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* warp_sums = scores + key_tokens;
+  const int query = blockIdx.x;
+  const int head = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warps = blockDim.x >> 5;
+  const __nv_bfloat16* query_ptr = q + (query * heads + head) * head_dim;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  for (int token = 0; token < key_tokens; ++token) {
+    const __nv_bfloat16* key = k + (static_cast<int64_t>(token) * heads + head) * head_dim;
+    float dot = tid < head_dim
+        ? __bfloat162float(query_ptr[tid]) * __bfloat162float(key[tid])
+        : 0.0f;
+    dot = warp_sum(dot);
+    if (lane == 0) warp_sums[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+      float total = lane < warps ? warp_sums[lane] : 0.0f;
+      total = warp_sum(total);
+      if (lane == 0) scores[token] = total * scale;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float maximum = -3.402823466e+38F;
+    for (int token = 0; token < key_tokens; ++token)
+      maximum = fmaxf(maximum, scores[token]);
+    float denominator = 0.0f;
+    for (int token = 0; token < key_tokens; ++token) {
+      scores[token] = expf(scores[token] - maximum);
+      denominator += scores[token];
+    }
+    for (int token = 0; token < key_tokens; ++token)
+      scores[token] /= denominator;
+  }
+  __syncthreads();
+  if (tid < head_dim) {
+    float accumulator = 0.0f;
+    for (int token = 0; token < key_tokens; ++token) {
+      const __nv_bfloat16* value =
+          v + (static_cast<int64_t>(token) * heads + head) * head_dim;
+      accumulator += scores[token] * __bfloat162float(value[tid]);
+    }
+    output[(query * heads + head) * head_dim + tid] =
+        __float2bfloat16(accumulator);
+  }
+}
 
-
+// Fixed-shape causal GQA used by multimodal prefill. Q is
+// [tokens,q_heads,head_dim], K/V are [tokens,kv_heads,head_dim].
+__global__ void causal_gqa_bf16_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k,
+    const __nv_bfloat16* v, __nv_bfloat16* output,
+    int tokens, int q_heads, int kv_heads, int head_dim) {
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* warp_sums = scores + tokens;
+  const int query = blockIdx.x;
+  const int q_head = blockIdx.y;
+  const int kv_head = q_head / (q_heads / kv_heads);
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int warps = blockDim.x >> 5;
+  const __nv_bfloat16* query_ptr =
+      q + (static_cast<int64_t>(query) * q_heads + q_head) * head_dim;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  for (int token = 0; token <= query; ++token) {
+    const __nv_bfloat16* key =
+        k + (static_cast<int64_t>(token) * kv_heads + kv_head) * head_dim;
+    float dot = tid < head_dim
+        ? __bfloat162float(query_ptr[tid]) * __bfloat162float(key[tid]) : 0.0f;
+    dot = warp_sum(dot);
+    if (lane == 0) warp_sums[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+      float total = lane < warps ? warp_sums[lane] : 0.0f;
+      total = warp_sum(total);
+      if (lane == 0) scores[token] = total * scale;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float maximum = -3.402823466e+38F;
+    for (int token = 0; token <= query; ++token)
+      maximum = fmaxf(maximum, scores[token]);
+    float denominator = 0.0f;
+    for (int token = 0; token <= query; ++token) {
+      scores[token] = expf(scores[token] - maximum);
+      denominator += scores[token];
+    }
+    for (int token = 0; token <= query; ++token) scores[token] /= denominator;
+  }
+  __syncthreads();
+  if (tid < head_dim) {
+    float accumulator = 0.0f;
+    for (int token = 0; token <= query; ++token) {
+      const __nv_bfloat16* value =
+          v + (static_cast<int64_t>(token) * kv_heads + kv_head) * head_dim;
+      accumulator += scores[token] * __bfloat162float(value[tid]);
+    }
+    output[(static_cast<int64_t>(query) * q_heads + q_head) * head_dim + tid] =
+        __float2bfloat16(accumulator);
+  }
+}

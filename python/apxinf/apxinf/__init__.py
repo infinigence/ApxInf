@@ -34,7 +34,7 @@ policy's ``from_pretrained`` pull in the ``apxinf_py`` binding.
 from __future__ import annotations
 
 from . import processors
-from .policies import AutoPolicy, Pi05Policy, Policy
+from .policies import AutoPolicy, GrootN17Policy, Pi05Policy, Policy
 from .robots import (
     ROBOT_PRESETS,
     RobotPreset,
@@ -60,6 +60,7 @@ __all__ = [
     "Policy",
     # L2 policies
     "Pi05Policy",
+    "GrootN17Policy",
     "AutoPolicy",
     # robot adapters
     "build_unitree_g1_policy",
