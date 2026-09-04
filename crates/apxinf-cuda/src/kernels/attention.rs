@@ -1366,3 +1366,81 @@ pub fn mqa_f16_e4m3_522(
         "FA2 direct E4M3 requires an SM100-family FA2 build".into(),
     ))
 }
+
+/// Causal GQA prefill attention on FP16 buffers with `head_dim = 128`.
+///
+/// * `query`: `[query_tokens, heads, 128]`; `key`/`value`:
+///   `[key_tokens, kv_heads, 128]` where `key_tokens >= query_tokens` and the
+///   queries are aligned to the end of the key sequence (new tokens appended
+///   to an existing prefix attend to the whole prefix plus themselves).
+/// * `output`: `[query_tokens, heads, 128]`; `softmax_lse`: f32
+///   `[heads, query_tokens]` scratch.
+///
+/// Available on SM80 and SM100-family builds that compile the vendored
+/// FlashAttention-2 FP16 kernels.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_prefill_f16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    output: &CudaBuffer,
+    softmax_lse: &CudaBuffer,
+    query_tokens: usize,
+    key_tokens: usize,
+    heads: usize,
+    kv_heads: usize,
+    scale: f32,
+) -> Result<()> {
+    const HEAD_DIM: usize = 128;
+    require_finite("causal prefill attention", &[scale])?;
+    if query_tokens == 0
+        || key_tokens < query_tokens
+        || heads == 0
+        || kv_heads == 0
+        || heads % kv_heads != 0
+    {
+        return Err(Error::Other(format!(
+            "causal prefill attention: invalid q={query_tokens} k={key_tokens} heads={heads}/{kv_heads}"
+        )));
+    }
+    let q_bytes = checked_bytes(DType::F16, &[query_tokens, heads, HEAD_DIM], "causal prefill")?;
+    let kv_bytes = checked_bytes(DType::F16, &[key_tokens, kv_heads, HEAD_DIM], "causal prefill")?;
+    let lse_bytes = checked_bytes(DType::F32, &[heads, query_tokens], "causal prefill")?;
+    require_buffers(
+        ctx,
+        "causal prefill attention",
+        &[
+            ("query", query, q_bytes),
+            ("key", key, kv_bytes),
+            ("value", value, kv_bytes),
+            ("output", output, q_bytes),
+            ("softmax_lse", softmax_lse, lse_bytes),
+        ],
+    )?;
+    #[cfg(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80))]
+    {
+        check_cuda(unsafe {
+            ffi::apxinf_static_fa2_f16_causal_hdim128(
+                query.ptr(),
+                key.ptr(),
+                value.ptr(),
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                query_tokens as i32,
+                key_tokens as i32,
+                heads as i32,
+                kv_heads as i32,
+                scale,
+                ctx.stream().handle(),
+            )
+        })
+    }
+    #[cfg(not(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80)))]
+    {
+        Err(Error::Other(
+            "causal prefill attention requires the FlashAttention-2 FP16 build".into(),
+        ))
+    }
+}

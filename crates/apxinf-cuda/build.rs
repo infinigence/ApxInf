@@ -390,6 +390,8 @@ fn main() {
                 let fa2_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_bf16_sm80.cu");
                 let fa2_f16_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_fp16.cu");
                 let fa2_f16_hdim256 = fa2_root.join("flash_attn/flash_fwd_hdim256_fp16.cu");
+                let fa2_f16_hdim128_causal =
+                    fa2_root.join("flash_attn/flash_fwd_hdim128_fp16_causal.cu");
                 let fa2_cutlass = fa2_root.join("cutlass/include");
                 assert!(
                     fa2_operator.is_file()
@@ -398,6 +400,7 @@ fn main() {
                         && fa2_hdim256.is_file()
                         && fa2_f16_hdim96.is_file()
                         && fa2_f16_hdim256.is_file()
+                        && fa2_f16_hdim128_causal.is_file()
                         && fa2_cutlass.is_dir(),
                     "vendored FlashAttention-2 sources are incomplete under {}",
                     fa2_root.display()
@@ -408,6 +411,7 @@ fn main() {
                     fa2_hdim256,
                     fa2_f16_hdim96,
                     fa2_f16_hdim256,
+                    fa2_f16_hdim128_causal,
                 ]);
                 if fa2_sm80 {
                     let fa2_split_hdim256 =

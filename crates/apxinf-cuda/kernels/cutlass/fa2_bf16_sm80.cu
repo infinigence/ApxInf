@@ -241,4 +241,28 @@ int fa2_f16(
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }
 
+// Causal (lower-triangular) FP16 forward for head_dim 128. Query rows are
+// aligned to the end of the key sequence (FlashAttention "bottom-right"
+// causal semantics), so `key_tokens >= query_tokens` supports appending new
+// tokens to an existing KV prefix.
+int fa2_f16_causal_hdim128(
+    const void* q, const void* k, const void* v, void* output,
+    void* softmax_lse, int batch, int query_tokens, int key_tokens,
+    int query_heads, int kv_heads, float softmax_scale, cudaStream_t stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
+      softmax_lse == nullptr || batch <= 0 || query_tokens <= 0 ||
+      key_tokens < query_tokens || query_heads <= 0 || kv_heads <= 0 ||
+      query_heads % kv_heads != 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, false, q, k, v, output, softmax_lse, batch, query_tokens,
+              key_tokens, query_heads, kv_heads, 128, softmax_scale);
+  params.is_causal = true;
+  params.window_size_left = -1;
+  params.window_size_right = 0;
+  FLASH_NAMESPACE::run_mha_fwd_<cutlass::half_t, 128, true>(params, stream);
+  return static_cast<int>(cudaSuccess);
+}
+
 }  // namespace apxinf::cuda::cutlass_ops
