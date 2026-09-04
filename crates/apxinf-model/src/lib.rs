@@ -10,6 +10,7 @@ pub mod registry;
 pub mod auto;
 pub mod profiling;
 pub mod pi05;
+pub mod qwen3moe;
 pub mod qwen3vl;
 pub mod vla;
 
@@ -25,6 +26,9 @@ pub use registry::{register, get, list};
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use profiling::GenerationProfile;
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
+pub use qwen3moe::{Qwen3MoeConfig, Qwen3MoeQuantization};
+#[cfg(feature = "cuda")]
+pub use qwen3moe::{Qwen3Moe, Qwen3MoeRuntime, Qwen3MoeWeights};
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use vla::{
     Action, ImageLayout, InferenceSpec, InitialLatent, Observation,
