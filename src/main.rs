@@ -1,5 +1,7 @@
 //! ApxInf LLM inference engine CLI.
 
+mod bench;
+
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -97,10 +99,46 @@ enum Commands {
         #[arg(short, long, default_value = "cpu")]
         device: String,
 
-        /// Weight dtype ("fp32" or "bf16"). On CUDA, "bf16" halves weight-
-        /// bandwidth and enables the bf16 fast path. Ignored on CPU.
+        /// Weight dtype ("auto", "fp32" or "bf16"). On CUDA, "bf16" halves
+        /// weight-bandwidth and enables the bf16 fast path; "auto" keeps a
+        /// quantized checkpoint's own format. Ignored on CPU.
         #[arg(long, default_value = "fp32")]
         dtype: String,
+    },
+
+    /// Sweep prefill and decode latency over input and output lengths
+    Bench {
+        /// Path to HuggingFace model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Device to run inference on (cpu or cuda)
+        #[arg(short, long, default_value = "cuda")]
+        device: String,
+
+        /// Weight dtype ("auto", "fp32" or "bf16"), as for `generate`.
+        #[arg(long, default_value = "auto")]
+        dtype: String,
+
+        /// Comma-separated input sequence lengths
+        #[arg(long, default_value = "128,1024,4096")]
+        isl: String,
+
+        /// Comma-separated output sequence lengths
+        #[arg(long, default_value = "128")]
+        osl: String,
+
+        /// Untimed iterations run first, to settle clocks and CUDA graphs
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+
+        /// Timed iterations per (ISL, OSL) point; the median is reported
+        #[arg(long, default_value_t = 3)]
+        iters: usize,
+
+        /// Also write the results as JSON
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 
     /// Run a quick test of the engine
@@ -160,14 +198,56 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Bench {
+            model,
+            device,
+            dtype,
+            isl,
+            osl,
+            warmup,
+            iters,
+            json,
+        } => {
+            let result = (|| -> Result<(), String> {
+                let args = bench::BenchArgs {
+                    model_dir: &model,
+                    device: parse_device(&device),
+                    dtype: parse_weight_dtype(&dtype)?,
+                    isl: bench::parse_lengths(&isl, "--isl")?,
+                    osl: bench::parse_lengths(&osl, "--osl")?,
+                    warmup,
+                    iters: iters.max(1),
+                    json: json.as_deref(),
+                };
+                bench::run(args).map_err(|error| error.to_string())
+            })();
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Test => {
             run_test();
         }
     }
 }
 
-fn parse_device(s: &str) -> Device {
-    match s.to_lowercase().as_str() {
+/// Shared by `generate` and `bench` so the two cannot disagree about what
+/// `--dtype` accepts.
+fn parse_weight_dtype(dtype: &str) -> Result<Option<DType>, String> {
+    match dtype.to_ascii_lowercase().as_str() {
+        // Quantized checkpoints carry their own weight format; `auto` lets the
+        // model keep it instead of forcing a dense dtype it cannot honour.
+        "auto" => Ok(None),
+        "fp32" | "f32" => Ok(Some(DType::F32)),
+        "bf16" => Ok(Some(DType::BF16)),
+        other => Err(format!(
+            "Unsupported text weight dtype `{other}`; use auto, fp32 or bf16"
+        )),
+    }
+}
+
+fn parse_device(s: &str) -> Device {    match s.to_lowercase().as_str() {
         "cuda" | "gpu" => Device::Cuda(0),
         "cpu" => Device::Cpu,
         _ => {
@@ -240,15 +320,7 @@ fn run_generate(
         (tokens, None)
     };
 
-    let text_weight_dtype = match dtype.to_ascii_lowercase().as_str() {
-        "fp32" | "f32" => Some(DType::F32),
-        "bf16" => Some(DType::BF16),
-        other => {
-            return Err(format!(
-                "Unsupported text weight dtype `{other}`; use fp32 or bf16"
-            ))
-        }
-    };
+    let text_weight_dtype = parse_weight_dtype(dtype)?;
     let generation_overrides = override_generation_config
         .map(GenerationOptions::from_json_str)
         .transpose()
