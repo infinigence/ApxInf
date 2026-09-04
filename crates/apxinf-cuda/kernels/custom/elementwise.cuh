@@ -182,3 +182,56 @@ __global__ void bias_position_bf16_kernel(
 }
 
 
+
+// ── MoE row permutation helpers ──────────────────────────────────────────
+
+// out[r, :] = x[source_rows[r], :]  (BF16, row width `cols`)
+__global__ void gather_rows_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x, const int32_t* __restrict__ source_rows,
+    __nv_bfloat16* __restrict__ output, int rows, int cols) {
+  const int64_t total = static_cast<int64_t>(rows) * cols;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < total; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int r = static_cast<int>(index / cols);
+    const int c = static_cast<int>(index - static_cast<int64_t>(r) * cols);
+    output[index] = x[static_cast<int64_t>(source_rows[r]) * cols + c];
+  }
+}
+
+// out[m, :] = sum_{s < k} weight[m*k + s] * y[slot_rows[m*k + s], :]
+// Every token owns exactly `k` routed rows, so the reduction is atomic-free.
+__global__ void weighted_gather_sum_bf16_kernel(
+    const __nv_bfloat16* __restrict__ y, const int32_t* __restrict__ slot_rows,
+    const float* __restrict__ weight, __nv_bfloat16* __restrict__ output,
+    int tokens, int k, int cols) {
+  const int64_t total = static_cast<int64_t>(tokens) * cols;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < total; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int m = static_cast<int>(index / cols);
+    const int c = static_cast<int>(index - static_cast<int64_t>(m) * cols);
+    float sum = 0.0f;
+    for (int s = 0; s < k; ++s) {
+      const int64_t slot = static_cast<int64_t>(m) * k + s;
+      sum += weight[slot] *
+             __bfloat162float(y[static_cast<int64_t>(slot_rows[slot]) * cols + c]);
+    }
+    output[index] = __float2bfloat16(sum);
+  }
+}
+
+// ── dtype conversion ─────────────────────────────────────────────────────
+__global__ void convert_bf16_to_f16_kernel(
+    const __nv_bfloat16* __restrict__ input, half* __restrict__ output, int64_t count) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < count; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    output[index] = __float2half(__bfloat162float(input[index]));
+  }
+}
+
+__global__ void convert_f16_to_bf16_kernel(
+    const half* __restrict__ input, __nv_bfloat16* __restrict__ output, int64_t count) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < count; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    output[index] = __float2bfloat16(__half2float(input[index]));
+  }
+}

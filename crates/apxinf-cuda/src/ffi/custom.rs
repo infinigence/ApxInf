@@ -932,3 +932,118 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+// ── AutoAWQ INT4 weights and MoE routing (adapters/custom_kernels.cu) ────
+extern "C" {
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_awq_dequant_bf16(
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        experts: i32,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        stride_out: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_w4a16_gemv_partial_bf16(
+        x: *const c_void,
+        x_slot_stride: i64,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        expert_ids: *const c_void,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        slot_scale: *const c_void,
+        partial: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_partial_sum_bf16(
+        partial: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        count: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_partial_silu_mul_bf16(
+        partial: *const c_void,
+        output: *mut c_void,
+        inter: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_moe_router_topk_bf16(
+        logits: *const c_void,
+        topk_idx: *mut c_void,
+        topk_weight: *mut c_void,
+        tokens: i32,
+        experts: i32,
+        k: i32,
+        renormalize: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_gather_rows_bf16(
+        x: *const c_void,
+        source_rows: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_weighted_gather_sum_bf16(
+        y: *const c_void,
+        slot_rows: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        tokens: i32,
+        k: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_silu_mul_rows_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        inter: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_convert_bf16_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_convert_f16_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}

@@ -2,6 +2,7 @@ mod bf16;
 mod fp8;
 mod plan;
 mod providers;
+pub mod w4a16;
 mod w8a8;
 
 use std::cell::RefCell;

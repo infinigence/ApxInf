@@ -388,3 +388,43 @@ pub fn euler_update_f16(
         output,
     ))
 }
+
+/// Convert `count` BF16 values to FP16.
+pub fn convert_bf16_to_f16_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    output: &CudaBuffer,
+    count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Err(Error::Other("dtype conversion needs count >= 1".into()));
+    }
+    require_buffers(
+        ctx,
+        "bf16->f16 conversion",
+        &[("input", input, count * 2), ("output", output, count * 2)],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_convert_bf16_f16(input.ptr(), output.ptr(), count as i64, ctx.stream().handle())
+    })
+}
+
+/// Convert `count` FP16 values to BF16.
+pub fn convert_f16_to_bf16_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    output: &CudaBuffer,
+    count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Err(Error::Other("dtype conversion needs count >= 1".into()));
+    }
+    require_buffers(
+        ctx,
+        "f16->bf16 conversion",
+        &[("input", input, count * 2), ("output", output, count * 2)],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_convert_f16_bf16(input.ptr(), output.ptr(), count as i64, ctx.stream().handle())
+    })
+}

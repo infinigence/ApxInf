@@ -1,6 +1,7 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -22,6 +23,7 @@ namespace {
 #include "../kernels/custom/elementwise.cuh"
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
+#include "../kernels/custom/selection.cuh"
 }  // namespace
 
 namespace {
@@ -449,5 +451,139 @@ extern "C" cudaError_t apxinf_static_bias_position_f16(
       static_cast<const half*>(projection), static_cast<const half*>(bias),
       static_cast<const half*>(position), static_cast<half*>(output),
       count, cols, tokens_per_view);
+  return cudaGetLastError();
+}
+
+// ── AutoAWQ INT4 weights and MoE routing ─────────────────────────────────
+
+namespace {
+int grid_stride_blocks(int64_t count, int threads, int cap) {
+  int64_t blocks = (count + threads - 1) / threads;
+  if (blocks > cap) blocks = cap;
+  return blocks < 1 ? 1 : static_cast<int>(blocks);
+}
+}  // namespace
+
+extern "C" cudaError_t apxinf_awq_dequant_bf16(
+    const void* qweight, const void* qzeros, const void* scales, void* output,
+    int rows, int packed_cols, int group_size, int experts, int64_t stride_q,
+    int64_t stride_z, int64_t stride_s, int64_t stride_out, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || experts <= 0 ||
+      rows % group_size != 0)
+    return cudaErrorInvalidValue;
+  const int64_t words = static_cast<int64_t>(rows) * packed_cols;
+  const dim3 grid(grid_stride_blocks(words, 256, 4096), experts);
+  awq_dequant_bf16_kernel<<<grid, 256, 0, stream>>>(
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<__nv_bfloat16*>(output), rows,
+      packed_cols, group_size, stride_q, stride_z, stride_s, stride_out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_gemv_partial_bf16(
+    const void* x, int64_t x_slot_stride, const void* qweight, const void* qzeros,
+    const void* scales, const void* expert_ids, int64_t stride_q, int64_t stride_z,
+    int64_t stride_s, const void* slot_scale, void* partial, int rows,
+    int packed_cols, int group_size, int splits, int slots, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || splits <= 0 ||
+      slots <= 0 || rows % group_size != 0)
+    return cudaErrorInvalidValue;
+  // Rows per block: ceil(rows/splits) rounded up to a multiple of 8 warps.
+  int rows_per_block = (rows + splits - 1) / splits;
+  rows_per_block = (rows_per_block + 7) / 8 * 8;
+  const int n_tiles = (packed_cols * 8 + 255) / 256;
+  const dim3 grid(n_tiles, splits, slots);
+  const size_t shared = static_cast<size_t>(rows_per_block) * sizeof(float) +
+                        8 * 256 * sizeof(float);
+  w4a16_gemv_partial_kernel<<<grid, 256, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), x_slot_stride,
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
+      stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
+      static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_partial_sum_bf16(
+    const void* partial, void* output, int cols, int count, cudaStream_t stream) {
+  if (cols <= 0 || count <= 0) return cudaErrorInvalidValue;
+  partial_sum_bf16_kernel<<<(cols + 255) / 256, 256, 0, stream>>>(
+      static_cast<const float*>(partial), static_cast<__nv_bfloat16*>(output), cols,
+      count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_partial_silu_mul_bf16(
+    const void* partial, void* output, int inter, int splits, int slots,
+    cudaStream_t stream) {
+  if (inter <= 0 || splits <= 0 || slots <= 0) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(inter) * slots;
+  partial_silu_mul_bf16_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(
+      static_cast<const float*>(partial), static_cast<__nv_bfloat16*>(output), inter,
+      splits, slots);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_moe_router_topk_bf16(
+    const void* logits, void* topk_idx, void* topk_weight, int tokens, int experts,
+    int k, int renormalize, cudaStream_t stream) {
+  if (tokens <= 0 || experts <= 0 || experts > 256 || k <= 0 || k > experts ||
+      k > 32)
+    return cudaErrorInvalidValue;
+  constexpr int warps_per_block = 4;
+  const int blocks = (tokens + warps_per_block - 1) / warps_per_block;
+  moe_router_topk_bf16_kernel<<<blocks, warps_per_block * 32, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(logits), static_cast<int32_t*>(topk_idx),
+      static_cast<float*>(topk_weight), tokens, experts, k, renormalize);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_gather_rows_bf16(
+    const void* x, const void* source_rows, void* output, int rows, int cols,
+    cudaStream_t stream) {
+  if (rows <= 0 || cols <= 0) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  gather_rows_bf16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), static_cast<const int32_t*>(source_rows),
+      static_cast<__nv_bfloat16*>(output), rows, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_weighted_gather_sum_bf16(
+    const void* y, const void* slot_rows, const void* weight, void* output,
+    int tokens, int k, int cols, cudaStream_t stream) {
+  if (tokens <= 0 || k <= 0 || cols <= 0) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(tokens) * cols;
+  weighted_gather_sum_bf16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0,
+                                    stream>>>(
+      static_cast<const __nv_bfloat16*>(y), static_cast<const int32_t*>(slot_rows),
+      static_cast<const float*>(weight), static_cast<__nv_bfloat16*>(output), tokens,
+      k, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_silu_mul_rows_bf16(
+    const void* gate_up, void* output, int rows, int inter, cudaStream_t stream) {
+  if (rows <= 0 || inter <= 0) return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(rows) * inter;
+  silu_mul_rows_bf16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(gate_up), static_cast<__nv_bfloat16*>(output),
+      rows, inter);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_convert_bf16_f16(
+    const void* input, void* output, int64_t count, cudaStream_t stream) {
+  if (count <= 0) return cudaErrorInvalidValue;
+  convert_bf16_to_f16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input), static_cast<half*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_convert_f16_bf16(
+    const void* input, void* output, int64_t count, cudaStream_t stream) {
+  if (count <= 0) return cudaErrorInvalidValue;
+  convert_f16_to_bf16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0, stream>>>(
+      static_cast<const half*>(input), static_cast<__nv_bfloat16*>(output), count);
   return cudaGetLastError();
 }
