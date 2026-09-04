@@ -462,7 +462,51 @@ __global__ void flash_attn_decode_bf16_splitk_kernel(
     // inside a captured kernel, and avoids reading/masking the padded tail
     // when the sequence is shorter than the bucket (the common case early
     // in generation). bucket_kv_len is just an upper bound now.
-    for (uint32_t t = warp_id; t < valid_len; t += WARPS) {
+    //
+    // Timesteps are taken DECODE_UNROLL at a time. The online softmax is
+    // inherently sequential — m, l and acc carry from one t to the next — but
+    // the *loads* are not: the addresses of K[t] and V[t] depend only on t.
+    // Issuing a batch of them up front turns a chain of single dependent
+    // 256-byte reads into a wide one, which is what this kernel was short of:
+    // at ISL 4096 it read 8.4 MB per layer in 564 us, about 15 GB/s against a
+    // 259 GB/s part, and cost 27 ms of a 42 ms token.
+    //
+    // The arithmetic below is in the same order as the scalar tail loop, so
+    // this is bit-identical, not just close.
+    constexpr int DECODE_UNROLL = 4;
+    uint32_t t = warp_id;
+    for (; t + (DECODE_UNROLL - 1) * WARPS < valid_len; t += DECODE_UNROLL * WARPS) {
+        float kv[DECODE_UNROLL][ELEMS_PER_THREAD];
+        float vv[DECODE_UNROLL][ELEMS_PER_THREAD];
+        #pragma unroll
+        for (int u = 0; u < DECODE_UNROLL; u++) {
+            const uint32_t tu = t + u * WARPS;
+            #pragma unroll
+            for (int i = 0; i < ELEMS_PER_THREAD; i++) {
+                kv[u][i] = __bfloat162float(k_base[tu * HEAD_DIM + i * 32 + lane]);
+                vv[u][i] = __bfloat162float(v_base[tu * HEAD_DIM + i * 32 + lane]);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < DECODE_UNROLL; u++) {
+            float dot = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < ELEMS_PER_THREAD; i++) dot += q_reg[i] * kv[u][i];
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xffffffff, dot, off);
+            dot *= scale;
+
+            float m_new = fmaxf(m, dot);
+            float p = expf(dot - m_new);
+            float exp_m = expf(m - m_new);
+            l = l * exp_m + p;
+            #pragma unroll
+            for (int i = 0; i < ELEMS_PER_THREAD; i++)
+                acc[i] = acc[i] * exp_m + p * vv[u][i];
+            m = m_new;
+        }
+    }
+    for (; t < valid_len; t += WARPS) {
         float dot = 0.0f;
         #pragma unroll
         for (int i = 0; i < ELEMS_PER_THREAD; i++) {
