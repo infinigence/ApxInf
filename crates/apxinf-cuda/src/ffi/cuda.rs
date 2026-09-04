@@ -46,6 +46,11 @@ extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
 
+    /// Free and total bytes of the pool that backs `cudaMalloc`. On Tegra
+    /// class parts this is the GPU carveout, which is far smaller than system
+    /// RAM, so placement policies must query it rather than assume.
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
+
     /// Allocate page-locked (pinned) host memory. With `cudaHostAllocMapped`
     /// the buffer is also directly accessible from the GPU via
     /// `cudaHostGetDevicePointer` — on unified-memory GPUs (Tegra/Thor) this

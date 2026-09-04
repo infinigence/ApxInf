@@ -48,6 +48,27 @@ impl Drop for CudaAllocation {
     }
 }
 
+/// A pinned host allocation that a [`CudaBuffer`] addresses through its mapped
+/// device pointer; freed with `cudaFreeHost`, not `cudaFree`.
+struct MappedAllocation {
+    host_ptr: *mut c_void,
+}
+
+// SAFETY: same reasoning as `CudaAllocation`; the pinned pages outlive every
+// device address derived from them.
+unsafe impl Send for MappedAllocation {}
+unsafe impl Sync for MappedAllocation {}
+
+impl Drop for MappedAllocation {
+    fn drop(&mut self) {
+        if !self.host_ptr.is_null() {
+            unsafe {
+                let _ = ffi::cudaFreeHost(self.host_ptr);
+            }
+        }
+    }
+}
+
 /// Owns a block of GPU memory. Automatically freed on drop.
 #[derive(Clone)]
 pub struct CudaBuffer {
@@ -62,6 +83,23 @@ unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
 
 impl CudaBuffer {
+    /// Free and total bytes of the `cudaMalloc` pool on `device`.
+    ///
+    /// On Tegra/Thor this pool is a carveout that is much smaller than system
+    /// RAM (14.4 GiB of 57.7 GiB on Thor-U), so any model whose weights might
+    /// not fit should consult this before deciding what to place where.
+    pub fn pool_memory(device: usize) -> Result<(usize, usize), String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        let mut free = 0usize;
+        let mut total = 0usize;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemGetInfo(&mut free, &mut total))?;
+        }
+        Ok((free, total))
+    }
+
     /// Allocate `num_bytes` of device memory.
     pub fn alloc(num_bytes: usize, device: usize) -> Result<Self, String> {
         unsafe {
@@ -78,6 +116,43 @@ impl CudaBuffer {
             device,
             owner,
         })
+    }
+
+    /// Allocate `num_bytes` of pinned host memory mapped into the device
+    /// address space, and address it as a device buffer.
+    ///
+    /// This exists for unified-memory SoCs (Tegra/Thor), where the GPU
+    /// carveout that backs `cudaMalloc` is much smaller than system RAM — on
+    /// Thor-U it caps out near 14.4 GiB against 57 GiB of LPDDR5X. Mapped
+    /// pinned pages draw from system memory instead and are reachable by
+    /// kernels at roughly 90% of carveout bandwidth (measured 230 vs 259
+    /// GB/s), which makes them the right home for weights that do not fit.
+    /// On a discrete GPU the same call would put the data across PCIe, so
+    /// callers should treat it as an explicit overflow policy, not a default.
+    pub fn alloc_mapped(num_bytes: usize, device: usize) -> Result<Self, String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        let mut host_ptr: *mut c_void = std::ptr::null_mut();
+        let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            ffi::check_cuda(ffi::cudaHostAlloc(
+                &mut host_ptr,
+                num_bytes,
+                ffi::cudaHostAllocMapped | ffi::cudaHostAllocPortable,
+            ))?;
+            // Take ownership before the next fallible call so an error here
+            // still frees the pinned pages.
+            let owner: Arc<dyn std::any::Any + Send + Sync> =
+                Arc::new(MappedAllocation { host_ptr });
+            ffi::check_cuda(ffi::cudaHostGetDevicePointer(&mut dev_ptr, host_ptr, 0))?;
+            Ok(Self {
+                ptr: dev_ptr,
+                len: num_bytes,
+                device,
+                owner,
+            })
+        }
     }
 
     /// Allocate and zero-fill.
