@@ -25,7 +25,7 @@ model-specific example only when it demonstrates a genuinely distinct workflow.
 ## Dependencies
 
 - The `*_infer.py` examples and servers need the **`apxinf_py` CUDA
-  binding** (`maturin develop --features cuda` in [`crates/apxinf-py`](../../../crates/apxinf-py))
+  binding** (see [Build ApxInf](../../../README.md#build-apxinf))
   and a compatible checkpoint directory.
 - Using a WallOSS checkpoint additionally needs `pip install -e "python/apxinf[walloss]"`
   for its Qwen2.5-VL tokenizer/image processor and serialized normalizers.

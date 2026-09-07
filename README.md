@@ -136,14 +136,14 @@ It works from the same guides a human would follow:
 git clone <repo-url> && cd ApxInf
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
-maturin develop --release --features cuda -m crates/apxinf-py/Cargo.toml
+CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip -m crates/apxinf-py/Cargo.toml
+pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
 pip install -e "python/apxinf[tokenizer,serving]"
 # For WallOSS checkpoints, use its processor extra instead:
 # pip install -e "python/apxinf[walloss,serving]"
 ```
 
-`maturin develop` compiles the binding into the *active* environment, so a venv
-or conda env has to be activated first. The extras keep model-specific processor
+Activate a venv or conda env before installing. The extras keep model-specific processor
 dependencies opt-in: PI0.5 uses `tokenizer`, while WallOSS uses `walloss`; both
 can add `serving` for msgpack/websockets.
 
@@ -155,11 +155,6 @@ The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;
 cross-compiling fails unless `APXINF_CUDA_ARCH` names the target (`sm_87` Orin,
 `sm_101` Thor-U, `sm_110` Thor).
-
-To ship a wheel instead of installing in place, build it with
-`maturin build --release --features cuda --auditwheel skip`. The skip matters on
-Jetson: the default `auditwheel` repair vendors a `libcuda` stub into the wheel,
-and the installed binding then fails at runtime with CUDA error 304.
 
 Confirm the binding imports and reaches the GPU:
 
