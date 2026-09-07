@@ -59,8 +59,9 @@ one CUDA launch. Record both the semantic fusion and the actual launch boundary.
 
 ## Keep the hot path on the device
 
-After canonical inputs have been uploaded, intermediate tensors remain on the
-target device through the final model output. The steady-state ledger must have:
+After the runtime's declared input representation has been uploaded,
+intermediate tensors remain on the target device through the final model
+output. The steady-state ledger must have:
 
 - no intermediate device-to-host-to-device round trips;
 - no host implementation of activation, indexing, interpolation, scatter,
@@ -69,7 +70,12 @@ target device through the final model output. The steady-state ledger must have:
 - no per-layer or per-solver-step allocation that could have been prepared.
 
 Host work is appropriate for checkpoint loading, one-time weight conversion,
-canonical input preprocessing, explicit calibration, and final output transfer.
+application/robot preprocessing outside the declared runtime contract,
+explicit calibration, and final output transfer. If a runtime declares resized
+RGB as an accepted representation, checkpoint-fixed pixel normalization,
+patchification, merge ordering, and dtype conversion are part of the maintained
+device path rather than host preprocessing. Prepare and capture them with the
+fixed-shape executor when their operators support CUDA Graph capture.
 A CPU implementation inside a layer may be used briefly to establish numerical
 evidence, but it is a **correctness scaffold**. Mark the affected ledger row,
 profile its cost, and use it to validate the replacement boundary. Once the

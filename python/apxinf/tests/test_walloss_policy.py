@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import numpy as np
@@ -19,6 +20,14 @@ class _FakeModel:
         return np.zeros((10, 26), dtype=np.float32)
 
 
+class _FakeNativeModel(_FakeModel):
+    accepts_rgb_u8 = True
+
+    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None, action_mask=None):
+        self.call = (rgb_u8, layout, token_ids, noise, action_mask)
+        return np.zeros((10, 26), dtype=np.float32)
+
+
 class _FakeProcessor:
     image_keys = ("observation/image", "observation/wrist_image")
     state_key = "observation/state"
@@ -33,21 +42,15 @@ class _FakeProcessor:
         )
 
 
-class _ArrayLike:
-    def __init__(self, value):
-        self.value = np.asarray(value)
+class _FakeNativeProcessor(_FakeProcessor):
+    native_rgb = True
 
-    def detach(self):
-        return self
-
-    def cpu(self):
-        return self
-
-    def float(self):
-        return self
-
-    def numpy(self):
-        return self.value
+    def __call__(self, observation):
+        return (
+            np.zeros((2, 252, 252, 3), dtype=np.uint8),
+            np.arange(313, dtype=np.uint32),
+            np.ones((10, 26), dtype=np.float32),
+        )
 
 
 class _FakeImageProcessor:
@@ -56,12 +59,11 @@ class _FakeImageProcessor:
     min_pixels = 56 * 56
     max_pixels = 14 * 14 * 4 * 1280
 
-    def __call__(self, *, images, return_tensors):
-        assert return_tensors == "pt"
-        assert [image.shape for image in images] == [(252, 252, 3)] * 2
+    def __call__(self, images):
+        assert [image.shape for image in images] == [(256, 256, 3)] * 2
         return {
-            "image_grid_thw": _ArrayLike([[1, 18, 18], [1, 18, 18]]),
-            "pixel_values": _ArrayLike(np.zeros((648, 1176), np.float32)),
+            "image_grid_thw": np.asarray([[1, 18, 18], [1, 18, 18]]),
+            "pixel_values": np.zeros((648, 1176), np.float32),
         }
 
 
@@ -71,11 +73,11 @@ class _FakeTokenizer:
     def __init__(self):
         self.prompt = None
 
-    def __call__(self, prompt, **kwargs):
+    def encode(self, prompt):
         self.prompt = prompt
         # 141 text + 2 image placeholders + 10 action tokens. Expansion adds
         # 80 tokens per image, yielding the real 313-token fixture shape.
-        return {"input_ids": [1] * 141 + [99, 99] + [2] * 10}
+        return [1] * 141 + [99, 99] + [2] * 10
 
 
 def test_registry_exports_walloss():
@@ -99,7 +101,9 @@ def test_autopolicy_detects_walloss_checkpoint_signature(tmp_path, monkeypatch):
     }
     (tmp_path / "config.json").write_text(json.dumps(document))
     monkeypatch.setattr(
-        WallossPolicy, "from_pretrained", classmethod(lambda cls, model_dir, **kwargs: (model_dir, kwargs))
+        WallossPolicy,
+        "from_pretrained",
+        classmethod(lambda cls, model_dir, **kwargs: (model_dir, kwargs)),
     )
     model_dir, kwargs = AutoPolicy.from_pretrained(tmp_path, precision="bf16")
     assert model_dir == tmp_path
@@ -166,7 +170,9 @@ def test_walloss_rejects_disabling_checkpoint_state_encoding(tmp_path):
 def test_walloss_rejects_static_fp8_calibration(tmp_path):
     from apxinf import WallossPolicy
 
-    with pytest.raises(TypeError, match="unsupported WallossPolicy options.*calibration"):
+    with pytest.raises(
+        TypeError, match="unsupported WallossPolicy options.*calibration"
+    ):
         WallossPolicy.from_pretrained(
             tmp_path,
             model=_FakeModel(),
@@ -175,11 +181,15 @@ def test_walloss_rejects_static_fp8_calibration(tmp_path):
         )
 
 
-def test_walloss_action_width_uses_checkpoint_unless_user_overrides(tmp_path, monkeypatch):
+def test_walloss_action_width_uses_checkpoint_unless_user_overrides(
+    tmp_path, monkeypatch
+):
     from apxinf import WallossPolicy
     from apxinf.policies.impls import walloss
 
-    monkeypatch.setattr(walloss, "_WallossProcessor", lambda *args, **kwargs: _FakeProcessor())
+    monkeypatch.setattr(
+        walloss, "_WallossProcessor", lambda *args, **kwargs: _FakeProcessor()
+    )
     monkeypatch.setattr(
         walloss,
         "_load_normalizer",
@@ -190,10 +200,120 @@ def test_walloss_action_width_uses_checkpoint_unless_user_overrides(tmp_path, mo
     )
 
     native = WallossPolicy.from_pretrained(tmp_path, model=_FakeModel())
-    overridden = WallossPolicy.from_pretrained(tmp_path, model=_FakeModel(), action_dim=7)
+    overridden = WallossPolicy.from_pretrained(
+        tmp_path, model=_FakeModel(), action_dim=7
+    )
 
     assert native.action_dim == 26
     assert overridden.action_dim == 7
+
+
+def test_walloss_from_pretrained_accepts_custom_python_processor(tmp_path, monkeypatch):
+    from apxinf import WallossPolicy
+    from apxinf.policies.impls import walloss
+
+    processor = _FakeProcessor()
+    monkeypatch.setattr(
+        walloss,
+        "_load_normalizer",
+        lambda path, norm_key: (
+            np.full(26, -1.0, np.float32),
+            np.full(26, 2.0, np.float32),
+        ),
+    )
+
+    policy = WallossPolicy.from_pretrained(
+        tmp_path,
+        model=_FakeModel(),
+        processor=processor,
+    )
+
+    assert policy.processor is processor
+    assert policy.metadata["state_bins"] == processor.state_bins
+
+
+def test_builtin_processor_selects_native_rgb_from_model_capability(
+    tmp_path, monkeypatch
+):
+    from apxinf import WallossPolicy
+    from apxinf.policies.impls import walloss
+
+    captured = {}
+
+    def fake_processor(*args, **kwargs):
+        captured.update(kwargs)
+        processor = _FakeNativeProcessor()
+        processor.native_rgb = kwargs["native_rgb"]
+        return processor
+
+    monkeypatch.setattr(walloss, "_WallossProcessor", fake_processor)
+    monkeypatch.setattr(
+        walloss,
+        "_load_normalizer",
+        lambda path, norm_key: (
+            np.full(26, -1.0, np.float32),
+            np.full(26, 2.0, np.float32),
+        ),
+    )
+
+    policy = WallossPolicy.from_pretrained(tmp_path, model=_FakeNativeModel())
+
+    assert captured["native_rgb"] is True
+    assert policy.processor.native_rgb is True
+
+
+def test_walloss_custom_processor_only_needs_to_be_callable(tmp_path, monkeypatch):
+    from apxinf import WallossPolicy
+    from apxinf.policies.impls import walloss
+
+    def processor(observation):
+        return _FakeProcessor()(observation)
+
+    monkeypatch.setattr(walloss, "_checkpoint_state_bins", lambda model_dir: 512)
+    monkeypatch.setattr(
+        walloss,
+        "_load_normalizer",
+        lambda path, norm_key: (
+            np.full(26, -1.0, np.float32),
+            np.full(26, 2.0, np.float32),
+        ),
+    )
+
+    policy = WallossPolicy.from_pretrained(
+        tmp_path,
+        model=_FakeModel(),
+        processor=processor,
+        image_keys=(),
+        camera_names=(),
+    )
+
+    assert policy.processor is processor
+    assert policy.metadata["image_keys"] == []
+    assert policy.metadata["state_bins"] == 512
+
+
+def test_custom_processor_cannot_implicitly_select_native_rgb(tmp_path, monkeypatch):
+    from apxinf import WallossPolicy
+    from apxinf.policies.impls import walloss
+
+    monkeypatch.setattr(
+        walloss,
+        "_load_normalizer",
+        lambda path, norm_key: (
+            np.full(26, -1.0, np.float32),
+            np.full(26, 2.0, np.float32),
+        ),
+    )
+    model = _FakeNativeModel()
+    policy = WallossPolicy.from_pretrained(
+        tmp_path,
+        model=model,
+        processor=_FakeNativeProcessor(),
+    )
+
+    policy.infer({})
+
+    assert len(model.call) == 4  # _infer_patches, not infer_rgb
 
 
 def test_policy_calls_patch_contract_and_unnormalizes():
@@ -222,6 +342,30 @@ def test_policy_calls_patch_contract_and_unnormalizes():
     assert result["timing"]["total_ms"] >= result["timing"]["model_ms"]
 
 
+def test_policy_calls_native_rgb_contract_when_processor_opts_in():
+    from apxinf import WallossPolicy
+
+    model = _FakeNativeModel()
+    policy = WallossPolicy(
+        model,
+        _FakeNativeProcessor(),
+        action_min=np.zeros(26, dtype=np.float32),
+        action_delta=np.ones(26, dtype=np.float32),
+        action_dim=7,
+        native_rgb=True,
+    )
+    noise = np.zeros((10, 26), dtype=np.float32)
+    policy.infer({}, noise=noise)
+
+    rgb_u8, layout, token_ids, passed_noise, action_mask = model.call
+    assert rgb_u8.shape == (2, 252, 252, 3)
+    assert rgb_u8.dtype == np.uint8
+    assert layout == "nhwc"
+    assert token_ids.shape == (313,)
+    np.testing.assert_array_equal(passed_noise, noise)
+    assert action_mask.shape == (10, 26)
+
+
 @pytest.mark.parametrize(("state_bins", "midpoint"), [(256, 128), (512, 256)])
 def test_processor_builds_fixed_walloss_contract(state_bins, midpoint):
     from apxinf.policies.impls.walloss import _WallossProcessor
@@ -239,9 +383,6 @@ def test_processor_builds_fixed_walloss_contract(state_bins, midpoint):
     processor.image_pad_token_id = 99
     processor.propri_min = np.full(26, -1.0, np.float32)
     processor.propri_delta = np.full(26, 2.0, np.float32)
-    processor.factor = 28
-    processor.min_pixels = 56 * 56
-    processor.max_pixels = 14 * 14 * 4 * 1280
 
     image = np.zeros((256, 256, 3), dtype=np.uint8)
     patches, tokens, mask = processor(
@@ -259,7 +400,65 @@ def test_processor_builds_fixed_walloss_contract(state_bins, midpoint):
     np.testing.assert_array_equal(mask[:, 7:], 0.0)
     assert "front view" in processor.tokenizer.prompt
     assert "right wrist view" in processor.tokenizer.prompt
-    assert "Proprioception: " + " ".join([str(midpoint)] * 7) in processor.tokenizer.prompt
+    assert (
+        "Proprioception: " + " ".join([str(midpoint)] * 7) in processor.tokenizer.prompt
+    )
+
+
+def test_native_image_processor_matches_transformers_449_golden(tmp_path):
+    from apxinf.policies.impls.walloss import _WallossImageProcessor
+
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "image_processor_type": "Qwen2VLImageProcessor",
+                "image_mean": [0.48145466, 0.4578275, 0.40821073],
+                "image_std": [0.26862954, 0.26130258, 0.27577711],
+                "min_pixels": 3136,
+                "max_pixels": 12845056,
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            }
+        )
+    )
+    processor = _WallossImageProcessor(tmp_path)
+    image = (np.arange(252 * 252 * 3, dtype=np.uint32) % 256).astype(np.uint8)
+    image = image.reshape(252, 252, 3)
+
+    output = processor([image])
+    patches = output["pixel_values"]
+
+    assert patches.shape == (324, 1176)
+    assert patches.dtype == np.float32
+    np.testing.assert_array_equal(output["image_grid_thw"], [[1, 18, 18]])
+    assert hashlib.sha256(patches.tobytes()).hexdigest() == (
+        "c49b6d88be7086491c81cd45f80c362d4ec930e16768767d299154b250418b35"
+    )
+
+    resized = processor.resize([image, image])
+    assert resized["rgb_u8"].shape == (2, 252, 252, 3)
+    assert resized["rgb_u8"].dtype == np.uint8
+    np.testing.assert_array_equal(resized["rgb_u8"][0], image)
+    np.testing.assert_array_equal(resized["image_grid_thw"], [[1, 18, 18]] * 2)
+
+
+def test_walloss_tokenizer_uses_tokenizer_json_and_adds_model_tokens(tmp_path):
+    tokenizers = pytest.importorskip("tokenizers")
+    from apxinf.policies.impls.walloss import _WallossTokenizer
+
+    tokenizer = tokenizers.Tokenizer(
+        tokenizers.models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+    )
+    tokenizer.add_special_tokens(["<|image_pad|>"])
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+
+    wrapped = _WallossTokenizer(tmp_path)
+
+    assert wrapped.token_to_id("<|image_pad|>") == 1
+    assert wrapped.token_to_id("<|propri|>") == 2
+    assert wrapped.token_to_id("<|action|>") == 3
+    assert wrapped.encode("<|action|>") == [3]
 
 
 @pytest.mark.parametrize(("override", "expected"), [(None, 512), (1024, 1024)])

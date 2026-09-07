@@ -145,9 +145,13 @@ pip install -e "python/apxinf[tokenizer,serving]"
 # pip install -e "python/apxinf[walloss,serving]"
 ```
 
-Activate a venv or conda env before installing. The extras keep model-specific processor
-dependencies opt-in: PI0.5 uses `tokenizer`, while WallOSS uses `walloss`; both
-can add `serving` for msgpack/websockets.
+Activate a venv or conda env before installing. The extras keep model-specific
+processor dependencies opt-in: PI0.5 uses `tokenizer`, while WallOSS uses
+`walloss`; both can add `serving` for msgpack/websockets. The WallOSS extra is
+torch-free and does not install Transformers; it uses the Rust-backed
+`tokenizers` wheel plus Pillow/NumPy for resizing and the compatibility patch
+path. With the native runtime, Qwen2.5-VL normalization and patchification run
+in CUDA.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
 CUDA backend into the binding, and it is required — the PI0.5 runtime is only

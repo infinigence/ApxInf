@@ -14,16 +14,20 @@ function. It owns:
 - schedules, caches, workspaces, and execution preparation;
 - selection among valid precision and fusion paths.
 
-It does not own raw device kernels or Python-side preprocessing and policy
-semantics.
+It does not own raw device kernels, arbitrary application observations, robot
+adapter semantics, or policy-level prompt, normalization, and action contracts.
+It may own checkpoint-fixed conversion from a declared model input
+representation to the tensors consumed by the network.
 
 ```text
-Python policy
-  preprocessing, normalization, public observation/action contract
+Policy / application adapter
+  container decode, robot field mapping, resize to the declared profile,
+  prompt/token construction, policy normalization and action postprocessing
                          |
                          v
 apxinf-model
-  architecture, weights, schedules, execution orchestration
+  declared tensor/RGB input, checkpoint-fixed tensor canonicalization,
+  architecture, weights, schedules and execution orchestration
                          |
                          v
 apxinf-core / apxinf-cuda
@@ -43,6 +47,41 @@ do not fit token sampling.
 
 The contracts may share model-neutral tensor or RNG facilities. They should not
 be unified merely because both accept language or images.
+
+## VLA input seam and preprocessing ownership
+
+Separate application and policy preprocessing from model tensor
+canonicalization. They have different interfaces, owners, and lifecycle
+requirements.
+
+The policy or application adapter owns:
+
+- decoding arbitrary image containers and observation objects;
+- mapping robot-specific fields, cameras, joint order, units, and masks into
+  the policy's canonical observation;
+- image resize or padding when it is not part of the runtime's declared input
+  representation;
+- experimental and user-defined transforms;
+- prompt/token construction, state normalization or discretization, and other
+  checkpoint policy semantics; and
+- trimming, unnormalizing, and adapting model actions for the caller or robot.
+
+The model runtime owns validation and execution after its declared input seam.
+A VLA may declare precomputed patches, resized RGB `u8`, or both as supported
+vision representations. If it advertises resized RGB through `VlaContract`,
+the input is already decoded and resized to the declared profile. The runtime
+may then own checkpoint-fixed pixel normalization, temporal duplication,
+patchification, spatial merge or ordering, layout conversion, and dtype
+conversion. Keeping those operations on the device allows them to share fixed
+buffers and CUDA Graph lifecycle with the network.
+
+This ownership does not turn `VlaRuntime` into a high-level policy. In
+particular, image normalization that converts declared RGB into model patches
+may be runtime-owned, while state/action normalization, prompt construction,
+tokenization, robot mapping, and action postprocessing remain policy- or
+adapter-owned. PI0.5 and WallOSS both use this distinction: their native RGB
+paths perform model tensor canonicalization in Rust/CUDA, while their Python
+policies still construct the model inputs and interpret the model actions.
 
 ## Five responsibilities inside a model
 

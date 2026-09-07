@@ -2,14 +2,14 @@ use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
 
-use apxinf_core::{Backend, Tensor};
+use apxinf_core::{Backend, DType, Tensor};
 use half::bf16;
 
 use crate::tuning::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TacticBackend,
     TacticMatch, TuningDType,
 };
-use crate::CudaBackend;
+use crate::{CudaBackend, CudaBuffer};
 
 struct CountingObserver(Cell<usize>);
 
@@ -17,6 +17,105 @@ impl crate::kernels::gemm::Bf16ActivationObserver for CountingObserver {
     fn observe(&self, _activation: &Tensor, _weight: &Tensor) -> apxinf_core::Result<()> {
         self.0.set(self.0.get() + 1);
         Ok(())
+    }
+}
+
+#[test]
+fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
+    const VIEWS: usize = 2;
+    const IMAGE_SIZE: usize = 8;
+    const PATCH_SIZE: usize = 2;
+    const TEMPORAL_PATCH_SIZE: usize = 2;
+    const MERGE_SIZE: usize = 2;
+    const GRID_SIZE: usize = IMAGE_SIZE / PATCH_SIZE;
+    const GROUPS_PER_SIDE: usize = GRID_SIZE / MERGE_SIZE;
+    const PATCH_ROWS: usize = VIEWS * GRID_SIZE * GRID_SIZE;
+    const PATCH_WIDTH: usize = 3 * TEMPORAL_PATCH_SIZE * PATCH_SIZE * PATCH_SIZE;
+    const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_72];
+    const STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
+
+    let backend = CudaBackend::new(0).unwrap();
+    let nhwc = (0..VIEWS * IMAGE_SIZE * IMAGE_SIZE * 3)
+        .map(|index| (index * 17 % 256) as u8)
+        .collect::<Vec<_>>();
+    let mut expected = vec![bf16::ZERO; PATCH_ROWS * PATCH_WIDTH];
+    for view in 0..VIEWS {
+        for group_y in 0..GROUPS_PER_SIDE {
+            for group_x in 0..GROUPS_PER_SIDE {
+                for merge_y in 0..MERGE_SIZE {
+                    for merge_x in 0..MERGE_SIZE {
+                        let row = ((((view * GROUPS_PER_SIDE + group_y) * GROUPS_PER_SIDE
+                            + group_x)
+                            * MERGE_SIZE
+                            + merge_y)
+                            * MERGE_SIZE)
+                            + merge_x;
+                        for channel in 0..3 {
+                            for temporal in 0..TEMPORAL_PATCH_SIZE {
+                                for dy in 0..PATCH_SIZE {
+                                    for dx in 0..PATCH_SIZE {
+                                        let y = (group_y * MERGE_SIZE + merge_y) * PATCH_SIZE + dy;
+                                        let x = (group_x * MERGE_SIZE + merge_x) * PATCH_SIZE + dx;
+                                        let source = ((view * IMAGE_SIZE + y) * IMAGE_SIZE + x) * 3
+                                            + channel;
+                                        let column = (((channel * TEMPORAL_PATCH_SIZE + temporal)
+                                            * PATCH_SIZE
+                                            + dy)
+                                            * PATCH_SIZE)
+                                            + dx;
+                                        let scaled = f32::from(nhwc[source]) * (1.0 / 255.0);
+                                        expected[row * PATCH_WIDTH + column] =
+                                            bf16::from_f32((scaled - MEAN[channel]) / STD[channel]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut nchw = vec![0u8; nhwc.len()];
+    for view in 0..VIEWS {
+        for y in 0..IMAGE_SIZE {
+            for x in 0..IMAGE_SIZE {
+                for channel in 0..3 {
+                    let source = ((view * IMAGE_SIZE + y) * IMAGE_SIZE + x) * 3 + channel;
+                    let destination = ((view * 3 + channel) * IMAGE_SIZE + y) * IMAGE_SIZE + x;
+                    nchw[destination] = nhwc[source];
+                }
+            }
+        }
+    }
+
+    for (bytes, layout) in [
+        (&nhwc, crate::kernels::preprocess::ImageLayout::Nhwc),
+        (&nchw, crate::kernels::preprocess::ImageLayout::Nchw),
+    ] {
+        let input = CudaBuffer::alloc(bytes.len(), backend.device_id()).unwrap();
+        input.copy_from_host(bytes).unwrap();
+        let output = backend
+            .to_device(&Tensor::zeros((PATCH_ROWS, PATCH_WIDTH), DType::BF16))
+            .unwrap();
+        crate::kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+            backend.context(),
+            &input,
+            &output,
+            VIEWS,
+            IMAGE_SIZE,
+            PATCH_SIZE,
+            TEMPORAL_PATCH_SIZE,
+            MERGE_SIZE,
+            layout,
+            1.0 / 255.0,
+            MEAN,
+            STD,
+        )
+        .unwrap();
+
+        let actual = backend.to_cpu(&output).unwrap();
+        assert_eq!(actual.as_bf16().unwrap(), expected);
     }
 }
 

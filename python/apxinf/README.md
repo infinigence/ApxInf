@@ -1,6 +1,6 @@
 # apxinf (Python frontend)
 
-Pure-Python (numpy/PIL/sentencepiece) processor library + the **L2** policy
+Python-first (NumPy/Pillow plus Rust-backed tokenizer) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 `apxinf.Model` so you never import `apxinf_py` directly.
@@ -33,6 +33,12 @@ apxinf/
   `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. No GPU /
   no Rust dependency; unit-tests run offline. sentencepiece is imported lazily
   by the tokenizer only.
+- **WallOSS processor** — its family-local policy reads `tokenizer.json`
+  through the Rust-backed `tokenizers` package. Pillow performs smart resize;
+  the native runtime performs Qwen2.5-VL normalization and patchification in
+  CUDA, while NumPy retains a compatible patch path for custom processors. Its
+  legacy `.pth` normalizer sidecars are read by a restricted tensor-only loader,
+  without importing Torch or Transformers.
 - **L2 policies** (`apxinf.Pi05Policy`, `apxinf.WallossPolicy`, or
   `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
   bare-model handle and return deployable actions from one
@@ -68,6 +74,13 @@ Two layers of `ProcessorStep` live here, and they extend differently:
   a few data-dict keys, **delegate to an injected natural step**, and write an
   output key. They define a *role* (which key they produce), not an
   implementation.
+
+WallOSS also accepts a callable `processor=` in `WallossPolicy.from_pretrained`.
+It must return `(patches_f32, token_ids_u32, action_mask_f32)` using the model's
+canonical shapes. The built-in processor remains the checkpoint-compatible
+default and sends resized RGB to runtimes that advertise that capability, so
+normalization and patchification run in the CUDA graph. This seam lets Python
+applications customize observation handling without forking the Rust runtime.
 
 **A new implementation should not touch `transforms.py`.** The swap seam is
 dependency injection at pipeline-assembly time, not the transform classes:

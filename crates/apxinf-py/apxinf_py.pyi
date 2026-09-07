@@ -57,7 +57,8 @@ class Model:
         rgb_u8: npt.NDArray[np.uint8],
         layout: str,
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
+        action_mask: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
         """L1: infer from resized RGB uint8. Returns normalized-domain action."""
         ...
@@ -88,3 +89,5 @@ class Model:
     def patches_per_view(self) -> int: ...
     @property
     def max_token_len(self) -> int: ...
+    @property
+    def accepts_rgb_u8(self) -> bool: ...

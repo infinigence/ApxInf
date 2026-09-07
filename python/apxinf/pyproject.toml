@@ -21,13 +21,13 @@ dependencies = [
 tokenizer = ["sentencepiece>=0.1.99"]
 # A live Pi05Policy binds the PyO3 model handle (Phase 1).
 policy = ["apxinf-py>=0.1.0"]
-# WallOSS owns a Qwen2.5-VL BPE/image processor and reads the checkpoint's
-# torch-serialized normalizers plus optional YAML training semantics. Keep these
-# heavyweight dependencies opt-in so the numpy/PIL processor package stays light.
-walloss = ["apxinf-py>=0.1.0", "torch>=2.0", "transformers>=4.49,<5", "PyYAML>=6"]
+# WallOSS reads Qwen's tokenizer.json through the Rust-backed tokenizers wheel,
+# implements image patchification in NumPy/Pillow, and reads its small PyTorch
+# normalizer archives without torch. YAML is needed only for legacy config.yml.
+walloss = ["apxinf-py>=0.1.0", "tokenizers>=0.21,<0.22", "PyYAML>=6"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
-test = ["pytest>=7", "sentencepiece>=0.1.99"]
+test = ["pytest>=7", "sentencepiece>=0.1.99", "tokenizers>=0.21,<0.22"]
 
 [tool.setuptools.packages.find]
 where = ["."]
