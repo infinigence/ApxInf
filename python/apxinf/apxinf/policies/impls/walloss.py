@@ -91,22 +91,20 @@ def _load_normalizer(path: Path, norm_key: str) -> tuple[np.ndarray, np.ndarray]
 
 
 class _WallossTokenizer:
-    """Qwen2.5-VL tokenizer backed directly by Hugging Face's Rust core."""
+    """Qwen2.5-VL tokenizer backed by ApxInf's native Rust tokenizer."""
 
     def __init__(self, model_dir: Path):
         try:
-            from tokenizers import Tokenizer
-        except (
-            ImportError
-        ) as error:  # pragma: no cover - dependency error is user-facing
+            import apxinf_py
+        except ImportError as error:  # pragma: no cover - dependency error is user-facing
             raise ImportError(
-                "WallossPolicy requires the 'walloss' extra (tokenizers)"
+                "WallossPolicy requires the native apxinf-py package"
             ) from error
 
         path = model_dir / "tokenizer.json"
         if not path.is_file():
             raise FileNotFoundError(f"WallOSS tokenizer file does not exist: {path}")
-        self._tokenizer = Tokenizer.from_file(str(path))
+        self._tokenizer = apxinf_py.HfTokenizer.from_file(str(path))
         self._tokenizer.add_tokens([_PROPRI, _ACTION])
         config_path = model_dir / "config.json"
         if config_path.is_file():
@@ -136,7 +134,7 @@ class _WallossTokenizer:
         return int(value)
 
     def encode(self, text: str) -> list[int]:
-        return list(self._tokenizer.encode(text, add_special_tokens=False).ids)
+        return list(self._tokenizer.encode(text))
 
 
 class _WallossImageProcessor:
@@ -296,7 +294,7 @@ def _checkpoint_state_bins(model_dir: Path) -> int:
     if config_yaml is not None:
         try:
             import yaml
-        except ImportError as error:  # pragma: no cover - declared by the walloss extra
+        except ImportError as error:  # pragma: no cover - declared project dependency
             raise ImportError(
                 "WallossPolicy requires PyYAML to read config.yml"
             ) from error

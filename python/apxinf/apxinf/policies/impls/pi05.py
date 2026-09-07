@@ -361,7 +361,7 @@ class Pi05Policy:
         """Build the **default** policy from a checkpoint directory.
 
         This is the from-disk convenience path: it loads the ``apxinf_py`` model
-        (unless one is passed in), builds the SentencePiece tokenizer and the
+        (unless one is passed in), builds the native SentencePiece tokenizer and the
         declared normalization transforms from files under ``model_dir``, assembles the default
         pre/post chains via :meth:`default_pipelines`, and constructs the policy.
         Its many parameters are exactly the knobs for *building processors from

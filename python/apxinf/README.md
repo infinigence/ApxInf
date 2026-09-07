@@ -1,6 +1,6 @@
 # apxinf (Python frontend)
 
-Python-first (NumPy/Pillow plus Rust-backed tokenizer) processor library + the **L2** policy
+Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 `apxinf.Model` so you never import `apxinf_py` directly.
@@ -30,11 +30,11 @@ apxinf/
 
 - **Processor steps** (`apxinf.processors`) — each an independently-callable
   `ProcessorStep`: `ParseImage`, `ResizeWithPad`, `PromptTokenizer`,
-  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. No GPU /
-  no Rust dependency; unit-tests run offline. sentencepiece is imported lazily
-  by the tokenizer only.
+  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. The
+  package remains importable without a GPU or native extension; built-in
+  tokenization loads `apxinf-py` lazily when the tokenizer is constructed.
 - **WallOSS processor** — its family-local policy reads `tokenizer.json`
-  through the Rust-backed `tokenizers` package. Pillow performs smart resize;
+  through `apxinf-py`. Pillow performs smart resize;
   the native runtime performs Qwen2.5-VL normalization and patchification in
   CUDA, while NumPy retains a compatible patch path for custom processors. Its
   legacy `.pth` normalizer sidecars are read by a restricted tensor-only loader,
@@ -208,6 +208,7 @@ pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
 
-Tokenizer-encode tests need a SentencePiece model (`APXINF_TOKENIZER` or
+Native tokenizer differential tests need the Python `sentencepiece` reference
+and a SentencePiece model (`APXINF_TOKENIZER` or
 `APXINF_PI05_MODEL_DIR`); the real-model layering test needs a CUDA `apxinf_py`
 build plus `APXINF_PI05_MODEL_DIR`.

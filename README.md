@@ -140,18 +140,14 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip -m crates/apxinf-py/Cargo.toml
 pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
-pip install -e "python/apxinf[tokenizer,serving]"
-# For WallOSS checkpoints, use its processor extra instead:
-# pip install -e "python/apxinf[walloss,serving]"
+pip install -e "python/apxinf[serving]"
 ```
 
-Activate a venv or conda env before installing. The extras keep model-specific
-processor dependencies opt-in: PI0.5 uses `tokenizer`, while WallOSS uses
-`walloss`; both can add `serving` for msgpack/websockets. The WallOSS extra is
-torch-free and does not install Transformers; it uses the Rust-backed
-`tokenizers` wheel plus Pillow/NumPy for resizing and the compatibility patch
-path. With the native runtime, Qwen2.5-VL normalization and patchification run
-in CUDA.
+Activate a venv or conda env before installing. The built-in PI0.5 and WallOSS
+tokenizers run through the native extension. The `serving` extra adds
+msgpack/websockets. WallOSS uses Pillow/NumPy for resizing and the
+compatibility patch path; with the native runtime, Qwen2.5-VL normalization and
+patchification run in CUDA.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
 CUDA backend into the binding, and it is required — the PI0.5 runtime is only

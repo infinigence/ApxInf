@@ -444,14 +444,28 @@ def test_native_image_processor_matches_transformers_449_golden(tmp_path):
 
 
 def test_walloss_tokenizer_uses_tokenizer_json_and_adds_model_tokens(tmp_path):
-    tokenizers = pytest.importorskip("tokenizers")
+    pytest.importorskip("apxinf_py")
     from apxinf.policies.impls.walloss import _WallossTokenizer
 
-    tokenizer = tokenizers.Tokenizer(
-        tokenizers.models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")
+    (tmp_path / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "truncation": None,
+                "padding": None,
+                "added_tokens": [],
+                "normalizer": None,
+                "pre_tokenizer": None,
+                "post_processor": None,
+                "decoder": None,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "<|image_pad|>": 1},
+                    "unk_token": "[UNK]",
+                },
+            }
+        )
     )
-    tokenizer.add_special_tokens(["<|image_pad|>"])
-    tokenizer.save(str(tmp_path / "tokenizer.json"))
 
     wrapped = _WallossTokenizer(tmp_path)
 

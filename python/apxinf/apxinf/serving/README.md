@@ -245,11 +245,10 @@ unchanged (matching OpenPI's "output transforms can see input state" semantics).
 # WallOSS
 
 WallOSS uses the same model-agnostic websocket transport as PI0.5. Install the
-model-specific preprocessing dependencies and launch the example. This extra
-does not install Torch or Transformers:
+transport dependencies and launch the example:
 
 ```bash
-pip install 'apxinf[walloss,serving]'
+pip install 'apxinf[serving]'
 ```
 
 The in-process Python API accepts the same observation dict as the server:

@@ -27,8 +27,8 @@ model-specific example only when it demonstrates a genuinely distinct workflow.
 - The `*_infer.py` examples and servers need the **`apxinf_py` CUDA
   binding** (see [Build ApxInf](../../../README.md#build-apxinf))
   and a compatible checkpoint directory.
-- Using a WallOSS checkpoint additionally needs `pip install -e "python/apxinf[walloss]"`
-  for its Rust-backed Qwen2.5-VL tokenizer and optional legacy YAML metadata.
+- Built-in PI0.5 and WallOSS tokenizers run through the installed `apxinf-py`
+  native extension.
   Image patchification and serialized normalizer loading need no Torch or
   Transformers installation.
 - `openpi_server.py` also needs the transport deps
