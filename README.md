@@ -349,11 +349,10 @@ curl -fL https://storage.googleapis.com/openpi-assets/checkpoints/pi05_libero/as
   -o <path-to-model>/norm_stats.json
 ```
 
-Download OpenPI's LIBERO `norm_stats.json` as shown above and pass `--norm-stats`
-explicitly to restore state/action scaling. This overrides checkpoint
-normalization, including LeRobot processor metadata; placing the file beside
-the weights alone does not ensure it is used. For a different or custom
-checkpoint, use its matching training statistics.
+The `lerobot/pi05_libero_base` checkpoint lost its normalization statistics
+during repository updates. To reproduce the officially reported performance,
+download OpenPI's LIBERO `norm_stats.json` separately as shown above and pass it
+explicitly with `--norm-stats`.
 
 ### Run
 
