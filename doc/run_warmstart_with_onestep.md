@@ -1,7 +1,10 @@
 # PI0.5 One-Step Warm-Start LIBERO Eval
 
-This note records the PI0.5 BF16 one-step warm-start optimization implemented in
-this repo and the real LIBERO results run on Jetson Orin GPU.
+This note records the PI0.5 one-step warm-start optimization implemented in
+this repo and the real LIBERO results on two platforms:
+
+- Jetson Orin GPU, BF16
+- Thor GPU, FP8
 
 ## Optimization
 
@@ -74,8 +77,8 @@ Warm-start evaluator:
 The CUDA binding must be rebuilt after changing the Rust runtime:
 
 ```bash
-cd /home/daigroup/projects/ApxInf
-source /home/daigroup/.cargo/env
+cd <repo-root>
+source ~/.cargo/env
 
 env -u CONDA_PREFIX \
   CUDA_PATH=/usr/local/cuda-12.6 \
@@ -94,7 +97,7 @@ Checks run:
   scripts/eval_libero.py \
   python/apxinf/apxinf/policies/impls/pi05.py
 
-source /home/daigroup/.cargo/env
+source ~/.cargo/env
 cargo check -p apxinf-model -p apxinf-py
 ```
 
@@ -103,10 +106,10 @@ cargo check -p apxinf-model -p apxinf-py
 Command:
 
 ```bash
-cd /home/daigroup/projects/ApxInf
+cd <repo-root>
 
 env -u CONDA_PREFIX \
-  LIBERO_CONFIG_PATH=/home/daigroup/projects/ApxInf/.venv/libero_config \
+  LIBERO_CONFIG_PATH=.venv/libero_config \
   MUJOCO_GL=egl \
   PYOPENGL_PLATFORM=egl \
   CUDA_PATH=/usr/local/cuda-12.6 \
@@ -115,7 +118,7 @@ env -u CONDA_PREFIX \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
   .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
-    --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
+    --model-dir .venv/pi05_libero_bf16 \
     --model-type pi05 \
     --precision bf16 \
     --action-dim 7 \
@@ -151,10 +154,10 @@ precision=bf16
 Command used for the real run:
 
 ```bash
-cd /home/daigroup/projects/ApxInf
+cd <repo-root>
 
 env -u CONDA_PREFIX \
-  LIBERO_CONFIG_PATH=/home/daigroup/projects/ApxInf/.venv/libero_config \
+  LIBERO_CONFIG_PATH=.venv/libero_config \
   MUJOCO_GL=egl \
   PYOPENGL_PLATFORM=egl \
   CUDA_PATH=/usr/local/cuda-12.6 \
@@ -163,7 +166,7 @@ env -u CONDA_PREFIX \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
   .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
-    --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
+    --model-dir .venv/pi05_libero_bf16 \
     --model-type pi05 \
     --precision bf16 \
     --action-dim 7 \
@@ -249,4 +252,106 @@ Previous same-environment BF16 LIBERO comparison:
 10-step BF16, no warm start: 93/100 = 93.0%
 1-step BF16, no warm start: 90/100 = 90.0%
 1-step BF16, warm start:    92/100 = 92.0%
+```
+
+## Thor FP8 Results
+
+Thor used the same `libero_10` setup with the Thor runtime stack.
+
+Run environment:
+
+- Machine: Thor GPU
+- CUDA arch: `sm_110`
+- Precision: FP8
+- Views: 2
+- Action horizon: 10
+- Suite: `libero_10`
+- Trials: 10 per task, 100 total
+- Tokenizer: `<path-to-pi05_libero_base>/paligemma_tokenizer.model`
+- Norm stats: `<path-to-pi05_libero_base>/assets/physical-intelligence/libero/norm_stats.json`
+- Model dir: `external/pi05_libero_base`
+
+The Thor FP8 runs used the existing calibration artifact at
+`external/pi05_libero_base/calibration.json`.
+
+### Thor FP8, warm-start + one-step
+
+Output files:
+
+- JSONL: `autoresearch/libero_fp8_warmstart_onestep.jsonl`
+- Summary: `autoresearch/libero_fp8_warmstart_onestep_summary.json`
+
+Accuracy:
+
+```text
+Overall: 94/100 = 94.0%
+```
+
+Per task:
+
+```text
+task 0: 10/10
+task 1: 10/10
+task 2: 8/10
+task 3: 10/10
+task 4: 10/10
+task 5: 10/10
+task 6: 10/10
+task 7: 10/10
+task 8: 7/10
+task 9: 9/10
+```
+
+Timing from the same summary:
+
+```text
+episodes: 100
+total_inference_calls: 5390
+model_ms_per_call: 31.6376
+inference_ms_per_call: 32.8490
+preprocess_ms_per_call: 0.6045
+server_processor_ms_per_call: 1.1981
+```
+
+### Thor FP8, no warm-start baseline
+
+Output files:
+
+- JSONL: `autoresearch/libero_fp8_nowarmstart.jsonl`
+- Summary: `autoresearch/libero_fp8_nowarmstart_summary.json`
+
+Accuracy:
+
+```text
+Representative overall: 93/100 = 93.0%
+```
+
+Per task, using the higher observed value among the measured Thor runs:
+
+```text
+task 0: 9/10
+task 1: 10/10
+task 2: 10/10
+task 3: 10/10
+task 4: 10/10
+task 5: 10/10
+task 6: 10/10
+task 7: 10/10
+task 8: 5/10
+task 9: 9/10
+```
+
+Timing from the same summary:
+
+```text
+episodes: 100
+total_inference_calls: 5434
+model_ms_per_call: 50.2904
+inference_ms_per_call: 51.5325
+preprocess_ms_per_call: 0.6224
+server_processor_ms_per_call: 1.2273
+```
+```text
+10-step FP8, no warm start: 93/100 = 93.0%
+1-step FP8, warm start:    94/100 = 94.0%
 ```
