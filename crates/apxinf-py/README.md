@@ -28,7 +28,8 @@ shape contract, but model loading errors.
 ```sh
 # In this crate directory. --features cuda is additive to pyproject's
 # extension-module feature.
-maturin develop --release --features cuda
+CARGO_TARGET_DIR=../../target/wheel maturin build --release --features cuda --auditwheel skip
+pip install --force-reinstall ../../target/wheel/wheels/apxinf_py-*.whl
 ```
 
 On Thor set the usual environment (see repo memory): `APXINF_CUDA_ARCH=sm_110`,

@@ -136,14 +136,14 @@ It works from the same guides a human would follow:
 git clone <repo-url> && cd ApxInf
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
-maturin develop --release --features cuda -m crates/apxinf-py/Cargo.toml
+CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip -m crates/apxinf-py/Cargo.toml
+pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
 pip install -e "python/apxinf[tokenizer,serving]"
 # For WallOSS checkpoints, use its processor extra instead:
 # pip install -e "python/apxinf[walloss,serving]"
 ```
 
-`maturin develop` compiles the binding into the *active* environment, so a venv
-or conda env has to be activated first. The extras keep model-specific processor
+Activate a venv or conda env before installing. The extras keep model-specific processor
 dependencies opt-in: PI0.5 uses `tokenizer`, while WallOSS uses `walloss`; both
 can add `serving` for msgpack/websockets.
 
@@ -155,11 +155,6 @@ The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;
 cross-compiling fails unless `APXINF_CUDA_ARCH` names the target (`sm_87` Orin,
 `sm_101` Thor-U, `sm_110` Thor).
-
-To ship a wheel instead of installing in place, build it with
-`maturin build --release --features cuda --auditwheel skip`. The skip matters on
-Jetson: the default `auditwheel` repair vendors a `libcuda` stub into the wheel,
-and the installed binding then fails at runtime with CUDA error 304.
 
 Confirm the binding imports and reaches the GPU:
 
@@ -350,7 +345,14 @@ arbitrary π0.5 checkpoint might not reproduce it.
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli download lerobot/pi05_libero_base --local-dir <path-to-model>
+curl -fL https://storage.googleapis.com/openpi-assets/checkpoints/pi05_libero/assets/physical-intelligence/libero/norm_stats.json \
+  -o <path-to-model>/norm_stats.json
 ```
+
+The `lerobot/pi05_libero_base` checkpoint lost its normalization statistics
+during repository updates. To reproduce the officially reported performance,
+download OpenPI's LIBERO `norm_stats.json` separately as shown above and pass it
+explicitly with `--norm-stats`.
 
 ### Run
 
@@ -384,6 +386,7 @@ pip install -e <path-to-openpi>/packages/openpi-client
 
 ```bash
 python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
+  --norm-stats <path-to-model>/norm_stats.json \
   --precision bf16 --action-horizon 10 \
   --suite libero_10 --tasks all --trials-per-task 50 \
   --results-jsonl <out-dir>/results.jsonl --summary-json <out-dir>/summary.json
@@ -397,13 +400,15 @@ That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
 - `--suite` picks the task suite, `--tasks` a comma list within it, and
   `--trials-per-task` the episode count; a smoke run is
   `--tasks 0 --trials-per-task 1`.
-- The model flags — `--model-type`, `--action-horizon`, `--action-dim`,
+- The model flags — `--model-type`, `--norm-stats`, `--action-horizon`, `--action-dim`,
   `--discrete-state`, FP8 `--calibration` — belong to `--backend in-process`
   alone.
 - `--backend websocket --host <h> --port <p>` evaluates a running
   [server](#openpi-compatible-serving) instead, on this machine or another. The
   model flags belong to the server there, and `--precision` only asserts what
   the server reports, so a mismatch fails at connect instead of skewing a run.
+  Pass `--norm-stats <path-to-model>/norm_stats.json` to
+  `scripts/pi05_openpi_websocket_server.py` when serving this checkpoint.
 - Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
   and the summary reports success rate alongside per-segment latency.
 

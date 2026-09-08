@@ -358,6 +358,7 @@ class InProcessBackend:
             "calibration": args.calibration,
             "tactics": args.tactics,
             "tokenizer_path": args.tokenizer,
+            "norm_stats": args.norm_stats,
             "norm_key": args.norm_key,
             "action_horizon": args.action_horizon,
             "num_views": args.num_views,
@@ -615,6 +616,10 @@ def parse_args() -> argparse.Namespace:
     in_process.add_argument("--calibration", type=pathlib.Path)
     in_process.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
     in_process.add_argument("--tokenizer", type=pathlib.Path)
+    in_process.add_argument(
+        "--norm-stats", type=pathlib.Path,
+        help="explicit OpenPI-style norm_stats.json; overrides checkpoint normalization",
+    )
     in_process.add_argument("--norm-key")
     in_process.add_argument("--action-dim", type=int, default=7, help="0 keeps the full vector")
     in_process.add_argument(
@@ -667,6 +672,14 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.backend == "in-process" and args.model_dir is None:
         parser.error("--backend in-process requires --model-dir")
+    if args.norm_stats is not None:
+        if args.backend == "websocket":
+            parser.error(
+                "--norm-stats applies to --backend in-process; for the websocket "
+                "backend pass it to pi05_openpi_websocket_server.py instead"
+            )
+        if not args.norm_stats.is_file():
+            parser.error("--norm-stats must name an existing file")
     if not (0.0 <= args.warm_start_alpha <= 1.0):
         parser.error("--warm-start-alpha must be in [0, 1]")
     if args.warm_start and args.warm_start_alpha >= 1.0:
