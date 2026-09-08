@@ -345,7 +345,15 @@ arbitrary π0.5 checkpoint might not reproduce it.
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli download lerobot/pi05_libero_base --local-dir <path-to-model>
+curl -fL https://storage.googleapis.com/openpi-assets/checkpoints/pi05_libero/assets/physical-intelligence/libero/norm_stats.json \
+  -o <path-to-model>/norm_stats.json
 ```
+
+Download OpenPI's LIBERO `norm_stats.json` as shown above and pass `--norm-stats`
+explicitly to restore state/action scaling. This overrides checkpoint
+normalization, including LeRobot processor metadata; placing the file beside
+the weights alone does not ensure it is used. For a different or custom
+checkpoint, use its matching training statistics.
 
 ### Run
 
@@ -379,6 +387,7 @@ pip install -e <path-to-openpi>/packages/openpi-client
 
 ```bash
 python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
+  --norm-stats <path-to-model>/norm_stats.json \
   --precision bf16 --action-horizon 10 \
   --suite libero_10 --tasks all --trials-per-task 50 \
   --results-jsonl <out-dir>/results.jsonl --summary-json <out-dir>/summary.json
@@ -392,13 +401,15 @@ That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
 - `--suite` picks the task suite, `--tasks` a comma list within it, and
   `--trials-per-task` the episode count; a smoke run is
   `--tasks 0 --trials-per-task 1`.
-- The model flags — `--model-type`, `--action-horizon`, `--action-dim`,
+- The model flags — `--model-type`, `--norm-stats`, `--action-horizon`, `--action-dim`,
   `--discrete-state`, FP8 `--calibration` — belong to `--backend in-process`
   alone.
 - `--backend websocket --host <h> --port <p>` evaluates a running
   [server](#openpi-compatible-serving) instead, on this machine or another. The
   model flags belong to the server there, and `--precision` only asserts what
   the server reports, so a mismatch fails at connect instead of skewing a run.
+  Pass `--norm-stats <path-to-model>/norm_stats.json` to
+  `scripts/pi05_openpi_websocket_server.py` when serving this checkpoint.
 - Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
   and the summary reports success rate alongside per-segment latency.
 
