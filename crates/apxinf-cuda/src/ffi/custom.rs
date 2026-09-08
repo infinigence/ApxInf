@@ -413,7 +413,7 @@ extern "C" {
         temporal_patch_size: i32,
         merge_size: i32,
         layout: i32,
-        rescale_factor: f32,
+        rescale_factor: f64,
         mean0: f32,
         mean1: f32,
         mean2: f32,

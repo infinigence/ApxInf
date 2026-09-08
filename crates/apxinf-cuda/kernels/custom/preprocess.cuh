@@ -101,7 +101,7 @@ template <bool kNhwc>
 __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(
     const uint8_t* images, __nv_bfloat16* patches, int views,
     int image_size, int patch_size, int temporal_patch_size, int merge_size,
-    float rescale_factor, float mean0, float mean1, float mean2,
+    double rescale_factor, float mean0, float mean1, float mean2,
     float std0, float std1, float std2) {
   const int grid_size = image_size / patch_size;
   const int groups_per_side = grid_size / merge_size;
@@ -143,7 +143,9 @@ __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(
 
     const float mean = channel == 0 ? mean0 : (channel == 1 ? mean1 : mean2);
     const float std = channel == 0 ? std0 : (channel == 1 ? std1 : std2);
-    const float scaled = __fmul_rn(static_cast<float>(images[input_index]), rescale_factor);
+    // Transformers rescales in float64, then rounds to float32 before normalization.
+    const float scaled = __double2float_rn(
+        __dmul_rn(static_cast<double>(images[input_index]), rescale_factor));
     // Match Transformers' float32 normalization boundary: subtract the
     // float32 channel mean, divide by the float32 channel std, then round once
     // to BF16 for the model input.

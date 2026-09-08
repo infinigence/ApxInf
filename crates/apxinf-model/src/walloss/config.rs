@@ -40,7 +40,7 @@ pub struct WallossVisionConfig {
 pub struct WallossImageProcessorConfig {
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
-    pub rescale_factor: f32,
+    pub rescale_factor: f64,
 }
 
 impl WallossImageProcessorConfig {
@@ -85,7 +85,7 @@ impl WallossImageProcessorConfig {
             Some(value) => value.as_f64().ok_or_else(|| {
                 Error::Other("walloss processor rescale_factor must be numeric".into())
             })?,
-        } as f32;
+        };
         for (name, expected) in [
             ("patch_size", vision.patch_size),
             ("temporal_patch_size", vision.temporal_patch_size),

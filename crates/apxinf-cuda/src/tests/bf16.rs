@@ -63,7 +63,8 @@ fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
                                             + dy)
                                             * PATCH_SIZE)
                                             + dx;
-                                        let scaled = f32::from(nhwc[source]) * (1.0 / 255.0);
+                                        let scaled =
+                                            (f64::from(nhwc[source]) * (1.0 / 255.0)) as f32;
                                         expected[row * PATCH_WIDTH + column] =
                                             bf16::from_f32((scaled - MEAN[channel]) / STD[channel]);
                                     }
@@ -244,5 +245,40 @@ fn persisted_bf16_cublaslt_tactic_matches_vendor() {
     assert!(
         max_abs <= 0.125 && rmse <= 0.02,
         "persisted BF16 tactic diverged from vendor: max_abs={max_abs}, rmse={rmse}"
+    );
+}
+
+#[test]
+fn temporal_merged_rescale_matches_float64_reference_at_bf16_boundary() {
+    let backend = CudaBackend::new(0).unwrap();
+    let bytes: Vec<u8> = (0..256).flat_map(|v| [v as u8; 3]).collect();
+    let input = CudaBuffer::alloc(bytes.len(), backend.device_id()).unwrap();
+    input.copy_from_host(&bytes).unwrap();
+    let output = backend
+        .to_device(&Tensor::zeros((256, 6), DType::BF16))
+        .unwrap();
+    let scale = 1.0f64 / 255.0;
+    let expected: Vec<bf16> = (0..256)
+        .flat_map(|v| [bf16::from_f32((f64::from(v) * scale) as f32 - 0.5); 6])
+        .collect();
+    assert_eq!(expected[127 * 6].to_bits(), 0xbb01);
+    crate::kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+        backend.context(),
+        &input,
+        &output,
+        1,
+        16,
+        1,
+        2,
+        1,
+        crate::kernels::preprocess::ImageLayout::Nhwc,
+        scale,
+        [0.5; 3],
+        [1.0; 3],
+    )
+    .unwrap();
+    assert_eq!(
+        backend.to_cpu(&output).unwrap().as_bf16().unwrap(),
+        expected
     );
 }

@@ -328,7 +328,7 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_e4m3(
 extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
     const void* images, void* patches, int views, int image_size,
     int patch_size, int temporal_patch_size, int merge_size, int layout,
-    float rescale_factor, float mean0, float mean1, float mean2,
+    double rescale_factor, float mean0, float mean1, float mean2,
     float std0, float std1, float std2,
     cudaStream_t stream) {
   if (images == nullptr || patches == nullptr || views <= 0 ||

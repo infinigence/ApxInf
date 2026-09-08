@@ -284,7 +284,7 @@ pub fn rgb_u8_to_normalized_temporal_merged_patches_bf16(
     temporal_patch_size: usize,
     merge_size: usize,
     layout: ImageLayout,
-    rescale_factor: f32,
+    rescale_factor: f64,
     image_mean: [f32; 3],
     image_std: [f32; 3],
 ) -> Result<()> {
