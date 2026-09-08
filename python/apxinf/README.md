@@ -202,10 +202,29 @@ may supply both settings. Direct policy construction leaves injection off by
 default. Choose normalization dtype according to the checkpoint/reference:
 rounding near a bin edge can change the prompt tokens.
 
-Tokenizer execution is native, while prompt/state orchestration remains Python.
-WallOSS requires its own state encoding and image-token expansion. See the
-[current flow contracts](../../doc/walloss-processor-architecture.md#current-pi05-and-walloss-flow-contracts)
-for both models' stages, ownership and custom-processor interfaces.
+## Built-in family contracts
+
+Tokenizer execution is native, while prompt/state orchestration and action
+postprocessing remain Python. The shared lifecycle and ownership rules are in
+[Model Lifecycle and Contracts](../../doc/model-lifecycle.md).
+
+| Contract | PI0.5 | WallOSS |
+| --- | --- | --- |
+| State encoding | optional 256-bin encoding, preserving underflow bin `-1`; normalization dtype is significant | required configured bins, clipping to range and selecting active state dimensions |
+| Token sequence | SentencePiece BOS; without state, append a separately encoded newline | HF added tokens, camera labels, image placeholder expansion and action tokens |
+| Image/model input | configured resized RGB views and token IDs | built-in resized RGB with two `18x18` grids; custom processor returns canonical patches, token IDs and action mask |
+| Output | trimmed, checkpoint-transformed actions plus normalized model actions | trimmed, inverse-normalized actions plus normalized model actions |
+| Customization | replaceable Python input/output pipelines | explicit `processor=` callable; custom processing does not implicitly select native RGB |
+
+For WallOSS, each image placeholder expands to
+`product(grid_thw) / merge_size^2` tokens. Camera order, labels and grid metadata
+must agree. A one-dimensional DOF mask broadcasts to
+`[action_horizon, action_dim]`; the active-state mask supplies its default.
+For PI0.5, separately encoding the trailing newline is part of the non-state
+sequence contract; concatenating it to the task before encoding is not an
+established equivalent. Both models return checkpoint-domain policy actions;
+external robot units, actuator ordering and command encoding remain adapter
+responsibilities. These differences must survive a future native prompt builder.
 
 ## Tests
 

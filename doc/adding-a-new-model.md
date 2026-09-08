@@ -2,6 +2,7 @@
 
 Use this guide after the reference model runs and its semantics are understood.
 Follow [the porting workflow](porting-workflow.md) for evidence and acceptance,
+[Model Lifecycle and Contracts](model-lifecycle.md) for stages and data contracts,
 [the model-layer architecture](model-layer-architecture.md) for ownership and
 dependencies, [Model Execution Wiring](model-execution-wiring.md) for composing
 the maintained device path, and [the kernel guide](adding-new-kernels.md) for

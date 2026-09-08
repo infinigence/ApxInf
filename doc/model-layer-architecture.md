@@ -2,7 +2,9 @@
 
 This document defines ownership and dependency rules for
 `crates/apxinf-model/`. Read it when adding a model, adding a precision path, or
-changing model execution topology.
+changing model execution topology. For model-instance, session and request lifetimes,
+stage contracts and their source ownership, see
+[Model Lifecycle and Contracts](model-lifecycle.md).
 
 ## Responsibility
 
@@ -85,8 +87,10 @@ policies still construct the model inputs and interpret the model actions.
 
 ## Five responsibilities inside a model
 
-Understand a model directory through the inference lifecycle rather than a
-fixed file recipe:
+These are structural responsibilities within the model layer, not sequential
+lifecycle stages. The temporal stages are defined in
+[Model Lifecycle and Contracts](model-lifecycle.md#seven-stages). Use these roles
+to understand a directory rather than requiring a fixed file recipe:
 
 1. **Frontage and contract** — registration, configuration, public runtime
    implementation and capability declaration.
