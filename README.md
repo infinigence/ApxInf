@@ -143,11 +143,7 @@ pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
 pip install -e "python/apxinf[serving]"
 ```
 
-Activate a venv or conda env before installing. The built-in PI0.5 and WallOSS
-tokenizers run through the native extension. The `serving` extra adds
-msgpack/websockets. WallOSS uses Pillow/NumPy for resizing and the
-compatibility patch path; with the native runtime, Qwen2.5-VL normalization and
-patchification run in CUDA.
+Activate a venv or conda env before installing. The `serving` extra adds msgpack/websockets.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
 CUDA backend into the binding, and it is required — the PI0.5 runtime is only
