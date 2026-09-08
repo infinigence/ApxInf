@@ -43,8 +43,8 @@ apxinf/
   `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
   bare-model handle and return deployable actions from one
   `infer(obs_dict) -> {actions, timing, ...}` call. `import apxinf`
-  stays CUDA-free; only `apxinf.Model` and a policy's `from_pretrained` pull in
-  `apxinf_py`.
+  stays CUDA-free; built-in tokenizer construction and model loading import
+  `apxinf_py` lazily.
 
 ## Domains
 
@@ -193,13 +193,19 @@ slots — the openpi convention for masked/missing cameras — so 2 cameras driv
 3-slot model. Passing more keys than slots is an error; disable padding with
 `pad_missing_views=False`.
 
-## State gap (reserved, not wired)
+## State injection
 
-pi05 expects proprioception injected as a **discretized state** spliced into the
-prompt (`build_prompt(..., discrete_state=True)`, aligned with Rust
-`pi05_prompt`). The current serving link omits it: `observation/state` is read
-but **dropped**. The interface slot exists (construct the tokenizer with
-`discrete_state=True`); the default path matches today's behavior.
+PI0.5 supports state injection with `discrete_state=True`. The policy normalizes
+raw state using the checkpoint-selected transform, discretizes it and builds the
+`Task/State/Action` prompt. This requires an explicit `state_key`; robot presets
+may supply both settings. Direct policy construction leaves injection off by
+default. Choose normalization dtype according to the checkpoint/reference:
+rounding near a bin edge can change the prompt tokens.
+
+Tokenizer execution is native, while prompt/state orchestration remains Python.
+WallOSS requires its own state encoding and image-token expansion. See the
+[current flow contracts](../../doc/walloss-processor-architecture.md#current-pi05-and-walloss-flow-contracts)
+for both models' stages, ownership and custom-processor interfaces.
 
 ## Tests
 
