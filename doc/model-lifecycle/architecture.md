@@ -134,54 +134,75 @@ crates/apxinf-model/src/
 
 ## Target development view
 
-This is a responsibility map, not a requirement to create one class, trait or
-folder per item. Small implementations can combine files without combining
-ownership. Preserve public imports with temporary forwarding exports when needed.
+Keep the current packages and useful files. Responsibilities are not a file
+checklist: do not create an assets module, loader module, processor package or
+shared execution framework merely to mirror the logical diagram. Preserve
+existing public imports. Split a file only when independent changes become
+hard to locate or verify.
+
+The minimal target adds one clear separation inside each model: network
+mathematics versus session resource management. Loading and typed input
+contracts can remain with the model entry point; schedule can remain with the
+network. Existing well-scoped config, input and weight files may stay separate.
 
 ```text
 python/apxinf/apxinf/
-  policies/
-    base.py                      end-to-end request guarantees
-    impls/
-      <pi05 | walloss | gr00t>/
-        policy.py                encode -> run -> decode
-        processor.py             model input/output semantics
-        assets.py                tokenizer, templates, statistics, adapters
-  processors/                    proven shared transformations
-  checkpoints/                   shared file-layout detection
-  adapters/                      external conventions and integrations
+  policies/impls/
+    pi05.py / walloss.py / gr00t.py   policy + encode/decode; private helpers OK
+  processors/                       keep existing reusable transformations
+  checkpoints/ / adapters/          keep existing responsibilities
 
 crates/apxinf-py/src/
-  lib.rs                         exports and registration
-  models/                        thin typed model bindings
+  lib.rs                            keep bindings here while manageable
 
 crates/apxinf-model/src/
-  auto.rs / registry.rs / builtin.rs
-  vla/                           common lifecycle guarantees and capabilities
-  execution/
-    capture.rs                   proven common capture/error-cleanup mechanism
-    lifecycle.rs                 readiness, strategy and invalidation
+  auto.rs / registry.rs / builtin.rs keep registration and loading entry points
+  vla/mod.rs                        lifecycle guarantees, not a new framework
   <pi05 | walloss | gr00t>/
-    model.rs                     configuration, weights, capabilities
-    loader.rs / weights/         checkpoint -> device representations
-    input.rs                     typed inputs, validation, specification derivation
-    network/                     layers, full computation, precision variants
-    schedule.rs                  solver mathematics where separately useful
-    execution.rs                 model session, buffers and request binding
+    mod.rs                          model entry, loading, capabilities
+    config.rs / weights*.rs         retain useful existing files
+    network.rs                      network mathematics and schedule
+    session.rs                      mutable buffers, prepare/run/invalidate
+    ...                             retain justified precision/input files
 
 crates/apxinf-cuda/
-  kernels/ / workspace.rs / graph.rs   existing device mechanisms
+  kernels/ / workspace.rs / graph.rs keep existing device mechanisms
 ```
+
+`network.rs` and `session.rs` are responsibility labels, not mandatory filenames
+or size limits. Existing executors can become the network implementation without
+being merged into one large file. Session can initially remain named runtime
+while its mathematical responsibilities are removed. No new shared execution
+directory is required: first reuse existing backend mechanisms, then extract a
+small helper only when equivalent maintained callers demonstrate a need.
 
 ```mermaid
 flowchart LR
-    R[Current runtime] --> L[Loading to loader and weights]
-    R --> M[Fixed resource ownership to model]
-    R --> N[Mathematics to network and schedule]
-    R --> I[Input validation to input]
-    R --> E[Mutable resources and execution to session]
-    E --> C[Repeated mechanisms to shared execution]
+    R[Current runtime] --> M[Model entry: loading and fixed weights]
+    R --> N[Network: model mathematics]
+    R --> S[Session: mutable execution resources]
+    P[Current policy] --> P2[Keep policy: encode and decode]
 ```
+
+## What must actually improve?
+
+Clear names and more files alone do not constitute improvement. The proposal
+must reduce the independent places that own the same rule and the knowledge
+needed to make a change. Validate these outcomes before calling a slice complete:
+
+| Change or question | Current friction | Target evidence |
+| --- | --- | --- |
+| Change prompt or state encoding | Processor and binding responsibilities are not always obvious | Change model processing code without editing capture or network mathematics |
+| Change solver mathematics | Network rules also live in runtime files, repeated by precision | One semantic owner, all supported precision paths checked against it |
+| Fix capture cleanup or plan invalidation | Each runtime independently maintains lifecycle rules | Equivalent callers share the proven mechanism, or an explicit justified difference |
+| Know whether preparation is complete | Prepare and first-run behavior differ across models | Same Ready guarantee, explicit execution strategy and measured first-run work |
+| Determine if a graph is reusable | Some compatibility constraints are implicit | Each model declares all bound conditions and rejects incompatible requests |
+| Add another model | Need to discover hidden shared-entry special cases | Predictable model-local implementation plus deliberate registration/contract changes |
+
+No fixed file-count or LOC reduction target is useful before implementation.
+Track touched responsibilities, duplicated invariants, public concepts callers
+must understand, and correctness/performance evidence. Do not introduce a
+pass-through module that merely forwards arguments to another module.
 
 Dependency rules:
 

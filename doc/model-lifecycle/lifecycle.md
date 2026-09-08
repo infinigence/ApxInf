@@ -159,6 +159,12 @@ manually orchestrate these internal stages for ordinary inference.
 
 ## Migration slices and acceptance
 
+Do not begin with a directory-wide rename or create one file per lifecycle stage.
+First characterize behavior, separate mathematical ownership from execution
+state inside existing model implementations, and only then extract demonstrated
+common mechanisms. Policy encode/decode helpers may stay in the existing file.
+
+
 This draft changes documentation only. It does not claim implementation LOC,
 GPU correctness, or latency results. The following slices describe expected code
 scope; estimate actual diff size after each bounded implementation is prepared.
@@ -166,9 +172,9 @@ scope; estimate actual diff size after each bounded implementation is prepared.
 | Slice | Expected scope | Acceptance evidence |
 | --- | --- | --- |
 | 1. Contract characterization | Existing policies, native inputs, public-path tests | Record each model's shape, dtype, decode context, reset and output-lifetime behavior |
-| 2. Policy and processor separation | Python model policy packages and thin bindings | Same raw observations yield equivalent encoded inputs and decoded actions; preserve imports |
+| 2. Policy and processor separation | Existing Python policy files and thin bindings | Same raw observations yield equivalent encoded inputs and decoded actions; preserve imports |
 | 3. Network extraction | PI0.5/WallOSS runtimes; GR00T after coordination with PR #42 | Reference checkpoints and exact-input eager results remain within declared tolerances |
-| 4. Session lifecycle | Model execution modules and minimal shared mechanisms | Prepare/replay parity, invalidation, latent-mode changes, failure cleanup and memory-budget checks |
+| 4. Session lifecycle | Model session implementations and proven shared helpers | Prepare/replay parity, invalidation, latent-mode changes, failure cleanup and memory-budget checks |
 | 5. Common registration and backbone seam | Loaders, bindings, reviewed Qwen3-VL reuse | All three have maintained loading/serving paths; no dependency-check bypass without reviewed interface |
 | 6. Qualification | Requested hardware and precision paths | Raw observation-to-action checks, eager/captured parity, latency and memory compared with baseline |
 
