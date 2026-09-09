@@ -2,8 +2,11 @@
 //!
 //! Two weight stores are supported:
 //!
-//! * the VLM directory (the Qwen3.5 release root), whose safetensors keys are
-//!   `model.language_model.*` and `model.visual.*`; and
+//! * the VLM directory (the Drive checkpoint root), whose safetensors keys
+//!   are `vlm.model.language_model.*` and `vlm.model.visual.*`: the reference
+//!   saves the outer QwenDrive module, so every VLM tensor carries exactly
+//!   one leading `vlm.` prefix that `QwenDriveVlmWeights::from_map` strips
+//!   before classification (bare `model.*` maps are accepted too); and
 //! * a planning-expert head directory (planner-sft / planner-rl), whose keys
 //!   carry an optional `planning_expert.` prefix that the reference strips at
 //!   load time (`load_planner`).
@@ -35,7 +38,18 @@ pub struct QwenDriveVlmWeights {
 }
 
 impl QwenDriveVlmWeights {
-    pub fn from_map(mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+    pub fn from_map(tensors: HashMap<String, Tensor>) -> Result<Self> {
+        // The Drive checkpoint saves the outer QwenDrive module, so every VLM
+        // tensor carries exactly one leading `vlm.` prefix (the reference wraps
+        // the VLM as `self.vlm` and saves the outer module). Strip it once
+        // before classification; bare `model.*` maps are accepted too.
+        let mut tensors: HashMap<String, Tensor> = tensors
+            .into_iter()
+            .map(|(key, tensor)| {
+                let stripped = key.strip_prefix("vlm.").unwrap_or(key.as_str());
+                (stripped.to_owned(), tensor)
+            })
+            .collect();
         let mut language = HashMap::new();
         let mut visual = HashMap::new();
         let mut ignored: Vec<String> = tensors
@@ -70,11 +84,18 @@ impl QwenDriveVlmWeights {
             }
         }
         if language.is_empty() {
-            return Err(Error::Other(
+            // Self-diagnosing in truncated remote logs: surface the first
+            // unmatched keys so a key-layout mismatch is visible directly.
+            let sample = if ignored.is_empty() {
+                "<none>".to_string()
+            } else {
+                ignored[..ignored.len().min(3)].join(", ")
+            };
+            return Err(Error::Other(format!(
                 "qwen_drive weights: no model.language_model.* tensors found; \
                  pass the VLM checkpoint directory (or attach a planner head \
-                 through QwenDriveExpertWeights::from_map)".into(),
-            ));
+                 through QwenDriveExpertWeights::from_map). First unmatched keys: {sample}"
+            )));
         }
         if !language.contains_key("model.language_model.embed_tokens.weight") {
             return Err(Error::Other(
@@ -307,13 +328,24 @@ pub fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
         )));
     }
     let [rows, cols] = [dims[0], dims[1]];
+    const TILE: usize = 32;
     match tensor.dtype() {
         apxinf_core::DType::F32 => {
             let data = tensor.as_f32()?;
             let mut out = vec![0.0f32; rows * cols];
-            for i in 0..rows {
-                for j in 0..cols {
-                    out[j * rows + i] = data[i * cols + j];
+            // Tiled permutation: the naive elementwise loop is cache-hostile
+            // on the multi-GB checkpoint matrices and starved the remote load
+            // stage; 32x32 tiles keep the strided writes cache-local. Same
+            // output permutation, memory-speed.
+            for ii in (0..rows).step_by(TILE) {
+                for jj in (0..cols).step_by(TILE) {
+                    let i_end = (ii + TILE).min(rows);
+                    let j_end = (jj + TILE).min(cols);
+                    for i in ii..i_end {
+                        for j in jj..j_end {
+                            out[j * rows + i] = data[i * cols + j];
+                        }
+                    }
                 }
             }
             Tensor::from_f32(vec![cols, rows], &out)
@@ -321,9 +353,15 @@ pub fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
         apxinf_core::DType::BF16 => {
             let data = tensor.as_bf16()?;
             let mut out = vec![half::bf16::from_f32(0.0); rows * cols];
-            for i in 0..rows {
-                for j in 0..cols {
-                    out[j * rows + i] = data[i * cols + j];
+            for ii in (0..rows).step_by(TILE) {
+                for jj in (0..cols).step_by(TILE) {
+                    let i_end = (ii + TILE).min(rows);
+                    let j_end = (jj + TILE).min(cols);
+                    for i in ii..i_end {
+                        for j in jj..j_end {
+                            out[j * rows + i] = data[i * cols + j];
+                        }
+                    }
                 }
             }
             Tensor::from_bf16(vec![cols, rows], &out)
@@ -414,7 +452,7 @@ mod tests {
         let history_dim = (config.num_history_points - 1) * config.trajectory_point_dim
             + config.expert.nav_command_classes;
         mlp(&mut map, "planning_expert.history_encoder", history_dim);
-        let dynamics_dim = config.num_history_points * config.expert.history_dynamics_dim;
+        let dynamics_dim = config.num_history_points * expert.history_dynamics_dim;
         mlp(&mut map, "planning_expert.history_velocity_encoder", dynamics_dim);
         mlp(&mut map, "planning_expert.history_acceleration_encoder", dynamics_dim);
         mlp(&mut map, "planning_expert.query_fusion", 7 * hidden);
