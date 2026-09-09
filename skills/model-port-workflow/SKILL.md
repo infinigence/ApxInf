@@ -1,6 +1,6 @@
 ---
 name: model-port-workflow
-description: Port a reference LLM, VLM, or VLA model into ApxInf with private evidence, model-layer isolation, kernel-gap handling, and end-to-end verification. Use when adding a model family, migrating a checkpoint/runtime, assessing operator coverage, or preparing a model-port review.
+description: Port a reference LLM, VLM, or VLA model into an ApxInf-native, fully GPU-resident execution path with private evidence, model-layer isolation, kernel-gap handling, and end-to-end verification. Use when adding a model family, migrating a checkpoint/runtime, assessing operator coverage, or preparing a model-port review.
 ---
 
 # Model Port Workflow
@@ -23,6 +23,40 @@ Read these repository documents before changing code:
 Read each selected document completely. Treat them as instructions, not
 background material.
 
+## Non-negotiable execution contract
+
+A completed accelerator port uses ApxInf as the inference runtime and execution
+planner. Implement the model through ApxInf model code, safe model-neutral
+operators, maintained fused interfaces, and backend kernels. Vendor math or
+kernel libraries are allowed only behind ApxInf's safe backend/operator APIs.
+
+Third-party inference engines are not an implementation path. Do not execute or
+embed model graphs, subgraphs, layers, or generated plans through TensorRT,
+ONNX Runtime, Torch/TorchScript, OpenVINO, or an equivalent external inference
+runtime. Reference frameworks may run only in the private evidence workspace.
+
+After canonical inputs enter the ApxInf runtime, the complete tensor
+computation graph stays on the target GPU until the explicit public output
+transfer. The host may load weights, prepare static metadata, upload public
+inputs, issue launches for fixed control flow, and receive final output; it may
+not compute intermediates, partition the graph onto CPU, or add intermediate
+D2H/H2D transfers or synchronization.
+
+CPU implementations and third-party-engine executions are private correctness
+scaffolds only. They require an ApxInf-native GPU replacement and may not be
+registered, shipped, benchmarked as the candidate implementation, or included
+in a model-port review. If native coverage is missing, follow the kernel
+workflow or report a concrete blocker.
+
+The maintained GPU path must support CUDA Graph acceleration for fixed
+profiles. Prefer one graph spanning canonical device inputs to outputs. When a
+VLA cannot be captured as one graph after concrete blockers are identified, the
+minimum partition is three captured graphs: Vision, Language, and Action, with
+stable-address device buffers and device-only handoff. The Action graph
+includes the complete fixed-step generation or denoising sequence. Dynamic
+allocation, host tensor computation, intermediate readback, and synchronization
+between graph segments are forbidden.
+
 ## Workflow
 
 1. During preflight, ask once for hands-off or hands-on execution and the
@@ -43,9 +77,11 @@ background material.
 4. Create an execution ledger from reference semantics through safe CUDA calls.
    Inspect maintained optimized executors and fused interfaces before the
    portable backend trait. Account for tensor lifetime, reusable KV/state,
-   workspace, host traffic, and graph eligibility. Completion: every hot-path
-   row has a device implementation, a named correctness scaffold with a device
-   exit criterion, or a concrete blocker.
+   workspace, host traffic, and graph eligibility. Define the intended whole
+   graph or Vision/Language/Action graph boundaries, stable buffers,
+   input-update mechanism, and capture blockers. Completion: every graph row
+   resolves to an ApxInf-native implementation, a private scaffold with a
+   named device exit criterion, or a concrete blocker.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness
@@ -63,12 +99,20 @@ background material.
    LLM/VLM or `VlaRuntime` plus the Python policy layer for VLA.
 8. Verify operators, transformations, intermediate checkpoints, eager and
    captured inference, host-transfer audit, public serving/policy integration,
-   and requested performance. Report functional acceptance separately from
-   optimization status (`target met`, `best effort with performance debt`, or
-   `blocked`). Performance is best effort unless explicitly declared a release
-   gate, but applicable existing optimized paths must be investigated.
+   and requested performance. Prove that tensor computation between public
+   input upload and public output transfer stays on GPU, and verify eager versus
+   captured parity, repeated replay, changed-input propagation, stable
+   addresses, and capture-safe workspace use. For a VLA, verify the whole-model
+   graph or all three minimum Vision/Language/Action graphs. Report functional
+   acceptance separately from optimization status (`target met`, `best effort
+   with performance debt`, or `blocked`). Performance is best effort unless
+   explicitly declared a release gate, but applicable existing optimized paths
+   must be investigated.
 9. Prepare a product-only diff. Keep checkpoints, captures, generated reports,
-   temporary adapters, replay scripts, and agent state outside the repository.
+   temporary adapters, replay scripts, generated engine plans, and agent state
+   outside the repository. Do not open a model-port review until correctness
+   scaffolds are removed, required capture/replay passes, and this execution
+   contract passes.
 
 ## Stop conditions
 
@@ -80,7 +124,10 @@ default next action, including whether to commit when that choice is useful.
 
 Stop with a concrete blocker when the reference cannot run, semantics remain
 unknown, canonical equivalence fails, a required kernel has no correct path, or
-the maintained public integration cannot be exercised. A performance gap alone
+the maintained public integration cannot be exercised. Missing ApxInf-native
+GPU coverage is a blocker; it does not authorize a third-party engine or CPU
+partition. A VLA capture path with fewer than the required Vision/Language/
+Action graphs is also a blocker. A performance gap alone
 is not a stop condition unless performance is an explicit release gate; exhaust
 applicable existing paths, measure the gap, and report the remaining debt.
 
