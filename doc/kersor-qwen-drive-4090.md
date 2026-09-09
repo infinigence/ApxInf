@@ -94,10 +94,11 @@ does not claim that this repair has passed until a new RTX 4090 receipt exists.
 
 ## Development skill and review boundary
 
-The ApxInf model-porting skill supplies the semantic contract: read the official
-reference, preserve checkpoint names and public behavior, add the native model
-registration, keep CPU scaffolds separate from device implementation, and use
-the fixed Host verifier for acceptance. KerSor supplies the long-running plan,
+The ApxInf [model-porting skill](../skills/model-port-workflow/SKILL.md)
+supplies the semantic contract: read the official reference, preserve checkpoint
+names and public behavior, add the native model registration, keep CPU scaffolds
+separate from device implementation, and use the fixed Host verifier for
+acceptance. KerSor supplies the long-running plan,
 resume and evidence loop around that skill. DSH supplies the model activation
 and SSH-capable Host handoff; it does not become the correctness authority.
 
