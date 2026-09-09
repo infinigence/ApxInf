@@ -368,7 +368,9 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
 
 /// Non-causal full attention for the vision tower. Q/K/V each
 /// `[seq, n_heads, head_dim]` bf16; returns `[seq, n_heads * head_dim]`.
-/// head_dim must be 64 (Qwen3-VL-2B vision).
+/// Non-causal full attention for the Qwen3-VL vision tower. Supports any
+/// head_dim (64 for Qwen3-VL-2B/4B, 72 for Qwen3-VL-8B); the CUDA kernel
+/// distributes head_dim columns cyclically across a 32-thread warp.
 pub fn vision(
     ctx: &CudaContext,
     q: &Tensor,
@@ -381,8 +383,8 @@ pub fn vision(
     if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
         return Err(Error::Other("vision_sdpa: only BF16 supported".into()));
     }
-    if head_dim != 64 {
-        return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
+    if head_dim == 0 || head_dim > 256 {
+        return Err(Error::Other("vision_sdpa: head_dim out of range".into()));
     }
     let device_id = ctx.device_id();
     let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
