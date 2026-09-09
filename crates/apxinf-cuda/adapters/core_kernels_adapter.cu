@@ -229,6 +229,27 @@ extern "C" cudaError_t apxinf_rms_norm_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_rms_norm_bf16_split(
+    const void* input, const void* weight, void* output,
+    uint32_t cols, uint32_t rows, float eps, int f16_weight, void* stream)
+{
+    if (!input || !weight || !output || !cols || cols > 8192 || !rows ||
+        uint64_t(rows) * cols > UINT32_MAX / 2 || !(eps > 0.f) ||
+        !std::isfinite(eps) || (f16_weight != 0 && f16_weight != 1))
+        return cudaErrorInvalidValue;
+    if (f16_weight)
+        rms_norm_bf16_kernel<half, __nv_bfloat16, true><<<rows, BLOCK_SIZE,
+            cols * sizeof(float), (cudaStream_t)stream>>>(
+            (const __nv_bfloat16*)input, (const half*)weight,
+            (__nv_bfloat16*)output, cols, rows, eps);
+    else
+        rms_norm_bf16_kernel<__nv_bfloat16, __nv_bfloat16, true><<<rows, BLOCK_SIZE,
+            cols * sizeof(float), (cudaStream_t)stream>>>(
+            (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
+            (__nv_bfloat16*)output, cols, rows, eps);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_rms_norm_add_bf16(
     void* x_inout, const void* delta, const void* weight, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
@@ -540,5 +561,36 @@ extern "C" cudaError_t apxinf_argmax_bf16(
     // One block of 256 threads — vocab (32k) / 256 = 128 elems/thread.
     argmax_bf16_kernel<<<1, 256, 0, s>>>(
         (const __nv_bfloat16*)logits, n, (uint32_t*)out);
+    return cudaGetLastError();
+}
+
+// BF16 activations with checkpoint FP16 RMSNorm weights.
+extern "C" cudaError_t apxinf_rms_norm_bf16_f16_weight(
+    const void* input, const void* weight, void* output,
+    uint32_t cols, uint32_t rows, float eps, void* stream)
+{
+    // One block per row. BLOCK_SIZE threads (256), strided over cols.
+    dim3 grid(rows, 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    size_t smem = cols * sizeof(float);
+    rms_norm_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)input, (const half*)weight,
+        (__nv_bfloat16*)output, cols, rows, eps);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rms_norm_add_bf16_f16_weight(
+    void* x_inout, const void* delta, const void* weight, void* output,
+    uint32_t cols, uint32_t rows, float eps, void* stream)
+{
+    // One block per row. BLOCK_SIZE threads (256), strided over cols.
+    // Shared mem: cols * sizeof(float) for x_new.
+    dim3 grid(rows, 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    size_t smem = cols * sizeof(float);
+    rms_norm_add_bf16_kernel<<<grid, block, smem, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)x_inout, (const __nv_bfloat16*)delta,
+        (const half*)weight, (__nv_bfloat16*)output,
+        cols, rows, eps);
     return cudaGetLastError();
 }

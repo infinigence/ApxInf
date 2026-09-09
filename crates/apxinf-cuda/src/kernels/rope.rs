@@ -11,6 +11,197 @@ use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
 
+/// Precomputed float RoPE values for head dimension 128, shared by all layers.
+pub struct Table128 {
+    buffer: CudaBuffer,
+    positions: usize,
+}
+impl Table128 {
+    pub fn new(ctx: &CudaContext, positions: usize, theta: f32) -> Result<Self> {
+        require_finite("RoPE table", &[theta])?;
+        if positions == 0 || positions > i32::MAX as usize / 64 || theta <= 0.0 {
+            return Err(Error::Other("RoPE table: invalid length or theta".into()));
+        }
+        let buffer =
+            CudaBuffer::alloc(positions * 64 * 2 * 4, ctx.device_id()).map_err(Error::Cuda)?;
+        check_cuda(unsafe {
+            ffi::apxinf_rope_table_128(buffer.ptr(), positions as i32, theta, ctx.stream().handle())
+        })?;
+        Ok(Self { buffer, positions })
+    }
+}
+
+/// Q/K RMSNorm + half-split RoPE + BF16 cache append + FP16 attention inputs.
+/// This fixed-head operator preserves BF16 rounding before and after RoPE.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_append_f16_into(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    qw: &CudaBuffer,
+    kw: &CudaBuffer,
+    oq: &CudaBuffer,
+    ok: &CudaBuffer,
+    ov: &CudaBuffer,
+    cache_k: &CudaBuffer,
+    cache_v: &CudaBuffer,
+    tokens: usize,
+    qheads: usize,
+    kvheads: usize,
+    capacity: usize,
+    offset: usize,
+    eps: f32,
+    table: &Table128,
+) -> Result<()> {
+    require_finite("fused QK norm", &[eps])?;
+    let end = offset
+        .checked_add(tokens)
+        .ok_or_else(|| Error::Other("QK position overflow".into()))?;
+    let rows = qheads
+        .checked_add(kvheads)
+        .and_then(|h| tokens.checked_mul(h));
+    if eps <= 0.0
+        || tokens == 0
+        || qheads == 0
+        || kvheads == 0
+        || end > capacity
+        || end > table.positions
+        || capacity > i32::MAX as usize
+        || rows.is_none_or(|n| n > (i32::MAX as usize - 3) / 32)
+    {
+        return Err(Error::Other("fused QK norm: invalid geometry".into()));
+    }
+    let qbytes = checked_bytes(DType::BF16, &[tokens, qheads, 128], "fused QK norm")?;
+    let kbytes = checked_bytes(DType::BF16, &[tokens, kvheads, 128], "fused QK norm")?;
+    let cache = checked_bytes(DType::BF16, &[capacity, kvheads, 128], "fused QK norm")?;
+    require_buffers(
+        ctx,
+        "fused QK norm",
+        &[
+            ("q", q, qbytes),
+            ("k", k, kbytes),
+            ("v", v, kbytes),
+            ("qw", qw, 256),
+            ("kw", kw, 256),
+            ("oq", oq, qbytes),
+            ("ok", ok, kbytes),
+            ("ov", ov, kbytes),
+            ("cache_k", cache_k, cache),
+            ("cache_v", cache_v, cache),
+            ("table", &table.buffer, table.positions * 512),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_qk_norm_rope_append_f16(
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            qw.ptr(),
+            kw.ptr(),
+            oq.ptr(),
+            ok.ptr(),
+            ov.ptr(),
+            cache_k.ptr(),
+            cache_v.ptr(),
+            tokens as i32,
+            qheads as i32,
+            kvheads as i32,
+            capacity as i32,
+            offset as i32,
+            eps,
+            table.buffer.ptr(),
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// Q/K processing with head-major FP16 prefill cache plus the BF16 decode cache.
+/// `used_k` contains the validated cache length after this chunk.
+/// This fixed-head operator preserves BF16 rounding before and after RoPE.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_append_cached_f16_into(
+    ctx: &CudaContext,
+    q: &CudaBuffer,
+    k: &CudaBuffer,
+    v: &CudaBuffer,
+    qw: &CudaBuffer,
+    kw: &CudaBuffer,
+    oq: &CudaBuffer,
+    ok: &CudaBuffer,
+    ov: &CudaBuffer,
+    cache_k: &CudaBuffer,
+    cache_v: &CudaBuffer,
+    tokens: usize,
+    qheads: usize,
+    kvheads: usize,
+    capacity: usize,
+    used_k: CudaDeviceAddress,
+    eps: f32,
+    table: &Table128,
+) -> Result<()> {
+    require_finite("fused QK norm", &[eps])?;
+    let end = capacity;
+    require_address(ctx, "cached QK norm", "used_k", used_k, 4)?;
+    let rows = qheads
+        .checked_add(kvheads)
+        .and_then(|h| tokens.checked_mul(h));
+    if eps <= 0.0
+        || tokens == 0
+        || tokens > capacity
+        || qheads == 0
+        || kvheads == 0
+        || end > capacity
+        || end > table.positions
+        || capacity > i32::MAX as usize
+        || rows.is_none_or(|n| n > (i32::MAX as usize - 3) / 32)
+    {
+        return Err(Error::Other("fused QK norm: invalid geometry".into()));
+    }
+    let qbytes = checked_bytes(DType::BF16, &[tokens, qheads, 128], "fused QK norm")?;
+    let kbytes = checked_bytes(DType::BF16, &[tokens, kvheads, 128], "fused QK norm")?;
+    let cache = checked_bytes(DType::BF16, &[capacity, kvheads, 128], "fused QK norm")?;
+    require_buffers(
+        ctx,
+        "fused QK norm",
+        &[
+            ("q", q, qbytes),
+            ("k", k, kbytes),
+            ("v", v, kbytes),
+            ("qw", qw, 256),
+            ("kw", kw, 256),
+            ("oq", oq, qbytes),
+            ("ok", ok, cache),
+            ("ov", ov, cache),
+            ("cache_k", cache_k, cache),
+            ("cache_v", cache_v, cache),
+            ("table", &table.buffer, table.positions * 512),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_qk_norm_rope_append_cached_f16(
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            qw.ptr(),
+            kw.ptr(),
+            oq.ptr(),
+            ok.ptr(),
+            ov.ptr(),
+            cache_k.ptr(),
+            cache_v.ptr(),
+            tokens as i32,
+            qheads as i32,
+            kvheads as i32,
+            capacity as i32,
+            used_k.ptr(),
+            eps,
+            table.buffer.ptr(),
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// Apply RoPE into caller-owned storage using a device-resident position.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_into(
@@ -292,6 +483,51 @@ pub fn apply_vision_2d(
         device_id,
         out_buf,
     ))
+}
+
+/// Batched BF16 half-split RoPE into persistent caller-owned storage.
+pub fn apply_batched_bf16_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    output: &CudaBuffer,
+    heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    theta: f32,
+    offset: u32,
+) -> Result<()> {
+    require_finite("batched RoPE", &[theta])?;
+    if head_dim % 2 != 0
+        || theta <= 0.0
+        || heads > 65535
+        || seq_len > 65535
+        || head_dim > u32::MAX as usize
+        || seq_len
+            .checked_add(offset as usize)
+            .is_none_or(|v| v > u32::MAX as usize)
+    {
+        return Err(Error::Other(
+            "batched RoPE: invalid geometry or theta".into(),
+        ));
+    }
+    let bytes = checked_bytes(DType::BF16, &[heads, head_dim, seq_len], "batched RoPE")?;
+    require_buffers(
+        ctx,
+        "batched RoPE",
+        &[("input", input, bytes), ("output", output, bytes)],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rope_batched_bf16(
+            input.ptr(),
+            output.ptr(),
+            head_dim as u32,
+            heads as u32,
+            seq_len as u32,
+            theta,
+            offset,
+            ctx.stream().handle(),
+        )
+    })
 }
 
 /// Batched RoPE with half-split pairs. Dispatches on dtype.
@@ -631,4 +867,76 @@ pub fn apply_q_write_kv_f16(
         ctx.device_id(),
         q_buffer,
     ))
+}
+
+/// Decode QKV split reduction, normalization, RoPE and cache append, head 128.
+#[allow(clippy::too_many_arguments)]
+pub fn qkv_partial_cache_bf16_into(
+    ctx: &CudaContext,
+    partial: &CudaBuffer,
+    qw: &CudaBuffer,
+    kw: &CudaBuffer,
+    q: &CudaBuffer,
+    ck: &CudaBuffer,
+    cv: &CudaBuffer,
+    position: CudaDeviceAddress,
+    qheads: usize,
+    kvheads: usize,
+    capacity: usize,
+    splits: usize,
+    eps: f32,
+    table: &Table128,
+) -> Result<()> {
+    require_finite("decode QKV fusion", &[eps])?;
+    let heads = kvheads.checked_mul(2).and_then(|h| h.checked_add(qheads));
+    if qheads == 0
+        || kvheads == 0
+        || capacity == 0
+        || capacity > table.positions
+        || splits == 0
+        || splits > i32::MAX as usize
+        || eps <= 0.0
+        || heads.is_none_or(|n| n > i32::MAX as usize / 128)
+    {
+        return Err(Error::Other("decode QKV fusion: invalid geometry".into()));
+    }
+    let pb = checked_bytes(
+        DType::F32,
+        &[heads.unwrap(), 128, splits],
+        "decode QKV fusion",
+    )?;
+    let cb = checked_bytes(DType::BF16, &[kvheads, capacity, 128], "decode QKV fusion")?;
+    let qb = checked_bytes(DType::BF16, &[qheads, 128], "decode QKV fusion")?;
+    require_buffers(
+        ctx,
+        "decode QKV fusion",
+        &[
+            ("partial", partial, pb),
+            ("qw", qw, 256),
+            ("kw", kw, 256),
+            ("q", q, qb),
+            ("ck", ck, cb),
+            ("cv", cv, cb),
+            ("table", &table.buffer, table.positions * 512),
+        ],
+    )?;
+    require_address(ctx, "decode QKV fusion", "position", position, 4)?;
+    check_cuda(unsafe {
+        ffi::apxinf_qkv_partial_norm_rope_cache_bf16(
+            partial.ptr(),
+            qw.ptr(),
+            kw.ptr(),
+            q.ptr(),
+            ck.ptr(),
+            cv.ptr(),
+            position.ptr(),
+            qheads as i32,
+            kvheads as i32,
+            capacity as i32,
+            splits as i32,
+            eps,
+            table.buffer.ptr(),
+            ctx.stream().handle(),
+        )
+    })
 }

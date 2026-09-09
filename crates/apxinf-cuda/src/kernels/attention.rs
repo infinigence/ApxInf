@@ -603,10 +603,7 @@ fn fa2_splitkv_enabled(
     if std::env::var_os("APXINF_DISABLE_FA2_SPLITKV").is_some() {
         return false;
     }
-    query_tokens <= 64
-        && key_tokens > query_tokens
-        && query_heads > kv_heads
-        && head_dim == 256
+    query_tokens <= 64 && key_tokens > query_tokens && query_heads > kv_heads && head_dim == 256
 }
 
 #[cfg(apxinf_fa2_sm80)]
@@ -1404,8 +1401,16 @@ pub fn causal_prefill_f16_into(
             "causal prefill attention: invalid q={query_tokens} k={key_tokens} heads={heads}/{kv_heads}"
         )));
     }
-    let q_bytes = checked_bytes(DType::F16, &[query_tokens, heads, HEAD_DIM], "causal prefill")?;
-    let kv_bytes = checked_bytes(DType::F16, &[key_tokens, kv_heads, HEAD_DIM], "causal prefill")?;
+    let q_bytes = checked_bytes(
+        DType::F16,
+        &[query_tokens, heads, HEAD_DIM],
+        "causal prefill",
+    )?;
+    let kv_bytes = checked_bytes(
+        DType::F16,
+        &[key_tokens, kv_heads, HEAD_DIM],
+        "causal prefill",
+    )?;
     let lse_bytes = checked_bytes(DType::F32, &[heads, query_tokens], "causal prefill")?;
     require_buffers(
         ctx,
@@ -1443,4 +1448,316 @@ pub fn causal_prefill_f16_into(
             "causal prefill attention requires the FlashAttention-2 FP16 build".into(),
         ))
     }
+}
+
+/// Causal FP16 attention over a head-major cache with device-resident used length.
+pub fn causal_prefill_cached_f16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    output: &CudaBuffer,
+    softmax_lse: &CudaBuffer,
+    query_tokens: usize,
+    key_tokens: usize,
+    used_k: CudaDeviceAddress,
+    heads: usize,
+    kv_heads: usize,
+    scale: f32,
+) -> Result<()> {
+    const HEAD_DIM: usize = 128;
+    require_address(ctx, "cached prefill attention", "used_k", used_k, 4)?;
+    require_finite("causal prefill attention", &[scale])?;
+    if query_tokens == 0
+        || key_tokens < query_tokens
+        || heads == 0
+        || kv_heads == 0
+        || heads % kv_heads != 0
+    {
+        return Err(Error::Other(format!(
+            "causal prefill attention: invalid q={query_tokens} k={key_tokens} heads={heads}/{kv_heads}"
+        )));
+    }
+    let q_bytes = checked_bytes(
+        DType::F16,
+        &[query_tokens, heads, HEAD_DIM],
+        "causal prefill",
+    )?;
+    let kv_bytes = checked_bytes(
+        DType::F16,
+        &[key_tokens, kv_heads, HEAD_DIM],
+        "causal prefill",
+    )?;
+    let lse_bytes = checked_bytes(DType::F32, &[heads, query_tokens], "causal prefill")?;
+    require_buffers(
+        ctx,
+        "causal prefill attention",
+        &[
+            ("query", query, q_bytes),
+            ("key", key, kv_bytes),
+            ("value", value, kv_bytes),
+            ("output", output, q_bytes),
+            ("softmax_lse", softmax_lse, lse_bytes),
+        ],
+    )?;
+    #[cfg(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80))]
+    {
+        check_cuda(unsafe {
+            ffi::apxinf_static_fa2_f16_causal_cached_hdim128(
+                query.ptr(),
+                key.ptr(),
+                value.ptr(),
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                query_tokens as i32,
+                key_tokens as i32,
+                used_k.ptr(),
+                heads as i32,
+                kv_heads as i32,
+                scale,
+                ctx.stream().handle(),
+            )
+        })
+    }
+    #[cfg(not(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80)))]
+    {
+        Err(Error::Other(
+            "causal prefill attention requires the FlashAttention-2 FP16 build".into(),
+        ))
+    }
+}
+
+enum GqaKernel {
+    Wmma,
+    Vector,
+    Balanced,
+    Mma(usize),
+}
+
+/// Split-sequence GQA for BF16, head dimension 128 and eight Q heads per KV head.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_bf16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    partial: &CudaBuffer,
+    output: &CudaBuffer,
+    kv_heads: usize,
+    capacity: usize,
+    splits: usize,
+    scale: f32,
+    position: CudaDeviceAddress,
+) -> Result<()> {
+    gqa_impl(
+        ctx,
+        query,
+        key,
+        value,
+        partial,
+        output,
+        kv_heads,
+        capacity,
+        splits,
+        GqaKernel::Wmma,
+        scale,
+        position,
+    )
+}
+
+/// Same WMMA arithmetic with 16-byte Q/K/V loads. Buffers must be aligned.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_vector_bf16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    partial: &CudaBuffer,
+    output: &CudaBuffer,
+    kv_heads: usize,
+    capacity: usize,
+    splits: usize,
+    scale: f32,
+    position: CudaDeviceAddress,
+) -> Result<()> {
+    if [query, key, value]
+        .iter()
+        .any(|buffer| (buffer.ptr() as usize) % 16 != 0)
+    {
+        return Err(Error::Other(
+            "GQA vector Q/K/V must be aligned to 16 bytes".into(),
+        ));
+    }
+    gqa_impl(
+        ctx,
+        query,
+        key,
+        value,
+        partial,
+        output,
+        kv_heads,
+        capacity,
+        splits,
+        GqaKernel::Vector,
+        scale,
+        position,
+    )
+}
+
+/// Vector GQA with whole-tile balancing above 512 tokens. The changed split
+/// boundaries can change BF16 output rounding at longer contexts.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_balanced_bf16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    partial: &CudaBuffer,
+    output: &CudaBuffer,
+    kv_heads: usize,
+    capacity: usize,
+    splits: usize,
+    scale: f32,
+    position: CudaDeviceAddress,
+) -> Result<()> {
+    if [query, key, value]
+        .iter()
+        .any(|buffer| (buffer.ptr() as usize) % 16 != 0)
+    {
+        return Err(Error::Other(
+            "GQA balanced Q/K/V must be aligned to 16 bytes".into(),
+        ));
+    }
+    gqa_impl(
+        ctx,
+        query,
+        key,
+        value,
+        partial,
+        output,
+        kv_heads,
+        capacity,
+        splits,
+        GqaKernel::Balanced,
+        scale,
+        position,
+    )
+}
+
+/// Eight-head m16n8k16 GQA with measured 32/64-token tiles.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_mma_bf16_into(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    partial: &CudaBuffer,
+    output: &CudaBuffer,
+    kv_heads: usize,
+    capacity: usize,
+    splits: usize,
+    tile: usize,
+    scale: f32,
+    position: CudaDeviceAddress,
+) -> Result<()> {
+    if !matches!(tile, 32 | 64) {
+        return Err(Error::Other("GQA MMA tile must be 32 or 64".into()));
+    }
+    gqa_impl(
+        ctx,
+        query,
+        key,
+        value,
+        partial,
+        output,
+        kv_heads,
+        capacity,
+        splits,
+        GqaKernel::Mma(tile),
+        scale,
+        position,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gqa_impl(
+    ctx: &CudaContext,
+    query: &CudaBuffer,
+    key: &CudaBuffer,
+    value: &CudaBuffer,
+    partial: &CudaBuffer,
+    output: &CudaBuffer,
+    kv_heads: usize,
+    capacity: usize,
+    splits: usize,
+    kernel: GqaKernel,
+    scale: f32,
+    position: CudaDeviceAddress,
+) -> Result<()> {
+    require_finite("GQA", &[scale])?;
+    if ctx.caps().compute_major < 8
+        || kv_heads == 0
+        || kv_heads > 8191
+        || capacity == 0
+        || capacity >= i32::MAX as usize - 128
+        || splits == 0
+        || splits > 128
+    {
+        return Err(Error::Other(
+            "GQA requires SM80+ and valid fixed-head geometry".into(),
+        ));
+    }
+    let qbytes = checked_bytes(DType::BF16, &[kv_heads, 8, 128], "GQA")?;
+    let kbytes = checked_bytes(DType::BF16, &[kv_heads, capacity, 128], "GQA")?;
+    let pbytes = checked_bytes(DType::F32, &[splits, kv_heads, 8, 130], "GQA")?;
+    require_buffers(
+        ctx,
+        "GQA",
+        &[
+            ("q", query, qbytes),
+            ("k", key, kbytes),
+            ("v", value, kbytes),
+            ("partial", partial, pbytes),
+            ("output", output, qbytes),
+        ],
+    )?;
+    require_address(ctx, "GQA", "position", position, 4)?;
+    check_cuda(unsafe {
+        if let GqaKernel::Mma(tile) = kernel {
+            ffi::apxinf_gqa_decode_mma_bf16(
+                query.ptr(),
+                key.ptr(),
+                value.ptr(),
+                partial.ptr(),
+                output.ptr(),
+                position.ptr(),
+                capacity as i32,
+                splits as i32,
+                kv_heads as i32,
+                tile as i32,
+                scale,
+                ctx.stream().handle(),
+            )
+        } else {
+            let launch = match kernel {
+                GqaKernel::Vector => ffi::apxinf_gqa_decode_vector_bf16,
+                GqaKernel::Balanced => ffi::apxinf_gqa_decode_balanced_bf16,
+                _ => ffi::apxinf_gqa_decode_bf16,
+            };
+            launch(
+                query.ptr(),
+                key.ptr(),
+                value.ptr(),
+                partial.ptr(),
+                output.ptr(),
+                position.ptr(),
+                capacity as i32,
+                splits as i32,
+                kv_heads as i32,
+                scale,
+                ctx.stream().handle(),
+            )
+        }
+    })
 }

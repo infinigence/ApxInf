@@ -91,6 +91,7 @@ __global__ void moe_router_topk_bf16_kernel(
   for (int i = 0; i < kPerLane; ++i) value[i] *= inv;
 
   float selected_sum = 0.0f;
+  float selected_value = 0.0f;
   for (int round = 0; round < k; ++round) {
     float best = -1.0f;
     int best_e = experts;
@@ -113,12 +114,15 @@ __global__ void moe_router_topk_bf16_kernel(
     }
     if (lane == 0) {
       topk_idx[static_cast<int64_t>(token) * k + round] = best_e;
-      topk_weight[static_cast<int64_t>(token) * k + round] = best;
     }
+    if (lane == round) selected_value = best;
     selected_sum += best;
     if (best_e < experts && (best_e & 31) == lane) value[best_e >> 5] = -1.0f;
   }
-  if (renormalize && lane < k) {
-    topk_weight[static_cast<int64_t>(token) * k + lane] /= selected_sum;
+  if (lane < k) {
+    // Each lane owns its final weight. Avoid reading another lane's global
+    // store without a memory barrier, and write the selected weights together.
+    topk_weight[static_cast<int64_t>(token) * k + lane] =
+        renormalize ? selected_value / selected_sum : selected_value;
   }
 }

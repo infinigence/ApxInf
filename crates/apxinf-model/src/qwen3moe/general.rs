@@ -27,7 +27,22 @@ pub struct Qwen3Moe {
 impl Qwen3Moe {
     /// Load an AutoAWQ checkpoint directory onto the CUDA backend.
     pub fn load(model_dir: &Path, backend: Arc<dyn Backend>) -> Result<Self> {
-        Self::load_with_max_seq_len(model_dir, backend, DEFAULT_MAX_SEQ_LEN)
+        let capacity = match std::env::var("APXINF_QWEN3MOE_MAX_SEQ_LEN") {
+            Ok(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n >= 16)
+                .ok_or_else(|| {
+                    Error::Other("APXINF_QWEN3MOE_MAX_SEQ_LEN must be an integer >= 16".into())
+                })?,
+            Err(std::env::VarError::NotPresent) => DEFAULT_MAX_SEQ_LEN,
+            Err(_) => {
+                return Err(Error::Other(
+                    "APXINF_QWEN3MOE_MAX_SEQ_LEN is not valid Unicode".into(),
+                ))
+            }
+        };
+        Self::load_with_max_seq_len(model_dir, backend, capacity)
     }
 
     pub fn load_with_max_seq_len(

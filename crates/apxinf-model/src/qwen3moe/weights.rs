@@ -58,8 +58,8 @@ impl AwqLinear {
 }
 
 pub struct Qwen3MoeLayerWeights {
-    pub attn_norm: DeviceBuffer, // bf16 [hidden]
-    pub ffn_norm: DeviceBuffer,  // bf16 [hidden]
+    pub attn_norm: DeviceBuffer, // [hidden], dtype selected by rms_weights_f16
+    pub ffn_norm: DeviceBuffer,  // [hidden], dtype selected by rms_weights_f16
     pub q_norm: DeviceBuffer,    // bf16 [head_dim]
     pub k_norm: DeviceBuffer,    // bf16 [head_dim]
     /// `[hidden] -> [q | k | v]`
@@ -77,8 +77,10 @@ pub struct Qwen3MoeLayerWeights {
 pub struct Qwen3MoeWeights {
     /// bf16 `[vocab, hidden]`
     pub embed_tokens: DeviceBuffer,
-    /// bf16 `[hidden]`
+    /// `[hidden]`, dtype selected by `rms_weights_f16`.
     pub final_norm: DeviceBuffer,
+    /// Preserve checkpoint FP16 RMS scale values; activations remain BF16.
+    pub rms_weights_f16: bool,
     /// bf16 `[vocab, hidden]` (row-major, consumed with a transposed GEMM).
     pub lm_head: DeviceBuffer,
     pub layers: Vec<Qwen3MoeLayerWeights>,
@@ -258,6 +260,22 @@ fn upload_bf16(
         dtype => Err(other(format!(
             "qwen3moe: `{name}` has dtype {dtype}, expected F16 or BF16"
         ))),
+    }
+}
+
+/// Preserve the quantized checkpoint's calibrated FP16 RMS scale values.
+fn upload_rms_weight(
+    archive: &SafetensorsArchive,
+    arena: &mut Arena,
+    name: &str,
+    shape: &[usize],
+    preserve_f16: bool,
+) -> Result<DeviceBuffer> {
+    if preserve_f16 {
+        let value = archive.get_checked(name, "F16", shape).map_err(other)?;
+        arena.upload(value.bytes)
+    } else {
+        upload_bf16(archive, arena, name, shape)
     }
 }
 
@@ -454,6 +472,8 @@ impl Qwen3MoeWeights {
         device: usize,
         runtime_reserve: usize,
     ) -> Result<Self> {
+        let rms_weights_f16 =
+            std::env::var("APXINF_QWEN3MOE_F16_RMS_WEIGHTS").as_deref() == Ok("1");
         let hidden = config.hidden_size;
         let group = config.group_size();
         let inter = config.moe_intermediate_size;
@@ -468,21 +488,37 @@ impl Qwen3MoeWeights {
         let hot_head = upload_bf16(
             archive,
             arena,
-            if tied { "model.embed_tokens.weight" } else { "lm_head.weight" },
+            if tied {
+                "model.embed_tokens.weight"
+            } else {
+                "lm_head.weight"
+            },
             &[config.vocab_size, hidden],
         )?;
-        let final_norm = upload_bf16(archive, arena, "model.norm.weight", &[hidden])?;
+        let final_norm = upload_rms_weight(
+            archive,
+            arena,
+            "model.norm.weight",
+            &[hidden],
+            rms_weights_f16,
+        )?;
 
         let mut dense = Vec::with_capacity(config.n_layers);
         for layer in 0..config.n_layers {
             let p = format!("model.layers.{layer}");
-            let attn_norm =
-                upload_bf16(archive, arena, &format!("{p}.input_layernorm.weight"), &[hidden])?;
-            let ffn_norm = upload_bf16(
+            let attn_norm = upload_rms_weight(
+                archive,
+                arena,
+                &format!("{p}.input_layernorm.weight"),
+                &[hidden],
+                rms_weights_f16,
+            )?;
+            let ffn_norm = upload_rms_weight(
                 archive,
                 arena,
                 &format!("{p}.post_attention_layernorm.weight"),
                 &[hidden],
+                rms_weights_f16,
             )?;
             let q_norm = upload_bf16(
                 archive,
@@ -499,9 +535,27 @@ impl Qwen3MoeWeights {
 
             let mut qkv = AwqStaging::new(hidden, q_dim + 2 * kv_dim, group, 1);
             qkv.push_expert(&[
-                awq_source(archive, &format!("{p}.self_attn.q_proj"), hidden, q_dim, group)?,
-                awq_source(archive, &format!("{p}.self_attn.k_proj"), hidden, kv_dim, group)?,
-                awq_source(archive, &format!("{p}.self_attn.v_proj"), hidden, kv_dim, group)?,
+                awq_source(
+                    archive,
+                    &format!("{p}.self_attn.q_proj"),
+                    hidden,
+                    q_dim,
+                    group,
+                )?,
+                awq_source(
+                    archive,
+                    &format!("{p}.self_attn.k_proj"),
+                    hidden,
+                    kv_dim,
+                    group,
+                )?,
+                awq_source(
+                    archive,
+                    &format!("{p}.self_attn.v_proj"),
+                    hidden,
+                    kv_dim,
+                    group,
+                )?,
             ])?;
             let qkv = qkv.upload(arena)?;
 
@@ -515,7 +569,9 @@ impl Qwen3MoeWeights {
             )?])?;
             let o = o.upload(arena)?;
 
-            let router_view = archive.get(&format!("{p}.mlp.gate.weight")).map_err(other)?;
+            let router_view = archive
+                .get(&format!("{p}.mlp.gate.weight"))
+                .map_err(other)?;
             let router = arena.upload(&transpose_f16_to_bf16(router_view, experts, hidden)?)?;
 
             dense.push(DenseLayer {
@@ -604,6 +660,7 @@ impl Qwen3MoeWeights {
         Ok(Self {
             embed_tokens,
             final_norm,
+            rms_weights_f16,
             lm_head,
             layers,
             device_bytes,

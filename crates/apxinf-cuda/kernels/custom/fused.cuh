@@ -15,9 +15,10 @@
 // separate add + norm it replaces). One block per row; block size up to
 // BLOCK_SIZE (256) threads, strided load, warp-shuffle reduction.
 
+template<typename NormWeight=__nv_bfloat16>
 __global__ void rms_norm_add_bf16_kernel(
     __nv_bfloat16* x_inout, const __nv_bfloat16* delta,
-    const __nv_bfloat16* weight, __nv_bfloat16* output,
+    const NormWeight* weight, __nv_bfloat16* output,
     uint32_t cols, uint32_t rows, float eps)
 {
     uint32_t row = blockIdx.x;
@@ -64,7 +65,7 @@ __global__ void rms_norm_add_bf16_kernel(
     // Phase 3: write x_new back to x_inout and the normed output.
     for (uint32_t i = tid; i < cols; i += blockDim.x) {
         float xn = x_new[i];
-        float w  = __bfloat162float(weight[i]);
+        float w  = static_cast<float>(weight[i]);
         x_inout[offset + i] = __float2bfloat16(xn);
         output[offset + i]  = __float2bfloat16(xn * rms * w);
     }

@@ -280,8 +280,14 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ComputeCapability { major: 11, minor: 0 },
-                ComputeCapability { major: 11, minor: 0 }
+                ComputeCapability {
+                    major: 11,
+                    minor: 0
+                },
+                ComputeCapability {
+                    major: 11,
+                    minor: 0
+                }
             ]
         );
         assert_eq!(select_uniform_arch(&parsed).unwrap(), "sm_110");
@@ -291,7 +297,10 @@ mod tests {
     fn rejects_mixed_visible_architectures() {
         let capabilities = [
             ComputeCapability { major: 8, minor: 7 },
-            ComputeCapability { major: 11, minor: 0 },
+            ComputeCapability {
+                major: 11,
+                minor: 0,
+            },
         ];
         let error = select_uniform_arch(&capabilities).unwrap_err();
         assert!(error.contains("sm_87, sm_110"), "{error}");

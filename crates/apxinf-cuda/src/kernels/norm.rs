@@ -10,6 +10,107 @@ use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
 
+/// BF16 activations normalized with checkpoint FP16 scale weights.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_f16_weight_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    cols: usize,
+    rows: usize,
+    eps: f32,
+) -> Result<()> {
+    require_finite("FP16-weight RMSNorm", &[eps])?;
+    if eps <= 0.0 || cols > 8192 || rows.checked_mul(cols).is_none_or(|n| n > u32::MAX as usize) {
+        return Err(Error::Other(
+            "FP16-weight RMSNorm dimensions or epsilon are invalid".into(),
+        ));
+    }
+    let matrix = checked_bytes(DType::BF16, &[rows, cols], "FP16-weight RMSNorm")?;
+    let weights = checked_bytes(DType::F16, &[cols], "FP16-weight RMSNorm")?;
+    require_buffers(
+        ctx,
+        "FP16-weight RMSNorm",
+        &[
+            ("input", input, matrix),
+            ("weight", weight, weights),
+            ("output", output, matrix),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rms_norm_bf16_f16_weight(
+            input.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            cols as u32,
+            rows as u32,
+            eps,
+            ctx.stream().handle(),
+        )
+    })
+}
+
+/// RMSNorm with BF16 high/low output rows, shaped `[rows, 2, cols]`.
+/// Their FP32 sum approximates the unrounded normalized input while preserving
+/// the scale weights. Intended for compensated BF16 matrix products.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_bf16_split_into(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    weight: &CudaBuffer,
+    weight_dtype: DType,
+    output: &CudaBuffer,
+    cols: usize,
+    rows: usize,
+    eps: f32,
+) -> Result<()> {
+    require_finite("split RMSNorm", &[eps])?;
+    if eps <= 0.0
+        || cols > 8192
+        || rows
+            .checked_mul(cols)
+            .is_none_or(|n| n > u32::MAX as usize / 2)
+    {
+        return Err(Error::Other(
+            "split RMSNorm dimensions or epsilon are invalid".into(),
+        ));
+    }
+    let f16_weight = match weight_dtype {
+        DType::BF16 => 0,
+        DType::F16 => 1,
+        _ => {
+            return Err(Error::Other(
+                "split RMSNorm requires BF16 or FP16 scale weights".into(),
+            ))
+        }
+    };
+    let matrix = checked_bytes(DType::BF16, &[rows, cols], "split RMSNorm")?;
+    let weights = checked_bytes(weight_dtype, &[cols], "split RMSNorm")?;
+    let result = checked_bytes(DType::BF16, &[rows, 2, cols], "split RMSNorm")?;
+    require_buffers(
+        ctx,
+        "split RMSNorm",
+        &[
+            ("input", input, matrix),
+            ("weight", weight, weights),
+            ("output", output, result),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rms_norm_bf16_split(
+            input.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            cols as u32,
+            rows as u32,
+            eps,
+            f16_weight,
+            ctx.stream().handle(),
+        )
+    })
+}
+
 /// RMS normalization into caller-owned storage.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_into(
@@ -402,4 +503,43 @@ pub fn adaptive_rms_quant_f16_e4m3(
         ctx.device_id(),
         output,
     ))
+}
+
+/// BF16 activations with checkpoint FP16 RMSNorm weights.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rms_f16_weight_into(
+    ctx: &CudaContext,
+    residual: &CudaBuffer,
+    delta: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    cols: usize,
+    rows: usize,
+    eps: f32,
+) -> Result<()> {
+    require_finite("residual RMSNorm", &[eps])?;
+    let matrix = checked_bytes(DType::BF16, &[rows, cols], "residual RMSNorm")?;
+    let weight_size = checked_bytes(DType::BF16, &[cols], "residual RMSNorm")?;
+    require_buffers(
+        ctx,
+        "residual RMSNorm",
+        &[
+            ("residual", residual, matrix),
+            ("delta", delta, matrix),
+            ("weight", weight, weight_size),
+            ("output", output, matrix),
+        ],
+    )?;
+    check_cuda(unsafe {
+        ffi::apxinf_rms_norm_add_bf16_f16_weight(
+            residual.ptr(),
+            delta.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            cols as u32,
+            rows as u32,
+            eps,
+            ctx.stream().handle(),
+        )
+    })
 }

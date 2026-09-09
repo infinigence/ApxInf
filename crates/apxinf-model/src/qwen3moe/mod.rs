@@ -25,6 +25,8 @@ pub mod general;
 #[cfg(feature = "cuda")]
 pub mod runtime;
 #[cfg(feature = "cuda")]
+mod trace;
+#[cfg(feature = "cuda")]
 pub mod weights;
 
 pub use config::{Qwen3MoeConfig, Qwen3MoeQuantization};

@@ -3,6 +3,7 @@ mod fp8;
 mod plan;
 mod providers;
 pub mod w4a16;
+pub mod w4a16_marlin;
 mod w8a8;
 
 use std::cell::RefCell;
@@ -84,7 +85,9 @@ pub fn install_bf16_observer(
     BF16_OBSERVER.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err(Error::Other("a BF16 activation observer is already installed".into()));
+            return Err(Error::Other(
+                "a BF16 activation observer is already installed".into(),
+            ));
         }
         *slot = Some(observer);
         Ok(Bf16ObserverGuard)
@@ -172,6 +175,74 @@ pub fn write(
     ctx.cublas()
         .gemm(dtype, m, n, k, alpha, a, b, beta, output)
         .map_err(apxinf_core::Error::Cuda)
+}
+
+/// Contiguous BF16 `A[M,K] @ weight[N,K]^T` with FP32 accumulation and output.
+/// Retains checkpoint BF16 weights without rounding the result back to BF16.
+pub fn bf16_f32_output_into(
+    ctx: &CudaContext,
+    a: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    use crate::ffi;
+    use std::ffi::c_void;
+    if [m, n, k].iter().any(|&x| x > i32::MAX as usize) {
+        return Err(Error::Other(
+            "BF16_F32_GEMM dimensions exceed cuBLAS i32 range".into(),
+        ));
+    }
+    require_buffers(
+        ctx,
+        "BF16_F32_GEMM",
+        &[
+            (
+                "A",
+                a,
+                checked_bytes(DType::BF16, &[m, k], "BF16_F32_GEMM")?,
+            ),
+            (
+                "weight",
+                weight,
+                checked_bytes(DType::BF16, &[n, k], "BF16_F32_GEMM")?,
+            ),
+            (
+                "output",
+                output,
+                checked_bytes(DType::F32, &[m, n], "BF16_F32_GEMM")?,
+            ),
+        ],
+    )?;
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    // Row-major transpose identity: C^T[N,M] = weight[N,K] @ A^T[K,M].
+    unsafe {
+        ffi::check_cublas(ffi::cublasGemmEx(
+            ctx.cublas().raw(),
+            ffi::cublasOperation_t::CUBLAS_OP_T,
+            ffi::cublasOperation_t::CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha as *const f32 as *const c_void,
+            weight.ptr(),
+            ffi::cudaDataType_t::CUDA_R_16BF,
+            k as i32,
+            a.ptr(),
+            ffi::cudaDataType_t::CUDA_R_16BF,
+            k as i32,
+            &beta as *const f32 as *const c_void,
+            output.ptr(),
+            ffi::cudaDataType_t::CUDA_R_32F,
+            n as i32,
+            ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            -1,
+        ))
+    }
+    .map_err(Error::Cuda)
 }
 
 /// GEMM with explicit transpose and row-stride contracts.

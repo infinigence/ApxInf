@@ -5,6 +5,259 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    pub fn apxinf_silu_bf16_table(table: *mut c_void, stream: cudaStream_t) -> cudaError_t;
+    pub fn apxinf_silu_mul_rows_f16_lut(
+        gu: *const c_void,
+        output: *mut c_void,
+        table: *const c_void,
+        rows: i32,
+        inter: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_rope_table_128(
+        table: *mut c_void,
+        positions: i32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qk_norm_rope_append_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        qw: *const c_void,
+        kw: *const c_void,
+        oq: *mut c_void,
+        ok: *mut c_void,
+        ov: *mut c_void,
+        cache_k: *mut c_void,
+        cache_v: *mut c_void,
+        tokens: i32,
+        qheads: i32,
+        kvheads: i32,
+        capacity: i32,
+        offset: i32,
+        eps: f32,
+        rope: *const c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qk_norm_rope_append_cached_f16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        qw: *const c_void,
+        kw: *const c_void,
+        oq: *mut c_void,
+        ok: *mut c_void,
+        ov: *mut c_void,
+        cache_k: *mut c_void,
+        cache_v: *mut c_void,
+        tokens: i32,
+        qheads: i32,
+        kvheads: i32,
+        capacity: i32,
+        used_k: *const c_void,
+        eps: f32,
+        rope: *const c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_moe_permute_marlin(
+        ids: *const c_void,
+        counts: *mut c_void,
+        offsets: *mut c_void,
+        sorted: *mut c_void,
+        experts_ids: *mut c_void,
+        padded: *mut c_void,
+        slots: i32,
+        experts: i32,
+        tile: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_gqa_decode_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partial: *mut c_void,
+        out: *mut c_void,
+        position: *const c_void,
+        capacity: i32,
+        splits: i32,
+        kv_heads: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_gqa_decode_balanced_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partial: *mut c_void,
+        out: *mut c_void,
+        position: *const c_void,
+        capacity: i32,
+        splits: i32,
+        kv_heads: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_gqa_decode_vector_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partial: *mut c_void,
+        out: *mut c_void,
+        position: *const c_void,
+        capacity: i32,
+        splits: i32,
+        kv_heads: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_gqa_decode_mma_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        partial: *mut c_void,
+        out: *mut c_void,
+        position: *const c_void,
+        capacity: i32,
+        splits: i32,
+        kv_heads: i32,
+        tile: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qkv_partial_norm_rope_cache_bf16(
+        partial: *const c_void,
+        qw: *const c_void,
+        kw: *const c_void,
+        oq: *mut c_void,
+        ck: *mut c_void,
+        cv: *mut c_void,
+        position: *const c_void,
+        qheads: i32,
+        kvheads: i32,
+        capacity: i32,
+        splits: i32,
+        eps: f32,
+        table: *const c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_partial_residual_rms_bf16(
+        x: *mut c_void,
+        partial: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        count: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_partial_residual_rms_bf16_f16_weight(
+        x: *mut c_void,
+        partial: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        count: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_routed_residual_rms_bf16(
+        x: *mut c_void,
+        y: *const c_void,
+        ids: *const c_void,
+        rw: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        rows: i32,
+        topk: i32,
+        eps: f32,
+        input_f16: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_routed_residual_rms_bf16_f16_weight(
+        x: *mut c_void,
+        y: *const c_void,
+        ids: *const c_void,
+        rw: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        rows: i32,
+        topk: i32,
+        eps: f32,
+        input_f16: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_partial_residual_rms_rows_bf16(
+        x: *mut c_void,
+        partial: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        rows: i32,
+        count: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_partial_residual_rms_rows_bf16_f16_weight(
+        x: *mut c_void,
+        partial: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: i32,
+        rows: i32,
+        count: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_silu_mul_rows_f16_rounded(
+        gu: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        inter: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_marlin_prepare() -> cudaError_t;
+    pub fn apxinf_marlin_repack(
+        q: *const c_void,
+        z: *const c_void,
+        s: *const c_void,
+        out_q: *mut c_void,
+        out_z: *mut c_void,
+        out_s: *mut c_void,
+        k: i32,
+        n: i32,
+        experts: i32,
+        fused_silu: i32,
+        scratch: *mut c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_marlin_grouped(
+        input: *const c_void,
+        q: *const c_void,
+        z: *const c_void,
+        s: *const c_void,
+        ids: *const c_void,
+        experts: *const c_void,
+        padded: *const c_void,
+        out: *mut c_void,
+        temporary: *mut c_void,
+        locks: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        blocks: i32,
+        top_k: i32,
+        tile_m: i32,
+        use_f16: i32,
+        fused_silu: i32,
+        variant: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_evict_l2(
         buffer: *mut c_void,
         bytes: usize,
@@ -689,7 +942,39 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_rms_norm_bf16_split(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: u32,
+        rows: u32,
+        eps: f32,
+        f16_weight: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rms_norm_bf16_f16_weight(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: u32,
+        rows: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_rms_norm_add_bf16(
+        x_inout: *mut c_void,
+        delta: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        cols: u32,
+        rows: u32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rms_norm_add_bf16_f16_weight(
         x_inout: *mut c_void,
         delta: *const c_void,
         weight: *const c_void,
@@ -935,6 +1220,22 @@ extern "C" {
 
 // ── AutoAWQ INT4 weights and MoE routing (adapters/custom_kernels.cu) ────
 extern "C" {
+    pub fn apxinf_w4a16_grouped_bf16(
+        input: *const c_void,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        tiles: *const c_void,
+        output: *mut c_void,
+        tile_count: i32,
+        k: i32,
+        n: i32,
+        group: i32,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
     pub fn apxinf_awq_dequant_bf16(
         qweight: *const c_void,
@@ -970,6 +1271,95 @@ extern "C" {
         group_size: i32,
         splits: i32,
         slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_w4a16_gemv_blocked_partial_bf16(
+        x: *const c_void,
+        x_slot_stride: i64,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        expert_ids: *const c_void,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        slot_scale: *const c_void,
+        partial: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_w4a16_gemv_magic_partial_bf16(
+        x: *const c_void,
+        x_slot_stride: i64,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        expert_ids: *const c_void,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        slot_scale: *const c_void,
+        partial: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_w4a16_gemv_magic_blocked_partial_bf16(
+        x: *const c_void,
+        x_slot_stride: i64,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        expert_ids: *const c_void,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        slot_scale: *const c_void,
+        partial: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_w4a16_gemv_pair_blocked_partial_bf16(
+        x: *const c_void,
+        x_slot_stride: i64,
+        qweight: *const c_void,
+        qzeros: *const c_void,
+        scales: *const c_void,
+        expert_ids: *const c_void,
+        stride_q: i64,
+        stride_z: i64,
+        stride_s: i64,
+        slot_scale: *const c_void,
+        partial: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        group_size: i32,
+        splits: i32,
+        slots: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_w4a16_blocked_repack(
+        source: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        packed_cols: i32,
+        experts: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 

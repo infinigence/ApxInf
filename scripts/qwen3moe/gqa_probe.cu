@@ -1,0 +1,36 @@
+// Independent CPU FP64 softmax oracle for the GQA decode candidate.
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
+#include <vector>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include "../../crates/apxinf-cuda/kernels/custom/gqa_decode.cuh"
+#define CHECK(x) do{auto e=(x);if(e!=cudaSuccess){fprintf(stderr,"%s: %s\n",#x,cudaGetErrorString(e));exit(1);}}while(0)
+template<class T>T* upload(const std::vector<T>& x){T*p;CHECK(cudaMalloc(&p,x.size()*sizeof(T)));CHECK(cudaMemcpy(p,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice));return p;}
+int main(int argc,char** argv){
+  const int capacity=8192,heads=32,kvheads=4,splits=argc>1?atoi(argv[1]):16;
+  if(splits<1 || splits>128)return 2;
+  std::vector<__nv_bfloat16> q(heads*128),k(kvheads*capacity*128),v(k.size());
+  uint32_t seed=123;auto random=[&](){seed=seed*1664525+1013904223;return __float2bfloat16(float(int(seed>>16)-32768)/32768.f);};
+  for(auto&x:q)x=random();for(auto&x:k)x=random();for(auto&x:v)x=random();
+  auto dq=upload(q),dk=upload(k),dv=upload(v);__nv_bfloat16*out;float*partial;uint32_t*pos;
+  CHECK(cudaMalloc(&out,heads*128*2));CHECK(cudaMalloc(&partial,splits*heads*130*4));CHECK(cudaMalloc(&pos,4));
+  for(int length:{1,31,32,33,127,1024,4096,8192}){
+    uint32_t position=length-1;CHECK(cudaMemcpy(pos,&position,4,cudaMemcpyHostToDevice));
+    auto launch=[&](){gqa_decode_partial_bf16_kernel<<<dim3(kvheads,splits),256>>>(dq,dk,dv,partial,pos,capacity,splits,kvheads,1.f/sqrtf(128));gqa_decode_combine_bf16_kernel<<<heads,128>>>(partial,out,heads,splits);};
+    launch();CHECK(cudaDeviceSynchronize());
+    cudaEvent_t begin,end;CHECK(cudaEventCreate(&begin));CHECK(cudaEventCreate(&end));CHECK(cudaEventRecord(begin));for(int i=0;i<20;++i)launch();CHECK(cudaEventRecord(end));CHECK(cudaEventSynchronize(end));float ms;CHECK(cudaEventElapsedTime(&ms,begin,end));
+    std::vector<__nv_bfloat16> got(heads*128);CHECK(cudaMemcpy(got.data(),out,got.size()*2,cudaMemcpyDeviceToHost));
+    double maxerror=0;int bad=0;
+    for(int h=0;h<heads;++h){
+      std::vector<double> score(length);double maximum=-INFINITY,total=0;
+      for(int t=0;t<length;++t){double dot=0;for(int d=0;d<128;++d)dot+=double(__bfloat162float(q[h*128+d]))*__bfloat162float(k[((h/8)*capacity+t)*128+d]);score[t]=dot/sqrt(128.);maximum=fmax(maximum,score[t]);}
+      for(auto&x:score){x=exp(x-maximum);total+=x;}
+      for(int d=0;d<128;++d){double ref=0;for(int t=0;t<length;++t)ref+=score[t]*__bfloat162float(v[((h/8)*capacity+t)*128+d]);ref/=total;double x=__bfloat162float(got[h*128+d]),error=fabs(x-ref);maxerror=fmax(maxerror,error);if(!std::isfinite(x)||error>.003+.01*fabs(ref))++bad;}
+    }
+    printf("length=%d ms=%g max_error=%g bad=%d\n",length,ms/20,maxerror,bad);if(bad)return 2;CHECK(cudaEventDestroy(begin));CHECK(cudaEventDestroy(end));
+  }
+  CHECK(cudaFree(dq));CHECK(cudaFree(dk));CHECK(cudaFree(dv));CHECK(cudaFree(out));CHECK(cudaFree(partial));CHECK(cudaFree(pos));
+}

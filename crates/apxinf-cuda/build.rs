@@ -2,6 +2,8 @@ use std::env;
 
 #[path = "build_support/cuda_arch.rs"]
 mod cuda_arch;
+#[path = "build_support/nvcc_cache.rs"]
+mod nvcc_cache;
 
 use cuda_arch::{is_cutlass_sm100_family, select_cuda_arch, ArchSource};
 
@@ -122,6 +124,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
+    println!("cargo:rerun-if-changed=build_support/nvcc_cache.rs");
     // Only try to link CUDA if the toolkit is available.
     let cuda_path = env::var("CUDA_PATH")
         .or_else(|_| env::var("CUDA_HOME"))
@@ -265,6 +268,7 @@ fn main() {
                 std::path::Path::new(&adapters_dir).join("static_bf16_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("w8a8_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("custom_kernels.cu"),
+                std::path::Path::new(&adapters_dir).join("marlin_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("cublas_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("cublaslt_adapter.cu"),
             ];
@@ -287,7 +291,8 @@ fn main() {
             let cutlass_fmha = std::path::Path::new(&adapters_dir).join("cutlass_fmha_adapter.cu");
             let cutlass_gemm = std::path::Path::new(&adapters_dir).join("cutlass_fp8_adapter.cu");
             let cutlass_bf16 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_adapter.cu");
-            let cutlass_bf16_sm89 = std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
+            let cutlass_bf16_sm89 =
+                std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
@@ -454,6 +459,7 @@ fn main() {
                     format!("{cuda_path}/targets/aarch64-linux/include"),
                     format!("{cuda_path}/thor/targets/aarch64-linux/include"),
                 ];
+                let mut object_cache = nvcc_cache::NvccCache::new(&nvcc);
                 for entry in &kernel_files {
                     println!("cargo:rerun-if-changed={}", entry.display());
                     let stem = entry.file_stem().unwrap().to_string_lossy().to_string();
@@ -555,9 +561,17 @@ fn main() {
                             cmd.arg(format!("-I{}", include.display()));
                         }
                     }
-                    let status = cmd.status().expect("failed to run nvcc");
-
-                    assert!(status.success(), "nvcc failed for {}", entry.display());
+                    if entry.file_name().is_some_and(|name| {
+                        name == "marlin_adapter.cu" || name == "custom_kernels.cu"
+                    }) {
+                        cmd.arg("--expt-relaxed-constexpr");
+                        cmd.arg(format!("-I{kernels_dir}/marlin/csrc"));
+                    }
+                    object_cache
+                        .compile(&mut cmd, std::path::Path::new(&obj))
+                        .unwrap_or_else(|error| {
+                            panic!("nvcc failed for {}: {error}", entry.display())
+                        });
                 }
 
                 // Create a static library from all kernel objects

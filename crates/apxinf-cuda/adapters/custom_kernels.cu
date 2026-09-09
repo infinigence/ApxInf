@@ -5,18 +5,35 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
+// Reuse the exact U4 conversion without importing third-party headers into
+// the adapter's anonymous namespace.
+#define MARLIN_NAMESPACE_NAME apxinf_decode_pair
+#include "../kernels/marlin/csrc/moe/marlin_moe_wna16/kernel.h"
+#include "../kernels/marlin/csrc/quantization/gptq_marlin/dequant.h"
+
 namespace {
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
+#include "../kernels/custom/w4a16_blocked.cuh"
+#include "../kernels/custom/w4a16_magic.cuh"
+#include "../kernels/custom/w4a16_pair.cuh"
+#include "../kernels/custom/grouped_gemm.cuh"
+#include "../kernels/custom/qk_norm_rope.cuh"
+#include "../kernels/custom/decode_epilogues.cuh"
+#include "../kernels/custom/moe_permutation.cuh"
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/attention.cuh"
+#include "../kernels/custom/gqa_decode.cuh"
+#include "../kernels/custom/gqa_decode_mma.cuh"
 #include "../kernels/custom/normalization.cuh"
 #include "../kernels/custom/activation.cuh"
 #include "../kernels/custom/embedding.cuh"
@@ -464,6 +481,67 @@ int grid_stride_blocks(int64_t count, int threads, int cap) {
 }
 }  // namespace
 
+extern "C" cudaError_t apxinf_rope_table_128(void* table,int positions,float theta,cudaStream_t stream) {
+  if(positions<=0 || positions>INT32_MAX/64 || !std::isfinite(theta) || theta<=0)return cudaErrorInvalidValue;
+  rope_table_f32_kernel<<<256,256,0,stream>>>(static_cast<float*>(table),positions,theta);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qk_norm_rope_append_f16(const void* q,const void* k,
+    const void* v,const void* qw,const void* kw,void* oq,void* ok,void* ov,
+    void* cache_k,void* cache_v,int tokens,int qheads,int kvheads,int capacity,
+    int offset,float eps,const void* rope,cudaStream_t stream) {
+  if(tokens<=0 || qheads<=0 || kvheads<=0 || offset<0 || tokens>capacity-offset
+      || int64_t(tokens)*(int64_t(qheads)+kvheads)>INT32_MAX)return cudaErrorInvalidValue;
+  qk_norm_rope_append_f16_kernel<<<(tokens*(qheads+kvheads)+3)/4,128,0,stream>>>(
+      static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),
+      static_cast<const __nv_bfloat16*>(v),static_cast<const __nv_bfloat16*>(qw),
+      static_cast<const __nv_bfloat16*>(kw),static_cast<half*>(oq),static_cast<half*>(ok),
+      static_cast<half*>(ov),static_cast<__nv_bfloat16*>(cache_k),static_cast<__nv_bfloat16*>(cache_v),
+      tokens,qheads,kvheads,capacity,offset,eps,static_cast<const float*>(rope));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qk_norm_rope_append_cached_f16(const void* q,const void* k,
+    const void* v,const void* qw,const void* kw,void* oq,void* ok,void* ov,
+    void* cache_k,void* cache_v,int tokens,int qheads,int kvheads,int capacity,
+    const void* used_k,float eps,const void* rope,cudaStream_t stream) {
+  if(tokens<=0 || qheads<=0 || kvheads<=0 || used_k==nullptr || tokens>capacity
+      || int64_t(tokens)*(int64_t(qheads)+kvheads)>INT32_MAX)return cudaErrorInvalidValue;
+  qk_norm_rope_append_f16_kernel<true><<<(tokens*(qheads+kvheads)+3)/4,128,0,stream>>>(
+      static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),
+      static_cast<const __nv_bfloat16*>(v),static_cast<const __nv_bfloat16*>(qw),
+      static_cast<const __nv_bfloat16*>(kw),static_cast<half*>(oq),static_cast<half*>(ok),
+      static_cast<half*>(ov),static_cast<__nv_bfloat16*>(cache_k),static_cast<__nv_bfloat16*>(cache_v),
+      tokens,qheads,kvheads,capacity,0,eps,static_cast<const float*>(rope),static_cast<const int32_t*>(used_k));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_moe_permute_marlin(const void* ids,void* counts,void* offsets,
+    void* sorted,void* expert_ids,void* padded,int slots,int experts,int tile,cudaStream_t stream) {
+  if((tile!=32 && tile!=64) || slots<=0 || slots>INT32_MAX-128*64 || experts<=0 || experts>128)return cudaErrorInvalidValue;
+  moe_count_slots_kernel<<<experts,256,0,stream>>>(static_cast<const int32_t*>(ids),static_cast<int*>(counts),slots);
+  moe_scan_tiles_kernel<<<1,128,0,stream>>>(static_cast<const int*>(counts),static_cast<int*>(offsets),
+      static_cast<int32_t*>(expert_ids),static_cast<int*>(padded),experts,tile);
+  moe_scatter_slots_kernel<<<experts,128,0,stream>>>(static_cast<const int32_t*>(ids),
+      static_cast<const int*>(counts),static_cast<const int*>(offsets),static_cast<int32_t*>(sorted),slots);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_grouped_bf16(
+    const void* input, const void* qweight, const void* qzeros, const void* scales,
+    const void* tiles, void* output, int tile_count, int k, int n, int group,
+    int64_t sq, int64_t sz, int64_t ss, cudaStream_t stream) {
+  if (tile_count <= 0 || k <= 0 || n <= 0 || n % 8 || group != 128 || k % 128)
+    return cudaErrorInvalidValue;
+  w4a16_grouped_bf16_kernel<<<dim3(tile_count, (n + 127) / 128), 128, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input), static_cast<const int32_t*>(qweight),
+      static_cast<const int32_t*>(qzeros), static_cast<const half*>(scales),
+      static_cast<const int32_t*>(tiles), static_cast<__nv_bfloat16*>(output),
+      k, n, group, sq, sz, ss);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_awq_dequant_bf16(
     const void* qweight, const void* qzeros, const void* scales, void* output,
     int rows, int packed_cols, int group_size, int experts, int64_t stride_q,
@@ -501,6 +579,116 @@ extern "C" cudaError_t apxinf_w4a16_gemv_partial_bf16(
       static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
       stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
       static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_gemv_blocked_partial_bf16(
+    const void* x, int64_t x_slot_stride, const void* qweight, const void* qzeros,
+    const void* scales, const void* expert_ids, int64_t stride_q, int64_t stride_z,
+    int64_t stride_s, const void* slot_scale, void* partial, int rows,
+    int packed_cols, int group_size, int splits, int slots, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || splits <= 0 ||
+      slots <= 0 || rows % group_size != 0 || rows % 4 || packed_cols % 32)
+    return cudaErrorInvalidValue;
+  // Rows per block: ceil(rows/splits) rounded up to a multiple of 8 warps.
+  int rows_per_block = (rows + splits - 1) / splits;
+  rows_per_block = (rows_per_block + 7) / 8 * 8;
+  const int n_tiles = (packed_cols * 8 + 255) / 256;
+  const dim3 grid(n_tiles, splits, slots);
+  const size_t shared = static_cast<size_t>(rows_per_block) * sizeof(float) +
+                        8 * 256 * sizeof(float);
+  w4a16_gemv_blocked_partial_kernel<<<grid, 256, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), x_slot_stride,
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
+      stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
+      static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_gemv_magic_partial_bf16(
+    const void* x, int64_t x_slot_stride, const void* qweight, const void* qzeros,
+    const void* scales, const void* expert_ids, int64_t stride_q, int64_t stride_z,
+    int64_t stride_s, const void* slot_scale, void* partial, int rows,
+    int packed_cols, int group_size, int splits, int slots, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || splits <= 0 ||
+      slots <= 0 || rows % group_size != 0)
+    return cudaErrorInvalidValue;
+  // Rows per block: ceil(rows/splits) rounded up to a multiple of 8 warps.
+  int rows_per_block = (rows + splits - 1) / splits;
+  rows_per_block = (rows_per_block + 7) / 8 * 8;
+  const int n_tiles = (packed_cols * 8 + 255) / 256;
+  const dim3 grid(n_tiles, splits, slots);
+  const size_t shared = static_cast<size_t>(rows_per_block) * sizeof(float) +
+                        8 * 256 * sizeof(float);
+  w4a16_gemv_magic_kernel<false><<<grid, 256, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), x_slot_stride,
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
+      stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
+      static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_gemv_magic_blocked_partial_bf16(
+    const void* x, int64_t x_slot_stride, const void* qweight, const void* qzeros,
+    const void* scales, const void* expert_ids, int64_t stride_q, int64_t stride_z,
+    int64_t stride_s, const void* slot_scale, void* partial, int rows,
+    int packed_cols, int group_size, int splits, int slots, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || splits <= 0 ||
+      slots <= 0 || rows % group_size != 0 || rows % 4 || packed_cols % 32)
+    return cudaErrorInvalidValue;
+  // Rows per block: ceil(rows/splits) rounded up to a multiple of 8 warps.
+  int rows_per_block = (rows + splits - 1) / splits;
+  rows_per_block = (rows_per_block + 7) / 8 * 8;
+  const int n_tiles = (packed_cols * 8 + 255) / 256;
+  const dim3 grid(n_tiles, splits, slots);
+  const size_t shared = static_cast<size_t>(rows_per_block) * sizeof(float) +
+                        8 * 256 * sizeof(float);
+  w4a16_gemv_magic_kernel<true><<<grid, 256, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), x_slot_stride,
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
+      stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
+      static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_gemv_pair_blocked_partial_bf16(
+    const void* x, int64_t x_slot_stride, const void* qweight, const void* qzeros,
+    const void* scales, const void* expert_ids, int64_t stride_q, int64_t stride_z,
+    int64_t stride_s, const void* slot_scale, void* partial, int rows,
+    int packed_cols, int group_size, int splits, int slots, cudaStream_t stream) {
+  if (rows <= 0 || packed_cols <= 0 || group_size <= 0 || splits <= 0 ||
+      slots <= 0 || rows % group_size != 0 || rows % 4 || packed_cols % 32)
+    return cudaErrorInvalidValue;
+  // Rows per block: ceil(rows/splits) rounded up to a multiple of 8 warps.
+  int rows_per_block = (rows + splits - 1) / splits;
+  rows_per_block = (rows_per_block + 7) / 8 * 8;
+  const int n_tiles = (packed_cols * 8 + 255) / 256;
+  const dim3 grid(n_tiles, splits, slots);
+  const size_t shared = static_cast<size_t>(rows_per_block) * sizeof(float) +
+                        8 * 256 * sizeof(float);
+  // Group 128 is the checkpoint layout. Keep a generic specialization for
+  // other valid groups; both preserve the original FP32 reduction order.
+  const auto kernel = group_size == 128
+      ? w4a16_gemv_pair_kernel<true, false, 128, true>
+      : w4a16_gemv_pair_kernel<true, false, 0, true>;
+  kernel<<<grid, 256, shared, stream>>>(
+      static_cast<const __nv_bfloat16*>(x), x_slot_stride,
+      static_cast<const int32_t*>(qweight), static_cast<const int32_t*>(qzeros),
+      static_cast<const half*>(scales), static_cast<const int32_t*>(expert_ids),
+      stride_q, stride_z, stride_s, static_cast<const float*>(slot_scale),
+      static_cast<float*>(partial), rows, packed_cols, group_size, rows_per_block);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_w4a16_blocked_repack(const void* source,void* output,
+    int rows,int packed_cols,int experts,cudaStream_t stream) {
+  if(rows<=0 || rows%128 || packed_cols<=0 || packed_cols%32 || experts<=0)
+    return cudaErrorInvalidValue;
+  w4a16_blocked_repack_kernel<<<256,256,0,stream>>>(static_cast<const int32_t*>(source),
+      static_cast<int4*>(output),rows,packed_cols,experts);
   return cudaGetLastError();
 }
 
@@ -585,5 +773,173 @@ extern "C" cudaError_t apxinf_convert_f16_bf16(
   if (count <= 0) return cudaErrorInvalidValue;
   convert_f16_to_bf16_kernel<<<grid_stride_blocks(count, 256, 4096), 256, 0, stream>>>(
       static_cast<const half*>(input), static_cast<__nv_bfloat16*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_gqa_decode_bf16(const void* q,const void* k,const void* v,
+    void* partial,void* out,const void* position,int capacity,int splits,int kv_heads,float scale,cudaStream_t stream) {
+  if(capacity<=0 || capacity==INT32_MAX || splits<=0 || splits>128 || kv_heads<=0 || kv_heads>8191)return cudaErrorInvalidValue;
+  gqa_decode_partial_bf16_kernel<<<dim3(kv_heads,splits),256,0,stream>>>(
+    static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),static_cast<const __nv_bfloat16*>(v),
+    static_cast<float*>(partial),static_cast<const uint32_t*>(position),capacity,splits,kv_heads,scale);
+  gqa_decode_combine_bf16_kernel<<<kv_heads*8,128,0,stream>>>(static_cast<const float*>(partial),
+    static_cast<__nv_bfloat16*>(out),kv_heads*8,splits);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_gqa_decode_vector_bf16(const void* q,const void* k,const void* v,
+    void* partial,void* out,const void* position,int capacity,int splits,int kv_heads,float scale,cudaStream_t stream) {
+  if(capacity<=0 || capacity>=INT32_MAX-128 || splits<=0 || splits>128 || kv_heads<=0 || kv_heads>8191)return cudaErrorInvalidValue;
+  if((reinterpret_cast<uintptr_t>(q)|reinterpret_cast<uintptr_t>(k)|reinterpret_cast<uintptr_t>(v))&15)return cudaErrorInvalidValue;
+  gqa_decode_vector_bf16_kernel<<<dim3(kv_heads,splits),256,0,stream>>>(
+    static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),static_cast<const __nv_bfloat16*>(v),
+    static_cast<float*>(partial),static_cast<const uint32_t*>(position),capacity,splits,kv_heads,scale);
+  gqa_decode_combine_bf16_kernel<<<kv_heads*8,128,0,stream>>>(static_cast<const float*>(partial),
+    static_cast<__nv_bfloat16*>(out),kv_heads*8,splits);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_gqa_decode_balanced_bf16(const void* q,const void* k,const void* v,
+    void* partial,void* out,const void* position,int capacity,int splits,int kv_heads,float scale,cudaStream_t stream) {
+  if(capacity<=0 || capacity>=INT32_MAX-128 || splits<=0 || splits>128 || kv_heads<=0 || kv_heads>8191)return cudaErrorInvalidValue;
+  if((reinterpret_cast<uintptr_t>(q)|reinterpret_cast<uintptr_t>(k)|reinterpret_cast<uintptr_t>(v))&15)return cudaErrorInvalidValue;
+  gqa_decode_vector_bf16_kernel<true><<<dim3(kv_heads,splits),256,0,stream>>>(
+    static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),static_cast<const __nv_bfloat16*>(v),
+    static_cast<float*>(partial),static_cast<const uint32_t*>(position),capacity,splits,kv_heads,scale);
+  gqa_decode_combine_bf16_kernel<<<kv_heads*8,128,0,stream>>>(static_cast<const float*>(partial),
+    static_cast<__nv_bfloat16*>(out),kv_heads*8,splits);
+  return cudaGetLastError();
+}
+
+// Tile32/64 use at most 44,672 dynamic shared bytes, below the default
+// 48-KiB limit. No attribute mutation occurs inside graph capture.
+extern "C" cudaError_t apxinf_gqa_decode_mma_bf16(const void* q,const void* k,const void* v,
+    void* partial,void* out,const void* position,int capacity,int splits,int kv_heads,int tile,float scale,cudaStream_t stream) {
+  if(capacity<=0 || capacity>=INT32_MAX-128 || splits<=0 || splits>128 || kv_heads<=0 || kv_heads>8191 || (tile!=32 && tile!=64))return cudaErrorInvalidValue;
+  const int shared=8*136*2+tile*136*2+tile*128*2+8*(tile+4)*4+2*8*(tile+8)*2+8*132*4;
+  auto kernel=tile==64?gqa_decode_mma_bf16_kernel<64>:gqa_decode_mma_bf16_kernel<32>;
+  kernel<<<dim3(kv_heads,splits),256,shared,stream>>>(
+    static_cast<const __nv_bfloat16*>(q),static_cast<const __nv_bfloat16*>(k),static_cast<const __nv_bfloat16*>(v),
+    static_cast<float*>(partial),static_cast<const uint32_t*>(position),capacity,splits,kv_heads,scale);
+  auto status=cudaGetLastError();if(status!=cudaSuccess)return status;
+  gqa_decode_combine_bf16_kernel<<<kv_heads*8,128,0,stream>>>(static_cast<const float*>(partial),
+    static_cast<__nv_bfloat16*>(out),kv_heads*8,splits);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qkv_partial_norm_rope_cache_bf16(const void* partial,
+    const void* qw,const void* kw,void* oq,void* ck,void* cv,const void* position,
+    int qheads,int kvheads,int capacity,int splits,float eps,const void* table,cudaStream_t stream) {
+  if(qheads<=0 || kvheads<=0 || int64_t(qheads)+2*kvheads>INT32_MAX/128 || capacity<=0 || splits<=0)return cudaErrorInvalidValue;
+  qkv_partial_norm_rope_cache_bf16_kernel<<<(qheads+kvheads+3)/4,128,0,stream>>>(
+    static_cast<const float*>(partial),static_cast<const __nv_bfloat16*>(qw),static_cast<const __nv_bfloat16*>(kw),
+    static_cast<__nv_bfloat16*>(oq),static_cast<__nv_bfloat16*>(ck),static_cast<__nv_bfloat16*>(cv),
+    static_cast<const uint32_t*>(position),qheads,kvheads,capacity,splits,eps,static_cast<const float*>(table));
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_partial_residual_rms_bf16(void* x,const void* partial,
+    const void* weight,void* output,int cols,int count,float eps,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || count<=0)return cudaErrorInvalidValue;
+  if(cols>=2048) {
+  partial_residual_rms_bf16_kernel<true><<<1,1024,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+    static_cast<const float*>(partial),static_cast<const __nv_bfloat16*>(weight),
+    static_cast<__nv_bfloat16*>(output),cols,1,count,eps);
+  } else {
+  partial_residual_rms_bf16_kernel<<<1,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+    static_cast<const float*>(partial),static_cast<const __nv_bfloat16*>(weight),
+    static_cast<__nv_bfloat16*>(output),cols,1,count,eps);
+  }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_partial_residual_rms_rows_bf16(void* x,const void* partial,
+    const void* weight,void* output,int cols,int rows,int count,float eps,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || rows<=0 || count<=0 || !(eps>0) || !isfinite(eps) ||
+     int64_t(rows)*cols>UINT32_MAX)return cudaErrorInvalidValue;
+  // Multi-row prefill favors one 256-thread block per row. Decode keeps its
+  // separately tuned 1024-thread load and original 256-thread reduction tree.
+  partial_residual_rms_bf16_kernel<<<rows,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+      static_cast<const float*>(partial),static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output),cols,rows,count,eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_routed_residual_rms_bf16(void* x,const void* y,const void* ids,const void* rw,
+    const void* weight,void* output,int cols,int rows,int topk,float eps,int input_f16,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || rows<=0 || topk<=0)return cudaErrorInvalidValue;
+  const bool vector = (cols==2048 || cols==4096)
+      && (reinterpret_cast<uintptr_t>(x)&15)==0 && (reinterpret_cast<uintptr_t>(y)&15)==0;
+  auto selected = input_f16 ? (vector ? routed_residual_rms_vector_kernel<true> : routed_residual_rms_bf16_kernel<true>)
+      : (vector ? routed_residual_rms_vector_kernel<false> : routed_residual_rms_bf16_kernel<false>);
+  selected<<<rows,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+      static_cast<const __nv_bfloat16*>(y),static_cast<const int32_t*>(ids),static_cast<const float*>(rw),
+      static_cast<const __nv_bfloat16*>(weight),static_cast<__nv_bfloat16*>(output),cols,rows,topk,eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_silu_mul_rows_f16_rounded(const void* gu,void* output,int rows,int inter,cudaStream_t stream) {
+  if(rows<=0 || inter<=0)return cudaErrorInvalidValue;
+  int64_t count=(int64_t(rows)*inter+255)/256;int blocks=int(count<256?count:256);
+  silu_mul_rows_f16_rounded_kernel<<<blocks,256,0,stream>>>(static_cast<const half*>(gu),static_cast<half*>(output),rows,inter);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_silu_bf16_table(void* table,cudaStream_t stream) {
+  silu_bf16_table_kernel<<<256,256,0,stream>>>(static_cast<float*>(table));return cudaGetLastError();
+}
+extern "C" cudaError_t apxinf_silu_mul_rows_f16_lut(const void* gu,void* output,
+    const void* table,int rows,int inter,cudaStream_t stream) {
+  if(rows<=0 || inter<=0)return cudaErrorInvalidValue;
+  int blocks=int(std::min<int64_t>(256,(int64_t(rows)*inter+255)/256));
+  if(inter==768 && rows<=(INT32_MAX-65536)/96
+      && (reinterpret_cast<uintptr_t>(gu)&15)==0 && (reinterpret_cast<uintptr_t>(output)&15)==0) {
+    silu_mul_rows_f16_lut_768_kernel<<<blocks,256,0,stream>>>(static_cast<const half*>(gu),
+        static_cast<half*>(output),static_cast<const float*>(table),rows);
+  } else {
+    silu_mul_rows_f16_lut_kernel<<<blocks,256,0,stream>>>(static_cast<const half*>(gu),
+        static_cast<half*>(output),static_cast<const float*>(table),rows,inter);
+  }
+  return cudaGetLastError();
+}
+
+// BF16 activations with checkpoint FP16 RMSNorm weights.
+extern "C" cudaError_t apxinf_partial_residual_rms_bf16_f16_weight(void* x,const void* partial,
+    const void* weight,void* output,int cols,int count,float eps,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || count<=0)return cudaErrorInvalidValue;
+  if(cols>=2048) {
+  partial_residual_rms_bf16_kernel<true,false,half><<<1,1024,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+    static_cast<const float*>(partial),static_cast<const half*>(weight),
+    static_cast<__nv_bfloat16*>(output),cols,1,count,eps);
+  } else {
+  partial_residual_rms_bf16_kernel<false,false,half><<<1,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+    static_cast<const float*>(partial),static_cast<const half*>(weight),
+    static_cast<__nv_bfloat16*>(output),cols,1,count,eps);
+  }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_partial_residual_rms_rows_bf16_f16_weight(void* x,const void* partial,
+    const void* weight,void* output,int cols,int rows,int count,float eps,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || rows<=0 || count<=0 || !(eps>0) || !isfinite(eps) ||
+     int64_t(rows)*cols>UINT32_MAX)return cudaErrorInvalidValue;
+  // Multi-row prefill favors one 256-thread block per row. Decode keeps its
+  // separately tuned 1024-thread load and original 256-thread reduction tree.
+  partial_residual_rms_bf16_kernel<false,false,half><<<rows,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+      static_cast<const float*>(partial),static_cast<const half*>(weight),
+      static_cast<__nv_bfloat16*>(output),cols,rows,count,eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_routed_residual_rms_bf16_f16_weight(void* x,const void* y,const void* ids,const void* rw,
+    const void* weight,void* output,int cols,int rows,int topk,float eps,int input_f16,cudaStream_t stream) {
+  if(cols<=0 || cols>8192 || rows<=0 || topk<=0)return cudaErrorInvalidValue;
+  const bool vector = (cols==2048 || cols==4096)
+      && (reinterpret_cast<uintptr_t>(x)&15)==0 && (reinterpret_cast<uintptr_t>(y)&15)==0;
+  auto selected = input_f16 ? (vector ? routed_residual_rms_vector_kernel<true,half> : routed_residual_rms_bf16_kernel<true,half>)
+      : (vector ? routed_residual_rms_vector_kernel<false,half> : routed_residual_rms_bf16_kernel<false,half>);
+  selected<<<rows,256,cols*4,stream>>>(static_cast<__nv_bfloat16*>(x),
+      static_cast<const __nv_bfloat16*>(y),static_cast<const int32_t*>(ids),static_cast<const float*>(rw),
+      static_cast<const half*>(weight),static_cast<__nv_bfloat16*>(output),cols,rows,topk,eps);
   return cudaGetLastError();
 }

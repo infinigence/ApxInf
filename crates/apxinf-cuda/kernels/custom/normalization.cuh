@@ -37,8 +37,10 @@ __global__ void rms_norm_f32_kernel(
 // where a 2048-wide row launched only 8 blocks and each thread re-read the
 // whole row). Mirrors rms_norm_add_bf16's reduction minus the residual.
 
+template<typename NormWeight=__nv_bfloat16, typename NormOutput=__nv_bfloat16,
+         bool SplitOutput=false>
 __global__ void rms_norm_bf16_kernel(
-    const __nv_bfloat16* input, const __nv_bfloat16* weight, __nv_bfloat16* output,
+    const __nv_bfloat16* input, const NormWeight* weight, NormOutput* output,
     uint32_t cols, uint32_t rows, float eps)
 {
     uint32_t row = blockIdx.x;
@@ -79,8 +81,18 @@ __global__ void rms_norm_bf16_kernel(
 
     // Phase 3: write the normed output from shared memory.
     for (uint32_t i = tid; i < cols; i += blockDim.x) {
-        float w = __bfloat162float(weight[i]);
-        output[offset + i] = __float2bfloat16(x_buf[i] * rms * w);
+        float w = static_cast<float>(weight[i]);
+        float value = x_buf[i] * rms * w;
+        if constexpr (SplitOutput) {
+            // Two BF16 rows represent one unrounded normalized row. Keep
+            // weights unchanged; the second row carries input-rounding error.
+            const auto high = __float2bfloat16(value);
+            output[2 * offset + i] = high;
+            output[2 * offset + cols + i] =
+                __float2bfloat16(value - __bfloat162float(high));
+        } else {
+            output[offset + i] = static_cast<NormOutput>(value);
+        }
     }
 }
 
@@ -254,6 +266,5 @@ __global__ void ada_rms_norm_bf16_kernel(
         __bfloat162float(style[cols + col]));
   }
 }
-
 
 

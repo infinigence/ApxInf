@@ -38,6 +38,23 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    #[cfg(any(apxinf_fa2_f16_sm100, apxinf_fa2_sm80))]
+    pub fn apxinf_static_fa2_f16_causal_cached_hdim128(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        softmax_lse: *mut c_void,
+        batches: i32,
+        query_tokens: i32,
+        key_tokens: i32,
+        used_k: *const c_void,
+        query_heads: i32,
+        kv_heads: i32,
+        softmax_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     #[cfg(apxinf_fa2_direct_e4m3_sm100)]
     pub fn apxinf_static_fa2_f16_direct_e4m3_522(
         q: *const c_void,
