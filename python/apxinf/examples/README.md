@@ -66,7 +66,7 @@ from the checkpoint weights (currently deployed WallOSS checkpoints may be eithe
 width is used. Prefix trimming is valid only when the selected normalizer and the
 checkpoint's leading-channel layout match the target robot. Non-prefix layouts
 need a body-aware adapter around the policy — see
-[apxinf-robo](https://github.com/team-mz/APXinf-robo), which pairs named bodies
+[apxinf-robo](https://github.com/RLinf/APXinf-robo), which pairs named bodies
 with named wire dialects — rather than a different `--action-dim`.
 
 WallOSS state-token binning is likewise loaded from checkpoint metadata

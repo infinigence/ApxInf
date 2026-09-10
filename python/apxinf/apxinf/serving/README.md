@@ -8,7 +8,7 @@ outer layer uses to splice its own robot steps into the pipelines.
 What this guide deliberately does *not* cover: named robots, simulator glue, and
 benchmark rollouts. A body's DoF layout and a dataset's wire keys are not
 properties of the weights, so they live one layer up, in
-[apxinf-robo](https://github.com/team-mz/APXinf-robo). See its
+[apxinf-robo](https://github.com/RLinf/APXinf-robo). See its
 `doc/adding-an-embodiment.md` for registering a robot and `apxinf-robo
 eval-libero` for the LIBERO protocol.
 

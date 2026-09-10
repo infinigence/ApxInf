@@ -262,7 +262,7 @@ so the client can assert it rather than guess.
 Named robots — `franka_libero`, `unitree_g1` — are the layer *above* this one:
 a body (DoF layout, delta mask, gripper convention) paired with a dialect, plus
 the simulator glue to drive them. That lives in
-[apxinf-robo](https://github.com/team-mz/APXinf-robo), which composes over this
+[apxinf-robo](https://github.com/RLinf/APXinf-robo), which composes over this
 engine and adds nothing to it:
 
 ```bash
@@ -445,7 +445,7 @@ That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
 - Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
   and the summary reports success rate alongside per-segment latency.
 
-[apxinf-robo](https://github.com/team-mz/APXinf-robo) runs the same protocol from
+[apxinf-robo](https://github.com/RLinf/APXinf-robo) runs the same protocol from
 the downstream repository, where LIBERO is one environment among several. This
 copy exists so an engine change can be regressed against ApxInf's own published
 numbers without a checkout that takes ApxInf as a submodule.

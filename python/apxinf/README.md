@@ -152,7 +152,7 @@ required, structural typing only.
 
 ## lerobot interop
 
-Lives in [apxinf-robo](https://github.com/team-mz/APXinf-robo), not here: wrapping
+Lives in [apxinf-robo](https://github.com/RLinf/APXinf-robo), not here: wrapping
 a `Policy` in lerobot's surface means translating *its* robot/camera/dataset-feature
 vocabulary, which is a property of the robot stack rather than of the checkpoint.
 `apxinf_robo.integrations.lerobot.ApxInfPolicy` wraps any `Policy` satisfying the

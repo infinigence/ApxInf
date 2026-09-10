@@ -74,7 +74,7 @@ out a repository that takes ApxInf as a submodule.
 
 ### Capturing out of process
 
-[apxinf-robo](https://github.com/team-mz/APXinf-robo) does the same capture from
+[apxinf-robo](https://github.com/RLinf/APXinf-robo) does the same capture from
 the other side of the seam, writing the NPZ directory `--input-dir` reads:
 
 ```bash
