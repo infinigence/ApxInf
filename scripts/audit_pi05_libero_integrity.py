@@ -2,7 +2,7 @@
 """Strictly audit a 10x10 PI0.5 LIBERO campaign and its BF16 parity gate.
 
 Cross-checks two artifacts: the ``apxinf.pi05.libero-eval.v1`` ledger written by
-``apxinf-robo eval-libero``, and the ``apxinf.pi05.libero-calibration-sweep.v1``
+``scripts/eval_libero.py``, and the ``apxinf.pi05.libero-calibration-sweep.v1``
 parity report written by ``scripts/sweep_pi05_libero_calibration.py`` here. Pure
 JSON validation — it imports neither LIBERO nor the engine.
 """

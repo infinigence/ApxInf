@@ -70,7 +70,7 @@ VIEW_SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 #: fall back to the model's own slot names, and the prompt to the one spelling
 #: openpi's wire has always used. They are published so that a caller *can*
 #: address the fallback contract by name instead of restating string literals,
-#: and so an adaptation layer (``apxinf-robo``) can assert against them.
+#: and so an adaptation layer can assert against them.
 #:
 #: ``CANONICAL_STATE_KEY`` is deliberately **not** a default anywhere. State has
 #: no safe fallback: a wrong camera key raises on the first inference, a wrong

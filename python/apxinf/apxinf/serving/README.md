@@ -7,10 +7,7 @@ outer layer uses to splice its own robot steps into the pipelines.
 
 What this guide deliberately does *not* cover: named robots, simulator glue, and
 benchmark rollouts. A body's DoF layout and a dataset's wire keys are not
-properties of the weights, so they live one layer up, in
-[apxinf-robo](https://github.com/RLinf/APXinf-robo). See its
-`doc/adding-an-embodiment.md` for registering a robot and `apxinf-robo
-eval-libero` for the LIBERO protocol.
+properties of the weights, so they belong one layer up, outside the engine.
 
 Paths below are relative to the repo root. The engine binding (`apxinf_py`) is
 built per GPU architecture — see the root [README](../../../../README.md) for the
@@ -87,8 +84,8 @@ python python/apxinf/examples/openpi_server.py \
   pushed to every client on connect (see §3), so it is asserted rather than
   assumed.
 
-`apxinf-robo serve --robot <name> --model-dir <ckpt>` is the same server with the
-keys and action width supplied from a named preset instead of the command line.
+An outer layer can wrap this same server and supply the keys and action width
+from a named preset instead of the command line.
 
 ## 3. Call it (stock `openpi_client`, unmodified)
 
@@ -137,9 +134,7 @@ ApxInf `ProcessorStep` and splice it onto a policy through
 [`ComposablePolicy.with_adapter`](../policies/base.py).
 
 This section documents the **engine seam**. The steps themselves belong to
-whoever owns the body — in practice `apxinf_robo.processors.<robot>`, with a
-worked Unitree G1 example and a registration walkthrough in that repo's
-`doc/adding-an-embodiment.md`.
+whoever owns the body, and live outside this repository.
 
 ### 4.1 OpenPI transform → ApxInf equivalent
 

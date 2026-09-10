@@ -19,9 +19,9 @@ why they live here rather than downstream.
 **Wire keys are yours to name.** ``--image-keys`` / ``--state-key`` say what your
 client sends; omit them and the policy falls back to its own view-slot vocabulary
 (``base_0_rgb``, ``left_wrist_0_rgb``, ...), which is a neutral fallback rather
-than a contract. If you want *named* robot contracts — a preset that fixes the
-keys, the action width, and the pre/post steps together and cross-checks them
-against the checkpoint — that is ``apxinf-robo``, which builds on this.
+than a contract. Binding those keys, the action width and the pre/post steps
+together into a *named* robot contract, and cross-checking it against the
+checkpoint, is a layer above this server rather than part of it.
 
 **State** is dropped unless ``--discrete-state`` is passed, which discretizes it
 into the prompt (normalized to [-1, 1] from ``norm_stats``) and then makes

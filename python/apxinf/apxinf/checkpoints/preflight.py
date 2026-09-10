@@ -10,11 +10,11 @@ What is deliberately *not* here is the other half: whether those facts match the
 body being served. "This checkpoint's actions are 7 wide" is a checkpoint fact;
 "...but this robot is 16-DoF" is a claim about a robot, and the engine has no
 robots. A caller that has an expected width compares it against
-:attr:`CheckpointReport.norm` and emits its own :class:`Finding` — that is what
-``apxinf-robo``'s ``check_checkpoint`` does, and why :data:`FAIL` / :data:`WARN`
-/ :data:`INFO`, :class:`Finding`, :func:`sort_findings` and
-:func:`format_findings` are exported: the two halves have to produce one report,
-so the vocabulary lives on the engine side and the robot side borrows it.
+:attr:`CheckpointReport.norm` and emits its own :class:`Finding` -- which is why
+:data:`FAIL` / :data:`WARN` / :data:`INFO`, :class:`Finding`,
+:func:`sort_findings` and :func:`format_findings` are exported: the checkpoint
+half and the body half have to produce one report, so the vocabulary lives on
+the engine side and the caller borrows it.
 
 Model view-count validation remains in
 :class:`~apxinf.policies.impls.pi05.Pi05Policy`; normalization value validation

@@ -6,11 +6,10 @@ Follow [the porting workflow](porting-workflow.md) for evidence and acceptance,
 dependencies, [Model Execution Wiring](model-execution-wiring.md) for composing
 the maintained device path, and [the kernel guide](adding-new-kernels.md) for
 genuine backend gaps. For a VLA, the *body* side of deployment — which
-observation keys a client sends, how state is routed, how to register a new robot
-— lives in [apxinf-robo](https://github.com/RLinf/APXinf-robo)
-(`doc/adding-an-embodiment.md`); none of it is needed to land a model here. A
-policy registered in `apxinf.policies` is servable on its own, with the caller
-naming its own wire keys.
+observation keys a client sends, how state is routed, how a named robot fixes
+them together — is not needed to land a model here. A policy registered in
+`apxinf.policies` is servable on its own, with the caller naming its own wire
+keys.
 
 ## Start with a separate model directory
 

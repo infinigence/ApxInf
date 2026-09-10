@@ -152,12 +152,11 @@ required, structural typing only.
 
 ## lerobot interop
 
-Lives in [apxinf-robo](https://github.com/RLinf/APXinf-robo), not here: wrapping
-a `Policy` in lerobot's surface means translating *its* robot/camera/dataset-feature
-vocabulary, which is a property of the robot stack rather than of the checkpoint.
-`apxinf_robo.integrations.lerobot.ApxInfPolicy` wraps any `Policy` satisfying the
-contract above, so a lerobot user keeps their robot, cameras, feature plumbing and
-action dispatch and swaps only the policy.
+Not here: wrapping a `Policy` in lerobot's surface means translating *its*
+robot/camera/dataset-feature vocabulary, which is a property of the robot stack
+rather than of the checkpoint. An adaptor built one layer up wraps any `Policy`
+satisfying the contract above, so a lerobot user keeps their robot, cameras,
+feature plumbing and action dispatch and swaps only the policy.
 
 Two notes that are the engine's to make, because they are about what this package
 does and does not run:

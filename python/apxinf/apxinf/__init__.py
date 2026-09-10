@@ -36,8 +36,8 @@ keys through ``image_keys=`` / ``state_key=`` / ``prompt_key=`` and wraps its ow
 body steps through :meth:`~apxinf.policies.base.ComposablePolicy.with_adapter`.
 :data:`CANONICAL_IMAGE_KEYS` / :data:`CANONICAL_STATE_KEY` /
 :data:`CANONICAL_PROMPT_KEY` name the neutral fallback for callers that want to
-address it without restating string literals. The robot/dataset/simulator
-adaptation layer built on top of these seams is ``apxinf-robo``.
+address it without restating string literals. A robot/dataset/simulator
+adaptation layer builds on top of these seams; none of it lives here.
 
 ``import apxinf`` never touches CUDA: only ``apxinf.Model`` (accessed lazily) and a
 policy's ``from_pretrained`` pull in the ``apxinf_py`` binding.

@@ -9,8 +9,8 @@ connects to it; see ``openpi_client.py`` for the other end.
 The wire keys are the caller's to name: this engine holds no dataset's dialect,
 so ``--image-keys`` / ``--state-key`` say what your client sends. Omit them and
 the policy falls back to its own view-slot vocabulary (``base_0_rgb``, ...),
-which is a fallback rather than a contract. A deployment that wants named robot
-contracts, presets, and simulator glue wants ``apxinf-robo`` on top of this.
+which is a fallback rather than a contract. Named robot contracts, presets, and
+simulator glue go one layer up, on top of this.
 
 Requires the ``apxinf_py`` CUDA binding plus the transport deps
 (``websockets`` / ``msgpack``; see scripts/requirements-pi05-websocket.txt).

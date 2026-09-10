@@ -57,9 +57,9 @@ def parse_args(argv=None):
             "Generate a checkpoint-bound PI0.5 FP8 profile from representative "
             "business Observations. Native LIBERO, manifest, and NPZ sources are "
             "supported. --libero-suite drives the simulator here and needs LIBERO "
-            "installed; 'apxinf-robo capture-libero' does the same capture out of "
-            "process and writes an NPZ directory that --input-dir reads, which is "
-            "the right seam for a deployment that owns its own environment."
+            "installed; capturing the frames elsewhere and passing --input-dir an "
+            "NPZ directory is the right seam for a deployment that owns its own "
+            "environment."
         ),
     )
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)

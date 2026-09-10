@@ -69,28 +69,27 @@ balanced task coverage.
 
 This command needs the same LIBERO and MuJoCo dependencies as the repository's
 LIBERO evaluation command. It exists so a kernel change or a new checkpoint can
-be recalibrated against ApxInf's own published LIBERO protocol without checking
-out a repository that takes ApxInf as a submodule.
+be recalibrated against ApxInf's own published LIBERO protocol.
 
-### Capturing out of process
+### Capturing on another machine
 
-[apxinf-robo](https://github.com/RLinf/APXinf-robo) does the same capture from
-the other side of the seam, writing the NPZ directory `--input-dir` reads:
+The two halves have disjoint requirements: rendering needs LIBERO and MuJoCo but
+no GPU and no checkpoint, and calibrating needs the checkpoint and a GPU but no
+simulator. Splitting them at the NPZ directory lets each run where it belongs —
+the simulator stays off the engine host — and makes the calibration input a
+reviewable, re-runnable artifact rather than a side effect of whoever happened to
+run the calibrator.
+
+Whatever writes those files decides the field names, and they have to be the wire
+keys the checkpoint is served under. When they are not the checkpoint's own,
+name them:
 
 ```bash
-apxinf-robo capture-libero --suite libero_10 --output-dir /tmp/libero-calib
 python3 scripts/calibrate_pi05.py \
   --model-dir <path-to-model> \
-  --input-dir /tmp/libero-calib
+  --image-key observation/image --image-key observation/wrist_image \
+  --input-dir <path-to-observations>
 ```
-
-The two produce the same frames — they share `scripts/libero_observation.py` and
-its apxinf-robo mirror — and differ in where MuJoCo runs. Prefer this form for a
-robot deployment: it keeps the simulator out of the engine host, and it makes the
-calibration input a reviewable, re-runnable artifact rather than a side effect of
-whoever happened to run the calibrator. `capture-libero` names the NPZ fields
-after the robot it was given, so the captured dialect is by construction the one
-the checkpoint is served under.
 
 For another simulator or a deployment source, export its public Observations
 through the manifest or directory interface instead.

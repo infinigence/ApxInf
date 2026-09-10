@@ -5,16 +5,15 @@ optional outer seam that translates a *source* into that contract: NPZ files and
 JSONL manifests, both readable anywhere with numpy and PIL, plus a direct
 in-process capture from native LIBERO initial states.
 
-The LIBERO path (``--libero-suite``) and ``apxinf-robo capture-libero``
-**overlap deliberately**.  The downstream command writes an NPZ directory that
-``load_npz_observations`` then reads, which makes the calibration input a
-reviewable, re-runnable artifact and keeps MuJoCo out of a robot deployment's
-engine.  This copy exists so ApxInf can recalibrate FP8 against its own
-published LIBERO protocol without checking out a repository that takes ApxInf as
-a submodule — a kernel change should not require the downstream repo to
-regress.  Both go through ``scripts/libero_observation.py``, so a change to
-camera orientation or state layout moves them together; see that module on
-keeping it and its apxinf-robo mirror in step.
+The LIBERO path (``--libero-suite``) and the NPZ path overlap deliberately. A
+capture run elsewhere writes an NPZ directory that ``load_npz_observations``
+then reads, which makes the calibration input a reviewable, re-runnable artifact
+and keeps MuJoCo out of a robot deployment's engine. The in-process copy exists
+so ApxInf can recalibrate FP8 against its own published LIBERO protocol -- a
+kernel change should not require a downstream checkout to regress. Both go
+through ``scripts/libero_observation.py``, so a change to camera orientation or
+state layout moves them together; see that module on keeping it and its mirror
+in step.
 """
 
 from __future__ import annotations
@@ -193,9 +192,9 @@ def load_libero_observations(
 ) -> tuple[Mapping[str, object], ...]:
     """Capture task-balanced observations from native LIBERO initial states.
 
-    Mirrors ``apxinf-robo capture-libero``, which writes the same frames to NPZ
-    for :func:`load_npz_observations` to read back; see the module docstring on
-    why both exist.
+    A mirror of this capture writes the same frames to NPZ for
+    :func:`load_npz_observations` to read back; see the module docstring on why
+    both exist.
     """
     if len(image_keys) != 2:
         raise ValueError(

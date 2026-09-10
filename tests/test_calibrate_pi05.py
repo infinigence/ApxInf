@@ -164,8 +164,8 @@ class CalibratePi05Test(unittest.TestCase):
 
     def test_calibration_job_consumes_a_captured_npz_directory_end_to_end(self):
         # The NPZ directory is the seam between whoever owns the environment
-        # (`apxinf-robo capture-libero`) and this engine-side calibrator: the
-        # observations are an artifact on disk, not a live simulator.
+        # and this engine-side calibrator: the observations are an artifact on
+        # disk, not a live simulator.
         class Model:
             image_size = 2
             action_horizon = 2

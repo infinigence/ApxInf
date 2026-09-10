@@ -25,12 +25,10 @@ Adding a new model needs no change here: register a policy in ``apxinf.policies`
 (``@register_policy("<name>")``) and run ``--backend in-process --model-type
 <name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
 
-``apxinf-robo eval-libero`` runs the same protocol from the downstream repository,
-where LIBERO is one environment among several. This copy exists so a kernel
-change, an FP8 recalibration or a tactic bump can be regressed end-to-end against
-ApxInf's own published LIBERO numbers without checking out a repository that takes
-ApxInf as a submodule. See ``scripts/libero_observation.py`` on keeping the two in
-step.
+This script exists so a kernel change, an FP8 recalibration or a tactic bump can
+be regressed end-to-end against ApxInf's own published LIBERO numbers. The
+observation conversion it uses is mirrored elsewhere; see
+``scripts/libero_observation.py`` on keeping the two in step.
 
     # websocket (server already running)
     python scripts/eval_libero.py --backend websocket --precision bf16 \
