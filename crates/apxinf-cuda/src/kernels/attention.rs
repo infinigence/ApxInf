@@ -1235,13 +1235,158 @@ pub fn segmented_mha_bf16(
     )?;
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
+        // TEMP-DIAG (implement_r4): per-call gate + clock; revert in the acceptance-bound revision.
+        static MHA_DIAG_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mha_diag_call = MHA_DIAG_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mha_diag = mha_diag_call < 2; // blocks 0 and 1 are the receipt-implicated calls
+        let mha_t0 = std::time::Instant::now();
+        // FIX (implement_r8): route-3 composed gemm_ex + tiled-softmax per-segment attention
+        // replaces the r6/r7 pad route. The vendored FA2 fwd family is measured pathological
+        // on sm_89 across hdim96 IsEvenK=false (r4 ~19.3s/launch), hdim96 IsEvenK=true
+        // (r6 ~19.2s) and hdim128 IsEvenK=true (r7 ~28.2s), so the head_dim==64 vision arm
+        // runs on measured-healthy cuBLAS GEMMs plus the tiled row-softmax kernel; scores
+        // stay fp32 end-to-end and P is rounded to bf16 for the PV MMA exactly as FA2 does.
+        // Revert/replace in the acceptance-bound revision per the prevailing marker policy.
+        let orig_head_dim = shape[2]; // FIX (implement_r6)
+        if orig_head_dim == 64 { // FIX (implement_r8): composed per-segment attention at the true dim
+            let qf32_buf = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                .map_err(Error::Cuda)?; // FIX (implement_r8)
+            let qf32_t = qf32_buf.as_tensor(q.shape().clone(), DType::F32).map_err(Error::Cuda)?; // FIX (implement_r8)
+            super::linear_attention::cast_bf16_to_f32(ctx, q, &qf32_t)?; // FIX (implement_r8)
+            let kf32_buf = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                .map_err(Error::Cuda)?; // FIX (implement_r8)
+            let kf32_t = kf32_buf.as_tensor(k.shape().clone(), DType::F32).map_err(Error::Cuda)?; // FIX (implement_r8)
+            super::linear_attention::cast_bf16_to_f32(ctx, k, &kf32_t)?; // FIX (implement_r8)
+            let output = output_buffer(ctx, q.size_in_bytes())?; // FIX (implement_r8): packed [T,16,64]; out_bytes=85,327,872 signs the composed route
+            // TEMP-DIAG (implement_r4): entry-alloc bracket; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!("[qwen_drive] mha_alloc_ok call={} out_bytes={} lse_bytes={} ms={}",
+                          mha_diag_call, q.size_in_bytes(),
+                          0, mha_t0.elapsed().as_millis());
+            }
+            for (seg_idx, bounds) in host_offsets.windows(2).enumerate() {
+                let start = bounds[0] as usize;
+                let tokens = (bounds[1] - bounds[0]) as usize;
+                if tokens == 0 { continue; } // FIX (implement_r8): degenerate-segment guard
+                // TEMP-DIAG (implement_r4): pre-launch segment marker; revert in the acceptance-bound revision.
+                if mha_diag {
+                    eprintln!("[qwen_drive] mha_seg call={} i={} start={} tokens={} ms={}",
+                              mha_diag_call, seg_idx, start, tokens, mha_t0.elapsed().as_millis());
+                }
+                let scores = CudaBuffer::alloc(shape[1] * tokens * tokens * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): fp32 [heads,tokens,tokens]
+                let probs = CudaBuffer::alloc(shape[1] * tokens * tokens * 2, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): bf16 [heads,tokens,tokens]
+                for head in 0..shape[1] {
+                    let q_head = buffer_slice(
+                        &qf32_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
+                    )?; // FIX (implement_r8)
+                    let k_head = buffer_slice(
+                        &kf32_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
+                    )?; // FIX (implement_r8)
+                    let scores_head = buffer_slice(&scores, head * tokens * tokens * 4, tokens * tokens * 4)?; // FIX (implement_r8)
+                    ctx.cublas()
+                        .gemm_ex(
+                            DType::F32,
+                            CublasTranspose::None,
+                            CublasTranspose::Transpose,
+                            tokens,
+                            tokens,
+                            orig_head_dim,
+                            (orig_head_dim as f32).sqrt().recip(),
+                            &q_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            &k_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            0.0,
+                            &scores_head,
+                            tokens as i32,
+                        )
+                        .map_err(Error::Cuda)?; // FIX (implement_r8): Q*K^T; alpha folds the softmax scale bound to the true dim 64
+                }
+                unsafe {
+                    ffi::check_cuda(ffi::apxinf_static_row_softmax_f32_bf16(
+                        scores.ptr() as *const std::ffi::c_void,
+                        probs.ptr(),
+                        tokens as u32,
+                        (shape[1] * tokens) as u32,
+                        ctx.stream().handle(),
+                    ))
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): tiled block-per-row softmax, fp32 in / bf16 out
+                }
+                for head in 0..shape[1] {
+                    let probs_head = buffer_slice(&probs, head * tokens * tokens * 2, tokens * tokens * 2)?; // FIX (implement_r8)
+                    let v_head = tensor_slice(
+                        v,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 2,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 2,
+                        ctx.device_id(),
+                    )?; // FIX (implement_r8)
+                    let out_head = buffer_slice(
+                        &output,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 2,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 2,
+                    )?; // FIX (implement_r8)
+                    ctx.cublas()
+                        .gemm_ex(
+                            DType::BF16,
+                            CublasTranspose::None,
+                            CublasTranspose::None,
+                            tokens,
+                            orig_head_dim,
+                            tokens,
+                            1.0,
+                            &probs_head,
+                            tokens as i32,
+                            &v_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            0.0,
+                            &out_head,
+                            (shape[1] * orig_head_dim) as i32,
+                        )
+                        .map_err(Error::Cuda)?; // FIX (implement_r8): P*V straight into the packed [T,16,64] output
+                }
+                // TEMP-DIAG (implement_r4): post-launch retirement probe; converts an async fault into a loud Err; revert in the acceptance-bound revision.
+                if mha_diag {
+                    ctx.synchronize().map_err(Error::Cuda)?;
+                    eprintln!("[qwen_drive] mha_seg_ok call={} i={} ms={}",
+                              mha_diag_call, seg_idx, mha_t0.elapsed().as_millis());
+                }
+            }
+            // TEMP-DIAG (implement_r4): separates "12 launches retired" from "epilogue cudaFree wedged"; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!("[qwen_drive] mha_loop_done call={} ms={}", mha_diag_call, mha_t0.elapsed().as_millis());
+            }
+            let result = make_gpu_tensor(
+                q.shape().clone(),
+                DType::BF16,
+                ctx.device_id(),
+                output,
+            );
+            return Ok(result);
+        }
         let output = output_buffer(ctx, q.size_in_bytes())?;
         let softmax_lse = output_buffer(ctx, shape[0] * shape[1] * std::mem::size_of::<f32>())?;
+        // TEMP-DIAG (implement_r4): entry-alloc bracket; revert in the acceptance-bound revision.
+        if mha_diag {
+            eprintln!("[qwen_drive] mha_alloc_ok call={} out_bytes={} lse_bytes={} ms={}",
+                      mha_diag_call, q.size_in_bytes(),
+                      shape[0] * shape[1] * std::mem::size_of::<f32>(), mha_t0.elapsed().as_millis());
+        }
         let row_bytes = shape[1] * shape[2] * DType::BF16.size_in_bytes();
         let lse_row_bytes = shape[1] * std::mem::size_of::<f32>();
-        for bounds in host_offsets.windows(2) {
+        for (seg_idx, bounds) in host_offsets.windows(2).enumerate() {
             let start = bounds[0] as usize;
             let tokens = (bounds[1] - bounds[0]) as usize;
+            // TEMP-DIAG (implement_r4): pre-launch segment marker; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!("[qwen_drive] mha_seg call={} i={} start={} tokens={} ms={}",
+                          mha_diag_call, seg_idx, start, tokens, mha_t0.elapsed().as_millis());
+            }
             unsafe {
                 ffi::check_cuda(ffi::apxinf_static_fa2_bf16(
                     gpu_ptr(q)?.cast::<u8>().add(start * row_bytes).cast(),
@@ -1264,13 +1409,24 @@ pub fn segmented_mha_bf16(
                 ))
                 .map_err(Error::Cuda)?;
             }
+            // TEMP-DIAG (implement_r4): post-launch retirement probe; converts an async fault into a loud Err; revert in the acceptance-bound revision.
+            if mha_diag {
+                ctx.synchronize().map_err(Error::Cuda)?;
+                eprintln!("[qwen_drive] mha_seg_ok call={} i={} ms={}",
+                          mha_diag_call, seg_idx, mha_t0.elapsed().as_millis());
+            }
         }
-        return Ok(make_gpu_tensor(
+        // TEMP-DIAG (implement_r4): separates "12 launches retired" from "epilogue cudaFree wedged"; revert in the acceptance-bound revision.
+        if mha_diag {
+            eprintln!("[qwen_drive] mha_loop_done call={} ms={}", mha_diag_call, mha_t0.elapsed().as_millis());
+        }
+        let result = make_gpu_tensor(
             q.shape().clone(),
             DType::BF16,
             ctx.device_id(),
             output,
-        ));
+        );
+        return Ok(result);
     }
     #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
     let output = output_buffer(ctx, q.size_in_bytes())?;
@@ -1633,7 +1789,6 @@ pub fn mha_f16(
                 output.ptr(),
                 batches as i32,
                 tokens_per_batch as i32,
-                tokens_per_batch as i32,
                 shape[1] as i32,
                 shape[1] as i32,
                 shape[2] as i32,
@@ -1641,7 +1796,7 @@ pub fn mha_f16(
             );
             if status == 0 {
                 return Ok(make_gpu_tensor(
-                    q.shape().clone(),
+                    Shape::new(vec![tokens, heads, head_dim]),
                     DType::F16,
                     ctx.device_id(),
                     output,
@@ -1708,6 +1863,9 @@ pub fn mqa_f16_e4m3_522(
     if q.dtype() != DType::F16
         || k.dtype() != DType::F16
         || v.dtype() != DType::F16
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape().dims() != k_shape
         || q_shape != [522, 8, 256]
         || k_shape != [522, 1, 256]
         || v.shape().dims() != k_shape

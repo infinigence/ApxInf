@@ -12,6 +12,7 @@ pub mod elementwise;
 pub mod embedding;
 pub mod fused;
 pub mod gemm;
+pub mod linear_attention;
 pub mod norm;
 pub mod preprocess;
 pub mod quantization;

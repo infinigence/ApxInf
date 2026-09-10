@@ -11,6 +11,7 @@ pub mod auto;
 pub mod profiling;
 pub mod pi05;
 pub mod qwen3vl;
+pub mod qwen_drive;
 pub mod vla;
 mod walloss;
 
@@ -27,6 +28,9 @@ pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWei
 pub use profiling::GenerationProfile;
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
+pub use qwen_drive::QwenDriveConfig;
+#[cfg(feature = "cuda")]
+pub use qwen_drive::QwenDriveModel;
 pub use vla::{
     Action, ImageLayout, InferenceSpec, InitialLatent, Observation,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
