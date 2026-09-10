@@ -8,6 +8,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 #include "../kernels/custom/math.cuh"
@@ -24,6 +26,20 @@ namespace {
 int blocks_for(int64_t count) {
   return static_cast<int>((count + kThreads - 1) / kThreads);
 }
+
+int bias_activation_blocks(int64_t count) {
+  int blocks = blocks_for(count);
+#if defined(APXINF_TARGET_SM110)
+  int cap = 0;
+#else
+  int cap = 512;
+#endif
+  const char* value = std::getenv("APXINF_BIAS_ACTIVATION_BLOCK_CAP");
+  if (value != nullptr) cap = std::atoi(value);
+  if (cap > 0 && blocks > cap) blocks = cap;
+  return blocks;
+}
+
 }  // namespace
 
 extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_bf16(
@@ -48,6 +64,8 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_bf16(
 extern "C" cudaError_t apxinf_static_bias_activation_bf16(
     const void* input, const void* bias, void* output,
     int rows, int cols, int activation, cudaStream_t stream) {
+  if (rows <= 0 || cols <= 0 || activation < 0 || activation > 3)
+    return cudaErrorInvalidValue;
   const int64_t count = static_cast<int64_t>(rows) * cols;
   const bool packed4 = cols % 4 == 0 &&
       reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) == 0 &&
@@ -59,24 +77,76 @@ extern "C" cudaError_t apxinf_static_bias_activation_bf16(
       reinterpret_cast<uintptr_t>(output) % alignof(__nv_bfloat162) == 0 &&
       (bias == nullptr ||
        reinterpret_cast<uintptr_t>(bias) % alignof(__nv_bfloat162) == 0);
-  if (packed4) {
+  const char* specialized_value =
+      std::getenv("APXINF_BIAS_ACTIVATION_SPECIALIZED");
+  const bool specialized = specialized_value != nullptr &&
+      std::strcmp(specialized_value, "0") != 0;
+  if (packed4 && specialized) {
+    const int blocks = bias_activation_blocks(count / 4);
+    if (activation == 0) {
+      bias_activation_bf16_packed4_specialized_kernel<0>
+          <<<blocks, kThreads, 0, stream>>>(
+              static_cast<const __nv_bfloat16*>(input),
+              static_cast<const __nv_bfloat16*>(bias),
+              static_cast<__nv_bfloat16*>(output), count / 4, cols);
+    } else if (activation == 1) {
+      bias_activation_bf16_packed4_specialized_kernel<1>
+          <<<blocks, kThreads, 0, stream>>>(
+              static_cast<const __nv_bfloat16*>(input),
+              static_cast<const __nv_bfloat16*>(bias),
+              static_cast<__nv_bfloat16*>(output), count / 4, cols);
+    } else if (activation == 2) {
+      bias_activation_bf16_packed4_specialized_kernel<2>
+          <<<blocks, kThreads, 0, stream>>>(
+              static_cast<const __nv_bfloat16*>(input),
+              static_cast<const __nv_bfloat16*>(bias),
+              static_cast<__nv_bfloat16*>(output), count / 4, cols);
+    } else {
+      bias_activation_bf16_packed4_specialized_kernel<3>
+          <<<blocks, kThreads, 0, stream>>>(
+              static_cast<const __nv_bfloat16*>(input),
+              static_cast<const __nv_bfloat16*>(bias),
+              static_cast<__nv_bfloat16*>(output), count / 4, cols);
+    }
+  } else if (packed4) {
     bias_activation_bf16_packed4_kernel<<<
-        blocks_for(count / 4), kThreads, 0, stream>>>(
+        bias_activation_blocks(count / 4), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(bias),
         static_cast<__nv_bfloat16*>(output), count / 4, cols, activation);
   } else if (packed2) {
     bias_activation_bf16_packed2_kernel<<<
-        blocks_for(count / 2), kThreads, 0, stream>>>(
+        bias_activation_blocks(count / 2), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(bias),
         static_cast<__nv_bfloat16*>(output), count / 2, cols, activation);
   } else {
-    bias_activation_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+    bias_activation_bf16_kernel<<<bias_activation_blocks(count), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(bias),
         static_cast<__nv_bfloat16*>(output), count, cols, activation);
   }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_qkv_in_place_bf16(
+    void* query, void* key, void* value, const void* query_bias,
+    const void* key_bias, const void* value_bias, int rows, int cols,
+    cudaStream_t stream) {
+  if (!query || !key || !value || !query_bias || !key_bias || !value_bias ||
+      rows <= 0 || cols <= 0 || cols % 4 != 0)
+    return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  const int64_t groups = static_cast<int64_t>(rows) * cols / 4;
+  int blocks = static_cast<int>((groups + threads - 1) / threads);
+  blocks = blocks > 1024 ? 1024 : blocks;
+  bias_qkv_in_place_bf16_packed4_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value),
+      static_cast<const __nv_bfloat16*>(query_bias),
+      static_cast<const __nv_bfloat16*>(key_bias),
+      static_cast<const __nv_bfloat16*>(value_bias), groups, cols / 4);
   return cudaGetLastError();
 }
 
@@ -112,6 +182,20 @@ extern "C" cudaError_t apxinf_static_gather_rows_bf16(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<const uint32_t*>(indices),
       static_cast<__nv_bfloat16*>(output), rows, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_scatter_rows_bf16(
+    const void* source, const void* rows, void* output,
+    int row_count, int cols, int add, cudaStream_t stream) {
+  if (source == nullptr || rows == nullptr || output == nullptr ||
+      row_count <= 0 || cols <= 0 || (add != 0 && add != 1))
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(row_count) * cols;
+  scatter_rows_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(source),
+      static_cast<const uint32_t*>(rows),
+      static_cast<__nv_bfloat16*>(output), count, cols, add != 0);
   return cudaGetLastError();
 }
 
@@ -209,7 +293,43 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
+  // The packed4 fast path stays on by default and is toggled only by its own
+  // dedicated APXINF_BIAS_RESIDUAL_BF16_PACKED4 override. The former code also
+  // consulted the process-global APXINF_GR00T_PRECISION here, but GR00T never
+  // calls this kernel (it uses bias_then_residual_bf16); that dead branch only
+  // let a GR00T env setting perturb Pi0.5/WallOSS/Qwen3-VL in the same process.
+  const char* packed4_value = std::getenv("APXINF_BIAS_RESIDUAL_BF16_PACKED4");
+  const bool packed4_enabled = packed4_value != nullptr
+      ? std::strcmp(packed4_value, "0") != 0
+      : true;
+  const uintptr_t pointers = reinterpret_cast<uintptr_t>(projection) |
+      reinterpret_cast<uintptr_t>(residual) |
+      reinterpret_cast<uintptr_t>(output) |
+      reinterpret_cast<uintptr_t>(bias);
+  if (packed4_enabled && (cols & 3) == 0 && (pointers & 7U) == 0) {
+    const int packed_cols = cols / 4;
+    const int64_t packed_count = count / 4;
+    bias_residual_bf16_packed4_kernel<<<
+        blocks_for(packed_count), kThreads, 0, stream>>>(
+        static_cast<const Bf16x4*>(projection),
+        static_cast<const Bf16x4*>(bias),
+        static_cast<const Bf16x4*>(residual),
+        static_cast<Bf16x4*>(output), packed_count, packed_cols);
+    return cudaGetLastError();
+  }
   bias_residual_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(projection),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<const __nv_bfloat16*>(residual),
+      static_cast<__nv_bfloat16*>(output), count, cols);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_then_residual_bf16(
+    const void* projection, const void* bias, const void* residual,
+    void* output, int rows, int cols, cudaStream_t stream) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  bias_then_residual_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(bias),
       static_cast<const __nv_bfloat16*>(residual),
@@ -258,7 +378,8 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_bf16_e4m3(
 extern "C" cudaError_t apxinf_static_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, cudaStream_t stream) {
-  layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
+  const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+  layer_norm_bf16_kernel<<<rows, kThreads, shared_bytes, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<const __nv_bfloat16*>(bias),

@@ -229,6 +229,23 @@ fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey 
     }
 }
 
+fn bf16_output_tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey {
+    GemmTuningKey {
+        op: GemmOp::Fp8Bf16,
+        device: DeviceFingerprint::from(ctx.caps()),
+        m,
+        n,
+        k,
+        activation_dtype: TuningDType::F8E4M3,
+        weight_dtype: TuningDType::F8E4M3,
+        output_dtype: TuningDType::Bf16,
+        layout: GemmLayout::RowMajor,
+        scale_mode: ScaleMode::PerTensor,
+        epilogue: Epilogue::None,
+        workspace_limit: usize::MAX,
+    }
+}
+
 pub fn exact_fp8_tactic(
     ctx: &CudaContext,
     m: usize,
@@ -1660,6 +1677,256 @@ pub fn prepare_cublaslt_fp8_gemm(m: usize, n: usize, k: usize) -> Result<()> {
     ffi::check_cublas(status).map_err(Error::Cuda)
 }
 
+pub fn prepare_cublaslt_fp8_gemm_bf16(m: usize, n: usize, k: usize) -> Result<()> {
+    let status = unsafe { ffi::apxinf_static_prepare_fp8_gemm_bf16(m as i32, n as i32, k as i32) };
+    ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+fn parse_fp8_bf16_heuristic(spec: &str, m: usize, n: usize, k: usize) -> Result<Option<i32>> {
+    for entry in spec.split(';').filter(|entry| !entry.is_empty()) {
+        let (shape, rank) = entry
+            .split_once('=')
+            .ok_or_else(|| Error::Other(format!("invalid FP8 BF16 tactic entry {entry:?}")))?;
+        let dims = shape
+            .split(',')
+            .map(str::parse::<usize>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Other(format!("invalid FP8 BF16 tactic shape {shape:?}")))?;
+        if dims.len() != 3 {
+            return Err(Error::Other(format!(
+                "FP8 BF16 tactic shape must be M,N,K, got {shape:?}"
+            )));
+        }
+        let rank = rank
+            .parse::<i32>()
+            .map_err(|_| Error::Other(format!("invalid FP8 BF16 tactic rank {rank:?}")))?;
+        if !(0..64).contains(&rank) {
+            return Err(Error::Other(format!(
+                "FP8 BF16 tactic rank must be in 0..64, got {rank}"
+            )));
+        }
+        if dims == [m, n, k] {
+            return Ok(Some(rank));
+        }
+    }
+    Ok(None)
+}
+
+fn configured_fp8_bf16_heuristic(m: usize, n: usize, k: usize) -> Result<Option<i32>> {
+    let Some(spec) = std::env::var_os("APXINF_FP8_BF16_CUBLASLT_TACTICS") else {
+        return Ok(None);
+    };
+    let spec = spec
+        .into_string()
+        .map_err(|_| Error::Other("APXINF_FP8_BF16_CUBLASLT_TACTICS must be valid UTF-8".into()))?;
+    parse_fp8_bf16_heuristic(&spec, m, n, k)
+}
+
+pub(super) fn set_cublaslt_fp8_bf16_gemm_heuristic(
+    m: usize,
+    n: usize,
+    k: usize,
+    heuristic_rank: i32,
+) -> Result<()> {
+    let status = unsafe {
+        ffi::apxinf_static_set_cublaslt_fp8_gemm_bf16_heuristic(
+            m as i32,
+            n as i32,
+            k as i32,
+            heuristic_rank,
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+/// Static native E4M3 x E4M3 GEMM with a BF16 output. This is the physical
+/// primitive used by BF16-residual model graphs such as GR00T; callers remain
+/// responsible for activation quantization and for applying any BF16 bias.
+pub fn gemm_fp8_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+) -> Result<Tensor> {
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
+            activation.dtype(),
+            weight.values_e4m3.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: if activation.device() != expected_device {
+                activation.device()
+            } else {
+                weight.values_e4m3.device()
+            },
+        });
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    if std::env::var_os("APXINF_GR00T_LOG_FP8_GEMM_SHAPES").is_some() {
+        eprintln!("APXINF_FP8_BF16_GEMM_SHAPE m={m} n={n} k={k}");
+    }
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    if crate::workspace::may_prepare_native_resources() {
+        let configured_rank = configured_fp8_bf16_heuristic(m, n, k)?;
+        let persisted_rank = ctx
+            .tuning()
+            .lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
+            .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
+            .map(|tactic| tactic.value);
+        if let Some(rank) = configured_rank.or(persisted_rank) {
+            set_cublaslt_fp8_bf16_gemm_heuristic(m, n, k, rank)?;
+        }
+        prepare_cublaslt_fp8_gemm_bf16(m, n, k)?;
+    }
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bf16(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            activation_scale * weight.scale,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
+}
+
+/// Static native E4M3 x E4M3 GEMM with a fused BF16 per-column bias and a
+/// BF16 output.  Resource preparation remains outside CUDA Graph capture.
+pub fn gemm_fp8_bias_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+    bias: &Tensor,
+) -> Result<Tensor> {
+    if activation.dtype() != DType::F8E4M3
+        || weight.values_e4m3.dtype() != DType::F8E4M3
+        || bias.dtype() != DType::BF16
+    {
+        return Err(Error::Other(format!(
+            "FP8 fused-bias GEMM expects E4M3/E4M3/BF16, got {}/{}/{}",
+            activation.dtype(),
+            weight.values_e4m3.dtype(),
+            bias.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 fused-bias GEMM cannot consume dual-GeGLU interleaved weights".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 fused-bias GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] || bias.shape().dims() != [b[1]] {
+        return Err(Error::Other(format!(
+            "FP8 fused-bias GEMM shape mismatch: {a:?} @ {b:?} + {:?}",
+            bias.shape().dims()
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [activation, weight.values_e4m3, bias] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8 fused-bias GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    if crate::workspace::may_prepare_native_resources() {
+        let configured_rank = configured_fp8_bf16_heuristic(m, n, k)?;
+        let persisted_rank = ctx
+            .tuning()
+            .lookup_gemm_exact(&bf16_output_tuning_key(ctx, m, n, k))
+            .filter(|tactic| tactic.backend == TacticBackend::CublasLt)
+            .map(|tactic| tactic.value);
+        if let Some(rank) = configured_rank.or(persisted_rank) {
+            set_cublaslt_fp8_bf16_gemm_heuristic(m, n, k, rank)?;
+        }
+        let status = unsafe {
+            ffi::apxinf_static_prepare_fp8_gemm_bias_bf16(
+                bias_buffer.ptr(),
+                m as i32,
+                n as i32,
+                k as i32,
+            )
+        };
+        ffi::check_cublas(status).map_err(Error::Cuda)?;
+    }
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bias_bf16(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            bias_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            activation_scale * weight.scale,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
+}
+
 pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<()> {
     let status =
         unsafe { ffi::apxinf_static_prepare_fp8_gemm_split_f16(m as i32, n as i32, k as i32) };
@@ -1766,6 +2033,21 @@ mod fp8_dual_geglu_tests {
             epilogue: Epilogue::GeGlu,
             workspace_limit: usize::MAX,
         }
+    }
+
+    #[test]
+    fn bf16_output_tactic_map_is_exact_and_strict() {
+        let spec = "41,1536,1536=3;1,3072,1536=4";
+        assert_eq!(
+            parse_fp8_bf16_heuristic(spec, 41, 1536, 1536).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            parse_fp8_bf16_heuristic(spec, 41, 1536, 6144).unwrap(),
+            None
+        );
+        assert!(parse_fp8_bf16_heuristic("41,1536=3", 41, 1536, 1536).is_err());
+        assert!(parse_fp8_bf16_heuristic("41,1536,1536=64", 41, 1536, 1536).is_err());
     }
 
     #[test]

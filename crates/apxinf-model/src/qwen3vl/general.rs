@@ -516,7 +516,7 @@ impl LlmTrait for GeneralQwen3VL {
 }
 
 /// Transfer text weights to backend's device.
-fn transfer_weights(w: &Qwen3VLTextWeights, backend: &dyn Backend) -> Result<Qwen3VLTextWeights> {
+pub(crate) fn transfer_weights(w: &Qwen3VLTextWeights, backend: &dyn Backend) -> Result<Qwen3VLTextWeights> {
     let layers = w.layers.iter().map(|l| Ok::<_, Error>(super::weights::Qwen3VLLayer {
         attn_norm_weight: backend.to_device(&l.attn_norm_weight)?,
         wq: backend.to_device(&l.wq)?,

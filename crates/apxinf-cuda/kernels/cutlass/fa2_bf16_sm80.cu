@@ -33,7 +33,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
                  const void* q, const void* k, const void* v, void* output,
                  void* softmax_lse, int batch, int query_tokens,
                  int key_tokens, int query_heads, int kv_heads, int head_dim,
-                 float softmax_scale) {
+                 float softmax_scale, bool is_causal) {
   params = {};
   params.is_bf16 = is_bf16;
   params.q_ptr = const_cast<void*>(q);
@@ -75,9 +75,12 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
   params.p_dropout_in_uint8_t = 255;
   params.rp_dropout = 1.0f;
 
-  params.is_causal = false;
+  params.is_causal = is_causal;
   params.window_size_left = -1;
-  params.window_size_right = -1;
+  // FA2 represents full causal attention as a right window of zero. Keeping
+  // the non-causal sentinel (-1) here would mask the diagonal and implement
+  // strict-causal attention instead.
+  params.window_size_right = is_causal ? 0 : -1;
   params.is_seqlens_k_cumulative = true;
   params.num_splits = 1;
 }
@@ -143,7 +146,7 @@ int setup_splitkv(FLASH_NAMESPACE::Flash_fwd_params& params,
 
 namespace apxinf::cuda::cutlass_ops {
 
-template <typename Element>
+template <typename Element, bool IsCausal>
 int fa2(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
@@ -159,9 +162,17 @@ int fa2(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
-  params.is_causal = false;
-  if (head_dim <= 96) {
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
+              IsCausal);
+  if constexpr (IsCausal) {
+    if (head_dim <= 96) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 96, true>(params, stream);
+    } else if (head_dim <= 128) {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 128, true>(params, stream);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_<Element, 256, true>(params, stream);
+    }
+  } else if (head_dim <= 96) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
   } else if (head_dim <= 128) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 128, false>(params, stream);
@@ -186,15 +197,46 @@ int fa2_causal(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
-  params.is_causal = true;
-  params.window_size_right = 0;
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
+              true);
   if (head_dim <= 96) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 96, true>(params, stream);
   } else if (head_dim <= 128) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 128, true>(params, stream);
   } else {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 256, true>(params, stream);
+  }
+  return static_cast<int>(cudaSuccess);
+}
+
+template <typename Element>
+int fa2_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  if (qkv == nullptr || output == nullptr || softmax_lse == nullptr ||
+      batch <= 0 || tokens <= 0 || heads <= 0 || head_dim <= 0 ||
+      head_dim > 256) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const int hidden = heads * head_dim;
+  const auto* base = static_cast<const Element*>(qkv);
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
+              base, base + hidden, base + 2 * hidden, output, softmax_lse,
+              batch, tokens, tokens, heads, heads, head_dim, softmax_scale,
+              false);
+  const int64_t qkv_row_stride = static_cast<int64_t>(3) * hidden;
+  params.q_batch_stride = static_cast<int64_t>(tokens) * qkv_row_stride;
+  params.k_batch_stride = params.q_batch_stride;
+  params.v_batch_stride = params.q_batch_stride;
+  params.q_row_stride = qkv_row_stride;
+  params.k_row_stride = qkv_row_stride;
+  params.v_row_stride = qkv_row_stride;
+  if (head_dim <= 96) {
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
+  } else {
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 256, false>(params, stream);
   }
   return static_cast<int>(cudaSuccess);
 }
@@ -217,11 +259,8 @@ int fa2_splitkv(
   FLASH_NAMESPACE::Flash_fwd_params params;
   fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
               q, k, v, output, softmax_lse, batch, query_tokens,
-              key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
-  params.is_causal = IsCausal;
-  if constexpr (IsCausal) {
-    params.window_size_right = 0;
-  }
+              key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
+              IsCausal);
   const int num_splits =
       setup_splitkv(params, softmax_lse_accum, o_accum, num_sms, query_tokens,
                     key_tokens, head_dim, batch, query_heads);
@@ -251,9 +290,18 @@ int fa2_bf16(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
-  return fa2<cutlass::bfloat16_t>(
+  return fa2<cutlass::bfloat16_t, false>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+int fa2_bf16_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  return fa2_strided_qkv<cutlass::bfloat16_t>(
+      qkv, output, softmax_lse, batch, tokens, heads, head_dim,
+      softmax_scale, stream);
 }
 
 int fa2_bf16_causal(
@@ -261,7 +309,7 @@ int fa2_bf16_causal(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
-  return fa2_causal<cutlass::bfloat16_t>(
+  return fa2<cutlass::bfloat16_t, true>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }
@@ -295,7 +343,7 @@ int fa2_f16(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
-  return fa2<cutlass::half_t>(
+  return fa2<cutlass::half_t, false>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }

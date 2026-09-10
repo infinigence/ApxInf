@@ -31,6 +31,162 @@ pub struct W8A8WeightView<'a> {
     pub layout: W8A8Layout,
 }
 
+/// Dynamically row-quantized activation that can be shared by projections
+/// consuming the same BF16 input (for example, transformer gate/up).
+pub struct W8A8Activation {
+    quantized: CudaBuffer,
+    row_scales: CudaBuffer,
+    rows: usize,
+    input_dim: usize,
+}
+
+pub fn quantize_w8a8_activation(ctx: &CudaContext, activation: &Tensor) -> Result<W8A8Activation> {
+    if activation.dtype() != DType::BF16 || activation.device() != Device::Cuda(ctx.device_id()) {
+        return Err(Error::Other(format!(
+            "W8A8 quantization expects a BF16 activation on CUDA {}, got {} on {}",
+            ctx.device_id(),
+            activation.dtype(),
+            activation.device()
+        )));
+    }
+    let dims = activation.shape().dims();
+    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 {
+        return Err(Error::Other(format!(
+            "W8A8 quantization expects a non-empty matrix, got {dims:?}"
+        )));
+    }
+    let (rows, input_dim) = (dims[0], dims[1]);
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let quantized = crate::workspace::output_buffer(ctx, rows * input_dim)?;
+    let row_scales = crate::workspace::output_buffer(ctx, rows * std::mem::size_of::<f32>())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_quantize_rows_bf16_int8(
+            activation.ptr(),
+            quantized.ptr(),
+            row_scales.ptr(),
+            rows as i32,
+            input_dim as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(W8A8Activation {
+        quantized,
+        row_scales,
+        rows,
+        input_dim,
+    })
+}
+
+pub fn adaptive_layer_norm_quantize_w8a8_activation(
+    ctx: &CudaContext,
+    input: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, W8A8Activation)> {
+    if input.dtype() != DType::BF16
+        || modulation.dtype() != DType::BF16
+        || input.device() != Device::Cuda(ctx.device_id())
+        || modulation.device() != Device::Cuda(ctx.device_id())
+        || !(eps > 0.0)
+    {
+        return Err(Error::Other(
+            "W8A8 adaptive LayerNorm quantization expects BF16 CUDA tensors and positive epsilon"
+                .into(),
+        ));
+    }
+    let dims = input.shape().dims();
+    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 || modulation.shape().dims() != [2 * dims[1]]
+    {
+        return Err(Error::Other(format!(
+            "W8A8 adaptive LayerNorm quantization expects [rows,cols] input and [2*cols] modulation, got {dims:?} and {:?}",
+            modulation.shape().dims()
+        )));
+    }
+    let (rows, input_dim) = (dims[0], dims[1]);
+    let input_buffer = CudaBuffer::from_tensor(input).map_err(Error::Cuda)?;
+    let modulation_buffer = CudaBuffer::from_tensor(modulation).map_err(Error::Cuda)?;
+    let output =
+        crate::workspace::output_buffer(ctx, rows * input_dim * DType::BF16.size_in_bytes())?;
+    let quantized = crate::workspace::output_buffer(ctx, rows * input_dim)?;
+    let row_scales = crate::workspace::output_buffer(ctx, rows * std::mem::size_of::<f32>())?;
+    unsafe {
+        ffi::check_cuda(
+            ffi::apxinf_static_adaptive_layer_norm_quantize_rows_bf16_int8(
+                input_buffer.ptr(),
+                modulation_buffer.ptr(),
+                output.ptr(),
+                quantized.ptr(),
+                row_scales.ptr(),
+                rows as i32,
+                input_dim as i32,
+                eps,
+                ctx.stream().handle(),
+            ),
+        )
+        .map_err(Error::Cuda)?;
+    }
+    Ok((
+        output.into_tensor(Shape::new(vec![rows, input_dim]), DType::BF16),
+        W8A8Activation {
+            quantized,
+            row_scales,
+            rows,
+            input_dim,
+        },
+    ))
+}
+
+pub fn quantize_w8a8_silu_mul_activation(
+    ctx: &CudaContext,
+    gate: &Tensor,
+    up: &Tensor,
+) -> Result<W8A8Activation> {
+    if gate.dtype() != DType::BF16
+        || up.dtype() != DType::BF16
+        || gate.device() != Device::Cuda(ctx.device_id())
+        || up.device() != Device::Cuda(ctx.device_id())
+        || gate.shape() != up.shape()
+    {
+        return Err(Error::Other(format!(
+            "W8A8 fused SiLU-mul quantization expects equal BF16 CUDA tensors, got {} {:?} and {} {:?}",
+            gate.dtype(),
+            gate.shape().dims(),
+            up.dtype(),
+            up.shape().dims()
+        )));
+    }
+    let dims = gate.shape().dims();
+    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 {
+        return Err(Error::Other(format!(
+            "W8A8 fused SiLU-mul quantization expects a non-empty matrix, got {dims:?}"
+        )));
+    }
+    let (rows, input_dim) = (dims[0], dims[1]);
+    let gate = CudaBuffer::from_tensor(gate).map_err(Error::Cuda)?;
+    let up = CudaBuffer::from_tensor(up).map_err(Error::Cuda)?;
+    let quantized = crate::workspace::output_buffer(ctx, rows * input_dim)?;
+    let row_scales = crate::workspace::output_buffer(ctx, rows * std::mem::size_of::<f32>())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_silu_mul_quantize_rows_bf16_int8(
+            gate.ptr(),
+            up.ptr(),
+            quantized.ptr(),
+            row_scales.ptr(),
+            rows as i32,
+            input_dim as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(W8A8Activation {
+        quantized,
+        row_scales,
+        rows,
+        input_dim,
+    })
+}
+
 struct CudaEventPair {
     start: ffi::cudaEvent_t,
     stop: ffi::cudaEvent_t,
@@ -287,8 +443,10 @@ pub fn gemm_w8a8(
     activation: &Tensor,
     weight: W8A8WeightView<'_>,
 ) -> Result<Tensor> {
-    let prefer_cutlass =
-        cfg!(apxinf_cutlass_int8_sm80) && matches!(ctx.caps().arch_family, CudaArchFamily::Sm80);
+    let prefer_cutlass = cfg!(apxinf_cutlass_int8_sm80)
+        && matches!(ctx.caps().arch_family, CudaArchFamily::Sm80)
+        && weight.input_dim % 16 == 0
+        && weight.output_dim % 8 == 0;
     gemm_w8a8_impl(ctx, activation, weight, Some(prefer_cutlass), false)
 }
 
@@ -317,6 +475,29 @@ fn gemm_w8a8_impl(
             activation.device()
         )));
     }
+    let activation = quantize_w8a8_activation(ctx, activation)?;
+    gemm_quantized_w8a8_impl(ctx, &activation, weight, default_cutlass, force_preference)
+}
+
+pub fn gemm_quantized_w8a8(
+    ctx: &CudaContext,
+    activation: &W8A8Activation,
+    weight: W8A8WeightView<'_>,
+) -> Result<Tensor> {
+    let prefer_cutlass = cfg!(apxinf_cutlass_int8_sm80)
+        && matches!(ctx.caps().arch_family, CudaArchFamily::Sm80)
+        && weight.input_dim % 16 == 0
+        && weight.output_dim % 8 == 0;
+    gemm_quantized_w8a8_impl(ctx, activation, weight, Some(prefer_cutlass), false)
+}
+
+fn gemm_quantized_w8a8_impl(
+    ctx: &CudaContext,
+    activation: &W8A8Activation,
+    weight: W8A8WeightView<'_>,
+    default_cutlass: Option<bool>,
+    force_preference: bool,
+) -> Result<Tensor> {
     if weight.scale_mode != W8A8ScaleMode::DynamicRowPerOutputChannel
         || weight.layout != W8A8Layout::OutputMajor
     {
@@ -324,11 +505,10 @@ fn gemm_w8a8_impl(
             "gemm_w8a8 received an unsupported scale mode or layout".into(),
         ));
     }
-    let dims = activation.shape().dims();
-    if dims.len() != 2 || dims[1] != weight.input_dim {
+    if activation.input_dim != weight.input_dim {
         return Err(Error::Other(format!(
-            "gemm_w8a8 activation shape mismatch: expected [M,{}], got {dims:?}",
-            weight.input_dim
+            "gemm_w8a8 activation width mismatch: expected {}, got {}",
+            weight.input_dim, activation.input_dim
         )));
     }
     if weight.values_i8.device() != ctx.device_id()
@@ -348,23 +528,14 @@ fn gemm_w8a8_impl(
         )));
     }
 
-    let rows = dims[0];
-    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
-    let weight_scales = CudaBuffer::from_tensor(weight.scales_f32).map_err(Error::Cuda)?;
-    let quantized = crate::workspace::output_buffer(ctx, rows * weight.input_dim)?;
-    let row_scales = crate::workspace::output_buffer(ctx, rows * std::mem::size_of::<f32>())?;
-    unsafe {
-        ffi::check_cuda(ffi::apxinf_static_quantize_rows_bf16_int8(
-            activation.ptr(),
-            quantized.ptr(),
-            row_scales.ptr(),
-            rows as i32,
-            weight.input_dim as i32,
-            ctx.stream().handle(),
-        ))
-        .map_err(Error::Cuda)?;
+    let rows = activation.rows;
+    if std::env::var_os("APXINF_GR00T_LOG_W8A8_GEMM_SHAPES").is_some() {
+        eprintln!(
+            "APXINF_W8A8_BF16_GEMM_SHAPE m={rows} n={} k={}",
+            weight.output_dim, weight.input_dim
+        );
     }
-
+    let weight_scales = CudaBuffer::from_tensor(weight.scales_f32).map_err(Error::Cuda)?;
     let output = crate::workspace::output_buffer(
         ctx,
         rows * weight.output_dim * DType::BF16.size_in_bytes(),
@@ -386,9 +557,9 @@ fn gemm_w8a8_impl(
                 autotune_request_w8a8(
                     ctx,
                     &key,
-                    &quantized,
+                    &activation.quantized,
                     weight.values_i8,
-                    &row_scales,
+                    &activation.row_scales,
                     &weight_scales,
                     preferred,
                 )
@@ -404,9 +575,9 @@ fn gemm_w8a8_impl(
     {
         let cutlass_result = unsafe {
             ffi::check_cuda(ffi::apxinf_static_cutlass_int8_gemm_bf16(
-                quantized.ptr(),
+                activation.quantized.ptr(),
                 weight.values_i8.ptr(),
-                row_scales.ptr(),
+                activation.row_scales.ptr(),
                 weight_scales.ptr(),
                 output.ptr(),
                 rows as i32,
@@ -440,7 +611,7 @@ fn gemm_w8a8_impl(
             rows,
             weight.output_dim,
             weight.input_dim,
-            &quantized,
+            &activation.quantized,
             weight.values_i8,
             &accumulators,
         )
@@ -448,7 +619,7 @@ fn gemm_w8a8_impl(
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_dequantize_int32_bf16(
             accumulators.ptr(),
-            row_scales.ptr(),
+            activation.row_scales.ptr(),
             weight_scales.ptr(),
             output.ptr(),
             rows as i32,

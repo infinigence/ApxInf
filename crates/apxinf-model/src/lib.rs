@@ -4,6 +4,7 @@ mod accelerator;
 pub mod builtin;
 pub mod debug;
 mod generation_config;
+pub mod gr00t;
 pub mod llama;
 pub mod llm_trait;
 pub mod registry;

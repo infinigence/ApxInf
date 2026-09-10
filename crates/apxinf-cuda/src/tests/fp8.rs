@@ -404,6 +404,26 @@ fn fp8_gemm_f16(
     )
 }
 
+fn fp8_gemm_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    weight: &Tensor,
+    activation_scale: f32,
+    weight_scale: f32,
+) -> Result<Tensor> {
+    crate::kernels::gemm::fp8_bf16(
+        ctx,
+        activation,
+        activation_scale,
+        crate::kernels::gemm::Fp8WeightView {
+            values_e4m3: weight,
+            scale: weight_scale,
+            dual_geglu_interleaved: false,
+            dual_geglu_auto_interleaved: None,
+        },
+    )
+}
+
 #[cfg(apxinf_fa2_f16_sm100)]
 #[test]
 fn fa2_language_mqa_f16_matches_cublas() {
@@ -942,6 +962,9 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
     const K: usize = 2048;
     const K_PADDED: usize = 2048;
     let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().arch_family != CudaArchFamily::Sm100 {
+        return;
+    }
     let activation = (0..M * K)
         .map(|index| {
             let row = index / K;

@@ -52,6 +52,16 @@ impl CudaKVCache {
         })
     }
 
+    /// Rewind the logical cache length without changing device addresses.
+    ///
+    /// This is intended for fixed-shape runtimes that overwrite every cache
+    /// position they subsequently expose to attention, including CUDA Graph
+    /// capture. General callers should continue to use [`KvCache::clear`],
+    /// which also clears the underlying storage.
+    pub fn rewind(&mut self) {
+        self.seq_len = 0;
+    }
+
     /// Append K/V data for multiple positions using the GPU append kernel.
     pub fn append(
         &self,
@@ -129,11 +139,11 @@ impl KvCache for CudaKVCache {
         self.seq_len = 0;
         let layer_bytes =
             self.n_kv_heads * self.max_seq_len * self.head_dim * std::mem::size_of::<f32>();
-        for buf in &mut self.k_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
+        for buffer in &mut self.k_buffers {
+            *buffer = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
         }
-        for buf in &mut self.v_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
+        for buffer in &mut self.v_buffers {
+            *buffer = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
         }
         Ok(())
     }

@@ -721,7 +721,7 @@ pub(super) fn vision_tower<W: VisionTowerWeights>(
     geometry: &DeviceVisionGeometry,
     patches: &Tensor,
 ) -> Result<Tensor> {
-    let ordered_patches = kernels::elementwise::gather_rows_bf16(
+    let ordered_patches = kernels::elementwise::gather_rows_bf16_device_indices(
         context,
         patches,
         &geometry.patch_order,
@@ -784,7 +784,12 @@ fn vision_merger<W: VisionTowerWeights>(
     let output = linear(context, &hidden, weights.merger_output())?;
     let output =
         kernels::elementwise::bias_bf16(context, &output, Some(weights.merger_output_bias()))?;
-    kernels::elementwise::gather_rows_bf16(context, &output, reverse_indices, merged_tokens)
+    kernels::elementwise::gather_rows_bf16_device_indices(
+        context,
+        &output,
+        reverse_indices,
+        merged_tokens,
+    )
 }
 
 pub fn action_embedding(

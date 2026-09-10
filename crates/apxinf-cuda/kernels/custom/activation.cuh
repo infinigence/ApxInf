@@ -51,6 +51,106 @@ __global__ void silu_mul_bf16_kernel(
     output[gid] = __float2bfloat16(s * u);
 }
 
+// Separate-input variant used when gate/up projections are not packed.  The
+// intermediate SiLU value is explicitly rounded to BF16 so this remains
+// bit-compatible with the former `silu` then `mul` kernel sequence.
+__global__ void silu_mul_separate_bf16_kernel(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_bfloat16* output, uint32_t count) {
+  const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= count) return;
+  const float g = __bfloat162float(gate[gid]);
+  const __nv_bfloat16 activated = __float2bfloat16(g / (1.0f + expf(-g)));
+  output[gid] = __float2bfloat16(
+      __bfloat162float(activated) * __bfloat162float(up[gid]));
+}
+
+__global__ void silu_mul_separate_bf16_packed4_kernel(
+    const Bf16x4* gate, const Bf16x4* up, Bf16x4* output,
+    uint32_t quad_count) {
+  uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t stride = blockDim.x * gridDim.x;
+  for (; index < quad_count; index += stride) {
+    const Bf16x4 g = gate[index];
+    const Bf16x4 u = up[index];
+    float values[4] = {
+        __bfloat162float(g.low.x), __bfloat162float(g.low.y),
+        __bfloat162float(g.high.x), __bfloat162float(g.high.y)};
+    const float ups[4] = {
+        __bfloat162float(u.low.x), __bfloat162float(u.low.y),
+        __bfloat162float(u.high.x), __bfloat162float(u.high.y)};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const __nv_bfloat16 activated =
+          __float2bfloat16(values[i] / (1.0f + expf(-values[i])));
+      values[i] = __bfloat162float(activated) * ups[i];
+    }
+    output[index] = Bf16x4{
+        __floats2bfloat162_rn(values[0], values[1]),
+        __floats2bfloat162_rn(values[2], values[3])};
+  }
+}
+
+// Preserve the existing three-stage numerical contract while avoiding the
+// two BF16 intermediates: SiLU rounds to BF16, multiplication rounds to BF16,
+// then the calibrated value converts to saturating E4M3.
+__global__ void silu_mul_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_fp8_e4m3* output, int64_t count, float inverse_scale) {
+  int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t pair_count = count / 2;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; pair < pair_count; pair += stride) {
+    const int64_t index = pair * 2;
+    const __nv_bfloat162 gate2 =
+        reinterpret_cast<const __nv_bfloat162*>(gate)[pair];
+    const __nv_bfloat162 up2 =
+        reinterpret_cast<const __nv_bfloat162*>(up)[pair];
+    const float gx = __bfloat162float(gate2.x);
+    const float gy = __bfloat162float(gate2.y);
+    const __nv_bfloat16 sx =
+        __float2bfloat16(gx / (1.0f + expf(-gx)));
+    const __nv_bfloat16 sy =
+        __float2bfloat16(gy / (1.0f + expf(-gy)));
+    const __nv_bfloat16 px = __float2bfloat16(
+        __bfloat162float(sx) * __bfloat162float(up2.x));
+    const __nv_bfloat16 py = __float2bfloat16(
+        __bfloat162float(sy) * __bfloat162float(up2.y));
+    reinterpret_cast<__nv_fp8x2_e4m3*>(output)[pair] =
+        __nv_fp8x2_e4m3(make_float2(
+            __bfloat162float(px) * inverse_scale,
+            __bfloat162float(py) * inverse_scale));
+  }
+  if (count % 2 != 0 && pair == pair_count) {
+    const float g = __bfloat162float(gate[count - 1]);
+    const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
+    const __nv_bfloat16 product = __float2bfloat16(
+        __bfloat162float(s) * __bfloat162float(up[count - 1]));
+    output[count - 1] = static_cast<__nv_fp8_e4m3>(
+        __bfloat162float(product) * inverse_scale);
+  }
+}
+
+__global__ void packed_gate_up_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* gate_up, __nv_fp8_e4m3* output,
+    int rows, int inner, float inverse_scale) {
+  const int64_t count = static_cast<int64_t>(rows) * inner;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / inner);
+    const int col = static_cast<int>(index - static_cast<int64_t>(row) * inner);
+    const __nv_bfloat16* row_input =
+        gate_up + static_cast<int64_t>(row) * 2 * inner;
+    const float g = __bfloat162float(row_input[col]);
+    const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
+    const __nv_bfloat16 product = __float2bfloat16(
+        __bfloat162float(s) * __bfloat162float(row_input[inner + col]));
+    output[index] = static_cast<__nv_fp8_e4m3>(
+        __bfloat162float(product) * inverse_scale);
+  }
+}
+
 
 
 // ── GELU (tanh approximation, bf16) — Qwen3-VL vision MLP ────────────────
@@ -85,6 +185,37 @@ __global__ void bias_gelu_quant_f16_e4m3_kernel(
     float gelu = gelu_tanh(x);
     gelu = fminf(448.0f, fmaxf(-448.0f, gelu * inverse_scale));
     output[index] = static_cast<__nv_fp8_e4m3>(gelu);
+  }
+}
+
+__global__ void bias_gelu_quant_bf16_e4m3_packed4_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    __nv_fp8_e4m3* output, int64_t quad_count, int cols,
+    float inverse_scale) {
+  int64_t quad_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int quads_per_row = cols / 4;
+  const Bf16x4* input4 = reinterpret_cast<const Bf16x4*>(input);
+  const Bf16x4* bias4 = reinterpret_cast<const Bf16x4*>(bias);
+  for (; quad_index < quad_count; quad_index += stride) {
+    const Bf16x4 x = input4[quad_index];
+    const Bf16x4 b = bias4[quad_index % quads_per_row];
+    const float y0 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(x.low.x) + __bfloat162float(b.low.x))));
+    const float y1 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(x.low.y) + __bfloat162float(b.low.y))));
+    const float y2 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(x.high.x) + __bfloat162float(b.high.x))));
+    const float y3 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(x.high.y) + __bfloat162float(b.high.y))));
+    const __nv_fp8x2_e4m3 first(make_float2(
+        y0 * inverse_scale, y1 * inverse_scale));
+    const __nv_fp8x2_e4m3 second(make_float2(
+        y2 * inverse_scale, y3 * inverse_scale));
+    reinterpret_cast<uint32_t*>(output)[quad_index] =
+        static_cast<uint32_t>(first.__x) |
+        (static_cast<uint32_t>(second.__x) << 16);
   }
 }
 
@@ -326,7 +457,44 @@ __global__ void bias_activation_bf16_kernel(
     if (bias != nullptr) value += __bfloat162float(bias[index % cols]);
     if (activation == 1) value = gelu_tanh(value);
     if (activation == 2) value = value / (1.0f + expf(-value));
+    if (activation == 3) value = fmaxf(value, 0.0f);
     output[index] = __float2bfloat16(value);
+  }
+}
+
+__global__ void bias_qkv_in_place_bf16_packed4_kernel(
+    __nv_bfloat16* query, __nv_bfloat16* key, __nv_bfloat16* value,
+    const __nv_bfloat16* query_bias, const __nv_bfloat16* key_bias,
+    const __nv_bfloat16* value_bias, int64_t group_count,
+    int groups_per_row) {
+  int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; group < group_count; group += stride) {
+    const int bias_group = static_cast<int>(group % groups_per_row);
+    const __nv_bfloat162* qb = reinterpret_cast<const __nv_bfloat162*>(query_bias) + 2 * bias_group;
+    const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(key_bias) + 2 * bias_group;
+    const __nv_bfloat162* vb = reinterpret_cast<const __nv_bfloat162*>(value_bias) + 2 * bias_group;
+    __nv_bfloat162* q = reinterpret_cast<__nv_bfloat162*>(query) + 2 * group;
+    __nv_bfloat162* k = reinterpret_cast<__nv_bfloat162*>(key) + 2 * group;
+    __nv_bfloat162* v = reinterpret_cast<__nv_bfloat162*>(value) + 2 * group;
+    const float2 q0 = __bfloat1622float2(q[0]);
+    const float2 q1 = __bfloat1622float2(q[1]);
+    const float2 k0 = __bfloat1622float2(k[0]);
+    const float2 k1 = __bfloat1622float2(k[1]);
+    const float2 v0 = __bfloat1622float2(v[0]);
+    const float2 v1 = __bfloat1622float2(v[1]);
+    const float2 qb0 = __bfloat1622float2(qb[0]);
+    const float2 qb1 = __bfloat1622float2(qb[1]);
+    const float2 kb0 = __bfloat1622float2(kb[0]);
+    const float2 kb1 = __bfloat1622float2(kb[1]);
+    const float2 vb0 = __bfloat1622float2(vb[0]);
+    const float2 vb1 = __bfloat1622float2(vb[1]);
+    q[0] = __floats2bfloat162_rn(q0.x + qb0.x, q0.y + qb0.y);
+    q[1] = __floats2bfloat162_rn(q1.x + qb1.x, q1.y + qb1.y);
+    k[0] = __floats2bfloat162_rn(k0.x + kb0.x, k0.y + kb0.y);
+    k[1] = __floats2bfloat162_rn(k1.x + kb1.x, k1.y + kb1.y);
+    v[0] = __floats2bfloat162_rn(v0.x + vb0.x, v0.y + vb0.y);
+    v[1] = __floats2bfloat162_rn(v1.x + vb1.x, v1.y + vb1.y);
   }
 }
 
@@ -358,6 +526,10 @@ __global__ void bias_activation_bf16_packed2_kernel(
     if (activation == 2) {
       first = first / (1.0f + expf(-first));
       second = second / (1.0f + expf(-second));
+    }
+    if (activation == 3) {
+      first = fmaxf(first, 0.0f);
+      second = fmaxf(second, 0.0f);
     }
     output2[pair_index] = __floats2bfloat162_rn(first, second);
   }
@@ -396,6 +568,54 @@ __global__ void bias_activation_bf16_packed4_kernel(
 #pragma unroll
       for (int i = 0; i < 4; ++i)
         values[i] = values[i] / (1.0f + expf(-values[i]));
+    }
+    if (activation == 3) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) values[i] = fmaxf(values[i], 0.0f);
+    }
+    output4[quad_index] = Bf16x4{
+        __floats2bfloat162_rn(values[0], values[1]),
+        __floats2bfloat162_rn(values[2], values[3]),
+    };
+  }
+}
+
+template <int kActivation>
+__global__ void bias_activation_bf16_packed4_specialized_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    __nv_bfloat16* output, int64_t quad_count, int cols) {
+  int64_t quad_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  const int quads_per_row = cols / 4;
+  const Bf16x4* input4 = reinterpret_cast<const Bf16x4*>(input);
+  const Bf16x4* bias4 = reinterpret_cast<const Bf16x4*>(bias);
+  Bf16x4* output4 = reinterpret_cast<Bf16x4*>(output);
+  for (; quad_index < quad_count; quad_index += stride) {
+    const Bf16x4 packed_input = input4[quad_index];
+    float values[4] = {
+        __bfloat162float(packed_input.low.x),
+        __bfloat162float(packed_input.low.y),
+        __bfloat162float(packed_input.high.x),
+        __bfloat162float(packed_input.high.y),
+    };
+    if (bias != nullptr) {
+      const Bf16x4 packed_bias = bias4[quad_index % quads_per_row];
+      values[0] += __bfloat162float(packed_bias.low.x);
+      values[1] += __bfloat162float(packed_bias.low.y);
+      values[2] += __bfloat162float(packed_bias.high.x);
+      values[3] += __bfloat162float(packed_bias.high.y);
+    }
+    if constexpr (kActivation == 1) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) values[i] = gelu_tanh(values[i]);
+    } else if constexpr (kActivation == 2) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        values[i] = values[i] / (1.0f + expf(-values[i]));
+    } else if constexpr (kActivation == 3) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) values[i] = fmaxf(values[i], 0.0f);
     }
     output4[quad_index] = Bf16x4{
         __floats2bfloat162_rn(values[0], values[1]),

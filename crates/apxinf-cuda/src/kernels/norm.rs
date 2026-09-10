@@ -1,6 +1,6 @@
 //! Normalization operator contracts.
 
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::contracts::{
     bf16_output, check_cuda, checked_bytes, fp8_output, gpu_ptr, make_gpu_tensor, matrix_shape,
@@ -119,7 +119,7 @@ pub fn rms(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Resu
     };
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -174,7 +174,7 @@ pub fn layer(
     } else {
         dims[dims.len() - 1]
     };
-    let out_buf = CudaBuffer::alloc_zeros(input.size_in_bytes(), device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, input.size_in_bytes())?;
     unsafe {
         let res = ffi::apxinf_layer_norm_bf16(
             gpu_ptr(input)?,
@@ -193,6 +193,129 @@ pub fn layer(
         DType::BF16,
         device_id,
         out_buf,
+    ))
+}
+
+/// LayerNorm followed by a row-broadcast adaptive affine transform.
+///
+/// `input` is `[rows, cols]`; `modulation` is `[2 * cols]` in
+/// `[scale, shift]` order. This is the model-neutral primitive used by
+/// diffusion transformer blocks such as GR00T's DiT.
+pub fn adaptive_layer(
+    ctx: &CudaContext,
+    input: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "adaptive LayerNorm")?;
+    require_finite("adaptive LayerNorm", &[eps])?;
+    if rows == 0 || cols == 0 {
+        return Err(Error::Other(
+            "adaptive LayerNorm requires non-zero rows and columns".into(),
+        ));
+    }
+    let modulation_columns = cols
+        .checked_mul(2)
+        .ok_or_else(|| Error::Other("adaptive LayerNorm modulation width overflow".into()))?;
+    if eps <= 0.0
+        || input.dtype() != DType::BF16
+        || modulation.dtype() != DType::BF16
+        || modulation.shape().dims() != [modulation_columns]
+    {
+        return Err(Error::Other(format!(
+            "adaptive LayerNorm expects BF16 [rows,{cols}] and modulation [{}], got {} {:?} and {} {:?}",
+            modulation_columns,
+            input.dtype(),
+            input.shape().dims(),
+            modulation.dtype(),
+            modulation.shape().dims()
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [input, modulation] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+    let rows_u32 = u32::try_from(rows)
+        .map_err(|_| Error::Other("adaptive LayerNorm row count exceeds CUDA ABI".into()))?;
+    let cols_u32 = u32::try_from(cols)
+        .map_err(|_| Error::Other("adaptive LayerNorm width exceeds CUDA ABI".into()))?;
+    let output = bf16_output(ctx, rows, cols)?;
+    check_cuda(unsafe {
+        ffi::apxinf_adaptive_layer_norm_bf16(
+            gpu_ptr(input)?,
+            gpu_ptr(modulation)?,
+            output.ptr(),
+            rows_u32,
+            cols_u32,
+            eps,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
+/// Adaptive LayerNorm producing both the exact BF16 result and its calibrated
+/// E4M3 representation. The quantized output matches applying the standalone
+/// BF16-to-E4M3 quantizer to the returned BF16 tensor.
+pub fn adaptive_layer_quant_bf16_e4m3(
+    ctx: &CudaContext,
+    input: &Tensor,
+    modulation: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let (rows, cols) = matrix_shape(input, "adaptive LayerNorm quantization")?;
+    require_finite("adaptive LayerNorm quantization", &[eps, scale])?;
+    let modulation_columns = cols
+        .checked_mul(2)
+        .ok_or_else(|| Error::Other("adaptive LayerNorm modulation width overflow".into()))?;
+    if rows == 0
+        || cols == 0
+        || eps <= 0.0
+        || scale <= 0.0
+        || input.dtype() != DType::BF16
+        || modulation.dtype() != DType::BF16
+        || modulation.shape().dims() != [modulation_columns]
+    {
+        return Err(Error::Other(
+            "adaptive LayerNorm quantization expects aligned BF16 input/modulation and positive epsilon/scale".into(),
+        ));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if input.device() != expected_device || modulation.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: input.device(),
+        });
+    }
+    let rows = u32::try_from(rows)
+        .map_err(|_| Error::Other("adaptive LayerNorm row count exceeds CUDA ABI".into()))?;
+    let cols = u32::try_from(cols)
+        .map_err(|_| Error::Other("adaptive LayerNorm width exceeds CUDA ABI".into()))?;
+    let bf16 = bf16_output(ctx, rows as usize, cols as usize)?;
+    let fp8 = fp8_output(ctx, rows as usize, cols as usize)?;
+    check_cuda(unsafe {
+        ffi::apxinf_adaptive_layer_norm_quant_bf16_e4m3(
+            gpu_ptr(input)?,
+            gpu_ptr(modulation)?,
+            bf16.ptr(),
+            fp8.ptr(),
+            rows,
+            cols,
+            eps,
+            scale,
+            ctx.stream().handle(),
+        )
+    })?;
+    let shape = Shape::new(vec![rows as usize, cols as usize]);
+    Ok((
+        make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), bf16),
+        make_gpu_tensor(shape, DType::F8E4M3, ctx.device_id(), fp8),
     ))
 }
 pub fn rms_bf16(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
@@ -439,6 +562,54 @@ pub fn layer_quant_f16_e4m3(
     let output = fp8_output(ctx, rows, cols)?;
     unsafe {
         ffi::check_cuda(ffi::apxinf_static_layer_norm_quant_f16_e4m3(
+            gpu_ptr(input)?,
+            gpu_ptr(weight)?,
+            gpu_ptr(bias)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            eps,
+            scale,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, cols]),
+        DType::F8E4M3,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+pub fn layer_quant_bf16_e4m3(
+    ctx: &CudaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "LayerNorm")?;
+    if input.dtype() != DType::BF16
+        || weight.dtype() != DType::BF16
+        || bias.dtype() != DType::BF16
+        || weight.shape().dims() != [cols]
+        || bias.shape().dims() != [cols]
+    {
+        return Err(Error::Other(
+            "static inference LayerNorm expects BF16 [rows,cols] and BF16 [cols] affine tensors"
+                .into(),
+        ));
+    }
+    if !eps.is_finite() || eps <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other(
+            "static inference LayerNorm epsilon and FP8 scale must be finite and positive".into(),
+        ));
+    }
+    let output = fp8_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_layer_norm_quant_bf16_e4m3(
             gpu_ptr(input)?,
             gpu_ptr(weight)?,
             gpu_ptr(bias)?,

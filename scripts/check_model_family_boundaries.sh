@@ -19,6 +19,16 @@ is_shared_dir() {
     return 1
 }
 
+# Composite model families may depend on a separately registered backbone only
+# through an explicitly reviewed edge. GR00T N1.7 embeds Qwen3-VL as its
+# released vision-language backbone; duplicating that architecture would make
+# checkpoint and numerical fixes diverge between the standalone and VLA paths.
+is_allowed_family_dependency() {
+    local family="$1"
+    local dependency="$2"
+    [[ "$family" == "gr00t" && "$dependency" == "qwen3vl" ]]
+}
+
 families=()
 for directory in "$model_root"/*; do
     [[ -d "$directory" && -f "$directory/mod.rs" ]] || continue
@@ -32,6 +42,7 @@ for family in "${families[@]}"; do
     family_dir="$model_root/$family"
     for other in "${families[@]}"; do
         [[ "$family" == "$other" ]] && continue
+        is_allowed_family_dependency "$family" "$other" && continue
         pattern="(crate::${other}|super::super::${other})([^[:alnum:]_]|$)|^[[:space:]]*use[[:space:]]+crate::\\{[^;]*${other}::"
         if command -v rg >/dev/null 2>&1; then
             if rg -n -g '*.rs' "$pattern" "$family_dir"; then

@@ -129,6 +129,8 @@ struct ResidualPlan {
 thread_local cublasLtHandle_t g_lt = nullptr;
 thread_local void* g_workspace = nullptr;
 thread_local std::unordered_map<ShapeKey, GemmPlan, ShapeHash> g_plans;
+thread_local std::unordered_map<ShapeKey, GemmPlan, ShapeHash>
+    g_fp8_bf16_plans;
 thread_local std::unordered_map<ShapeKey, Bf16GemmPlan, ShapeHash>
     g_bf16_plans;
 thread_local std::unordered_map<ShapeKey, GemmPlan, ShapeHash>
@@ -140,7 +142,11 @@ thread_local std::unordered_map<ResidualKey, ResidualPlan, ResidualHash>
     g_residual_plans;
 thread_local std::unordered_map<ResidualKey, ResidualPlan, ResidualHash>
     g_bias_plans;
+thread_local std::unordered_map<ResidualKey, ResidualPlan, ResidualHash>
+    g_fp8_bf16_bias_plans;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_cublaslt_ranks;
+thread_local std::unordered_map<ShapeKey, int, ShapeHash>
+    g_fp8_bf16_cublaslt_ranks;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_bias_ranks;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_gelu_ranks;
 thread_local std::unordered_map<ShapeKey, int, ShapeHash> g_fp8_residual_ranks;
@@ -237,6 +243,23 @@ void invalidate_fp8_gelu_plans(const ShapeKey& key) {
     if (it->first.shape == key) {
       destroy_gelu_plan(&it->second);
       it = g_gelu_plans.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void invalidate_fp8_bf16_shape_plans(const ShapeKey& key) {
+  auto plan_it = g_fp8_bf16_plans.find(key);
+  if (plan_it != g_fp8_bf16_plans.end()) {
+    destroy_plan(&plan_it->second);
+    g_fp8_bf16_plans.erase(plan_it);
+  }
+  for (auto it = g_fp8_bf16_bias_plans.begin();
+       it != g_fp8_bf16_bias_plans.end();) {
+    if (it->first.shape == key) {
+      destroy_residual_plan(&it->second);
+      it = g_fp8_bf16_bias_plans.erase(it);
     } else {
       ++it;
     }
@@ -410,6 +433,64 @@ cublasStatus_t make_plan(const ShapeKey& key, GemmPlan* plan) {
   if (status == CUBLAS_STATUS_SUCCESS && returned > rank &&
       results[rank].state == CUBLAS_STATUS_SUCCESS) {
     plan->algorithm = results[rank].algo;
+    plan->has_algorithm = true;
+  } else if (status == CUBLAS_STATUS_SUCCESS) {
+    status = CUBLAS_STATUS_NOT_SUPPORTED;
+  }
+  return status;
+}
+
+cublasStatus_t make_fp8_bf16_plan(const ShapeKey& key, GemmPlan* plan) {
+  // Row-major D=A@B is represented as D^T=B^T@A^T. Keeping a separate
+  // plan cache is required because the output data type is part of the
+  // cuBLASLt matrix-layout and algorithm contract.
+  cublasStatus_t status = cublasLtMatmulDescCreate(
+      &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+
+  cublasOperation_t op = CUBLAS_OP_N;
+  status = cublasLtMatmulDescSetAttribute(
+      plan->operation, CUBLASLT_MATMUL_DESC_TRANSA, &op, sizeof(op));
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatmulDescSetAttribute(
+      plan->operation, CUBLASLT_MATMUL_DESC_TRANSB, &op, sizeof(op));
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+
+  status = cublasLtMatrixLayoutCreate(
+      &plan->weight, CUDA_R_8F_E4M3, key.n, key.k, key.n);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutCreate(
+      &plan->activation, CUDA_R_8F_E4M3, key.k, key.m, key.k);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  status = cublasLtMatrixLayoutCreate(
+      &plan->output, CUDA_R_16BF, key.n, key.m, key.n);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  status = cublasLtMatmulPreferenceCreate(&preference);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  size_t workspace_bytes = kWorkspaceBytes;
+  status = cublasLtMatmulPreferenceSetAttribute(
+      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &workspace_bytes, sizeof(workspace_bytes));
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cublasLtMatmulPreferenceDestroy(preference);
+    return status;
+  }
+  int requested = 1;
+  auto rank_it = g_fp8_bf16_cublaslt_ranks.find(key);
+  if (rank_it != g_fp8_bf16_cublaslt_ranks.end())
+    requested = rank_it->second + 1;
+  std::vector<cublasLtMatmulHeuristicResult_t> results(requested);
+  int returned = 0;
+  status = cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan->operation, plan->weight, plan->activation, plan->output,
+      plan->output, preference, requested, results.data(), &returned);
+  cublasLtMatmulPreferenceDestroy(preference);
+  const int selected_rank = requested - 1;
+  if (status == CUBLAS_STATUS_SUCCESS && returned > selected_rank &&
+      results[selected_rank].state == CUBLAS_STATUS_SUCCESS) {
+    plan->algorithm = results[selected_rank].algo;
     plan->has_algorithm = true;
   } else if (status == CUBLAS_STATUS_SUCCESS) {
     status = CUBLAS_STATUS_NOT_SUPPORTED;
@@ -601,7 +682,7 @@ cublasStatus_t make_gelu_plan(
 
 cublasStatus_t make_residual_plan(
     const ShapeKey& key, ResidualPlan* plan, int heuristic_rank = 0,
-    const CustomAlgoConfig* custom = nullptr) {
+    const CustomAlgoConfig* custom = nullptr, bool bf16_output = false) {
   cublasStatus_t status = cublasLtMatmulDescCreate(
       &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
@@ -619,7 +700,9 @@ cublasStatus_t make_residual_plan(
       plan->operation, CUBLASLT_MATMUL_DESC_EPILOGUE,
       &epilogue, sizeof(epilogue));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
-  cudaDataType_t bias_type = CUDA_R_16F;
+  const cudaDataType_t output_type =
+      bf16_output ? CUDA_R_16BF : CUDA_R_16F;
+  cudaDataType_t bias_type = output_type;
   status = cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
       &bias_type, sizeof(bias_type));
@@ -632,7 +715,7 @@ cublasStatus_t make_residual_plan(
       &plan->activation, CUDA_R_8F_E4M3, key.k, key.m, key.k);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatrixLayoutCreate(
-      &plan->output, CUDA_R_16F, key.n, key.m, key.n);
+      &plan->output, output_type, key.n, key.m, key.n);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
   cudaError_t cuda_status = cudaMalloc(
@@ -717,6 +800,21 @@ cublasStatus_t prepare_gemm_plan(const ShapeKey& key) {
     return status;
   }
   g_plans.emplace(key, plan);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t prepare_fp8_bf16_gemm_plan(const ShapeKey& key) {
+  cublasStatus_t status = initialize();
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  if (g_fp8_bf16_plans.find(key) != g_fp8_bf16_plans.end())
+    return CUBLAS_STATUS_SUCCESS;
+  GemmPlan plan;
+  status = make_fp8_bf16_plan(key, &plan);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    destroy_plan(&plan);
+    return status;
+  }
+  g_fp8_bf16_plans.emplace(key, plan);
   return CUBLAS_STATUS_SUCCESS;
 }
 
@@ -826,6 +924,29 @@ cublasStatus_t prepare_bias_plan(const ResidualKey& key) {
       return status;
     }
     it = g_bias_plans.emplace(key, plan).first;
+  }
+  return cublasLtMatmulDescSetAttribute(
+      it->second.operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+      &key.bias, sizeof(key.bias));
+}
+
+cublasStatus_t prepare_fp8_bf16_bias_plan(const ResidualKey& key) {
+  cublasStatus_t status = initialize();
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
+  auto it = g_fp8_bf16_bias_plans.find(key);
+  if (it == g_fp8_bf16_bias_plans.end()) {
+    ResidualPlan plan;
+    int heuristic_rank = 0;
+    auto rank_it = g_fp8_bf16_cublaslt_ranks.find(key.shape);
+    if (rank_it != g_fp8_bf16_cublaslt_ranks.end())
+      heuristic_rank = rank_it->second;
+    status = make_residual_plan(
+        key.shape, &plan, heuristic_rank, nullptr, true);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      destroy_residual_plan(&plan);
+      return status;
+    }
+    it = g_fp8_bf16_bias_plans.emplace(key, plan).first;
   }
   return cublasLtMatmulDescSetAttribute(
       it->second.operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
@@ -1156,6 +1277,12 @@ extern "C" int apxinf_static_prepare_fp8_gemm_f16(int m, int n, int k) {
   return static_cast<int>(prepare_gemm_plan(ShapeKey{m, n, k}));
 }
 
+extern "C" int apxinf_static_prepare_fp8_gemm_bf16(int m, int n, int k) {
+  if (m <= 0 || n <= 0 || k <= 0)
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  return static_cast<int>(prepare_fp8_bf16_gemm_plan(ShapeKey{m, n, k}));
+}
+
 extern "C" int apxinf_static_prepare_fp8_gemm_split_f16(
     int m, int n, int k) {
   if (m <= 0 || n <= 0 || k <= 0 || (n & 1) != 0)
@@ -1191,6 +1318,14 @@ extern "C" int apxinf_static_prepare_fp8_gemm_bias_f16(
       prepare_bias_plan(ResidualKey{ShapeKey{m, n, k}, bias}));
 }
 
+extern "C" int apxinf_static_prepare_fp8_gemm_bias_bf16(
+    const void* bias, int m, int n, int k) {
+  if (bias == nullptr || m <= 0 || n <= 0 || k <= 0)
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  return static_cast<int>(
+      prepare_fp8_bf16_bias_plan(ResidualKey{ShapeKey{m, n, k}, bias}));
+}
+
 extern "C" int apxinf_static_fp8_gemm_f16(
     const void* activation, const void* weight, void* output,
     int m, int n, int k, float alpha, cudaStream_t stream) {
@@ -1211,6 +1346,27 @@ extern "C" int apxinf_static_fp8_gemm_f16(
       plan.has_algorithm ? &plan.algorithm : nullptr,
       g_workspace, kWorkspaceBytes, stream);
   return static_cast<int>(status);
+}
+
+extern "C" int apxinf_static_fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || output == nullptr ||
+      m <= 0 || n <= 0 || k <= 0)
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  ShapeKey key{m, n, k};
+  auto it = g_fp8_bf16_plans.find(key);
+  if (it == g_fp8_bf16_plans.end())
+    return static_cast<int>(CUBLAS_STATUS_NOT_INITIALIZED);
+
+  const float beta = 0.0f;
+  GemmPlan& plan = it->second;
+  return static_cast<int>(cublasLtMatmul(
+      g_lt, plan.operation, &alpha,
+      weight, plan.weight, activation, plan.activation,
+      &beta, output, plan.output, output, plan.output,
+      plan.has_algorithm ? &plan.algorithm : nullptr,
+      g_workspace, kWorkspaceBytes, stream));
 }
 
 extern "C" int apxinf_static_fp8_gemm_split_f16(
@@ -1335,6 +1491,28 @@ extern "C" int apxinf_static_fp8_gemm_bias_f16(
       g_workspace, kWorkspaceBytes, stream));
 }
 
+extern "C" int apxinf_static_fp8_gemm_bias_bf16(
+    const void* activation, const void* weight, const void* bias, void* output,
+    int m, int n, int k, float alpha, cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || m <= 0 || n <= 0 || k <= 0) {
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  }
+  ResidualKey key{ShapeKey{m, n, k}, bias};
+  auto it = g_fp8_bf16_bias_plans.find(key);
+  if (it == g_fp8_bf16_bias_plans.end())
+    return static_cast<int>(CUBLAS_STATUS_NOT_INITIALIZED);
+
+  ResidualPlan& plan = it->second;
+  const float beta = 0.0f;
+  return static_cast<int>(cublasLtMatmul(
+      g_lt, plan.operation, &alpha,
+      weight, plan.weight, activation, plan.activation,
+      &beta, output, plan.output, output, plan.output,
+      plan.has_algorithm ? &plan.algorithm : nullptr,
+      g_workspace, kWorkspaceBytes, stream));
+}
+
 extern "C" int apxinf_static_set_cublaslt_gemm_heuristic(
     int m, int n, int k, int heuristic_rank) {
   if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||
@@ -1343,6 +1521,21 @@ extern "C" int apxinf_static_set_cublaslt_gemm_heuristic(
   g_fp8_custom_algorithms.erase(key);
   g_cublaslt_ranks[key] = heuristic_rank;
   invalidate_fp8_shape_plans(key);
+  return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+}
+
+extern "C" int apxinf_static_set_cublaslt_fp8_gemm_bf16_heuristic(
+    int m, int n, int k, int heuristic_rank) {
+  if (m <= 0 || n <= 0 || k <= 0 || heuristic_rank < 0 ||
+      heuristic_rank >= 64) return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  ShapeKey key{m, n, k};
+  auto rank_it = g_fp8_bf16_cublaslt_ranks.find(key);
+  if (rank_it != g_fp8_bf16_cublaslt_ranks.end() &&
+      rank_it->second == heuristic_rank) {
+    return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+  }
+  g_fp8_bf16_cublaslt_ranks[key] = heuristic_rank;
+  invalidate_fp8_bf16_shape_plans(key);
   return static_cast<int>(CUBLAS_STATUS_SUCCESS);
 }
 
@@ -1577,5 +1770,135 @@ extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_f16(
   plan.algorithm = results[best_rank].algo;
   plan.has_algorithm = true;
   g_cublaslt_ranks[key] = best_rank;
+  return static_cast<int>(CUBLAS_STATUS_SUCCESS);
+}
+
+extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    void* l2_eviction_buffer, size_t l2_eviction_bytes,
+    int m, int n, int k, float alpha, int max_algorithms,
+    int warmup_iterations, int benchmark_iterations,
+    int* returned_algorithms, float* milliseconds, cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || output == nullptr ||
+      l2_eviction_buffer == nullptr || l2_eviction_bytes == 0 ||
+      returned_algorithms == nullptr || milliseconds == nullptr ||
+      m <= 0 || n <= 0 || k <= 0 || max_algorithms <= 0 ||
+      max_algorithms > 64 || warmup_iterations < 0 ||
+      benchmark_iterations <= 0) {
+    return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
+  }
+  cublasStatus_t status = initialize();
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
+
+  ShapeKey key{m, n, k};
+  auto it = g_fp8_bf16_plans.find(key);
+  if (it == g_fp8_bf16_plans.end()) {
+    GemmPlan plan;
+    status = make_fp8_bf16_plan(key, &plan);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      destroy_plan(&plan);
+      return static_cast<int>(status);
+    }
+    it = g_fp8_bf16_plans.emplace(key, plan).first;
+  }
+  GemmPlan& plan = it->second;
+
+  cublasLtMatmulPreference_t preference = nullptr;
+  status = cublasLtMatmulPreferenceCreate(&preference);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
+  size_t workspace_bytes = kWorkspaceBytes;
+  status = cublasLtMatmulPreferenceSetAttribute(
+      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &workspace_bytes, sizeof(workspace_bytes));
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cublasLtMatmulPreferenceDestroy(preference);
+    return static_cast<int>(status);
+  }
+  std::vector<cublasLtMatmulHeuristicResult_t> results(max_algorithms);
+  int returned = 0;
+  status = cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan.operation, plan.weight, plan.activation, plan.output,
+      plan.output, preference, max_algorithms, results.data(), &returned);
+  cublasLtMatmulPreferenceDestroy(preference);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
+  *returned_algorithms = returned;
+  for (int i = 0; i < max_algorithms; ++i) milliseconds[i] = -1.0f;
+  if (returned == 0) return static_cast<int>(CUBLAS_STATUS_NOT_SUPPORTED);
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  if (cudaEventCreate(&start) != cudaSuccess ||
+      cudaEventCreate(&stop) != cudaSuccess) {
+    if (start != nullptr) cudaEventDestroy(start);
+    if (stop != nullptr) cudaEventDestroy(stop);
+    return static_cast<int>(CUBLAS_STATUS_ALLOC_FAILED);
+  }
+  const float beta = 0.0f;
+  int best_rank = -1;
+  float best_ms = 1.0e30f;
+  for (int rank = 0; rank < returned; ++rank) {
+    if (results[rank].state != CUBLAS_STATUS_SUCCESS) continue;
+    bool valid = true;
+    for (int iteration = 0; iteration < warmup_iterations; ++iteration) {
+      if (apxinf_static_evict_l2(l2_eviction_buffer, l2_eviction_bytes,
+                                static_cast<uint32_t>(rank * 4099 + iteration),
+                                stream) != cudaSuccess) {
+        valid = false;
+        break;
+      }
+      status = cublasLtMatmul(
+          g_lt, plan.operation, &alpha,
+          weight, plan.weight, activation, plan.activation,
+          &beta, output, plan.output, output, plan.output,
+          &results[rank].algo, g_workspace, kWorkspaceBytes, stream);
+      if (status != CUBLAS_STATUS_SUCCESS) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid || cudaStreamSynchronize(stream) != cudaSuccess) continue;
+    float elapsed = 0.0f;
+    for (int iteration = 0; iteration < benchmark_iterations; ++iteration) {
+      if (apxinf_static_evict_l2(l2_eviction_buffer, l2_eviction_bytes,
+                                static_cast<uint32_t>(rank * 65537 + iteration),
+                                stream) != cudaSuccess ||
+          cudaEventRecord(start, stream) != cudaSuccess) {
+        valid = false;
+        break;
+      }
+      status = cublasLtMatmul(
+          g_lt, plan.operation, &alpha,
+          weight, plan.weight, activation, plan.activation,
+          &beta, output, plan.output, output, plan.output,
+          &results[rank].algo, g_workspace, kWorkspaceBytes, stream);
+      if (status != CUBLAS_STATUS_SUCCESS) {
+        valid = false;
+        break;
+      }
+      if (cudaEventRecord(stop, stream) != cudaSuccess ||
+          cudaEventSynchronize(stop) != cudaSuccess) {
+        valid = false;
+        break;
+      }
+      float iteration_ms = 0.0f;
+      if (cudaEventElapsedTime(&iteration_ms, start, stop) != cudaSuccess) {
+        valid = false;
+        break;
+      }
+      elapsed += iteration_ms;
+    }
+    if (!valid) continue;
+    elapsed /= static_cast<float>(benchmark_iterations);
+    milliseconds[rank] = elapsed;
+    if (elapsed < best_ms) {
+      best_ms = elapsed;
+      best_rank = rank;
+    }
+  }
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  if (best_rank < 0) return static_cast<int>(CUBLAS_STATUS_NOT_SUPPORTED);
+  plan.algorithm = results[best_rank].algo;
+  plan.has_algorithm = true;
   return static_cast<int>(CUBLAS_STATUS_SUCCESS);
 }

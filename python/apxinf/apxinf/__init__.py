@@ -57,7 +57,14 @@ from .conventions import (
     get_convention,
     register_convention,
 )
-from .policies import AutoPolicy, ComposablePolicy, Pi05Policy, Policy, WallossPolicy
+from .policies import (
+    AutoPolicy,
+    ComposablePolicy,
+    Gr00tPolicy,
+    Pi05Policy,
+    Policy,
+    WallossPolicy,
+)
 from .robots import (
     ROBOT_PRESETS,
     Embodiment,
@@ -87,6 +94,7 @@ __all__ = [
     "ComposablePolicy",
     # L2 policies
     "Pi05Policy",
+    "Gr00tPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework

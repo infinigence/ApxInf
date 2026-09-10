@@ -13,6 +13,7 @@ meaningless — the point is the call shape).
 | Example | Shows |
 |---|---|
 | [`pi05policy_infer.py`](pi05policy_infer.py) | Concrete `Pi05Policy.from_pretrained` — model-specific knobs (`action_dim`, `image_keys`). |
+| [`gr00tpolicy_infer.py`](gr00tpolicy_infer.py) | Concrete `Gr00tPolicy.from_pretrained` — raw RGB/state/prompt through NVIDIA preprocessing and ApxInf Model Core. |
 | [`autopolicy_infer.py`](autopolicy_infer.py) | Generic `AutoPolicy.from_pretrained` — dispatch by `config.json` model type and pass concrete-policy options as JSON. |
 | [`openpi_server.py`](openpi_server.py) | Serve any registered policy over OpenPI's websocket protocol (`apxinf.serving`). |
 | [`openpi_client.py`](openpi_client.py) | Connect an OpenPI client, read metadata, send one observation, read actions. |
@@ -46,6 +47,15 @@ python examples/openpi_client.py --host 127.0.0.1 --port 8000
 # Or skip the network and call the policy in-process
 python examples/pi05policy_infer.py --model-dir /path/to/checkpoint
 python examples/autopolicy_infer.py --model-dir /path/to/checkpoint
+
+# GR00T uses the official processor and a separate Cosmos backbone.
+python examples/gr00tpolicy_infer.py \
+  --model-dir /path/to/gr00t \
+  --backbone /path/to/Cosmos-Reason2-2B \
+  --image /path/to/image.png \
+  --wrist-image /path/to/wrist.png \
+  --state /path/to/state.npy \
+  --prompt "put the object in the basket"
 
 # WallOSS uses the same generic commands. Policy-specific options are data.
 python examples/autopolicy_infer.py \

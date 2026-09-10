@@ -10,7 +10,7 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 # The processor library is pure numpy/PIL/sentencepiece with no GPU / no Rust
 # dependency, so it installs and unit-tests offline. `apxinf-py` is only needed
-# when a real Pi05Policy is constructed, hence it is an optional extra.
+# when a native policy is constructed, hence it is an optional extra.
 dependencies = [
     "numpy>=1.21",
     "Pillow>=9.0.0",
@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 # The prompt tokenizer needs sentencepiece; the golden/layering tests want it too.
 tokenizer = ["sentencepiece>=0.1.99"]
-# A live Pi05Policy binds the PyO3 model handle (Phase 1).
+# A live policy binds the PyO3 model handle.
 policy = ["apxinf-py>=0.1.0"]
 # WallOSS owns a Qwen2.5-VL BPE/image processor and reads the checkpoint's
 # torch-serialized normalizers plus optional YAML training semantics. Keep these

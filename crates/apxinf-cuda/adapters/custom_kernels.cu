@@ -59,6 +59,26 @@ extern "C" cudaError_t apxinf_static_evict_l2(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_qkv_split_gqa_bf16(
+    const void* input, void* query, void* key, void* value,
+    int rows, int query_cols, int key_value_cols, cudaStream_t stream) {
+  if (input == nullptr || query == nullptr || key == nullptr || value == nullptr ||
+      rows <= 0 || query_cols <= 0 || key_value_cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  const int64_t count = static_cast<int64_t>(rows) *
+      (query_cols + 2 * key_value_cols);
+  int blocks = static_cast<int>((count + threads - 1) / threads);
+  blocks = blocks > 1024 ? 1024 : blocks;
+  qkv_split_gqa_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<__nv_bfloat16*>(query),
+      static_cast<__nv_bfloat16*>(key),
+      static_cast<__nv_bfloat16*>(value), rows, query_cols, key_value_cols);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_quantize_f16_e4m3(
     const void* input, void* output, int64_t count, float scale,
     cudaStream_t stream) {
@@ -90,6 +110,39 @@ extern "C" cudaError_t apxinf_static_quantize_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_quantize_bf16_e4m3(
+    const void* input, void* output, int64_t count, float scale,
+    cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0 || !(scale > 0.0f))
+    return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  const int64_t vector_count = count & ~int64_t{3};
+  int blocks = static_cast<int>(((vector_count / 4) + threads - 1) / threads);
+#if defined(APXINF_TARGET_SM110)
+  int block_cap = 80;
+#else
+  int block_cap = 1024;
+#endif
+  if (const char* value = std::getenv("APXINF_BF16_FP8_QUANT_BLOCK_CAP")) {
+    const int parsed = std::atoi(value);
+    if (parsed > 0) block_cap = parsed;
+  }
+  blocks = blocks > block_cap ? block_cap : blocks;
+  if (vector_count > 0) {
+    quantize_bf16_e4m3_packed4_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_fp8_e4m3*>(output), vector_count, 1.0f / scale);
+  }
+  const int64_t tail = count - vector_count;
+  if (tail > 0) {
+    quantize_bf16_e4m3_kernel<<<1, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input) + vector_count,
+        static_cast<__nv_fp8_e4m3*>(output) + vector_count,
+        tail, 1.0f / scale);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_dequantize_e4m3_f16(
     const void* input, void* output, int64_t count, float scale,
     cudaStream_t stream) {
@@ -102,19 +155,6 @@ extern "C" cudaError_t apxinf_static_dequantize_e4m3_f16(
   dequantize_e4m3_f16_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const __nv_fp8_e4m3*>(input),
       static_cast<half*>(output), count, scale);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_static_quantize_bf16_e4m3(
-    const void* input, void* output, int64_t count, float scale,
-    cudaStream_t stream) {
-  if (input == nullptr || output == nullptr || count <= 0 || !(scale > 0.0f))
-    return cudaErrorInvalidValue;
-  int blocks = static_cast<int>((count + 255) / 256);
-  blocks = blocks > 4096 ? 4096 : blocks;
-  quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(input),
-      static_cast<__nv_fp8_e4m3*>(output), count, 1.0f / scale);
   return cudaGetLastError();
 }
 
@@ -353,6 +393,24 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+  const int threads = 256;
+  layer_norm_quant_bf16_e4m3_kernel<<<rows, threads, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), rows, cols, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_layer_norm_quant_f16_e4m3(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
@@ -374,6 +432,29 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_f16_e4m3(
   bias_gelu_quant_f16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const half*>(input), static_cast<const half*>(bias),
       static_cast<__nv_fp8_e4m3*>(output), count, cols, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  const int64_t quad_count = static_cast<int64_t>(rows) * cols / 4;
+  int blocks = static_cast<int>((quad_count + threads - 1) / threads);
+#if defined(APXINF_TARGET_SM110)
+  blocks = blocks > 80 ? 80 : blocks;
+#else
+  blocks = blocks > 1024 ? 1024 : blocks;
+#endif
+  bias_gelu_quant_bf16_e4m3_packed4_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), quad_count, cols, 1.0f / scale);
   return cudaGetLastError();
 }
 

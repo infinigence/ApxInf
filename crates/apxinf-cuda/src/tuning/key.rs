@@ -7,6 +7,7 @@ pub enum GemmOp {
     Bf16,
     W8A8,
     Fp8F16,
+    Fp8Bf16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -189,7 +189,6 @@ impl Backend for CudaBackend {
         if tensors.is_empty() {
             return Err(Error::Other("concat_2d: empty input".into()));
         }
-        let device_id = self.ctx.device_id();
         let dtype = tensors[0].dtype();
         let elem = dtype.size_in_bytes();
         let dims0 = tensors[0].shape().dims();
@@ -208,7 +207,7 @@ impl Backend for CudaBackend {
             }
         }
         let out_bytes = rows * total_cols * elem;
-        let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+        let out_buf = crate::workspace::output_buffer(&self.ctx, out_bytes)?;
         let dst_pitch = total_cols * elem;
         let mut col_offset = 0usize;
         for t in tensors {
@@ -381,5 +380,55 @@ mod graph_tests {
         let mut output = vec![0u8; 64];
         buffer.copy_to_host(&mut output).unwrap();
         assert!(output.iter().all(|value| *value == 0x5a));
+    }
+
+    #[test]
+    fn backend_graph_stream_recovers_after_workspace_exhaustion() {
+        let backend = CudaBackend::new(0).unwrap();
+        let workspace = crate::workspace::GraphWorkspace::new(64, 0).unwrap();
+
+        let error = crate::workspace::prepare_with_workspace(&workspace, || {
+            crate::workspace::output_buffer(backend.context(), 65).map(|_| ())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace exhausted"));
+
+        let buffer = CudaBuffer::alloc_zeros(64, 0).unwrap();
+        backend.begin_capture().unwrap();
+        crate::graph::captured_memset(backend.context(), &buffer, 0xa5).unwrap();
+        let graph = backend.end_capture().unwrap();
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+
+        let mut output = vec![0u8; 64];
+        buffer.copy_to_host(&mut output).unwrap();
+        assert!(output.iter().all(|value| *value == 0xa5));
+    }
+
+    #[test]
+    fn backend_graph_stream_recovers_after_capture_body_error() {
+        let backend = CudaBackend::new(0).unwrap();
+        let workspace = crate::workspace::GraphWorkspace::new(64, 0).unwrap();
+        let discarded = CudaBuffer::alloc_zeros(64, 0).unwrap();
+
+        backend.begin_capture().unwrap();
+        let error = crate::workspace::with_workspace(&workspace, || {
+            crate::graph::captured_memset(backend.context(), &discarded, 0x11).unwrap();
+            crate::workspace::output_buffer(backend.context(), 65).map(|_| ())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace exhausted"));
+        drop(backend.end_capture());
+
+        let buffer = CudaBuffer::alloc_zeros(64, 0).unwrap();
+        backend.begin_capture().unwrap();
+        crate::graph::captured_memset(backend.context(), &buffer, 0x3c).unwrap();
+        let graph = backend.end_capture().unwrap();
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+
+        let mut output = vec![0u8; 64];
+        buffer.copy_to_host(&mut output).unwrap();
+        assert!(output.iter().all(|value| *value == 0x3c));
     }
 }

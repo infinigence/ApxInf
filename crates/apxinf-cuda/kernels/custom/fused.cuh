@@ -364,6 +364,55 @@ __global__ void bias_residual_bf16_kernel(
   }
 }
 
+__global__ void bias_residual_bf16_packed4_kernel(
+    const Bf16x4* projection, const Bf16x4* bias,
+    const Bf16x4* residual, Bf16x4* output,
+    int64_t packed_count, int packed_cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < packed_count; index += stride) {
+    const Bf16x4 projected = projection[index];
+    const Bf16x4 skipped = residual[index];
+    float2 projection_low = __bfloat1622float2(projected.low);
+    float2 projection_high = __bfloat1622float2(projected.high);
+    const float2 residual_low = __bfloat1622float2(skipped.low);
+    const float2 residual_high = __bfloat1622float2(skipped.high);
+    projection_low.x += residual_low.x;
+    projection_low.y += residual_low.y;
+    projection_high.x += residual_high.x;
+    projection_high.y += residual_high.y;
+    if (bias != nullptr) {
+      const Bf16x4 bias_value = bias[index % packed_cols];
+      const float2 bias_low = __bfloat1622float2(bias_value.low);
+      const float2 bias_high = __bfloat1622float2(bias_value.high);
+      projection_low.x += bias_low.x;
+      projection_low.y += bias_low.y;
+      projection_high.x += bias_high.x;
+      projection_high.y += bias_high.y;
+    }
+    output[index] = Bf16x4{
+        __floats2bfloat162_rn(projection_low.x, projection_low.y),
+        __floats2bfloat162_rn(projection_high.x, projection_high.y)};
+  }
+}
+
+// Preserve a two-kernel `bias_bf16` then `add_bf16` contract in one launch:
+// the projection+bias sum is rounded to BF16 before adding the residual.
+__global__ void bias_then_residual_bf16_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* bias,
+    const __nv_bfloat16* residual, __nv_bfloat16* output,
+    int64_t count, int cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    float value = __bfloat162float(projection[index]);
+    if (bias != nullptr) value += __bfloat162float(bias[index % cols]);
+    const __nv_bfloat16 biased = __float2bfloat16(value);
+    output[index] = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[index]));
+  }
+}
+
 __global__ void bias_residual_f16_bf16_kernel(
     const half* projection, const __nv_bfloat16* bias,
     const __nv_bfloat16* residual, __nv_bfloat16* output,
@@ -850,6 +899,28 @@ __global__ void qkv_split_bias_bf16_kernel(
       k[token * projection_width + col - projection_width] = __float2bfloat16(value);
     } else {
       v[token * projection_width + col - 2 * projection_width] = __float2bfloat16(value);
+    }
+  }
+}
+
+__global__ void qkv_split_gqa_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* query,
+    __nv_bfloat16* key, __nv_bfloat16* value,
+    int rows, int query_cols, int key_value_cols) {
+  const int total_cols = query_cols + 2 * key_value_cols;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t count = static_cast<int64_t>(rows) * total_cols;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / total_cols);
+    const int col = static_cast<int>(index - static_cast<int64_t>(row) * total_cols);
+    if (col < query_cols) {
+      query[static_cast<int64_t>(row) * query_cols + col] = input[index];
+    } else if (col < query_cols + key_value_cols) {
+      key[static_cast<int64_t>(row) * key_value_cols + col - query_cols] = input[index];
+    } else {
+      value[static_cast<int64_t>(row) * key_value_cols + col - query_cols - key_value_cols] =
+          input[index];
     }
   }
 }

@@ -39,10 +39,14 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use apxinf_core::{Device, RngKey, Shape, Tensor};
+#[cfg(feature = "cuda")]
+use apxinf_model::gr00t::{Gr00tConfig, Gr00tLoadOptions, Gr00tObservation, Gr00tVlaRuntime};
 use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
     SyntheticWeights, VisionObservation, VlaContract, VlaRequest,
 };
+#[cfg(feature = "cuda")]
+use half::bf16;
 
 /// Map any Rust error into a Python `RuntimeError`.
 fn runtime_err<E: std::fmt::Display>(error: E) -> PyErr {
@@ -75,6 +79,8 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
         "auto" => Ok(ModelPrecision::Auto),
         "fp8" => Ok(ModelPrecision::Fp8),
         "bf16" => Ok(ModelPrecision::Bf16),
+        // Keep the historical Pi0.5 alias for backward compatibility. New
+        // GR00T-facing APIs and documentation expose only `int8`.
         "int8" | "w8a8" => Ok(ModelPrecision::W8A8),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown precision `{other}` (expected auto|fp8|bf16|int8)"
@@ -122,6 +128,147 @@ pub struct Model {
     device: Device,
     sampling_seed: Cell<u64>,
     sampling_draw: Cell<u64>,
+}
+
+/// Loaded GR00T N1.7 bare Model Core.
+///
+/// Pre/post-processing deliberately stays in NVIDIA's pinned Python processor
+/// so closed-loop evaluation exercises the exact checkpoint contract.
+#[cfg(feature = "cuda")]
+#[pyclass(unsendable)]
+pub struct Gr00tModel {
+    runtime: Option<Gr00tVlaRuntime>,
+    config: Gr00tConfig,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl Gr00tModel {
+    #[staticmethod]
+    #[pyo3(signature = (checkpoint, backbone, device="cuda:0", precision="bf16", calibration=None, tactics=None))]
+    fn load(
+        checkpoint: PathBuf,
+        backbone: PathBuf,
+        device: &str,
+        precision: &str,
+        calibration: Option<PathBuf>,
+        tactics: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let config =
+            Gr00tConfig::from_json_file(&checkpoint.join("config.json")).map_err(runtime_err)?;
+        let options = Gr00tLoadOptions {
+            config: Some(config.clone()),
+            precision: parse_precision(precision)?,
+            backbone_path: Some(backbone),
+            fp8_calibration_path: calibration,
+            tuning_path: tactics,
+        };
+        let runtime =
+            Gr00tVlaRuntime::from_dir(&checkpoint, options, device).map_err(runtime_err)?;
+        Ok(Self {
+            runtime: Some(runtime),
+            config,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer<'py>(
+        &mut self,
+        py: Python<'py>,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: usize,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let pixels_shape = pixel_values.shape();
+        if pixels_shape.len() != 2 {
+            return Err(PyValueError::new_err("pixel_values must be a rank-2 array"));
+        }
+        let grids_shape = image_grid_thw.shape();
+        if grids_shape.len() != 2 || grids_shape[1] != 3 {
+            return Err(PyValueError::new_err(
+                "image_grid_thw must have shape [images, 3]",
+            ));
+        }
+        let to_bf16 = |values: &[f32]| {
+            values
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>()
+        };
+        let pixels = pixel_values
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("pixel_values must be C-contiguous float32"))?;
+        let state_values = state
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("state must be C-contiguous float32"))?;
+        let noise_values = noise
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("noise must be C-contiguous float32"))?;
+        let grids = image_grid_thw
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("image_grid_thw must be C-contiguous uint32"))?;
+        let observation = Gr00tObservation {
+            pixel_values: Tensor::from_bf16(Shape::new(pixels_shape.to_vec()), &to_bf16(pixels))
+                .map_err(runtime_err)?,
+            image_grid_thw: grids
+                .chunks_exact(3)
+                .map(|row| [row[0], row[1], row[2]])
+                .collect(),
+            token_ids: token_ids
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous uint32"))?
+                .to_vec(),
+            attention_mask: attention_mask
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("attention_mask must be C-contiguous uint8"))?
+                .to_vec(),
+            state: Tensor::from_bf16(Shape::new(state.shape().to_vec()), &to_bf16(state_values))
+                .map_err(runtime_err)?,
+            embodiment_id,
+            noise: Tensor::from_bf16(Shape::new(noise.shape().to_vec()), &to_bf16(noise_values))
+                .map_err(runtime_err)?,
+        };
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("GR00T model is closed"))?;
+        let output = runtime.infer(&observation).map_err(runtime_err)?;
+        let flat = output.to_f32_vec().map_err(runtime_err)?;
+        let expected = self.config.action_horizon * self.config.max_action_dim;
+        if flat.len() != expected {
+            return Err(PyRuntimeError::new_err(format!(
+                "GR00T returned {} action values, expected {expected}",
+                flat.len()
+            )));
+        }
+        let array = Array2::from_shape_vec(
+            (self.config.action_horizon, self.config.max_action_dim),
+            flat,
+        )
+        .map_err(runtime_err)?;
+        Ok(array.into_pyarray_bound(py))
+    }
+
+    #[getter]
+    fn action_horizon(&self) -> usize {
+        self.config.action_horizon
+    }
+
+    #[getter]
+    fn action_dim(&self) -> usize {
+        self.config.max_action_dim
+    }
+
+    /// Release model weights, CUDA Graphs and device workspaces immediately.
+    fn close(&mut self) {
+        self.runtime.take();
+    }
 }
 
 impl Model {
@@ -802,6 +949,8 @@ impl Model {
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
+    #[cfg(feature = "cuda")]
+    module.add_class::<Gr00tModel>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

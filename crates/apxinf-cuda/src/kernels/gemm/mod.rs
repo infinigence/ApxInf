@@ -14,6 +14,7 @@ use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::cublas::CublasTranspose;
 use crate::tuning::{TacticStore, TuningDb, TuningMode, TuningPaths, TuningSession};
+use crate::workspace::output_buffer;
 
 pub(crate) use fp8::resolve_fused_plan as resolve_fused_fp8_plan;
 pub(crate) use plan::GemmPlanCache;
@@ -21,15 +22,20 @@ pub use plan::{PlanSource, PreparedGemmPlan};
 
 pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
 #[cfg(test)]
-pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
+pub(crate) use fp8::{dequantize_e4m3_f16, prepare_cublaslt_fp8_gemm};
 pub use fp8::{
-    exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_dynamic_bf16,
+    exact_fp8_tactic, gemm_fp8 as fp8, gemm_fp8_bf16 as fp8_bf16,
+    gemm_fp8_bias_bf16 as fp8_bias_bf16, gemm_fp8_dynamic_bf16,
     gemm_fp8_geglu_fused as fp8_geglu_fused, native_fp8_gemm_supported as native_fp8_supported,
     DynamicFp8WeightView, Fp8WeightView,
 };
 #[cfg(test)]
 pub(crate) use w8a8::gemm_w8a8_with_preference;
-pub use w8a8::{gemm_w8a8 as w8a8, W8A8Layout, W8A8ScaleMode, W8A8WeightView};
+pub use w8a8::{
+    adaptive_layer_norm_quantize_w8a8_activation, gemm_quantized_w8a8, gemm_w8a8 as w8a8,
+    quantize_w8a8_activation, quantize_w8a8_silu_mul_activation, W8A8Activation, W8A8Layout,
+    W8A8ScaleMode, W8A8WeightView,
+};
 
 /// Validate and install a read-only tactic database before graph capture.
 pub fn install_tuning_db(ctx: &CudaContext, database: &TuningDb) -> Result<()> {
@@ -84,7 +90,9 @@ pub fn install_bf16_observer(
     BF16_OBSERVER.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
-            return Err(Error::Other("a BF16 activation observer is already installed".into()));
+            return Err(Error::Other(
+                "a BF16 activation observer is already installed".into(),
+            ));
         }
         *slot = Some(observer);
         Ok(Bf16ObserverGuard)
@@ -141,15 +149,21 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
             },
         });
     }
+    // Keep the portable Backend contract unchanged while allowing an installed
+    // exact-shape BF16 tactic database to select the existing cuBLASLt path.
+    // gemm_bf16 falls back to the same vendor cuBLAS implementation when no
+    // exact tactic is installed. Batched/N-D matmuls retain the generic path.
+    if activation.dtype() == DType::BF16 && activation.ndim() == 2 && weight.ndim() == 2 {
+        return bf16::gemm_bf16(ctx, activation, weight);
+    }
     let output_shape = activation.shape().matmul_shape(weight.shape())?;
     let m = activation.shape().dims()[activation.ndim() - 2];
     let k = activation.shape().dims()[activation.ndim() - 1];
     let n = weight.shape().dims()[weight.ndim() - 1];
-    let output = CudaBuffer::alloc_zeros(
+    let output = output_buffer(
+        ctx,
         output_shape.numel() * activation.dtype().size_in_bytes(),
-        ctx.device_id(),
-    )
-    .map_err(Error::Cuda)?;
+    )?;
     let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     ctx.cublas()

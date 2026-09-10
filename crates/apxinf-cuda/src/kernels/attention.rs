@@ -189,8 +189,7 @@ pub fn sdpa(
     let gqa_ratio = n_heads / n_kv_heads;
     let dtype = query.dtype();
     let element_bytes = dtype.size_in_bytes();
-    let scores = CudaBuffer::alloc(seq_len * n_heads * kv_len * element_bytes, ctx.device_id())
-        .map_err(Error::Cuda)?;
+    let scores = output_buffer(ctx, seq_len * n_heads * kv_len * element_bytes)?;
     let key_cache = cache.k_buffer(layer_idx);
 
     for kv_head in 0..n_kv_heads {
@@ -215,11 +214,7 @@ pub fn sdpa(
     let scores = super::elementwise::scale(ctx, &scores, 1.0 / (head_dim as f32).sqrt())?;
     let attention = softmax_causal(ctx, &scores, kv_offset, n_heads as u32)?;
 
-    let output = CudaBuffer::alloc(
-        seq_len * n_heads * head_dim * element_bytes,
-        ctx.device_id(),
-    )
-    .map_err(Error::Cuda)?;
+    let output = output_buffer(ctx, seq_len * n_heads * head_dim * element_bytes)?;
     let value_cache = cache.v_buffer(layer_idx);
     for kv_head in 0..n_kv_heads {
         for sequence in 0..seq_len {
@@ -329,13 +324,12 @@ pub fn flash_bf16_into(
 
 /// Softmax on CUDA. Dispatches on dtype.
 pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
-    let device_id = ctx.device_id();
     let dims = input.shape().dims();
     let rows = dims[dims.len() - 2];
     let cols = *dims.last().unwrap();
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -361,7 +355,7 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     Ok(make_gpu_tensor(
         input.shape().clone(),
         input.dtype(),
-        device_id,
+        ctx.device_id(),
         out_buf,
     ))
 }
@@ -384,41 +378,299 @@ pub fn vision(
     if head_dim != 64 {
         return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
     }
-    let device_id = ctx.device_id();
-    let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
-            gpu_ptr(q)?,
-            gpu_ptr(k)?,
-            gpu_ptr(v)?,
-            out_buf.ptr(),
-            seq_len as u32,
-            n_heads as u32,
-            head_dim as u32,
-            scale,
-            ctx.stream().handle(),
-        );
-        ffi::check_cuda(res).map_err(Error::Cuda)?;
+
+    // FA2 fast path: Qwen3-VL vision attention is a non-causal full-segment
+    // forward. On sm80/sm100 FA2 builds, route through the vendored
+    // FlashAttention-2 kernel (head_dim=64 dispatches to the hdim96 kernel via
+    // d_rounded), matching the pre-rebase 56ms baseline which ran vision on
+    // apxinf_fa2::flash_fwd_kernel<96,..>. The single-warp naive
+    // noncausal_sdpa_bf16_kernel below is ~43ms for 48 segments and is kept
+    // only for portable (non-FA2) builds.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let hidden_size = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::Other("vision_sdpa: hidden size overflow".into()))?;
+        let output = fa2_attention(
+            ctx, q, k, v, 1, seq_len, seq_len, n_heads, n_heads, head_dim,
+        )?;
+        return output.reshape(vec![seq_len, hidden_size]);
     }
-    Ok(make_gpu_tensor(
-        Shape::new(vec![seq_len, n_heads * head_dim]),
-        DType::BF16,
-        device_id,
-        out_buf,
-    ))
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    {
+        let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
+        let out_buf = output_buffer(ctx, out_bytes)?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        unsafe {
+            let res = ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            );
+            ffi::check_cuda(res).map_err(Error::Cuda)?;
+        }
+        Ok(make_gpu_tensor(
+            Shape::new(vec![seq_len, n_heads * head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            out_buf,
+        ))
+    }
 }
 
 /// Causal attention mask on CUDA. Dispatches on dtype.
+pub fn noncausal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+        return Err(Error::Other("noncausal_sdpa: only BF16 supported".into()));
+    }
+    if n_heads == 0 || head_dim == 0 || head_dim > 64 || head_dim % 2 != 0 {
+        return Err(Error::Other(format!(
+            "noncausal_sdpa: expected non-zero heads and an even head_dim <= 64, got {n_heads}x{head_dim}"
+        )));
+    }
+    let query_dims = q.shape().dims();
+    let key_dims = k.shape().dims();
+    let value_dims = v.shape().dims();
+    if query_dims.len() != 3
+        || key_dims.len() != 3
+        || value_dims.len() != 3
+        || query_dims[1..] != [n_heads, head_dim]
+        || key_dims[1..] != [n_heads, head_dim]
+        || value_dims != key_dims
+        || query_dims[0] == 0
+        || key_dims[0] == 0
+    {
+        return Err(Error::Other(format!(
+            "noncausal_sdpa: expected Q [query,{n_heads},{head_dim}] and K/V [kv,{n_heads},{head_dim}] with non-zero rows, got {query_dims:?}, {key_dims:?}, {value_dims:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for (name, tensor) in [("query", q), ("key", k), ("value", v)] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+        if tensor.numel() == 0 {
+            return Err(Error::Other(format!(
+                "noncausal_sdpa: {name} must not be empty"
+            )));
+        }
+    }
+    let query_len = query_dims[0];
+    let key_value_len = key_dims[0];
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    if key_value_len > 12_287 {
+        return Err(Error::Other(format!(
+            "noncausal_sdpa: portable key/value length {key_value_len} exceeds 12287"
+        )));
+    }
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let hidden_size = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| Error::Other("noncausal_sdpa: hidden size overflow".into()))?;
+        let output = fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            1,
+            query_len,
+            key_value_len,
+            n_heads,
+            n_heads,
+            head_dim,
+        )?;
+        return output.reshape(vec![query_len, hidden_size]);
+    }
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let hidden_size = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("noncausal_sdpa: hidden size overflow".into()))?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let query_len_u32 = u32::try_from(query_len)
+        .map_err(|_| Error::Other("noncausal_sdpa: query length exceeds CUDA ABI".into()))?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let key_value_len_u32 = u32::try_from(key_value_len)
+        .map_err(|_| Error::Other("noncausal_sdpa: key/value length exceeds CUDA ABI".into()))?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let n_heads_u32 = u32::try_from(n_heads)
+        .map_err(|_| Error::Other("noncausal_sdpa: head count exceeds CUDA ABI".into()))?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let head_dim_u32 = u32::try_from(head_dim)
+        .map_err(|_| Error::Other("noncausal_sdpa: head dimension exceeds CUDA ABI".into()))?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let output = bf16_output(ctx, query_len, hidden_size)?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    check_cuda(unsafe {
+        ffi::apxinf_noncausal_sdpa_bf16(
+            gpu_ptr(q)?,
+            gpu_ptr(k)?,
+            gpu_ptr(v)?,
+            output.ptr(),
+            query_len_u32,
+            key_value_len_u32,
+            n_heads_u32,
+            head_dim_u32,
+            scale,
+            ctx.stream().handle(),
+        )
+    })?;
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(matrix_tensor(ctx, query_len, hidden_size, output))
+}
+
+pub fn noncausal_strided_qkv(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if qkv.dtype() != DType::BF16 || qkv.ndim() != 2 {
+        return Err(Error::Other(
+            "strided QKV attention expects a rank-2 BF16 tensor".into(),
+        ));
+    }
+    let hidden = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("strided QKV attention hidden size overflow".into()))?;
+    let dims = qkv.shape().dims();
+    if n_heads == 0
+        || head_dim == 0
+        || head_dim > 64
+        || head_dim % 2 != 0
+        || dims[0] == 0
+        || dims[1] != 3 * hidden
+        || qkv.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(format!(
+            "strided QKV attention expected CUDA BF16 [tokens,{}], got {:?} on {}",
+            3 * hidden,
+            dims,
+            qkv.device()
+        )));
+    }
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let tokens = dims[0];
+        let output = output_buffer(ctx, tokens * hidden * DType::BF16.size_in_bytes())?;
+        let softmax_lse = output_buffer(
+            ctx,
+            n_heads
+                .checked_mul(tokens)
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| Error::Other("strided QKV attention LSE size overflow".into()))?,
+        )?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_strided_qkv(
+                gpu_ptr(qkv)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                i32::try_from(tokens).map_err(|_| {
+                    Error::Other("strided QKV attention token count exceeds i32".into())
+                })?,
+                i32::try_from(n_heads).map_err(|_| {
+                    Error::Other("strided QKV attention head count exceeds i32".into())
+                })?,
+                i32::try_from(head_dim).map_err(|_| {
+                    Error::Other("strided QKV attention head dimension exceeds i32".into())
+                })?,
+                (head_dim as f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(make_gpu_tensor(
+            Shape::new(vec![tokens, hidden]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        ));
+    }
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Err(Error::Other(
+        "strided QKV attention requires the in-tree BF16 FA2 backend".into(),
+    ))
+}
+
+pub fn split_qkv_gqa_bf16(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    query_cols: usize,
+    key_value_cols: usize,
+) -> Result<QkvTensors> {
+    let (rows, cols) = matrix_shape(qkv, "GQA QKV split")?;
+    if qkv.dtype() != DType::BF16 || cols != query_cols + 2 * key_value_cols {
+        return Err(Error::Other("static BF16 GQA QKV shape mismatch".into()));
+    }
+    let q = bf16_output(ctx, rows, query_cols)?;
+    let k = bf16_output(ctx, rows, key_value_cols)?;
+    let v = bf16_output(ctx, rows, key_value_cols)?;
+    check_cuda(unsafe {
+        ffi::apxinf_static_qkv_split_gqa_bf16(
+            gpu_ptr(qkv)?,
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            rows as i32,
+            query_cols as i32,
+            key_value_cols as i32,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(QkvTensors {
+        q: make_gpu_tensor(
+            Shape::new(vec![rows, query_cols]),
+            DType::BF16,
+            ctx.device_id(),
+            q,
+        ),
+        k: make_gpu_tensor(
+            Shape::new(vec![rows, key_value_cols]),
+            DType::BF16,
+            ctx.device_id(),
+            k,
+        ),
+        v: make_gpu_tensor(
+            Shape::new(vec![rows, key_value_cols]),
+            DType::BF16,
+            ctx.device_id(),
+            v,
+        ),
+    })
+}
+
 pub fn causal_mask(ctx: &CudaContext, input: &Tensor, kv_offset: u32) -> Result<Tensor> {
-    let device_id = ctx.device_id();
     let dims = input.shape().dims();
     let rows = dims[dims.len() - 2];
     let cols = *dims.last().unwrap();
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -446,7 +698,7 @@ pub fn causal_mask(ctx: &CudaContext, input: &Tensor, kv_offset: u32) -> Result<
     Ok(make_gpu_tensor(
         input.shape().clone(),
         input.dtype(),
-        device_id,
+        ctx.device_id(),
         out_buf,
     ))
 }
@@ -458,13 +710,12 @@ pub fn softmax_causal(
     kv_offset: u32,
     n_heads: u32,
 ) -> Result<Tensor> {
-    let device_id = ctx.device_id();
     let dims = input.shape().dims();
     let rows = dims[dims.len() - 2];
     let cols = *dims.last().unwrap();
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {
@@ -494,7 +745,7 @@ pub fn softmax_causal(
     Ok(make_gpu_tensor(
         input.shape().clone(),
         input.dtype(),
-        device_id,
+        ctx.device_id(),
         out_buf,
     ))
 }
@@ -944,6 +1195,104 @@ pub(crate) fn fa2_attention_splitkv(
         ctx.device_id(),
         output,
     ))
+}
+
+/// Fixed-shape causal GQA prefill over contiguous BF16 Q/K/V tensors.
+///
+/// Returns `None` when the shape is unsupported or when the in-tree BF16 FA2
+/// implementation is unavailable, so callers can retain their portable
+/// KV-cache path. SM100-family builds compile the BF16 specializations beside
+/// the FP16 kernels and can use this path without adding native objects.
+pub fn causal_gqa_prefill_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<Option<Tensor>> {
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape() != k.shape()
+        || q_shape[0] == 0
+        || q_shape[0] != k_shape[0]
+        || q_shape[1] == 0
+        || k_shape[1] == 0
+        || q_shape[1] % k_shape[1] != 0
+        || q_shape[2] == 0
+        || q_shape[2] > 256
+        || q_shape[2] != k_shape[2]
+    {
+        return Err(Error::Other(
+            "causal BF16 GQA prefill shape mismatch".into(),
+        ));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        if q_shape[2] <= 96 {
+            return Ok(None);
+        }
+        let query_tokens = i32::try_from(q_shape[0])
+            .map_err(|_| Error::Other("causal BF16 GQA query length exceeds i32".into()))?;
+        let key_tokens = i32::try_from(k_shape[0])
+            .map_err(|_| Error::Other("causal BF16 GQA key/value length exceeds i32".into()))?;
+        let query_heads = i32::try_from(q_shape[1])
+            .map_err(|_| Error::Other("causal BF16 GQA query head count exceeds i32".into()))?;
+        let kv_heads = i32::try_from(k_shape[1])
+            .map_err(|_| Error::Other("causal BF16 GQA key/value head count exceeds i32".into()))?;
+        let head_dim = i32::try_from(q_shape[2])
+            .map_err(|_| Error::Other("causal BF16 GQA head dimension exceeds i32".into()))?;
+        let output = output_buffer(ctx, q.size_in_bytes())?;
+        let lse_elements = q_shape[0]
+            .checked_mul(q_shape[1])
+            .ok_or_else(|| Error::Other("causal BF16 GQA LSE size overflow".into()))?;
+        let softmax_lse = output_buffer(
+            ctx,
+            lse_elements
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| Error::Other("causal BF16 GQA LSE byte overflow".into()))?,
+        )?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_causal(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                query_tokens,
+                key_tokens,
+                query_heads,
+                kv_heads,
+                head_dim,
+                (q_shape[2] as f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(Some(make_gpu_tensor(
+            q.shape().clone(),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
 }
 
 #[cfg(apxinf_cutlass_fmha)]

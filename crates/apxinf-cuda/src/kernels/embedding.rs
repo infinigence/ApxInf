@@ -9,6 +9,7 @@ use super::contracts::{
 use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
+use crate::workspace::output_buffer;
 
 pub fn lookup_into(
     ctx: &CudaContext,

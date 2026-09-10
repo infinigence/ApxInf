@@ -18,6 +18,7 @@ apxinf-model = { path = "../apxinf-model" }
 # below so `cargo test` can still link a Python interpreter for the harness.
 pyo3 = "0.22"
 numpy = "0.22"
+half = "2"
 
 [features]
 default = []

@@ -55,6 +55,20 @@ extern "C" {
         softmax_scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    pub fn apxinf_static_fa2_bf16_strided_qkv(
+        qkv: *const c_void,
+        output: *mut c_void,
+        softmax_lse: *mut c_void,
+        batch: i32,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     pub fn apxinf_static_fa2_bf16_causal(
         q: *const c_void,

@@ -257,6 +257,79 @@ pub fn apply_mrope(
     ))
 }
 
+pub fn prepare_mrope_cos_sin(
+    ctx: &CudaContext,
+    seq_len: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &CudaBuffer,
+) -> Result<CudaBuffer> {
+    require_finite("mRoPE table", &[theta])?;
+    if seq_len == 0 || head_dim == 0 || head_dim % 2 != 0 || theta <= 0.0 {
+        return Err(Error::Other(
+            "mRoPE table requires non-zero sequence length, an even head dimension and positive theta".into(),
+        ));
+    }
+    let bytes = seq_len
+        .checked_mul(head_dim / 2)
+        .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("mRoPE table byte count overflow".into()))?;
+    let table = output_buffer(ctx, bytes)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_prepare_mrope_cos_sin_f32(
+            table.ptr(),
+            head_dim as u32,
+            seq_len as u32,
+            theta,
+            pos_ids.ptr(),
+            sections[1] as u32,
+            sections[2] as u32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(table)
+}
+
+pub fn apply_mrope_precomputed(
+    ctx: &CudaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    table: &CudaBuffer,
+) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 {
+        return Err(Error::Other("precomputed mRoPE requires BF16 input".into()));
+    }
+    let dims = input.shape().dims();
+    let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
+    if input.numel() != seq_len * n_heads * head_dim {
+        return Err(Error::Other(format!(
+            "precomputed mRoPE: incompatible input {dims:?}, heads {n_heads}, head_dim {head_dim}"
+        )));
+    }
+    let out_buf = output_buffer(ctx, input.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rope_mrope_precomputed_bf16(
+            gpu_ptr(input)?,
+            out_buf.ptr(),
+            table.ptr(),
+            head_dim as u32,
+            n_heads as u32,
+            seq_len as u32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        out_buf,
+    ))
+}
+
 /// Vision 2D-RoPE (bf16). `input` `[seq, heads, head_dim]`; `pos_ids` flat
 /// u32 slice of length `seq * 2` (h, w per token). head_dim=64 for Qwen3-VL.
 pub fn apply_vision_2d(
@@ -293,6 +366,277 @@ pub fn apply_vision_2d(
         device_id,
         out_buf,
     ))
+}
+
+/// Apply vision 2D-RoPE to Q and K together, sharing position/frequency work.
+/// Both inputs and outputs use `[seq_len, n_heads, head_dim]` BF16 layout.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_vision_2d_pair(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &CudaBuffer,
+) -> Result<(Tensor, Tensor)> {
+    if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 {
+        return Err(Error::Other(
+            "rope_vision_2d_pair: only BF16 supported".into(),
+        ));
+    }
+    require_finite("vision 2D-RoPE pair", &[theta])?;
+    if head_dim == 0 || head_dim % 2 != 0 || n_heads == 0 || theta <= 0.0 {
+        return Err(Error::Other(
+            "vision 2D-RoPE pair requires non-zero heads, an even head dimension and positive theta"
+                .into(),
+        ));
+    }
+    let q_dims = q.shape().dims();
+    if q_dims.len() != 3 || q_dims[1] != n_heads || q_dims[2] != head_dim {
+        return Err(Error::Other(format!(
+            "vision 2D-RoPE pair expected Q [seq,{n_heads},{head_dim}], got {q_dims:?}"
+        )));
+    }
+    if k.shape().dims() != q_dims {
+        return Err(Error::Other(format!(
+            "vision 2D-RoPE pair requires equal Q/K shapes, got {:?} and {:?}",
+            q_dims,
+            k.shape().dims()
+        )));
+    }
+    let seq_len = q_dims[0];
+    let seq_len_u32 = u32::try_from(seq_len)
+        .map_err(|_| Error::Other("vision 2D-RoPE sequence exceeds u32".into()))?;
+    let n_heads_u32 = u32::try_from(n_heads)
+        .map_err(|_| Error::Other("vision 2D-RoPE head count exceeds u32".into()))?;
+    let head_dim_u32 = u32::try_from(head_dim)
+        .map_err(|_| Error::Other("vision 2D-RoPE head dimension exceeds u32".into()))?;
+    let expected_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, n_heads, head_dim],
+        "vision 2D-RoPE pair",
+    )?;
+    let position_bytes = seq_len
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("vision 2D-RoPE position size overflow".into()))?;
+    let q_buffer = CudaBuffer::from_tensor(q).map_err(Error::Cuda)?;
+    let k_buffer = CudaBuffer::from_tensor(k).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "vision 2D-RoPE pair",
+        &[
+            ("q", &q_buffer, expected_bytes),
+            ("k", &k_buffer, expected_bytes),
+        ],
+    )?;
+    require_address(
+        ctx,
+        "vision 2D-RoPE pair",
+        "positions",
+        pos_ids.address(),
+        position_bytes,
+    )?;
+
+    let q_out = output_buffer(ctx, expected_bytes)?;
+    let k_out = output_buffer(ctx, expected_bytes)?;
+    check_cuda(unsafe {
+        ffi::apxinf_rope_vision_2d_pair_bf16(
+            q_buffer.ptr(),
+            k_buffer.ptr(),
+            q_out.ptr(),
+            k_out.ptr(),
+            head_dim_u32,
+            n_heads_u32,
+            seq_len_u32,
+            theta,
+            pos_ids.ptr(),
+            ctx.stream().handle(),
+        )
+    })?;
+    let shape = q.shape().clone();
+    Ok((
+        make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), q_out),
+        make_gpu_tensor(shape, DType::BF16, ctx.device_id(), k_out),
+    ))
+}
+
+/// Split a packed vision QKV projection, add bias, and apply 2D RoPE to Q/K
+/// in one launch. The kernel preserves the BF16 rounding boundary of the
+/// decomposed split-then-RoPE path.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_bias_apply_vision_2d(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &CudaBuffer,
+) -> Result<QkvTensors> {
+    split_qkv_bias_apply_vision_2d_impl(ctx, qkv, bias, n_heads, head_dim, theta, pos_ids, None)
+}
+
+pub fn prepare_vision_rope_cos_sin(
+    ctx: &CudaContext,
+    seq_len: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &CudaBuffer,
+) -> Result<CudaBuffer> {
+    require_finite("vision RoPE table", &[theta])?;
+    if seq_len == 0 || head_dim == 0 || head_dim % 2 != 0 || theta <= 0.0 {
+        return Err(Error::Other(
+            "vision RoPE table requires non-zero sequence length, an even head dimension and positive theta".into(),
+        ));
+    }
+    let bytes = seq_len
+        .checked_mul(head_dim / 2)
+        .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("vision RoPE table byte count overflow".into()))?;
+    let table = output_buffer(ctx, bytes)?;
+    check_cuda(unsafe {
+        ffi::apxinf_prepare_vision_rope_cos_sin_f32(
+            table.ptr(),
+            u32::try_from(head_dim)
+                .map_err(|_| Error::Other("vision RoPE head dimension exceeds u32".into()))?,
+            u32::try_from(seq_len)
+                .map_err(|_| Error::Other("vision RoPE sequence exceeds u32".into()))?,
+            theta,
+            pos_ids.ptr(),
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(table)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_bias_apply_vision_2d_precomputed(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    pos_ids: &CudaBuffer,
+    table: &CudaBuffer,
+) -> Result<QkvTensors> {
+    split_qkv_bias_apply_vision_2d_impl(
+        ctx,
+        qkv,
+        bias,
+        n_heads,
+        head_dim,
+        1.0,
+        pos_ids,
+        Some(table),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_bias_apply_vision_2d_impl(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &CudaBuffer,
+    rotation_table: Option<&CudaBuffer>,
+) -> Result<QkvTensors> {
+    let (seq_len, width) = matrix_shape(qkv, "vision fused QKV 2D-RoPE")?;
+    let projection_width = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("vision fused QKV width overflow".into()))?;
+    if qkv.dtype() != DType::BF16
+        || width != 3 * projection_width
+        || bias.dtype() != DType::BF16
+        || bias.shape().dims() != [width]
+        || head_dim == 0
+        || head_dim % 2 != 0
+        || n_heads == 0
+        || theta <= 0.0
+    {
+        return Err(Error::Other(
+            "vision fused QKV 2D-RoPE shape or dtype mismatch".into(),
+        ));
+    }
+    require_finite("vision fused QKV 2D-RoPE", &[theta])?;
+    let qkv_bytes = checked_bytes(DType::BF16, &[seq_len, width], "vision fused QKV")?;
+    let bias_bytes = checked_bytes(DType::BF16, &[width], "vision fused QKV bias")?;
+    let output_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, n_heads, head_dim],
+        "vision fused QKV output",
+    )?;
+    let position_bytes = seq_len
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("vision fused QKV position size overflow".into()))?;
+    let qkv_buffer = CudaBuffer::from_tensor(qkv).map_err(Error::Cuda)?;
+    let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "vision fused QKV 2D-RoPE",
+        &[
+            ("qkv", &qkv_buffer, qkv_bytes),
+            ("bias", &bias_buffer, bias_bytes),
+        ],
+    )?;
+    require_address(
+        ctx,
+        "vision fused QKV 2D-RoPE",
+        "positions",
+        pos_ids.address(),
+        position_bytes,
+    )?;
+    let q = output_buffer(ctx, output_bytes)?;
+    let k = output_buffer(ctx, output_bytes)?;
+    let v = output_buffer(ctx, output_bytes)?;
+    check_cuda(unsafe {
+        if let Some(table) = rotation_table {
+            ffi::apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+                qkv_buffer.ptr(),
+                bias_buffer.ptr(),
+                q.ptr(),
+                k.ptr(),
+                v.ptr(),
+                u32::try_from(head_dim).map_err(|_| {
+                    Error::Other("vision fused QKV head dimension exceeds u32".into())
+                })?,
+                u32::try_from(n_heads)
+                    .map_err(|_| Error::Other("vision fused QKV head count exceeds u32".into()))?,
+                u32::try_from(seq_len)
+                    .map_err(|_| Error::Other("vision fused QKV sequence exceeds u32".into()))?,
+                table.ptr(),
+                ctx.stream().handle(),
+            )
+        } else {
+            ffi::apxinf_qkv_split_bias_vision_rope_bf16(
+                qkv_buffer.ptr(),
+                bias_buffer.ptr(),
+                q.ptr(),
+                k.ptr(),
+                v.ptr(),
+                u32::try_from(head_dim).map_err(|_| {
+                    Error::Other("vision fused QKV head dimension exceeds u32".into())
+                })?,
+                u32::try_from(n_heads)
+                    .map_err(|_| Error::Other("vision fused QKV head count exceeds u32".into()))?,
+                u32::try_from(seq_len)
+                    .map_err(|_| Error::Other("vision fused QKV sequence exceeds u32".into()))?,
+                theta,
+                pos_ids.ptr(),
+                ctx.stream().handle(),
+            )
+        }
+    })?;
+    let shape = Shape::new(vec![seq_len, n_heads, head_dim]);
+    Ok(QkvTensors {
+        q: make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), q),
+        k: make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), k),
+        v: make_gpu_tensor(shape, DType::BF16, ctx.device_id(), v),
+    })
 }
 
 /// Batched RoPE with half-split pairs. Dispatches on dtype.

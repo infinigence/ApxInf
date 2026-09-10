@@ -49,6 +49,22 @@ __global__ void add_bf16_kernel(
     output[gid] = __float2bfloat16(x);
 }
 
+__global__ void add_bf16_packed4_kernel(
+    const Bf16x4* a, const Bf16x4* b, Bf16x4* output, uint32_t count)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    const Bf16x4 av = a[gid];
+    const Bf16x4 bv = b[gid];
+    const float2 a0 = __bfloat1622float2(av.low);
+    const float2 a1 = __bfloat1622float2(av.high);
+    const float2 b0 = __bfloat1622float2(bv.low);
+    const float2 b1 = __bfloat1622float2(bv.high);
+    output[gid] = Bf16x4{
+        __floats2bfloat162_rn(a0.x + b0.x, a0.y + b0.y),
+        __floats2bfloat162_rn(a1.x + b1.x, a1.y + b1.y)};
+}
+
 
 
 // ── Mul (bf16) ────────────────────────────────────────────────────────────
@@ -164,6 +180,25 @@ __global__ void gather_rows_bf16_kernel(
     const int row = static_cast<int>(index / cols);
     const int col = static_cast<int>(index % cols);
     output[index] = input[static_cast<int64_t>(indices[row]) * cols + col];
+  }
+}
+
+__global__ void scatter_rows_bf16_kernel(
+    const __nv_bfloat16* source, const uint32_t* rows,
+    __nv_bfloat16* output, int64_t count, int cols, bool add) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int source_row = static_cast<int>(index / cols);
+    const int column = static_cast<int>(index % cols);
+    const int64_t output_index =
+        static_cast<int64_t>(rows[source_row]) * cols + column;
+    if (add) {
+      output[output_index] = __float2bfloat16(
+          __bfloat162float(output[output_index]) + __bfloat162float(source[index]));
+    } else {
+      output[output_index] = source[index];
+    }
   }
 }
 

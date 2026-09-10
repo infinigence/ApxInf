@@ -187,9 +187,9 @@ cudaError_t w8a8_gemm_bf16(
   }
   if (m <= 64) {
     return run_w8a8_bf16<
-        cutlass::gemm::GemmShape<64, 128, 128>,
-        cutlass::gemm::GemmShape<64, 64, 64>,
-        3>(a, b, a_scales, b_scales, d, m, n, k, stream);
+        cutlass::gemm::GemmShape<64, 64, 128>,
+        cutlass::gemm::GemmShape<32, 64, 64>,
+        5>(a, b, a_scales, b_scales, d, m, n, k, stream);
   }
   return run_w8a8_bf16<
       cutlass::gemm::GemmShape<128, 128, 64>,
