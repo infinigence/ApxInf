@@ -10,3 +10,6 @@ __pycache__/
 
 # Local model-port worktrees
 experiment/
+
+# Local development artifacts (see AGENTS.md)
+/devlocal/

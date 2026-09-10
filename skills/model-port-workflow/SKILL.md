@@ -7,7 +7,8 @@ description: Port a reference LLM, VLM, or VLA model into ApxInf with private ev
 
 ## Required reading
 
-Read these repository documents before changing code:
+Read the project root [AGENTS.md](../../AGENTS.md#development-artifacts)
+for artifact placement, then read these repository documents before changing code:
 
 1. [`doc/porting-workflow.md`](../../doc/porting-workflow.md) for the complete
    evidence and acceptance sequence.
@@ -67,8 +68,10 @@ background material.
    optimization status (`target met`, `best effort with performance debt`, or
    `blocked`). Performance is best effort unless explicitly declared a release
    gate, but applicable existing optimized paths must be investigated.
-9. Prepare a product-only diff. Keep checkpoints, captures, generated reports,
-   temporary adapters, replay scripts, and agent state outside the repository.
+9. Prepare a product-only diff. Store generated captures, reports, temporary
+   adapters, replay scripts, and agent state in the ignored
+   `<project-root>/devlocal/<feat-name>/` directory according to `AGENTS.md`.
+   Reuse existing external checkpoints and reference checkouts in place.
 
 ## Stop conditions
 
