@@ -5,12 +5,12 @@ this repo and the real LIBERO results run on Jetson Orin GPU.
 
 ## Optimization
 
-The runtime half of this optimization — partial flow — lives in this repo. The
-evaluator half lives in [apxinf-robo](https://github.com/team-mz/APXinf-robo),
-which owns LIBERO and the rollout loop; it is enabled by one switch:
+The runtime half of this optimization — partial flow — lives in the Rust model
+crates. The evaluator half lives in `scripts/eval_libero.py`, and is enabled by
+one switch:
 
 ```bash
-apxinf-robo eval-libero --warm-start ...
+python scripts/eval_libero.py --warm-start ...
 ```
 
 When enabled, the evaluator uses all of the following together:
@@ -61,9 +61,9 @@ Runtime partial-flow support:
   - forwards `num_flow_steps` and `flow_start_time`
   - includes them in policy metadata
 
-Warm-start evaluator (in [apxinf-robo](https://github.com/team-mz/APXinf-robo)):
+Warm-start evaluator:
 
-- `src/apxinf_robo/cli/eval_libero.py`
+- `scripts/eval_libero.py`
   - adds `--warm-start`
   - adds `--warm-start-alpha`, default `0.5`
   - adds `--flow-start-time`
@@ -113,7 +113,7 @@ env -u CONDA_PREFIX \
   CUDA_HOME=/usr/local/cuda-12.6 \
   APXINF_CUDA_ARCH=sm_87 \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
-  .venv/bin/python -m apxinf_robo.cli.eval_libero \
+  .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
     --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
     --model-type pi05 \
@@ -161,7 +161,7 @@ env -u CONDA_PREFIX \
   CUDA_HOME=/usr/local/cuda-12.6 \
   APXINF_CUDA_ARCH=sm_87 \
   LD_LIBRARY_PATH=/usr/local/cuda-12.6/targets/aarch64-linux/lib:/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-} \
-  .venv/bin/python -m apxinf_robo.cli.eval_libero \
+  .venv/bin/python scripts/eval_libero.py \
     --backend in-process \
     --model-dir /home/daigroup/projects/ApxInf/.venv/pi05_libero_bf16 \
     --model-type pi05 \

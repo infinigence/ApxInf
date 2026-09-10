@@ -48,13 +48,34 @@ This is the format for frames that were rendered rather than photographed: the
 producer writes them once, and the calibration input becomes a reviewable,
 re-runnable artifact instead of a side effect of a rollout.
 
-## Capturing from a simulator
+## Native LIBERO task observations
 
-The calibrator drives no simulator. MuJoCo, a task suite, and a camera
-convention are properties of the *environment*, not of the weights, so capture
-belongs to whoever owns the environment. For LIBERO,
-[apxinf-robo](https://github.com/team-mz/APXinf-robo) writes the directory this
-command then reads:
+For the PI0.5 LIBERO checkpoint, generate a calibration file from observations
+rendered by the actual LIBERO10 task suite:
+
+```bash
+python3 scripts/calibrate_pi05.py \
+  --model-dir <path-to-model> \
+  --libero-suite libero_10
+```
+
+This path uses LIBERO's BDDL tasks, language instructions, initial states, and
+off-screen simulator cameras. It applies the same camera orientation and
+robot-state conversion as `scripts/eval_libero.py` — the resize is the policy's,
+so the calibration frames are the ones inference will actually see. Sampling is
+deterministic and task-balanced. By default it captures one settled initial
+state from every task; `--samples N` selects more initial states while retaining
+balanced task coverage.
+
+This command needs the same LIBERO and MuJoCo dependencies as the repository's
+LIBERO evaluation command. It exists so a kernel change or a new checkpoint can
+be recalibrated against ApxInf's own published LIBERO protocol without checking
+out a repository that takes ApxInf as a submodule.
+
+### Capturing out of process
+
+[apxinf-robo](https://github.com/team-mz/APXinf-robo) does the same capture from
+the other side of the seam, writing the NPZ directory `--input-dir` reads:
 
 ```bash
 apxinf-robo capture-libero --suite libero_10 --output-dir /tmp/libero-calib
@@ -63,14 +84,13 @@ python3 scripts/calibrate_pi05.py \
   --input-dir /tmp/libero-calib
 ```
 
-`capture-libero` uses LIBERO's BDDL tasks, language instructions, initial
-states, and off-screen simulator cameras, applying the same camera orientation
-and robot-state conversion as `apxinf-robo eval-libero` — so the calibration
-frames are the ones the policy will actually see. Sampling is deterministic and
-task-balanced: by default one settled initial state per task, with `--samples N`
-selecting more while keeping every task covered. The NPZ field names come from
-the named robot preset, so the captured dialect is by construction the one the
-checkpoint is served under.
+The two produce the same frames — they share `scripts/libero_observation.py` and
+its apxinf-robo mirror — and differ in where MuJoCo runs. Prefer this form for a
+robot deployment: it keeps the simulator out of the engine host, and it makes the
+calibration input a reviewable, re-runnable artifact rather than a side effect of
+whoever happened to run the calibrator. `capture-libero` names the NPZ fields
+after the robot it was given, so the captured dialect is by construction the one
+the checkpoint is served under.
 
 For another simulator or a deployment source, export its public Observations
 through the manifest or directory interface instead.

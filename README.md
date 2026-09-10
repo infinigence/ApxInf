@@ -278,7 +278,7 @@ The default, on every supported device. Runs on the checkpoint alone; no
 calibration.
 
 ```bash
-python examples/openpi_server.py \
+python scripts/pi05_openpi_websocket_server.py \
   --model-dir <path-to-model> --precision bf16 \
   --image-keys observation/image,observation/wrist_image \
   --state-key observation/state \
@@ -299,9 +299,11 @@ deployment data explicitly; when omitted, ApxInf falls back to
 `<path-to-model>/calibration.json`:
 
 ```bash
-python examples/openpi_server.py \
+python scripts/pi05_openpi_websocket_server.py \
   --model-dir <path-to-model> --precision fp8 \
-  --policy-options '{"calibration":"<path-to-calibration.json>"}' \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state \
+  --calibration <path-to-calibration.json> \
   --port 8000
 ```
 
@@ -322,10 +324,19 @@ python3 scripts/calibrate_pi05.py \
   --manifest <path-to-observations.jsonl>
 ```
 
-The calibrator reads observations off disk and drives no simulator — MuJoCo and a
-task suite are properties of the environment, not of the weights. To calibrate on
-LIBERO frames, capture them first with `apxinf-robo capture-libero`, then point
-the calibrator at the directory:
+For the PI0.5 LIBERO checkpoint, capture task-balanced observations directly
+from the native LIBERO10 simulator:
+
+```bash
+python3 scripts/calibrate_pi05.py \
+  --model-dir <path-to-model> \
+  --libero-suite libero_10
+```
+
+That drives MuJoCo in this process and uses the same LIBERO dependencies as
+[LIBERO evaluation](#libero-evaluation). A deployment that already owns its
+environment can instead capture the frames out of process and hand the
+calibrator a directory, which makes the calibration input a reviewable artifact:
 
 ```bash
 apxinf-robo capture-libero --suite libero_10 --output-dir /tmp/libero-calib
@@ -335,7 +346,7 @@ python3 scripts/calibrate_pi05.py \
 ```
 
 See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
-format and output options.
+format, native LIBERO sampling, and output options.
 
 ### INT8
 
@@ -343,8 +354,10 @@ W8A8, optimized for Orin (SM87) and Ada (SM89). Needs nothing beyond the
 checkpoint.
 
 ```bash
-python examples/openpi_server.py \
-  --model-dir <path-to-model> --precision int8 --port 8000
+python scripts/pi05_openpi_websocket_server.py \
+  --model-dir <path-to-model> --precision int8 --port 8000 \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state
 ```
 
 ```python
@@ -373,13 +386,36 @@ explicitly with `--norm-stats`.
 
 ### Run
 
-The rollout itself lives in [apxinf-robo](https://github.com/team-mz/APXinf-robo),
-which owns LIBERO, MuJoCo, the Franka body, and the resumable episode ledger.
-This engine holds none of that: a simulator is not a property of the weights.
+The rollout needs LIBERO and MuJoCo:
 
 ```bash
-pip install "apxinf-robo[libero]"     # plus LIBERO itself; see that repo's README
-apxinf-robo eval-libero --backend in-process --model-dir <path-to-model> \
+python -c 'from libero.libero import benchmark'
+```
+
+If that fails, install LIBERO from source:
+
+```bash
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git <path-to-libero>
+pip install -r <path-to-libero>/requirements.txt   # robosuite brings MuJoCo; pins numpy==1.22.4
+pip install -e <path-to-libero>
+export MUJOCO_GL=egl                               # headless; osmesa if the machine has no EGL
+```
+
+That numpy pin is the one thing to watch: it predates Python 3.11, so on a newer
+interpreter it has no wheel and builds from source. `--no-deps` skips it.
+
+`--backend websocket` additionally needs `openpi-client`, from an openpi
+checkout:
+
+```bash
+git clone https://github.com/Physical-Intelligence/openpi.git <path-to-openpi>
+pip install -e <path-to-openpi>/packages/openpi-client
+```
+
+`scripts/eval_libero.py` builds the policy in-process — no server involved:
+
+```bash
+python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
   --norm-stats <path-to-model>/norm_stats.json \
   --precision bf16 --action-horizon 10 \
   --suite libero_10 --tasks all --trials-per-task 50 \
@@ -387,9 +423,32 @@ apxinf-robo eval-libero --backend in-process --model-dir <path-to-model> \
 ```
 
 That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
-(the default), 500 episodes in total. `--backend websocket --host <h> --port <p>`
-evaluates a running [server](#openpi-compatible-serving) instead — the same
-engine, reached over the wire rather than built in-process.
+(the default), 500 episodes in total.
+
+### Options
+
+- `--suite` picks the task suite, `--tasks` a comma list within it, and
+  `--trials-per-task` the episode count; a smoke run is
+  `--tasks 0 --trials-per-task 1`.
+- The model flags — `--model-type`, `--norm-stats`, `--action-horizon`, `--action-dim`,
+  `--discrete-state`, FP8 `--calibration` — belong to `--backend in-process`
+  alone.
+- `--backend websocket --host <h> --port <p>` evaluates a running
+  [server](#openpi-compatible-serving) instead, on this machine or another. The
+  model flags belong to the server there, and `--precision` only asserts what
+  the server reports, so a mismatch fails at connect instead of skewing a run.
+  Pass `--norm-stats <path-to-model>/norm_stats.json` to
+  `scripts/pi05_openpi_websocket_server.py` when serving this checkpoint.
+- `--image-keys` / `--state-key` override the LIBERO wire keys, for a checkpoint
+  trained against a differently named recording of the same suite. Both backends
+  read them, so an in-process and a websocket run stay comparable.
+- Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
+  and the summary reports success rate alongside per-segment latency.
+
+[apxinf-robo](https://github.com/team-mz/APXinf-robo) runs the same protocol from
+the downstream repository, where LIBERO is one environment among several. This
+copy exists so an engine change can be regressed against ApxInf's own published
+numbers without a checkout that takes ApxInf as a submodule.
 
 
 ## Benchmark

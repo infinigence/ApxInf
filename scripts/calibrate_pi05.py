@@ -32,13 +32,17 @@ def _progress(message: str) -> None:
 
 if __package__:
     from .pi05_calibration_data import (
+        load_libero_observations,
         load_npz_observations,
         load_observation_manifest,
+        task_stratified_indices,
     )
 else:
     from pi05_calibration_data import (
+        load_libero_observations,
         load_npz_observations,
         load_observation_manifest,
+        task_stratified_indices,
     )
 
 
@@ -46,15 +50,16 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         usage=(
             "%(prog)s --model-dir MODEL_DIR "
-            "(--manifest OBSERVATIONS.jsonl | --input-dir DIR | SOURCE) "
-            "[--output PATH]"
+            "(--libero-suite libero_10 | --manifest OBSERVATIONS.jsonl "
+            "| --input-dir DIR | SOURCE) [--output PATH]"
         ),
         description=(
             "Generate a checkpoint-bound PI0.5 FP8 profile from representative "
-            "business Observations. Manifest and NPZ sources are supported. "
-            "Capturing observations out of a live simulator belongs to whoever "
-            "owns the environment: 'apxinf-robo capture-libero' writes an NPZ "
-            "directory that --input-dir reads."
+            "business Observations. Native LIBERO, manifest, and NPZ sources are "
+            "supported. --libero-suite drives the simulator here and needs LIBERO "
+            "installed; 'apxinf-robo capture-libero' does the same capture out of "
+            "process and writes an NPZ directory that --input-dir reads, which is "
+            "the right seam for a deployment that owns its own environment."
         ),
     )
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
@@ -75,6 +80,22 @@ def parse_args(argv=None):
         "--manifest",
         type=pathlib.Path,
         help="JSONL Observation manifest; image fields are paths relative to this file",
+    )
+    parser.add_argument(
+        "--libero-suite",
+        choices=(
+            "libero_10",
+            "libero_90",
+            "libero_spatial",
+            "libero_object",
+            "libero_goal",
+        ),
+        help="capture native simulator observations from this LIBERO task suite",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        help="task-balanced LIBERO sample count (default: one initial state per task)",
     )
     parser.add_argument(
         "--zero-fixture",
@@ -111,14 +132,19 @@ def validate_args(args):
             args.input,
             args.input_dir,
             args.manifest,
+            args.libero_suite,
             args.zero_fixture,
         )
     )
     if modes != 1:
         raise ValueError(
-            "pass exactly one calibration source: --manifest, --input-dir, "
+            "pass exactly one calibration source: --manifest, --libero-suite, --input-dir, "
             "one or more --input files, or --zero-fixture"
         )
+    if args.samples is not None and args.libero_suite is None:
+        raise ValueError("--samples applies only to --libero-suite")
+    if args.samples is not None and args.samples < 1:
+        raise ValueError("--samples must be positive")
     if not np.isfinite(args.margin) or args.margin < 1.0:
         raise ValueError("--margin must be finite and >= 1")
     if args.seed < 0:
@@ -134,7 +160,7 @@ def validate_args(args):
     if args.data_id is not None and not args.data_id.strip():
         raise ValueError("--data-id must not be empty")
     if (
-        (args.input or args.input_dir or args.manifest)
+        (args.input or args.input_dir or args.manifest or args.libero_suite)
         and args.data_id is not None
         and args.data_id.startswith("synthetic:")
     ):
@@ -191,6 +217,18 @@ def resolve_observations(args, policy):
             state_width = getattr(state_normalizer, "width", policy.action_dim)
             observation[policy.state_key] = np.zeros(state_width, np.float32)
         return (observation,), "synthetic:zero-observation-v1"
+
+    if args.libero_suite is not None:
+        observations = load_libero_observations(
+            args.libero_suite,
+            image_keys=policy.image_keys,
+            sample_count=args.samples,
+            seed=args.seed,
+            prompt_key=policy.prompt_key,
+            state_key=policy.state_key,
+            progress=_progress,
+        )
+        return observations, _observation_identity(observations)
 
     if args.manifest is not None:
         observations = load_observation_manifest(
