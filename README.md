@@ -73,9 +73,6 @@ python python/apxinf/examples/openpi_server.py \
   --state-key observation/state
 ```
 
-The wire keys are the caller's to name — see
-[OpenPI-compatible serving](#openpi-compatible-serving).
-
 An unmodified `openpi-client` connects to it:
 
 ```python
@@ -246,28 +243,16 @@ policy = AutoPolicy.from_pretrained(
 WebsocketPolicyServer(policy, "0.0.0.0", 8000).serve_forever()
 ```
 
-**The wire keys are yours to name.** This engine holds no dataset's dialect: what
-a client calls its cameras is a property of the recording, not of the weights, and
-one checkpoint architecture is served under several. `image_keys=` / `state_key=`
-/ `prompt_key=` say what your client sends. Omit `image_keys` and the policy falls
-back to the model's own view-slot names (`base_0_rgb`, ...) — a fallback, not a
-contract, published as `apxinf.CANONICAL_IMAGE_KEYS`. `state_key` has no fallback
-at all: a wrong camera key raises on the first inference, a wrong state key is
+`image_keys=` / `state_key=` / `prompt_key=` say what your client sends. Omit
+`image_keys` and the policy falls back to the model's own view-slot names
+(`base_0_rgb`, ...), published as `apxinf.CANONICAL_IMAGE_KEYS` — a fallback,
+not a contract. `state_key` has no fallback at all, because the two failures are
+not alike: a wrong camera key raises on the first inference, a wrong state key is
 silent, so a policy that reads state refuses to be built without one.
 
 The server keeps the checkpoint's native action width unless the user supplies
 `--action-dim`. It publishes the resolved wire contract in connect-time metadata
 so the client can assert it rather than guess.
-
-Named robots — `franka_libero`, `unitree_g1` — are the layer *above* this one:
-a body (DoF layout, delta mask, gripper convention) paired with a dialect, plus
-the simulator glue to drive them. That lives in
-[apxinf-robo](https://github.com/RLinf/APXinf-robo), which composes over this
-engine and adds nothing to it:
-
-```bash
-apxinf-robo serve --robot unitree_g1 --model-dir <path-to-model> --port 8000
-```
 
 
 ## Precisions
@@ -335,14 +320,14 @@ python3 scripts/calibrate_pi05.py \
 
 That drives MuJoCo in this process and uses the same LIBERO dependencies as
 [LIBERO evaluation](#libero-evaluation). A deployment that already owns its
-environment can instead capture the frames out of process and hand the
-calibrator a directory, which makes the calibration input a reviewable artifact:
+environment can capture the frames itself instead and hand the calibrator a
+directory of Observation NPZ files, which makes the calibration input a
+reviewable artifact rather than a side effect of a rollout:
 
 ```bash
-apxinf-robo capture-libero --suite libero_10 --output-dir /tmp/libero-calib
 python3 scripts/calibrate_pi05.py \
   --model-dir <path-to-model> \
-  --input-dir /tmp/libero-calib
+  --input-dir <path-to-observations>
 ```
 
 See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
@@ -439,16 +424,10 @@ That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
   the server reports, so a mismatch fails at connect instead of skewing a run.
   Pass `--norm-stats <path-to-model>/norm_stats.json` to
   `scripts/pi05_openpi_websocket_server.py` when serving this checkpoint.
-- `--image-keys` / `--state-key` override the LIBERO wire keys, for a checkpoint
-  trained against a differently named recording of the same suite. Both backends
+- `--image-keys` / `--state-key` override the LIBERO wire keys. Both backends
   read them, so an in-process and a websocket run stay comparable.
 - Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
   and the summary reports success rate alongside per-segment latency.
-
-[apxinf-robo](https://github.com/RLinf/APXinf-robo) runs the same protocol from
-the downstream repository, where LIBERO is one environment among several. This
-copy exists so an engine change can be regressed against ApxInf's own published
-numbers without a checkout that takes ApxInf as a submodule.
 
 
 ## Benchmark
