@@ -2,6 +2,12 @@
 
 Status: Draft
 
+Follow [Development artifacts](../AGENTS.md#development-artifacts) for
+task-specific output. Keep intermediate representations, experimental code,
+search notes, profiles, and evaluation results under
+`<project-root>/devlocal/<feat-name>/`. Curate reusable findings before
+promoting them into maintained code or documentation.
+
 This document describes the higher-level optimization loop you are building for
 turning a user-provided PyTorch model into optimized Rust/C++ implementation
 work. It is intentionally broader than the current porting workflow docs.

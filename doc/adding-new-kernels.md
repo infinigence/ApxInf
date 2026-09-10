@@ -7,6 +7,11 @@ interfaces, device compositions, and runtime lifetime requirements. Absence
 from the portable backend trait alone is not evidence that a CUDA capability is
 missing.
 
+Follow [Development artifacts](../AGENTS.md#development-artifacts) for
+one-off probes, experimental kernels, generated tuning reports, and validation
+captures. Keep them under `<project-root>/devlocal/<feat-name>/`; maintained
+operators and tests retain the source locations described below.
+
 This document is intended for an agent responsible for porting a working PyTorch reference model to ApxInf. It assumes that the model already runs on the target hardware and that an initial scan has identified operators, data types, shapes, or hardware implementations missing from ApxInf.
 
 The goal is not to translate the PyTorch graph node by node. The goal is to:
