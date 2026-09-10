@@ -127,10 +127,10 @@ ApxInf, Jetson Thor, BF16, parity against the reference within 1e-2
 ```
 
 It works from the same guides a human would follow:
-- [porting workflow](../../doc/porting-workflow.md),
-- [adding a new model](../../doc/adding-a-new-model.md),
-- [model-layer architecture](../../doc/model-layer-architecture.md),
-- [adding new kernels](../../doc/adding-new-kernels.md).
+- [porting workflow](doc/porting-workflow.md),
+- [adding a new model](doc/adding-a-new-model.md),
+- [model-layer architecture](doc/model-layer-architecture.md),
+- [adding new kernels](doc/adding-new-kernels.md).
 
 ## Build ApxInf
 
@@ -196,8 +196,8 @@ model.action_horizon, model.num_views, model.image_size    # what it was loaded 
 
 Adds the pre/post pipelines and reads the checkpoint's tokenizer and
 `norm_stats`, so it takes a raw observation dict and returns deployable actions
-— the [Run a policy](#run-a-policy) snippet. Beyond that call it exposes the
-serving contract, the pipelines, and the layer boundary:
+— the [Run a policy](#run-a-policy-through-python-api) snippet. Beyond that call
+it exposes the serving contract, the pipelines, and the layer boundary:
 
 ```python
 policy = AutoPolicy.from_pretrained(
@@ -208,16 +208,14 @@ policy = AutoPolicy.from_pretrained(
 
 policy.metadata             # model_type, action_horizon, image_keys, state_key, ...
 
-# Pipelines are ordered named steps — image_stack -> tokenize in, trim -> unnormalize
-# out — and every mutation returns a new one, so a custom step drops in as a value.
-policy.input_pipeline = policy.input_pipeline.replace("tokenize", MyTokenizeStep())
-policy.output_pipeline = policy.output_pipeline.insert_after(
-    "unnormalize", ("clip", MyClip())
-)
-
 result = policy.infer(observation)
 result["normalized_actions"]  # what L1 returned, before trim + unnormalize
 ```
+
+The pipelines are ordered named steps — `image_stack -> tokenize` in, `trim ->
+unnormalize` out — and every mutation returns a new one, so a custom step drops
+in as a value: `policy.input_pipeline.replace("tokenize", MyTokenizeStep())`.
+See [the frontend README](python/apxinf/README.md).
 
 ### L3 — websocket server
 
@@ -257,31 +255,30 @@ so the client can assert it rather than guess.
 
 ## Precisions
 
-### BF16
-
-The default, on every supported device. Runs on the checkpoint alone; no
-calibration.
+`--precision` selects the numeric path; the serving command is otherwise
+unchanged.
 
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --precision bf16 \
+  --model-dir <path-to-model> --precision bf16 --port 8000 \
   --image-keys observation/image,observation/wrist_image \
-  --state-key observation/state \
-  --port 8000
+  --state-key observation/state
 ```
 
 ```python
 policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
 ```
 
-### FP8
+| Precision | Where | Needs |
+|---|---|---|
+| `bf16` | every supported device; the default | the checkpoint alone |
+| `fp8` | Thor only, where it is the fastest path — Orin has no FP8 Tensor Cores | per-tensor activation scales |
+| `int8` | W8A8, optimized for Orin (SM87) and Ada (SM89) | the checkpoint alone |
 
-Thor only, where it is the fastest path. Orin has no FP8 Tensor Cores and is not
-supported.
+### FP8 calibration
 
-FP8 needs per-tensor activation scales. Pass the calibration generated for the
-deployment data explicitly; when omitted, ApxInf falls back to
-`<path-to-model>/calibration.json`:
+Pass the calibration generated for the deployment data explicitly; when omitted,
+ApxInf falls back to `<path-to-model>/calibration.json`:
 
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
@@ -301,53 +298,27 @@ policy = AutoPolicy.from_pretrained(
 ```
 
 If the checkpoint does not contain `calibration.json`, generate one from
-representative Observations:
+representative Observations — a JSONL manifest, a directory of Observation NPZ
+files captured wherever the environment already lives, or the native LIBERO10
+simulator driven in this process:
 
 ```bash
-python3 scripts/calibrate_pi05.py \
-  --model-dir <path-to-model> \
+python3 scripts/calibrate_pi05.py --model-dir <path-to-model> \
   --manifest <path-to-observations.jsonl>
-```
 
-For the PI0.5 LIBERO checkpoint, capture task-balanced observations directly
-from the native LIBERO10 simulator:
+python3 scripts/calibrate_pi05.py --model-dir <path-to-model> \
+  --input-dir <path-to-observations>
 
-```bash
-python3 scripts/calibrate_pi05.py \
-  --model-dir <path-to-model> \
+python3 scripts/calibrate_pi05.py --model-dir <path-to-model> \
   --libero-suite libero_10
 ```
 
-That drives MuJoCo in this process and uses the same LIBERO dependencies as
-[LIBERO evaluation](#libero-evaluation). A deployment that already owns its
-environment can capture the frames itself instead and hand the calibrator a
-directory of Observation NPZ files, which makes the calibration input a
-reviewable artifact rather than a side effect of a rollout:
-
-```bash
-python3 scripts/calibrate_pi05.py \
-  --model-dir <path-to-model> \
-  --input-dir <path-to-observations>
-```
+The NPZ form makes the calibration input a reviewable artifact rather than a side
+effect of a rollout; `--libero-suite` drives MuJoCo here and needs the same
+dependencies as [LIBERO evaluation](#libero-evaluation).
 
 See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
 format, native LIBERO sampling, and output options.
-
-### INT8
-
-W8A8, optimized for Orin (SM87) and Ada (SM89). Needs nothing beyond the
-checkpoint.
-
-```bash
-python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --precision int8 --port 8000 \
-  --image-keys observation/image,observation/wrist_image \
-  --state-key observation/state
-```
-
-```python
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="int8")
-```
 
 
 ## LIBERO evaluation
@@ -377,25 +348,16 @@ The rollout needs LIBERO and MuJoCo:
 python -c 'from libero.libero import benchmark'
 ```
 
-If that fails, install LIBERO from source:
+If that fails, install
+[LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) from source
+(`pip install -r requirements.txt && pip install -e .`, then `export
+MUJOCO_GL=egl`, or `osmesa` if the machine has no EGL). Its `requirements.txt`
+brings MuJoCo through robosuite and pins `numpy==1.22.4`, which predates Python
+3.11 and so builds from source on a newer interpreter; `--no-deps` skips it.
 
-```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git <path-to-libero>
-pip install -r <path-to-libero>/requirements.txt   # robosuite brings MuJoCo; pins numpy==1.22.4
-pip install -e <path-to-libero>
-export MUJOCO_GL=egl                               # headless; osmesa if the machine has no EGL
-```
-
-That numpy pin is the one thing to watch: it predates Python 3.11, so on a newer
-interpreter it has no wheel and builds from source. `--no-deps` skips it.
-
-`--backend websocket` additionally needs `openpi-client`, from an openpi
-checkout:
-
-```bash
-git clone https://github.com/Physical-Intelligence/openpi.git <path-to-openpi>
-pip install -e <path-to-openpi>/packages/openpi-client
-```
+`--backend websocket` additionally needs `openpi-client`, from an
+[openpi](https://github.com/Physical-Intelligence/openpi) checkout
+(`pip install -e packages/openpi-client`).
 
 `scripts/eval_libero.py` builds the policy in-process — no server involved:
 
