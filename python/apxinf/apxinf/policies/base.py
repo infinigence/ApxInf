@@ -14,8 +14,11 @@ points other layers code against:
   an *outer* layer (a robot adapter) can wrap steps around its chain. Optional:
   a policy is a perfectly good :class:`Policy` without it.
 * :data:`VIEW_SLOTS` — the camera slot names a checkpoint's weights consume, in
-  order. Model vocabulary, kept here so a policy and a robot preset can both
-  name a slot without importing each other.
+  order. Model vocabulary, kept here so a policy and an outer adaptation layer
+  can both name a slot without importing each other.
+* :data:`CANONICAL_IMAGE_KEYS` / :data:`CANONICAL_STATE_KEY` /
+  :data:`CANONICAL_PROMPT_KEY` — the observation keys a policy reads when the
+  caller names none. Not a dataset's dialect: the *absence* of one.
 
 The ``Policy.infer`` result is a plain dict. Two keys are guaranteed across all
 policies: ``actions`` (deployable, unnormalized-domain ``float32``
@@ -31,7 +34,15 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, runtime_che
 
 import numpy as np
 
-__all__ = ["Policy", "BareModel", "ComposablePolicy", "VIEW_SLOTS"]
+__all__ = [
+    "Policy",
+    "BareModel",
+    "ComposablePolicy",
+    "VIEW_SLOTS",
+    "CANONICAL_IMAGE_KEYS",
+    "CANONICAL_STATE_KEY",
+    "CANONICAL_PROMPT_KEY",
+]
 
 #: Camera view slots, in the order a checkpoint's weights consume them, as named
 #: by openpi's ``model.IMAGE_KEYS``.
@@ -39,14 +50,36 @@ __all__ = ["Policy", "BareModel", "ComposablePolicy", "VIEW_SLOTS"]
 #: These are **model** vocabulary, not wire keys and not a dataset's convention.
 #: A checkpoint's ``num_views`` says how many of these it was trained on; the
 #: *order* is baked into the weights, and nothing here ever crosses the network.
-#: They live in this module rather than in a robot preset or in ``pi05.py``
-#: because both sides need to agree on them without either importing the other:
-#: a policy uses them to name the cameras it wants when the caller does not, and
-#: a robot preset uses them to say which slot each of its wire keys fills.
+#: They live in this module rather than in a policy implementation because both
+#: sides need to agree on them without either importing the other: a policy uses
+#: them to name the cameras it wants when the caller does not, and an outer
+#: adaptation layer uses them to say which slot each of its wire keys fills.
 #:
 #: The pi05 family shares this vocabulary. A model with a different camera layout
 #: declares its own rather than stretching this tuple.
 VIEW_SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+
+#: The observation keys a policy reads when the caller names none.
+#:
+#: This engine holds **no dataset's wire contract**. What a client calls its
+#: cameras is a property of the recording, not of the weights, and it varies
+#: across datasets that share one checkpoint architecture — so naming keys is the
+#: caller's job, through ``image_keys=`` / ``state_key=`` / ``prompt_key=``.
+#:
+#: These three constants are what is left when nobody names anything: the cameras
+#: fall back to the model's own slot names, and the prompt to the one spelling
+#: openpi's wire has always used. They are published so that a caller *can*
+#: address the fallback contract by name instead of restating string literals,
+#: and so an adaptation layer (``apxinf-robo``) can assert against them.
+#:
+#: ``CANONICAL_STATE_KEY`` is deliberately **not** a default anywhere. State has
+#: no safe fallback: a wrong camera key raises on the first inference, a wrong
+#: state key is silent, and a policy that reads state refuses to be built without
+#: an explicit ``state_key``. It is here to name the neutral spelling, not to
+#: supply one.
+CANONICAL_IMAGE_KEYS = VIEW_SLOTS
+CANONICAL_STATE_KEY = "state"
+CANONICAL_PROMPT_KEY = "prompt"
 
 
 @runtime_checkable

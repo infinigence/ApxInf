@@ -55,17 +55,19 @@ python examples/autopolicy_infer.py \
 
 python examples/openpi_server.py \
   --model-dir /path/to/wall-oss-0.5 \
-  --robot franka_libero \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state \
   --policy-options '{"norm_key":"x2_normal"}'
 ```
 
-Without `--robot` or `--action-dim`, both generic launchers keep the action width
-inferred from the checkpoint weights (currently deployed WallOSS checkpoints may
-be either 7 or 26 channels). A user-supplied `--action-dim` wins; otherwise a
-named robot preset supplies its deployable width; otherwise the checkpoint width
-is used. Prefix trimming is valid only when the selected normalizer and the
+Without `--action-dim`, both generic launchers keep the action width inferred
+from the checkpoint weights (currently deployed WallOSS checkpoints may be either
+7 or 26 channels). A user-supplied `--action-dim` wins; otherwise the checkpoint
+width is used. Prefix trimming is valid only when the selected normalizer and the
 checkpoint's leading-channel layout match the target robot. Non-prefix layouts
-need a robot adapter rather than a different `--action-dim`.
+need a body-aware adapter around the policy — see
+[apxinf-robo](https://github.com/team-mz/APXinf-robo), which pairs named bodies
+with named wire dialects — rather than a different `--action-dim`.
 
 WallOSS state-token binning is likewise loaded from checkpoint metadata
 (`config.json`, then legacy `config.yml`) and falls back to 256 only when absent.

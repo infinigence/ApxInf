@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Audit one precision-tagged ApxInf PI0.5 LIBERO campaign ledger."""
+"""Audit one precision-tagged ApxInf PI0.5 LIBERO campaign ledger.
+
+Pure JSON/JSONL validation of an ``apxinf.pi05.libero-eval.v1`` ledger, which
+``apxinf-robo eval-libero`` writes; this script imports neither LIBERO nor the
+engine. It is release tooling for the accuracy table in README.md.
+"""
 
 from __future__ import annotations
 

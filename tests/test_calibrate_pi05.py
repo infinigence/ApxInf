@@ -24,79 +24,6 @@ class CalibratePi05Test(unittest.TestCase):
             expected,
         )
 
-    def test_task_stratified_indices_cover_tasks_before_repeating(self):
-        indices = calibrate_pi05.task_stratified_indices(
-            [0, 0, 0, 1, 1, 2], sample_count=5, seed=7
-        )
-
-        self.assertEqual(len(indices), 5)
-        selected_tasks = [
-            [0, 0, 0, 1, 1, 2][index]
-            for index in indices
-        ]
-        self.assertEqual(set(selected_tasks[:3]), {0, 1, 2})
-        self.assertLessEqual(max(selected_tasks.count(task) for task in set(selected_tasks)), 2)
-
-    def test_libero_mode_captures_task_balanced_native_observations(self):
-        class Task:
-            def __init__(self, task_id):
-                self.language = f"task {task_id}"
-
-        class Suite:
-            n_tasks = 2
-
-            def get_task(self, task_id):
-                return Task(task_id)
-
-            def get_task_init_states(self, task_id):
-                return np.asarray([[task_id, 0], [task_id, 1]], dtype=np.float32)
-
-        class Env:
-            def reset(self):
-                pass
-
-            def set_init_state(self, initial_state):
-                self.value = int(initial_state[0] * 10 + initial_state[1])
-                return self._observation()
-
-            def step(self, _action):
-                return self._observation(), 0.0, False, {}
-
-            def _observation(self):
-                return {
-                    "agentview_image": np.full((3, 4, 3), self.value, np.uint8),
-                    "robot0_eye_in_hand_image": np.full(
-                        (3, 4, 3), self.value + 20, np.uint8
-                    ),
-                    "robot0_eef_pos": np.arange(3, dtype=np.float32),
-                    "robot0_eef_quat": np.asarray([0, 0, 0, 1], np.float32),
-                    "robot0_gripper_qpos": np.asarray([0.1, 0.2], np.float32),
-                }
-
-            def close(self):
-                pass
-
-        with mock.patch.object(
-            pi05_calibration_data, "_load_libero_suite", return_value=Suite()
-        ), mock.patch.object(pi05_calibration_data, "make_env", side_effect=lambda *_: Env()):
-            observations = pi05_calibration_data.load_libero_observations(
-                "libero_10",
-                image_keys=("observation/image", "observation/wrist_image"),
-                sample_count=2,
-                seed=7,
-                prompt_key="prompt",
-                state_key="observation/state",
-            )
-
-        self.assertEqual(len(observations), 2)
-        self.assertEqual(
-            {observation["prompt"] for observation in observations},
-            {"task 0", "task 1"},
-        )
-        self.assertEqual(observations[0]["observation/image"].shape, (224, 224, 3))
-        self.assertEqual(observations[0]["observation/state"].shape, (8,))
-        self.assertEqual(observations[0]["observation/state"].dtype, np.float32)
-
     def test_input_directory_expands_npz_files_in_stable_order(self):
         class Policy:
             image_keys = ("observation/image",)
@@ -155,7 +82,10 @@ class CalibratePi05Test(unittest.TestCase):
         self.assertEqual(observations[0]["observation/state"].dtype, np.float32)
         self.assertTrue(identity.startswith("sha256:"))
 
-    def test_calibration_job_consumes_native_libero_source_end_to_end(self):
+    def test_calibration_job_consumes_a_captured_npz_directory_end_to_end(self):
+        # The NPZ directory is the seam between whoever owns the environment
+        # (`apxinf-robo capture-libero`) and this engine-side calibrator: the
+        # observations are an artifact on disk, not a live simulator.
         class Model:
             image_size = 2
             action_horizon = 2
@@ -185,33 +115,32 @@ class CalibratePi05Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             (root / "model.safetensors").write_bytes(b"weights")
+            captured = root / "captured"
+            captured.mkdir()
+            for index in range(2):
+                np.savez(
+                    captured / f"sample-{index:03d}.npz",
+                    **{
+                        "observation/image": np.zeros((2, 2, 3), np.uint8),
+                        "observation/wrist_image": np.zeros((2, 2, 3), np.uint8),
+                        "observation/state": np.zeros(8, np.float32),
+                        "prompt": np.asarray(f"task {index}"),
+                    },
+                )
             output = root / "profile.json"
             args = calibrate_pi05.parse_args(
                 [
                     "--model-dir",
                     str(root),
-                    "--libero-suite",
-                    "libero_10",
+                    "--input-dir",
+                    str(captured),
                     "--output",
                     str(output),
                     "--source-revision",
                     "test-revision",
                 ]
             )
-            observations = tuple(
-                {
-                    "observation/image": np.zeros((2, 2, 3), np.uint8),
-                    "observation/wrist_image": np.zeros((2, 2, 3), np.uint8),
-                    "observation/state": np.zeros(8, np.float32),
-                    "prompt": f"task {index}",
-                }
-                for index in range(2)
-            )
-            with mock.patch.object(
-                calibrate_pi05,
-                "load_libero_observations",
-                return_value=observations,
-            ), mock.patch.object(calibrate_pi05, "_progress") as progress:
+            with mock.patch.object(calibrate_pi05, "_progress") as progress:
                 result = calibrate_pi05.run_from_args(
                     args, policy_factory=lambda *_args, **_kwargs: Policy()
                 )

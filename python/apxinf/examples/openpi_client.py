@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Minimal OpenPI websocket client: connect, read metadata, send one observation.
 
-The distilled client half of the LIBERO eval (scripts/eval_pi05_libero_openpi.py)
+The distilled client half of a benchmark rollout (``apxinf-robo eval-libero``)
 with the simulator and resumable ledger stripped away — just how to reach a
 ``apxinf.serving`` server (or any OpenPI ``WebsocketPolicyServer``) and get an
 action chunk back. Pair it with ``openpi_server.py``.

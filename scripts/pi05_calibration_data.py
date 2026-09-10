@@ -1,23 +1,25 @@
 """Data-source adapters for PI0.5 calibration Observations.
 
 The calibration module consumes ApxInf Observations.  This module is the
-optional outer seam that translates storage formats into that contract.
+optional outer seam that translates *storage formats* into that contract: NPZ
+files and JSONL manifests, both readable anywhere with numpy and PIL.
+
+Capturing observations from a live simulator is a different job with a different
+dependency set, and it belongs to whoever owns the environment.  ``apxinf-robo
+capture-libero`` writes an NPZ directory this module then reads, which keeps
+MuJoCo out of the engine and makes the calibration input a reviewable artifact
+rather than a side effect of a rollout.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 import json
 import pathlib
 from typing import Any
 
 import numpy as np
 from PIL import Image
-
-if __package__:
-    from .libero_observation import make_env, to_apxinf_observation
-else:
-    from libero_observation import make_env, to_apxinf_observation
 
 
 def _decode_npz_value(value):
@@ -116,124 +118,4 @@ def load_observation_manifest(
 
     if not observations:
         raise ValueError(f"calibration manifest has no observations: {path}")
-    return tuple(observations)
-
-
-def task_stratified_indices(
-    task_indices: Sequence[object], *, sample_count: int, seed: int
-) -> list[int]:
-    """Choose deterministic, balanced frame indices across every task group."""
-    if sample_count < 1:
-        raise ValueError("calibration sample count must be positive")
-    if sample_count > len(task_indices):
-        raise ValueError(
-            f"requested {sample_count} calibration samples from {len(task_indices)} frames"
-        )
-    groups: dict[object, list[int]] = {}
-    for index, raw_task in enumerate(task_indices):
-        task = raw_task.item() if hasattr(raw_task, "item") else raw_task
-        groups.setdefault(task, []).append(index)
-    if sample_count < len(groups):
-        raise ValueError(
-            f"--samples={sample_count} cannot cover all {len(groups)} tasks; "
-            "increase --samples"
-        )
-
-    rng = np.random.default_rng(seed)
-    tasks = sorted(groups, key=lambda value: (type(value).__name__, repr(value)))
-    queues = {task: list(rng.permutation(groups[task])) for task in tasks}
-    selected: list[int] = []
-    while len(selected) < sample_count:
-        progressed = False
-        for task in tasks:
-            if queues[task] and len(selected) < sample_count:
-                selected.append(int(queues[task].pop()))
-                progressed = True
-        if not progressed:
-            break
-    return selected
-
-
-def _load_libero_suite(suite_name: str):
-    try:
-        from libero.libero import benchmark
-    except ImportError as error:
-        raise ImportError(
-            "native LIBERO observations require the LIBERO and MuJoCo evaluation "
-            "dependencies; install LIBERO as described in README.md"
-        ) from error
-    benchmark_dict = benchmark.get_benchmark_dict()
-    if suite_name not in benchmark_dict:
-        raise ValueError(f"unknown LIBERO suite: {suite_name}")
-    return benchmark_dict[suite_name]()
-
-
-def load_libero_observations(
-    suite_name: str,
-    *,
-    image_keys: Sequence[str],
-    sample_count: int | None,
-    seed: int,
-    prompt_key: str,
-    state_key: str,
-    progress: Callable[[str], None] | None = None,
-) -> tuple[Mapping[str, object], ...]:
-    """Capture task-balanced observations from native LIBERO initial states."""
-    if len(image_keys) != 2:
-        raise ValueError(
-            "native LIBERO calibration requires exactly two configured image views"
-        )
-    progress = progress or (lambda _message: None)
-    suite = _load_libero_suite(suite_name)
-    states_by_task = [
-        suite.get_task_init_states(task_id) for task_id in range(suite.n_tasks)
-    ]
-    task_indices = [
-        task_id
-        for task_id, initial_states in enumerate(states_by_task)
-        for _ in range(len(initial_states))
-    ]
-    selected_count = sample_count if sample_count is not None else suite.n_tasks
-    flat_indices = task_stratified_indices(
-        task_indices, sample_count=selected_count, seed=seed
-    )
-    offsets = []
-    offset = 0
-    for initial_states in states_by_task:
-        offsets.append(offset)
-        offset += len(initial_states)
-    selected_by_task: dict[int, list[int]] = {}
-    for flat_index in flat_indices:
-        task_id = task_indices[flat_index]
-        selected_by_task.setdefault(task_id, []).append(flat_index - offsets[task_id])
-
-    observations = []
-    dummy_action = [0.0] * 6 + [-1.0]
-    for task_id in sorted(selected_by_task):
-        task = suite.get_task(task_id)
-        prompt = str(task.language)
-        progress(
-            f"Capturing {suite_name} task {task_id} "
-            f"({len(selected_by_task[task_id])} observation(s))..."
-        )
-        env = make_env(task, seed)
-        try:
-            for initial_state_index in selected_by_task[task_id]:
-                env.reset()
-                raw_observation = env.set_init_state(
-                    states_by_task[task_id][initial_state_index]
-                )
-                for _ in range(10):
-                    raw_observation, _, _, _ = env.step(dummy_action)
-                observations.append(
-                    to_apxinf_observation(
-                        raw_observation,
-                        prompt=prompt,
-                        image_keys=(image_keys[0], image_keys[1]),
-                        prompt_key=prompt_key,
-                        state_key=state_key,
-                    )
-                )
-        finally:
-            env.close()
     return tuple(observations)

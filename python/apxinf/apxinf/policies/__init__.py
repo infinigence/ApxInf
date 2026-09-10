@@ -5,8 +5,9 @@ owns its own steps and :class:`~apxinf.processors.base.ProcessorStep`. It is spl
 into a **stable** outer layer and a **volatile** inner one:
 
 * :mod:`~apxinf.policies.base` — the :class:`Policy` / :class:`BareModel` contracts,
-  plus :class:`ComposablePolicy` (the opt-in seam a robot adapter wraps) and
-  :data:`VIEW_SLOTS` (the camera slot names the weights consume, in order).
+  plus :class:`ComposablePolicy` (the opt-in seam an outer adaptation layer wraps),
+  :data:`VIEW_SLOTS` (the camera slot names the weights consume, in order), and the
+  ``CANONICAL_*`` keys a policy falls back to when the caller names none.
 * :mod:`~apxinf.policies.registry` — the ``model_type -> policy class`` registry.
 * :mod:`~apxinf.policies.auto` — :class:`AutoPolicy`, dispatch by ``config.json`` type.
 * :mod:`~apxinf.policies.impls` — the concrete per-model policies (``pi05``, ...),
@@ -26,7 +27,15 @@ inside ``from_pretrained`` — so importing the package stays offline-friendly.
 from __future__ import annotations
 
 from .auto import AutoPolicy
-from .base import VIEW_SLOTS, BareModel, ComposablePolicy, Policy
+from .base import (
+    CANONICAL_IMAGE_KEYS,
+    CANONICAL_PROMPT_KEY,
+    CANONICAL_STATE_KEY,
+    VIEW_SLOTS,
+    BareModel,
+    ComposablePolicy,
+    Policy,
+)
 from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
@@ -37,6 +46,9 @@ __all__ = [
     "BareModel",
     "ComposablePolicy",
     "VIEW_SLOTS",
+    "CANONICAL_IMAGE_KEYS",
+    "CANONICAL_STATE_KEY",
+    "CANONICAL_PROMPT_KEY",
     "AutoPolicy",
     "register_policy",
     "get_policy",

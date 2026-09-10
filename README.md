@@ -68,8 +68,13 @@ Resize, tokenization, normalization, and the flow sampler all run inside `infer`
 
 ```bash
 python python/apxinf/examples/openpi_server.py \
-  --model-dir <path-to-model> --robot franka_libero --precision bf16 --port 8000
+  --model-dir <path-to-model> --precision bf16 --port 8000 \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state
 ```
+
+The wire keys are the caller's to name — see
+[OpenPI-compatible serving](#openpi-compatible-serving).
 
 An unmodified `openpi-client` connects to it:
 
@@ -229,32 +234,40 @@ robot stack connects without a code change — swap the endpoint and keep the
 observation dict you already send.
 
 ```python
-from apxinf import build_robot_policy
+from apxinf import AutoPolicy
 from apxinf.serving import WebsocketPolicyServer
 
-policy = build_robot_policy("unitree_g1", "<path-to-model>", precision="bf16")
+policy = AutoPolicy.from_pretrained(
+    "<path-to-model>",
+    precision="bf16",
+    image_keys=("observation/image", "observation/wrist_image"),
+    state_key="observation/state",
+)
 WebsocketPolicyServer(policy, "0.0.0.0", 8000).serve_forever()
 ```
 
-`--robot` selects the wire contract — camera keys, state routing, deployable
-action width — the way OpenPI selects a `TrainConfig`. It is not negotiated at
-connect time, so a checkpoint fine-tuned for another robot must name its preset;
-a mismatch produces wrong actions, not an error.
-
-| Preset | Cameras | State | Action |
-|---|---|---|---|
-| `franka_libero` | `observation/image`, `observation/wrist_image` | `observation/state`; encoding is checkpoint-specific | 7-dim EEF delta |
-| `unitree_g1` | 3 views | 16-dim, discretized into the prompt | delta joints, 32→16 encode |
-
-`--help` lists every preset. If an installed client uses different keys, pass
-the concrete policy fields through `--policy-options` (for example
-`{"image_keys":[...],"state_key":"state"}`) or register a named preset; do not
-edit the generic server. See [Adding an embodiment](doc/adding-an-embodiment.md).
+**The wire keys are yours to name.** This engine holds no dataset's dialect: what
+a client calls its cameras is a property of the recording, not of the weights, and
+one checkpoint architecture is served under several. `image_keys=` / `state_key=`
+/ `prompt_key=` say what your client sends. Omit `image_keys` and the policy falls
+back to the model's own view-slot names (`base_0_rgb`, ...) — a fallback, not a
+contract, published as `apxinf.CANONICAL_IMAGE_KEYS`. `state_key` has no fallback
+at all: a wrong camera key raises on the first inference, a wrong state key is
+silent, so a policy that reads state refuses to be built without one.
 
 The server keeps the checkpoint's native action width unless the user supplies
-`--action-dim` or selects a preset with a deployable width. It publishes the
-resolved wire contract in connect-time metadata so the client can assert it
-rather than guess.
+`--action-dim`. It publishes the resolved wire contract in connect-time metadata
+so the client can assert it rather than guess.
+
+Named robots — `franka_libero`, `unitree_g1` — are the layer *above* this one:
+a body (DoF layout, delta mask, gripper convention) paired with a dialect, plus
+the simulator glue to drive them. That lives in
+[apxinf-robo](https://github.com/team-mz/APXinf-robo), which composes over this
+engine and adds nothing to it:
+
+```bash
+apxinf-robo serve --robot unitree_g1 --model-dir <path-to-model> --port 8000
+```
 
 
 ## Precisions
@@ -265,8 +278,10 @@ The default, on every supported device. Runs on the checkpoint alone; no
 calibration.
 
 ```bash
-python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --robot franka_libero --precision bf16 \
+python examples/openpi_server.py \
+  --model-dir <path-to-model> --precision bf16 \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state \
   --port 8000
 ```
 
@@ -284,9 +299,9 @@ deployment data explicitly; when omitted, ApxInf falls back to
 `<path-to-model>/calibration.json`:
 
 ```bash
-python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --robot franka_libero --precision fp8 \
-  --calibration <path-to-calibration.json> \
+python examples/openpi_server.py \
+  --model-dir <path-to-model> --precision fp8 \
+  --policy-options '{"calibration":"<path-to-calibration.json>"}' \
   --port 8000
 ```
 
@@ -307,18 +322,20 @@ python3 scripts/calibrate_pi05.py \
   --manifest <path-to-observations.jsonl>
 ```
 
-For the PI0.5 LIBERO checkpoint, capture task-balanced observations directly
-from the native LIBERO10 simulator:
+The calibrator reads observations off disk and drives no simulator — MuJoCo and a
+task suite are properties of the environment, not of the weights. To calibrate on
+LIBERO frames, capture them first with `apxinf-robo capture-libero`, then point
+the calibrator at the directory:
 
 ```bash
+apxinf-robo capture-libero --suite libero_10 --output-dir /tmp/libero-calib
 python3 scripts/calibrate_pi05.py \
   --model-dir <path-to-model> \
-  --libero-suite libero_10
+  --input-dir /tmp/libero-calib
 ```
 
 See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
-format, native LIBERO sampling, and output options. The native path uses the
-same LIBERO/MuJoCo dependencies as [LIBERO evaluation](#libero-evaluation).
+format and output options.
 
 ### INT8
 
@@ -326,8 +343,8 @@ W8A8, optimized for Orin (SM87) and Ada (SM89). Needs nothing beyond the
 checkpoint.
 
 ```bash
-python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --robot franka_libero --precision int8 --port 8000
+python examples/openpi_server.py \
+  --model-dir <path-to-model> --precision int8 --port 8000
 ```
 
 ```python
@@ -356,36 +373,13 @@ explicitly with `--norm-stats`.
 
 ### Run
 
-The rollout needs LIBERO and MuJoCo:
+The rollout itself lives in [apxinf-robo](https://github.com/team-mz/APXinf-robo),
+which owns LIBERO, MuJoCo, the Franka body, and the resumable episode ledger.
+This engine holds none of that: a simulator is not a property of the weights.
 
 ```bash
-python -c 'from libero.libero import benchmark'
-```
-
-If that fails, install LIBERO from source:
-
-```bash
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git <path-to-libero>
-pip install -r <path-to-libero>/requirements.txt   # robosuite brings MuJoCo; pins numpy==1.22.4
-pip install -e <path-to-libero>
-export MUJOCO_GL=egl                               # headless; osmesa if the machine has no EGL
-```
-
-That numpy pin is the one thing to watch: it predates Python 3.11, so on a newer
-interpreter it has no wheel and builds from source. `--no-deps` skips it.
-
-`--backend websocket` additionally needs `openpi-client`, from an openpi
-checkout:
-
-```bash
-git clone https://github.com/Physical-Intelligence/openpi.git <path-to-openpi>
-pip install -e <path-to-openpi>/packages/openpi-client
-```
-
-`scripts/eval_libero.py` builds the policy in-process — no server involved:
-
-```bash
-python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
+pip install "apxinf-robo[libero]"     # plus LIBERO itself; see that repo's README
+apxinf-robo eval-libero --backend in-process --model-dir <path-to-model> \
   --norm-stats <path-to-model>/norm_stats.json \
   --precision bf16 --action-horizon 10 \
   --suite libero_10 --tasks all --trials-per-task 50 \
@@ -393,24 +387,9 @@ python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
 ```
 
 That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
-(the default), 500 episodes in total.
-
-### Options
-
-- `--suite` picks the task suite, `--tasks` a comma list within it, and
-  `--trials-per-task` the episode count; a smoke run is
-  `--tasks 0 --trials-per-task 1`.
-- The model flags — `--model-type`, `--norm-stats`, `--action-horizon`, `--action-dim`,
-  `--discrete-state`, FP8 `--calibration` — belong to `--backend in-process`
-  alone.
-- `--backend websocket --host <h> --port <p>` evaluates a running
-  [server](#openpi-compatible-serving) instead, on this machine or another. The
-  model flags belong to the server there, and `--precision` only asserts what
-  the server reports, so a mismatch fails at connect instead of skewing a run.
-  Pass `--norm-stats <path-to-model>/norm_stats.json` to
-  `scripts/pi05_openpi_websocket_server.py` when serving this checkpoint.
-- Runs are resumable: completed task/trial rows in the JSONL ledger are skipped,
-  and the summary reports success rate alongside per-segment latency.
+(the default), 500 episodes in total. `--backend websocket --host <h> --port <p>`
+evaluates a running [server](#openpi-compatible-serving) instead — the same
+engine, reached over the wire rather than built in-process.
 
 
 ## Benchmark
