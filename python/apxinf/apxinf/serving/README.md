@@ -1,10 +1,13 @@
-# Serving pi05 over the OpenPI websocket protocol
+# Serving a policy over the OpenPI websocket protocol
 
-Run a pi05 checkpoint on the ApxInf engine and expose it through an
+Run a checkpoint on the ApxInf engine and expose it through an
 **OpenPI-compatible websocket**, so any unmodified upstream `openpi_client` can
-connect. This guide covers starting the server, calling it, running the
-LIBERO-10 accuracy eval, and porting an OpenPI config + processors for a new
-robot.
+connect. This guide covers starting the server, calling it, and the seam an
+outer layer uses to splice its own robot steps into the pipelines.
+
+What this guide deliberately does *not* cover: named robots, simulator glue, and
+benchmark rollouts. A body's DoF layout and a dataset's wire keys are not
+properties of the weights, so they belong one layer up, outside the engine.
 
 Paths below are relative to the repo root. The engine binding (`apxinf_py`) is
 built per GPU architecture — see the root [README](../../../../README.md) for the
@@ -16,10 +19,8 @@ Rust/CUDA build (`APXINF_CUDA_ARCH=sm_87` for Orin, `sm_110` for Thor).
 # engine binding (architecture-specific wheel built from crates/apxinf-py)
 pip install apxinf_py-*.whl
 # numpy frontend: processors + L2 policy + serving
-pip install -e python/apxinf
-# transport + processor deps
-pip install -r scripts/requirements-pi05-websocket.txt
-# upstream client (for §3 / §4)
+pip install -e "python/apxinf[tokenizer,serving]"
+# upstream client (for §3)
 pip install openpi-client
 ```
 
@@ -37,47 +38,54 @@ python -c "import apxinf_py; print(apxinf_py.Model.load('pi05','<ckpt>/model.saf
 ## 2. Start the server
 
 ```bash
-python scripts/pi05_openpi_websocket_server.py \
+python python/apxinf/examples/openpi_server.py \
     --model-dir <ckpt> \
-    --robot franka_libero \  # embodiment preset: wire keys + pre/post steps + action width
+    --image-keys observation/image,observation/wrist_image \
+    --state-key observation/state \
     --precision bf16 \
     --device cuda:0 \
     --host 0.0.0.0 --port 8000
 ```
 
-- `--robot` is the one flag that decides **which keys the client must send**. It
-  is openpi's `serve_policy.py --policy.config <TrainConfig>` equivalent: the
-  embodiment is fixed at startup and the client cannot negotiate it. A checkpoint
-  fine-tuned for another robot **must** name it — the wire keys, the state
-  routing, and the action encoding all differ, and a mismatch degrades silently
-  (plausible-looking actions from the wrong cameras) rather than failing.
-  `--robot` also sets `--action-dim` and `--discrete-state`; pass those flags only
-  to override the preset. `python scripts/pi05_openpi_websocket_server.py --help`
-  lists every preset with its slot→key mapping.
-- Presets are named `<arm>_<key convention>`, because the arm alone does not fix
-  the contract: LIBERO and DROID are both Franka Panda with different keys and
-  action spaces. `--robot libero` still resolves to `franka_libero`.
-- `--image-keys` / `--state-key` override individual keys, for a deployed client
-  that already speaks a fixed dialect. `--image-keys` order is significant: key
-  *i* fills model view slot *i* (`base_0_rgb`, `left_wrist_0_rgb`,
-  `right_wrist_0_rgb`).
-- `--num-views` serves a checkpoint with **fewer cameras than it declares** — a
-  3-view checkpoint on a 2-camera robot. The trailing view slots are dropped at
-  load time, which is numerically identical to what openpi does (it zero-pads the
-  absent view and masks it; a masked view is excluded from attention, occupies no
-  RoPE position, and the vision tower has no per-slot parameters) while skipping
-  that view's 256 patch tokens every step. It must equal the number of image
-  keys. The explicit value prevents a missing camera key from silently reducing
-  the loaded view count.
+- `--image-keys` / `--state-key` decide **which keys the client must send**. They
+  are the caller's to name: what a client calls its cameras is a property of the
+  recording, not of the weights, and one checkpoint architecture is served under
+  several dialects. The contract is fixed at startup and the client cannot
+  negotiate it.
+- `--image-keys` order is significant: key *i* fills model view slot *i*
+  (`base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb`). Omit the flag and the
+  policy falls back to those slot names themselves — published as
+  `apxinf.CANONICAL_IMAGE_KEYS`, a fallback rather than a contract.
+- `--state-key` has no fallback. A wrong camera key raises on the first
+  inference; a wrong state key is silent, so a policy that reads state refuses to
+  be built without one. `apxinf.CANONICAL_STATE_KEY` names the neutral spelling
+  (`"state"`) for a caller that wants it, but nothing defaults to it.
+- Wire keys may be written **flat** (`"observation/image"` — the slash is part of
+  the name, as LIBERO and DROID send it) or as a **nested path**
+  (`"images/cam_high"` → `obs["images"]["cam_high"]`, as ALOHA and G1 send it). A
+  flat hit always wins, so both layouts work from one tuple and an unmodified
+  upstream client needs no changes.
+- `--policy-options '{"num_views": 2}'` serves a checkpoint with **fewer cameras
+  than the checkpoint declares** — a 3-view checkpoint on a 2-camera robot. The
+  trailing view slots are dropped at load time, which is numerically identical to
+  what openpi does (it zero-pads the absent view and masks it; a masked view is
+  excluded from attention, occupies no RoPE position, and the vision tower has no
+  per-slot parameters) while skipping that view's 256 patch tokens every step. It
+  must equal the number of image keys. The explicit value prevents a missing
+  camera key from silently reducing the loaded view count.
+- Remaining policy kwargs — `prompt_key`, `discrete_state`, `norm_stats`,
+  `calibration` — go through `--policy-options` as a JSON object.
+- `--action-dim` narrows the published action width; omitted, the checkpoint's
+  native width is served.
 - `--host 0.0.0.0` accepts remote clients (split deployment); `127.0.0.1` for a
   local-only test.
 - Health check: `curl http://<host>:8000/healthz` → `OK`.
-- The startup log prints the served contract; the same fields are pushed to every
-  client on connect (see §3):
+- The resolved contract — image keys, state key, action horizon and width — is
+  pushed to every client on connect (see §3), so it is asserted rather than
+  assumed.
 
-  ```
-  serving robot=franka_libero H=10 x D=7 image_keys=['observation/image', 'observation/wrist_image'] state=observation/state discrete_state=False
-  ```
+An outer layer can wrap this same server and supply the keys and action width
+from a named preset instead of the command line.
 
 ## 3. Call it (stock `openpi_client`, unmodified)
 
@@ -86,14 +94,14 @@ from openpi_client import websocket_client_policy
 
 client = websocket_client_policy.WebsocketClientPolicy("<host>", 8000)
 meta = client.get_server_metadata()
-# {'robot': 'franka_libero', 'image_keys': ['observation/image', 'observation/wrist_image'],
+# {'image_keys': ['observation/image', 'observation/wrist_image'],
 #  'state_key': 'observation/state', 'discrete_state': False, 'prompt_key': 'prompt',
 #  'num_views': 2, 'action_horizon': 10, 'action_dim': 7, 'precision': 'bf16', ...}
 
 result = client.infer({
     "observation/image":       base_rgb_uint8,     # HWC uint8 RGB; the server resizes
     "observation/wrist_image": wrist_rgb_uint8,
-    "observation/state":       state_f32,          # dropped unless discrete_state; see §5
+    "observation/state":       state_f32,          # dropped unless discrete_state
     "prompt":                  "put both moka pots on the stove",
 })
 result["actions"]         # float32 [H, action_dim]; H is the checkpoint's native horizon
@@ -116,111 +124,32 @@ edge), so any input resolution is fine.
 
 Reference client: [python/apxinf/examples/openpi_client.py](../../examples/openpi_client.py).
 
-## 4. LIBERO-10 accuracy eval
+## 4. Splice your own robot steps into the pipelines
 
-The simulation side (client) can run two ways; the server always hosts the
-engine. LIBERO needs a pinned sim stack (`robosuite==1.4.0` / `mujoco==2.3.2` /
-`bddl==1.0.1`) and `MUJOCO_GL=egl` on headless boxes, plus a LIBERO checkout on
-`PYTHONPATH`.
+An OpenPI fine-tune ships a set of `DataTransformFn` pre/post transforms — say a
+16-DoF humanoid with `action_dim=32` and delta joint actions, with
+`myRobotInputs` / `myRobotOutputs`. Porting those into ApxInf pulls no external
+framework in: you translate each `dict→dict` transform, by semantics, into an
+ApxInf `ProcessorStep` and splice it onto a policy through
+[`ComposablePolicy.with_adapter`](../policies/base.py).
 
-### Form A — same machine
+This section documents the **engine seam**. The steps themselves belong to
+whoever owns the body, and live outside this repository.
 
-```bash
-# terminal 1: server (see §2)
-python scripts/pi05_openpi_websocket_server.py --model-dir <ckpt> --precision bf16 --port 8000 &
+### 4.1 OpenPI transform → ApxInf equivalent
 
-# terminal 2: eval against the local server
-export MUJOCO_GL=egl
-export PYTHONPATH=<path/to/LIBERO>
-python scripts/eval_pi05_libero_openpi.py \
-    --host 127.0.0.1 --port 8000 --precision bf16 \
-    --task-ids 0,1,2,3,4,5,6,7,8,9 --trials-per-task 10 \
-    --results-jsonl out/libero_bf16.jsonl \
-    --summary-json  out/libero_bf16.summary.json
-```
-
-### Form B — split: client on an x86 sim box, server remote
-
-Decouple via websocket: keep the fragile sim stack on a machine that already runs
-LIBERO, and let the engine host be inference-only — the production-shaped call
-pattern (robot/sim on one end, engine on the other).
-
-```bash
-# server host: start with --host 0.0.0.0 (see §2)
-# x86 client (its own LIBERO env):
-python scripts/eval_pi05_libero_openpi.py \
-    --host <server-host> --port 8000 --precision bf16 \
-    --task-ids 0,1,2,3,4,5,6,7,8,9 --trials-per-task 10 \
-    --results-jsonl out/libero_bf16.jsonl \
-    --summary-json  out/libero_bf16.summary.json
-```
-
-The evaluator is resumable (fsync'd JSONL ledger, skips completed trials on
-rerun); every trial records success / steps / replans and a four-segment timing
-split; the summary rolls up `success_rate` and timing. Key `summary.json`
-fields:
-
-```jsonc
-{
-  "success_rate": 0.87,                 // LIBERO-10 task-level success (accuracy)
-  "per_task": { "0": {"success_rate": ...}, ... },
-  "timing": {
-    "total_inference_calls": 431,       // = total replans
-    "per_call_ms": {                    // mean split per websocket inference call
-      "model_ms": 213.4,                //   bare model (engine)
-      "server_processor_ms": 6.1,       //   server pre/post pipeline
-      "websocket_transport_ms": 4.8,    //   transport + serialization
-      "preprocess_ms": 2.3,             //   client resize+state (not in round-trip)
-      "inference_ms": 224.5             //   round-trip wall clock ≈ sum of the first three
-    }
-  }
-}
-```
-
-> LIBERO is a **Franka Panda 7-DoF** benchmark (7-dim action = 6 EEF deltas + 1
-> gripper), so eval runs the default `--robot franka_libero` preset, which
-> already sets the 2 camera keys and the 7-dim action width. It is a different
-> embodiment from the robots in §5 (e.g. G1) and unrelated to them.
-
-## 5. Port an OpenPI config + processors into apxinf (for your own robot)
-
-Given an **OpenPI fine-tune config + a set of `DataTransformFn` pre/post
-transforms** (e.g. `pi05_UnitreeG1`: 3 cameras, 16-DoF state, `action_dim=32`,
-delta joint actions, with `unitreeG1Inputs` / `unitreeG1Outputs`), you do **not**
-pull any external framework into apxinf. You port those `dict→dict` transforms,
-by semantics, into apxinf `ProcessorStep`s and splice them into the pre/post
-`Pipeline` of `Pi05Policy`.
-
-A working G1 example ships in-tree — copy and adapt it:
-
-```
-python/apxinf/apxinf/processors/robots/unitree_g1.py   # robot-specific ProcessorSteps
-python/apxinf/apxinf/robots/unitree_g1.py              # build_unitree_g1_policy factory
-python/apxinf/apxinf/conventions.py                    # the G1 client's wire keys
-```
-
-### 5.1 Two landing spots
-
-| Layer | Where | What |
+| OpenPI transform | ApxInf equivalent | Note |
 |---|---|---|
-| **robot-specific step** (pure numpy, per-embodiment, model-agnostic) | `python/apxinf/apxinf/processors/robots/<robot>.py` | `ProcessorStep` subclasses: decode-state / delta→absolute / encode-actions |
-| **assembly factory** (wires the steps onto `Pi05Policy`) | `python/apxinf/apxinf/robots/<robot>.py` | a `build_<robot>_policy(...)` that rewrites the pre/post pipelines after `from_pretrained` |
-| **recording convention** (the wire keys your client sends) | `python/apxinf/apxinf/conventions.py` | a `Convention`; it belongs to the *dataset*, so no step and no factory may hardcode it |
-
-### 5.2 OpenPI transform → apxinf equivalent (G1 as the sample)
-
-| OpenPI transform | apxinf equivalent | Note |
-|---|---|---|
-| camera rename + CHW→HWC + float→uint8 | `image_keys` config + existing `ParseImage` | **no new code** — `ParseImage` already does CHW→HWC / float→uint8 |
-| `_decode_state` (joint flip + gripper→angle) | `UnitreeG1DecodeState` (**input** step, before `tokenize`) | so both discretized state and delta→absolute see decoded state |
+| camera rename + CHW→HWC + float→uint8 | `image_keys=` config + existing `ParseImage` | **no new code** — `ParseImage` already does CHW→HWC / float→uint8 |
+| `_decode_state` (joint flip + gripper→angle) | a `DecodeState` **input** step, before `tokenize` | so both discretized state and delta→absolute see decoded state |
 | 32-dim unnormalize | existing `Unnormalize` (**full model width**) | full-width so delta→absolute sees the complete action |
-| `AbsoluteActions` (delta→absolute, needs state) | `UnitreeG1AbsoluteActions` (**output** step) | adds current state on masked joint dims; gripper dims pass through |
-| `unitreeG1Outputs` 32→16 + flip + gripper | `UnitreeG1EncodeActions` (**output** step) | trim to robot dims, apply flip, invert gripper map |
+| `AbsoluteActions` (delta→absolute, needs state) | an `AbsoluteActions` **output** step | adds current state on masked joint dims; gripper dims pass through |
+| `myRobotOutputs` 32→16 + flip + gripper | an `EncodeActions` **output** step | trim to robot dims, apply flip, invert gripper map |
 
-> **Not ported**: training-time data-cleaning variants (`_NoLeftCam` /
-> `fixed_hand`) are on the training-data path, not the serving path.
+> **Not ported**: training-time data-cleaning variants are on the training-data
+> path, not the serving path.
 
-### 5.3 Write a ProcessorStep
+### 4.2 Write a ProcessorStep
 
 Narrow contract: `__call__(data) -> data`, mutating the `data` dict in place;
 observation lives under `OBSERVATION`, actions under `ACTIONS` (see
@@ -229,8 +158,8 @@ observation lives under `OBSERVATION`, actions under `ACTIONS` (see
 
 ```python
 import numpy as np
-from ..base import ProcessorStep
-from ..transforms import ACTIONS, OBSERVATION
+from apxinf import ProcessorStep
+from apxinf.processors.transforms import ACTIONS, OBSERVATION
 
 class MyRobotEncodeActions(ProcessorStep):
     """Map absolute pi actions back to robot space: 32->N, flip, gripper."""
@@ -243,29 +172,27 @@ class MyRobotEncodeActions(ProcessorStep):
 
 An input step is analogous: read state from `data[OBSERVATION][state_key]`,
 decode, write back (work on a **shallow copy** — don't mutate the caller's dict).
-Port **placeholder calibration** faithfully as a hook (in G1 the flip mask is all
-`1`, gripper `clip(0,1)` — currently pass-through); fill in real calibration here.
+Port **placeholder calibration** faithfully as a hook rather than silently
+dropping it; fill in real calibration there.
 
-### 5.4 Assemble the pipeline in the factory
+### 4.3 Assemble the pipeline with `with_adapter`
 
 Default pi05 pipelines: input `[image_stack, tokenize]`, output
 `[trim, unnormalize]`. Noise is generated inside the runtime unless the caller
 passes it explicitly; a custom host sampler can still be inserted as a pipeline
 step.
 
-Robot adapters use
-[`ComposablePolicy.with_adapter`](../policies/base.py) to prepend input steps
-and append output steps without depending on model-specific step names. The
-factory loads the full-width policy through `AutoPolicy` and wraps it:
+`with_adapter` prepends input steps and appends output steps — strict onion
+nesting, so an adapter never has to know a model-specific step name. Load the
+full-width policy through `AutoPolicy` and wrap it:
 
 ```python
-from ..policies.auto import AutoPolicy
-from ..policies.base import ComposablePolicy
-from ..processors.robots.my_robot import (
+from apxinf import AutoPolicy, ComposablePolicy
+from my_package.processors import (
     MyRobotDecodeState, MyRobotAbsoluteActions, MyRobotEncodeActions, ROBOT_DIM,
 )
 
-# state_key and image_keys come from the selected Convention (§5.6).
+# state_key and image_keys are the deployment's to name — a dataset fact.
 def build_my_robot_policy(model_dir, *, state_key, image_keys,
                           use_delta_joint_actions=True, adapt_to_pi=True, **kw):
     base = AutoPolicy.from_pretrained(
@@ -304,121 +231,17 @@ output: [trim, unnormalize, absolute, encode]   # normalized[H,32] -> actions[H,
 `trim` is the model's own step at full width (a no-op when `norm_stats` is as
 wide as the model), so `absolute` still sees the whole action.
 
-### 5.5 One general framework hook (built in, nothing to change)
+The wrapped policy is still a `Policy`, so it serves through
+`WebsocketPolicyServer` unchanged and publishes the adapter's `action_dim` and
+`metadata` in the connect-time contract (§3).
+
+### 4.4 One framework hook (built in, nothing to change)
 
 The delta→absolute output step needs to see the **input state**.
 `Pi05Policy.infer` already passes the (decoded) observation into the output
 pipeline; the stock `trim`/`unnormalize` ignore it, so existing numbers are
 unchanged (matching OpenPI's "output transforms can see input state" semantics).
 
-### 5.6 Register a preset (the last step — do not skip it)
-
-A factory alone is not deployable: whoever launches the server still has to know
-your robot's wire keys, action width, and state routing, and getting any of them
-wrong is silent. Add one entry to
-[`python/apxinf/apxinf/robots/presets.py`](../robots/presets.py) and the whole
-contract becomes `--robot <name>`:
-
-```python
-MY_ROBOT_BODY = Embodiment(                       # the hardware: survives a re-record
-    name="my_robot",
-    num_cameras=2,
-    action_dim=None,                              # None: the encode step trims
-    builder=build_my_robot_policy,
-    builder_kwargs={"use_delta_joint_actions": True, "adapt_to_pi": True},
-)
-
-# In apxinf/conventions.py — the dataset dialect: survives a re-body.
-MY_ROBOT_KEYS = Convention(
-    name="my_dataset",
-    image_keys=("images/cam_high", "images/cam_left_wrist"),  # in model view-slot order
-    state_key="state",
-    discrete_state=True,                          # False *drops* state entirely
-)
-
-MY_ROBOT = RobotPreset(
-    name="my_robot",                              # <arm>_<key convention> if the arm is shared
-    embodiment=MY_ROBOT_BODY,
-    convention=MY_ROBOT_KEYS,
-    summary="My robot: 2 cameras, 14-DoF state, delta joint actions",
-)
-
-ROBOT_PRESETS = {p.name: p for p in (FRANKA_LIBERO, UNITREE_G1, MY_ROBOT)}
-```
-
-An `Embodiment` defines the robot body and processing requirements. A
-`Convention` defines dataset wire keys and state routing. `RobotPreset` registers
-a supported pairing, which is selected with `--robot`.
-
-For a robot implemented in another package, register the convention and preset
-when that package is imported:
-
-```python
-from apxinf import Convention, Embodiment, RobotPreset
-from apxinf import register_convention, register_robot_preset
-
-MY_KEYS = register_convention(Convention(name="my_dataset", ...))
-MY_ROBOT = register_robot_preset(
-    RobotPreset(name="myarm_my_dataset", embodiment=MY_ARM, convention=MY_KEYS),
-    aliases=("myarm",),
-)
-```
-
-Re-registering a name requires `replace=True`; aliases cannot shadow canonical
-preset names. Registration is process-local, so `--robot` sees presets from
-modules imported by the server process.
-
-`image_keys` is order-significant: entry *i* becomes model view slot *i*
-(`base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb`). `preset.slots` renders this
-pairing for logs. Registration validates duplicate keys, view-count limits, and
-agreement between the convention and embodiment camera counts.
-
-Wire keys may be written **flat** (`"observation/image"` — the slash is part of
-the name, as LIBERO and DROID send it) or as a **nested path**
-(`"images/cam_high"` → `obs["images"]["cam_high"]`, as ALOHA and G1 send it). A
-flat hit always wins, so both layouts work from one tuple and an unmodified
-upstream client needs no changes.
-
-The preset's contract is published in the served metadata (§3) and printed at
-startup, so a client can assert it.
-
-### 5.7 Use and verify
-
-```python
-from apxinf import build_unitree_g1_policy          # shipped G1 example
-from apxinf.conventions import UNITREE_G1 as G1_KEYS
-
-policy = build_unitree_g1_policy(
-    "<g1-ckpt>",
-    state_key=G1_KEYS.state_key,                    # required: a dataset fact, not a body's
-    image_keys=G1_KEYS.image_keys,
-    use_delta_joint_actions=True,
-    adapt_to_pi=True,
-)
-actions = policy.infer(obs)["actions"]               # [H, 16]
-```
-
-Or let the preset table supply both, which is what the server does:
-
-```python
-from apxinf import build_robot_policy
-policy = build_robot_policy("unitree_g1", "<g1-ckpt>")
-```
-
-Served the same way, once §5.6 is done:
-
-```bash
-python scripts/pi05_openpi_websocket_server.py --model-dir <g1-ckpt> --robot unitree_g1
-```
-
-Smoke test (plumbing/shape): [scripts/g1_adapter_smoke.py](../../../../scripts/g1_adapter_smoke.py)
-feeds a G1-shaped observation (3 cameras uint8 HWC + 16-dim state + prompt)
-through the whole chain and asserts the output is `[H,16]`, finite, gripper dims
-∈ [0,1]. **Without real weights / norm_stats** the unnormalize degrades to a
-full-width identity — that proves the config runs end-to-end through the apxinf
-interface (compatibility), not executable numbers. For real values, supply the
-robot's `norm_stats` (≥ROBOT_DIM wide) + real gripper limits + checkpoint; the
-**same adapter code runs unchanged**.
 # WallOSS
 
 WallOSS uses the same model-agnostic websocket transport as PI0.5. Install the
@@ -435,6 +258,8 @@ from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
     "/path/to/wall-oss-0.5", norm_key="x2_normal", action_dim=7,
+    image_keys=("observation/image", "observation/wrist_image"),
+    state_key="observation/state",
 )
 result = policy.infer({
     "observation/image": base_rgb_uint8,
@@ -451,6 +276,8 @@ To expose the same policy over WebSocket:
 python python/apxinf/examples/openpi_server.py \
   --model-dir /path/to/wall-oss-0.5 \
   --action-dim 7 \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state \
   --policy-options '{"norm_key":"x2_normal"}'
 ```
 
@@ -458,7 +285,6 @@ Add `"tactics":"/path/to/tactics.json"` to `--policy-options` to override a
 checkpoint-local tuning database, for example after generating tactics for a
 newer kernel build.
 
-Requests contain `observation/image`, `observation/wrist_image`,
-`observation/state`, and `prompt`. Images are RGB `uint8`; the policy owns the
-Qwen2.5-VL resize/patch/token preprocessing and returns an `[10, action_dim]`
-action chunk through the normal OpenPI-compatible `actions` response.
+Images are RGB `uint8`; the policy owns the Qwen2.5-VL resize/patch/token
+preprocessing and returns an `[10, action_dim]` action chunk through the normal
+OpenPI-compatible `actions` response.

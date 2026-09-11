@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Thin CLI launcher for the OpenPI-compatible π0.5 websocket service.
+"""Full-surface CLI launcher for the OpenPI-compatible π0.5 websocket service.
 
 All reusable logic lives in the library: the transport shell in
-:mod:`apxinf.serving`, the policy in :mod:`apxinf` (``AutoPolicy`` /
-``Pi05Policy``), and the per-embodiment wire contract in
-:mod:`apxinf.robots.presets`. This file is only argument parsing + wiring — load
-an **in-process** policy through the ``apxinf_py`` PyO3 binding and serve it.
+:mod:`apxinf.serving` and the policy in :mod:`apxinf` (``AutoPolicy`` /
+``Pi05Policy``). This file is only argument parsing + wiring — load an
+**in-process** policy through the ``apxinf_py`` PyO3 binding and serve it.
 
-**Embodiment:** ``--robot`` selects the wire keys and the robot pre/post steps,
-the way openpi's ``serve_policy.py --policy.config <TrainConfig>`` does. It
-defaults to ``franka_libero``; a checkpoint fine-tuned for another robot **must**
-name it, because the wire keys, the state routing, and the action encoding all
-differ and a mismatch degrades silently rather than failing. ``--image-keys`` /
-``--state-key`` override individual fields for a client that already speaks a
-fixed dialect.
+``examples/openpi_server.py`` is the same thing in twenty lines, and is the right
+place to start reading. This launcher exists for the engine-domain knobs that
+example deliberately omits: ``--random-weights`` (serve with no checkpoint at
+all, to time the engine), ``--calibration`` and ``--autotune`` (FP8 activation
+scales and GEMM tactic tuning), ``--norm-stats`` / ``--norm-key`` / ``--asset-id``
+/ ``--ckpt-format`` (say which statistics and which layout to read when a
+directory is ambiguous), ``--num-views``, and ``--discrete-state``. Every one of
+those is a property of the *checkpoint or the engine*, not of a robot, which is
+why they live here rather than downstream.
 
-**State:** each preset decides whether ``state`` is injected (discretized into
-the prompt, normalized to [-1, 1] from ``norm_stats``) or dropped —
-``--discrete-state`` / ``--no-discrete-state`` override it. ``franka_libero``
-drops state; a joint-space robot needs it.
+**Wire keys are yours to name.** ``--image-keys`` / ``--state-key`` say what your
+client sends; omit them and the policy falls back to its own view-slot vocabulary
+(``base_0_rgb``, ``left_wrist_0_rgb``, ...), which is a neutral fallback rather
+than a contract. Binding those keys, the action width and the pre/post steps
+together into a *named* robot contract, and cross-checking it against the
+checkpoint, is a layer above this server rather than part of it.
+
+**State** is dropped unless ``--discrete-state`` is passed, which discretizes it
+into the prompt (normalized to [-1, 1] from ``norm_stats``) and then makes
+``--state-key`` mandatory: there is no dataset-neutral name to guess, and
+guessing one loses proprioception in silence.
 
 **Images are RGB.** Neither this server nor openpi converts colour: an
 ``H×W×3`` uint8 array is taken as RGB as-is. A client reading frames with
@@ -42,19 +50,17 @@ _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
 if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
-from apxinf import Pi05Policy  # noqa: E402
+from apxinf import AutoPolicy, Pi05Policy  # noqa: E402
 from apxinf.checkpoints import FORMATS as CHECKPOINT_FORMATS  # noqa: E402
-from apxinf.robots.preflight import FAIL, WARN, check_checkpoint, format_findings  # noqa: E402
-from apxinf.robots.presets import (  # noqa: E402
-    ROBOT_PRESETS,
-    available_robots,
-    build_robot_policy,
-    get_robot_preset,
+from apxinf.checkpoints.preflight import (  # noqa: E402
+    FAIL,
+    WARN,
+    format_findings,
+    inspect_checkpoint,
+    sort_findings,
 )
 from apxinf.serving import WebsocketPolicyServer  # noqa: E402
 from apxinf._tactics import resolve_pi05_tactics  # noqa: E402
-
-DEFAULT_ROBOT = "franka_libero"
 
 
 def _split_keys(value: str) -> tuple:
@@ -65,45 +71,34 @@ def _split_keys(value: str) -> tuple:
 
 
 def parse_args() -> argparse.Namespace:
-    robot_help = "\n".join(f"  {p.describe()}" for p in ROBOT_PRESETS.values())
     parser = argparse.ArgumentParser(
         description="Serve a ApxInf PI0.5 policy through OpenPI's websocket API "
         "(in-process; no subprocess)",
-        epilog=f"robot presets (--robot):\n{robot_help}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--model-dir", type=pathlib.Path, help="checkpoint directory")
     parser.add_argument(
-        "--robot",
-        choices=available_robots(include_aliases=True),
-        default=DEFAULT_ROBOT,
-        help="embodiment preset: wire keys + robot pre/post steps + action width "
-        f"(default: {DEFAULT_ROBOT}). openpi's --policy.config equivalent; a "
-        "checkpoint fine-tuned for another robot must name it. Presets are named "
-        "<arm>_<key convention>, since the arm alone does not fix the contract.",
-    )
-    parser.add_argument(
         "--image-keys",
         type=_split_keys,
         default=None,
-        help="comma-separated camera wire keys, overriding the preset. Order is "
-        "significant: key i fills model view slot i (base, left wrist, right "
-        "wrist). Nested client layouts are written as a path, e.g. "
-        "'images/cam_high,images/cam_left_wrist'.",
+        help="comma-separated camera wire keys. Order is significant: key i fills "
+        "model view slot i (base, left wrist, right wrist). Nested client layouts "
+        "are written as a path, e.g. 'images/cam_high,images/cam_left_wrist'. "
+        "Omitted, the policy names them after its own view slots.",
     )
     parser.add_argument(
         "--state-key",
         default=None,
-        help="observation key holding the state vector, overriding the preset",
+        help="observation key holding the state vector; required with --discrete-state",
     )
     parser.add_argument(
         "--random-weights",
         action="store_true",
         help="serve a checkpoint-free engine with deterministic random weights and "
         "synthetic processors (latency-only; actions are numerically meaningless). "
-        "Reproduces --robot's wire keys and view count but not its robot pre/post "
-        "steps, which need a checkpoint; the served metadata says robot_steps=false "
-        "and startup warns per gap. No --model-dir needed.",
+        "The wire keys and view count are real; the tokenizer emits a fixed token "
+        "stream and never reads state, and the unnormalizer is the identity map. "
+        "No --model-dir needed.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -166,8 +161,8 @@ def parse_args() -> argparse.Namespace:
         "--action-dim",
         type=int,
         default=None,
-        help="deployable action width to trim to, overriding the preset "
-        "(LIBERO=7; 0 keeps the full vector)",
+        help="deployable action width to trim the checkpoint's action transform to "
+        "(LIBERO=7; 0 or omitted keeps the full vector)",
     )
     parser.add_argument("--norm-key", default="actions")
     parser.add_argument(
@@ -187,8 +182,9 @@ def parse_args() -> argparse.Namespace:
         "number of image keys). Drops the trailing view slots at load time — "
         "equivalent to openpi zero-padding and masking them, minus their patch "
         "tokens. Required to be explicit: a short image_keys list on its own is "
-        "an error, so a forgotten camera fails instead of degrading. Also sets "
-        "the synthetic view count under --random-weights.",
+        "an error, so a forgotten camera fails instead of degrading. Under "
+        "--random-weights it also sets the synthetic view count, and is required "
+        "there when --image-keys is not given.",
     )
     # Synthetic-shape knobs, used only with --random-weights (a checkpoint runs its
     # native config). They mirror apxinf_py.Model.random.
@@ -202,14 +198,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=None,
         help="inject discretized state into the prompt (state normalized to "
-        "[-1, 1] from norm_stats), overriding the preset. Without it state is "
-        "silently dropped — a joint-space robot needs this on.",
+        "[-1, 1] from norm_stats). Without it state is dropped, so a joint-space "
+        "robot needs this on — and with it --state-key becomes mandatory.",
     )
     parser.add_argument(
         "--no-discrete-state",
         dest="discrete_state",
         action="store_false",
-        help="drop state even if the preset injects it",
+        help="drop state explicitly (the default, stated for symmetry)",
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
@@ -229,21 +225,26 @@ def main() -> None:
     if args.random_weights and args.model_dir is not None:
         raise ValueError("--random-weights is checkpoint-free; do not also pass --model-dir")
 
-    preset = get_robot_preset(args.robot)
-    image_keys = args.image_keys if args.image_keys is not None else preset.image_keys
-    state_key = args.state_key if args.state_key is not None else preset.state_key
-    discrete_state = preset.discrete_state if args.discrete_state is None else args.discrete_state
-    if args.num_views is not None and args.num_views != len(image_keys):
-        raise ValueError(
-            f"--num-views {args.num_views} disagrees with the {len(image_keys)} "
-            f"camera keys being served ({list(image_keys)}); they name the same "
-            "cameras, so they must match"
-        )
+    image_keys = args.image_keys
+    state_key = args.state_key
+    discrete_state = bool(args.discrete_state)
+    if args.num_views is not None and image_keys is not None:
+        if args.num_views != len(image_keys):
+            raise ValueError(
+                f"--num-views {args.num_views} disagrees with the {len(image_keys)} "
+                f"camera keys being served ({list(image_keys)}); they name the same "
+                "cameras, so they must match"
+            )
+    if discrete_state and state_key is None:
+        # Caught here rather than inside the policy so the message names the flag
+        # the operator actually typed. State that is read but never addressed is
+        # not an error anywhere downstream — it is simply absent from the prompt.
+        raise ValueError("--discrete-state reads state; name its wire key with --state-key")
 
     metadata = {
         "protocol": "openpi.websocket_policy",
         "precision": args.precision,
-        "policy": preset.name,
+        "policy": "pi05",
         "autotune": args.autotune,
     }
     if args.random_weights:
@@ -265,32 +266,29 @@ def main() -> None:
         if args.precision == "fp8":
             calibration = str(args.calibration) if args.calibration is not None else "uniform:1.0"
         action_horizon = args.action_horizon if args.action_horizon is not None else 50
-        # The preset's cameras define the synthetic view count unless --num-views is
-        # given explicitly, so --robot alone yields a servable synthetic engine.
-        num_views = args.num_views if args.num_views is not None else len(image_keys)
-        # A checkpoint-free engine still serves the preset's *deployable* width, so a
-        # client previews the action shape it will get in production. --action-dim
-        # outranks it (and also sets the synthetic model's own width).
-        model_dim = args.action_dim or 32
-        trim_dim = args.action_dim if args.action_dim is not None else preset.action_dim
-        served_dim = trim_dim or model_dim
-        # The synthetic path reproduces the preset's wire keys and view count and
-        # nothing else: the tokenizer emits a fixed token stream and never reads
-        # state, and preset.builder never runs. The published metadata is the wire
-        # contract, so name every gap and mark robot_steps=False below — silently
-        # serving half an embodiment under its own name is precisely the mismatch
-        # --robot exists to prevent.
-        gaps = preset.synthetic_gaps(
-            discrete_state=discrete_state, served_action_dim=served_dim
-        )
-        if gaps:
-            logging.warning(
-                "--random-weights cannot honour %s: %s. The wire keys and view count "
-                "are real; the action semantics are not. Use a checkpoint to preview "
-                "the full contract.",
-                preset.name,
-                "; ".join(gaps),
+        # There is no checkpoint to read a camera count off, so it has to be said:
+        # either name the keys and the count follows, or state the count and the
+        # policy names the slots itself. Defaulting would silently time the wrong
+        # number of vision towers, which is the one number this mode exists to time.
+        if args.num_views is not None:
+            num_views = args.num_views
+        elif image_keys is not None:
+            num_views = len(image_keys)
+        else:
+            raise ValueError(
+                "--random-weights has no checkpoint to read a view count from; "
+                "pass --num-views, or --image-keys and it follows"
             )
+        # --action-dim sets both the synthetic model's own width and the width it
+        # trims to; without it the model is 32-wide and nothing is trimmed.
+        model_dim = args.action_dim or 32
+        trim_dim = args.action_dim
+        logging.warning(
+            "--random-weights serves real wire keys and a real view count and "
+            "nothing else: the tokenizer emits a fixed token stream and never "
+            "reads state, and the unnormalizer is the identity map. The actions "
+            "are latency-only. Use a checkpoint to preview the full contract."
+        )
         logging.info(
             "serving checkpoint-free %s random-weights engine (views=%d, H=%d, T=%d) "
             "— actions are latency-only",
@@ -319,28 +317,27 @@ def main() -> None:
             token_count=args.token_count,
             action_dim=(trim_dim or None),
             seed=args.seed,
-            image_keys=image_keys[:num_views],
+            image_keys=(image_keys[:num_views] if image_keys is not None else None),
             state_key=state_key,
-            metadata={**metadata, "robot": preset.name, "robot_steps": False},
+            metadata=metadata,
         )
     else:
-        # Validate checkpoint and embodiment metadata before loading weights.
-        findings = check_checkpoint(
+        # Read what the checkpoint says about itself before any weight is loaded:
+        # an unreadable layout or missing statistics should cost a second, not a
+        # multi-gigabyte load followed by a failure deep in the pipeline.
+        report = inspect_checkpoint(
             args.model_dir,
-            preset.name,
             norm_key=args.norm_key,
-            discrete_state=discrete_state,
-            image_keys=image_keys,
-            action_dim=args.action_dim,
+            state_norm_key=("state" if discrete_state else None),
             tokenizer_path=args.tokenizer,
             checkpoint_format=args.ckpt_format,
             asset_id=args.asset_id,
             norm_stats=args.norm_stats,
         )
-        fatal = [f for f in findings if f.level == FAIL]
-        if fatal:
+        findings = sort_findings(report.findings)
+        if any(finding.level == FAIL for finding in findings):
             raise SystemExit(
-                f"preflight: {args.model_dir} does not match --robot {preset.name}\n"
+                f"preflight: {args.model_dir} cannot be served as configured\n"
                 + format_findings(findings, include_info=False)
             )
         for finding in findings:
@@ -349,46 +346,42 @@ def main() -> None:
             )
             logging.log(level, "preflight %s", finding)
 
-        logging.info(
-            "loading %s policy in-process from %s as robot=%s",
-            args.precision,
-            args.model_dir,
-            preset.describe(),
-        )
-        policy = build_robot_policy(
-            preset.name,
-            args.model_dir,
-            image_keys=image_keys,
-            state_key=state_key,
-            discrete_state=discrete_state,
-            action_dim=args.action_dim,
-            num_views=args.num_views,
-            model_type=args.model_type,
-            checkpoint=args.checkpoint,
-            device=args.device,
-            precision=args.precision,
-            calibration=args.calibration,
-            tactics=args.tactics,
-            autotune=args.autotune,
-            tokenizer_path=args.tokenizer,
-            checkpoint_format=args.ckpt_format,
-            asset_id=args.asset_id,
-            norm_stats=args.norm_stats,
-            norm_key=args.norm_key,
-            action_horizon=args.action_horizon,
-            seed=args.seed,
-            metadata=metadata,
-        )
+        logging.info("loading %s policy in-process from %s", args.precision, args.model_dir)
+        options = {
+            "model_type": args.model_type,
+            "checkpoint": args.checkpoint,
+            "device": args.device,
+            "precision": args.precision,
+            "calibration": args.calibration,
+            "tactics": args.tactics,
+            "autotune": args.autotune,
+            "tokenizer_path": args.tokenizer,
+            "checkpoint_format": args.ckpt_format,
+            "asset_id": args.asset_id,
+            "norm_stats": args.norm_stats,
+            "norm_key": args.norm_key,
+            "action_horizon": args.action_horizon,
+            "num_views": args.num_views,
+            "action_dim": (args.action_dim or None),
+            "discrete_state": discrete_state,
+            "seed": args.seed,
+            "metadata": metadata,
+        }
+        # Omitted keys keep the policy's own fallback (view-slot image keys, no
+        # state key), which is not the same as passing None: passing None would
+        # be this launcher asserting a dialect it was never told.
+        if image_keys is not None:
+            options["image_keys"] = image_keys
+        if state_key is not None:
+            options["state_key"] = state_key
+        policy = AutoPolicy.from_pretrained(args.model_dir, **options)
     # Clients read the served wire contract off this metadata rather than assuming
     # one: a key mismatch is silent on the wire but visible here. A null state_key
     # is not a gap — it says this policy drops state, so there is no key to send
     # one under; rendered as "(dropped)" so the log line cannot read as an omission.
     served_state_key = policy.metadata["state_key"]
     logging.info(
-        "serving robot=%s robot_steps=%s H=%d x D=%d image_keys=%s state=%s "
-        "discrete_state=%s",
-        policy.metadata.get("robot", preset.name),
-        policy.metadata.get("robot_steps"),
+        "serving H=%d x D=%d image_keys=%s state=%s discrete_state=%s",
         policy.metadata["action_horizon"],
         policy.metadata["action_dim"],
         policy.metadata["image_keys"],

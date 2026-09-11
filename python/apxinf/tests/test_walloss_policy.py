@@ -106,8 +106,11 @@ def test_autopolicy_detects_walloss_checkpoint_signature(tmp_path, monkeypatch):
     assert kwargs == {"precision": "bf16"}
 
 
-def test_franka_libero_preset_builds_walloss_policy(tmp_path, monkeypatch):
-    from apxinf import build_robot_policy
+def test_caller_supplied_wire_keys_reach_the_published_metadata(tmp_path, monkeypatch):
+    # The engine names no dataset's keys, so a deployment states its own. What is
+    # worth checking here is that they survive the trip: the policy publishes the
+    # keys it will actually read, and a narrowed action_dim narrows the map too.
+    from apxinf import WallossPolicy
     from apxinf.policies.impls import walloss
 
     (tmp_path / "config.json").write_text(
@@ -133,13 +136,14 @@ def test_franka_libero_preset_builds_walloss_policy(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(walloss, "_WallossProcessor", lambda *args, **kwargs: processor)
 
-    policy = build_robot_policy(
-        "franka_libero",
+    policy = WallossPolicy.from_pretrained(
         tmp_path,
         model=_FakeModel(),
+        image_keys=("observation/image", "observation/wrist_image"),
+        state_key="observation/state",
+        action_dim=7,
     )
 
-    assert policy.metadata["robot"] == "franka_libero"
     assert policy.metadata["image_keys"] == [
         "observation/image",
         "observation/wrist_image",
