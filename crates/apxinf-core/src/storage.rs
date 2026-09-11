@@ -17,18 +17,54 @@ pub enum Storage {
     },
 }
 
-/// Opaque handle to GPU memory. `apxinf-cuda` constructs these and stores its
-/// owning buffer in `_prevent_leak` so that
-/// device memory is freed when all references are dropped.
+/// Opaque handle to GPU memory. CUDA backends construct these and retain the
+/// owning allocation so device memory stays live while the tensor is live.
+///
+/// The public fields are retained during the `apxinf-cuda-new` migration so
+/// the existing CUDA backend keeps building unchanged. New backends should use
+/// [`GpuStorageHandle::from_raw_parts`] and the accessor methods instead.
 #[derive(Clone)]
 pub struct GpuStorageHandle {
-    /// Raw CUDA device pointer, cast to usize.
+    /// Raw CUDA device pointer, cast to `usize`.
     pub ptr: usize,
     /// Total allocated bytes on device.
     pub len: usize,
-    /// Holds the owning backend buffer (for example, `Arc<CudaBuffer>`)
-    /// so that Drop frees GPU memory automatically.
+    /// Retains the backend allocation owner until the last handle is dropped.
     pub _prevent_leak: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl GpuStorageHandle {
+    /// Construct a handle for a backend-owned GPU allocation.
+    ///
+    /// # Safety
+    ///
+    /// For every non-empty handle, `ptr..ptr + len` must be a valid device
+    /// allocation on the declared [`Device`] for as long as `owner` is alive.
+    /// The range must not wrap around the address space. Backends must retain
+    /// an owner that releases the allocation only after the last handle drops.
+    pub unsafe fn from_raw_parts(
+        ptr: usize,
+        len: usize,
+        owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            _prevent_leak: owner,
+        }
+    }
+
+    pub fn ptr(&self) -> usize {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn owner(&self) -> Option<&Arc<dyn std::any::Any + Send + Sync>> {
+        self._prevent_leak.as_ref()
+    }
 }
 
 impl std::fmt::Debug for GpuStorageHandle {

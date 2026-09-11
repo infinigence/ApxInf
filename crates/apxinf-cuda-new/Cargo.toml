@@ -1,0 +1,18 @@
+[package]
+name = "apxinf-cuda"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+build = "build.rs"
+
+[features]
+default = []
+# Kept as an empty Cargo capability because the enclosing workspace maps its
+# top-level `cuda` feature to `apxinf-cuda/nvtx`.
+nvtx = []
+
+[dependencies]
+apxinf-core = { path = "../apxinf-core", features = ["quantized-dtypes"] }
+
+[dev-dependencies]
+half = { version = "2", features = ["bytemuck"] }
