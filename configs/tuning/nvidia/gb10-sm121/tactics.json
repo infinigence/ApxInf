@@ -1,0 +1,960 @@
+{
+  "cublas_version": "13.1",
+  "cuda_version": "13.0",
+  "device_name": "NVIDIA GB10",
+  "kernel_build_id": "kb1-be4aa1097f95160a9a1aeaa382eae5d8",
+  "records": [
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 1,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.018173440247774123,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 5,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 1,
+        "n": 3072,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.03659263923764229,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 10,
+        "n": 32,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.00994431994855404,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 3,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 32,
+        "layout": "row_major",
+        "m": 10,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.005854720007628203,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 10,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.0305318396538496,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 4096,
+        "layout": "row_major",
+        "m": 10,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.05007615983486176,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 10,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.03422975957393646,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 2,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 10,
+        "n": 8192,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.11166975855827332,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 3,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "geglu",
+        "k": 1024,
+        "layout": "row_major",
+        "m": 10,
+        "n": 8192,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.12814080029726027,
+      "tactic": {
+        "backend": "gemm_then_geglu",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 588,
+        "layout": "row_major",
+        "m": 512,
+        "n": 1152,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.02428032048046589,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "row_major",
+        "m": 512,
+        "n": 1152,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.030795520544052123,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 4304,
+        "layout": "row_major",
+        "m": 512,
+        "n": 1152,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.10843263745307924,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "row_major",
+        "m": 512,
+        "n": 2048,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.045745919197797774,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "row_major",
+        "m": 512,
+        "n": 3456,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.07972096264362336,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "row_major",
+        "m": 512,
+        "n": 4304,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.09993984192609788,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 522,
+        "n": 2048,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.08510079711675644,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 1,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 16384,
+        "layout": "row_major",
+        "m": 522,
+        "n": 2048,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.40965760111808774,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 522,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.107804157435894,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 522,
+        "n": 32768,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.8993433594703675,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "geglu",
+        "k": 2048,
+        "layout": "row_major",
+        "m": 522,
+        "n": 32768,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 1.1152153539657592,
+      "tactic": {
+        "backend": "gemm_then_geglu",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "weight_output_major",
+        "m": 1,
+        "n": 1024,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.00983679998666048,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "weight_output_major",
+        "m": 1,
+        "n": 3072,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.011882240064442155,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 32,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.00985600009560585,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 32,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 1024,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.009803520068526268,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 1024,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.01751807987689972,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 4096,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 1024,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.02543743997812271,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 2560,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.02015744000673294,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1024,
+        "layout": "weight_output_major",
+        "m": 10,
+        "n": 8192,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.04504192024469376,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 588,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 1152,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.02494592003524303,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 1152,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.02683135971426964,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 4304,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 1152,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.0699340796470642,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 2048,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.03558783978223801,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 3456,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.06361088186502456,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 1152,
+        "layout": "weight_output_major",
+        "m": 512,
+        "n": 4304,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.08354048132896423,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "weight_output_major",
+        "m": 522,
+        "n": 2048,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.04975104033946991,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 16384,
+        "layout": "weight_output_major",
+        "m": 522,
+        "n": 2048,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.43938687920570374,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "weight_output_major",
+        "m": 522,
+        "n": 2560,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.06442112177610397,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "i8",
+        "device": {
+          "multiprocessor_count": 48,
+          "sm": 121
+        },
+        "epilogue": "none",
+        "k": 2048,
+        "layout": "weight_output_major",
+        "m": 522,
+        "n": 32768,
+        "op": "w8a8",
+        "output_dtype": "bf16",
+        "scale_mode": "dynamic_row_per_output_channel",
+        "weight_dtype": "i8",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 1.1516428756713868,
+      "tactic": {
+        "backend": "vendor",
+        "id": 0,
+        "implementation_version": 1
+      }
+    }
+  ],
+  "schema": "apxinf.cuda.tuning.v1",
+  "sm": 121
+}
