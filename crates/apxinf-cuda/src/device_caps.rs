@@ -76,7 +76,7 @@ impl CudaDeviceCaps {
     pub const fn classify(sm: u32) -> CudaArchFamily {
         match sm {
             80 | 86 | 87 | 89 => CudaArchFamily::Sm80,
-            100 | 101 | 110 | 120 => CudaArchFamily::Sm100,
+            100 | 101 | 110 | 120 | 121 => CudaArchFamily::Sm100,
             other => CudaArchFamily::Other(other),
         }
     }
@@ -101,7 +101,7 @@ mod tests {
         for sm in [80, 86, 87, 89] {
             assert_eq!(CudaDeviceCaps::classify(sm), CudaArchFamily::Sm80);
         }
-        for sm in [100, 101, 110, 120] {
+        for sm in [100, 101, 110, 120, 121] {
             assert_eq!(CudaDeviceCaps::classify(sm), CudaArchFamily::Sm100);
         }
     }
