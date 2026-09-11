@@ -17,8 +17,9 @@ apxinf/
 │   └── impls/        concrete per-model policies (the part that grows)
 │       ├── pi05.py       Pi05Policy (registered as "pi05")
 │       └── walloss.py    WallossPolicy (registered as "walloss")
-├── adapters/     downstream: expose a Policy through a foreign API (lazy imports)
-│   └── lerobot.py   ApxInfPolicy — drop-in policy for a lerobot control loop
+├── checkpoints/  read a checkpoint's layout, norm stats and metadata; the
+│                 `.pth` sidecar reader here is tensor-only (no Torch import)
+├── serving/      the L3 layer — the OpenPI-compatible websocket server
 └── __init__.py   facade: Model (lazy), concrete policies, AutoPolicy, Policy, steps
 ```
 
