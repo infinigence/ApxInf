@@ -36,7 +36,7 @@ def test_explicit_norm_stats_reaches_checkpoint_loader(monkeypatch, tmp_path):
 
     monkeypatch.setattr(AutoPolicy, "from_pretrained", load)
     args = parse(monkeypatch, tmp_path, "--norm-stats", str(stats))
-    eval_libero.InProcessBackend(args)
+    eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
     assert loaded[0].norm_stats == stats
     assert loaded[0].normalization.action.values["q01"] == (2.0,) * 7
 
@@ -49,7 +49,8 @@ def test_omitted_norm_stats_preserves_checkpoint_defaults(monkeypatch, tmp_path)
         return SimpleNamespace(metadata={})
 
     monkeypatch.setattr(AutoPolicy, "from_pretrained", load)
-    eval_libero.InProcessBackend(parse(monkeypatch, tmp_path))
+    args = parse(monkeypatch, tmp_path)
+    eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
     assert "norm_stats" not in options
 
 

@@ -106,7 +106,7 @@ def test_common_policy_options_reject_non_objects(value):
         common.json_object(value)
 
 
-def test_websocket_example_uses_named_robot_builder(monkeypatch, tmp_path):
+def test_websocket_example_passes_caller_named_wire_keys_through(monkeypatch, tmp_path):
     pytest.importorskip("websockets")
     pytest.importorskip("msgpack")
     example = _load_example("openpi_server")
@@ -123,8 +123,8 @@ def test_websocket_example_uses_named_robot_builder(monkeypatch, tmp_path):
         def serve_forever(self):
             captured["served"] = True
 
-    def fake_build(robot, model_dir, **kwargs):
-        captured.update(robot=robot, model_dir=model_dir, kwargs=kwargs)
+    def fake_load(model_dir, **kwargs):
+        captured.update(model_dir=model_dir, kwargs=kwargs)
         return FakePolicy()
 
     monkeypatch.setattr(
@@ -134,24 +134,26 @@ def test_websocket_example_uses_named_robot_builder(monkeypatch, tmp_path):
             model_dir=tmp_path,
             precision="bf16",
             device="cuda:0",
-            robot="franka_libero",
             action_dim=0,
             policy_options={"norm_key": "libero_all"},
+            image_keys="observation/image, observation/wrist_image",
+            state_key="observation/state",
             host="127.0.0.1",
             port=8017,
         ),
     )
-    monkeypatch.setattr(example, "build_robot_policy", fake_build)
+    monkeypatch.setattr(example.AutoPolicy, "from_pretrained", fake_load)
     monkeypatch.setattr(example, "WebsocketPolicyServer", FakeServer)
 
     example.main()
 
-    assert captured["robot"] == "franka_libero"
     assert captured["model_dir"] == tmp_path
     assert captured["kwargs"] == {
         "norm_key": "libero_all",
         "device": "cuda:0",
         "precision": "bf16",
+        "image_keys": ("observation/image", "observation/wrist_image"),
+        "state_key": "observation/state",
         "metadata": {
             "protocol": "openpi.websocket_policy",
             "precision": "bf16",
@@ -163,7 +165,7 @@ def test_websocket_example_uses_named_robot_builder(monkeypatch, tmp_path):
     assert captured["closed"] is True
 
 
-def test_websocket_example_uses_autopolicy_without_robot(monkeypatch, tmp_path):
+def test_websocket_example_leaves_unnamed_keys_to_the_policy(monkeypatch, tmp_path):
     pytest.importorskip("websockets")
     pytest.importorskip("msgpack")
     example = _load_example("openpi_server")
@@ -191,9 +193,10 @@ def test_websocket_example_uses_autopolicy_without_robot(monkeypatch, tmp_path):
             model_dir=tmp_path,
             precision="bf16",
             device="cuda:0",
-            robot=None,
             action_dim=0,
             policy_options={},
+            image_keys=None,
+            state_key=None,
             host="127.0.0.1",
             port=8000,
         ),
@@ -204,6 +207,9 @@ def test_websocket_example_uses_autopolicy_without_robot(monkeypatch, tmp_path):
     example.main()
 
     assert captured["model_dir"] == tmp_path
+    # Nothing invented on the caller's behalf: the policy's own fallback applies.
     assert "action_dim" not in captured["kwargs"]
+    assert "image_keys" not in captured["kwargs"]
+    assert "state_key" not in captured["kwargs"]
     assert captured["served"] is True
     assert captured["closed"] is True

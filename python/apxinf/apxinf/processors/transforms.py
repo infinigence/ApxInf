@@ -136,10 +136,10 @@ class ImageStack(ProcessorStep):
     becomes ``rgb[i]``, which the checkpoint trained as its slot ``i`` (openpi's
     ``base_0_rgb`` / ``left_wrist_0_rgb`` / ``right_wrist_0_rgb``). A wrong order
     stacks cleanly and silently feeds the wrong camera to each slot, so build the
-    tuple from a slot-named preset (:mod:`apxinf.robots.presets`) rather than by
-    hand. Each key is resolved by :func:`lookup_key`, so flat
-    (``"observation/image"``) and nested (``"images/cam_high"``) wire layouts both
-    work.
+    tuple by pairing each wire key with a named slot
+    (:data:`~apxinf.policies.base.VIEW_SLOTS`) rather than by hand. Each key is
+    resolved by :func:`lookup_key`, so flat (``"observation/image"``) and nested
+    (``"images/cam_high"``) wire layouts both work.
     """
 
     def __init__(
@@ -196,8 +196,8 @@ class Tokenize(ProcessorStep):
             raise ValueError(
                 "Tokenize: the tokenizer discretizes state into the prompt but no "
                 "state_key was given, so there is no key to read it from. Name the "
-                "wire key your client sends (see apxinf.conventions), or use a "
-                "tokenizer with discrete_state=False to drop state deliberately."
+                "wire key your client sends, or use a tokenizer with "
+                "discrete_state=False to drop state deliberately."
             )
         self.tokenizer = tokenizer
         self.state_normalizer = state_normalizer

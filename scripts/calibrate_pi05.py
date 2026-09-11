@@ -50,13 +50,16 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         usage=(
             "%(prog)s --model-dir MODEL_DIR "
-            "(--libero-suite libero_10 | --manifest OBSERVATIONS.jsonl | SOURCE) "
-            "[--output PATH]"
+            "(--libero-suite libero_10 | --manifest OBSERVATIONS.jsonl "
+            "| --input-dir DIR | SOURCE) [--output PATH]"
         ),
         description=(
             "Generate a checkpoint-bound PI0.5 FP8 profile from representative "
             "business Observations. Native LIBERO, manifest, and NPZ sources are "
-            "supported."
+            "supported. --libero-suite drives the simulator here and needs LIBERO "
+            "installed; capturing the frames elsewhere and passing --input-dir an "
+            "NPZ directory is the right seam for a deployment that owns its own "
+            "environment."
         ),
     )
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)

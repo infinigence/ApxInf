@@ -2,14 +2,15 @@
 
 Use this guide after the reference model runs and its semantics are understood.
 Follow [the porting workflow](porting-workflow.md) for evidence and acceptance,
+[Model Lifecycle and Contracts](model-lifecycle.md) for stages and data contracts,
 [the model-layer architecture](model-layer-architecture.md) for ownership and
 dependencies, [Model Execution Wiring](model-execution-wiring.md) for composing
 the maintained device path, and [the kernel guide](adding-new-kernels.md) for
-genuine backend gaps. For a VLA,
-[adding an embodiment](adding-an-embodiment.md) covers the
-Python-side serving contract this guide leaves to the policy layer: which
-observation keys a client sends, how state is routed, and how to register a new
-robot.
+genuine backend gaps. For a VLA, the *body* side of deployment — which
+observation keys a client sends, how state is routed, how a named robot fixes
+them together — is not needed to land a model here. A policy registered in
+`apxinf.policies` is servable on its own, with the caller naming its own wire
+keys.
 
 ## Start with a separate model directory
 
@@ -83,9 +84,22 @@ place its state encoder, action decoder, denoising schedule, embodiment logic,
 or workspace inside `pi05/`. A first version may copy PI0.5 runtime or executor
 structure extensively; correctness and isolation are the initial goal.
 
-Python preprocessing, normalization, policy metadata, and action
-postprocessing belong in the Python policy layer. Rust model code receives the
-canonical tensors and owns model structure, weights, and execution.
+Choose the model input seam explicitly. The policy or application adapter owns
+raw observation-container decoding, robot field and camera mapping, resize when
+it is outside the declared model input representation, and experimental or
+user-defined transforms. Policy semantics also stay outside the low-level
+model: prompt and token construction, state/action normalization, action-mask
+construction, and final action postprocessing.
+
+The Rust runtime may accept either already canonical patch tensors or a
+declared intermediate representation such as resized RGB `u8`. When
+`VlaContract` advertises resized RGB support, checkpoint-fixed model tensor
+canonicalization after that seam may belong to the Rust/CUDA runtime. Examples
+include pixel normalization, temporal duplication, patchification, merge
+ordering, layout conversion, and dtype conversion. These operations may be
+prepared and CUDA-graph captured with the model executor. RGB support does not
+make the low-level model responsible for arbitrary image containers, robot
+observation dictionaries, prompt construction, or action unnormalization.
 
 ## Implement by responsibility
 
@@ -153,7 +167,10 @@ Register the loader under stable model identifiers. Ensure the normal
 example binary is not a deployment integration.
 
 Expose Python policy support only after the Rust runtime contract is stable.
-Keep preprocessing and postprocessing outside the low-level runtime.
+Keep application/robot preprocessing and policy-level normalization, prompt,
+mask, and action postprocessing outside the low-level runtime. Checkpoint-fixed
+canonicalization from a declared model representation to model tensors may
+remain inside the runtime as described above.
 
 ## Add static-FP8 calibration
 

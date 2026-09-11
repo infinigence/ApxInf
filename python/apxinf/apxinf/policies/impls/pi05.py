@@ -33,8 +33,8 @@ order. This path does **not** assume the incoming state is already in ``[-1, 1]`
 **This module defines no dataset wire keys.** ``image_keys`` falls back to the
 model's own :data:`~apxinf.policies.base.VIEW_SLOTS`, and ``state_key`` has no
 fallback at all — it is required exactly when state is read and may stay ``None``
-when state is dropped. Wire keys belong to :mod:`apxinf.conventions`; a robot
-preset pairs one with a body.
+when state is dropped. Wire keys belong to the caller: pass ``image_keys=`` /
+``state_key=`` / ``prompt_key=``, or let an outer adaptation layer supply them.
 
 This module registers ``Pi05Policy`` under ``model_type="pi05"`` so
 :class:`~apxinf.policies.auto.AutoPolicy` can dispatch to it.
@@ -68,7 +68,7 @@ from ...checkpoints.descriptor import (
     NormalizationPlan,
     TransformSpec,
 )
-from ..base import VIEW_SLOTS, BareModel
+from ..base import CANONICAL_STATE_KEY, VIEW_SLOTS, BareModel
 from ...processors import (
     GaussianNoise,
     ImageStack,
@@ -211,9 +211,9 @@ class Pi05Policy:
             # tokenizer quietly injects nothing — proprioception lost in silence.
             raise ValueError(
                 "Pi05Policy: this chain discretizes state into the prompt but no "
-                "state_key was given. Name the wire key your client sends (see "
-                "apxinf.conventions, or a robot preset), or build the policy with "
-                "discrete_state=False to drop state deliberately."
+                "state_key was given. Name the wire key your client sends via "
+                "state_key=, or build the policy with discrete_state=False to "
+                "drop state deliberately."
             )
 
         # Kept apart from the derived half so ``with_adapter`` can carry the
@@ -277,7 +277,7 @@ class Pi05Policy:
         Omitting ``image_keys`` names the cameras after the model's own
         :data:`~apxinf.policies.base.VIEW_SLOTS`, because this layer has no
         business guessing anyone's wire keys — see :func:`_default_image_keys`.
-        A real deployment states them, usually via a robot preset.
+        A real deployment states them, usually through an outer adaptation layer.
 
         ``state_key`` has no such fallback and none is possible: there is no
         model-side vocabulary for a state key the way ``VIEW_SLOTS`` is one for
@@ -286,9 +286,8 @@ class Pi05Policy:
         stay ``None`` when state is dropped, in which case nothing looks it up.
 
         A deployment with *fewer* cameras than the checkpoint declares is served
-        by loading with ``num_views=`` (``--num-views`` on the server), which
-        drops the trailing view slots at load time rather than zero-filling them
-        per request.
+        by loading with ``num_views=``, which drops the trailing view slots at
+        load time rather than zero-filling them per request.
         """
         image_keys = tuple(
             image_keys if image_keys is not None else _default_image_keys(model.num_views)
@@ -362,7 +361,7 @@ class Pi05Policy:
         """Build the **default** policy from a checkpoint directory.
 
         This is the from-disk convenience path: it loads the ``apxinf_py`` model
-        (unless one is passed in), builds the SentencePiece tokenizer and the
+        (unless one is passed in), builds the native SentencePiece tokenizer and the
         declared normalization transforms from files under ``model_dir``, assembles the default
         pre/post chains via :meth:`default_pipelines`, and constructs the policy.
         Its many parameters are exactly the knobs for *building processors from
@@ -430,9 +429,9 @@ class Pi05Policy:
             # no key would inject nothing and publish state_key=null.
             raise ValueError(
                 "Pi05Policy.from_pretrained: discrete_state=True needs a state_key — "
-                "the wire key your client sends state under (see apxinf.conventions, "
-                "or use a robot preset via build_robot_policy). Pass "
-                "discrete_state=False to drop state instead."
+                "the wire key your client sends state under (e.g. "
+                f"state_key={CANONICAL_STATE_KEY!r}). Pass discrete_state=False "
+                "to drop state instead."
             )
         if unnormalizer is not None and action_dim is not None and int(action_dim) != unnormalizer.width:
             # Both name the deployable width; an injected map already fixes it, so

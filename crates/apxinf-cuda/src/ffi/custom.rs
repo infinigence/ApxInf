@@ -404,6 +404,24 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        image_size: i32,
+        patch_size: i32,
+        temporal_patch_size: i32,
+        merge_size: i32,
+        layout: i32,
+        rescale_factor: f64,
+        mean0: f32,
+        mean1: f32,
+        mean2: f32,
+        std0: f32,
+        std1: f32,
+        std2: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     /// BF16 bias/activation epilogue. `activation`: 0=identity, 1=GELU-tanh,
     /// 2=SiLU.
     pub fn apxinf_static_bias_activation_bf16(

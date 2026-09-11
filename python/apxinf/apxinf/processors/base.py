@@ -9,7 +9,7 @@ Interfaces:
   ``unnormalizer(action)`` — without a pipeline and without touching the model.
 * :meth:`ProcessorStep.with_overrides` returns a reconfigured *copy* of a step,
   tweaking only the knobs the step advertises in ``PARAMS``. Heavy state (a
-  loaded SentencePiece model) is shared by shallow copy, not rebuilt.
+  loaded native tokenizer) is shared by shallow copy, not rebuilt.
 * :class:`Pipeline` chains named steps left-to-right, threading one value
   through, and supports whole-step replacement and per-step parameter override
   while leaving the other steps untouched. It also composes: ``prepend`` /
