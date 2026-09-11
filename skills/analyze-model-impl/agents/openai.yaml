@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Model Implementation"
+  short_description: "Map model stages through Rust ops to CUDA kernels"
+  default_prompt: "Use $analyze-model-impl to trace the current model implementation and produce tables mapping model computations through Rust operations to the CUDA kernels selected by the active configuration."
