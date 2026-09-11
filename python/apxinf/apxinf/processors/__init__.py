@@ -10,7 +10,7 @@ from __future__ import annotations
 from .base import Pipeline, ProcessorStep
 from .noise import GaussianNoise
 from .normalize import Normalizer, Unnormalizer, load_norm_stats
-from .resize import ParseImage, ResizeWithPad
+from .resize import ParseImage, ResizeWithPad, TorchResizeWithPad
 from .tokenize import PromptTokenizer, SyntheticTokenizer, build_prompt, discretize_state
 from .transforms import ImageStack, SampleNoise, Tokenize, Trim, has_key, lookup_key, set_key
 from .transforms import Unnormalize as UnnormalizeStep
@@ -20,6 +20,7 @@ __all__ = [
     "Pipeline",
     "ParseImage",
     "ResizeWithPad",
+    "TorchResizeWithPad",
     "PromptTokenizer",
     "SyntheticTokenizer",
     "build_prompt",

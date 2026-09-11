@@ -176,6 +176,24 @@ impl LoadedModel {
         self.vla()?.infer_host_f32(request)
     }
 
+    /// Discrete action-token output shape, for autoregressive token VLAs.
+    ///
+    /// `None` means the loaded runtime emits continuous actions only.
+    pub fn action_token_shape(&self) -> Result<Option<[usize; 2]>> {
+        Ok(self.vla()?.action_token_shape())
+    }
+
+    /// Run VLA inference and return the raw discrete action tokens, for
+    /// autoregressive token VLAs only. `stop_token` ends the decode early (see
+    /// [`VlaRuntime::infer_action_tokens`]).
+    pub fn infer_action_tokens(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+    ) -> Result<Tensor> {
+        self.vla()?.infer_action_tokens(request, stop_token)
+    }
+
     pub fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         self.vla()?.calibration_amax(request)
     }

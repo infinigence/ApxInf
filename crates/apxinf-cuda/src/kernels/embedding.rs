@@ -173,6 +173,50 @@ pub fn add_position_bf16(
     }
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
+/// FP32 projection with bias and a learned per-view position embedding,
+/// rounded to BF16.
+///
+/// PaliGemma's SigLIP `embeddings` block runs in FP32; the BF16 encoder only
+/// sees the rounded sum. Reproducing that split is required for π0-FAST,
+/// because rounding the patch projection to BF16 flips action tokens.
+pub fn add_position_f32_bf16(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    position: &Tensor,
+    tokens_per_view: usize,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(projection, "position embedding")?;
+    let position_dims = position.shape().dims();
+    let position_ok =
+        position_dims == [tokens_per_view, cols] || position_dims == [1, tokens_per_view, cols];
+    if projection.dtype() != DType::F32
+        || position.dtype() != DType::F32
+        || !position_ok
+        || rows % tokens_per_view != 0
+        || bias.is_some_and(|value| value.dtype() != DType::F32 || value.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "static inference FP32 position embedding shape mismatch".into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_position_f32_bf16(
+            gpu_ptr(projection)?,
+            optional_ptr(bias)?,
+            gpu_ptr(position)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            tokens_per_view as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
 /// PaliGemma input embedding, including the required `sqrt(hidden_size)`
 /// normalization from OpenPI's `Embedder.encode`.
 pub fn lookup_f16(

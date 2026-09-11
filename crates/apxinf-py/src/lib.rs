@@ -30,15 +30,15 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use numpy::ndarray::Array2;
+use numpy::ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use apxinf_core::{Device, RngKey, Shape, Tensor};
+use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
     SyntheticWeights, VisionObservation, VlaContract, VlaRequest,
@@ -119,6 +119,8 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
 pub struct Model {
     model: LoadedModel,
     contract: VlaContract,
+    /// `Some` for autoregressive token VLAs (π0-FAST); `None` for continuous ones.
+    action_tokens: Option<[usize; 2]>,
     device: Device,
     sampling_seed: Cell<u64>,
     sampling_draw: Cell<u64>,
@@ -352,10 +354,13 @@ impl Model {
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
-        let contract = loaded.vla().map_err(runtime_err)?.contract();
+        let vla = loaded.vla().map_err(runtime_err)?;
+        let contract = vla.contract();
+        let action_tokens = vla.action_token_shape();
         Ok(Self {
             model: loaded,
             contract,
+            action_tokens,
             device,
             sampling_seed: Cell::new(sampling_seed),
             sampling_draw: Cell::new(0),
@@ -453,10 +458,13 @@ impl Model {
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, Path::new(""), &options).map_err(runtime_err)?;
-        let contract = loaded.vla().map_err(runtime_err)?.contract();
+        let vla = loaded.vla().map_err(runtime_err)?;
+        let contract = vla.contract();
+        let action_tokens = vla.action_token_shape();
         Ok(Self {
             model: loaded,
             contract,
+            action_tokens,
             device,
             sampling_seed: Cell::new(sampling_seed),
             sampling_draw: Cell::new(0),
@@ -627,6 +635,94 @@ impl Model {
             }
             None => self.run_generated(py, observation, self.next_sampling_rng()?),
         }
+    }
+
+    /// **L1** discrete action-token inference for autoregressive token VLAs
+    /// (π0-FAST). Raw observations in, FAST action tokens out.
+    ///
+    /// The engine returns token ids, never continuous actions: π0-FAST decodes
+    /// actions by autoregressing FAST tokens, so detokenization (BPE + DCT) and
+    /// unnormalization belong to the policy layer that knows the tokenizer.
+    ///
+    /// * `rgb_u8` — `uint8` `[num_views, image_size, image_size, 3]` or the
+    ///   channels-first equivalent selected by `layout`.
+    /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
+    ///
+    /// * `stop_token` — optional id that ends the stream: the runtime emits it
+    ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
+    ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
+    ///
+    /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
+    /// it was hit.
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn infer_action_tokens_rgb<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        let token_shape = self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py.infer_action_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("infer_action_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_action_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_action_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_action_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        // Token VLAs condition on the observation alone; the request still
+        // carries an initial latent, and the runtime ignores it.
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        let decoded = self
+            .model
+            .infer_action_tokens(&request, stop_token)
+            .map_err(runtime_err)?;
+        let values = decoded.to_f32_vec().map_err(runtime_err)?;
+        if values.is_empty() || values.len() > token_shape[1] {
+            return Err(PyRuntimeError::new_err(format!(
+                "apxinf_py.infer_action_tokens_rgb: runtime produced {} tokens, expected 1..={}",
+                values.len(),
+                token_shape[1]
+            )));
+        }
+        let ids = values.into_iter().map(|value| value as u32).collect::<Vec<u32>>();
+        Ok(Array1::from_vec(ids).into_pyarray_bound(py))
     }
 
     /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi05.py``.

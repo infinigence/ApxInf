@@ -10,6 +10,7 @@ pub mod registry;
 pub mod auto;
 pub mod profiling;
 pub mod pi05;
+pub mod pi0fast;
 pub mod qwen3vl;
 pub mod vla;
 mod walloss;

@@ -404,6 +404,16 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    /// FP32 raw-image preprocessing: `uint8` NHWC/NCHW to patch-major FP32.
+    pub fn apxinf_static_rgb_u8_to_patches_f32(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        image_size: i32,
+        patch_size: i32,
+        layout: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     /// BF16 bias/activation epilogue. `activation`: 0=identity, 1=GELU-tanh,
     /// 2=SiLU.
     pub fn apxinf_static_bias_activation_bf16(
@@ -716,6 +726,17 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_bias_position_bf16(
+        projection: *const c_void,
+        bias: *const c_void,
+        position: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        tokens_per_view: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_static_bias_position_f32_bf16(
         projection: *const c_void,
         bias: *const c_void,
         position: *const c_void,

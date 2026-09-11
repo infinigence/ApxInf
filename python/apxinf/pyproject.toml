@@ -25,6 +25,11 @@ policy = ["apxinf-py>=0.1.0"]
 # torch-serialized normalizers plus optional YAML training semantics. Keep these
 # heavyweight dependencies opt-in so the numpy/PIL processor package stays light.
 walloss = ["apxinf-py>=0.1.0", "torch>=2.0", "transformers>=4.49,<5", "PyYAML>=6"]
+# π0-FAST needs no torch: both tokenizers (PaliGemma for the prompt and id space,
+# FAST for the BPE detokenization) load through `tokenizers` — the engine behind
+# HF's fast tokenizers — straight from the assets the checkpoint names, and the
+# DCT comes from scipy. The ApxInf binding is still the only runtime.
+pi0fast = ["apxinf-py>=0.1.0", "tokenizers>=0.15", "scipy>=1.9"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
 # The lerobot adapter (apxinf.adapters.lerobot) returns torch tensors, and its
@@ -32,7 +37,9 @@ serving = ["msgpack>=1.0.5", "websockets>=14.0"]
 # itself is deliberately *not* pinned here: the adapter is built against a moving
 # API, and users bring their own already-installed version.
 lerobot = ["torch>=2.0"]
-test = ["pytest>=7", "sentencepiece>=0.1.99"]
+# The π0-FAST tests read a miniature checkpoint with the same tokenizer/scipy
+# stack the policy itself needs, so both are part of the test extra.
+test = ["pytest>=7", "sentencepiece>=0.1.99", "tokenizers>=0.15", "scipy>=1.9"]
 
 [tool.setuptools.packages.find]
 where = ["."]

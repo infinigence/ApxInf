@@ -180,6 +180,37 @@ pub trait VlaRuntime {
     /// already owns the backend.
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>>;
 
+    /// Discrete action-token output shape for autoregressive token VLAs.
+    ///
+    /// A runtime whose deployable output is a token sequence (π0-FAST) returns
+    /// `Some([1, max_action_tokens])`; continuous-action runtimes keep `None`
+    /// and use [`contract`](Self::contract) alone.
+    fn action_token_shape(&self) -> Option<[usize; 2]> {
+        None
+    }
+
+    /// Run inference and return the raw action token ids as `[1, steps]` `f32`.
+    ///
+    /// Integral values are exact in `f32` well beyond any model vocabulary.
+    /// Token detokenization (FAST BPE + DCT) is action postprocessing and stays
+    /// in the Python policy layer.
+    ///
+    /// `stop_token` ends an autoregressive decode early: the runtime emits the
+    /// id, stops, and returns the shorter stream (π0-FAST's FAST stream ends at
+    /// the `|` terminator after ~10% of `max_action_tokens`, and its detokenizer
+    /// truncates there anyway). It rides this token-only entry point rather than
+    /// [`Observation`] so a continuous-action family never carries — or has to
+    /// spell out — a control knob that only token decoding reads.
+    fn infer_action_tokens(
+        &self,
+        _request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<Tensor> {
+        Err(Error::Other(
+            "this VLA runtime does not produce discrete action tokens".into(),
+        ))
+    }
+
     /// Collect named BF16 activation maxima for an FP8 calibration profile.
     fn calibration_amax(&self, _request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         Err(Error::Other(
