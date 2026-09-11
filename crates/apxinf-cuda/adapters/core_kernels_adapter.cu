@@ -128,7 +128,8 @@ extern "C" cudaError_t apxinf_attention_softmax_f32(
     const void* scores, void* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    uint32_t n_col_blocks = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    dim3 grid(n_col_blocks * rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     attention_softmax_f32_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const float*)scores, (float*)output, cols, rows, kv_offset, n_heads);
@@ -330,7 +331,8 @@ extern "C" cudaError_t apxinf_attention_softmax_bf16(
     const void* scores, void* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    uint32_t n_col_blocks = (cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    dim3 grid(n_col_blocks * rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     attention_softmax_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)scores, (__nv_bfloat16*)output,
@@ -495,9 +497,8 @@ extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     const void* q, const void* k, const void* v, void* out,
     uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)
 {
-    // Only head_dim=64 (Qwen3-VL vision) is supported; the kernel uses a
-    // 32-thread / 2-element-per-thread layout.
-    if (head_dim != 64) return cudaErrorInvalidConfiguration;
+    // The kernel assigns head_dim columns cyclically across a 32-thread
+    // warp, so any head_dim works (verified on 64 and 72).
     dim3 grid(seq_len, n_heads, 1);
     dim3 block(32, 1, 1);
     size_t smem = (seq_len + 1) * sizeof(float);

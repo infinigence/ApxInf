@@ -76,9 +76,12 @@ impl Qwen3VLVisionWeights {
         let patch_embed_weight = {
             let raw = tensors.remove("model.visual.patch_embed.proj.weight")
                 .ok_or_else(|| Error::Other("missing patch_embed.proj.weight".into()))?;
-            // Shape [1024, 3, 2, 16, 16] → reshape to [1024, 1536] then
-            // transpose to [1536, 1024] for matmul (cuBLAS row-major).
-            let flattened = reshape_5d_to_2d(&raw, 1024, 1536)?;
+            // Shape [embed_dim, 3, 2, 16, 16] → reshape to [embed_dim, patch_elems]
+            // then transpose for matmul (cuBLAS row-major). embed_dim differs per
+            // size (1024 for 2B/4B, 1152 for 8B), so read it from the config.
+            let patch_elems = vc.in_channels * vc.temporal_patch_size
+                * vc.patch_size * vc.patch_size;
+            let flattened = reshape_5d_to_2d(&raw, vc.hidden_size, patch_elems)?;
             transpose_2d(&flattened)?
         };
         let patch_embed_bias = tensors.remove("model.visual.patch_embed.proj.bias")

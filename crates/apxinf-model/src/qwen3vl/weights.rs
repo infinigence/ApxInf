@@ -14,9 +14,17 @@ use super::config::Qwen3VLConfig;
 /// All text-stack weights for Qwen3-VL, in the layout the decode graph
 /// wants (2D projections transposed to `[in, out]` for cuBLAS row-major).
 pub struct Qwen3VLTextWeights {
-    /// `[vocab_size, hidden_size]`. Doubles as the lm_head weight because
-    /// Qwen3-VL uses tied embeddings.
+    /// `[vocab_size, hidden_size]`. Doubles as the lm_head weight when the
+    /// checkpoint has no separate output projection (tied embeddings).
     pub token_embedding: Tensor,
+    /// Separate output projection for untied checkpoints, transposed to
+    /// `[hidden, vocab]`. `None` means tied.
+    ///
+    /// Presence is decided by the checkpoint, not by the `tie_word_embeddings`
+    /// config key: several shipped configs omit the key while still shipping a
+    /// real `lm_head.weight`, and trusting the key there yields logits that
+    /// are uncorrelated with the reference.
+    pub lm_head: Option<Tensor>,
     pub layers: Vec<Qwen3VLLayer>,
     pub output_norm_weight: Tensor,
 }
@@ -81,8 +89,14 @@ impl Qwen3VLTextWeights {
             .ok_or_else(|| Error::Other("missing model.language_model.embed_tokens.weight".into()))?;
         let output_norm_weight = tensors.remove("model.language_model.norm.weight")
             .ok_or_else(|| Error::Other("missing model.language_model.norm.weight".into()))?;
+        // Untied checkpoints carry their own output projection. Transpose it
+        // to [hidden, vocab] so it drops into the same GEMM as the tied path.
+        let lm_head = match tensors.remove("lm_head.weight") {
+            Some(t) => Some(transpose_2d(&t)?),
+            None => None,
+        };
 
-        Ok(Self { token_embedding, layers, output_norm_weight })
+        Ok(Self { token_embedding, lm_head, layers, output_norm_weight })
     }
 }
 
