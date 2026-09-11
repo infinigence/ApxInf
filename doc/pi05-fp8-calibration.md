@@ -32,6 +32,22 @@ Choose observations that represent deployment cameras, prompts, robot state,
 lighting, scenes, and object poses. Every observation must contain exactly the
 camera views expected by the checkpoint.
 
+## Observation directory
+
+The second input is a directory of `*.npz` files, one Observation per file, with
+array values stored under the wire keys. `--input-dir` globs `*.npz` and sorts
+the names, so zero-padded filenames keep the data identity stable between runs.
+
+```bash
+python3 scripts/calibrate_pi05.py \
+  --model-dir <path-to-model> \
+  --input-dir <path-to-observations>
+```
+
+This is the format for frames that were rendered rather than photographed: the
+producer writes them once, and the calibration input becomes a reviewable,
+re-runnable artifact instead of a side effect of a rollout.
+
 ## Native LIBERO task observations
 
 For the PI0.5 LIBERO checkpoint, generate a calibration file from observations
@@ -44,15 +60,39 @@ python3 scripts/calibrate_pi05.py \
 ```
 
 This path uses LIBERO's BDDL tasks, language instructions, initial states, and
-off-screen simulator cameras. It applies the same camera orientation, resize,
-and robot-state conversion as `scripts/eval_libero.py`. Sampling is
+off-screen simulator cameras. It applies the same camera orientation and
+robot-state conversion as `scripts/eval_libero.py` — the resize is the policy's,
+so the calibration frames are the ones inference will actually see. Sampling is
 deterministic and task-balanced. By default it captures one settled initial
 state from every task; `--samples N` selects more initial states while retaining
 balanced task coverage.
 
 This command needs the same LIBERO and MuJoCo dependencies as the repository's
-LIBERO evaluation command. For another simulator or deployment source, export
-its public Observations through the manifest interface instead.
+LIBERO evaluation command. It exists so a kernel change or a new checkpoint can
+be recalibrated against ApxInf's own published LIBERO protocol.
+
+### Capturing on another machine
+
+The two halves have disjoint requirements: rendering needs LIBERO and MuJoCo but
+no GPU and no checkpoint, and calibrating needs the checkpoint and a GPU but no
+simulator. Splitting them at the NPZ directory lets each run where it belongs —
+the simulator stays off the engine host — and makes the calibration input a
+reviewable, re-runnable artifact rather than a side effect of whoever happened to
+run the calibrator.
+
+Whatever writes those files decides the field names, and they have to be the wire
+keys the checkpoint is served under. When they are not the checkpoint's own,
+name them:
+
+```bash
+python3 scripts/calibrate_pi05.py \
+  --model-dir <path-to-model> \
+  --image-key observation/image --image-key observation/wrist_image \
+  --input-dir <path-to-observations>
+```
+
+For another simulator or a deployment source, export its public Observations
+through the manifest or directory interface instead.
 
 ## Loading the calibration file
 

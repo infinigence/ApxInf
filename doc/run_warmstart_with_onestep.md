@@ -8,11 +8,12 @@ this repo and the real LIBERO results on two platforms:
 
 ## Optimization
 
-The warm-start path is implemented in `scripts/eval_libero.py` and is enabled
-by one switch:
+The runtime half of this optimization — partial flow — lives in the Rust model
+crates. The evaluator half lives in `scripts/eval_libero.py`, and is enabled by
+one switch:
 
 ```bash
---warm-start
+python scripts/eval_libero.py --warm-start ...
 ```
 
 When enabled, the evaluator uses all of the following together:
@@ -94,7 +95,6 @@ Checks run:
 
 ```bash
 .venv/bin/python -m py_compile \
-  scripts/eval_libero.py \
   python/apxinf/apxinf/policies/impls/pi05.py
 
 source ~/.cargo/env

@@ -25,6 +25,11 @@ Adding a new model needs no change here: register a policy in ``apxinf.policies`
 (``@register_policy("<name>")``) and run ``--backend in-process --model-type
 <name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
 
+This script exists so a kernel change, an FP8 recalibration or a tactic bump can
+be regressed end-to-end against ApxInf's own published LIBERO numbers. The
+observation conversion it uses is mirrored elsewhere; see
+``scripts/libero_observation.py`` on keeping the two in step.
+
     # websocket (server already running)
     python scripts/eval_libero.py --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
@@ -39,14 +44,13 @@ from __future__ import annotations
 
 import argparse
 import collections
-import functools
 import json
 import os
 import pathlib
 import sys
 import time
 import traceback
-from typing import Mapping, Optional, Protocol, Tuple
+from typing import NamedTuple, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -58,10 +62,15 @@ else:
 # --- rollout protocol constants (OpenPI's public PI0.5 LIBERO configuration) ---
 LIBERO_ACTION_DIM = 7
 
-#: The preset whose wire contract this evaluator drives. The keys themselves are
-#: *not* restated here: they are read from the table below, so the evaluator and
-#: the server cannot drift into two different dialects of "LIBERO".
-LIBERO_PRESET = "franka_libero"
+#: LIBERO's wire dialect, mirroring openpi's ``LiberoInputs``. Stated here rather
+#: than looked up: this file *is* the LIBERO evaluator, and LIBERO's keys are
+#: fixed by the published benchmark, so naming them is not a second source of
+#: truth for anything that varies. ``--image-keys`` / ``--state-key`` override
+#: them so a checkpoint trained under other keys can still be scored on the suite.
+LIBERO_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
+LIBERO_STATE_KEY = "observation/state"
+LIBERO_PROMPT_KEY = "prompt"
+
 MAX_STEPS = 520
 WAIT_STEPS = 10
 REPLAN_STEPS = 5
@@ -78,26 +87,43 @@ ALL_SUITES = (
 LedgerKey = Tuple[str, int, int]  # (suite, task_id, trial_id)
 
 
+class WireKeys(NamedTuple):
+    """What this evaluator puts on the wire, resolved once from the arguments."""
+
+    image_keys: Tuple[str, str]
+    state_key: str
+    prompt_key: str
+
+
+def _two_image_keys(value: str) -> Tuple[str, str]:
+    """Parse ``--image-keys base,wrist``.
+
+    Rejects any other count here rather than in the policy: LIBERO renders exactly
+    two cameras, and a third name would silently address a view the simulator
+    never fills.
+    """
+    keys = tuple(part.strip() for part in value.split(",") if part.strip())
+    if len(keys) != 2:
+        raise argparse.ArgumentTypeError(
+            f"expected two comma-separated keys (base,wrist), got {len(keys)}: {value!r}"
+        )
+    return keys
+
+
+def resolve_wire_keys(args: argparse.Namespace) -> WireKeys:
+    image_keys = getattr(args, "image_keys", None) or LIBERO_IMAGE_KEYS
+    return WireKeys(
+        image_keys=(image_keys[0], image_keys[1]),
+        state_key=getattr(args, "state_key", None) or LIBERO_STATE_KEY,
+        prompt_key=getattr(args, "prompt_key", None) or LIBERO_PROMPT_KEY,
+    )
+
+
 def _add_apxinf_to_path() -> None:
     """Make ``import apxinf`` work from a source checkout, idempotently."""
     package_dir = pathlib.Path(__file__).resolve().parents[1] / "python" / "apxinf"
     if package_dir.is_dir() and str(package_dir) not in sys.path:
         sys.path.insert(0, str(package_dir))
-
-
-@functools.lru_cache(maxsize=1)
-def libero_convention():
-    """LIBERO's wire dialect, read from the preset table rather than restated.
-
-    Both backends send the same observation, so both resolve it here: the keys
-    the evaluator writes are by construction the keys ``--robot franka_libero``
-    serves. Importing ``apxinf`` costs no CUDA (the binding is loaded lazily by
-    ``from_pretrained``), so the websocket backend pays nothing for this.
-    """
-    _add_apxinf_to_path()
-    from apxinf import get_robot_preset
-
-    return get_robot_preset(LIBERO_PRESET).convention
 
 
 # --- LIBERO harness (inlined; was scripts/libero_harness.py) ------------------
@@ -297,22 +323,24 @@ def state_finger_joints(metadata: Mapping) -> int:
     )
 
 
-def _observation(base, wrist, state, prompt) -> dict:
+def _observation(base, wrist, state, prompt, keys: WireKeys) -> dict:
     """The OpenPI LIBERO observation both backends consume, identical on the wire
-    and in-process. Keys come from the preset table, not from constants here."""
-    convention = libero_convention()
+    and in-process. The keys are resolved once per run, so what the evaluator
+    sends and what the policy is built to read cannot drift apart mid-rollout."""
     return {
-        convention.image_keys[0]: base,
-        convention.image_keys[1]: wrist,
-        convention.state_key: state,
-        convention.prompt_key: prompt,
+        keys.image_keys[0]: base,
+        keys.image_keys[1]: wrist,
+        keys.state_key: state,
+        keys.prompt_key: prompt,
     }
 
 
 class WebsocketBackend:
     """Reach an OpenPI-compatible server through the unmodified ``openpi_client``."""
 
-    def __init__(self, host: str, port: int, expected_precision: str) -> None:
+    def __init__(
+        self, host: str, port: int, expected_precision: str, keys: WireKeys
+    ) -> None:
         from openpi_client import websocket_client_policy
 
         # WebsocketClientPolicy honours the ambient proxy; exempt the target host
@@ -325,19 +353,47 @@ class WebsocketBackend:
             os.environ[variable] = ",".join(entries)
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port)
         self.metadata = self._client.get_server_metadata()
+        self._keys = keys
         actual_precision = self.metadata.get("precision")
         if actual_precision != expected_precision:
             self.close()
             raise RuntimeError(
                 f"server precision is {actual_precision!r}, expected {expected_precision!r}"
             )
+        self._assert_server_speaks_the_same_dialect()
+
+    def _assert_server_speaks_the_same_dialect(self) -> None:
+        """Fail at connect rather than score a run on ignored observations.
+
+        The server publishes the keys it will actually read. Sending different
+        ones does not raise for the *state* key — it is simply absent, the policy
+        proceeds without proprioception, and the run finishes with a plausible,
+        wrong success rate. Compare what the metadata reports, when it reports it.
+        """
+        served_images = self.metadata.get("image_keys")
+        if served_images is not None and tuple(served_images) != self._keys.image_keys:
+            self.close()
+            raise RuntimeError(
+                f"server serves image_keys={list(served_images)} but this run sends "
+                f"{list(self._keys.image_keys)}; pass --image-keys to match it"
+            )
+        if "state_key" in self.metadata:
+            served_state = self.metadata["state_key"]
+            if served_state is not None and served_state != self._keys.state_key:
+                self.close()
+                raise RuntimeError(
+                    f"server serves state_key={served_state!r} but this run sends "
+                    f"{self._keys.state_key!r}; pass --state-key to match it"
+                )
 
     def infer(
         self, base, wrist, state, prompt, noise=None
     ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
         if noise is not None:
             raise RuntimeError("warm-start noise requires --backend in-process")
-        response = self._client.infer(_observation(base, wrist, state, prompt))
+        response = self._client.infer(
+            _observation(base, wrist, state, prompt, self._keys)
+        )
         actions = np.asarray(response["actions"], dtype=np.float32)
         # Only OpenPI-contract keys ride the wire; ``policy_timing`` /
         # ``server_timing`` are the server's tolerated diagnostic namespaces.
@@ -371,12 +427,13 @@ class InProcessBackend:
     so a future ``GrootPolicy`` runs here with no change to this file.
     """
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, keys: WireKeys) -> None:
         # Lazy: importing apxinf pulls in the policy stack; websocket-only users
         # never pay for it. Make ``import apxinf`` work from a source checkout.
         _add_apxinf_to_path()
         from apxinf import AutoPolicy
 
+        self._keys = keys
         options = {
             "checkpoint": args.checkpoint,
             "calibration": args.calibration,
@@ -391,20 +448,19 @@ class InProcessBackend:
             "discrete_state": args.discrete_state,
             "seed": args.model_seed if args.model_seed is not None else args.seed,
         }
-        convention = libero_convention()
         self._policy = AutoPolicy.from_pretrained(
             args.model_dir,
             model_type=args.model_type,
             device=args.device,
             precision=args.precision,
             action_dim=(args.action_dim or None),
-            # LIBERO's wire keys, read from the ``franka_libero`` preset rather
-            # than restated: the policy layer holds no dataset's convention as a
-            # default, and this evaluator should not become a second source of
-            # truth for what "LIBERO keys" means.
-            image_keys=convention.image_keys,
-            state_key=convention.state_key,
-            prompt_key=convention.prompt_key,
+            # The same keys the websocket backend puts on the wire, so the two
+            # backends are comparable by construction: the policy layer holds no
+            # dataset's keys as a default, and a run that scored one dialect
+            # in-process and another over the wire would be meaningless.
+            image_keys=keys.image_keys,
+            state_key=keys.state_key,
+            prompt_key=keys.prompt_key,
             metadata={"precision": args.precision, "policy": "libero"},
             **{name: value for name, value in options.items() if value is not None},
         )
@@ -413,7 +469,9 @@ class InProcessBackend:
     def infer(
         self, base, wrist, state, prompt, noise=None
     ) -> Tuple[np.ndarray, np.ndarray, dict]:
-        result = self._policy.infer(_observation(base, wrist, state, prompt), noise=noise)
+        result = self._policy.infer(
+            _observation(base, wrist, state, prompt, self._keys), noise=noise
+        )
         actions = np.asarray(result["actions"], dtype=np.float32)
         normalized = np.asarray(result["normalized_actions"], dtype=np.float32)
         timing = result.get("timing", {}) or {}
@@ -431,9 +489,10 @@ class InProcessBackend:
 
 
 def build_backend(args: argparse.Namespace) -> Backend:
+    keys = resolve_wire_keys(args)
     if args.backend == "websocket":
-        return WebsocketBackend(args.host, args.port, args.precision)
-    return InProcessBackend(args)
+        return WebsocketBackend(args.host, args.port, args.precision, keys)
+    return InProcessBackend(args, keys)
 
 
 # --- rollout ------------------------------------------------------------------
@@ -628,6 +687,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--results-jsonl", required=True, type=pathlib.Path)
     parser.add_argument("--summary-json", required=True, type=pathlib.Path)
+
+    wire = parser.add_argument_group(
+        "wire keys",
+        "Override the names this evaluator sends observations under. The defaults "
+        "are LIBERO's own; change them only to score a checkpoint that was trained "
+        "against a differently named recording of the same suite.",
+    )
+    wire.add_argument(
+        "--image-keys",
+        type=_two_image_keys,
+        metavar="BASE,WRIST",
+        help=f"default: {','.join(LIBERO_IMAGE_KEYS)}",
+    )
+    wire.add_argument("--state-key", help=f"default: {LIBERO_STATE_KEY}")
+    wire.add_argument("--prompt-key", help=f"default: {LIBERO_PROMPT_KEY}")
 
     websocket = parser.add_argument_group("websocket backend")
     websocket.add_argument("--host", default="127.0.0.1")

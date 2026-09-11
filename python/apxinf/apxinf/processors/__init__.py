@@ -2,7 +2,7 @@
 
 Every step is an independently-callable :class:`ProcessorStep`; :class:`Pipeline`
 chains them. Nothing here imports ``apxinf_py`` or touches CUDA, so the whole
-module unit-tests offline (sentencepiece is imported lazily by the tokenizer).
+module unit-tests offline (the native binding is imported lazily by the tokenizer).
 """
 
 from __future__ import annotations

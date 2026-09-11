@@ -93,8 +93,15 @@ class CalibratePi05Test(unittest.TestCase):
             {observation["prompt"] for observation in observations},
             {"task 0", "task 1"},
         )
-        self.assertEqual(observations[0]["observation/image"].shape, (224, 224, 3))
-        self.assertEqual(observations[0]["observation/state"].shape, (8,))
+        # Frames come out at the simulator's own resolution: `libero_images` only
+        # reorients, and the selected policy owns the resize to the model's edge.
+        # State is 3 position + 3 axis-angle + 1 gripper. Both of these asserted
+        # (224, 224, 3) and (8,) until aa82c96 moved the resize into the policy and
+        # collapsed the mirrored gripper joints, and left the expectations behind;
+        # tests/test_libero_observation.py pins the same widths as literals.
+        self.assertEqual(observations[0]["observation/image"].shape, (3, 4, 3))
+        self.assertEqual(observations[0]["observation/wrist_image"].shape, (3, 4, 3))
+        self.assertEqual(observations[0]["observation/state"].shape, (7,))
         self.assertEqual(observations[0]["observation/state"].dtype, np.float32)
 
     def test_input_directory_expands_npz_files_in_stable_order(self):
@@ -155,7 +162,90 @@ class CalibratePi05Test(unittest.TestCase):
         self.assertEqual(observations[0]["observation/state"].dtype, np.float32)
         self.assertTrue(identity.startswith("sha256:"))
 
+    def test_calibration_job_consumes_a_captured_npz_directory_end_to_end(self):
+        # The NPZ directory is the seam between whoever owns the environment
+        # and this engine-side calibrator: the observations are an artifact on
+        # disk, not a live simulator.
+        class Model:
+            image_size = 2
+            action_horizon = 2
+            action_dim = 3
+
+        class Policy:
+            model = Model()
+            image_keys = ("observation/image", "observation/wrist_image")
+            prompt_key = "prompt"
+            state_key = "observation/state"
+            discrete_state = False
+
+            def calibration_plan(self):
+                return CalibrationPlan.runtime_validated_sites(
+                    model_family="pi05",
+                    sites=("vision.patch_input",),
+                    schema=calibrate_pi05.SCHEMA,
+                    seed_algorithm="numpy-pcg64-seed-sequence-v1",
+                )
+
+            def collect_calibration(self, observation, context):
+                return {"vision.patch_input": float(context.sample_index + 1)}
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "model.safetensors").write_bytes(b"weights")
+            captured = root / "captured"
+            captured.mkdir()
+            for index in range(2):
+                np.savez(
+                    captured / f"sample-{index:03d}.npz",
+                    **{
+                        "observation/image": np.zeros((2, 2, 3), np.uint8),
+                        "observation/wrist_image": np.zeros((2, 2, 3), np.uint8),
+                        "observation/state": np.zeros(8, np.float32),
+                        "prompt": np.asarray(f"task {index}"),
+                    },
+                )
+            output = root / "profile.json"
+            args = calibrate_pi05.parse_args(
+                [
+                    "--model-dir",
+                    str(root),
+                    "--input-dir",
+                    str(captured),
+                    "--output",
+                    str(output),
+                    "--source-revision",
+                    "test-revision",
+                ]
+            )
+            with mock.patch.object(calibrate_pi05, "_progress") as progress:
+                result = calibrate_pi05.run_from_args(
+                    args, policy_factory=lambda *_args, **_kwargs: Policy()
+                )
+
+            document = json.loads(output.read_text())
+            progress_messages = [call.args[0] for call in progress.call_args_list]
+
+        self.assertEqual(result.output, output)
+        self.assertEqual(document["calibration_data"]["sample_count"], 2)
+        self.assertTrue(document["calibration_data"]["identity"].startswith("sha256:"))
+        self.assertEqual(document["scales"]["vision.patch_input"]["amax"], 2.0)
+        self.assertIn(
+            "Hashing the checkpoint for profile identity (this reads all weight files)...",
+            progress_messages,
+        )
+        self.assertIn(
+            "Running eager BF16 calibration over 2 observation(s)...",
+            progress_messages,
+        )
+        self.assertEqual(progress_messages[-1], "Calibration profile written.")
+
     def test_calibration_job_consumes_native_libero_source_end_to_end(self):
+        # The other half of the pair above: --libero-suite drives the simulator in
+        # this process, so ApxInf can recalibrate against its own published LIBERO
+        # protocol without a downstream checkout. Both must stay wired up.
         class Model:
             image_size = 2
             action_horizon = 2
@@ -211,27 +301,34 @@ class CalibratePi05Test(unittest.TestCase):
                 calibrate_pi05,
                 "load_libero_observations",
                 return_value=observations,
-            ), mock.patch.object(calibrate_pi05, "_progress") as progress:
+            ) as capture, mock.patch.object(calibrate_pi05, "_progress"):
                 result = calibrate_pi05.run_from_args(
                     args, policy_factory=lambda *_args, **_kwargs: Policy()
                 )
 
             document = json.loads(output.read_text())
-            progress_messages = [call.args[0] for call in progress.call_args_list]
 
         self.assertEqual(result.output, output)
         self.assertEqual(document["calibration_data"]["sample_count"], 2)
         self.assertTrue(document["calibration_data"]["identity"].startswith("sha256:"))
-        self.assertEqual(document["scales"]["vision.patch_input"]["amax"], 2.0)
-        self.assertIn(
-            "Hashing the checkpoint for profile identity (this reads all weight files)...",
-            progress_messages,
+        # The capture is asked for the *policy's* keys, not a restated dialect, so
+        # calibration observations arrive under the names inference will read.
+        self.assertEqual(capture.call_args.args, ("libero_10",))
+        self.assertEqual(
+            capture.call_args.kwargs["image_keys"],
+            ("observation/image", "observation/wrist_image"),
         )
-        self.assertIn(
-            "Running eager BF16 calibration over 2 observation(s)...",
-            progress_messages,
+        self.assertEqual(capture.call_args.kwargs["state_key"], "observation/state")
+
+    def test_samples_is_rejected_without_a_libero_suite(self):
+        # --samples only means something for the sampler that reads it; accepting
+        # it against an NPZ directory would silently ignore the operator's intent.
+        args = calibrate_pi05.parse_args(
+            ["--model-dir", ".", "--zero-fixture", "--samples", "4"]
         )
-        self.assertEqual(progress_messages[-1], "Calibration profile written.")
+        with self.assertRaises(ValueError) as raised:
+            calibrate_pi05.validate_args(args)
+        self.assertIn("--samples applies only to --libero-suite", str(raised.exception))
 
     def test_calibration_job_accepts_observation_iterable_without_source_adapter(self):
         class Policy:
