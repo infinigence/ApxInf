@@ -8,25 +8,21 @@ version = "0.1.0"
 description = "ApxInf Python frontend: processors, VLA policies, and serving."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
-# The processor library is pure numpy/PIL/sentencepiece with no GPU / no Rust
-# dependency, so it installs and unit-tests offline. `apxinf-py` is only needed
-# when a real Pi05Policy is constructed, hence it is an optional extra.
+# The processor library stays importable without the native extension. Built-in
+# policy tokenizers are provided by `apxinf-py`; custom Python processors remain
+# ordinary callables and need only the dependencies they choose.
 dependencies = [
     "numpy>=1.21",
     "Pillow>=9.0.0",
+    "PyYAML>=6",
 ]
 
 [project.optional-dependencies]
-# The prompt tokenizer needs sentencepiece; the golden/layering tests want it too.
-tokenizer = ["sentencepiece>=0.1.99"]
 # A live Pi05Policy binds the PyO3 model handle (Phase 1).
 policy = ["apxinf-py>=0.1.0"]
-# WallOSS owns a Qwen2.5-VL BPE/image processor and reads the checkpoint's
-# torch-serialized normalizers plus optional YAML training semantics. Keep these
-# heavyweight dependencies opt-in so the numpy/PIL processor package stays light.
-walloss = ["apxinf-py>=0.1.0", "torch>=2.0", "transformers>=4.49,<5", "PyYAML>=6"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+# SentencePiece remains a test-only reference for native differential checks.
 test = ["pytest>=7", "sentencepiece>=0.1.99"]
 
 [tool.setuptools.packages.find]

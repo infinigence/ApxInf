@@ -19,7 +19,7 @@ Rust/CUDA build (`APXINF_CUDA_ARCH=sm_87` for Orin, `sm_110` for Thor).
 # engine binding (architecture-specific wheel built from crates/apxinf-py)
 pip install apxinf_py-*.whl
 # numpy frontend: processors + L2 policy + serving
-pip install -e "python/apxinf[tokenizer,serving]"
+pip install -e "python/apxinf[serving]"
 # upstream client (for §3)
 pip install openpi-client
 ```
@@ -245,10 +245,10 @@ unchanged (matching OpenPI's "output transforms can see input state" semantics).
 # WallOSS
 
 WallOSS uses the same model-agnostic websocket transport as PI0.5. Install the
-model-specific preprocessing dependencies and launch the example:
+transport dependencies and launch the example:
 
 ```bash
-pip install 'apxinf[walloss,serving]'
+pip install 'apxinf[serving]'
 ```
 
 The in-process Python API accepts the same observation dict as the server:

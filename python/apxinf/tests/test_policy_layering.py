@@ -363,14 +363,26 @@ def test_real_model_layering(model_dir):
             device=os.environ.get("APXINF_PI05_DEVICE", "cuda:0"),
             precision=precision,
             action_dim=LIBERO_DIM,
+            # make_obs() speaks the openpi wire; the fallback would be the
+            # model's own view slots, which that observation does not carry.
+            image_keys=DEFAULT_KEYS,
             seed=0,
         )
-    except Exception as error:  # noqa: BLE001 - load needs CUDA build + checkpoint
+    except (OSError, RuntimeError) as error:
+        # Only the environment may skip this test: a missing tactics JSON or
+        # checkpoint file (OSError) and every engine/device failure the binding
+        # reports (RuntimeError). A broader `except Exception` would also
+        # swallow the binding's argument validation (ValueError) and a broken
+        # import, i.e. exactly the regressions this test exists to catch.
         pytest.skip(f"pi05 load failed: {error}")
 
     assert isinstance(policy, Pi05Policy)
     obs = make_obs()
-    noise = np.random.default_rng(0).standard_normal((HORIZON, MODEL_DIM), dtype=np.float32)
+    # The real checkpoint's horizon and width come from the weights, not from
+    # MockModel's constants — pi05_libero_base runs H=50, not HORIZON.
+    noise = np.random.default_rng(0).standard_normal(
+        (policy.model.action_horizon, policy.model.action_dim), dtype=np.float32
+    )
     result = policy.infer(obs, noise=noise)
     normalized = result["normalized_actions"]
 

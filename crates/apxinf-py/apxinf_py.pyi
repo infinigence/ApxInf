@@ -7,6 +7,25 @@ import numpy.typing as npt
 
 __version__: str
 
+class HfTokenizer:
+    """Rust-backed Hugging Face ``tokenizer.json`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "HfTokenizer": ...
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, token_ids: list[int]) -> str: ...
+    def add_tokens(self, tokens: list[str]) -> int: ...
+    def token_to_id(self, token: str) -> int | None: ...
+    @property
+    def vocab_size(self) -> int: ...
+
+class SentencePieceTokenizer:
+    """Native SentencePiece ``.model`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "SentencePieceTokenizer": ...
+    def encode(self, text: str, add_bos: bool = ...) -> list[int]: ...
+
 class Model:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
@@ -57,7 +76,8 @@ class Model:
         rgb_u8: npt.NDArray[np.uint8],
         layout: str,
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
+        action_mask: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
         """L1: infer from resized RGB uint8. Returns normalized-domain action."""
         ...
@@ -88,3 +108,5 @@ class Model:
     def patches_per_view(self) -> int: ...
     @property
     def max_token_len(self) -> int: ...
+    @property
+    def accepts_rgb_u8(self) -> bool: ...

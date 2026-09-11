@@ -49,6 +49,7 @@ from .preflight import (
     inspect_checkpoint,
     sort_findings,
 )
+from .torch_state import TorchStateError, load_torch_state_file
 
 __all__ = [
     "CheckpointError",
@@ -68,12 +69,14 @@ __all__ = [
     "OpenPINormalizationError",
     "TOKENIZER_NAMES",
     "TokenizerSpec",
+    "TorchStateError",
     "TransformSpec",
     "WARN",
     "detect_checkpoint",
     "format_findings",
     "has_layout_metadata",
     "inspect_checkpoint",
+    "load_torch_state_file",
     "read_metadata_pt",
     "read_norm_stats",
     "repack_structure",
