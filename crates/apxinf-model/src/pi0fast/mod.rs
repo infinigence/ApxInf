@@ -25,7 +25,8 @@ mod weights;
 
 #[cfg(feature = "cuda")]
 pub use bf16_executor::{
-    language_layer_bf16, language_layer_cached_bf16, vision_layer_bf16,
+    language_layer_bf16, language_layer_cached_bf16, language_layer_cached_decode_bf16,
+    vision_layer_bf16,
     vision_patch_embed_f32_bf16, Bf16LanguageLayerOutput,
 };
 pub use bf16_weights::{bf16_to_device, f32_to_device, Bf16LinearWeights};

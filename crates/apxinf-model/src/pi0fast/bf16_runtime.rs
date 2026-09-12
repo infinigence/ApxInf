@@ -14,23 +14,98 @@
 //! The runtime returns the raw action tokens. FAST detokenization (BPE + DCT)
 //! is action postprocessing and belongs to the Python policy layer.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::backend::{
-    kernels, Context, DeviceAddress, DeviceBuffer as CudaBuffer, RuntimeBackend,
-};
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
-use kernels::{cache, elementwise, embedding, gemm, norm, sampling};
+use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use apxinf_core::{Error, Result, Tensor};
+use kernels::{cache, elementwise, embedding, gemm, norm, sampling, GraphWorkspace};
 
 use super::{
-    language_layer_bf16, language_layer_cached_bf16, vision_layer_bf16,
+    language_layer_bf16, language_layer_cached_decode_bf16, vision_layer_bf16,
     vision_patch_embed_f32_bf16, Pi0FastConfig, StaticBf16Pi0FastWeights,
 };
+
+/// Conservative arena reservation for one `infer` traversal.
+///
+/// [`GraphWorkspace`] is a bump arena: every buffer `output_buffer` hands out
+/// during a call stays live until the scope ends, so the capacity has to cover
+/// the *sum* of the call's intermediates rather than their peak. The estimate
+/// follows `infer_arena` op by op and is deliberately generous; an
+/// under-estimate surfaces as a workspace-exhausted error naming the exact
+/// requirement.
+fn arena_bytes(config: &Pi0FastConfig, token_count: usize) -> usize {
+    const BF16: usize = 2;
+    const F32: usize = 4;
+    const ALIGN: usize = 256;
+
+    let patches = config.patch_tokens();
+    let vw = config.vision_width;
+    let vmlp = config.vision_mlp_dim;
+    let lw = config.language.width;
+    let lmlp = config.language.mlp_dim;
+    let prefix = patches + token_count;
+    let cache_rows = prefix + config.max_action_tokens;
+    let kv_cols = config.language.num_kv_heads * config.language.head_dim;
+
+    let mut total = 0usize;
+    let mut add = |bytes: usize| total += bytes + ALIGN;
+
+    // FP32 SigLIP patch embedding: projection, bias+position, BF16 output.
+    add(patches * vw * F32);
+    add(patches * vw * F32);
+    add(patches * vw * BF16);
+
+    for _ in 0..config.vision_depth {
+        add(patches * vw * BF16);
+        add(patches * 3 * vw * BF16);
+        add(patches * 3 * vw * BF16);
+        add(patches * vw * BF16);
+        add(patches * vw * BF16);
+        add(patches * vw * BF16);
+        add(patches * vw * BF16);
+        add(patches * vmlp * BF16);
+        add(patches * vmlp * BF16);
+        add(patches * vw * BF16);
+        add(patches * vw * BF16);
+    }
+    add(patches * vw * BF16);
+    add(patches * vw * BF16);
+    add(patches * lw * BF16);
+    add(patches * lw * BF16);
+
+    add(token_count * lw * BF16);
+    add(prefix * lw * BF16);
+    for _ in 0..config.language.depth {
+        add(prefix * lw * BF16);
+        add(prefix * 3 * lw * BF16);
+        add(prefix * 2 * lw * BF16);
+        add(prefix * lw * BF16);
+        add(prefix * lw * BF16);
+        add(prefix * lw * BF16);
+        add(prefix * lw * BF16);
+        add(prefix * 2 * lmlp * BF16);
+        add(prefix * lmlp * BF16);
+        add(prefix * lw * BF16);
+        add(prefix * lw * BF16);
+    }
+    // Prefix KV cache copy plus the last-row gather.
+    add(2 * config.language.depth * cache_rows * kv_cols * BF16);
+    add(lw * BF16 * 4);
+
+    // Autoregressive steps: one token through every layer, plus lm_head logits.
+    let per_step = config.language.depth * 7 * lw * BF16 + config.language.depth * 3 * lmlp * BF16;
+    add(config.max_action_tokens * (per_step + config.vocab_size * BF16));
+
+    total + (total / 4)
+}
 
 pub struct Pi0FastBf16Runtime {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi0FastConfig>,
     weights: Arc<StaticBf16Pi0FastWeights>,
+    /// Persistent arena for the per-call intermediates. Without it every
+    /// intermediate is a raw `cudaMalloc`/`cudaFree` pair.
+    arena: Mutex<Option<GraphWorkspace>>,
 }
 
 impl Pi0FastBf16Runtime {
@@ -51,11 +126,45 @@ impl Pi0FastBf16Runtime {
             backend,
             config,
             weights,
+            arena: Mutex::new(None),
         })
     }
 
     fn ctx(&self) -> &Context {
         self.backend.context()
+    }
+
+    /// Run `operation` inside the persistent arena, growing it when a call
+    /// needs more room than the current one provides.
+    fn with_arena<T>(
+        &self,
+        token_count: usize,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let capacity = arena_bytes(&self.config, token_count);
+        let mut arena = self
+            .arena
+            .lock()
+            .map_err(|_| Error::Other("π0-FAST arena mutex is poisoned".into()))?;
+        if arena
+            .as_ref()
+            .is_none_or(|workspace| workspace.capacity() < capacity)
+        {
+            *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
+        }
+        kernels::with_workspace_eager(
+            arena.as_ref().expect("arena is populated above"),
+            operation,
+        )
+    }
+
+    /// Bytes of the arena the last call used.
+    pub fn arena_used_bytes(&self) -> usize {
+        self.arena
+            .lock()
+            .ok()
+            .and_then(|arena| arena.as_ref().map(|workspace| workspace.used()))
+            .unwrap_or(0)
     }
 
     /// Longest token sequence the decode loop can address: the whole prompt
@@ -114,6 +223,19 @@ impl Pi0FastBf16Runtime {
         token_count: usize,
         stop_token: Option<u32>,
     ) -> Result<Vec<u32>> {
+        self.with_arena(token_count, || {
+            self.infer_arena(patches, token_ids, token_count, stop_token)
+        })
+    }
+
+    /// One full traversal. The caller has already bound the arena.
+    fn infer_arena(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+    ) -> Result<Vec<u32>> {
         let config = &self.config;
         if token_count == 0 || token_count > config.max_token_len + 1 {
             return Err(Error::Other(format!(
@@ -124,7 +246,7 @@ impl Pi0FastBf16Runtime {
         let max_sequence = self.max_sequence(token_count);
 
         let image = self.embed_images(patches)?;
-        let language = self.embed_tokens(token_ids.address(), token_count)?;
+        let language = self.embed_tokens(token_ids, token_count)?;
         let prefix = elementwise::concat_rows_bf16(self.ctx(), &image, &language)?;
 
         let (hidden, keys, values) = self.decode_prefix(prefix, max_sequence)?;
@@ -158,9 +280,9 @@ impl Pi0FastBf16Runtime {
             if step + 1 == config.max_action_tokens {
                 break;
             }
-            let mut step_hidden = self.embed_tokens(slot.address(), 1)?;
+            let mut step_hidden = self.embed_tokens(&slot, 1)?;
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                step_hidden = language_layer_cached_bf16(
+                step_hidden = language_layer_cached_decode_bf16(
                     self.ctx(),
                     config.language,
                     layer,
@@ -233,7 +355,7 @@ impl Pi0FastBf16Runtime {
             &self.weights.language_final_norm_scale,
             self.config.rms_norm_eps,
         )?;
-        gemm::bf16(self.ctx(), &normalized, &self.weights.lm_head.weight)
+        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
     }
 
     /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
@@ -242,23 +364,9 @@ impl Pi0FastBf16Runtime {
     /// image embeddings alone, so the factor belongs to the caller's token
     /// stream rather than to the lookup kernel. The text tower, the generated
     /// action token, and the autoregressive feedback loop all share this path.
-    fn embed_tokens(&self, ids: DeviceAddress, token_count: usize) -> Result<Tensor> {
+    fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let table = CudaBuffer::from_tensor(&self.weights.token_embedding).map_err(Error::Cuda)?;
-        let bytes = token_count * width * DType::BF16.size_in_bytes();
-        let output = CudaBuffer::alloc(bytes, self.ctx().device_id()).map_err(Error::Cuda)?;
-        embedding::lookup_into(
-            self.ctx(),
-            DType::BF16,
-            &table,
-            ids,
-            &output,
-            width,
-            token_count,
-        )?;
-        let tensor = output
-            .as_tensor(Shape::new(vec![token_count, width]), DType::BF16)
-            .map_err(Error::Cuda)?;
+        let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
         elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
     }
 }

@@ -28,6 +28,16 @@ pub fn with_workspace<T>(
     crate::workspace::with_workspace(workspace, operation)
 }
 
+/// Bind a workspace for an eager (non-captured) traversal, keeping native
+/// execution resources installable so GEMM plans resolve and autotune as they
+/// would without a workspace.
+pub fn with_workspace_eager<T>(
+    workspace: &GraphWorkspace,
+    operation: impl FnOnce() -> apxinf_core::Result<T>,
+) -> apxinf_core::Result<T> {
+    crate::workspace::with_workspace_eager(workspace, operation)
+}
+
 /// Run an eager preflight that prepares native plans and workspace before
 /// CUDA graph capture.
 pub fn prepare_with_workspace<T>(

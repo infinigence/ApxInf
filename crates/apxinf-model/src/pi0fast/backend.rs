@@ -6,5 +6,5 @@
 
 pub(crate) use crate::accelerator::cuda::kernels::preprocess::ImageLayout;
 pub(crate) use crate::accelerator::cuda::{
-    kernels, Context, DeviceAddress, DeviceBuffer, RuntimeBackend,
+    kernels, Context, DeviceBuffer, RuntimeBackend,
 };

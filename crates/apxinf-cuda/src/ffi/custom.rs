@@ -404,6 +404,17 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    /// Same addressing as the BF16 variant, but the normalized patch value stays
+    /// in FP32 for a patch projection that is kept at full precision.
+    pub fn apxinf_static_rgb_u8_to_patches_f32(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        image_size: i32,
+        patch_size: i32,
+        layout: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
         images: *const c_void,
         patches: *mut c_void,
