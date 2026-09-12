@@ -22,6 +22,8 @@ pub fn register_builtin_models() {
     crate::pi05::register_builtin();
     #[cfg(feature = "cuda")]
     crate::walloss::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::pi0fast::register_builtin();
 }
 fn load_llama(
     path: &Path,

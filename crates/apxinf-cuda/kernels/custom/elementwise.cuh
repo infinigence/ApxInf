@@ -194,6 +194,21 @@ __global__ void euler_update_bf16_kernel(
   }
 }
 
+__global__ void bias_position_f32_kernel(
+    const float* projection, const float* bias,
+    const float* position, __nv_bfloat16* output,
+    int64_t count, int cols, int tokens_per_view) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int col = static_cast<int>(index % cols);
+    const int token = static_cast<int>((index / cols) % tokens_per_view);
+    float value = projection[index] + position[token * cols + col];
+    if (bias != nullptr) value += bias[col];
+    output[index] = __float2bfloat16(value);
+  }
+}
+
 __global__ void bias_position_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* bias,
     const __nv_bfloat16* position, __nv_bfloat16* output,

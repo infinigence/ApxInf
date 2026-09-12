@@ -149,23 +149,27 @@ impl GraphWorkspace {
 thread_local! {
     static ACTIVE_WORKSPACE: Cell<*const GraphWorkspace> = const { Cell::new(std::ptr::null()) };
     static PREPARING: Cell<bool> = const { Cell::new(false) };
+    static EAGER: Cell<bool> = const { Cell::new(false) };
 }
 
 struct ActiveWorkspaceGuard {
     workspace: *const GraphWorkspace,
     preparing: bool,
+    eager: bool,
 }
 
 impl Drop for ActiveWorkspaceGuard {
     fn drop(&mut self) {
         ACTIVE_WORKSPACE.with(|active| active.set(self.workspace));
         PREPARING.with(|preparing| preparing.set(self.preparing));
+        EAGER.with(|eager| eager.set(self.eager));
     }
 }
 
 fn with_workspace_phase<T>(
     workspace: &GraphWorkspace,
     prepare: bool,
+    eager: bool,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     workspace.reset();
@@ -177,9 +181,11 @@ fn with_workspace_phase<T>(
         }
         let previous = active.replace(workspace as *const _);
         let previous_preparing = PREPARING.with(|preparing| preparing.replace(prepare));
+        let previous_eager = EAGER.with(|current| current.replace(eager));
         let _guard = ActiveWorkspaceGuard {
             workspace: previous,
             preparing: previous_preparing,
+            eager: previous_eager,
         };
         operation()
     })
@@ -189,20 +195,36 @@ pub(crate) fn prepare_with_workspace<T>(
     workspace: &GraphWorkspace,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    with_workspace_phase(workspace, true, operation)
+    with_workspace_phase(workspace, true, false, operation)
 }
 
 pub(crate) fn with_workspace<T>(
     workspace: &GraphWorkspace,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    with_workspace_phase(workspace, false, operation)
+    with_workspace_phase(workspace, false, false, operation)
+}
+
+/// Bind a workspace for an eager (non-captured) traversal.
+///
+/// Identical to [`with_workspace`] except that native execution resources stay
+/// installable, so GEMM plan resolution and autotuning behave exactly as they
+/// do without a workspace. Capture must keep using [`with_workspace`]: a
+/// workspace-bound traversal cannot tell whether it is recording, and CUDA
+/// forbids allocating or re-planning inside a capture.
+pub(crate) fn with_workspace_eager<T>(
+    workspace: &GraphWorkspace,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    with_workspace_phase(workspace, false, true, operation)
 }
 
 /// Native execution resources may be installed only before capture or when an
 /// operation is executed without a graph workspace.
 pub(crate) fn may_prepare_native_resources() -> bool {
-    PREPARING.with(Cell::get) || ACTIVE_WORKSPACE.with(|active| active.get().is_null())
+    PREPARING.with(Cell::get)
+        || EAGER.with(Cell::get)
+        || ACTIVE_WORKSPACE.with(|active| active.get().is_null())
 }
 
 /// Whether execution is the synthetic eager traversal used only to prepare a

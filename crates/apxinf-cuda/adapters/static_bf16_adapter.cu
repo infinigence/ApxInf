@@ -45,6 +45,27 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_bf16(
   return cudaGetLastError();
 }
 
+// PaliGemma keeps the SigLIP patch embedding in FP32, so the raw-image path
+// produces an FP32 patch tensor for an FP32 patch projection.
+extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_f32(
+    const void* images, void* patches, int views, int image_size,
+    int patch_size, int layout, cudaStream_t stream) {
+  if (views <= 0 || image_size <= 0 || patch_size <= 0 ||
+      image_size % patch_size != 0 || (layout != 0 && layout != 1))
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(views) * 3 * image_size * image_size;
+  if (layout == 0) {
+    rgb_u8_to_patches_f32_kernel<true><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<float*>(patches),
+        views, image_size, patch_size);
+  } else {
+    rgb_u8_to_patches_f32_kernel<false><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<float*>(patches),
+        views, image_size, patch_size);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_bias_activation_bf16(
     const void* input, const void* bias, void* output,
     int rows, int cols, int activation, cudaStream_t stream) {
@@ -522,6 +543,22 @@ extern "C" cudaError_t apxinf_static_bias_position_bf16(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(bias),
       static_cast<const __nv_bfloat16*>(position),
+      static_cast<__nv_bfloat16*>(output), count, cols, tokens_per_view);
+  return cudaGetLastError();
+}
+
+// FP32 projection + bias + learned position embedding, rounded to BF16 for the
+// vision encoder. Mirrors PaliGemma's `embeddings` block, which runs in FP32
+// and only then casts into the BF16 transformer stack.
+extern "C" cudaError_t apxinf_static_bias_position_f32_bf16(
+    const void* projection, const void* bias, const void* position,
+    void* output, int rows, int cols, int tokens_per_view,
+    cudaStream_t stream) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  bias_position_f32_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const float*>(projection),
+      static_cast<const float*>(bias),
+      static_cast<const float*>(position),
       static_cast<__nv_bfloat16*>(output), count, cols, tokens_per_view);
   return cudaGetLastError();
 }

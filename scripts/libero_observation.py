@@ -37,16 +37,27 @@ def libero_images(base: np.ndarray, wrist: np.ndarray) -> np.ndarray:
     )
 
 
-def libero_state(observation) -> np.ndarray:
-    """Convert LIBERO's two mirrored finger joints to one gripper coordinate."""
+def libero_state(observation, *, finger_joints: int = 1) -> np.ndarray:
+    """Convert LIBERO proprioception into the vector a checkpoint consumes.
+
+    LIBERO reports two mirrored finger joints. ``finger_joints=1`` collapses
+    them into a single gripper coordinate (7 values), the openpi-derived
+    convention this harness has used for PI0.5. ``finger_joints=2`` keeps both
+    (8 values), which is what LeRobot's own LIBERO environment produces and what
+    a checkpoint trained on ``HuggingFaceVLA/libero`` was trained on — π0-FAST's
+    ``observation.state`` statistics are 8 wide, so its policy declares
+    ``state_dim=8`` and the harness builds that vector.
+    """
     gripper = np.asarray(observation["robot0_gripper_qpos"]).reshape(-1)
     if gripper.size != 2:
         raise ValueError(f"robot0_gripper_qpos must have 2 values, got {gripper.size}")
+    if finger_joints not in (1, 2):
+        raise ValueError(f"finger_joints must be 1 or 2, got {finger_joints}")
     return np.concatenate(
         (
             observation["robot0_eef_pos"],
             quat_to_axis_angle(observation["robot0_eef_quat"]),
-            gripper[:1],
+            gripper[:finger_joints],
         )
     ).astype(np.float32, copy=False)
 
@@ -79,13 +90,14 @@ def to_apxinf_observation(
     image_keys: tuple[str, str],
     prompt_key: str,
     state_key: str,
+    finger_joints: int = 1,
 ) -> dict:
     """Convert one raw simulator frame using the evaluation-time convention."""
     images = libero_images(
         observation["agentview_image"],
         observation["robot0_eye_in_hand_image"],
     )
-    state = libero_state(observation)
+    state = libero_state(observation, finger_joints=finger_joints)
     return {
         image_keys[0]: images[0],
         image_keys[1]: images[1],

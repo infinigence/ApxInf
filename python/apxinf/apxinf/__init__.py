@@ -86,6 +86,7 @@ __all__ = [
     "ComposablePolicy",
     # L2 policies
     "Pi05Policy",
+    "Pi0FastPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework
