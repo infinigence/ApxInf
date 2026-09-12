@@ -447,12 +447,15 @@ extern "C" cudaError_t apxinf_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    // One block per row: block-parallel reduction over cols, matching the
+    // rms_norm_bf16 launch policy. The previous per-thread serial reduction
+    // made this the single largest GPU kernel in the vision tower.
+    dim3 grid(rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     layer_norm_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)bias, (__nv_bfloat16*)output,
-        cols, rows, eps);
+        rows, cols, eps);
     return cudaGetLastError();
 }
 

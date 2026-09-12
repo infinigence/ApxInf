@@ -93,33 +93,6 @@ __global__ void rms_norm_bf16_kernel(
 // with normalization along the last axis. Vision blocks have both weight
 // and bias, unlike the text stack's RMSNorm.
 
-__global__ void layer_norm_bf16_kernel(
-    const __nv_bfloat16* input, const __nv_bfloat16* weight,
-    const __nv_bfloat16* bias, __nv_bfloat16* output,
-    uint32_t cols, uint32_t rows, float eps)
-{
-    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t row = blockIdx.y;
-    if (col >= cols || row >= rows) return;
-
-    uint32_t offset = row * cols;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < cols; i++) {
-        sum += __bfloat162float(input[offset + i]);
-    }
-    float mean = sum / (float)cols;
-    float sum_sq = 0.0f;
-    for (uint32_t i = 0; i < cols; i++) {
-        float d = __bfloat162float(input[offset + i]) - mean;
-        sum_sq += d * d;
-    }
-    float inv_std = rsqrtf(sum_sq / (float)cols + eps);
-
-    float x = __bfloat162float(input[offset + col]);
-    float w = __bfloat162float(weight[col]);
-    float b = __bfloat162float(bias[col]);
-    output[offset + col] = __float2bfloat16(w * (x - mean) * inv_std + b);
-}
 
 
 
