@@ -189,6 +189,53 @@ pub fn sdpa(
     let gqa_ratio = n_heads / n_kv_heads;
     let dtype = query.dtype();
     let element_bytes = dtype.size_in_bytes();
+
+    // Fast path: vendor FlashAttention-2 causal prefill for the Qwen3-VL
+    // text tower (BF16, head_dim 128). The KV cache layout is
+    // [n_kv_heads, max_seq, head_dim]; FA2 wants [tokens, n_kv_heads, head_dim],
+    // so gather the valid prefix (two bf16 copy kernels) then call the dense
+    // causal GQA entry. This replaces the three-pass materialized path that
+    // allocated a seq*heads*kv_len score matrix and launched one cuBLAS GEMV
+    // per (head, query). Only the contiguous causal case (kv_offset == 0,
+    // i.e. a fresh prefill over the whole prompt) takes this path; chunked or
+    // continued prefill falls through to the legacy path. Set
+    // APXINF_PREFILL_SDPA_LEGACY=1 to force the legacy path for A/B checks.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    if dtype == DType::BF16
+        && head_dim == 128
+        && kv_offset == 0
+        && kv_len == seq_len
+        && std::env::var_os("APXINF_PREFILL_SDPA_LEGACY").is_none()
+    {
+        let gather = |src: &CudaBuffer| -> Result<CudaBuffer> {
+            let dst = CudaBuffer::alloc_zeros(
+                seq_len * n_kv_heads * head_dim * element_bytes,
+                ctx.device_id(),
+            )
+            .map_err(Error::Cuda)?;
+            unsafe {
+                let res = ffi::apxinf_kv_cache_gather_bf16(
+                    src.ptr(),
+                    dst.ptr(),
+                    seq_len as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_seq_len as u32,
+                    kv_offset,
+                    ctx.stream().handle(),
+                );
+                ffi::check_cuda(res).map_err(Error::Cuda)?;
+            }
+            Ok(dst)
+        };
+        let k_buf = gather(cache.k_buffer(layer_idx))?;
+        let v_buf = gather(cache.v_buffer(layer_idx))?;
+        let kv_shape = Shape::new(vec![seq_len, n_kv_heads, head_dim]);
+        let k_t = make_gpu_tensor(kv_shape.clone(), DType::BF16, ctx.device_id(), k_buf);
+        let v_t = make_gpu_tensor(kv_shape, DType::BF16, ctx.device_id(), v_buf);
+        return causal_gqa_bf16(ctx, &query, &k_t, &v_t, seq_len);
+    }
+
     let scores = CudaBuffer::alloc(seq_len * n_heads * kv_len * element_bytes, ctx.device_id())
         .map_err(Error::Cuda)?;
     let key_cache = cache.k_buffer(layer_idx);
@@ -368,7 +415,12 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
 
 /// Non-causal full attention for the vision tower. Q/K/V each
 /// `[seq, n_heads, head_dim]` bf16; returns `[seq, n_heads * head_dim]`.
-/// head_dim must be 64 (Qwen3-VL-2B vision).
+/// Non-causal full attention for the Qwen3-VL vision tower. Supports any
+/// head_dim (64 for Qwen3-VL-2B/4B, 72 for Qwen3-VL-8B); columns are
+/// distributed cyclically across a 32-thread warp. For head_dim 64 the
+/// default is a 4-warp flash-decoding kernel; set APXINF_VISION_SDPA_LEGACY
+/// to use the original three-pass kernel. head_dim 72 uses the cyclic
+/// three-pass kernel (no 4-warp path).
 pub fn vision(
     ctx: &CudaContext,
     q: &Tensor,
@@ -381,25 +433,76 @@ pub fn vision(
     if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
         return Err(Error::Other("vision_sdpa: only BF16 supported".into()));
     }
-    if head_dim != 64 {
-        return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
+    if head_dim == 0 || head_dim > 256 {
+        return Err(Error::Other("vision_sdpa: head_dim out of range".into()));
     }
+    // Preferred path on Blackwell/sm80/sm100 where the vendored
+    // FlashAttention-2 BF16 forward is compiled: run the whole vision
+    // attention as one tensor-core FA2 kernel. FA2 handles head_dim 64 and
+    // 72 internally (96-tile with even-K masking), so Qwen3-VL 2B/4B (64) and
+    // 8B (72) both go through here. Non-causal, dense heads, contiguous
+    // [seq, n_heads, head_dim] Q/K/V, so no layout gather is needed.
+    // APXINF_VISION_SDPA_LEGACY=1 forces the in-tree multi-warp/scalar path.
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    if std::env::var_os("APXINF_VISION_SDPA_LEGACY").is_none() {
+        let out = fa2_attention(
+            ctx, q, k, v,
+            /*batches*/ 1,
+            /*query_tokens*/ seq_len,
+            /*key_tokens*/ seq_len,
+            /*query_heads*/ n_heads,
+            /*kv_heads*/ n_heads,
+            head_dim,
+        )?;
+        // fa2_attention keeps the 3-D [seq, n_heads, head_dim] shape; the
+        // vision block expects the flattened [seq, n_heads * head_dim].
+        return out.reshape(vec![seq_len, n_heads * head_dim]);
+    }
+
     let device_id = ctx.device_id();
     let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
     let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // 4-warp flash-decoding (register-resident online softmax, no per-query
+    // score buffer) covers head_dim 64 (Qwen3-VL-2B/4B ViT) and head_dim 72
+    // (Qwen3-VL-8B ViT), via two shape-specialized kernels. Other dimensions
+    // use the cyclic single-warp kernel. APXINF_VISION_SDPA_LEGACY=1 forces
+    // the three-pass kernel for numerical A/B comparison.
+    let v3_kind = if std::env::var_os("APXINF_VISION_SDPA_LEGACY").is_some() {
+        0
+    } else if head_dim == 64 {
+        1
+    } else if head_dim == 72 {
+        2
+    } else {
+        0
+    };
     unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
-            gpu_ptr(q)?,
-            gpu_ptr(k)?,
-            gpu_ptr(v)?,
-            out_buf.ptr(),
-            seq_len as u32,
-            n_heads as u32,
-            head_dim as u32,
-            scale,
-            ctx.stream().handle(),
-        );
+        let res = if v3_kind == 1 {
+            ffi::apxinf_vision_sdpa_bf16_v3(
+                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
+                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                ctx.stream().handle(),
+            )
+        } else if v3_kind == 2 {
+            ffi::apxinf_vision_sdpa_bf16_v3_hd72(
+                gpu_ptr(q)?, gpu_ptr(k)?, gpu_ptr(v)?, out_buf.ptr(),
+                seq_len as u32, n_heads as u32, head_dim as u32, scale,
+                ctx.stream().handle(),
+            )
+        } else {
+            ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            )
+        };
         ffi::check_cuda(res).map_err(Error::Cuda)?;
     }
     Ok(make_gpu_tensor(

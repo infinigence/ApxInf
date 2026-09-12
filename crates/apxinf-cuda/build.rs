@@ -102,6 +102,14 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
 
+// Architectures that compile the vendored FlashAttention-2 BF16 forward
+// kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
+// the same v2.7.4 instantiations; the -arch flag selects the real target.
+fn is_fa2_bf16_arch(arch: &str) -> bool {
+    is_fa2_sm80_family(arch)
+        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
+}
+
 fn is_cutlass_sm89_family(arch: &str) -> bool {
     matches!(arch, "sm_89")
 }
@@ -384,7 +392,7 @@ fn main() {
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
             let mut fa2_includes = Vec::new();
-            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
+            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_bf16_arch);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
             if fa2_sm80 || fa2_f16_sm100 {
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
