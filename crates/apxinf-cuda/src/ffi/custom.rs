@@ -1054,6 +1054,16 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    pub fn apxinf_kv_cache_gather_bf16(
+        src: *const c_void,
+        dst: *mut c_void,
+        tokens: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        max_seq_len: u32,
+        kv_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_flash_attn_decode_bf16(
         q: *const c_void,
         k_cache: *const c_void,
@@ -1142,6 +1152,32 @@ extern "C" {
     ) -> cudaError_t;
 
     pub fn apxinf_vision_sdpa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+
+    pub fn apxinf_vision_sdpa_bf16_v3(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        seq_len: u32,
+        n_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+
+    pub fn apxinf_vision_sdpa_bf16_v3_hd72(
         q: *const c_void,
         k: *const c_void,
         v: *const c_void,
