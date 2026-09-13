@@ -139,24 +139,6 @@ fn cache_view(cache: &Tensor, kv_len: usize) -> Result<Tensor> {
         .map_err(Error::Cuda)
 }
 
-// TEMP-DIAG (implement_r3 / synthesis_r3, folded A2): hidden-row {0, rows-1} l2 pair for
-// the layer_delta probe; revert in the acceptance-bound revision.
-fn hidden_row_l2_pair(hidden: &Tensor) -> Result<(f64, f64)> {
-    let dims = hidden.shape().dims().to_vec();
-    let width = *dims.last().unwrap_or(&1);
-    let rows = hidden.numel() / width.max(1);
-    let row_bytes = width * DType::BF16.size_in_bytes();
-    let buf = DeviceBuffer::from_tensor(hidden).map_err(Error::Cuda)?;
-    let l2_row = |row: usize| -> Result<f64> {
-        let view = buf.view(row * row_bytes, row_bytes).map_err(Error::Cuda)?;
-        let rt = view.as_tensor(Shape::new(vec![1, width]), DType::BF16).map_err(Error::Cuda)?;
-        let vals = transfers::to_cpu(&rt)?.to_f32_vec()
-            .map_err(|e| Error::Other(format!("qwen_drive layer_delta: {e}")))?;
-        Ok(vals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt())
-    };
-    Ok((l2_row(0)?, l2_row(rows - 1)?))
-}
-
 enum LayerCache {
     FullAttention { k: Tensor, v: Tensor },
     Gdn {
@@ -468,57 +450,6 @@ impl QwenDriveModel {
         Ok(out)
     }
 
-    // TEMP-DIAG (implement_r19): full-stack echo-margin trajectory lens (lens_trajectory_r17) --
-    // applies the model's own final readout (rms_norm_plus1 + lm_head) to the last 3 hidden
-    // rows at one site, returning one digest line with per-row top-2 + own-token logit and the
-    // pre-norm row l2 values; the k=31 site is the same computation as the final readout
-    // (probe-validity gate) and the lens l2 must equal the live hidden_norm l2 (probe-bug
-    // detector); digest-routed so every value lands inside the 80-line capture window; revert
-    // in the acceptance-bound revision.
-    fn shiftlens_probe(&self, hidden: &Tensor, tail3: &[u32; 3], k_tag: &str, kind: &str) -> Result<String> {
-        let dims = hidden.shape().dims().to_vec();
-        let width = *dims.last().unwrap_or(&1);
-        let rows = hidden.numel() / width.max(1);
-        if rows < 3 {
-            return Ok(format!("[qwen_drive] shiftlens k={k_tag} kind={kind} rows={rows} (skipped: rows < 3)"));
-        }
-        let row_bytes = width * DType::BF16.size_in_bytes();
-        let hbuf = DeviceBuffer::from_tensor(hidden).map_err(Error::Cuda)?;
-        let slab = hbuf.view((rows - 3) * row_bytes, 3 * row_bytes).map_err(Error::Cuda)?;
-        let slab_t = slab.as_tensor(Shape::new(vec![3, width]), DType::BF16).map_err(Error::Cuda)?;
-        let hvals = transfers::to_cpu(&slab_t)?.to_f32_vec()
-            .map_err(|e| Error::Other(format!("qwen_drive shiftlens l2: {e}")))?;
-        let mut l2s: Vec<f64> = Vec::new();
-        for r in 0..3usize {
-            l2s.push(hvals[r * width..(r + 1) * width].iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt());
-        }
-        let lens_normed = la::rms_norm_plus1(self.ctx(), &slab_t, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
-        let lens_logits = self.lm_head(&lens_normed)?;
-        let vocab = self.config.text.vocab_size;
-        let lvals = transfers::to_cpu(&lens_logits)?.to_f32_vec()
-            .map_err(|e| Error::Other(format!("qwen_drive shiftlens: {e}")))?;
-        let mut cells: Vec<(u32, f32, u32, f32, f32)> = Vec::new();
-        for r in 0..3usize {
-            let row = &lvals[r * vocab..(r + 1) * vocab];
-            let mut best: (u32, f32) = (0, f32::NEG_INFINITY);
-            let mut runner: (u32, f32) = (0, f32::NEG_INFINITY);
-            for (idx, &value) in row.iter().enumerate() {
-                if value > best.1 {
-                    runner = best;
-                    best = (idx as u32, value);
-                } else if value > runner.1 {
-                    runner = (idx as u32, value);
-                }
-            }
-            cells.push((best.0, best.1, runner.0, runner.1, row[tail3[r] as usize]));
-        }
-        // r16 row convention: rowN1 = last hidden row (slab row 2, own token tail3[2]),
-        // rowN2 = slab row 1 (tail3[1]), rowN3 = slab row 0 (tail3[0]); l2 in the same order.
-        Ok(format!(
-            "[qwen_drive] shiftlens k={} kind={} rowN1={:?} rowN2={:?} rowN3={:?} l2=({:.4},{:.4},{:.4})",
-            k_tag, kind, cells[2], cells[1], cells[0], l2s[2], l2s[1], l2s[0]))
-    }
-
     fn forward_mlp(&self, x: Tensor, post_norm: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, trace: bool) -> Result<Tensor> {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
@@ -741,34 +672,6 @@ impl QwenDriveModel {
             )?;
         }
         if layer_idx == 0 && seq > 1 { trace_rows("text0_core", &gdn_out)?; }
-        // TEMP-DIAG (implement_r16): GDN layer-0 zero-history fingerprint (shift_gdn_r15 P2) --
-        // row 0 is the unique zero-history row: correct math yields a finite normal-magnitude
-        // row, while ANY one-position-lag mechanism (conv window, T-diagonal exclusion, lagged
-        // prep) forces gdn_out row 0 to exactly 0; the conv_out row-0 companion splits
-        // conv-window lag from diagonal-exclusion. Digest-routed (a live print here would sit
-        // above the 80-line capture window); revert in the acceptance-bound revision.
-        if layer_idx == 0 && seq > 1 {
-            let gbuf = DeviceBuffer::from_tensor(&gdn_out).map_err(Error::Cuda)?;
-            let gview = gbuf.view(0, 2 * value_dim * DType::BF16.size_in_bytes()).map_err(Error::Cuda)?;
-            let gt = gview.as_tensor(Shape::new(vec![2, value_dim]), DType::BF16).map_err(Error::Cuda)?;
-            let gvals = transfers::to_cpu(&gt)?.to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive gdn_row: {e}")))?;
-            let gl2 = |r: usize| -> f64 {
-                gvals[r * value_dim..(r + 1) * value_dim].iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt()
-            };
-            let g_line0 = format!("[qwen_drive] gdn_row0 l2={:.4} first4={:?}", gl2(0), &gvals[..gvals.len().min(4)]);
-            let g_line1 = format!("[qwen_drive] gdn_row1 l2={:.4} first4={:?}", gl2(1), &gvals[value_dim..value_dim + 4]);
-            let cbuf = DeviceBuffer::from_tensor(&conv_out).map_err(Error::Cuda)?;
-            let cview = cbuf.view(0, conv_dim * DType::BF16.size_in_bytes()).map_err(Error::Cuda)?;
-            let ct = cview.as_tensor(Shape::new(vec![1, conv_dim]), DType::BF16).map_err(Error::Cuda)?;
-            let cvals = transfers::to_cpu(&ct)?.to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive conv_row: {e}")))?;
-            let cl2: f64 = cvals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
-            let c_line = format!("[qwen_drive] conv_row0 l2={:.4} first4={:?}", cl2, &cvals[..cvals.len().min(4)]);
-            self.diag_digest.push(g_line0);
-            self.diag_digest.push(g_line1);
-            self.diag_digest.push(c_line);
-        }
         let gated = la::gated_rms_silu(
             ctx,
             &gdn_out.reshape(vec![seq * num_v_heads, head_v])?,
@@ -791,7 +694,7 @@ impl QwenDriveModel {
 
     /// Run the text transformer over one token span, appending to the hybrid
     /// cache. `positions` is the per-token mRoPE position triple.
-    fn run_text(&mut self, x: Tensor, positions: &[[u32; 3]], probe_tail3: Option<[u32; 3]>) -> Result<Tensor> {
+    fn run_text(&mut self, x: Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
         let seq = positions.len();
         if seq == 0 {
             return Err(Error::Other("qwen_drive: empty forward span".into()));
@@ -800,15 +703,6 @@ impl QwenDriveModel {
         self.last_position = last[0].max(last[1]).max(last[2]) as i64;
         let (cos, sin) = self.mrope_tables(positions)?;
         let mut hidden = x;
-        // TEMP-DIAG (implement_r19): pre-stack echo-margin lens site k=pre (the assembled
-        // embedding/scatter output before layer 0); digest-routed; revert in the
-        // acceptance-bound revision.
-        if seq > 1 {
-            if let Some(t3) = probe_tail3 {
-                let line = self.shiftlens_probe(&hidden, &t3, "pre", "embed")?;
-                self.diag_digest.push(line);
-            }
-        }
         // TEMP-DIAG (implement_r10): per-layer ms attribution for the measured 43.37s
         // prefill (over the ~29s/inference allowance); ms_since_prev on line k ~= layer
         // k-1's duration; revert in the acceptance-bound revision.
@@ -826,57 +720,12 @@ impl QwenDriveModel {
                 eprintln!("[qwen_drive] prefill_layer k={} kind={} ms_since_prev={:.1}", layer_idx, if is_full { "full" } else { "gdn" }, layer_t0.elapsed().as_secs_f64() * 1000.0);
             }
             layer_t0 = std::time::Instant::now();
-            // TEMP-DIAG (implement_r3 / synthesis_r3, folded A2): mixer-delta probe -- hidden
-            // rows {0, rows-1} l2 before/after layers {2(gdn),3(full),30(gdn),31(full)};
-            // digest-routed; revert in the acceptance-bound revision.
-            let layer_delta_probe = seq > 1 && matches!(layer_idx, 2 | 3 | 30 | 31);
-            let pre_l2 = if layer_delta_probe { Some(hidden_row_l2_pair(&hidden)?) } else { None };
             hidden = if is_full {
                 self.forward_full_attention(hidden, layer_idx, &cos, &sin, seq)?
             } else {
                 self.forward_gdn(hidden, layer_idx, seq)?
             };
             if seq > 1 { trace_rows(&format!("model_language_model_layers_{layer_idx}"), &hidden)?; }
-            if let Some((pre0, pre1)) = pre_l2 {
-                let (post0, post1) = hidden_row_l2_pair(&hidden)?;
-                self.diag_digest.push(format!(
-                    "[qwen_drive] layer_delta k={} kind={} row0 {:.4}->{:.4} rowN1 {:.4}->{:.4}",
-                    layer_idx, if is_full { "full" } else { "gdn" }, pre0, post0, pre1, post1));
-            }
-            // TEMP-DIAG (implement_r12): per-layer prefill hidden-row norm fingerprint; the first
-            // anomalous k names the corrupting layer; revert in the acceptance-bound revision.
-            if seq > 1 {
-                let dims = hidden.shape().dims().to_vec();
-                let width = *dims.last().unwrap_or(&1);
-                let rows = hidden.numel() / width.max(1);
-                let row_bytes = width * DType::BF16.size_in_bytes();
-                let buf = DeviceBuffer::from_tensor(&hidden).map_err(Error::Cuda)?;
-                let view = buf.view((rows - 1) * row_bytes, row_bytes).map_err(Error::Cuda)?;
-                let row_t = view.as_tensor(Shape::new(vec![1, width]), DType::BF16).map_err(Error::Cuda)?;
-                let vals = transfers::to_cpu(&row_t)?.to_f32_vec()
-                    .map_err(|e| Error::Other(format!("qwen_drive hidden_norm: {e}")))?;
-                let l2: f64 = vals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
-                let mean: f64 = vals.iter().map(|&v| v as f64).sum::<f64>() / vals.len().max(1) as f64;
-                eprintln!("[qwen_drive] hidden_norm k={} kind={} l2={:.4} mean={:.6} first2={:?}",
-                    layer_idx, if is_full { "full" } else { "gdn" }, l2, mean, &vals[..vals.len().min(2)]);
-                // TEMP-DIAG (implement_r13): capture k=0 and the final layer for the digest
-                // re-emission inside the capture window (same format as the live marker).
-                if layer_idx == 0 || layer_idx + 1 == self.config.text.n_layers {
-                    self.diag_digest.push(format!("[qwen_drive] hidden_norm k={} kind={} l2={:.4} mean={:.6} first2={:?}",
-                        layer_idx, if is_full { "full" } else { "gdn" }, l2, mean, &vals[..vals.len().min(2)]));
-                }
-            }
-            // TEMP-DIAG (implement_r19, thinned at successor implement_r5 / synthesis_r4): the
-            // 33-site erosion trajectory is a settled receipt; keep only the final-layer site
-            // here (k=31) -- with the k=pre site before the layer loop it preserves the
-            // probe-validity gate pair (lens l2 == hidden_norm l2); the 'shiftlens k=' prefix
-            // and tuple format are unchanged; revert in the acceptance-bound revision.
-            if seq > 1 && layer_idx + 1 == self.config.text.n_layers {
-                if let Some(t3) = probe_tail3 {
-                    let line = self.shiftlens_probe(&hidden, &t3, &layer_idx.to_string(), if is_full { "full" } else { "gdn" })?;
-                    self.diag_digest.push(line);
-                }
-            }
         }
         self.cache_len += seq;
         let normed = la::rms_norm_plus1(self.ctx(), &hidden, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
@@ -972,100 +821,12 @@ impl QwenDriveModel {
             }
             let row_map_dev = upload_u32(self.ctx(), &row_map)?;
             x = elementwise::replace_rows_bf16(self.ctx(), &x, vis_primary, &row_map_dev)?; // TEMP-DIAG (implement_r13): scatter source retargeted to the (possibly ablated) tensor
-            // TEMP-DIAG (implement_r3 / synthesis_r3 A1 discriminator): post-scatter row
-            // readback -- row 0 (text control) and the first image row; under true vision
-            // rimg_first4 must equal the vis_fp row0 fingerprint; digest-routed; revert in
-            // the acceptance-bound revision.
-            {
-                let dims = x.shape().dims().to_vec();
-                let width = *dims.last().unwrap_or(&1);
-                let row_bytes = width * DType::BF16.size_in_bytes();
-                let xbuf = DeviceBuffer::from_tensor(&x).map_err(Error::Cuda)?;
-                let read_row = |row: usize| -> Result<(f64, Vec<f32>)> {
-                    let view = xbuf.view(row * row_bytes, row_bytes).map_err(Error::Cuda)?;
-                    let rt = view.as_tensor(Shape::new(vec![1, width]), DType::BF16).map_err(Error::Cuda)?;
-                    let vals = transfers::to_cpu(&rt)?.to_f32_vec()
-                        .map_err(|e| Error::Other(format!("qwen_drive scatter_rows: {e}")))?;
-                    let l2: f64 = vals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
-                    Ok((l2, vals[..vals.len().min(4)].to_vec()))
-                };
-                let (r0_l2, r0_first4) = read_row(0)?;
-                if let Some(img_row) = token_ids.iter().position(|&token| token == image_tok) {
-                    let (rimg_l2, rimg_first4) = read_row(img_row)?;
-                    self.diag_digest.push(format!(
-                        "[qwen_drive] scatter_rows r0_l2={:.4} r0_first4={:?} rimg={} rimg_l2={:.4} rimg_first4={:?}",
-                        r0_l2, r0_first4, img_row, rimg_l2, rimg_first4));
-                }
-            }
-            // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 3 L6): pre-merger frame-0
-            // localization leg -- one ~7.1MB readback of the vis.pre_merger frame-0 slice;
-            // degenerate pre_merger => tower, diverse => merger chain; digest-routed; revert in
-            // the acceptance-bound revision.
-            {
-                let pdims = vis.pre_merger.shape().dims().to_vec();
-                let pwidth = *pdims.last().unwrap_or(&1);
-                let pframe = grid_thw
-                    .first()
-                    .map(|g| (g[0] as usize) * (g[1] as usize) * (g[2] as usize))
-                    .unwrap_or(0)
-                    .min(pdims[0]);
-                if pframe > 0 && pwidth >= 4 {
-                    let pbuf = DeviceBuffer::from_tensor(&vis.pre_merger).map_err(Error::Cuda)?;
-                    let pview = pbuf.view(0, pframe * pwidth * DType::BF16.size_in_bytes()).map_err(Error::Cuda)?;
-                    let pt = pview.as_tensor(Shape::new(vec![pframe, pwidth]), DType::BF16).map_err(Error::Cuda)?;
-                    let pvals = transfers::to_cpu(&pt)?.to_f32_vec()
-                        .map_err(|e| Error::Other(format!("qwen_drive vis_premerge: {e}")))?;
-                    let mut pl2: Vec<f64> = Vec::with_capacity(pframe);
-                    for r in 0..pframe {
-                        let row = &pvals[r * pwidth..(r + 1) * pwidth];
-                        pl2.push(row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt());
-                    }
-                    let mut pl2s = pl2.clone();
-                    pl2s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let pmean = pl2.iter().sum::<f64>() / pl2.len().max(1) as f64;
-                    let mut row_parts: Vec<String> = Vec::new();
-                    for &r in &[0usize, 867, 1736, 2603, 3471] {
-                        let r = r.min(pframe - 1);
-                        row_parts.push(format!("r{}={:?}", r, &pvals[r * pwidth..r * pwidth + 4]));
-                    }
-                    self.diag_digest.push(format!(
-                        "[qwen_drive] vis_premerge l2=[{:.4},{:.4},{:.4}] {}",
-                        pl2s[0], pl2s[pl2s.len() - 1], pmean, row_parts.join(" ")));
-                }
-            }
             // TEMP-DIAG (implement_r2): image-embedding scatter completion marker; revert in the acceptance-bound revision.
             eprintln!("[qwen_drive] embed_scatter_done");
             grid_thw
         } else {
             empty_grids
         };
-        // TEMP-DIAG (implement_r15): input-assembly row-alignment discriminator. The r14
-        // logits_tail3 sweep measured a per-row one-position content shift (row i argmaxes
-        // token_ids[i]); the prompt tail carries repeated ids (198 at N-1/N-4, 279 at
-        // N-9/N-13), so under a row-aligned embed+scatter the assembled rows of equal ids
-        // are bit-identical while a one-position shift makes them differ. Digest-routed (a
-        // live print here would sit above the 80-line capture window); revert in the
-        // acceptance-bound revision.
-        if token_ids.len() >= 16 {
-            let n = token_ids.len();
-            let dims = x.shape().dims().to_vec();
-            let width = *dims.last().unwrap_or(&1);
-            let row_bytes = width * DType::BF16.size_in_bytes();
-            let xbuf = DeviceBuffer::from_tensor(&x).map_err(Error::Cuda)?;
-            let slab = xbuf.view((n - 16) * row_bytes, 16 * row_bytes).map_err(Error::Cuda)?;
-            let slab_t = slab.as_tensor(Shape::new(vec![16, width]), DType::BF16).map_err(Error::Cuda)?;
-            let vals = transfers::to_cpu(&slab_t)?.to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive embed_pair: {e}")))?;
-            let max_diff = |a: usize, b: usize| -> f32 {
-                let (ra, rb) = (&vals[a * width..(a + 1) * width], &vals[b * width..(b + 1) * width]);
-                ra.iter().zip(rb.iter()).fold(0.0f32, |m, (u, v)| m.max((u - v).abs()))
-            };
-            let (d198, d279) = (max_diff(15, 12), max_diff(7, 3));
-            self.diag_digest.push(format!(
-                "[qwen_drive] embed_pair n={} ids=({},{},{},{}) eq_198={} eq_279={} maxdiff_198={:.6} maxdiff_279={:.6}",
-                n, token_ids[n - 1], token_ids[n - 4], token_ids[n - 9], token_ids[n - 13],
-                d198 == 0.0, d279 == 0.0, d198, d279));
-        }
         let positions = self.rope_index(token_ids, grids)?;
         let max_pos = positions
             .iter()
@@ -1080,14 +841,6 @@ impl QwenDriveModel {
         if self.cache_len + token_ids.len() > self.max_seq_len {
             return Err(Error::Other("qwen_drive: prompt exceeds the cache capacity".into()));
         }
-        // TEMP-DIAG (implement_r19): last-3 prompt ids for the echo-margin lens own-token
-        // logits (token N-1/N-2/N-3 at the measured prompt); revert in the acceptance-bound
-        // revision.
-        let probe_tail3 = if token_ids.len() >= 3 {
-            Some([token_ids[token_ids.len() - 3], token_ids[token_ids.len() - 2], token_ids[token_ids.len() - 1]])
-        } else {
-            None
-        };
         // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2 support): publish the
         // per-row segment map (1=prefix-text, 2=image, 3=vision-marker, 4=tail-text) for the
         // attn_mix probe's token-id-driven segment masses; revert in the acceptance-bound revision.
@@ -1113,7 +866,7 @@ impl QwenDriveModel {
                 .collect();
             attention::set_attn_seg_map(seg_map);
         }
-        self.run_text(x, &positions, probe_tail3)
+        self.run_text(x, &positions)
     }
 
     /// Continuation/decode forward over already-tokenized ids.
@@ -1131,7 +884,7 @@ impl QwenDriveModel {
             })
             .collect();
         let x = self.embed_tokens(token_ids)?;
-        self.run_text(x, &positions, None)
+        self.run_text(x, &positions)
     }
 
     fn scene_caches(&self) -> Result<Vec<(Tensor, Tensor)>> {
@@ -1188,83 +941,10 @@ impl QwenDriveModel {
         for line in vision::take_vision_diag_lines() {
             self.diag_digest.push(line);
         }
-        // TEMP-DIAG (implement_final_r20): intrinsic self-similarity floor calibration --
-        // lm_head over bare rms_norm_plus1'd embedding rows for a bounded id sample
-        // (5 key ids + prompt-tail unique ids + 24 fixed-stride ids). Bisects the residual
-        // echo-repair classes: F1 self_argmax ~= n with +30-class margins => the k=pre +35
-        // echo is the tied table's intrinsic floor (stack content-strength convicted) vs F2
-        // id 198's margin anomalous => embedding content/scale defect. Read-only on
-        // weights; ~30ms-class cost lands in the post-prefill window; digest-routed
-        // (captured 43 -> 49, header ~64th-from-end, in-window); revert in the
-        // acceptance-bound revision.
-        {
-            let vocab = self.config.text.vocab_size;
-            let mut sample: Vec<u32> = vec![198, 220, 266, 74455, 248045];
-            for &id in &token_ids[token_ids.len().saturating_sub(16)..] {
-                if !sample.contains(&id) {
-                    sample.push(id);
-                }
-            }
-            for i in 0..24u64 {
-                let id = ((i * 10301) % (vocab as u64)) as u32;
-                if !sample.contains(&id) {
-                    sample.push(id);
-                }
-            }
-            let k = sample.len();
-            let ids_dev = upload_u32(self.ctx(), &sample)?;
-            let emb = embedding::lookup(self.ctx(), &self.weights.embed_tokens, &ids_dev, k)?;
-            let normed = la::rms_norm_plus1(self.ctx(), &emb, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
-            let lens = self.lm_head(&normed)?;
-            let lbuf = DeviceBuffer::from_tensor(&lens).map_err(Error::Cuda)?;
-            let lview = lbuf.view(0, k * vocab * DType::BF16.size_in_bytes()).map_err(Error::Cuda)?;
-            let lt = lview.as_tensor(Shape::new(vec![k, vocab]), DType::BF16).map_err(Error::Cuda)?;
-            let lvals = transfers::to_cpu(&lt)?.to_f32_vec()
-                .map_err(|e| Error::Other(format!("qwen_drive floor_sample: {e}")))?;
-            let key_ids = [198u32, 220, 266, 74455, 248045];
-            let mut self_argmax = 0usize;
-            let mut margins: Vec<f32> = Vec::with_capacity(k);
-            let mut key_lines: Vec<String> = Vec::new();
-            for (i, &id) in sample.iter().enumerate() {
-                let row = &lvals[i * vocab..(i + 1) * vocab];
-                let self_logit = row[id as usize];
-                let mut best: (u32, f32) = (0, f32::NEG_INFINITY);
-                let mut runner: (u32, f32) = (0, f32::NEG_INFINITY);
-                for (j, &value) in row.iter().enumerate() {
-                    if value > best.1 {
-                        runner = best;
-                        best = (j as u32, value);
-                    } else if value > runner.1 {
-                        runner = (j as u32, value);
-                    }
-                }
-                if best.0 == id {
-                    self_argmax += 1;
-                }
-                margins.push(self_logit - runner.1);
-                if key_ids.contains(&id) {
-                    key_lines.push(format!(
-                        "[qwen_drive] floor_key id={} self={:.3} top=({},{:.3}) runner=({},{:.3})",
-                        id, self_logit, best.0, best.1, runner.0, runner.1));
-                }
-            }
-            margins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = margins[margins.len() / 2];
-            self.diag_digest.push(format!(
-                "[qwen_drive] floor_sample n={} self_argmax={} median_self_margin={:.3} max={:.3} min={:.3}",
-                k, self_argmax, median, margins[margins.len() - 1], margins[0]));
-            for line in key_lines {
-                self.diag_digest.push(line);
-            }
-        }
         let mut diag_last_step = std::time::Instant::now();
         let eos_dev = upload_u32(self.ctx(), eos_token_ids)?;
         let mut generated = Vec::new();
         let mut diag_eos = false;
-        // Opt-in readback at the first divergent decode step. Sampling and
-        // generated token history are unchanged by this diagnostic.
-        let trace_decode_step = std::env::var("APXINF_QWEN_TRACE_DECODE_STEP")
-            .ok().and_then(|value| value.parse::<usize>().ok());
         for step in 0..max_new_tokens {
             if step < min_new_tokens {
                 let row = logits.shape().dims()[0] - 1;
@@ -1272,156 +952,6 @@ impl QwenDriveModel {
             }
             let sample = sampler.sample(NextTokenLogits::last(&logits, self.config.text.vocab_size)?)?;
             generated.push(sample.token_id);
-            // TEMP-DIAG (implement_r11): first-token logits fingerprint (top-8 ids+values, row
-            // max/min) — the single discriminating observation for the constant-token-198 defect;
-            // one ~0.5MB readback + one device sync per generate() call; revert in the
-            // acceptance-bound revision. Extended at successor-mission implement_r2 (synthesis_r2
-            // directive): fires at step 0 AND step 1 (step-1 top1 separates strict lag from echo)
-            // and, at successor-mission implement_r5, is complemented by the digest-routed row_health sweep (the r2 logits_rows line was subsumed and removed).
-            if step == 0 || step == 1 || trace_decode_step == Some(step) {
-                let vocab = self.config.text.vocab_size;
-                let rows = logits.numel() / vocab;
-                let row_bytes = vocab * DType::BF16.size_in_bytes();
-                let logits_buf = DeviceBuffer::from_tensor(&logits).map_err(Error::Cuda)?;
-                let row_view = logits_buf.view((rows - 1) * row_bytes, row_bytes).map_err(Error::Cuda)?;
-                let row_tensor = row_view.as_tensor(Shape::new(vec![1, vocab]), DType::BF16).map_err(Error::Cuda)?;
-                let row_cpu = transfers::to_cpu(&row_tensor)?;
-                let values = row_cpu.to_f32_vec().map_err(|e| Error::Other(format!("qwen_drive logits_top8: {e}")))?;
-                let mut top8: Vec<(u32, f32)> = Vec::new();
-                let mut row_min = f32::INFINITY;
-                let mut row_max = f32::NEG_INFINITY;
-                for (idx, &value) in values.iter().enumerate() {
-                    row_min = row_min.min(value);
-                    row_max = row_max.max(value);
-                    if top8.len() < 8 || value > top8[7].1 {
-                        top8.push((idx as u32, value));
-                        top8.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                        top8.truncate(8);
-                    }
-                }
-                eprintln!("[qwen_drive] logits_top8 step={} rows={} max={:.4} min={:.4} top8={:?}", step, rows, row_max, row_min, top8);
-                // TEMP-DIAG (implement_r14): logits-row argmax sweep over rows N-1/N-2/N-3
-                // (reuses the r11 row-readback idiom; two extra ~0.5MB readbacks at step 0
-                // only; successor implement_r2: step-1 decode logits hold a single row, so the
-                // sweep is guarded to rows>=3 and skipped at step 1); revert in the
-                // acceptance-bound revision.
-                if rows >= 3 {
-                let mut tail: Vec<Vec<(u32, f32)>> = Vec::new();
-                for back in 1..=2usize {
-                    let row_view = logits_buf.view((rows - 1 - back) * row_bytes, row_bytes).map_err(Error::Cuda)?;
-                    let row_tensor = row_view.as_tensor(Shape::new(vec![1, vocab]), DType::BF16).map_err(Error::Cuda)?;
-                    let row_cpu = transfers::to_cpu(&row_tensor)?;
-                    let values = row_cpu.to_f32_vec().map_err(|e| Error::Other(format!("qwen_drive logits_tail3: {e}")))?;
-                    let mut top3: Vec<(u32, f32)> = Vec::new();
-                    for (idx, &value) in values.iter().enumerate() {
-                        if top3.len() < 3 || value > top3[2].1 {
-                            top3.push((idx as u32, value));
-                            top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                            top3.truncate(3);
-                        }
-                    }
-                    tail.push(top3);
-                }
-                eprintln!("[qwen_drive] logits_tail3 step={} rows={} n1={:?} n2_top3={:?} n3_top3={:?}", step, rows, top8[0], tail[0], tail[1]);
-                }
-                // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 1): row_health 64-row
-                // step-0 teacher-forced sweep, digest-routed as 4 lines (pre/mid/tail/aggregate).
-                // Rows: dense 0..=25, the self-describing vision-marker ladder (token_ids in
-                // {vision_start, vision_end}), tail rows-16..rows-1, deduped; per row
-                // (row, own_id, own_logit, top1_id, top1_logit, next_id, next_logit, flag) with
-                // flag precedence D(own==next) > H(top1==next) > E(top1==own) > O; the aggregate
-                // line reports hit/echo/other/degen counts plus first_break row/kind/region.
-                // Replaces the subsumed r2 logits_rows sweep; revert in the acceptance-bound revision.
-                if step == 0 && rows > 16 {
-                    let vs_tok = self.config.vision_start_token_id;
-                    let ve_tok = self.config.vision_end_token_id;
-                    let img_tok = self.config.image_token_id;
-                    let last_img = token_ids.iter().rposition(|&tok| tok == img_tok).unwrap_or(0);
-                    let mut sweep_rows: Vec<usize> = (0..=25usize).collect();
-                    for (r, &tok) in token_ids.iter().enumerate().take(rows) {
-                        if tok == vs_tok || tok == ve_tok {
-                            sweep_rows.push(r);
-                        }
-                    }
-                    for row in (rows - 16)..rows {
-                        sweep_rows.push(row);
-                    }
-                    sweep_rows.sort_unstable();
-                    sweep_rows.dedup();
-                    let mut pre_txt: Vec<String> = Vec::new();
-                    let mut mid_txt: Vec<String> = Vec::new();
-                    let mut tail_txt: Vec<String> = Vec::new();
-                    let (mut hit, mut echo, mut other, mut degen) = (0usize, 0usize, 0usize, 0usize);
-                    let mut first_break: Option<(usize, char)> = None;
-                    for &row in &sweep_rows {
-                        let row_view = logits_buf.view(row * row_bytes, row_bytes).map_err(Error::Cuda)?;
-                        let row_tensor = row_view.as_tensor(Shape::new(vec![1, vocab]), DType::BF16).map_err(Error::Cuda)?;
-                        let row_cpu = transfers::to_cpu(&row_tensor)?;
-                        let values = row_cpu.to_f32_vec().map_err(|e| Error::Other(format!("qwen_drive row_health: {e}")))?;
-                        let mut top1: (u32, f32) = (0, f32::NEG_INFINITY);
-                        for (idx, &value) in values.iter().enumerate() {
-                            if value > top1.1 {
-                                top1 = (idx as u32, value);
-                            }
-                        }
-                        let own_id = token_ids.get(row).copied().unwrap_or(0);
-                        let next_id = token_ids.get(row + 1).copied();
-                        let own_logit = values[own_id as usize];
-                        let next_logit = next_id.map(|id| values[id as usize]).unwrap_or(f32::NAN);
-                        let flag = if next_id == Some(own_id) {
-                            'D'
-                        } else if next_id == Some(top1.0) {
-                            'H'
-                        } else if top1.0 == own_id {
-                            'E'
-                        } else {
-                            'O'
-                        };
-                        match flag {
-                            'H' => hit += 1,
-                            'E' => echo += 1,
-                            'D' => degen += 1,
-                            _ => other += 1,
-                        }
-                        if (flag == 'E' || flag == 'O') && first_break.is_none() {
-                            first_break = Some((row, flag));
-                        }
-                        let part = format!(
-                            "({},{},{:.4},{},{:.4},{},{:.4},{})",
-                            row,
-                            own_id,
-                            own_logit,
-                            top1.0,
-                            top1.1,
-                            next_id.map(|id| id.to_string()).unwrap_or_else(|| "na".to_string()),
-                            next_logit,
-                            flag,
-                        );
-                        if row <= 25 {
-                            pre_txt.push(part);
-                        } else if row >= rows - 16 {
-                            tail_txt.push(part);
-                        } else {
-                            mid_txt.push(part);
-                        }
-                    }
-                    let (fb_row, fb_kind) = first_break
-                        .map(|(r, f)| (r.to_string(), f.to_string()))
-                        .unwrap_or_else(|| ("none".to_string(), "none".to_string()));
-                    let fb_region = match first_break {
-                        None => "none",
-                        Some((r, _)) if r < 4 => "prefix",
-                        Some((r, _)) if r > last_img => "tail",
-                        Some(_) => "marker",
-                    };
-                    self.diag_digest.push(format!("[qwen_drive] row_health_pre step=0 [{}]", pre_txt.join(" ")));
-                    self.diag_digest.push(format!("[qwen_drive] row_health_mid step=0 [{}]", mid_txt.join(" ")));
-                    self.diag_digest.push(format!("[qwen_drive] row_health_tail step=0 [{}]", tail_txt.join(" ")));
-                    self.diag_digest.push(format!(
-                        "[qwen_drive] row_health step=0 probed={} hit={} echo={} other={} degen={} first_break={} kind={} region={}",
-                        sweep_rows.len(), hit, echo, other, degen, fb_row, fb_kind, fb_region));
-                }
-            }
             // TEMP-DIAG (implement_r1): heartbeat at step 0 and every 25 steps; revert in the acceptance-bound revision.
             if step % 25 == 0 {
                 eprintln!("[qwen_drive] decode_step k={} token_id={} ms_since_last={:.1}", step, sample.token_id, diag_last_step.elapsed().as_secs_f64() * 1000.0);
