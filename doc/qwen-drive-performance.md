@@ -16,3 +16,14 @@ Workload: four fixed public VQA scenes, batch 1, BF16, exactly 64 generated toke
 Geometric mean speedup: 1.023421x (approximately 2.29 percent latency reduction). All requests met the fixed output count. The 1.05x performance target is not reached; optimization continues. No claim applies to full-length generation, direct/reasoning/perception, throughput under concurrency, or general serving.
 
 The installed Nsight Systems 2023.3.1 failed processing a separate profiler attempt and exported no CUDA kernel records; its partial API statistics are invalid for attribution. The timing result above comes from the independent no-profiler benchmark.
+
+
+## Follow-up repeat: initial gain not reproduced
+
+A subsequent baseline-then-candidate batch with the same workload measured
+baseline medians [3.676311, 3.705151, 3.687875, 3.674581] seconds and candidate
+medians [3.673305, 3.677313, 3.680310, 3.686379] seconds. Paired geometric mean
+speedup was only 1.001804x; scene 3 slightly regressed. The initial 1.023421x
+observation is therefore not a replicated speedup. Treat diagnostic removal as
+code/work reduction with uncertain timing benefit, and continue optimization.
+Do not publish a stable 2.3 percent gain claim.
