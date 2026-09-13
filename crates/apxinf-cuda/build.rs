@@ -119,6 +119,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=APXINF_FA2_TRIM_UNUSED");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
@@ -545,6 +546,33 @@ fn main() {
                             cmd.arg("-DAPXINF_FA2_SM80=1");
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
+                        // Drop the FlashAttention-2 feature axes this adapter never
+                        // reaches. `fill_params` value-initializes the parameter block
+                        // and then leaves `alibi_slopes_ptr` null and `softcap` zero;
+                        // dropout is pinned to the keep-everything encoding
+                        // (`p_dropout == 1.0`, `rp_dropout == 1.0`); and the window is
+                        // either fully open (-1/-1) or causal (right == 0), so the
+                        // kernels' `Is_local` is never taken. Each macro removes one
+                        // bool template axis, and the instantiations are the product of
+                        // those axes, so the four together cut ptxas work by up to 16x.
+                        //
+                        // This matters on Orin: ptxas needs multiple hours per FA2
+                        // translation unit at sm_87 (measured at over 2.5h on
+                        // flash_fwd_hdim128_bf16_sm80.cu alone, 99.8% CPU, 5.4GB RSS).
+                        //
+                        // UNEVEN_K is deliberately NOT disabled: seqlen_k is a runtime
+                        // value and is not block-aligned in general.
+                        //
+                        // Opt-in for now, until the trimmed build has cleared the fixed
+                        // accuracy gates on the target device.
+                        if std::env::var_os("APXINF_FA2_TRIM_UNUSED").is_some() {
+                            cmd.args([
+                                "-DFLASHATTENTION_DISABLE_DROPOUT",
+                                "-DFLASHATTENTION_DISABLE_ALIBI",
+                                "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                                "-DFLASHATTENTION_DISABLE_LOCAL",
+                            ]);
+                        }
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
