@@ -143,6 +143,554 @@ fn gqa_values(
         .map_err(Error::Cuda)
 }
 
+// TEMP-DIAG (implement_r3 / synthesis_r3): cross-crate probe-line sink for the
+// composed-causal attention P-invariant probe below; the qwen_drive model drains it
+// into its diag_digest right after prefill_done so the lines land inside the receipt
+// window; revert in the acceptance-bound revision.
+static ATTN_DIAG_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// TEMP-DIAG (implement_r3 / synthesis_r3): drain the attention probe lines; revert in
+/// the acceptance-bound revision.
+pub fn take_attn_diag_lines() -> Vec<String> {
+    ATTN_DIAG_LINES
+        .lock()
+        .map(|mut lines| std::mem::take(&mut *lines))
+        .unwrap_or_default()
+}
+
+// TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2 support): per-prompt-row segment
+// classes published by the model before prefill (1=prefix-text, 2=image, 3=vision-marker,
+// 4=tail-text) so the attn_mix probe can compute token-id-driven segment masses; revert in
+// the acceptance-bound revision.
+static ATTN_SEG_MAP: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// TEMP-DIAG (implement_r5): publish the segment map; revert in the acceptance-bound revision.
+pub fn set_attn_seg_map(map: Vec<u8>) {
+    if let Ok(mut guard) = ATTN_SEG_MAP.lock() {
+        *guard = map;
+    }
+}
+
+/// Composed causal GQA prefill for the hdim256 text stack: chunked fp32 QK^T
+/// GEMMs, the base-compiled fused causal mask+softmax kernel, and fp32 PV GEMMs
+/// (the route-3 floor generalized to the causal hdim256 surface).
+pub(crate) fn composed_gqa_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+    causal: bool,
+) -> Result<Tensor> {
+    // FIX (implement_r9): the vendored FA2 hdim256 causal instantiation is measured
+    // pathological on sm_89 (r8: text layer-3 prefill consumed the remaining ~225s of
+    // the 300s job). Compose measured-healthy cuBLAS GEMMs with the fused causal
+    // softmax instead: scores and P stay fp32 end-to-end (strictly closer to exact
+    // than FA2's bf16-P MMA rounding), and one RNE cast restores the packed bf16
+    // [Q,heads,256] output contract. Causality is exact at chunk boundaries: chunk
+    // [t0, t0+c_len) attends keys [0, base+t0+c_len) via kv_offset=base+t0 and the
+    // kernel writes masked cells exact 0.0f, so the PV GEMM adds exact zeros. GQA
+    // group g=h/group matches FA2's kv-head indexing. Revert/replace in the
+    // acceptance-bound revision per the prevailing marker policy.
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    let heads = q_shape[1];
+    let kv_heads = k_shape[1];
+    let head_dim = q_shape[2];
+    let group = heads / kv_heads;
+    let base = if causal { key_tokens - q_shape[0] } else { 0 };
+    let alpha = (head_dim as f32).sqrt().recip(); // FIX (implement_r9): softmax scale bound to the true head dim 256
+                                                  // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2): value-level attn_mix probe
+                                                  // for the composed-causal path, absorbing the r3 P-invariant lines. Fires on prefill
+                                                  // full-attention calls only (q_rows>1; Rust && short-circuits so single-row decode calls
+                                                  // never increment the counter): fetch counts 0..7 are the 8 prefill full layers; fire at
+                                                  // count 0 (text layer 3) and count 7 (text layer 31). Probe rows {3, 5000, q_rows-16,
+                                                  // q_rows-13, q_rows-1} = {3, 5000, 10441, 10444, 10456} at the measured 10457-row prefill,
+                                                  // head 0 (+ head 1 at q_rows-13 for the GQA pairing leg, layer 3 only). Host math on the
+                                                  // already-resident fp32 buffers (qf32/kf32/vf32/out_f32), no new kernels; one-time ~86MB
+                                                  // K/V readbacks per fired layer; revert in the acceptance-bound revision.
+    static ATTN_PROBE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let attn_probe = causal
+        && q_shape[0] > 1
+        && matches!(
+            ATTN_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            0 | 7
+        );
+    let probe_rows: [usize; 5] = [
+        3,
+        5000,
+        q_shape[0].saturating_sub(16),
+        q_shape[0].saturating_sub(13),
+        q_shape[0].saturating_sub(1),
+    ];
+    let mut probe_store: Vec<(usize, usize, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+    let mut probe_gqa: Option<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> = None;
+    let mut probe_tail_store: Vec<(usize, usize, Vec<f32>)> = Vec::new();
+    const C_Q: usize = 1024; // FIX (implement_r9): query-chunk rows; bounds the fp32 scores transient
+    let qf32_buf = CudaBuffer::alloc(q_shape[0] * heads * head_dim * 4, ctx.device_id())
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    let qf32_t = qf32_buf
+        .as_tensor(q.shape().clone(), DType::F32)
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    super::linear_attention::cast_bf16_to_f32(ctx, q, &qf32_t)?; // FIX (implement_r9)
+    let kf32_buf = CudaBuffer::alloc(k_shape[0] * kv_heads * head_dim * 4, ctx.device_id())
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    let kf32_t = kf32_buf
+        .as_tensor(k.shape().clone(), DType::F32)
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    super::linear_attention::cast_bf16_to_f32(ctx, k, &kf32_t)?; // FIX (implement_r9)
+    let vf32_buf = CudaBuffer::alloc(k_shape[0] * kv_heads * head_dim * 4, ctx.device_id())
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    let vf32_t = vf32_buf
+        .as_tensor(v.shape().clone(), DType::F32)
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    super::linear_attention::cast_bf16_to_f32(ctx, v, &vf32_t)?; // FIX (implement_r9)
+    let out_f32_buf = CudaBuffer::alloc(q_shape[0] * heads * head_dim * 4, ctx.device_id())
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    let out_f32_t = out_f32_buf
+        .as_tensor(q.shape().clone(), DType::F32)
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    let scores = CudaBuffer::alloc(
+        heads * C_Q.min(q_shape[0]) * key_tokens * 4,
+        ctx.device_id(),
+    )
+    .map_err(Error::Cuda)?; // FIX (implement_r10): fp32 [C,heads,kend] token-major slab reused per chunk; min() is byte-identical at the r9 prefill geometry (q=10457>C_Q=1024) and shrinks the decode Q=1 slab from ~685MB to heads*kv*4 (~669KB); beta=0 GEMMs write every read cell
+    for t0 in (0..q_shape[0]).step_by(C_Q) {
+        let c_len = C_Q.min(q_shape[0] - t0);
+        let kend = if causal {
+            base + t0 + c_len
+        } else {
+            key_tokens
+        };
+        // An offset beyond all keys makes the same softmax kernel unmasked.
+        let kv_offset = if causal { base + t0 } else { key_tokens } as u32;
+        for h in 0..heads {
+            let g = h / group; // FIX (implement_r9): kv head for q head h
+            let q_head = buffer_slice(
+                &qf32_buf,
+                ((t0 * heads + h) * head_dim) * 4,
+                ((c_len - 1) * heads * head_dim + head_dim) * 4,
+            )?; // FIX (implement_r9)
+            let k_head = buffer_slice(
+                &kf32_buf,
+                (g * head_dim) * 4,
+                ((kend - 1) * kv_heads * head_dim + head_dim) * 4,
+            )?; // FIX (implement_r9)
+            let scores_head = buffer_slice(
+                &scores,
+                (h * kend) * 4,
+                (((c_len - 1) * heads + 1) * kend) * 4,
+            )?; // FIX (implement_r9): ldc=heads*kend writes the token-major [C,heads,kend] layout
+            ctx.cublas()
+                .gemm_ex(
+                    DType::F32,
+                    CublasTranspose::None,
+                    CublasTranspose::Transpose,
+                    c_len,
+                    kend,
+                    head_dim,
+                    alpha,
+                    &q_head,
+                    (heads * head_dim) as i32,
+                    &k_head,
+                    (kv_heads * head_dim) as i32,
+                    0.0,
+                    &scores_head,
+                    (heads * kend) as i32,
+                )
+                .map_err(Error::Cuda)?; // FIX (implement_r9): fp32 Q*K^T; alpha folds the softmax scale
+        }
+        // FIX (implement_final_r20): Option A budget repair -- in-place tiled causal fp32
+        // softmax over the scores slab (adapters/custom_kernels.cu
+        // row_softmax_causal_f32_kernel) replaces the thread-per-element
+        // attention_softmax_f32_kernel and softmax_causal's fresh ~3.84GB/layer
+        // alloc/memset/free churn; masked cells are written exact 0.0f so the PV GEMM
+        // adds exact zeros. In-place is safe: rows are block-exclusive, every index is
+        // owned by exactly one thread, and block_max/block_sum synchronize between the
+        // read and write passes. The PV loop below reads probs_head from `scores`.
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_row_softmax_causal_f32(
+                scores.ptr() as *const std::ffi::c_void,
+                scores.ptr(),
+                kend as u32,
+                (c_len * heads) as u32,
+                kv_offset,
+                heads as u32,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        for h in 0..heads {
+            let g = h / group; // FIX (implement_r9)
+            let probs_head = buffer_slice(
+                &scores,
+                (h * kend) * 4,
+                (((c_len - 1) * heads + 1) * kend) * 4,
+            )?; // FIX (implement_final_r20): in-place probs live in the scores slab
+            let v_head = buffer_slice(
+                &vf32_buf,
+                (g * head_dim) * 4,
+                ((kend - 1) * kv_heads * head_dim + head_dim) * 4,
+            )?; // FIX (implement_r9)
+            let out_head = buffer_slice(
+                &out_f32_buf,
+                ((t0 * heads + h) * head_dim) * 4,
+                ((c_len - 1) * heads * head_dim + head_dim) * 4,
+            )?; // FIX (implement_r9)
+            ctx.cublas()
+                .gemm_ex(
+                    DType::F32,
+                    CublasTranspose::None,
+                    CublasTranspose::None,
+                    c_len,
+                    head_dim,
+                    kend,
+                    1.0,
+                    &probs_head,
+                    (heads * kend) as i32,
+                    &v_head,
+                    (kv_heads * head_dim) as i32,
+                    0.0,
+                    &out_head,
+                    (heads * head_dim) as i32,
+                )
+                .map_err(Error::Cuda)?; // FIX (implement_r9): fp32 P*V into the packed [Q,heads,256] fp32 stage
+        }
+        if attn_probe {
+            let read_row = |buf: &CudaBuffer, r: usize, h: usize| -> Result<Vec<f32>> {
+                // TEMP-DIAG (implement_r5): packed [rows, heads, head_dim] fp32 row readback.
+                let bytes = crate::transfers::copy_device_to_host(
+                    ctx.device_id(),
+                    buf.ptr() as usize + ((r * heads + h) * head_dim) * 4,
+                    head_dim * 4,
+                )
+                .map_err(Error::Cuda)?;
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect())
+            };
+            for &row in probe_rows.iter() {
+                if row >= t0 && row < t0 + c_len {
+                    // TEMP-DIAG (implement_r5): capture the probed row's P row (head 0; element
+                    // offset ((row-t0)*heads + head0)*kend in the token-major slab), q row and
+                    // out row to host Vecs; the P row is per-chunk-live only.
+                    let p_bytes = crate::transfers::copy_device_to_host(
+                        ctx.device_id(),
+                        scores.ptr() as usize + ((row - t0) * heads) * kend * 4,
+                        kend * 4,
+                    )
+                    .map_err(Error::Cuda)?;
+                    let p_row: Vec<f32> = p_bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    let q_row = read_row(&qf32_buf, row, 0)?;
+                    let out_row = read_row(&out_f32_buf, row, 0)?;
+                    probe_store.push((row, kend, p_row, q_row, out_row));
+                    if row == q_shape[0].saturating_sub(13)
+                        && ATTN_PROBE.load(std::sync::atomic::Ordering::Relaxed) == 1
+                    {
+                        // TEMP-DIAG (implement_r5): head-1 GQA dual-fit leg at row 10444,
+                        // layer 3 only (counter reads 1 during the first firing).
+                        let p1_bytes = crate::transfers::copy_device_to_host(
+                            ctx.device_id(),
+                            scores.ptr() as usize + ((row - t0) * heads + 1) * kend * 4,
+                            kend * 4,
+                        )
+                        .map_err(Error::Cuda)?;
+                        let p1_row: Vec<f32> = p1_bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect();
+                        let q1_row = read_row(&qf32_buf, row, 1)?;
+                        let out1_row = read_row(&out_f32_buf, row, 1)?;
+                        probe_gqa = Some((row, p1_row, q1_row, out1_row));
+                    }
+                }
+            }
+            for row in q_shape[0].saturating_sub(15)..q_shape[0] {
+                if row >= t0 && row < t0 + c_len {
+                    for h in 0..heads {
+                        // TEMP-DIAG (implement_r5): capture tail-row attention outputs at every
+                        // head for the query-independence (constant-bias) leg.
+                        let out_row = read_row(&out_f32_buf, row, h)?;
+                        probe_tail_store.push((row, h, out_row));
+                    }
+                }
+            }
+        }
+    }
+
+    // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2): host-side value reconstruction
+    // on the captured rows plus the already-resident fp32 K/V buffers (~86MB one-time readbacks
+    // per fired layer); emits 8 lines at layer 3 (5 per-row + gqa + kv + tail) and 7 at layer 31.
+    if attn_probe {
+        let layer_tag = if ATTN_PROBE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            3
+        } else {
+            31
+        };
+        let kv_len = k_shape[0];
+        let read_kv = |buf: &CudaBuffer| -> Result<Vec<f32>> {
+            let bytes = crate::transfers::copy_device_to_host(
+                ctx.device_id(),
+                buf.ptr() as usize,
+                kv_len * kv_heads * head_dim * 4,
+            )
+            .map_err(Error::Cuda)?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        };
+        let k_host = read_kv(&kf32_buf)?;
+        let v_host = read_kv(&vf32_buf)?;
+        let seg_map: Vec<u8> = ATTN_SEG_MAP
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let seg_of = |j: usize| -> u8 { seg_map.get(j).copied().unwrap_or(0) };
+        // Row j of kv head g in the packed [kv_len, kv_heads, head_dim] fp32 host copies.
+        let k_slice =
+            |j: usize, g: usize| -> (usize, usize) { ((j * kv_heads + g) * head_dim, head_dim) };
+        if let Ok(mut lines) = ATTN_DIAG_LINES.lock() {
+            for (row, kend_r, p_row, q_row, out_row) in &probe_store {
+                let valid = (*row + 1).min(*kend_r);
+                let mut p_max = 0.0f32;
+                let mut viol = 0usize;
+                for (j, &p) in p_row.iter().enumerate() {
+                    if j < valid && p > p_max {
+                        p_max = p;
+                    }
+                    if j > *row && p != 0.0 {
+                        viol += 1;
+                    }
+                }
+                let mut masses = [0.0f64; 5];
+                let mut entropy = 0.0f64;
+                let mut p_sum = 0.0f64;
+                for (j, &p) in p_row.iter().enumerate().take(valid) {
+                    let pf = p as f64;
+                    p_sum += pf;
+                    let cls = seg_of(j).min(4) as usize;
+                    masses[cls] += pf;
+                    if p > 0.0 {
+                        entropy -= pf * pf.ln();
+                    }
+                }
+                let keff = entropy.exp();
+                let out_l2: f64 = out_row
+                    .iter()
+                    .map(|&v| (v as f64) * (v as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                // M5: affine score reconstruction s = ln(p/p_max) vs alpha*(q.K_j) at kv head 0.
+                let mut s_pred: Vec<f32> = Vec::with_capacity(valid);
+                let mut s_pred_max = f32::NEG_INFINITY;
+                for j in 0..valid {
+                    let (ko, kw) = k_slice(j, 0);
+                    let mut dot = 0.0f32;
+                    for c in 0..head_dim {
+                        dot += q_row[c] * k_host[ko + c.min(kw - 1)];
+                    }
+                    let s = alpha * dot;
+                    s_pred.push(s);
+                    if s > s_pred_max {
+                        s_pred_max = s;
+                    }
+                }
+                let mut m5res = 0.0f64;
+                for j in 0..valid {
+                    let p = p_row[j];
+                    if p > 0.0 && p_max > 0.0 {
+                        let s_meas = (p / p_max).ln();
+                        let s_pred_n = s_pred[j] - s_pred_max;
+                        let d = (s_meas - s_pred_n).abs() as f64;
+                        if d > m5res {
+                            m5res = d;
+                        }
+                    }
+                }
+                let mut p_top: Vec<usize> = (0..valid).collect();
+                p_top.sort_by(|&a, &b| {
+                    p_row[b]
+                        .partial_cmp(&p_row[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                p_top.truncate(8);
+                let mut s_top: Vec<usize> = (0..valid).collect();
+                s_top.sort_by(|&a, &b| {
+                    s_pred[b]
+                        .partial_cmp(&s_pred[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                s_top.truncate(8);
+                let m5agr = p_top == s_top;
+                // M6: PV reconstruction and uniform-mean distance at kv head 0.
+                let mut pv = vec![0.0f64; head_dim];
+                let mut mu = vec![0.0f64; head_dim];
+                for j in 0..valid {
+                    let pj = p_row[j] as f64;
+                    let (vo, _vw) = k_slice(j, 0);
+                    for c in 0..head_dim {
+                        pv[c] += pj * v_host[vo + c] as f64;
+                        mu[c] += v_host[vo + c] as f64;
+                    }
+                }
+                let inv = 1.0 / valid.max(1) as f64;
+                let mut pv_err = 0.0f64;
+                let mut mu_dist = 0.0f64;
+                for c in 0..head_dim {
+                    let d = pv[c] - out_row[c] as f64;
+                    pv_err += d * d;
+                    let dm = out_row[c] as f64 - mu[c] * inv;
+                    mu_dist += dm * dm;
+                }
+                let denom = out_l2.max(1e-12);
+                lines.push(format!(
+                    "[qwen_drive] attn_mix k={} row={} valid={} m_pre={:.6} m_img={:.6} m_mark={:.6} m_tail={:.6} keff={:.1} pmax={:.6} viol={} outl2={:.4} m5res={:.4} m5agr={} m6pv={:.4} m6mu={:.4}",
+                    layer_tag,
+                    row,
+                    valid,
+                    masses[1] / p_sum.max(1e-12),
+                    masses[2] / p_sum.max(1e-12),
+                    masses[3] / p_sum.max(1e-12),
+                    masses[4] / p_sum.max(1e-12),
+                    keff,
+                    p_max,
+                    viol,
+                    out_l2,
+                    m5res,
+                    m5agr,
+                    pv_err.sqrt() / denom,
+                    mu_dist.sqrt() / denom
+                ));
+            }
+            // GQA dual-fit leg (head 1 against kv heads 0 and 1), emitted at layer 3 only.
+            if let Some((row, p1_row, q1_row, _out1_row)) = &probe_gqa {
+                let valid = (*row + 1).min(p1_row.len());
+                let mut p1_max = 0.0f32;
+                for &p in p1_row.iter().take(valid) {
+                    if p > p1_max {
+                        p1_max = p;
+                    }
+                }
+                let mut res = [0.0f64; 2];
+                for g in 0..2usize {
+                    let mut s_max = f32::NEG_INFINITY;
+                    let mut s_vec: Vec<f32> = Vec::with_capacity(valid);
+                    for j in 0..valid {
+                        let (ko, kw) = k_slice(j, g);
+                        let mut dot = 0.0f32;
+                        for c in 0..head_dim {
+                            dot += q1_row[c] * k_host[ko + c.min(kw - 1)];
+                        }
+                        let s = alpha * dot;
+                        s_vec.push(s);
+                        if s > s_max {
+                            s_max = s;
+                        }
+                    }
+                    for j in 0..valid {
+                        let p = p1_row[j];
+                        if p > 0.0 && p1_max > 0.0 {
+                            let d = ((p / p1_max).ln() - (s_vec[j] - s_max)).abs();
+                            if d as f64 > res[g] {
+                                res[g] = d as f64;
+                            }
+                        }
+                    }
+                }
+                lines.push(format!(
+                    "[qwen_drive] attn_mix_gqa k=3 row={} head=1 res_g0={:.4} res_g1={:.4}",
+                    row, res[0], res[1]
+                ));
+            }
+            // M7: per-segment mean cosine to the segment mean (kv head 0), image vs prefix, K and V.
+            let seg_cos = |src: &[f32], cls: u8| -> f64 {
+                let mut mean_v = vec![0.0f64; head_dim];
+                let mut n = 0usize;
+                for j in 0..kv_len {
+                    if seg_of(j) == cls {
+                        let (o, _w) = k_slice(j, 0);
+                        for c in 0..head_dim {
+                            mean_v[c] += src[o + c] as f64;
+                        }
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    return f64::NAN;
+                }
+                for c in 0..head_dim {
+                    mean_v[c] /= n as f64;
+                }
+                let mean_norm: f64 = mean_v.iter().map(|&v| v * v).sum::<f64>().sqrt();
+                let mut acc = 0.0f64;
+                for j in 0..kv_len {
+                    if seg_of(j) == cls {
+                        let (o, _w) = k_slice(j, 0);
+                        let mut dot = 0.0f64;
+                        let mut nj = 0.0f64;
+                        for c in 0..head_dim {
+                            dot += src[o + c] as f64 * mean_v[c];
+                            nj += (src[o + c] as f64) * (src[o + c] as f64);
+                        }
+                        acc += dot / (nj.sqrt() * mean_norm).max(1e-12);
+                    }
+                }
+                acc / n as f64
+            };
+            lines.push(format!(
+                "[qwen_drive] attn_mix_kv k={} k_img_cos={:.4} k_pre_cos={:.4} v_img_cos={:.4} v_pre_cos={:.4}",
+                layer_tag,
+                seg_cos(&k_host, 2),
+                seg_cos(&k_host, 1),
+                seg_cos(&v_host, 2),
+                seg_cos(&v_host, 1)
+            ));
+            // M8: max pairwise cosine between tail-row attention outputs, per head then max.
+            let mut maxcos = 0.0f64;
+            for h in 0..heads {
+                let rows_h: Vec<&Vec<f32>> = probe_tail_store
+                    .iter()
+                    .filter(|(_, hh, _)| *hh == h)
+                    .map(|(_, _, v)| v)
+                    .collect();
+                for i in 0..rows_h.len() {
+                    for j in (i + 1)..rows_h.len() {
+                        let mut dot = 0.0f64;
+                        let mut na = 0.0f64;
+                        let mut nb = 0.0f64;
+                        for c in 0..head_dim {
+                            let a = rows_h[i][c] as f64;
+                            let b = rows_h[j][c] as f64;
+                            dot += a * b;
+                            na += a * a;
+                            nb += b * b;
+                        }
+                        let cs = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                        if cs > maxcos {
+                            maxcos = cs;
+                        }
+                    }
+                }
+            }
+            lines.push(format!(
+                "[qwen_drive] attn_mix_tail k={} maxcos={:.4}",
+                layer_tag, maxcos
+            ));
+        }
+    }
+    let out_bf16 = output_buffer(ctx, q.size_in_bytes())?; // FIX (implement_r9)
+    let out_bf16_t = out_bf16
+        .as_tensor(q.shape().clone(), DType::BF16)
+        .map_err(Error::Cuda)?; // FIX (implement_r9)
+    super::linear_attention::cast_f32_to_bf16(ctx, &out_f32_t, &out_bf16_t)?; // FIX (implement_r9)
+    Ok(out_bf16_t)
+}
+
 /// GQA scaled-dot-product attention over an existing CUDA KV cache.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa(
@@ -1069,6 +1617,19 @@ pub fn causal_gqa_bf16(
     }
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
+        // Use the head256 specialization for complete causal prefill and
+        // single-token decode. Unequal multi-token prefixes use composed GQA.
+        if q_shape[2] == 256 {
+            #[cfg(apxinf_fa2_sm80)]
+            if q_shape[0] == key_tokens && q_shape[0] > 1 {
+                return fa2_attention_causal(ctx,q,k,v,q_shape[0],key_tokens,q_shape[1],k_shape[1],q_shape[2]);
+            }
+            #[cfg(apxinf_fa2_sm80)]
+            if q_shape[0] == 1 {
+                return fa2_attention_splitkv(ctx,q,k,v,1,1,key_tokens,q_shape[1],k_shape[1],q_shape[2],false);
+            }
+            return composed_gqa_bf16(ctx, q, k, v, key_tokens, true);
+        }
         if fa2_splitkv_enabled(q_shape[0], key_tokens, q_shape[1], k_shape[1], q_shape[2]) {
             return fa2_attention_splitkv(
                 ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], k_shape[1], q_shape[2], true,
@@ -1235,13 +1796,246 @@ pub fn segmented_mha_bf16(
     )?;
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
+        // TEMP-DIAG (implement_r4): per-call gate + clock; revert in the acceptance-bound revision.
+        static MHA_DIAG_CALL: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let mha_diag_call = MHA_DIAG_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mha_diag = mha_diag_call < 2; // blocks 0 and 1 are the receipt-implicated calls
+        let mha_t0 = std::time::Instant::now();
+        // FIX (implement_r8): route-3 composed gemm_ex + tiled-softmax per-segment attention
+        // replaces the r6/r7 pad route. The vendored FA2 fwd family is measured pathological
+        // on sm_89 across hdim96 IsEvenK=false (r4 ~19.3s/launch), hdim96 IsEvenK=true
+        // (r6 ~19.2s) and hdim128 IsEvenK=true (r7 ~28.2s), so the head_dim==64 vision arm
+        // runs on measured-healthy cuBLAS GEMMs plus the tiled row-softmax kernel; scores
+        // stay fp32 end-to-end and P is rounded to bf16 for the PV MMA exactly as FA2 does.
+        // Revert/replace in the acceptance-bound revision per the prevailing marker policy.
+        let orig_head_dim = shape[2]; // FIX (implement_r6)
+        #[cfg(apxinf_fa2_sm80)]
+        if orig_head_dim == 64 {
+            if host_offsets.first() != Some(&0)
+                || host_offsets.last().map(|&v| v as usize) != Some(shape[0])
+                || host_offsets
+                    .windows(2)
+                    .any(|v| v[1] < v[0] || (v[1] - v[0]) as usize > max_tokens)
+                || [q, k, v]
+                    .iter()
+                    .any(|t| t.device() != Device::Cuda(ctx.device_id()))
+            {
+                return Err(Error::Other("segmented MHA offsets/device mismatch".into()));
+            }
+            let bytes = checked_bytes(DType::BF16, shape, "segmented head64 MHA")?;
+            let output = output_buffer(ctx, bytes)?;
+            let row_bytes = checked_bytes(DType::BF16, &[shape[1], 64], "head64 row")?;
+            for bounds in host_offsets.windows(2) {
+                let start = bounds[0] as usize;
+                let tokens = (bounds[1] - bounds[0]) as usize;
+                if tokens == 0 {
+                    continue;
+                }
+                let piece = |tensor: &Tensor| -> Result<Tensor> {
+                    CudaBuffer::from_tensor(tensor)
+                        .map_err(Error::Cuda)?
+                        .view(start * row_bytes, tokens * row_bytes)
+                        .map_err(Error::Cuda)?
+                        .as_tensor(Shape::new(vec![tokens, shape[1], 64]), DType::BF16)
+                        .map_err(Error::Cuda)
+                };
+                let (sq, sk, sv) = (piece(q)?, piece(k)?, piece(v)?);
+                let segment = fa2_attention_splitkv(
+                    ctx, &sq, &sk, &sv, 1, tokens, tokens, shape[1], shape[1], 64, false,
+                )?;
+                crate::transfers::copy_tensor_2d_to_buffer(
+                    ctx,
+                    &segment,
+                    &output,
+                    start * row_bytes,
+                    row_bytes,
+                    row_bytes,
+                    row_bytes,
+                    tokens,
+                )?;
+            }
+            return Ok(make_gpu_tensor(
+                q.shape().clone(),
+                DType::BF16,
+                ctx.device_id(),
+                output,
+            ));
+        }
+        #[cfg(not(apxinf_fa2_sm80))]
+        if orig_head_dim == 64 {
+            // FIX (implement_r8): composed per-segment attention at the true dim
+            let qf32_buf =
+                CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8)
+            let qf32_t = qf32_buf
+                .as_tensor(q.shape().clone(), DType::F32)
+                .map_err(Error::Cuda)?; // FIX (implement_r8)
+            super::linear_attention::cast_bf16_to_f32(ctx, q, &qf32_t)?; // FIX (implement_r8)
+            let kf32_buf =
+                CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8)
+            let kf32_t = kf32_buf
+                .as_tensor(k.shape().clone(), DType::F32)
+                .map_err(Error::Cuda)?; // FIX (implement_r8)
+            super::linear_attention::cast_bf16_to_f32(ctx, k, &kf32_t)?; // FIX (implement_r8)
+            let output = output_buffer(ctx, q.size_in_bytes())?; // FIX (implement_r8): packed [T,16,64]; out_bytes=85,327,872 signs the composed route
+                                                                 // TEMP-DIAG (implement_r4): entry-alloc bracket; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!(
+                    "[qwen_drive] mha_alloc_ok call={} out_bytes={} lse_bytes={} ms={}",
+                    mha_diag_call,
+                    q.size_in_bytes(),
+                    0,
+                    mha_t0.elapsed().as_millis()
+                );
+            }
+            for (seg_idx, bounds) in host_offsets.windows(2).enumerate() {
+                let start = bounds[0] as usize;
+                let tokens = (bounds[1] - bounds[0]) as usize;
+                if tokens == 0 {
+                    continue;
+                } // FIX (implement_r8): degenerate-segment guard
+                  // TEMP-DIAG (implement_r4): pre-launch segment marker; revert in the acceptance-bound revision.
+                if mha_diag {
+                    eprintln!(
+                        "[qwen_drive] mha_seg call={} i={} start={} tokens={} ms={}",
+                        mha_diag_call,
+                        seg_idx,
+                        start,
+                        tokens,
+                        mha_t0.elapsed().as_millis()
+                    );
+                }
+                let scores = CudaBuffer::alloc(shape[1] * tokens * tokens * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): fp32 [heads,tokens,tokens]
+                let probs = CudaBuffer::alloc(shape[1] * tokens * tokens * 2, ctx.device_id())
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): bf16 [heads,tokens,tokens]
+                for head in 0..shape[1] {
+                    let q_head = buffer_slice(
+                        &qf32_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
+                    )?; // FIX (implement_r8)
+                    let k_head = buffer_slice(
+                        &kf32_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
+                    )?; // FIX (implement_r8)
+                    let scores_head =
+                        buffer_slice(&scores, head * tokens * tokens * 4, tokens * tokens * 4)?; // FIX (implement_r8)
+                    ctx.cublas()
+                        .gemm_ex(
+                            DType::F32,
+                            CublasTranspose::None,
+                            CublasTranspose::Transpose,
+                            tokens,
+                            tokens,
+                            orig_head_dim,
+                            (orig_head_dim as f32).sqrt().recip(),
+                            &q_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            &k_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            0.0,
+                            &scores_head,
+                            tokens as i32,
+                        )
+                        .map_err(Error::Cuda)?; // FIX (implement_r8): Q*K^T; alpha folds the softmax scale bound to the true dim 64
+                }
+                unsafe {
+                    ffi::check_cuda(ffi::apxinf_static_row_softmax_f32_bf16(
+                        scores.ptr() as *const std::ffi::c_void,
+                        probs.ptr(),
+                        tokens as u32,
+                        (shape[1] * tokens) as u32,
+                        ctx.stream().handle(),
+                    ))
+                    .map_err(Error::Cuda)?; // FIX (implement_r8): tiled block-per-row softmax, fp32 in / bf16 out
+                }
+                for head in 0..shape[1] {
+                    let probs_head =
+                        buffer_slice(&probs, head * tokens * tokens * 2, tokens * tokens * 2)?; // FIX (implement_r8)
+                    let v_head = tensor_slice(
+                        v,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 2,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 2,
+                        ctx.device_id(),
+                    )?; // FIX (implement_r8)
+                    let out_head = buffer_slice(
+                        &output,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 2,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 2,
+                    )?; // FIX (implement_r8)
+                    ctx.cublas()
+                        .gemm_ex(
+                            DType::BF16,
+                            CublasTranspose::None,
+                            CublasTranspose::None,
+                            tokens,
+                            orig_head_dim,
+                            tokens,
+                            1.0,
+                            &probs_head,
+                            tokens as i32,
+                            &v_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            0.0,
+                            &out_head,
+                            (shape[1] * orig_head_dim) as i32,
+                        )
+                        .map_err(Error::Cuda)?; // FIX (implement_r8): P*V straight into the packed [T,16,64] output
+                }
+                // TEMP-DIAG (implement_r4): post-launch retirement probe; converts an async fault into a loud Err; revert in the acceptance-bound revision.
+                if mha_diag {
+                    ctx.synchronize().map_err(Error::Cuda)?;
+                    eprintln!(
+                        "[qwen_drive] mha_seg_ok call={} i={} ms={}",
+                        mha_diag_call,
+                        seg_idx,
+                        mha_t0.elapsed().as_millis()
+                    );
+                }
+            }
+            // TEMP-DIAG (implement_r4): separates "12 launches retired" from "epilogue cudaFree wedged"; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!(
+                    "[qwen_drive] mha_loop_done call={} ms={}",
+                    mha_diag_call,
+                    mha_t0.elapsed().as_millis()
+                );
+            }
+            let result = make_gpu_tensor(q.shape().clone(), DType::BF16, ctx.device_id(), output);
+            return Ok(result);
+        }
         let output = output_buffer(ctx, q.size_in_bytes())?;
         let softmax_lse = output_buffer(ctx, shape[0] * shape[1] * std::mem::size_of::<f32>())?;
+        // TEMP-DIAG (implement_r4): entry-alloc bracket; revert in the acceptance-bound revision.
+        if mha_diag {
+            eprintln!(
+                "[qwen_drive] mha_alloc_ok call={} out_bytes={} lse_bytes={} ms={}",
+                mha_diag_call,
+                q.size_in_bytes(),
+                shape[0] * shape[1] * std::mem::size_of::<f32>(),
+                mha_t0.elapsed().as_millis()
+            );
+        }
         let row_bytes = shape[1] * shape[2] * DType::BF16.size_in_bytes();
         let lse_row_bytes = shape[1] * std::mem::size_of::<f32>();
-        for bounds in host_offsets.windows(2) {
+        for (seg_idx, bounds) in host_offsets.windows(2).enumerate() {
             let start = bounds[0] as usize;
             let tokens = (bounds[1] - bounds[0]) as usize;
+            // TEMP-DIAG (implement_r4): pre-launch segment marker; revert in the acceptance-bound revision.
+            if mha_diag {
+                eprintln!(
+                    "[qwen_drive] mha_seg call={} i={} start={} tokens={} ms={}",
+                    mha_diag_call,
+                    seg_idx,
+                    start,
+                    tokens,
+                    mha_t0.elapsed().as_millis()
+                );
+            }
             unsafe {
                 ffi::check_cuda(ffi::apxinf_static_fa2_bf16(
                     gpu_ptr(q)?.cast::<u8>().add(start * row_bytes).cast(),
@@ -1264,13 +2058,27 @@ pub fn segmented_mha_bf16(
                 ))
                 .map_err(Error::Cuda)?;
             }
+            // TEMP-DIAG (implement_r4): post-launch retirement probe; converts an async fault into a loud Err; revert in the acceptance-bound revision.
+            if mha_diag {
+                ctx.synchronize().map_err(Error::Cuda)?;
+                eprintln!(
+                    "[qwen_drive] mha_seg_ok call={} i={} ms={}",
+                    mha_diag_call,
+                    seg_idx,
+                    mha_t0.elapsed().as_millis()
+                );
+            }
         }
-        return Ok(make_gpu_tensor(
-            q.shape().clone(),
-            DType::BF16,
-            ctx.device_id(),
-            output,
-        ));
+        // TEMP-DIAG (implement_r4): separates "12 launches retired" from "epilogue cudaFree wedged"; revert in the acceptance-bound revision.
+        if mha_diag {
+            eprintln!(
+                "[qwen_drive] mha_loop_done call={} ms={}",
+                mha_diag_call,
+                mha_t0.elapsed().as_millis()
+            );
+        }
+        let result = make_gpu_tensor(q.shape().clone(), DType::BF16, ctx.device_id(), output);
+        return Ok(result);
     }
     #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
     let output = output_buffer(ctx, q.size_in_bytes())?;
@@ -1633,7 +2441,6 @@ pub fn mha_f16(
                 output.ptr(),
                 batches as i32,
                 tokens_per_batch as i32,
-                tokens_per_batch as i32,
                 shape[1] as i32,
                 shape[1] as i32,
                 shape[2] as i32,
@@ -1641,7 +2448,7 @@ pub fn mha_f16(
             );
             if status == 0 {
                 return Ok(make_gpu_tensor(
-                    q.shape().clone(),
+                    Shape::new(vec![tokens, heads, head_dim]),
                     DType::F16,
                     ctx.device_id(),
                     output,
@@ -1708,6 +2515,9 @@ pub fn mqa_f16_e4m3_522(
     if q.dtype() != DType::F16
         || k.dtype() != DType::F16
         || v.dtype() != DType::F16
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape().dims() != k_shape
         || q_shape != [522, 8, 256]
         || k_shape != [522, 1, 256]
         || v.shape().dims() != k_shape

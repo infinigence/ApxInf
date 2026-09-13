@@ -7,6 +7,22 @@ use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
     pub fn apxinf_static_prepare_bf16_gemm(m: i32, n: i32, k: i32) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_bf16_gemm_bias(
+        m: i32,
+        n: i32,
+        k: i32,
+        bias: *const c_void,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_bf16_gemm_bias(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_set_cublaslt_bf16_gemm_heuristic(
         m: i32,
         n: i32,

@@ -1,7 +1,7 @@
-"""Concrete per-model L2 policies — the volatile part of the policy layer.
+"""Concrete per-model L2 policies - the volatile part of the policy layer.
 
 One module per model family (:mod:`~apxinf.policies.impls.pi05`, and future
-``groot``, ...). The stable machinery — contracts, registry, dispatch — lives one
+``groot``, ...). The stable machinery - contracts, registry, dispatch - lives one
 level up in :mod:`apxinf.policies`; only this package grows as models are added.
 
 Importing this package imports every model module for its side effect: each
@@ -18,6 +18,7 @@ inside ``from_pretrained``, so importing the package stays offline-friendly.
 from __future__ import annotations
 
 from .pi05 import Pi05Policy
+from .qwen_drive import QwenDrivePolicy
 from .walloss import WallossPolicy
 
-__all__ = ["Pi05Policy", "WallossPolicy"]
+__all__ = ["Pi05Policy", "QwenDrivePolicy", "WallossPolicy"]

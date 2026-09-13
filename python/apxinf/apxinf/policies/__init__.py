@@ -4,12 +4,12 @@ This package owns everything policy-related, mirroring how :mod:`apxinf.processo
 owns its own steps and :class:`~apxinf.processors.base.ProcessorStep`. It is split
 into a **stable** outer layer and a **volatile** inner one:
 
-* :mod:`~apxinf.policies.base` — the :class:`Policy` / :class:`BareModel` contracts,
+* :mod:`~apxinf.policies.base` - the :class:`Policy` / :class:`BareModel` contracts,
   plus :class:`ComposablePolicy` (the opt-in seam a robot adapter wraps) and
   :data:`VIEW_SLOTS` (the camera slot names the weights consume, in order).
-* :mod:`~apxinf.policies.registry` — the ``model_type -> policy class`` registry.
-* :mod:`~apxinf.policies.auto` — :class:`AutoPolicy`, dispatch by ``config.json`` type.
-* :mod:`~apxinf.policies.impls` — the concrete per-model policies (``pi05``, ...),
+* :mod:`~apxinf.policies.registry` - the ``model_type -> policy class`` registry.
+* :mod:`~apxinf.policies.auto` - :class:`AutoPolicy`, dispatch by ``config.json`` type.
+* :mod:`~apxinf.policies.impls` - the concrete per-model policies (``pi05``, ...),
   the only part that grows as models are added.
 
 Importing this package imports :mod:`~apxinf.policies.impls`, whose modules
@@ -19,8 +19,8 @@ register themselves under a ``model_type`` via :func:`register_policy` so
 ``@register_policy("<name>")``), then re-export it from
 :mod:`apxinf.policies.impls`.
 
-None of this imports ``apxinf_py`` — policy classes load the CUDA binding lazily,
-inside ``from_pretrained`` — so importing the package stays offline-friendly.
+None of this imports ``apxinf_py`` - policy classes load the CUDA binding lazily,
+inside ``from_pretrained`` - so importing the package stays offline-friendly.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from .base import VIEW_SLOTS, BareModel, ComposablePolicy, Policy
 from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
-from .impls import Pi05Policy, WallossPolicy
+from .impls import Pi05Policy, QwenDrivePolicy, WallossPolicy
 
 __all__ = [
     "Policy",
@@ -42,5 +42,6 @@ __all__ = [
     "get_policy",
     "available_policies",
     "Pi05Policy",
+    "QwenDrivePolicy",
     "WallossPolicy",
 ]

@@ -17,6 +17,8 @@ pub fn register_builtin_models() {
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
+    registry::register("qwen_drive", load_qwen_drive);
+    registry::register("qwen_drive-cuda", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
     crate::pi05::register_builtin();
@@ -64,6 +66,46 @@ fn load_qwen3vl(
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
     Ok(LoadedModel::text(Box::new(model)))
+}
+
+/// Load the Qwen-Drive VLM through the maintained registry surface. When the
+/// checkpoint ships the SFT planner head beside the VLM it is attached so the
+/// direct-planning flow works out of the box; the Python policy passes an
+/// explicit planner path for the RL head. CUDA-only: other devices fail
+/// clearly here.
+fn load_qwen_drive(
+    path: &Path,
+    device: Device,
+    backend: Arc<dyn Backend>,
+    _options: &LoadOptions,
+) -> Result<LoadedModel> {
+    #[cfg(feature = "cuda")]
+    {
+        let model_dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        };
+        let planner_dir = model_dir.join("planner-sft");
+        let planner = if planner_dir.is_dir() {
+            Some(planner_dir.as_path())
+        } else {
+            None
+        };
+        let model = crate::qwen_drive::QwenDriveModel::load_with_backend(
+            model_dir, planner, backend,
+        )?;
+        Ok(LoadedModel::text(Box::new(model)))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (path, device, backend);
+        Err(Error::Other(
+            "qwen_drive requires the cuda feature (native CUDA deployment); \
+             this build has no CUDA support"
+                .into(),
+        ))
+    }
 }
 
 fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {

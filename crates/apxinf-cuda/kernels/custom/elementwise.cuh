@@ -1,4 +1,9 @@
 #pragma once
+__global__ void expand_spatial_bf16_kernel(const __nv_bfloat16* x,__nv_bfloat16* y,int spatial,int64_t count) {
+  for(int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=static_cast<int64_t>(gridDim.x)*blockDim.x)
+    y[i]=x[i/spatial];
+}
+
 
 // Copyright 2026 apxinf contributors.
 // Pure CUDA operators grouped by physical operation; launch policy lives under adapters/.

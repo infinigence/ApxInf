@@ -5,6 +5,78 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    pub fn apxinf_sinusoidal_embedding_bf16(
+        positions: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        dim: i32,
+        scale: f32,
+        frequency_step: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_batch_norm_relu_bf16(
+        x: *const c_void,
+        mean: *const c_void,
+        invstd: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        channels: i32,
+        spatial: i32,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_expand_spatial_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        spatial: i32,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_group_norm_bf16_rounded(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        batches: i32,
+        channels: i32,
+        spatial: i32,
+        groups: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_global_mean_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        spatial: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_relu_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_channel_layer_norm_bf16_rounded(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        batches: i32,
+        channels: i32,
+        spatial: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_max_pool2x2_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        height: i32,
+        width: i32,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_evict_l2(
         buffer: *mut c_void,
         bytes: usize,
@@ -466,6 +538,13 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_swiglu_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        inner: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_swiglu_bf16_rounded(
         gate_up: *const c_void,
         output: *mut c_void,
         rows: i32,

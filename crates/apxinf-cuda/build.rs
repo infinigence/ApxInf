@@ -421,6 +421,11 @@ fn main() {
                     fa2_root.display()
                 );
                 fa2_sources.push(fa2_split_hdim256);
+                if fa2_sm80 {
+                    fa2_sources
+                        .push(std::path::Path::new(&adapters_dir).join("fa2_head64_adapter.cu"));
+                    fa2_sources.push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
+                }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
                     let direct_operator = cutlass_root.join("fa2_f16_e4m3_sm100.cu");
@@ -522,7 +527,14 @@ fn main() {
                         cmd.args([
                             "--expt-relaxed-constexpr",
                             "--expt-extended-lambda",
-                            "--use_fast_math",
+                        ]);
+                        // Reference SDPA specializations use libdevice exp/log in the
+                        // split combiner; fast math changes BF16 output rounding.
+                        if !entry.ends_with("fa2_head256_adapter.cu")
+                            && !entry.ends_with("fa2_head64_adapter.cu") {
+                            cmd.arg("--use_fast_math");
+                        }
+                        cmd.args([
                             "-U__CUDA_NO_HALF_OPERATORS__",
                             "-U__CUDA_NO_HALF_CONVERSIONS__",
                             "-U__CUDA_NO_HALF2_OPERATORS__",

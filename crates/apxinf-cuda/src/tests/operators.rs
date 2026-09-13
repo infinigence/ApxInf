@@ -27,6 +27,310 @@ fn silu_ref(x: f32) -> f32 {
 }
 
 #[test]
+fn gdn_preparation_separates_prefill_and_decode_precision() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let mut values = (1..=8).map(|v| v as f32).collect::<Vec<_>>();
+    values.extend((1..=8).rev().map(|v| v as f32));
+    values.extend([0.0; 8]);
+    let input = upload_fp32_as_bf16(&ctx, &values, vec![1, 24]).unwrap();
+    let q = CudaBuffer::alloc(32, 0).unwrap();
+    let k = CudaBuffer::alloc(32, 0).unwrap();
+    for recurrent in [false, true] {
+        crate::kernels::linear_attention::gdn_qk_prep(
+            &ctx, &input, &q, &k, 1, 1, 1, 8, 8, recurrent, 1e-6,
+        )
+        .unwrap();
+        let read = |b: &CudaBuffer| {
+            crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, 8]), DType::F32).unwrap())
+                .unwrap()
+                .to_f32_vec()
+                .unwrap()
+        };
+        let (actual_q, actual_k) = (read(&q), read(&k));
+        for i in 0..8 {
+            let qn = (values[i] as f64 / (204.0f64 + 1e-6).sqrt()) as f32;
+            let kn = (values[8 + i] as f64 / (204.0f64 + 1e-6).sqrt()) as f32;
+            if recurrent {
+                assert!((actual_q[i] - qn * (1.0f64 / 8.0f64.sqrt()) as f32).abs() < 1e-6);
+                assert!((actual_k[i] - kn).abs() < 1e-6);
+            } else {
+                assert_eq!(actual_q[i], half::bf16::from_f32(qn).to_f32());
+                assert_eq!(actual_k[i], half::bf16::from_f32(kn).to_f32());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires cuDNN v9 on the loader path and a CUDA GPU"]
+fn cudnn_3d_convolution_matches_scalar_volume() {
+    use crate::kernels::convolution::{conv3d, Conv3dSpec};
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (ci, co, d, h, w) = (8, 16, 3, 4, 5);
+    let x = (0..ci * d * h * w)
+        .map(|i| ((i % 11) as f32 - 5.0) / 8.0)
+        .collect::<Vec<_>>();
+    let weight = (0..co * ci * 8)
+        .map(|i| ((i % 7) as f32 - 3.0) / 8.0)
+        .collect::<Vec<_>>();
+    let bias = (0..co).map(|i| i as f32 / 16.0).collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    for oc in 0..co {
+        for z in 0..d - 1 {
+            for y in 0..h - 1 {
+                for xx in 0..w - 1 {
+                    let mut sum = 0.0f32;
+                    for ic in 0..ci {
+                        for kz in 0..2 {
+                            for ky in 0..2 {
+                                for kx in 0..2 {
+                                    let xi = ((ic * d + z + kz) * h + y + ky) * w + xx + kx;
+                                    let wi = (((oc * ci + ic) * 2 + kz) * 2 + ky) * 2 + kx;
+                                    sum += x[xi] * weight[wi];
+                                }
+                            }
+                        }
+                    }
+                    expected.push(
+                        half::bf16::from_f32(half::bf16::from_f32(sum).to_f32() + bias[oc])
+                            .to_f32(),
+                    );
+                }
+            }
+        }
+    }
+    let xt = upload_fp32_as_bf16(&ctx, &x, vec![1, ci, d, h, w]).unwrap();
+    let wt = upload_fp32_as_bf16(&ctx, &weight, vec![co, ci, 2, 2, 2]).unwrap();
+    let bt = upload_fp32_as_bf16(&ctx, &bias, vec![co]).unwrap();
+    let output = conv3d(&ctx, &xt, &wt, Some(&bt), Conv3dSpec::default()).unwrap();
+    assert_eq!(output.shape().dims(), [1, co, d - 1, h - 1, w - 1]);
+    assert_eq!(download_bf16_as_fp32(&output).unwrap(), expected);
+}
+
+#[test]
+fn perception_feature_layout_preserves_batches() {
+    use crate::kernels::{activation, elementwise, pooling};
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let a = [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0];
+    let b = [10.0, 11.0, -10.0, -11.0];
+    let a = upload_fp32_as_bf16(&ctx, &a, vec![2, 3, 1, 1]).unwrap();
+    let b = upload_fp32_as_bf16(&ctx, &b, vec![2, 2, 1, 1]).unwrap();
+    let a = elementwise::expand_spatial_bf16(&ctx, &a, 2, 3).unwrap();
+    let b = elementwise::expand_spatial_bf16(&ctx, &b, 2, 3).unwrap();
+    let joined = elementwise::concat_channels_bf16(&ctx, &[&a, &b]).unwrap();
+    let channels = [-3.0, -2.0, -1.0, 10.0, 11.0, 0.0, 1.0, 2.0, -10.0, -11.0];
+    let expected = channels
+        .iter()
+        .flat_map(|&v| std::iter::repeat(v).take(6))
+        .collect::<Vec<_>>();
+    assert_eq!(download_bf16_as_fp32(&joined).unwrap(), expected);
+    let pooled = pooling::global_mean_bf16(&ctx, &joined).unwrap();
+    assert_eq!(download_bf16_as_fp32(&pooled).unwrap(), channels);
+    let relu = activation::relu_bf16(&ctx, &joined).unwrap();
+    assert_eq!(
+        download_bf16_as_fp32(&relu).unwrap(),
+        expected.iter().map(|&v| v.max(0.0)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn group_norm_materializes_bf16_statistics() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let x = [
+        1.0, 2.0, 4.0, 1.0, 2.0, 4.0, -1.0, -2.0, -4.0, -1.0, -2.0, -4.0,
+    ];
+    let gamma = [0.5, 1.0, 1.5, 2.0];
+    let beta = [0.0, 1.0, -1.0, 0.0];
+    let xt = upload_fp32_as_bf16(&ctx, &x, vec![1, 4, 1, 3]).unwrap();
+    let wt = upload_fp32_as_bf16(&ctx, &gamma, vec![4]).unwrap();
+    let bt = upload_fp32_as_bf16(&ctx, &beta, vec![4]).unwrap();
+    let output = crate::kernels::norm::group_bf16_rounded(&ctx, &xt, &wt, &bt, 2, 1e-5).unwrap();
+    let bf = |v: f32| half::bf16::from_f32(v).to_f32();
+    let inv = bf((14.0f32 / 9.0 + bf(1e-5)).sqrt().recip());
+    let expected = x
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let c = i / 3;
+            let mean = bf(if c < 2 { 7.0 / 3.0 } else { -7.0 / 3.0 });
+            let scale = inv * gamma[c];
+            bf(scale.mul_add(value, (-mean).mul_add(scale, beta[c])))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(download_bf16_as_fp32(&output).unwrap(), expected);
+}
+
+#[test]
+fn bf16_linear_bias_rounds_after_accumulation() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    // The product is 1.015686..., which rounds to 1.015625 in BF16.
+    // Adding the bias before rounding preserves the nonzero residual.
+    let mut x = vec![0.0; 4 * 8];
+    let mut w = vec![0.0; 8 * 8];
+    for row in 0..4 {
+        x[row * 8] = 1.0078125;
+    }
+    for col in 0..8 {
+        w[col] = 1.0078125;
+    }
+    let xt = upload_fp32_as_bf16(&ctx, &x, vec![4, 8]).unwrap();
+    let wt = upload_fp32_as_bf16(&ctx, &w, vec![8, 8]).unwrap();
+    let bt = upload_fp32_as_bf16(&ctx, &[-1.015625; 8], vec![8]).unwrap();
+    let out = crate::kernels::gemm::bf16_bias(&ctx, &xt, &wt, &bt).unwrap();
+    let actual = download_bf16_as_fp32(&out).unwrap();
+    assert_eq!(actual, vec![1.0 / 16384.0; 32]);
+}
+
+#[test]
+#[ignore = "requires cuDNN v9 on the dynamic-loader path and a CUDA GPU"]
+fn cudnn_convolution_matches_scalar_cross_correlation() {
+    use crate::kernels::convolution::{conv2d, conv_transpose2d, Conv2dSpec};
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    for transpose in [false, true] {
+        let (channels, outputs, height, width, kernel) = (8, 16, 3, 5, 2);
+        let stride = if transpose { 2 } else { 1 };
+        let oh = if transpose { height * 2 } else { height - 1 };
+        let ow = if transpose { width * 2 } else { width - 1 };
+        let x: Vec<f32> = (0..channels * height * width)
+            .map(|i| ((i % 11) as f32 - 5.0) / 8.0)
+            .collect();
+        let w: Vec<f32> = (0..channels * outputs * kernel * kernel)
+            .map(|i| ((i % 7) as f32 - 3.0) / 8.0)
+            .collect();
+        let bias: Vec<f32> = (0..outputs).map(|i| i as f32 / 16.0).collect();
+        let mut expected = vec![0.0f32; outputs * oh * ow];
+        for co in 0..outputs {
+            for ci in 0..channels {
+                for iy in 0..height {
+                    for ix in 0..width {
+                        for ky in 0..kernel {
+                            for kx in 0..kernel {
+                                let (oy, ox, wi) = if transpose {
+                                    (
+                                        iy * stride + ky,
+                                        ix * stride + kx,
+                                        ((ci * outputs + co) * kernel + ky) * kernel + kx,
+                                    )
+                                } else {
+                                    if iy < ky || ix < kx {
+                                        continue;
+                                    }
+                                    (
+                                        iy - ky,
+                                        ix - kx,
+                                        ((co * channels + ci) * kernel + ky) * kernel + kx,
+                                    )
+                                };
+                                if oy < oh && ox < ow {
+                                    expected[(co * oh + oy) * ow + ox] +=
+                                        x[(ci * height + iy) * width + ix] * w[wi];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (i, value) in expected.iter_mut().enumerate() {
+            *value =
+                half::bf16::from_f32(half::bf16::from_f32(*value).to_f32() + bias[i / (oh * ow)])
+                    .to_f32();
+        }
+        let xt = upload_fp32_as_bf16(&ctx, &x, vec![1, channels, height, width]).unwrap();
+        let filter_shape = if transpose {
+            vec![channels, outputs, kernel, kernel]
+        } else {
+            vec![outputs, channels, kernel, kernel]
+        };
+        let wt = upload_fp32_as_bf16(&ctx, &w, filter_shape).unwrap();
+        let bt = upload_fp32_as_bf16(&ctx, &bias, vec![outputs]).unwrap();
+        let spec = Conv2dSpec {
+            stride: [stride, stride],
+            ..Default::default()
+        };
+        let y = if transpose {
+            conv_transpose2d(&ctx, &xt, &wt, Some(&bt), spec)
+        } else {
+            conv2d(&ctx, &xt, &wt, Some(&bt), spec)
+        }
+        .unwrap();
+        assert_eq!(y.shape().dims(), [1, outputs, oh, ow]);
+        assert_eq!(download_bf16_as_fp32(&y).unwrap(), expected);
+    }
+}
+
+#[test]
+fn rounded_swiglu_preserves_bf16_activation_boundary() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (rows, inner) = (3, 129);
+    let input: Vec<f32> = (0..rows * inner * 2)
+        .map(|i| half::bf16::from_f32((i % 101) as f32 / 8.0 - 6.0).to_f32())
+        .collect();
+    let expected: Vec<f32> = (0..rows * inner)
+        .map(|i| {
+            let row = i / inner;
+            let col = i % inner;
+            let gate = input[row * 2 * inner + col];
+            let up = input[row * 2 * inner + inner + col];
+            half::bf16::from_f32(half::bf16::from_f32(silu_ref(gate)).to_f32() * up).to_f32()
+        })
+        .collect();
+    let x = upload_fp32_as_bf16(&ctx, &input, vec![rows, 2 * inner]).unwrap();
+    let y = crate::kernels::activation::swiglu_bf16_rounded(&ctx, &x).unwrap();
+    assert_bf16_close_elementwise(&download_bf16_as_fp32(&y).unwrap(), &expected);
+}
+
+#[test]
+fn composed_joint_gqa_is_unmasked_and_respects_head_groups() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    // Include more queries than keys and a query tile boundary. Noncausal
+    // attention must attend all keys in both cases without offset underflow.
+    for (queries, keys, heads, kv_heads, dim) in
+        [(3, 5, 4, 2, 256), (5, 3, 4, 2, 256), (1025, 3, 2, 1, 16)]
+    {
+        let values = |n, shift| {
+            (0..n)
+                .map(|i| half::bf16::from_f32((((i + shift) % 37) as f32 - 18.0) / 32.0).to_f32())
+                .collect::<Vec<f32>>()
+        };
+        let q = values(queries * heads * dim, 0);
+        let k = values(keys * kv_heads * dim, 7);
+        let v = values(keys * kv_heads * dim, 19);
+        let mut expected = vec![0.0f32; queries * heads * dim];
+        for row in 0..queries {
+            for head in 0..heads {
+                let group = head / (heads / kv_heads);
+                let mut scores = vec![0.0f32; keys];
+                for token in 0..keys {
+                    scores[token] = (0..dim)
+                        .map(|d| {
+                            q[(row * heads + head) * dim + d]
+                                * k[(token * kv_heads + group) * dim + d]
+                        })
+                        .sum::<f32>()
+                        / (dim as f32).sqrt();
+                }
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let total: f32 = scores.iter().map(|s| (s - max).exp()).sum();
+                for d in 0..dim {
+                    expected[(row * heads + head) * dim + d] = (0..keys)
+                        .map(|t| {
+                            (scores[t] - max).exp() / total * v[(t * kv_heads + group) * dim + d]
+                        })
+                        .sum();
+                }
+            }
+        }
+        let qt = upload_fp32_as_bf16(&ctx, &q, vec![queries, heads, dim]).unwrap();
+        let kt = upload_fp32_as_bf16(&ctx, &k, vec![keys, kv_heads, dim]).unwrap();
+        let vt = upload_fp32_as_bf16(&ctx, &v, vec![keys, kv_heads, dim]).unwrap();
+        let actual =
+            crate::kernels::attention::composed_gqa_bf16(&ctx, &qt, &kt, &vt, keys, false).unwrap();
+        assert_bf16_close_reduction(&download_bf16_as_fp32(&actual).unwrap(), &expected);
+    }
+}
+
+#[test]
 fn silu_bf16_matches_fp32_reference() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     // A mix of magnitudes and signs so we exercise the tails of exp/sigmoid.
