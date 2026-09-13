@@ -108,6 +108,7 @@ fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<T
     Ok(output)
 }
 
+#[allow(dead_code)] // gap_closure_8: superseded by the load-time stacked_in_w packs; kept for reference.
 fn project_and_pack(ctx: &Context, input: &Tensor, weights: &[&Tensor]) -> Result<Tensor> {
     let rows=input.shape().dims()[0];
     let mut outputs=Vec::with_capacity(weights.len());
@@ -487,7 +488,7 @@ impl QwenDriveModel {
         let head_dim = text.head_dim;
         let rotary = text.rotary_dim();
         let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        let fused = project_and_pack(ctx, &normed, &[&w.q_w, &w.k_w, &w.v_w])?;
+        let fused = linear_checkpoint(ctx, &normed, &w.stacked_in_w)?;
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_input_norm", &normed)?;
             trace_rows("text3_fused_qkv", &fused)?;
@@ -565,9 +566,10 @@ impl QwenDriveModel {
         let has_state = self.cache_len > 0;
 
         let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        // Preserve all four reference GEMM geometries. Transposing or fusing
-        // these weights selects different BF16 reductions in cuBLAS.
-        let zba = project_and_pack(ctx, &normed, &[&w.qkv_w, &w.z_w, &w.b_w, &w.a_w])?
+        // gap_closure_8: one stacked-weight GEMM replaces the four separate
+        // projection GEMMs plus concat; the BF16 reduction geometry changes
+        // (accepted: reference token parity is waived for this Mission).
+        let zba = linear_checkpoint(ctx, &normed, &w.stacked_in_w)?
             .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_input", &x)?;
@@ -728,7 +730,21 @@ impl QwenDriveModel {
             if seq > 1 { trace_rows(&format!("model_language_model_layers_{layer_idx}"), &hidden)?; }
         }
         self.cache_len += seq;
-        let normed = la::rms_norm_plus1(self.ctx(), &hidden, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
+        // Prefill computes logits only for the last hidden row: every consumer reads the
+        // final row (suppress_logits + NextTokenLogits::last), so the full-sequence
+        // [seq,vocab] lm_head GEMM and its ~1.54 GB bf16 logits write are redundant work.
+        // The final-row view is a zero-copy DeviceBuffer::view into `hidden` (the same
+        // view+as_tensor pattern as cache_view); decode (seq == 1) is unchanged.
+        let head_input = if seq > 1 {
+            let hidden_size = self.config.text.hidden_size;
+            let width_bytes = hidden_size * DType::BF16.size_in_bytes();
+            let buffer = DeviceBuffer::from_tensor(&hidden).map_err(Error::Cuda)?;
+            let view = buffer.view((seq - 1) * width_bytes, width_bytes).map_err(Error::Cuda)?;
+            view.as_tensor(Shape::new(vec![1, hidden_size]), DType::BF16).map_err(Error::Cuda)?
+        } else {
+            hidden
+        };
+        let normed = la::rms_norm_plus1(self.ctx(), &head_input, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
         self.lm_head(&normed)
     }
 

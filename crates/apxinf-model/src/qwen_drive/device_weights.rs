@@ -55,6 +55,40 @@ fn concat_columns(tensors: &[&Tensor]) -> Result<Tensor> {
     Tensor::from_bf16(vec![rows, cols], &out)
 }
 
+/// Host-side row concat of equally wide `[out_i, in]` checkpoint projections
+/// into `[sum(out_i), in]`. BF16 only. gap_closure_8: builds the stacked
+/// input-projection packs once at load so each text layer runs one GEMM
+/// instead of 4 (GDN) or 3 (full attention) plus a concat kernel per step.
+fn concat_rows(tensors: &[&Tensor]) -> Result<Tensor> {
+    let first = tensors
+        .first()
+        .ok_or_else(|| Error::Other("qwen_drive concat: no tensors".into()))?;
+    if first.shape().dims().len() != 2 || first.dtype() != DType::BF16 {
+        return Err(Error::Other(
+            "qwen_drive concat: expected BF16 matrices".into(),
+        ));
+    }
+    let width = first.shape().dims()[1];
+    let mut rows = 0usize;
+    for tensor in tensors {
+        let dims = tensor.shape().dims();
+        if dims.len() != 2 || dims[1] != width || tensor.dtype() != DType::BF16 {
+            return Err(Error::Other(
+                "qwen_drive concat: expected equally wide BF16 matrices".into(),
+            ));
+        }
+        rows += dims[0];
+    }
+    let mut out = vec![half::bf16::from_f32(0.0); rows * width];
+    let mut offset = 0usize;
+    for tensor in tensors {
+        let data = tensor.as_bf16()?;
+        out[offset..offset + data.len()].copy_from_slice(data);
+        offset += data.len();
+    }
+    Tensor::from_bf16(vec![rows, width], &out)
+}
+
 /// Exact bf16 -> f32 widening on the host (for fp32-consumed constants).
 fn widen_to_f32(tensor: &Tensor) -> Result<Tensor> {
     let dims = tensor.shape().dims().to_vec();
@@ -140,6 +174,9 @@ pub struct FullAttentionLayerWeights {
     /// Fused `[hidden, 2*intermediate]` (gate rows first).
     pub gate_up_w: Tensor,
     pub down_w: Tensor,
+    /// Load-time row-stacked `[q;k;v]` `[out,hidden]` pack (gap_closure_8):
+    /// one GEMM per layer step instead of 3 GEMMs plus a concat kernel.
+    pub stacked_in_w: Tensor,
 }
 
 pub struct GdnLayerWeights {
@@ -161,6 +198,10 @@ pub struct GdnLayerWeights {
     pub post_norm: Tensor,
     pub gate_up_w: Tensor,
     pub down_w: Tensor,
+    /// Load-time row-stacked `[qkv;z;b;a]` `[out,hidden]` pack
+    /// (gap_closure_8): one GEMM per layer step instead of 4 GEMMs plus a
+    /// concat kernel.
+    pub stacked_in_w: Tensor,
 }
 
 pub enum MixerWeights {
@@ -349,6 +390,7 @@ impl QwenDriveDeviceWeights {
                         "qwen_drive: q/k/v projection shape mismatch at layer {index}"
                     )));
                 }
+                let stacked_in = concat_rows(&[&q, &k, &v])?;
                 layers.push(MixerWeights::FullAttention(FullAttentionLayerWeights {
                     input_norm,
                     q_w: up(backend, &q)?,
@@ -369,6 +411,7 @@ impl QwenDriveDeviceWeights {
                     post_norm,
                     gate_up_w,
                     down_w,
+                    stacked_in_w: up(backend, &stacked_in)?,
                 }));
             } else {
                 let in_qkv = take(
@@ -399,6 +442,7 @@ impl QwenDriveDeviceWeights {
                 if index == 0 {
                     a_log_layer0_first4 = a_log_pre[..a_log_pre.len().min(4)].to_vec();
                 }
+                let stacked_in = concat_rows(&[&in_qkv, &in_z, &in_b, &in_a])?;
                 layers.push(MixerWeights::Gdn(GdnLayerWeights {
                     input_norm,
                     qkv_w: up(backend, &in_qkv)?,
@@ -425,6 +469,7 @@ impl QwenDriveDeviceWeights {
                     post_norm,
                     gate_up_w,
                     down_w,
+                    stacked_in_w: up(backend, &stacked_in)?,
                 }));
             }
         }

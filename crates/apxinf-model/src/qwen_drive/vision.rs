@@ -38,6 +38,13 @@ pub fn take_vision_diag_lines() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// Hoisted position-embed caches (pos_embed_hoist_5): the 48x48x1024 table is a
+// checkpoint-lifetime constant and the interpolated output depends only on the
+// request grid_thw, so both are computed once and reused across requests.
+static POS_TABLE_HOST: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+static POS_CACHE: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<Vec<[u32; 3]>, Tensor>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 fn upload_u32(ctx: &Context, values: &[u32]) -> Result<DeviceBuffer> {
     let bytes: Vec<u8> = values
         .iter()
@@ -186,7 +193,8 @@ pub fn forward(
 /// Bilinear-interpolate the learned 48x48 position table to each image's
 /// patch grid and permute to the merge-block-major layout. Copied with
 /// provenance from qwen3vl's vision tower (HF `fast_pos_embed_interpolate` +
-/// the spatial-merge shuffle); the table is read back per request (debt).
+/// the spatial-merge shuffle); the table readback and the interpolated device
+/// result are hoisted into process-lifetime caches (pos_embed_hoist_5).
 fn compute_pos_embeds(
     config: &QwenDriveConfig,
     weights: &VisionDeviceWeights,
@@ -197,10 +205,20 @@ fn compute_pos_embeds(
     let hidden = vc.hidden_size;
     let merge = vc.spatial_merge_size;
     let grid_side = (vc.num_position_embeddings as f64).sqrt().round() as usize;
-    let cpu = transfers::to_cpu(&weights.pos_embed)?;
-    let table = cpu
-        .to_f32_vec()
-        .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
+    let cache_key: Vec<[u32; 3]> = grid_thw.to_vec();
+    if let Ok(cache) = POS_CACHE.lock() {
+        if let Some(cached) = cache.get(cache_key.as_slice()) {
+            return Ok(cached.clone());
+        }
+    }
+    let table: &[f32] = POS_TABLE_HOST.get_or_init(|| {
+        transfers::to_cpu(&weights.pos_embed)
+            .and_then(|cpu| {
+                cpu.to_f32_vec()
+                    .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))
+            })
+            .unwrap_or_default()
+    });
     if table.len() != grid_side * grid_side * hidden {
         return Err(Error::Other(
             "qwen_drive vision: pos_embed table shape mismatch".into(),
@@ -307,7 +325,11 @@ fn compute_pos_embeds(
     }
     let rounded: Vec<half::bf16> = out.iter().map(|&v| half::bf16::from_f32(v)).collect();
     let tensor = Tensor::from_bf16(vec![total, hidden], &rounded)?;
-    transfers::to_cuda(&tensor, ctx.device_id())
+    let tensor = transfers::to_cuda(&tensor, ctx.device_id())?;
+    if let Ok(mut cache) = POS_CACHE.lock() {
+        cache.insert(cache_key, tensor.clone());
+    }
+    Ok(tensor)
 }
 
 /// Vision 2D-RoPE position ids `(h, w)` per patch in the merge-block-major
