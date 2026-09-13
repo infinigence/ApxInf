@@ -30,7 +30,10 @@ The tested native path uses RTX 4090, BF16, ApxInf Rust/CUDA and AutoPolicy.
 `APXINF_QWEN_TRACE_DECODE_STEP` enables a logits readback at one decode step.
 `APXINF_QWEN_HEAD_INPUT` names an output file for single-row LM-head inputs;
 when enabled it is overwritten on subsequent calls. Both are unset by default.
-Existing development diagnostics remain and need cleanup before production.
+`APXINF_QWEN_TRACE_DIR` also records single-token layer outputs as
+`decode_layer_<index>.f32`; these are overwritten by each decode call. Run a
+bounded prefix to inspect the intended last step. Existing development
+diagnostics remain and need cleanup before production.
 
 Two direct-takeover experiments regressed VQA scene 0 and were reverted:
 recurrent decay via approximate exp2, and 128-dimensional recurrent tree

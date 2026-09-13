@@ -1,8 +1,10 @@
 # Model Porting Workflow
 
 This document is the workflow. It guides an agent porting a working reference
-model into ApxInf without moving private source code, checkpoints, captures, or
-credentials into the repository.
+model into ApxInf while keeping private reference material and generated
+evidence out of the product diff, and credentials out of generated artifacts.
+Follow [Development artifacts](../AGENTS.md#development-artifacts) for all
+task-specific output locations.
 
 The agent owns investigation and implementation decisions. Commands and small
 temporary programs are tools for collecting evidence, not a workflow engine.
@@ -19,7 +21,7 @@ been replayed against the original model evidence.
 
 ## 1. Define the port
 
-Before editing code, record outside the repository:
+Before editing code, record in `<project-root>/devlocal/<feat-name>/`:
 
 - exact model variant, reference repository, and immutable revision;
 - checkpoint identity and license constraints;
@@ -109,13 +111,14 @@ specific blocker or approval request that prevents that work.
 
 ### Private port workspace
 
-Use a **private port workspace** for reference checkouts, captures, temporary
-programs, and generated evidence. Place it under the ignored
-`experiment/<port-name>/` directory or outside the repository, and verify with
-`git status` that none of its contents are tracked. Do not commit model weights,
-captured tensors, environment snapshots, or generated JSON reports. This rule
-is repository-local and self-contained; machine-specific agent configuration
-does not change it.
+The **private port workspace** is the ignored
+`<project-root>/devlocal/<feat-name>/` directory defined by
+[AGENTS.md](../AGENTS.md#development-artifacts). Keep generated captures,
+temporary programs, port notes, and reproducibility evidence there. Reuse
+existing external reference checkouts and checkpoints in place and record their
+identities in the workspace. Verify ignore rules with `git check-ignore` and
+inspect `git status` before review. Do not commit model weights, captured
+tensors, environment snapshots, or generated JSON reports.
 
 ## 2. Run the reference implementation
 

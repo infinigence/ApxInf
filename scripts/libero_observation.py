@@ -1,4 +1,17 @@
-"""Translate native LIBERO simulator observations into ApxInf Observations."""
+"""Translate native LIBERO simulator observations into ApxInf Observations.
+
+**This module is a deliberate mirror of ``apxinf_robo.envs.libero``.** Both
+repositories evaluate on LIBERO — ApxInf so it can regress its own engine
+end-to-end without a downstream checkout, apxinf-robo so a robot deployment can
+be scored — and both need the same two conversions. The duplication is accepted;
+the *divergence* is not, because a changed rotation or a changed state layout
+produces wrong success rates on both sides with no error anywhere.
+
+If you change ``libero_images`` or ``libero_state`` here, change the mirror. The
+golden values in ``tests/test_libero_observation.py`` (and the matching file in
+apxinf-robo) are stated as literals for exactly that reason: they cannot be
+kept passing by editing the derivation.
+"""
 
 from __future__ import annotations
 

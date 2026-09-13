@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-model = { path = "../apxinf-model" }
+apxinf-tokenizer = { path = "../apxinf-tokenizer", features = ["sentencepiece"] }
 # Keep pyo3 default features (incl. `macros`); `extension-module` is opt-in
 # below so `cargo test` can still link a Python interpreter for the harness.
 pyo3 = "0.22"

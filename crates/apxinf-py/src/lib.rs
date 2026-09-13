@@ -48,6 +48,65 @@ use apxinf_model::{
 };
 #[cfg(feature = "cuda")]
 use apxinf_model::qwen_drive::ExpertConditioning;
+use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
+
+/// Hugging Face `tokenizer.json` runtime backed by the Rust `tokenizers` crate.
+#[pyclass(name = "HfTokenizer", unsendable)]
+pub struct HfTokenizer {
+    inner: NativeHf,
+}
+
+#[pymethods]
+impl HfTokenizer {
+    #[staticmethod]
+    fn from_file(path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            inner: NativeHf::from_file(path).map_err(runtime_err)?,
+        })
+    }
+
+    fn encode(&self, text: &str) -> PyResult<Vec<u32>> {
+        self.inner.encode(text).map_err(runtime_err)
+    }
+
+    fn decode(&self, token_ids: Vec<u32>) -> PyResult<String> {
+        self.inner.decode(&token_ids).map_err(runtime_err)
+    }
+
+    fn add_tokens(&mut self, tokens: Vec<String>) -> usize {
+        self.inner.add_tokens(&tokens)
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+}
+
+/// Native SentencePiece `.model` runtime used by PI0.5 processors.
+#[pyclass(name = "SentencePieceTokenizer", unsendable)]
+pub struct PySentencePieceTokenizer {
+    inner: NativeSentencePiece,
+}
+
+#[pymethods]
+impl PySentencePieceTokenizer {
+    #[staticmethod]
+    fn from_file(path: PathBuf) -> PyResult<Self> {
+        Ok(Self {
+            inner: NativeSentencePiece::from_file(path).map_err(runtime_err)?,
+        })
+    }
+
+    #[pyo3(signature = (text, add_bos=false))]
+    fn encode(&self, text: &str, add_bos: bool) -> PyResult<Vec<u32>> {
+        self.inner.encode(text, add_bos).map_err(runtime_err)
+    }
+}
 
 /// Map any Rust error into a Python `RuntimeError`.
 fn runtime_err<E: std::fmt::Display>(error: E) -> PyErr {
@@ -584,7 +643,7 @@ impl Model {
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
-    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None))]
+    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None))]
     fn infer_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -592,6 +651,7 @@ impl Model {
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
         noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let contract = self.require_rgb_contract("infer_rgb")?;
         let layout = parse_layout(layout)?;
@@ -623,7 +683,9 @@ impl Model {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
             state: None,
-            action_mask: None,
+            action_mask: action_mask
+                .map(|value| self.action_mask_tensor(value))
+                .transpose()?,
         };
         match noise {
             Some(noise) => {
@@ -789,6 +851,11 @@ impl Model {
     #[getter]
     fn max_token_len(&self) -> usize {
         self.max_token_len_value()
+    }
+
+    #[getter]
+    fn accepts_rgb_u8(&self) -> bool {
+        self.contract.accepts_rgb_u8
     }
 
     fn __repr__(&self) -> String {
@@ -1062,6 +1129,8 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
     #[cfg(feature = "cuda")]
     module.add_class::<QwenDriveModel>()?;
+    module.add_class::<HfTokenizer>()?;
+    module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

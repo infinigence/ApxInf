@@ -1,7 +1,19 @@
 """Data-source adapters for PI0.5 calibration Observations.
 
 The calibration module consumes ApxInf Observations.  This module is the
-optional outer seam that translates storage formats into that contract.
+optional outer seam that translates a *source* into that contract: NPZ files and
+JSONL manifests, both readable anywhere with numpy and PIL, plus a direct
+in-process capture from native LIBERO initial states.
+
+The LIBERO path (``--libero-suite``) and the NPZ path overlap deliberately. A
+capture run elsewhere writes an NPZ directory that ``load_npz_observations``
+then reads, which makes the calibration input a reviewable, re-runnable artifact
+and keeps MuJoCo out of a robot deployment's engine. The in-process copy exists
+so ApxInf can recalibrate FP8 against its own published LIBERO protocol -- a
+kernel change should not require a downstream checkout to regress. Both go
+through ``scripts/libero_observation.py``, so a change to camera orientation or
+state layout moves them together; see that module on keeping it and its mirror
+in step.
 """
 
 from __future__ import annotations
@@ -178,7 +190,12 @@ def load_libero_observations(
     state_key: str,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[Mapping[str, object], ...]:
-    """Capture task-balanced observations from native LIBERO initial states."""
+    """Capture task-balanced observations from native LIBERO initial states.
+
+    A mirror of this capture writes the same frames to NPZ for
+    :func:`load_npz_observations` to read back; see the module docstring on why
+    both exist.
+    """
     if len(image_keys) != 2:
         raise ValueError(
             "native LIBERO calibration requires exactly two configured image views"

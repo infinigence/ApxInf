@@ -9,9 +9,11 @@ to the `apxinf` Python package:
 
 - **PI0.5 L1** `Model.infer_rgb(...)` — resized RGB in; vision patchification
   runs inside the Rust CUDA graph.
-- **WallOSS policy bridge** `Model._infer_patches(...)` — Qwen2.5-VL canonical
-  patches/tokens/action mask in. Raw-observation preprocessing remains isolated
-  in `apxinf.policies.impls.walloss`.
+- **WallOSS L1** `Model.infer_rgb(...)` — resized RGB in; Qwen2.5-VL
+  normalization, temporal patchification, and spatial-merge ordering run in
+  the captured CUDA path.
+- **WallOSS custom-processor bridge** `Model._infer_patches(...)` — canonical
+  patches/tokens/action mask in, preserving user-defined Python processors.
 
 Returns `float32` `[action_horizon, action_dim]` in the **normalized** domain.
 
@@ -28,7 +30,8 @@ shape contract, but model loading errors.
 ```sh
 # In this crate directory. --features cuda is additive to pyproject's
 # extension-module feature.
-maturin develop --release --features cuda
+CARGO_TARGET_DIR=../../target/wheel maturin build --release --features cuda --auditwheel skip
+pip install --force-reinstall ../../target/wheel/wheels/apxinf_py-*.whl
 ```
 
 On Thor set the usual environment (see repo memory): `APXINF_CUDA_ARCH=sm_110`,
