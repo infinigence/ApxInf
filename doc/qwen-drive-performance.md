@@ -63,3 +63,17 @@ The prototype crops logits in the shared text path and therefore does not retain
 the public multi-token forward output shape. It must be scoped to generation
 before promotion as a general API-compatible implementation. This source change
 is not included in the diagnostic-removal commit documented above.
+
+## Rebuilt diagnostic-only paired replay
+
+The diagnostic-only candidate `1931881583b975925c7e7b2b086ead35c2d0a66dee27cd6dc74fdbbe28d2027f` was rebuilt as library `241496aa17864ec4cdf4bfec9e0e6db70e2439b004b6d40e9875dce28e109ba1`, matching its initial build and distinct from baseline. Fresh baseline medians were [3.642118, 3.666379, 3.665816, 3.678474] seconds; candidate medians were [3.598071, 3.609911, 3.620278, 3.636127] seconds. Paired geometric speedup was **1.013026x** (1.29 percent latency reduction), with all four scenes generating 64 tokens. The fixed-original-baseline ratio was 1.014134x, below the 1.05x gate. This supports a small diagnostic-removal benefit; subtracting it from the separate prefill paired batch would not isolate prefill's effect because the batches ran at different times.
+
+## Position-cache candidate: first valid measurement
+
+DSH/Kimi-K3 repaired proposal serialization in revision7 and submitted candidate `287766b4a414133295c2efb2aaf8de50e9685378e9b29bdf23e841649e6d5ca4` (proposal `2f4b2fc3e64782484f7c6361c2a838faf980a75f1f2ef906e1e53f2cde549882`). The repaired build produced library `80733db3eadc95ac2a5bd51ac7ddd32b6884c67ce5be7a425b5951a12a400535`. Four scene medians were [3.488187, 3.529561, 3.489460, 3.492119] seconds, all with 64 generated tokens. Geometric speedup versus the frozen baseline was **1.047829x** (4.56 percent latency reduction); valid=true, passed=false. The 1.05x target remains unmet and replay is pending.
+
+The prototype adds a process-global host position table and grid-keyed device tensor cache. It does not own these caches per model, bound the number of grids, or key on model weights/device context. Those lifecycle limitations and the shared forward-output-shape limitation remain; this measurement applies only to the fixed single-model process workload. It is not general deployment qualification.
+
+## Position-cache paired replay: threshold-sensitive
+
+The same source and library were rebuilt for a fresh baseline-then-candidate replay. Baseline medians [3.648873, 3.665581, 3.671292, 3.660577] seconds; candidate medians [3.508858, 3.491607, 3.482623, 3.471670] seconds; all four scenes generated 64 tokens. Speedup against the frozen original baseline was 1.051171x (this replay's verifier passed), but the fresh paired ratio was **1.049563x**. The initial batch was 1.047829x; the geometric mean of these two frozen-baseline batch ratios is 1.049499x (descriptive only, not a new acceptance rule). This is a threshold-sensitive result, not robust evidence of clearing 1.05x. Preserve the original failed receipt and the passed replay; continue optimization rather than selecting the passing batch. Cache lifetime and public forward-shape limitations remain.
