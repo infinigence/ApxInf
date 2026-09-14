@@ -37,6 +37,20 @@ use super::weights::{QwenDriveExpertWeights, QwenDriveVlmWeights};
 
 const GDN_CHUNK: usize = 64;
 
+/// Gate for the TEMP-DIAG development probes.
+///
+/// Several of those probes copy hidden state back to the host once per layer
+/// during prefill, and every copy synchronizes the stream, so leaving them on
+/// costs real decode throughput on top of the printing itself. They are
+/// debugging scaffolding for the divergence hunt, not part of the model, and
+/// nothing reads their output for control flow -- `diag_digest` is only ever
+/// pushed to and printed. Off unless `APXINF_QWEN_DIAG` is set, so the probes
+/// remain available verbatim when the hunt needs them.
+pub(super) fn diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("APXINF_QWEN_DIAG").is_some())
+}
+
 // Private takeover checkpoint probe; opt-in and removed before product acceptance.
 pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else { return Ok(()); };
@@ -747,7 +761,7 @@ impl QwenDriveModel {
         // prep) forces gdn_out row 0 to exactly 0; the conv_out row-0 companion splits
         // conv-window lag from diagonal-exclusion. Digest-routed (a live print here would sit
         // above the 80-line capture window); revert in the acceptance-bound revision.
-        if layer_idx == 0 && seq > 1 {
+        if layer_idx == 0 && seq > 1 && diagnostics_enabled() {
             let gbuf = DeviceBuffer::from_tensor(&gdn_out).map_err(Error::Cuda)?;
             let gview = gbuf.view(0, 2 * value_dim * DType::BF16.size_in_bytes()).map_err(Error::Cuda)?;
             let gt = gview.as_tensor(Shape::new(vec![2, value_dim]), DType::BF16).map_err(Error::Cuda)?;
@@ -803,7 +817,7 @@ impl QwenDriveModel {
         // TEMP-DIAG (implement_r19): pre-stack echo-margin lens site k=pre (the assembled
         // embedding/scatter output before layer 0); digest-routed; revert in the
         // acceptance-bound revision.
-        if seq > 1 {
+        if seq > 1 && diagnostics_enabled() {
             if let Some(t3) = probe_tail3 {
                 let line = self.shiftlens_probe(&hidden, &t3, "pre", "embed")?;
                 self.diag_digest.push(line);
@@ -822,14 +836,15 @@ impl QwenDriveModel {
             // TEMP-DIAG (implement_r11): fire only during prefill (seq > 1); the 64 single-token
             // decode forwards flooded the head-limited receipt (~2048 lines) and truncated
             // gen_entry/vision_entry/mha signature/prefill_done/decode_step in r10.
-            if seq > 1 {
+            if seq > 1 && diagnostics_enabled() {
                 eprintln!("[qwen_drive] prefill_layer k={} kind={} ms_since_prev={:.1}", layer_idx, if is_full { "full" } else { "gdn" }, layer_t0.elapsed().as_secs_f64() * 1000.0);
             }
             layer_t0 = std::time::Instant::now();
             // TEMP-DIAG (implement_r3 / synthesis_r3, folded A2): mixer-delta probe -- hidden
             // rows {0, rows-1} l2 before/after layers {2(gdn),3(full),30(gdn),31(full)};
             // digest-routed; revert in the acceptance-bound revision.
-            let layer_delta_probe = seq > 1 && matches!(layer_idx, 2 | 3 | 30 | 31);
+            let layer_delta_probe =
+                seq > 1 && diagnostics_enabled() && matches!(layer_idx, 2 | 3 | 30 | 31);
             let pre_l2 = if layer_delta_probe { Some(hidden_row_l2_pair(&hidden)?) } else { None };
             hidden = if is_full {
                 self.forward_full_attention(hidden, layer_idx, &cos, &sin, seq)?
@@ -837,6 +852,7 @@ impl QwenDriveModel {
                 self.forward_gdn(hidden, layer_idx, seq)?
             };
             if seq > 1 { trace_rows(&format!("model_language_model_layers_{layer_idx}"), &hidden)?; }
+            if seq == 1 { trace_rows(&format!("decode_layer_{layer_idx}"), &hidden)?; }
             if let Some((pre0, pre1)) = pre_l2 {
                 let (post0, post1) = hidden_row_l2_pair(&hidden)?;
                 self.diag_digest.push(format!(
@@ -845,7 +861,7 @@ impl QwenDriveModel {
             }
             // TEMP-DIAG (implement_r12): per-layer prefill hidden-row norm fingerprint; the first
             // anomalous k names the corrupting layer; revert in the acceptance-bound revision.
-            if seq > 1 {
+            if seq > 1 && diagnostics_enabled() {
                 let dims = hidden.shape().dims().to_vec();
                 let width = *dims.last().unwrap_or(&1);
                 let rows = hidden.numel() / width.max(1);
@@ -871,7 +887,7 @@ impl QwenDriveModel {
             // here (k=31) -- with the k=pre site before the layer loop it preserves the
             // probe-validity gate pair (lens l2 == hidden_norm l2); the 'shiftlens k=' prefix
             // and tuple format are unchanged; revert in the acceptance-bound revision.
-            if seq > 1 && layer_idx + 1 == self.config.text.n_layers {
+            if seq > 1 && diagnostics_enabled() && layer_idx + 1 == self.config.text.n_layers {
                 if let Some(t3) = probe_tail3 {
                     let line = self.shiftlens_probe(&hidden, &t3, &layer_idx.to_string(), if is_full { "full" } else { "gdn" })?;
                     self.diag_digest.push(line);
@@ -1197,7 +1213,7 @@ impl QwenDriveModel {
         // weights; ~30ms-class cost lands in the post-prefill window; digest-routed
         // (captured 43 -> 49, header ~64th-from-end, in-window); revert in the
         // acceptance-bound revision.
-        {
+        if diagnostics_enabled() {
             let vocab = self.config.text.vocab_size;
             let mut sample: Vec<u32> = vec![198, 220, 266, 74455, 248045];
             for &id in &token_ids[token_ids.len().saturating_sub(16)..] {
@@ -1278,7 +1294,11 @@ impl QwenDriveModel {
             // acceptance-bound revision. Extended at successor-mission implement_r2 (synthesis_r2
             // directive): fires at step 0 AND step 1 (step-1 top1 separates strict lag from echo)
             // and, at successor-mission implement_r5, is complemented by the digest-routed row_health sweep (the r2 logits_rows line was subsumed and removed).
-            if step == 0 || step == 1 || trace_decode_step == Some(step) {
+            // The step 0/1 readbacks are unconditional scaffolding and follow the
+            // diagnostics gate; the APXINF_QWEN_TRACE_DECODE_STEP readback is an
+            // explicit opt-in and still fires on its own.
+            if ((step == 0 || step == 1) && diagnostics_enabled()) || trace_decode_step == Some(step)
+            {
                 let vocab = self.config.text.vocab_size;
                 let rows = logits.numel() / vocab;
                 let row_bytes = vocab * DType::BF16.size_in_bytes();
@@ -1332,7 +1352,7 @@ impl QwenDriveModel {
                 // flag precedence D(own==next) > H(top1==next) > E(top1==own) > O; the aggregate
                 // line reports hit/echo/other/degen counts plus first_break row/kind/region.
                 // Replaces the subsumed r2 logits_rows sweep; revert in the acceptance-bound revision.
-                if step == 0 && rows > 16 {
+                if step == 0 && rows > 16 && diagnostics_enabled() {
                     let vs_tok = self.config.vision_start_token_id;
                     let ve_tok = self.config.vision_end_token_id;
                     let img_tok = self.config.image_token_id;
