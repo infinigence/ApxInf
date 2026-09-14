@@ -1,6 +1,8 @@
-# ApxInf
+<div align="center">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/logo.png" alt="apxinf-logo" width="512"/>
+</div>
 
-## Description
+# ApxInf
 
 ApxInf is a reimagined edge inference engine born of the agentic coding era,
 combining high performance, reliability, and energy efficiency across devices
@@ -462,3 +464,14 @@ Built with Rust 1.95 and 1.96; no minimum supported version is declared.
 ## License
 
 Apache 2.0. Vendored third-party components retain their own licenses.
+
+
+## Community
+
+
+Scan the QR Code to join our Wechat Group
+
+<div align="left">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/wechat.jpg" alt="wechat-group" width="256"/>
+</div>
+
