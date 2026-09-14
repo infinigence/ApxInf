@@ -1079,6 +1079,65 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   return cudaGetLastError();
 }
 
+
+// Tile width for the chunk-state kernel, one instantiation per value.
+// Prefill seconds at the shipped shape, one binary, same session:
+//   tile  1 -> 3.262   2 -> 3.261   4 -> 3.193   8 -> 2.830   16 -> 3.057
+// Reuse rises with the tile and so does register pressure, and 8 is where the
+// two cross: past it the block loses an SM slot and gives back more than the
+// saved shared reads were worth. Not a value worth guessing -- 16 looked like
+// the obvious choice and is 8% slower than 8.
+// APXINF_GDN_CHUNK_TILE overrides it for re-sweeps on other shapes.
+static int chunk_state_tile() {
+  static const int tile = [] {
+    if (const char* v = std::getenv("APXINF_GDN_CHUNK_TILE")) {
+      const int requested = std::atoi(v);
+      if (requested == 1 || requested == 2 || requested == 4 ||
+          requested == 8 || requested == 16) {
+        return requested;
+      }
+    }
+    return 8;
+  }();
+  return tile;
+}
+
+#define CHUNK_STATE_ARGS                                                      \
+  num_v_heads, block_threads, smem, stream, q, k, g_cum, t_in, vt_in, kcd_in, \
+      state, out, seq, seq_pad, head_k_dim, head_v_dim, chunk_size,           \
+      total_chunks, out_row_width
+
+template <int TILE>
+static cudaError_t launch_chunk_state(
+    int num_v_heads, int block_threads, size_t smem, cudaStream_t stream,
+    const void* q, const void* k, const void* g_cum, const void* t_in,
+    const void* vt_in, const void* kcd_in, void* state, void* out,
+    int seq, int seq_pad, int head_k_dim, int head_v_dim, int chunk_size,
+    int total_chunks, int out_row_width) {
+  if (smem > 48u * 1024u) {
+    static bool opted_in = false;
+    if (!opted_in) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(gdn_chunk_state_kernel<TILE>),
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      opted_in = true;
+    }
+  }
+  gdn_chunk_state_kernel<TILE><<<num_v_heads, block_threads, smem, stream>>>(
+      static_cast<const float*>(q), static_cast<const float*>(k),
+      static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
+      static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
+      static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
+      seq, seq_pad, head_k_dim, head_v_dim, chunk_size, total_chunks,
+      out_row_width,
+      static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim))));
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
     const void* q, const void* k, const void* g_cum, const void* t_in,
     const void* vt_in, const void* kcd_in, void* state, void* out,
@@ -1125,31 +1184,21 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float) +
       static_cast<size_t>(head_k_dim) * head_v_dim * sizeof(__nv_bfloat16) +
       static_cast<size_t>(chunk_size) * head_v_dim * sizeof(__nv_bfloat16);
-  // At the shipped shape this lands at 64KB, past the 48KB a kernel receives
-  // without asking. Opt in once; a device that refuses keeps the error rather
-  // than launching with too little shared memory.
-  if (smem > 48u * 1024u) {
-    static bool opted_in = false;
-    if (!opted_in) {
-      const cudaError_t attr = cudaFuncSetAttribute(
-          reinterpret_cast<const void*>(gdn_chunk_state_kernel),
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(smem));
-      if (attr != cudaSuccess) {
-        return attr;
-      }
-      opted_in = true;
-    }
+  // At the shipped shape this lands at 80KB, past the 48KB a kernel receives
+  // without asking. Opt in once per instantiation; a device that refuses keeps
+  // the error rather than launching with too little shared memory.
+  const int tile = chunk_state_tile();
+  cudaError_t launched = cudaErrorInvalidValue;
+  switch (tile) {
+    case 1: launched = launch_chunk_state<1>(CHUNK_STATE_ARGS); break;
+    case 2: launched = launch_chunk_state<2>(CHUNK_STATE_ARGS); break;
+    case 4: launched = launch_chunk_state<4>(CHUNK_STATE_ARGS); break;
+    case 8: launched = launch_chunk_state<8>(CHUNK_STATE_ARGS); break;
+    default: launched = launch_chunk_state<16>(CHUNK_STATE_ARGS); break;
   }
-  gdn_chunk_state_kernel<<<num_v_heads, block_threads, smem, stream>>>(
-      static_cast<const float*>(q), static_cast<const float*>(k),
-      static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
-      static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
-      static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
-      seq, seq_pad, head_k_dim, head_v_dim, chunk_size, total_chunks,
-      out_row_width, static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim))));
-  return cudaGetLastError();
+  return launched;
 }
+
 
 extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
     const void* q, const void* k, const void* v, const void* beta,
