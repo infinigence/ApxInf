@@ -89,6 +89,40 @@ fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
     Tensor::from_bf16(dims, &narrowed)
 }
 
+/// Concatenate `[out, hidden]` checkpoint-layout weights along their output
+/// rows.
+///
+/// The GDN input projections were applied as one GEMM each and then packed on
+/// device. Four GEMMs over the same activation read the same weight bytes as
+/// one, but two of them are only `[32, hidden]`, so the group ran at about
+/// 70GB/s against the 172GB/s the MLP projections reach on this board. Packed
+/// here instead, the layer issues a single GEMM whose output already has the
+/// layout the pack produced. BF16 through f32 and back is exact, so the values
+/// are unchanged.
+fn concat_rows_bf16(parts: &[&Tensor]) -> Result<Tensor> {
+    let cols = parts
+        .first()
+        .and_then(|t| t.shape().dims().get(1).copied())
+        .ok_or_else(|| Error::Other("qwen_drive: packed projection needs 2D parts".into()))?;
+    let mut rows = 0usize;
+    let mut values: Vec<half::bf16> = Vec::new();
+    for part in parts {
+        let dims = part.shape().dims();
+        if dims.len() != 2 || dims[1] != cols {
+            return Err(Error::Other(format!(
+                "qwen_drive: packed projection expects [out, {cols}], got {dims:?}"
+            )));
+        }
+        rows += dims[0];
+        values.extend(
+            part.to_f32_vec()?
+                .iter()
+                .map(|value| half::bf16::from_f32(*value)),
+        );
+    }
+    Tensor::from_bf16(vec![rows, cols], &values)
+}
+
 fn up(backend: &dyn Backend, tensor: &Tensor) -> Result<Tensor> {
     backend.to_device(tensor)
 }
@@ -144,11 +178,9 @@ pub struct FullAttentionLayerWeights {
 
 pub struct GdnLayerWeights {
     pub input_norm: Tensor,
-    /// Input projections preserve reference `[out, hidden]` storage and GEMM shape.
-    pub qkv_w: Tensor,
-    pub z_w: Tensor,
-    pub b_w: Tensor,
-    pub a_w: Tensor,
+    /// The four input projections packed along their output rows, in the order
+    /// qkv, z, b, a -- the layout the on-device pack used to build.
+    pub zba_w: Tensor,
     /// `[conv_dim, kernel_size]` (squeezed depthwise conv weight).
     pub conv_w: Tensor,
     /// `[num_v_heads]` fp32.
@@ -401,10 +433,10 @@ impl QwenDriveDeviceWeights {
                 }
                 layers.push(MixerWeights::Gdn(GdnLayerWeights {
                     input_norm,
-                    qkv_w: up(backend, &in_qkv)?,
-                    z_w: up(backend, &in_z)?,
-                    b_w: up(backend, &in_b)?,
-                    a_w: up(backend, &in_a)?,
+                    zba_w: up(
+                        backend,
+                        &concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?,
+                    )?,
                     conv_w: up(backend, &conv.reshape(vec![conv_dim, kernel])?)?,
                     dt_bias: up(
                         backend,

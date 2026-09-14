@@ -771,7 +771,11 @@ impl QwenDriveModel {
         }
         // Preserve all four reference GEMM geometries. Transposing or fusing
         // these weights selects different BF16 reductions in cuBLAS.
-        let zba = project_and_pack(ctx, &normed, &[&w.qkv_w, &w.z_w, &w.b_w, &w.a_w])?
+        // One GEMM over the packed projection. Four separate ones read the same
+        // weight bytes, but two were only [32, hidden] and dragged the group to
+        // about 70GB/s where the MLP projections reach 172GB/s; the packed
+        // weight also arrives in the layout the on-device pack used to build.
+        let zba = linear_checkpoint(ctx, &normed, &w.zba_w)?
             .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
         if gdn_timed {
             gdn_stage_mark(ctx, layer_idx, "project", &mut gdn_since)?;
