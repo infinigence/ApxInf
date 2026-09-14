@@ -95,8 +95,18 @@ impl GraphWorkspace {
             .checked_add(WORKSPACE_ALIGNMENT - 1)
             .ok_or_else(|| Error::Other("static inference workspace offset overflow".into()))?
             & !(WORKSPACE_ALIGNMENT - 1);
+        // Diagnostic slack between arena allocations. The driver hands out
+        // separate, non-adjacent blocks, so a kernel that writes slightly past
+        // the end of its buffer lands in unused memory; the arena packs
+        // allocations back to back, where the same overrun clobbers the next
+        // one. If a slack makes a failure go away, that is the shape of it.
+        let slack: usize = std::env::var("APXINF_CUDA_WORKSPACE_SLACK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         let end = start
             .checked_add(bytes)
+            .and_then(|value| value.checked_add(slack))
             .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
         if end > self.storage.len() {
             return Err(Error::Other(format!(

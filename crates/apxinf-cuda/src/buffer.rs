@@ -74,6 +74,11 @@ fn alloc_cache() -> Option<&'static std::sync::Mutex<AllocCache>> {
         .as_ref()
 }
 
+fn poison_allocations() -> bool {
+    static POISON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POISON.get_or_init(|| std::env::var_os("APXINF_CUDA_POISON_ALLOC").is_some())
+}
+
 /// Take a cached block of exactly `num_bytes` on `device`, if one is held.
 fn cache_take(num_bytes: usize, device: usize) -> Option<*mut c_void> {
     let mut cache = alloc_cache()?.lock().ok()?;
@@ -150,6 +155,17 @@ impl CudaBuffer {
                 fresh
             }
         };
+        // Poison every allocation under APXINF_CUDA_POISON_ALLOC. 0xFF is NaN at
+        // every float width, so anything that reads a buffer before writing it
+        // shows up in the result. Unlike poisoning operator outputs alone, this
+        // covers the allocations a model makes directly, which is where a
+        // read-before-write would otherwise stay hidden behind whatever the
+        // previous owner of the block left there.
+        if poison_allocations() {
+            unsafe {
+                ffi::check_cuda(ffi::cudaMemset(ptr, 0xFF, num_bytes))?;
+            }
+        }
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation {
             ptr,
             len: num_bytes,

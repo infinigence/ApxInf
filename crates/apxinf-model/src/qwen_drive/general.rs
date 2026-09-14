@@ -868,10 +868,17 @@ impl QwenDriveModel {
             self.gdn_graph_prepared = vec![[false, false]; self.weights.layers.len()];
         }
         if self.gdn_graph_workspace.is_none() {
+            // Allocating the arena mid-decode is the one moment this path
+            // perturbs anything: the corruption appears only at the step the
+            // arena is first taken, in a full-attention layer that never uses
+            // it, and is gone by the next step. Drain before and after so the
+            // allocation cannot land among work already in flight.
+            cuda.synchronize()?;
             self.gdn_graph_workspace = Some(kernels::GraphWorkspace::new(
                 DECODE_GRAPH_ARENA_BYTES,
                 ctx.device_id(),
             )?);
+            cuda.synchronize()?;
         }
         if self.gdn_graph_in.is_none() {
             self.gdn_graph_in = Some(persistent_tensor(ctx, &dims, DType::BF16)?);
@@ -883,6 +890,39 @@ impl QwenDriveModel {
         // The capture reads this address, so every step stages its input here.
         let staged = self.gdn_graph_in.clone().expect("staging input");
         device_copy(ctx, &staged, &x, bytes)?;
+
+        // Diagnostic arm: run the body inside the arena with no capture and no
+        // replay. If this is already wrong, the fault is in the workspace
+        // allocation path rather than in anything CUDA graphs do.
+        if std::env::var_os("APXINF_QWEN_DECODE_GRAPH_ARENA_ONLY").is_some() {
+            // `raw` drops the staging copies as well, which separates the arena
+            // itself from the copies in and out of it.
+            let raw = std::env::var("APXINF_QWEN_DECODE_GRAPH_ARENA_ONLY")
+                .map(|value| value.contains("raw"))
+                .unwrap_or(false);
+            let input = if raw { x.clone() } else { staged.clone() };
+            let prepare = std::env::var("APXINF_QWEN_DECODE_GRAPH_ARENA_ONLY")
+                .map(|value| value.contains("prepare"))
+                .unwrap_or(false);
+            let workspace = self.gdn_graph_workspace.take().expect("graph arena");
+            let produced = if prepare {
+                kernels::prepare_with_workspace(&workspace, || {
+                    self.forward_gdn_eager(input, layer_idx, 1)
+                })
+            } else {
+                kernels::with_workspace(&workspace, || self.forward_gdn_eager(input, layer_idx, 1))
+            };
+            self.gdn_graph_workspace = Some(workspace);
+            let output = produced?;
+            if raw {
+                return Ok(output);
+            }
+            let landing = self.gdn_graph_result[layer_idx]
+                .clone()
+                .expect("landing buffer");
+            device_copy(ctx, &landing, &output, bytes)?;
+            return Ok(landing);
+        }
 
         if !self.gdn_graph_prepared[layer_idx][parity] {
             // Declared preflight: executes, so its output is this step's real
