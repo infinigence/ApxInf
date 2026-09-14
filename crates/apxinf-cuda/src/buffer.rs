@@ -90,10 +90,15 @@ impl CudaBuffer {
     }
 
     /// Allocate and zero-fill asynchronously on the given stream.
+    ///
+    /// Takes the stream by reference: `CudaStream` owns its stream and is
+    /// neither `Copy` nor `Clone`, so the by-value form this replaced could
+    /// not be called with the `&CudaStream` a context hands out, and had no
+    /// callers.
     pub fn alloc_zeros_async(
         num_bytes: usize,
         device: usize,
-        stream: crate::CudaStream,
+        stream: &crate::CudaStream,
     ) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;
         unsafe {

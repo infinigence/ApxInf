@@ -126,8 +126,15 @@ fn device_tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor>
         .map_err(Error::Cuda)
 }
 
+/// Allocate zeroed device scratch on the compute stream.
+///
+/// The GDN scan takes ten of these per layer, and `DeviceBuffer::alloc_zeros`
+/// clears them with the blocking `cudaMemset`, so each layer forced the device
+/// to drain several times over. The async form is stream-ordered against the
+/// kernels that read the memory, which is the only ordering that matters here.
 fn alloc_zeros(ctx: &Context, bytes: usize) -> Result<DeviceBuffer> {
-    DeviceBuffer::alloc_zeros(bytes.max(1), ctx.device_id()).map_err(Error::Cuda)
+    DeviceBuffer::alloc_zeros_async(bytes.max(1), ctx.device_id(), ctx.stream())
+        .map_err(Error::Cuda)
 }
 
 /// Apply a BF16 linear weight in its original checkpoint [out,in] layout.
@@ -724,11 +731,20 @@ impl QwenDriveModel {
         let kernel = text.linear_conv_kernel_dim;
         let has_state = self.cache_len > 0;
 
+        // The scan is only part of a GDN layer; attribute what precedes it too.
+        let gdn_timed = seq > 1 && diagnostics_enabled();
+        let mut gdn_since = std::time::Instant::now();
         let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
+        if gdn_timed {
+            gdn_stage_mark(ctx, layer_idx, "pre_norm", &mut gdn_since)?;
+        }
         // Preserve all four reference GEMM geometries. Transposing or fusing
         // these weights selects different BF16 reductions in cuBLAS.
         let zba = project_and_pack(ctx, &normed, &[&w.qkv_w, &w.z_w, &w.b_w, &w.a_w])?
             .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
+        if gdn_timed {
+            gdn_stage_mark(ctx, layer_idx, "project", &mut gdn_since)?;
+        }
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_input", &x)?;
             trace_rows("text0_input_norm", &normed)?;
@@ -758,6 +774,9 @@ impl QwenDriveModel {
             *flip = !*flip;
         }
         if layer_idx == 0 && seq > 1 { trace_rows("text0_conv_silu", &conv_out)?; }
+        if gdn_timed {
+            gdn_stage_mark(ctx, layer_idx, "conv_silu", &mut gdn_since)?;
+        }
 
         let recurrent_decode = has_state && seq == 1;
         let seq_pad = if recurrent_decode { 1 } else { seq.div_ceil(GDN_CHUNK) * GDN_CHUNK };
@@ -766,6 +785,9 @@ impl QwenDriveModel {
         let v_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes())?;
         let beta_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
         let g_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
+        if gdn_timed {
+            gdn_stage_mark(ctx, layer_idx, "qkvbg_alloc", &mut gdn_since)?;
+        }
         la::gdn_qk_prep(ctx, &conv_out, &q_buf, &k_buf, seq_pad, num_k_heads, num_v_heads, head_k, key_dim, recurrent_decode, 1e-6)?;
         la::gdn_vb_prep(
             ctx,
@@ -810,12 +832,10 @@ impl QwenDriveModel {
             let t_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes())?;
             let vt_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_v * DType::F32.size_in_bytes())?;
             let kcd_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_k * DType::F32.size_in_bytes())?;
-            // GDN prefill dominates this model's prefill on Orin, so the scan is
-            // attributable stage by stage. Off by default: each mark synchronizes.
-            let gdn_timed = diagnostics_enabled();
-            let mut gdn_since = std::time::Instant::now();
+            // Covers the q/k/v/beta/g preparation kernels and the scan's own
+            // zeroed allocations, which sit between conv_silu and cumsum.
             if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "alloc", &mut gdn_since)?;
+                gdn_stage_mark(ctx, layer_idx, "prep_alloc", &mut gdn_since)?;
             }
             la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
             if gdn_timed {
