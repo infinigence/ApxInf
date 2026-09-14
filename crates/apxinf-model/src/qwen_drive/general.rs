@@ -518,6 +518,16 @@ impl QwenDriveModel {
 
     fn reset_state(&mut self) -> Result<()> {
         self.caches = Self::fresh_caches(&self.config, &self.cuda, self.max_seq_len)?;
+        // Captured GDN graphs hold the addresses of the cache buffers they were
+        // recorded against, and those buffers are about to be replaced. Left
+        // in place they read and write freed memory: with the allocation cache
+        // on, that memory is handed straight back out to the fresh caches, so
+        // the replay corrupts live state instead of faulting. Drop them and let
+        // the next sequence re-prepare and re-capture.
+        self.gdn_graphs.clear();
+        self.gdn_graph_out.clear();
+        self.gdn_graph_result.clear();
+        self.gdn_graph_prepared.clear();
         self.cache_len = 0;
         self.rope_delta = 0;
         self.last_position = 0;
@@ -880,6 +890,21 @@ impl QwenDriveModel {
             )?);
             cuda.synchronize()?;
         }
+        // Diagnostic arm: take the arena and then run the body exactly as the
+        // eager path does, with no workspace bound, no staging, no capture. The
+        // only difference from a clean run is that a 64MB block now exists.
+        // Every hypothesis that blames what the arena path *does* predicts this
+        // is correct; a layout hypothesis -- some kernel writing past the end of
+        // a buffer whose neighbour this allocation changed -- predicts it is
+        // wrong, and that would explain a full-attention layer going bad while
+        // the GDN layer that uses the arena stays exact.
+        if std::env::var("APXINF_QWEN_DECODE_GRAPH_ARENA_ONLY")
+            .map(|value| value.contains("alloc"))
+            .unwrap_or(false)
+        {
+            return self.forward_gdn_eager(x, layer_idx, 1);
+        }
+
         if self.gdn_graph_in.is_none() {
             self.gdn_graph_in = Some(persistent_tensor(ctx, &dims, DType::BF16)?);
         }
@@ -942,7 +967,11 @@ impl QwenDriveModel {
             return Ok(landing);
         }
 
+        // A capture executes the Rust body, so the host-side conv flip advances
+        // on that step and must not be advanced again after the replay below.
+        let mut captured_now = false;
         if self.gdn_graphs[layer_idx][parity].is_none() {
+            captured_now = true;
             cuda.synchronize()?;
             let workspace = self.gdn_graph_workspace.take().expect("graph arena");
             cuda.begin_capture()?;
@@ -967,6 +996,22 @@ impl QwenDriveModel {
             .as_ref()
             .expect("captured graph")
             .replay()?;
+
+        // The conv state is a ping-pong pair chosen by a host-side flip, and
+        // `parity` is that flip. The eager body toggles it on its way through;
+        // a replay runs no Rust at all, so without this the flip freezes, the
+        // same graph is selected on every step, and it reads the same conv
+        // buffer forever while writing the one nothing reads. The layer then
+        // sees a convolution window frozen at the step of the last eager pass,
+        // which is why the generation collapses into repetition rather than
+        // drifting. Advancing it here restores the alternation the two captured
+        // graphs were built for: parity 0 reads A and writes B, parity 1 reads
+        // B and writes A.
+        if !captured_now {
+            if let LayerCache::Gdn { flip, .. } = &mut self.caches[layer_idx] {
+                *flip = !*flip;
+            }
+        }
 
         // The captured output lives in the arena, which the next captured layer
         // reuses, so it is copied into this layer's own buffer before returning.
