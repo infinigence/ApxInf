@@ -212,11 +212,51 @@ pub(crate) fn is_preparing_workspace() -> bool {
     PREPARING.with(Cell::get)
 }
 
+/// Whether the workspace-less path may hand back an uncleared buffer.
+///
+/// The workspace path already makes the case: `GraphWorkspace::allocate`
+/// returns a reused view into its arena and never clears it, so every consumer
+/// of `output_buffer` already tolerates dirty memory. The fallback cleared
+/// anyway, and it is not cheap -- one Qwen-Drive VQA inference on Orin issued
+/// 33,545 memsets covering 41GB, 313ms of GPU time on top of 371ms of host API,
+/// with single prefill outputs reaching 114MB.
+///
+/// Opt-in through `APXINF_CUDA_SKIP_OUTPUT_ZERO` until the model families that
+/// have only ever taken the workspace-less path have been checked. Setting it
+/// to `poison` fills the buffer with 0xFF instead, which is NaN for every float
+/// width: that turns "nothing read uninitialized memory" from something a clean
+/// run merely fails to disprove into something a run actively convicts, because
+/// any such read propagates NaN into the output.
+#[derive(Clone, Copy, PartialEq)]
+enum OutputFill {
+    Zero,
+    Dirty,
+    Poison,
+}
+
+fn output_fill() -> OutputFill {
+    static FILL: std::sync::OnceLock<OutputFill> = std::sync::OnceLock::new();
+    *FILL.get_or_init(
+        || match std::env::var("APXINF_CUDA_SKIP_OUTPUT_ZERO").as_deref() {
+            Err(_) => OutputFill::Zero,
+            Ok("poison") => OutputFill::Poison,
+            Ok(_) => OutputFill::Dirty,
+        },
+    )
+}
+
 pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
         if workspace.is_null() {
-            CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
+            match output_fill() {
+                OutputFill::Zero => {
+                    CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
+                }
+                OutputFill::Dirty => CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda),
+                OutputFill::Poison => CudaBuffer::alloc_filled(bytes, ctx.device_id(), 0xFF)
+                    .map_err(Error::Cuda),
+            }
         } else {
             unsafe { &*workspace }.allocate(bytes, ctx.device_id())
         }

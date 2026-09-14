@@ -172,6 +172,19 @@ impl CudaBuffer {
         Ok(buf)
     }
 
+    /// Allocate and fill every byte with `value`.
+    ///
+    /// Used to poison operator outputs under test: 0xFF is NaN at every float
+    /// width, so a consumer that reads memory the producing kernel did not
+    /// write shows up in the result instead of passing unnoticed.
+    pub fn alloc_filled(num_bytes: usize, device: usize, value: i32) -> Result<Self, String> {
+        let buf = Self::alloc(num_bytes, device)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset(buf.ptr, value, num_bytes))?;
+        }
+        Ok(buf)
+    }
+
     /// Allocate and zero-fill asynchronously on the given stream.
     ///
     /// Takes the stream by reference: `CudaStream` owns its stream and is
