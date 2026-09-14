@@ -108,9 +108,27 @@ fn device_copy(ctx: &Context, destination: &Tensor, source: &Tensor, bytes: usiz
 /// every step -- wrong without failing. GDN carries a fixed-size recurrent
 /// state updated in place, and its conv state double-buffers, so one capture
 /// per layer per parity covers it exactly.
-fn decode_graph_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("APXINF_QWEN_DECODE_GRAPH").is_some())
+/// `APXINF_QWEN_DECODE_GRAPH` selects which GDN layers take the captured path:
+/// `all`, or a single layer index to isolate one while the rest stay eager.
+/// Restricting it to one layer separates a fault inside a captured body from
+/// one in how the bodies share the arena and the staging buffers.
+fn decode_graph_layers() -> Option<Option<usize>> {
+    static SETTING: std::sync::OnceLock<Option<Option<usize>>> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| match std::env::var("APXINF_QWEN_DECODE_GRAPH") {
+        Err(_) => None,
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(layer) => Some(Some(layer)),
+            Err(_) => Some(None),
+        },
+    })
+}
+
+fn decode_graph_enabled_for(layer_idx: usize) -> bool {
+    match decode_graph_layers() {
+        None => false,
+        Some(None) => true,
+        Some(Some(only)) => only == layer_idx,
+    }
 }
 
 /// Decode steps to run eagerly before capturing.
@@ -817,7 +835,7 @@ impl QwenDriveModel {
         if seq != 1
             || self.cache_len == 0
             || step < DECODE_GRAPH_WARMUP_STEPS
-            || !decode_graph_enabled()
+            || !decode_graph_enabled_for(layer_idx)
         {
             return self.forward_gdn_eager(x, layer_idx, seq);
         }
