@@ -172,6 +172,36 @@ impl CudaBuffer {
         Ok(buf)
     }
 
+    /// Copy `num_bytes` from another device buffer on the given stream.
+    ///
+    /// A captured graph reads and writes fixed addresses, so a caller that
+    /// replays one has to move its inputs into the buffers the capture baked
+    /// and its results back out. Stream-ordered, so it sequences with the
+    /// replay without a host sync.
+    pub fn copy_from_device_async(
+        &self,
+        source: &CudaBuffer,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len || num_bytes > source.len {
+            return Err(format!(
+                "device copy of {num_bytes} bytes exceeds {} or {}",
+                self.len, source.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                num_bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Fill `num_bytes` of this buffer with `value` on the given stream.
     ///
     /// Workspace views are reused rather than freshly allocated, so a caller

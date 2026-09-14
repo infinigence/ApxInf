@@ -75,6 +75,51 @@ fn gdn_stage_mark(
     Ok(())
 }
 
+/// Arena for the captured GDN decode bodies. One layer's decode intermediates
+/// are well under a megabyte at seq 1; this leaves room without tuning.
+const DECODE_GRAPH_ARENA_BYTES: usize = 64 * 1024 * 1024;
+
+/// A tensor outside the graph arena, so its address survives the arena being
+/// reused by the next captured layer.
+fn persistent_tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor> {
+    let elements: usize = shape.iter().product();
+    let bytes = elements
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(|| Error::Other("qwen_drive: persistent tensor size overflow".into()))?;
+    DeviceBuffer::alloc(bytes.max(1), ctx.device_id())
+        .map_err(Error::Cuda)?
+        .as_tensor(Shape::new(shape.to_vec()), dtype)
+        .map_err(Error::Cuda)
+}
+
+/// Stream-ordered device copy between two tensors of the same byte length.
+fn device_copy(ctx: &Context, destination: &Tensor, source: &Tensor, bytes: usize) -> Result<()> {
+    let dst = DeviceBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    let src = DeviceBuffer::from_tensor(source).map_err(Error::Cuda)?;
+    dst.copy_from_device_async(&src, bytes, ctx.stream())
+        .map_err(Error::Cuda)
+}
+
+/// Whether decode may run the GDN layers from captured CUDA graphs.
+///
+/// Only the GDN layers qualify. The full-attention layers pass `cache_len` and
+/// `kv_len` to their kernels as host scalars, and a capture bakes those in, so
+/// a replay would write the same KV slot and attend over the same extent on
+/// every step -- wrong without failing. GDN carries a fixed-size recurrent
+/// state updated in place, and its conv state double-buffers, so one capture
+/// per layer per parity covers it exactly.
+fn decode_graph_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("APXINF_QWEN_DECODE_GRAPH").is_some())
+}
+
+/// Decode steps to run eagerly before capturing.
+///
+/// cuBLASLt plan preparation allocates, which is illegal inside a capture, and
+/// `may_prepare_native_resources` reports false once a workspace is bound. Two
+/// eager passes leave every plan on this path already built.
+const DECODE_GRAPH_WARMUP_STEPS: usize = 2;
+
 /// The decode step the divergence probes should fire at, from
 /// `APXINF_QWEN_TRACE_DECODE_STEP`. Unset means no step.
 fn trace_decode_step() -> Option<usize> {
@@ -260,6 +305,25 @@ pub struct QwenDriveModel {
     /// one step instead of overwriting itself on every one of them. `None`
     /// outside the decode loop.
     decode_step: Option<usize>,
+    /// Captured GDN decode graphs, by layer and by the conv double-buffer
+    /// parity the capture baked in.
+    gdn_graphs: Vec<[Option<Box<dyn apxinf_core::Graph>>; 2]>,
+    /// Whether one eager pass has already run under the arena for this layer
+    /// and parity. cuBLASLt plans bind buffer addresses when they are prepared,
+    /// and `may_prepare_native_resources` reports false once a workspace is
+    /// bound unless the pass is a declared preflight, so a capture taken before
+    /// that preflight records kernels set up against the driver-allocated
+    /// buffers the eager steps used.
+    gdn_graph_prepared: Vec<[bool; 2]>,
+    /// Where a captured layer leaves its result: a workspace view, valid only
+    /// until the arena is reused, so it is copied out after every replay.
+    gdn_graph_out: Vec<[Option<Tensor>; 2]>,
+    /// Fixed-address input a captured layer reads, and the per-layer landing
+    /// buffer a replayed result is copied into.
+    gdn_graph_in: Option<Tensor>,
+    gdn_graph_result: Vec<Option<Tensor>>,
+    /// Stable-address arena the captured bodies allocate from.
+    gdn_graph_workspace: Option<kernels::GraphWorkspace>,
 }
 
 /// Install the CUDA GEMM tactic store for this device.
@@ -371,6 +435,12 @@ impl QwenDriveModel {
             last_position: 0,
             diag_digest: Vec::new(),
             decode_step: None,
+            gdn_graphs: Vec::new(),
+            gdn_graph_prepared: Vec::new(),
+            gdn_graph_out: Vec::new(),
+            gdn_graph_in: None,
+            gdn_graph_result: Vec::new(),
+            gdn_graph_workspace: None,
         })
     }
 
@@ -735,7 +805,124 @@ impl QwenDriveModel {
         self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, false)
     }
 
-    fn forward_gdn(
+    /// Run one GDN decode layer, from a captured graph when one is available.
+    ///
+    /// Order matters. A capture records without executing, but the host-side
+    /// conv parity flip inside the body runs either way, so the sequence is
+    /// capture (parity advances, device does nothing) then replay (device does
+    /// the work once). Running the body eagerly first and capturing afterwards
+    /// would advance the parity twice and bake the wrong buffers.
+    fn forward_gdn(&mut self, x: Tensor, layer_idx: usize, seq: usize) -> Result<Tensor> {
+        let step = self.decode_step.unwrap_or(0);
+        if seq != 1
+            || self.cache_len == 0
+            || step < DECODE_GRAPH_WARMUP_STEPS
+            || !decode_graph_enabled()
+        {
+            return self.forward_gdn_eager(x, layer_idx, seq);
+        }
+        let parity = match &self.caches[layer_idx] {
+            LayerCache::Gdn { flip, .. } => usize::from(*flip),
+            _ => return self.forward_gdn_eager(x, layer_idx, seq),
+        };
+        self.forward_gdn_captured(x, layer_idx, parity)
+    }
+
+    fn forward_gdn_captured(
+        &mut self,
+        x: Tensor,
+        layer_idx: usize,
+        parity: usize,
+    ) -> Result<Tensor> {
+        let cuda = Arc::clone(&self.cuda);
+        let ctx = cuda.context();
+        let dims = x.shape().dims().to_vec();
+        let bytes = x.numel() * DType::BF16.size_in_bytes();
+
+        if self.gdn_graphs.len() != self.weights.layers.len() {
+            self.gdn_graphs = (0..self.weights.layers.len())
+                .map(|_| [None, None])
+                .collect();
+            self.gdn_graph_out = (0..self.weights.layers.len())
+                .map(|_| [None, None])
+                .collect();
+            self.gdn_graph_result = vec![None; self.weights.layers.len()];
+            self.gdn_graph_prepared = vec![[false, false]; self.weights.layers.len()];
+        }
+        if self.gdn_graph_workspace.is_none() {
+            self.gdn_graph_workspace = Some(kernels::GraphWorkspace::new(
+                DECODE_GRAPH_ARENA_BYTES,
+                ctx.device_id(),
+            )?);
+        }
+        if self.gdn_graph_in.is_none() {
+            self.gdn_graph_in = Some(persistent_tensor(ctx, &dims, DType::BF16)?);
+        }
+        if self.gdn_graph_result[layer_idx].is_none() {
+            self.gdn_graph_result[layer_idx] = Some(persistent_tensor(ctx, &dims, DType::BF16)?);
+        }
+
+        // The capture reads this address, so every step stages its input here.
+        let staged = self.gdn_graph_in.clone().expect("staging input");
+        device_copy(ctx, &staged, &x, bytes)?;
+
+        if !self.gdn_graph_prepared[layer_idx][parity] {
+            // Declared preflight: executes, so its output is this step's real
+            // result and the recurrent and conv state advance exactly once.
+            let workspace = self.gdn_graph_workspace.take().expect("graph arena");
+            let prepared = kernels::prepare_with_workspace(&workspace, || {
+                self.forward_gdn_eager(staged.clone(), layer_idx, 1)
+            });
+            self.gdn_graph_workspace = Some(workspace);
+            let output = prepared?;
+            cuda.synchronize()?;
+            self.gdn_graph_prepared[layer_idx][parity] = true;
+            let landing = self.gdn_graph_result[layer_idx]
+                .clone()
+                .expect("landing buffer");
+            device_copy(ctx, &landing, &output, bytes)?;
+            return Ok(landing);
+        }
+
+        if self.gdn_graphs[layer_idx][parity].is_none() {
+            cuda.synchronize()?;
+            let workspace = self.gdn_graph_workspace.take().expect("graph arena");
+            cuda.begin_capture()?;
+            let captured = kernels::with_workspace(&workspace, || {
+                self.forward_gdn_eager(staged.clone(), layer_idx, 1)
+            });
+            let output = match captured {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = cuda.end_capture();
+                    self.gdn_graph_workspace = Some(workspace);
+                    return Err(error);
+                }
+            };
+            let graph = cuda.end_capture()?;
+            self.gdn_graph_workspace = Some(workspace);
+            self.gdn_graph_out[layer_idx][parity] = Some(output);
+            self.gdn_graphs[layer_idx][parity] = Some(graph);
+        }
+
+        self.gdn_graphs[layer_idx][parity]
+            .as_ref()
+            .expect("captured graph")
+            .replay()?;
+
+        // The captured output lives in the arena, which the next captured layer
+        // reuses, so it is copied into this layer's own buffer before returning.
+        let produced = self.gdn_graph_out[layer_idx][parity]
+            .clone()
+            .expect("captured output");
+        let landing = self.gdn_graph_result[layer_idx]
+            .clone()
+            .expect("landing buffer");
+        device_copy(ctx, &landing, &produced, bytes)?;
+        Ok(landing)
+    }
+
+    fn forward_gdn_eager(
         &mut self,
         x: Tensor,
         layer_idx: usize,
