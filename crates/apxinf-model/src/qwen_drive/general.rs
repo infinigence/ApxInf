@@ -108,6 +108,25 @@ fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<T
     Ok(output)
 }
 
+/// implement_port r4 (analysis/stack_candidate_selection_r4): `linear_checkpoint`
+/// variant writing into a caller-provided BF16 output tensor (model-owned decode
+/// workspace reuse). gemm::write_ex already exposes the output DeviceBuffer, so
+/// this is the identical GEMM with the allocation removed; no FFI change.
+fn linear_checkpoint_into(ctx: &Context, input: &Tensor, weight: &Tensor, out: &Tensor) -> Result<()> {
+    let x=input.shape().dims();let w=weight.shape().dims();
+    if x.len()!=2 || w.len()!=2 || x[1]!=w[1] || input.dtype()!=DType::BF16 || weight.dtype()!=DType::BF16
+        || out.dtype()!=DType::BF16 || out.shape().dims()!=[x[0],w[0]] {
+        return Err(Error::Other("qwen_drive: checkpoint linear shape/dtype mismatch".into()));
+    }
+    let stride=i32::try_from(x[1]).map_err(|_|Error::Other("linear input stride overflow".into()))?;
+    let columns=i32::try_from(w[0]).map_err(|_|Error::Other("linear output stride overflow".into()))?;
+    gemm::write_ex(ctx,DType::BF16,CublasTranspose::None,CublasTranspose::Transpose,x[0],w[0],x[1],
+        1.0,&DeviceBuffer::from_tensor(input).map_err(Error::Cuda)?,stride,
+        &DeviceBuffer::from_tensor(weight).map_err(Error::Cuda)?,stride,0.0,
+        &DeviceBuffer::from_tensor(out).map_err(Error::Cuda)?,columns)?;
+    Ok(())
+}
+
 #[allow(dead_code)] // gap_closure_8: superseded by the load-time stacked_in_w packs; kept for reference.
 fn project_and_pack(ctx: &Context, input: &Tensor, weights: &[&Tensor]) -> Result<Tensor> {
     let rows=input.shape().dims()[0];
@@ -151,6 +170,190 @@ enum LayerCache {
     },
 }
 
+/// Model-owned single-token decode workspace (implement_port r2, per
+/// analysis/candidate_selection_r2): fixed-shape buffers allocated once at load
+/// and reused across all layers, decode steps, and requests on the seq==1 forward
+/// path, replacing ~176 per-token cudaMalloc/memset pairs (DeviceBuffer::alloc and
+/// alloc_zeros are unpooled driver calls). Every buffer is fully written by its
+/// producing kernel before any consumer in the same step (full_attn_prepare,
+/// causal_conv1d_silu_bf16, gdn_qk_prep/gdn_vb_prep, gdn_recurrent), so one-time
+/// zero-fill preserves the prior alloc_zeros semantics; the seq>1 path keeps its
+/// original per-call allocations byte-identical.
+struct DecodeWorkspace {
+    q_out: Tensor,
+    conv_out: Tensor,
+    gdn_out: Tensor,
+    q_buf: DeviceBuffer,
+    k_buf: DeviceBuffer,
+    v_buf: DeviceBuffer,
+    beta_buf: DeviceBuffer,
+    g_buf: DeviceBuffer,
+    // implement_port r3 (analysis/stack_candidate_selection_r3): model-owned,
+    // fixed-capacity mrope decode-table cache. inv_freq is computed once at load;
+    // a window of device cos/sin rows is recomputed and uploaded only on a miss
+    // (about one 2xH2D pair per request instead of per decode step), and each
+    // seq==1 step is served a zero-copy row view.
+    rope_inv_freq: Vec<f32>,
+    rope_rotary: usize,
+    rope_cos: DeviceBuffer,
+    rope_sin: DeviceBuffer,
+    rope_base: u32,
+    rope_valid: usize,
+    // implement_port r4 (analysis/stack_candidate_selection_r4): fixed-shape
+    // role buffers for the seq==1 decode path, reused via *_into out-parameter
+    // variants across all 32 layers and every decode step. Shapes repeat across
+    // layers at seq==1 and each buffer is fully rewritten by its producing
+    // kernel before any consumer reads it within the same step
+    // (write-before-read: rms_norm_plus1_into, the stacked GEMMs, the FA2
+    // split-KV pair, gated_rms_silu_into, the o/out/down projections and the
+    // residual adds), so one shared buffer per role is safe and one-time
+    // zero-fill preserves the prior alloc_zeros semantics. Widths derive from
+    // the config: fused_attn = q|gate + k + v packed rows, zba_gdn = conv_dim
+    // + value_dim + 2 * num_v_heads; the FA2 scratch is sized once for the
+    // max_splits = 128 cap (block_n = 64 at head_dim 256), covering every
+    // kv_len the decode route presents. All buffers are model-owned, bounded,
+    // and die with the model; the seq>1 prefill path is untouched.
+    normed: Tensor,
+    residual: Tensor,
+    proj: Tensor,
+    fused_attn: Tensor,
+    zba_gdn: Tensor,
+    gated: Tensor,
+    fa2_out: Tensor,
+    fa2_lse: DeviceBuffer,
+    fa2_lse_accum: DeviceBuffer,
+    fa2_o_accum: DeviceBuffer,
+    tok_id: DeviceBuffer,
+}
+
+/// Fixed row capacity of the model-owned mrope decode-table window (bounded).
+const ROPE_WINDOW: usize = 4096;
+
+impl DecodeWorkspace {
+    fn new(config: &QwenDriveConfig, device: usize) -> Result<Self> {
+        let text = &config.text;
+        let head_dim = text.head_dim;
+        let num_k_heads = text.linear_num_key_heads;
+        let num_v_heads = text.linear_num_value_heads;
+        let head_k = text.linear_key_head_dim;
+        let head_v = text.linear_value_head_dim;
+        let key_dim = num_k_heads * head_k;
+        let value_dim = num_v_heads * head_v;
+        let conv_dim = 2 * key_dim + value_dim;
+        let q_out_bytes = (text.n_heads * head_dim * DType::BF16.size_in_bytes()).max(1);
+        let conv_bytes = (conv_dim * DType::BF16.size_in_bytes()).max(1);
+        let gdn_bytes = (value_dim * DType::BF16.size_in_bytes()).max(1);
+        let q_out = DeviceBuffer::alloc_zeros(q_out_bytes, device)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, text.n_heads, head_dim]), DType::BF16)
+            .map_err(Error::Cuda)?;
+        let conv_out = DeviceBuffer::alloc_zeros(conv_bytes, device)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, conv_dim]), DType::BF16)
+            .map_err(Error::Cuda)?;
+        let gdn_out = DeviceBuffer::alloc_zeros(gdn_bytes, device)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, value_dim]), DType::BF16)
+            .map_err(Error::Cuda)?;
+        let f32_size = DType::F32.size_in_bytes();
+        let q_buf = DeviceBuffer::alloc_zeros((num_v_heads * head_k * f32_size).max(1), device).map_err(Error::Cuda)?;
+        let k_buf = DeviceBuffer::alloc_zeros((num_v_heads * head_k * f32_size).max(1), device).map_err(Error::Cuda)?;
+        let v_buf = DeviceBuffer::alloc_zeros((num_v_heads * head_v * f32_size).max(1), device).map_err(Error::Cuda)?;
+        let beta_buf = DeviceBuffer::alloc_zeros((num_v_heads * f32_size).max(1), device).map_err(Error::Cuda)?;
+        let g_buf = DeviceBuffer::alloc_zeros((num_v_heads * f32_size).max(1), device).map_err(Error::Cuda)?;
+        // implement_port r3: inv_freq from the same expression mrope_tables uses,
+        // computed once instead of per forward span; the device window starts empty
+        // (rope_valid = 0 forces exactly one fill on the first decode step).
+        let rope_rotary = text.rotary_dim();
+        let pairs = rope_rotary / 2;
+        let mut rope_inv_freq = vec![0.0f32; pairs];
+        for (i, slot) in rope_inv_freq.iter_mut().enumerate() {
+            *slot = 1.0 / text.rope_theta.powf(2.0 * i as f32 / rope_rotary as f32);
+        }
+        let rope_bytes = (ROPE_WINDOW * rope_rotary * DType::BF16.size_in_bytes()).max(1);
+        let rope_cos = DeviceBuffer::alloc_zeros(rope_bytes, device).map_err(Error::Cuda)?;
+        let rope_sin = DeviceBuffer::alloc_zeros(rope_bytes, device).map_err(Error::Cuda)?;
+        // implement_port r4: allocate the fixed-shape role buffers once. Widths
+        // derive from the config (fused_attn = q|gate + k + v packed rows;
+        // zba_gdn = conv_dim + value_dim + 2 * num_v_heads); the FA2 split-KV
+        // scratch is sized for the max_splits = 128 cap so it covers every
+        // kv_len (only one full-attention layer runs at a time).
+        let hidden = text.hidden_size;
+        let bf16_size = DType::BF16.size_in_bytes();
+        let role = |width: usize| -> Result<Tensor> {
+            DeviceBuffer::alloc_zeros((width * bf16_size).max(1), device)
+                .map_err(Error::Cuda)?
+                .as_tensor(Shape::new(vec![1, width]), DType::BF16)
+                .map_err(Error::Cuda)
+        };
+        let fused_attn_width = 2 * text.n_heads * head_dim + 2 * text.n_kv_heads * head_dim;
+        let zba_gdn_width = conv_dim + value_dim + 2 * num_v_heads;
+        let normed = role(hidden)?;
+        let residual = role(hidden)?;
+        let proj = role(hidden)?;
+        let fused_attn = role(fused_attn_width)?;
+        let zba_gdn = role(zba_gdn_width)?;
+        let gated = role(value_dim)?;
+        let fa2_out = DeviceBuffer::alloc_zeros(q_out_bytes, device)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, text.n_heads, head_dim]), DType::BF16)
+            .map_err(Error::Cuda)?;
+        // FA2 split-KV decode scratch: max_splits is capped at 128 by the kernel
+        // wrapper (block_n = 64 at head_dim 256), lse rows are batches*heads*1.
+        const FA2_MAX_SPLITS: usize = 128;
+        let fa2_lse = DeviceBuffer::alloc_zeros(text.n_heads * f32_size, device).map_err(Error::Cuda)?;
+        let fa2_lse_accum = DeviceBuffer::alloc_zeros(FA2_MAX_SPLITS * text.n_heads * f32_size, device).map_err(Error::Cuda)?;
+        let fa2_o_accum = DeviceBuffer::alloc_zeros(FA2_MAX_SPLITS * text.n_heads * head_dim * f32_size, device).map_err(Error::Cuda)?;
+        // One-element token-id upload buffer for the seq==1 embed path (same
+        // blocking H2D copy as upload_u32; only the per-step alloc is removed).
+        let tok_id = DeviceBuffer::alloc_zeros(std::mem::size_of::<u32>(), device).map_err(Error::Cuda)?;
+        Ok(Self { q_out, conv_out, gdn_out, q_buf, k_buf, v_buf, beta_buf, g_buf,
+            rope_inv_freq, rope_rotary, rope_cos, rope_sin, rope_base: 0, rope_valid: 0,
+            normed, residual, proj, fused_attn, zba_gdn, gated, fa2_out,
+            fa2_lse, fa2_lse_accum, fa2_o_accum, tok_id })
+    }
+
+    /// Zero-copy `[1, rotary]` cos/sin row views for one equal-axes decode
+    /// position. On a window miss the rows `[pos, pos + ROPE_WINDOW)` are rebuilt
+    /// on the host with the SAME fp32 math and bf16 rounding as `mrope_tables`
+    /// (bit-identical values) and uploaded once; hits only construct views (the
+    /// same DeviceBuffer::view + as_tensor pattern as `cache_view`).
+    fn rope_row(&mut self, pos: u32) -> Result<(Tensor, Tensor)> {
+        let pairs = self.rope_rotary / 2;
+        let row_bytes = self.rope_rotary * DType::BF16.size_in_bytes();
+        if self.rope_valid == 0 || pos < self.rope_base || pos >= self.rope_base + self.rope_valid as u32 {
+            let mut cos = Vec::with_capacity(ROPE_WINDOW * self.rope_rotary);
+            let mut sin = Vec::with_capacity(ROPE_WINDOW * self.rope_rotary);
+            for row in 0..ROPE_WINDOW {
+                let position = pos.wrapping_add(row as u32) as f32;
+                let mut cos_row = vec![0.0f32; self.rope_rotary];
+                let mut sin_row = vec![0.0f32; self.rope_rotary];
+                for p in 0..pairs {
+                    let phase = position * self.rope_inv_freq[p];
+                    cos_row[p] = bf16_round(phase.cos());
+                    cos_row[pairs + p] = cos_row[p];
+                    sin_row[p] = bf16_round(phase.sin());
+                    sin_row[pairs + p] = sin_row[p];
+                }
+                cos.extend_from_slice(&cos_row);
+                sin.extend_from_slice(&sin_row);
+            }
+            let cos_bytes: Vec<u8> = cos.iter().flat_map(|&v| half::bf16::from_f32(v).to_le_bytes()).collect();
+            let sin_bytes: Vec<u8> = sin.iter().flat_map(|&v| half::bf16::from_f32(v).to_le_bytes()).collect();
+            self.rope_cos.copy_from_host(&cos_bytes).map_err(Error::Cuda)?;
+            self.rope_sin.copy_from_host(&sin_bytes).map_err(Error::Cuda)?;
+            self.rope_base = pos;
+            self.rope_valid = ROPE_WINDOW;
+        }
+        let offset = ((pos - self.rope_base) as usize) * row_bytes;
+        let cos = self.rope_cos.view(offset, row_bytes).map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, self.rope_rotary]), DType::BF16).map_err(Error::Cuda)?;
+        let sin = self.rope_sin.view(offset, row_bytes).map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![1, self.rope_rotary]), DType::BF16).map_err(Error::Cuda)?;
+        Ok((cos, sin))
+    }
+}
+
 /// The native Qwen-Drive model (VLM + optional planning expert).
 pub struct QwenDriveModel {
     config: QwenDriveConfig,
@@ -158,6 +361,9 @@ pub struct QwenDriveModel {
     cuda: Arc<RuntimeBackend>,
     weights: QwenDriveDeviceWeights,
     caches: Vec<LayerCache>,
+    // implement_port r2: model-owned decode workspace (see DecodeWorkspace);
+    // allocated once at load, reused by the seq==1 forward path only.
+    decode_ws: DecodeWorkspace,
     cache_len: usize,
     rope_delta: i64,
     max_seq_len: usize,
@@ -214,12 +420,14 @@ impl QwenDriveModel {
         );
         let max_seq_len = config.text.max_position_embeddings.min(16384); // FIX (implement_r5): 8192 < measured 10457-token VQA prompt (12x868 image tokens + text); 16384 covers the post-clamp-revert worst case 10457+2048=12505 under the config ceiling 32768 (+256MiB full-attn KV cache).
         let caches = Self::fresh_caches(&config, &cuda, max_seq_len)?;
+        let decode_ws = DecodeWorkspace::new(&config, cuda.device_id())?;
         Ok(Self {
             config,
             backend,
             cuda,
             weights,
             caches,
+            decode_ws,
             cache_len: 0,
             rope_delta: 0,
             max_seq_len,
@@ -451,9 +659,25 @@ impl QwenDriveModel {
         Ok(out)
     }
 
-    fn forward_mlp(&self, x: Tensor, post_norm: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, trace: bool) -> Result<Tensor> {
+    fn forward_mlp(&self, x: Tensor, post_norm: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, trace: bool, seq: usize) -> Result<Tensor> {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
+        if seq == 1 {
+            // implement_port r4: reuse the model-owned role buffers on the
+            // single-token decode path; every buffer is fully rewritten by its
+            // producing kernel before its consumer reads it within the step.
+            // The gate_up matmul and swiglu intermediates keep their per-call
+            // allocations (deferred to a later revision).
+            let normed = self.decode_ws.normed.clone();
+            la::rms_norm_plus1_into(ctx, &x, post_norm, eps, &normed)?;
+            let gu = gemm::matmul(ctx, &normed, gate_up_w)?;
+            let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
+            let down = self.decode_ws.proj.clone();
+            linear_checkpoint_into(ctx, &act, down_w, &down)?;
+            let hidden = self.decode_ws.residual.clone();
+            elementwise::add_out(ctx, &x, &down, &hidden)?;
+            return Ok(hidden);
+        }
         let normed = la::rms_norm_plus1(ctx, &x, post_norm, eps)?;
         let gu = gemm::matmul(ctx, &normed, gate_up_w)?;
         let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
@@ -487,15 +711,38 @@ impl QwenDriveModel {
         let kv_heads = text.n_kv_heads;
         let head_dim = text.head_dim;
         let rotary = text.rotary_dim();
-        let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        let fused = linear_checkpoint(ctx, &normed, &w.stacked_in_w)?;
+        // implement_port r4: on the single-token decode path reuse the
+        // model-owned role buffers via *_into variants (normed, the packed qkv
+        // GEMM, the FA2 split-KV output+scratch, the o_proj GEMM and the
+        // residual add), removing the per-step wrapper-internal allocations.
+        // Each is fully rewritten before its consumer reads it within the step.
+        let normed = if seq == 1 {
+            let normed = self.decode_ws.normed.clone();
+            la::rms_norm_plus1_into(ctx, &x, &w.input_norm, eps, &normed)?;
+            normed
+        } else {
+            la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?
+        };
+        let fused = if seq == 1 {
+            let fused = self.decode_ws.fused_attn.clone();
+            linear_checkpoint_into(ctx, &normed, &w.stacked_in_w, &fused)?;
+            fused
+        } else {
+            linear_checkpoint(ctx, &normed, &w.stacked_in_w)?
+        };
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_input_norm", &normed)?;
             trace_rows("text3_fused_qkv", &fused)?;
             trace_rows("text3_cos", cos)?;
             trace_rows("text3_sin", sin)?;
         }
-        let q_out = device_tensor(ctx, &[seq, heads, head_dim], DType::BF16)?;
+        // implement_port r2: reuse the model-owned decode workspace for seq==1;
+        // full_attn_prepare fully rewrites q_out every step before it is read.
+        let q_out = if seq == 1 {
+            self.decode_ws.q_out.clone()
+        } else {
+            device_tensor(ctx, &[seq, heads, head_dim], DType::BF16)?
+        };
         let (k_cache, v_cache) = match &self.caches[layer_idx] {
             LayerCache::FullAttention { k, v } => (k.clone(), v.clone()),
             _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
@@ -520,7 +767,26 @@ impl QwenDriveModel {
         let kv_len = self.cache_len + seq;
         let k_view = cache_view(&k_cache, kv_len)?;
         let v_view = cache_view(&v_cache, kv_len)?;
-        let attn = attention::causal_gqa_bf16(ctx, &q_out, &k_view, &v_view, kv_len)?;
+        let attn = if seq == 1 {
+            // implement_port r4: identical FA2 split-KV decode kernel writing
+            // into the model-owned output + fixed-capacity scratch (the
+            // attention::causal_gqa_bf16 decode route).
+            let attn = self.decode_ws.fa2_out.clone();
+            attention::fa2_attention_splitkv_into(
+                ctx,
+                &q_out,
+                &k_view,
+                &v_view,
+                kv_len,
+                &attn,
+                &self.decode_ws.fa2_lse,
+                &self.decode_ws.fa2_lse_accum,
+                &self.decode_ws.fa2_o_accum,
+            )?;
+            attn
+        } else {
+            attention::causal_gqa_bf16(ctx, &q_out, &k_view, &v_view, kv_len)?
+        };
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_q", &q_out.reshape(vec![seq, heads * head_dim])?)?;
             trace_rows("text3_k", &k_view.reshape(vec![kv_len, kv_heads * head_dim])?)?;
@@ -529,13 +795,25 @@ impl QwenDriveModel {
         }
         let attn = attn.reshape(vec![seq, heads * head_dim])?;
         la::sigmoid_gate_mul(ctx, &attn, &fused, heads, head_dim)?;
-        let proj = linear_checkpoint(ctx, &attn, &w.o_w)?;
+        let proj = if seq == 1 {
+            let proj = self.decode_ws.proj.clone();
+            linear_checkpoint_into(ctx, &attn, &w.o_w, &proj)?;
+            proj
+        } else {
+            linear_checkpoint(ctx, &attn, &w.o_w)?
+        };
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_gated_attention", &attn)?;
             trace_rows("text3_out_proj", &proj)?;
         }
-        let hidden = elementwise::add(ctx, &x, &proj)?;
-        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, false)
+        let hidden = if seq == 1 {
+            let hidden = self.decode_ws.residual.clone();
+            elementwise::add_out(ctx, &x, &proj, &hidden)?;
+            hidden
+        } else {
+            elementwise::add(ctx, &x, &proj)?
+        };
+        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, false, seq)
     }
 
     fn forward_gdn(
@@ -565,18 +843,41 @@ impl QwenDriveModel {
         let kernel = text.linear_conv_kernel_dim;
         let has_state = self.cache_len > 0;
 
-        let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
+        // implement_port r4: on the single-token decode path reuse the
+        // model-owned role buffers via *_into variants (normed, the packed
+        // in-projection GEMM, the gated norm, the out_proj GEMM and the
+        // residual add), removing the per-step wrapper-internal allocations.
+        // Each is fully rewritten before its consumer reads it within the step.
+        let normed = if seq == 1 {
+            let normed = self.decode_ws.normed.clone();
+            la::rms_norm_plus1_into(ctx, &x, &w.input_norm, eps, &normed)?;
+            normed
+        } else {
+            la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?
+        };
         // gap_closure_8: one stacked-weight GEMM replaces the four separate
         // projection GEMMs plus concat; the BF16 reduction geometry changes
         // (accepted: reference token parity is waived for this Mission).
-        let zba = linear_checkpoint(ctx, &normed, &w.stacked_in_w)?
-            .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
+        let zba = if seq == 1 {
+            let zba = self.decode_ws.zba_gdn.clone();
+            linear_checkpoint_into(ctx, &normed, &w.stacked_in_w, &zba)?;
+            zba
+        } else {
+            linear_checkpoint(ctx, &normed, &w.stacked_in_w)?
+                .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?
+        };
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_input", &x)?;
             trace_rows("text0_input_norm", &normed)?;
             trace_rows("text0_zba", &zba)?;
         }
-        let conv_out = device_tensor(ctx, &[seq, conv_dim], DType::BF16)?;
+        // implement_port r2: reuse the model-owned decode workspace for seq==1;
+        // causal_conv1d_silu_bf16 fully rewrites conv_out every step.
+        let conv_out = if seq == 1 {
+            self.decode_ws.conv_out.clone()
+        } else {
+            device_tensor(ctx, &[seq, conv_dim], DType::BF16)?
+        };
         let (state_current, state_next) = match &self.caches[layer_idx] {
             LayerCache::Gdn { conv_state_a, conv_state_b, flip, .. } => {
                 if *flip {
@@ -603,11 +904,27 @@ impl QwenDriveModel {
 
         let recurrent_decode = has_state && seq == 1;
         let seq_pad = if recurrent_decode { 1 } else { seq.div_ceil(GDN_CHUNK) * GDN_CHUNK };
-        let q_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?;
-        let k_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?;
-        let v_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes())?;
-        let beta_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
-        let g_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
+        // implement_port r2: in the recurrent decode step (seq_pad == 1) reuse the
+        // model-owned fp32 prep buffers; gdn_qk_prep/gdn_vb_prep fully rewrite them
+        // before gdn_recurrent reads them. The chunked prefill branch keeps its
+        // seq_pad-sized per-call allocations unchanged.
+        let (q_buf, k_buf, v_buf, beta_buf, g_buf) = if recurrent_decode {
+            (
+                self.decode_ws.q_buf.clone(),
+                self.decode_ws.k_buf.clone(),
+                self.decode_ws.v_buf.clone(),
+                self.decode_ws.beta_buf.clone(),
+                self.decode_ws.g_buf.clone(),
+            )
+        } else {
+            (
+                alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?,
+                alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?,
+                alloc_zeros(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes())?,
+                alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?,
+                alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?,
+            )
+        };
         la::gdn_qk_prep(ctx, &conv_out, &q_buf, &k_buf, seq_pad, num_k_heads, num_v_heads, head_k, key_dim, recurrent_decode, 1e-6)?;
         la::gdn_vb_prep(
             ctx,
@@ -625,7 +942,13 @@ impl QwenDriveModel {
             head_v,
             2 * key_dim,
         )?;
-        let gdn_out = device_tensor(ctx, &[seq, value_dim], DType::BF16)?;
+        // implement_port r2: reuse the model-owned decode workspace for seq==1;
+        // gdn_recurrent fully rewrites gdn_out every step before the gated norm reads it.
+        let gdn_out = if seq == 1 {
+            self.decode_ws.gdn_out.clone()
+        } else {
+            device_tensor(ctx, &[seq, value_dim], DType::BF16)?
+        };
         let rec_state = match &self.caches[layer_idx] {
             LayerCache::Gdn { recurrent, .. } => recurrent.clone(),
             _ => return Err(Error::Other("qwen_drive: cache kind mismatch".into())),
@@ -674,24 +997,53 @@ impl QwenDriveModel {
             )?;
         }
         if layer_idx == 0 && seq > 1 { trace_rows("text0_core", &gdn_out)?; }
-        let gated = la::gated_rms_silu(
-            ctx,
-            &gdn_out.reshape(vec![seq * num_v_heads, head_v])?,
-            &zba,
-            z_col,
-            num_v_heads,
-            &w.gated_norm,
-            1e-6,
-        )?;
-        let gated = gated.reshape(vec![seq, value_dim])?;
-        let proj = linear_checkpoint(ctx, &gated, &w.out_w)?;
-        let hidden = elementwise::add(ctx, &x, &proj)?;
+        let gated = if seq == 1 {
+            // implement_port r4: write the gated norm into the model-owned
+            // [1, value_dim] buffer (viewed [seq * num_v_heads, head_v]).
+            let gated = self.decode_ws.gated.clone();
+            la::gated_rms_silu_into(
+                ctx,
+                &gdn_out.reshape(vec![seq * num_v_heads, head_v])?,
+                &zba,
+                z_col,
+                num_v_heads,
+                &w.gated_norm,
+                1e-6,
+                &gated.reshape(vec![seq * num_v_heads, head_v])?,
+            )?;
+            gated
+        } else {
+            la::gated_rms_silu(
+                ctx,
+                &gdn_out.reshape(vec![seq * num_v_heads, head_v])?,
+                &zba,
+                z_col,
+                num_v_heads,
+                &w.gated_norm,
+                1e-6,
+            )?
+            .reshape(vec![seq, value_dim])?
+        };
+        let proj = if seq == 1 {
+            let proj = self.decode_ws.proj.clone();
+            linear_checkpoint_into(ctx, &gated, &w.out_w, &proj)?;
+            proj
+        } else {
+            linear_checkpoint(ctx, &gated, &w.out_w)?
+        };
+        let hidden = if seq == 1 {
+            let hidden = self.decode_ws.residual.clone();
+            elementwise::add_out(ctx, &x, &proj, &hidden)?;
+            hidden
+        } else {
+            elementwise::add(ctx, &x, &proj)?
+        };
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_gated_norm", &gated)?;
             trace_rows("text0_out_proj", &proj)?;
             trace_rows("text0_residual", &hidden)?;
         }
-        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, layer_idx == 0 && seq > 1)
+        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, layer_idx == 0 && seq > 1, seq)
     }
 
     /// Run the text transformer over one token span, appending to the hybrid
@@ -703,7 +1055,18 @@ impl QwenDriveModel {
         }
         let last = positions[seq - 1];
         self.last_position = last[0].max(last[1]).max(last[2]) as i64;
-        let (cos, sin) = self.mrope_tables(positions)?;
+        // implement_port r3 (analysis/stack_candidate_selection_r3): single-token
+        // decode always presents one equal-axes position triple (forward_tokens
+        // builds [p, p, p]), so serve it from the model-owned windowed table
+        // (bit-identical values; zero-copy row view; window refill only on a
+        // miss) instead of recomputing inv_freq and uploading two fresh device
+        // tensors per step. Every other span (prefill, planning, any non-equal
+        // axes) keeps the original mrope_tables path unchanged.
+        let (cos, sin) = if seq == 1 && positions[0][0] == positions[0][1] && positions[0][1] == positions[0][2] {
+            self.decode_ws.rope_row(positions[0][0])?
+        } else {
+            self.mrope_tables(positions)?
+        };
         let mut hidden = x;
         // TEMP-DIAG (implement_r10): per-layer ms attribution for the measured 43.37s
         // prefill (over the ~29s/inference allowance); ms_since_prev on line k ~= layer
@@ -744,12 +1107,32 @@ impl QwenDriveModel {
         } else {
             hidden
         };
-        let normed = la::rms_norm_plus1(self.ctx(), &head_input, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
+        // implement_port r4: reuse the model-owned normed buffer on the
+        // single-token decode path for the final norm; the lm_head input
+        // (self.decode_ws.normed, [1, hidden]) is consumed by the lm_head GEMM
+        // before any later write, so the public [seq, vocab] output shape and
+        // the seq>1 path are unchanged.
+        let normed = if seq == 1 {
+            let normed = self.decode_ws.normed.clone();
+            la::rms_norm_plus1_into(self.ctx(), &head_input, &self.weights.final_norm, self.config.text.rms_norm_eps, &normed)?;
+            normed
+        } else {
+            la::rms_norm_plus1(self.ctx(), &head_input, &self.weights.final_norm, self.config.text.rms_norm_eps)?
+        };
         self.lm_head(&normed)
     }
 
     fn embed_tokens(&self, token_ids: &[u32]) -> Result<Tensor> {
-        let ids = upload_u32(self.ctx(), token_ids)?;
+        // implement_port r4: the single-token decode path reuses the
+        // model-owned 1-element upload buffer (same copy_from_host, no
+        // per-step cudaMalloc); the embedding lookup consumes it immediately.
+        let ids = if token_ids.len() == 1 {
+            let bytes = token_ids[0].to_ne_bytes();
+            self.decode_ws.tok_id.copy_from_host(&bytes).map_err(Error::Cuda)?;
+            self.decode_ws.tok_id.clone()
+        } else {
+            upload_u32(self.ctx(), token_ids)?
+        };
         // Qwen uses the raw embedding table; lookup_bf16 applies Gemma scaling.
         let output = embedding::lookup(self.ctx(), &self.weights.embed_tokens, &ids, token_ids.len())?;
         trace_rows("model_language_model_embed_tokens", &output)?;

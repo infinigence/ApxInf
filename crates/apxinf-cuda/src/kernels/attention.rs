@@ -1494,6 +1494,123 @@ pub(crate) fn fa2_attention_splitkv(
     ))
 }
 
+/// Single-token head-256 split-KV FA2 decode variant writing into
+/// caller-provided output and scratch buffers (implement_port r4: model-owned
+/// decode-workspace reuse). Mirrors the decode route of `causal_gqa_bf16`
+/// (`fa2_attention_splitkv(..., causal = false)`): identical kernel, launch
+/// parameters and scratch layout. The scratch is validated against the
+/// current `max_splits` and sized by the caller for the cap of 128, so one
+/// fixed-capacity set covers every kv_len the decode route can present; the
+/// kernel fully writes the split range it later reduces, so reuse needs no
+/// per-step zero-fill.
+#[allow(clippy::too_many_arguments)]
+pub fn fa2_attention_splitkv_into(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    key_tokens: usize,
+    out: &Tensor,
+    softmax_lse: &CudaBuffer,
+    softmax_lse_accum: &CudaBuffer,
+    o_accum: &CudaBuffer,
+) -> Result<()> {
+    let q_shape = q.shape().dims();
+    let k_shape = k.shape().dims();
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16)
+        || out.dtype() != DType::BF16
+        || out.shape().dims() != q_shape
+        || q_shape.len() != 3
+        || k_shape.len() != 3
+        || v.shape() != k.shape()
+        || k_shape[0] < key_tokens
+        || k_shape[2] != q_shape[2]
+        || k_shape[1] == 0
+        || q_shape[1] % k_shape[1] != 0
+        || key_tokens < q_shape[0]
+    {
+        return Err(Error::Other(
+            "static inference causal BF16 GQA shape mismatch".into(),
+        ));
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        if q_shape[0] != 1 || q_shape[2] != 256 {
+            return Err(Error::Other(
+                "fa2_attention_splitkv_into expects the single-token head-256 decode shape".into(),
+            ));
+        }
+        let batches = 1usize;
+        let query_tokens = 1usize;
+        let query_heads = q_shape[1];
+        let kv_heads = k_shape[1];
+        let head_dim = q_shape[2];
+        let lse_bytes = batches
+            .checked_mul(query_heads)
+            .and_then(|value| value.checked_mul(query_tokens))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("static inference BF16 split-KV LSE size overflow".into()))?;
+        let block_n = if head_dim <= 64 {
+            256
+        } else if head_dim <= 128 {
+            128
+        } else {
+            64
+        };
+        let max_splits = key_tokens.div_ceil(block_n).min(128);
+        let lse_accum_bytes = max_splits
+            .checked_mul(lse_bytes)
+            .ok_or_else(|| Error::Other("static inference BF16 split-KV LSE accum overflow".into()))?;
+        let o_accum_bytes = max_splits
+            .checked_mul(batches)
+            .and_then(|value| value.checked_mul(query_tokens))
+            .and_then(|value| value.checked_mul(query_heads))
+            .and_then(|value| value.checked_mul(head_dim))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("static inference BF16 split-KV O accum overflow".into()))?;
+        require_buffers(
+            ctx,
+            "static inference BF16 split-KV into",
+            &[
+                ("softmax_lse", softmax_lse, lse_bytes),
+                ("softmax_lse_accum", softmax_lse_accum, lse_accum_bytes),
+                ("o_accum", o_accum, o_accum_bytes),
+            ],
+        )?;
+        let status = unsafe {
+            ffi::apxinf_static_fa2_bf16_splitkv(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                gpu_ptr(out)?,
+                softmax_lse.ptr(),
+                softmax_lse_accum.ptr(),
+                o_accum.ptr(),
+                batches as i32,
+                query_tokens as i32,
+                key_tokens as i32,
+                query_heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                (head_dim as f32).sqrt().recip(),
+                ctx.caps().multiprocessor_count as i32,
+                ctx.stream().handle(),
+            )
+        };
+        ffi::check_cuda(status).map_err(Error::Cuda)?;
+        return Ok(());
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    {
+        let _ = (key_tokens, out, softmax_lse, softmax_lse_accum, o_accum);
+        Err(Error::Other(
+            "causal BF16 GQA requires the FA2 backend".into(),
+        ))
+    }
+}
+
 #[cfg(apxinf_cutlass_fmha)]
 fn cublas_mqa_bf16(
     ctx: &CudaContext,

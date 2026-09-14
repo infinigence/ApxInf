@@ -621,6 +621,58 @@ pub fn gated_rms_silu(
     ))
 }
 
+/// `gated_rms_silu` variant writing into a caller-provided output tensor
+/// (implement_port r4: model-owned decode-workspace reuse). Identical kernel,
+/// validation and launch parameters; `out` must be `[rows, cols]` BF16 and is
+/// fully written on every call, so reuse needs no per-step zero-fill.
+pub fn gated_rms_silu_into(
+    ctx: &CudaContext,
+    x: &Tensor,
+    z: &Tensor,
+    z_col_offset: usize,
+    z_heads: usize,
+    weight: &Tensor,
+    eps: f32,
+    out: &Tensor,
+) -> Result<()> {
+    let (rows, cols) = matrix_shape(x, "gated rms silu")?;
+    let (z_rows, z_width) = matrix_shape(z, "gated rms silu")?;
+    if rows == 0
+        || z_heads == 0
+        || rows % z_heads != 0
+        || z_rows != rows / z_heads
+        || z_col_offset + z_heads * cols > z_width
+        || weight.shape().dims() != [cols]
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        return Err(Error::Other("gated rms silu shape mismatch".into()));
+    }
+    for tensor in [x, z, weight] {
+        expect_bf16(tensor, "gated rms silu")?;
+    }
+    if out.dtype() != DType::BF16 || out.shape().dims() != [rows, cols] {
+        return Err(Error::Other("gated rms silu out shape/dtype mismatch".into()));
+    }
+    let z_ptr = gpu_ptr(z)?;
+    unsafe {
+        check_cuda(ffi::apxinf_static_gated_rms_silu_bf16(
+            gpu_ptr(x)?,
+            z_ptr,
+            gpu_ptr(weight)?,
+            gpu_ptr(out)?,
+            rows as i32,
+            cols as i32,
+            z_heads as i32,
+            z_width as i64,
+            z_col_offset as i64,
+            eps,
+            ctx.stream().handle(),
+        ))
+    }?;
+    Ok(())
+}
+
 /// RMSNorm with zero-init (1 + weight) semantics, fp32 compute, BF16 storage.
 pub fn rms_norm_plus1(
     ctx: &CudaContext,
@@ -652,6 +704,39 @@ pub fn rms_norm_plus1(
         ctx.device_id(),
         output,
     ))
+}
+
+/// `rms_norm_plus1` variant writing into a caller-provided output tensor
+/// (implement_port r4: model-owned decode-workspace reuse). Identical kernel,
+/// validation and launch parameters; `out` must be `[rows, cols]` BF16 and is
+/// fully written on every call, so reuse needs no per-step zero-fill.
+pub fn rms_norm_plus1_into(
+    ctx: &CudaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    out: &Tensor,
+) -> Result<()> {
+    let (rows, cols) = matrix_shape(input, "rms norm plus1")?;
+    if rows == 0 || cols == 0 || weight.shape().dims() != [cols] || !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other("rms norm plus1 shape mismatch".into()));
+    }
+    expect_bf16(input, "rms norm plus1")?;
+    expect_bf16(weight, "rms norm plus1")?;
+    if out.dtype() != DType::BF16 || out.shape().dims() != [rows, cols] {
+        return Err(Error::Other("rms norm plus1 out shape/dtype mismatch".into()));
+    }
+    unsafe {
+        check_cuda(ffi::apxinf_static_rms_norm_plus1_bf16(
+            gpu_ptr(input)?,
+            gpu_ptr(weight)?,
+            gpu_ptr(out)?,
+            rows as i32,
+            cols as i32,
+            eps,
+            ctx.stream().handle(),
+        ))
+    }
 }
 
 /// Partial rotary from precomputed BF16 cos/sin tables `[rows, rotary_dim]`.

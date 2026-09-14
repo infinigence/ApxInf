@@ -239,6 +239,41 @@ pub fn add(ctx: &CudaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// `add` variant writing into a caller-provided output tensor
+/// (implement_port r4: model-owned decode-workspace reuse; named `add_out`
+/// because the buffer-based `add_into` already exists for graph capture).
+/// Identical kernel and dtype dispatch; `out` must match `a` in shape and
+/// dtype. Elementwise with no cross-element reads, so exact aliasing of
+/// `a`/`b` with `out` (in-place residual update) is safe.
+pub fn add_out(ctx: &CudaContext, a: &Tensor, b: &Tensor, out: &Tensor) -> Result<()> {
+    let count = a.numel() as u32;
+    if out.shape() != a.shape() || out.dtype() != a.dtype() {
+        return Err(Error::Other("add_out output shape/dtype mismatch".into()));
+    }
+    let out_ptr = gpu_ptr(out)?;
+    unsafe {
+        let res = match a.dtype() {
+            DType::F32 => ffi::apxinf_add_f32(
+                gpu_ptr(a)?,
+                gpu_ptr(b)?,
+                out_ptr,
+                count,
+                ctx.stream().handle(),
+            ),
+            DType::BF16 => ffi::apxinf_add_bf16(
+                gpu_ptr(a)?,
+                gpu_ptr(b)?,
+                out_ptr,
+                count,
+                ctx.stream().handle(),
+            ),
+            dtype => return unsupported_dtype("add", dtype),
+        };
+        ffi::check_cuda(res).map_err(Error::Cuda)?;
+    }
+    Ok(())
+}
+
 /// Element-wise multiply on CUDA. Dispatches on dtype.
 pub fn mul(ctx: &CudaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let device_id = ctx.device_id();
