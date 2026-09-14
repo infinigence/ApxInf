@@ -55,6 +55,29 @@ of 0.913, entirely from scene 0. Compare scenes 1-3, or add warmup.
 Worth knowing, but see Target A: qwen-drive does not reach the tuned or fused
 GEMM paths on any device, so these cfgs are not what is holding it back.
 
+## What does and does not pay on this board
+
+Three separate attempts to cut "redundant global reads" measured at or below
+noise, and the reason was the same each time: this board has 4MB of L2, and
+every working set involved fit inside it, so the repeated reads were already
+cache hits rather than DRAM traffic.
+
+  gdn_attn_raw staging     96x redundancy on 64KB of tiles     -2.8%
+  gdn_recurrent staging    4 passes over 2MB of state          -0.2%, reverted
+  GDN scratch allocation   28ms per layer by the probe          +0.1%
+
+What did pay, on the same kernels:
+
+  bank conflicts    a 32-way conflict from an unpadded stride   9.6x on that kernel
+  occupancy         256 -> 512 threads where a block held 1/3 of an SM   1.47x
+  real redundancy   an exp2 and two BF16 rounds recomputed 64x  1.27x
+  work not needed   a prefill head over 3095 rows to read one   1.022x end to end
+
+Count instructions and check the shared-memory bank mapping before counting
+bytes. And distrust a sync-based stage probe: it attributes queued async work
+to whichever stage happens to synchronize, which is how the allocation stage
+came to look like 25% of a layer and cash out at 0.1%.
+
 ## Target A -- qwen-drive is not on the tuned GEMM path (highest priority)
 
 This is the finding that reorganized the list, and it is not sm_87-specific:
