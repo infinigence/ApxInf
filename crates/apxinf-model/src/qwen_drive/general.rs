@@ -1031,6 +1031,24 @@ impl QwenDriveModel {
         }
         self.cache_len += seq;
         let normed = la::rms_norm_plus1(self.ctx(), &hidden, &self.weights.final_norm, self.config.text.rms_norm_eps)?;
+        // Only the final row feeds the next token. Prefill ran the head over
+        // every position anyway -- at the shipped prompt that is a
+        // [3095, 248064] BF16 output, 1.5GB written to read one row, and the
+        // single largest GEMM in the profile at 164ms. The probes that read the
+        // other rows sit behind the diagnostics gate, so keep the full head for
+        // them and slice for everyone else.
+        let rows = normed.shape().dims()[0];
+        if rows > 1 && !diagnostics_enabled() {
+            let width = normed.shape().dims()[1];
+            let row_bytes = width * DType::BF16.size_in_bytes();
+            let buffer = DeviceBuffer::from_tensor(&normed).map_err(Error::Cuda)?;
+            let last = buffer
+                .view((rows - 1) * row_bytes, row_bytes)
+                .map_err(Error::Cuda)?
+                .as_tensor(Shape::new(vec![1, width]), DType::BF16)
+                .map_err(Error::Cuda)?;
+            return self.lm_head(&last);
+        }
         self.lm_head(&normed)
     }
 
