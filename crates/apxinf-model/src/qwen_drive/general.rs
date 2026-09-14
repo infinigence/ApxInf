@@ -120,7 +120,7 @@ fn device_tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor>
     let bytes = elements
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| Error::Other("qwen_drive: tensor size overflow".into()))?;
-    let buffer = DeviceBuffer::alloc(bytes.max(1), ctx.device_id()).map_err(Error::Cuda)?;
+    let buffer = kernels::scratch_buffer(ctx, bytes.max(1))?;
     buffer
         .as_tensor(Shape::new(shape.to_vec()), dtype)
         .map_err(Error::Cuda)
@@ -133,8 +133,7 @@ fn device_tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor>
 /// to drain several times over. The async form is stream-ordered against the
 /// kernels that read the memory, which is the only ordering that matters here.
 fn alloc_zeros(ctx: &Context, bytes: usize) -> Result<DeviceBuffer> {
-    DeviceBuffer::alloc_zeros_async(bytes.max(1), ctx.device_id(), ctx.stream())
-        .map_err(Error::Cuda)
+    kernels::scratch_buffer_zeroed(ctx, bytes.max(1))
 }
 
 /// GDN scan scratch.
@@ -149,7 +148,7 @@ fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<Devic
     if padded {
         alloc_zeros(ctx, bytes)
     } else {
-        DeviceBuffer::alloc(bytes.max(1), ctx.device_id()).map_err(Error::Cuda)
+        kernels::scratch_buffer(ctx, bytes.max(1))
     }
 }
 

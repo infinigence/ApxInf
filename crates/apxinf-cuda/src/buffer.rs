@@ -172,6 +172,33 @@ impl CudaBuffer {
         Ok(buf)
     }
 
+    /// Fill `num_bytes` of this buffer with `value` on the given stream.
+    ///
+    /// Workspace views are reused rather than freshly allocated, so a caller
+    /// that needs cleared memory has to clear it explicitly.
+    pub fn memset_async(
+        &self,
+        value: i32,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len {
+            return Err(format!(
+                "memset of {num_bytes} bytes exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                value,
+                num_bytes,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Allocate and fill every byte with `value`.
     ///
     /// Used to poison operator outputs under test: 0xFF is NaN at every float

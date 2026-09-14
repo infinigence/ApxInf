@@ -50,7 +50,7 @@ fn device_tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor>
     let bytes = elements
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| Error::Other("qwen_drive expert: tensor size overflow".into()))?;
-    let buffer = DeviceBuffer::alloc(bytes.max(1), ctx.device_id()).map_err(Error::Cuda)?;
+    let buffer = kernels::scratch_buffer(ctx, bytes.max(1))?;
     buffer
         .as_tensor(Shape::new(shape.to_vec()), dtype)
         .map_err(Error::Cuda)

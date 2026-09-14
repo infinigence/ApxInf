@@ -263,6 +263,26 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
     })
 }
 
+/// Like [`output_buffer`], but cleared.
+///
+/// A fresh driver allocation is not zero either, but the workspace hands back
+/// a reused arena view, so a caller that needs zeros has to say so. Used for
+/// the padded tails that a model's prep kernels leave untouched.
+pub(crate) fn output_buffer_zeroed(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
+    ACTIVE_WORKSPACE.with(|active| {
+        let workspace = active.get();
+        if workspace.is_null() {
+            CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream()).map_err(Error::Cuda)
+        } else {
+            let buffer = unsafe { &*workspace }.allocate(bytes, ctx.device_id())?;
+            buffer
+                .memset_async(0, bytes, ctx.stream())
+                .map_err(Error::Cuda)?;
+            Ok(buffer)
+        }
+    })
+}
+
 pub(crate) fn fp8_emulation_required(ctx: &CudaContext) -> Result<bool> {
     Ok(ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
