@@ -97,3 +97,7 @@ Candidate `75513b8cdf5b7e6cef767f80cc70a9606edfc70a61e30c9c7a365301e7b90b97` (pr
 ## Successor r4: cross-module decode buffer reuse
 
 DSH/Kimi-K3 candidate `88b8de2ce96444d67213dc40cec1707f73fd46a321d2da981204f88e64b04f7b` added output-buffer variants and model-owned decode scratch across CUDA wrappers. The first eight-cell batch measured **1.060107x** versus the frozen packed-projection baseline, valid=true and passed=true; output counts matched in all eight cells. The current Mission completed its timing verifier. Independent baseline/candidate replay was started on 2026-09-14 and remains pending. Existing public-forward last-row cropping remains a delivery limitation; timing acceptance does not establish full deployment readiness.
+
+## Round20 campaign: prefill allocation reuse
+
+Candidate `1702dee0405376d689dc54ccc59398a829ce219d999ac271f9d35a23e61a03e6` reached 1.160087x against the campaign baseline on eight64/256-budget cells. All output lengths matched; valid=true and passed=true. Changes reuse vision attention scratch and GDN prefill scratch and remove redundant GEMM output zeroing. This is one measurement batch, not independent replication. The timing Mission completed at revision7 of a20-revision maximum. Global vision position caches and public forward last-row cropping remain unresolved delivery limitations. An independent replay attempt on2026-09-14 was not confirmed launched because SSH connections were reset during handshake; that is infrastructure unknown, not a candidate verdict.

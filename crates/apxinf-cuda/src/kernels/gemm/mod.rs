@@ -231,7 +231,10 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
     let m = activation.shape().dims()[activation.ndim() - 2];
     let k = activation.shape().dims()[activation.ndim() - 1];
     let n = weight.shape().dims()[weight.ndim() - 1];
-    let output = CudaBuffer::alloc_zeros(
+    // implement_port r6 (analysis/r6_change_selection): plain alloc — the
+    // cuBLAS GEMM below runs with beta = 0.0 and fully overwrites the output,
+    // so the synchronous alloc_zeros memset was dead work.
+    let output = CudaBuffer::alloc(
         output_shape.numel() * activation.dtype().size_in_bytes(),
         ctx.device_id(),
     )

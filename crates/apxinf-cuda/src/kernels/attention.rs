@@ -1537,13 +1537,19 @@ pub fn fa2_attention_splitkv_into(
     }
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
-        if q_shape[0] != 1 || q_shape[2] != 256 {
+        // implement_port r6 (analysis/r6_change_selection): also admit the
+        // vision segmented-MHA segment shape (non-causal, head_dim == 64,
+        // query_tokens == key_tokens); the launched kernel, launch parameters
+        // and scratch layout are byte-identical to the per-segment
+        // fa2_attention_splitkv call the sm80 segmented arm made before.
+        let vision_segment = q_shape[2] == 64 && q_shape[0] == key_tokens;
+        if !(q_shape[0] == 1 && q_shape[2] == 256) && !vision_segment {
             return Err(Error::Other(
-                "fa2_attention_splitkv_into expects the single-token head-256 decode shape".into(),
+                "fa2_attention_splitkv_into expects the single-token head-256 decode or head-64 vision segment shape".into(),
             ));
         }
         let batches = 1usize;
-        let query_tokens = 1usize;
+        let query_tokens = q_shape[0];
         let query_heads = q_shape[1];
         let kv_heads = k_shape[1];
         let head_dim = q_shape[2];
@@ -1943,6 +1949,42 @@ pub fn segmented_mha_bf16(
             let bytes = checked_bytes(DType::BF16, shape, "segmented head64 MHA")?;
             let output = output_buffer(ctx, bytes)?;
             let row_bytes = checked_bytes(DType::BF16, &[shape[1], 64], "head64 row")?;
+            // implement_port r6 (analysis/r6_change_selection): hoist the FA2
+            // split-KV scratch out of the segment loop. Sized once for
+            // max_tokens (require_buffers accepts larger-than-required); raw
+            // CudaBuffer::alloc natively — the kernel fully writes the split
+            // range it later reduces, so no zero-fill is needed — output_buffer
+            // under graph capture, and one per-segment _into call writes the
+            // final bytes directly into the packed output view, replacing the
+            // per-segment fa2_attention_splitkv + copy_tensor_2d_to_buffer pair
+            // (identical kernel, launch parameters and destination bytes).
+            let max_splits = max_tokens.div_ceil(256).min(128);
+            let lse_bytes = shape[1]
+                .checked_mul(max_tokens)
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| Error::Other("segmented head64 MHA LSE scratch overflow".into()))?;
+            let lse_accum_bytes = max_splits
+                .checked_mul(lse_bytes)
+                .ok_or_else(|| Error::Other("segmented head64 MHA LSE accum scratch overflow".into()))?;
+            let o_accum_bytes = max_splits
+                .checked_mul(max_tokens)
+                .and_then(|value| value.checked_mul(shape[1]))
+                .and_then(|value| value.checked_mul(64))
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| Error::Other("segmented head64 MHA O accum scratch overflow".into()))?;
+            let (softmax_lse, softmax_lse_accum, o_accum) = if may_prepare_native_resources() {
+                (
+                    CudaBuffer::alloc(lse_bytes, ctx.device_id()).map_err(Error::Cuda)?,
+                    CudaBuffer::alloc(lse_accum_bytes, ctx.device_id()).map_err(Error::Cuda)?,
+                    CudaBuffer::alloc(o_accum_bytes, ctx.device_id()).map_err(Error::Cuda)?,
+                )
+            } else {
+                (
+                    output_buffer(ctx, lse_bytes)?,
+                    output_buffer(ctx, lse_accum_bytes)?,
+                    output_buffer(ctx, o_accum_bytes)?,
+                )
+            };
             for bounds in host_offsets.windows(2) {
                 let start = bounds[0] as usize;
                 let tokens = (bounds[1] - bounds[0]) as usize;
@@ -1958,18 +2000,14 @@ pub fn segmented_mha_bf16(
                         .map_err(Error::Cuda)
                 };
                 let (sq, sk, sv) = (piece(q)?, piece(k)?, piece(v)?);
-                let segment = fa2_attention_splitkv(
-                    ctx, &sq, &sk, &sv, 1, tokens, tokens, shape[1], shape[1], 64, false,
-                )?;
-                crate::transfers::copy_tensor_2d_to_buffer(
-                    ctx,
-                    &segment,
-                    &output,
-                    start * row_bytes,
-                    row_bytes,
-                    row_bytes,
-                    row_bytes,
-                    tokens,
+                let out_view = output
+                    .view(start * row_bytes, tokens * row_bytes)
+                    .map_err(Error::Cuda)?
+                    .as_tensor(Shape::new(vec![tokens, shape[1], 64]), DType::BF16)
+                    .map_err(Error::Cuda)?;
+                fa2_attention_splitkv_into(
+                    ctx, &sq, &sk, &sv, tokens, &out_view, &softmax_lse, &softmax_lse_accum,
+                    &o_accum,
                 )?;
             }
             return Ok(make_gpu_tensor(

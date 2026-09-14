@@ -57,22 +57,6 @@ pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     Ok(())
 }
 
-// TEMP-DIAG (implement_r13): zero-vision ablation switch (vision_loader_r12 V3);
-// when true the image-embedding scatter consumes a zeros tensor instead of vis.primary
-// AFTER the vis_fp fingerprint has read the true tower output; deactivated at r14
-// (question answered: vision content exonerated as the constant-198 driver; true-vision
-// measurement required for comparability); revert in the acceptance-bound revision.
-// RE-ACTIVATED at successor-mission implement_r2 (synthesis_r2 directive): one-revision
-// receipt-test of the r13 exoneration record, which survives only as this comment; bundled
-// with the step-1 + content-row logits discriminators in the same revision; revert in the
-// acceptance-bound revision.
-// DEACTIVATED at successor-mission implement_r3 (synthesis_r3 directive): the R2 receipt
-// answered branch B2 (zero-vision ablation active with the vis_fp l2=1103.4933 sanity gate
-// intact, constant-198 collapse persisted at steps 0/1 -- vision-content poisoning refuted);
-// R3 restores true-vision geometry because the A1 scatter-fidelity and C1 attention-value
-// discriminators need it; the flag itself is REMOVED in the acceptance-bound revision.
-const DIAG_ZERO_VISION: bool = false;
-
 fn bf16_round(value: f32) -> f32 {
     half::bf16::from_f32(value).to_f32()
 }
@@ -224,6 +208,64 @@ struct DecodeWorkspace {
     fa2_lse_accum: DeviceBuffer,
     fa2_o_accum: DeviceBuffer,
     tok_id: DeviceBuffer,
+    // implement_port r5 (analysis/r5_change_selection): the per-step gate_up
+    // GEMM output, swiglu intermediate, and embedding-lookup output were the
+    // residual per-call allocations explicitly deferred at r4 (forward_mlp
+    // comment). Sized from config.intermediate_size (gate_up = 2*intermediate)
+    // and hidden_size; each is fully rewritten by its producing kernel before
+    // its consumer within the same seq==1 step (write-before-read), so one
+    // model-owned buffer per role is safe across all 32 layers and requests.
+    gate_up_out: Tensor,
+    swiglu_out: Tensor,
+    embed_out: Tensor,
+}
+
+/// implement_port r6 (analysis/r6_change_selection): once-per-request GDN
+/// chunked-prefill scratch, allocated in run_text for the seq>1 (or no-state)
+/// path and shared across all GDN layers, replacing ten per-layer alloc_zeros
+/// calls (~310 MB of host-blocking cudaMalloc+memset per layer per request).
+/// gdn_qk_prep/gdn_vb_prep fully rewrite rows [0, seq) every layer and the
+/// padded tail [seq, seq_pad) is never written by any kernel (it keeps the
+/// caller's zero fill), so zeroing once per request reproduces the per-layer
+/// alloc_zeros bytes bit-identically; g_cum/a_buf/t_buf/vt_buf/kcd_buf are
+/// fully rewritten every layer by gdn_cumsum/gdn_attn_raw/gdn_tri_solve/
+/// gdn_chunk_gemm before gdn_chunk_state reads them.
+struct PrefillGdnScratch {
+    q_buf: DeviceBuffer,
+    k_buf: DeviceBuffer,
+    v_buf: DeviceBuffer,
+    beta_buf: DeviceBuffer,
+    g_buf: DeviceBuffer,
+    g_cum: DeviceBuffer,
+    a_buf: DeviceBuffer,
+    t_buf: DeviceBuffer,
+    vt_buf: DeviceBuffer,
+    kcd_buf: DeviceBuffer,
+}
+
+/// Allocate the shared prefill GDN scratch once per request; sizes match the
+/// prior per-layer alloc_zeros calls exactly.
+fn prefill_gdn_scratch(
+    ctx: &Context,
+    num_v_heads: usize,
+    head_k: usize,
+    head_v: usize,
+    seq_pad: usize,
+) -> Result<PrefillGdnScratch> {
+    let chunks = seq_pad / GDN_CHUNK;
+    let f32_size = DType::F32.size_in_bytes();
+    Ok(PrefillGdnScratch {
+        q_buf: alloc_zeros(ctx, num_v_heads * seq_pad * head_k * f32_size)?,
+        k_buf: alloc_zeros(ctx, num_v_heads * seq_pad * head_k * f32_size)?,
+        v_buf: alloc_zeros(ctx, num_v_heads * seq_pad * head_v * f32_size)?,
+        beta_buf: alloc_zeros(ctx, num_v_heads * seq_pad * f32_size)?,
+        g_buf: alloc_zeros(ctx, num_v_heads * seq_pad * f32_size)?,
+        g_cum: alloc_zeros(ctx, num_v_heads * seq_pad * f32_size)?,
+        a_buf: alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * f32_size)?,
+        t_buf: alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * f32_size)?,
+        vt_buf: alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_v * f32_size)?,
+        kcd_buf: alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_k * f32_size)?,
+    })
 }
 
 /// Fixed row capacity of the model-owned mrope decode-table window (bounded).
@@ -307,10 +349,17 @@ impl DecodeWorkspace {
         // One-element token-id upload buffer for the seq==1 embed path (same
         // blocking H2D copy as upload_u32; only the per-step alloc is removed).
         let tok_id = DeviceBuffer::alloc_zeros(std::mem::size_of::<u32>(), device).map_err(Error::Cuda)?;
+        // implement_port r5: allocate the deferred per-step MLP/embedding role
+        // buffers once (gate_up = 2*intermediate, swiglu = intermediate, embed =
+        // hidden); one-time alloc_zeros preserves the prior alloc_zeros initial
+        // state and each is write-before-read within its step.
+        let gate_up_out = role(2 * text.intermediate_size)?;
+        let swiglu_out = role(text.intermediate_size)?;
+        let embed_out = role(hidden)?;
         Ok(Self { q_out, conv_out, gdn_out, q_buf, k_buf, v_buf, beta_buf, g_buf,
             rope_inv_freq, rope_rotary, rope_cos, rope_sin, rope_base: 0, rope_valid: 0,
             normed, residual, proj, fused_attn, zba_gdn, gated, fa2_out,
-            fa2_lse, fa2_lse_accum, fa2_o_accum, tok_id })
+            fa2_lse, fa2_lse_accum, fa2_o_accum, tok_id, gate_up_out, swiglu_out, embed_out })
     }
 
     /// Zero-copy `[1, rotary]` cos/sin row views for one equal-axes decode
@@ -666,12 +715,32 @@ impl QwenDriveModel {
             // implement_port r4: reuse the model-owned role buffers on the
             // single-token decode path; every buffer is fully rewritten by its
             // producing kernel before its consumer reads it within the step.
-            // The gate_up matmul and swiglu intermediates keep their per-call
-            // allocations (deferred to a later revision).
+            // implement_port r5 (analysis/r5_change_selection): the deferred
+            // gate_up GEMM output and swiglu intermediate now also reuse
+            // model-owned buffers (gemm::write is the same cublas call
+            // gemm::matmul makes, minus the output allocation;
+            // swiglu_bf16_rounded_into is the same FFI kernel with a
+            // caller-provided output), so the seq==1 MLP performs no per-call
+            // cudaMalloc/memset at all. gate_up_w is the load-time
+            // concat_columns pack in [hidden, 2*intermediate] ([K, N]) layout
+            // (device_weights.rs), matching the gemm::matmul contract.
             let normed = self.decode_ws.normed.clone();
             la::rms_norm_plus1_into(ctx, &x, post_norm, eps, &normed)?;
-            let gu = gemm::matmul(ctx, &normed, gate_up_w)?;
-            let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
+            let gu = self.decode_ws.gate_up_out.clone();
+            gemm::write(
+                ctx,
+                DType::BF16,
+                1,
+                gate_up_w.shape().dims()[1],
+                gate_up_w.shape().dims()[0],
+                1.0,
+                &DeviceBuffer::from_tensor(&normed).map_err(Error::Cuda)?,
+                &DeviceBuffer::from_tensor(gate_up_w).map_err(Error::Cuda)?,
+                0.0,
+                &DeviceBuffer::from_tensor(&gu).map_err(Error::Cuda)?,
+            )?;
+            let act = self.decode_ws.swiglu_out.clone();
+            activation::swiglu_bf16_rounded_into(ctx, &gu, &act)?;
             let down = self.decode_ws.proj.clone();
             linear_checkpoint_into(ctx, &act, down_w, &down)?;
             let hidden = self.decode_ws.residual.clone();
@@ -821,6 +890,7 @@ impl QwenDriveModel {
         x: Tensor,
         layer_idx: usize,
         seq: usize,
+        prefill_scratch: Option<&PrefillGdnScratch>,
     ) -> Result<Tensor> {
         let cuda = Arc::clone(&self.cuda);
         let ctx = cuda.context();
@@ -917,12 +987,17 @@ impl QwenDriveModel {
                 self.decode_ws.g_buf.clone(),
             )
         } else {
+            // implement_port r6: reuse the once-per-request PrefillGdnScratch
+            // instead of five per-layer alloc_zeros calls (see run_text).
+            let scratch = prefill_scratch.ok_or_else(|| {
+                Error::Other("qwen_drive: missing prefill GDN scratch".into())
+            })?;
             (
-                alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?,
-                alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?,
-                alloc_zeros(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes())?,
-                alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?,
-                alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?,
+                scratch.q_buf.clone(),
+                scratch.k_buf.clone(),
+                scratch.v_buf.clone(),
+                scratch.beta_buf.clone(),
+                scratch.g_buf.clone(),
             )
         };
         la::gdn_qk_prep(ctx, &conv_out, &q_buf, &k_buf, seq_pad, num_k_heads, num_v_heads, head_k, key_dim, recurrent_decode, 1e-6)?;
@@ -970,11 +1045,16 @@ impl QwenDriveModel {
             )?;
         } else {
             let chunks = seq_pad / GDN_CHUNK;
-            let g_cum = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
-            let a_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes())?;
-            let t_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes())?;
-            let vt_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_v * DType::F32.size_in_bytes())?;
-            let kcd_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_k * DType::F32.size_in_bytes())?;
+            // implement_port r6: reuse the once-per-request PrefillGdnScratch
+            // instead of five per-layer alloc_zeros calls (see run_text).
+            let scratch = prefill_scratch.ok_or_else(|| {
+                Error::Other("qwen_drive: missing prefill GDN scratch".into())
+            })?;
+            let g_cum = scratch.g_cum.clone();
+            let a_buf = scratch.a_buf.clone();
+            let t_buf = scratch.t_buf.clone();
+            let vt_buf = scratch.vt_buf.clone();
+            let kcd_buf = scratch.kcd_buf.clone();
             la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
             la::gdn_attn_raw(ctx, &q_buf, &k_buf, &beta_buf, &g_cum, &a_buf, &t_buf, seq_pad, num_v_heads, head_k, GDN_CHUNK)?;
             la::gdn_tri_solve(ctx, &a_buf, num_v_heads * chunks, GDN_CHUNK)?;
@@ -1068,27 +1148,35 @@ impl QwenDriveModel {
             self.mrope_tables(positions)?
         };
         let mut hidden = x;
-        // TEMP-DIAG (implement_r10): per-layer ms attribution for the measured 43.37s
-        // prefill (over the ~29s/inference allowance); ms_since_prev on line k ~= layer
-        // k-1's duration; revert in the acceptance-bound revision.
-        let mut layer_t0 = std::time::Instant::now();
+        // implement_port r5 (analysis/r5_change_selection): removed the residual
+        // TEMP-DIAG per-layer prefill timing (Instant::now + eprintln, 32 lines/
+        // request) from the hot path; this diagnostic class previously measured
+        // 1.013x paired geomean. The functional layer loop is unchanged.
+        // implement_port r6 (analysis/r6_change_selection): allocate the GDN
+        // chunked-prefill scratch once per request (ten fp32 buffers, ~310 MB)
+        // instead of per GDN layer; forward_gdn's recurrent decode branch does
+        // not use it, matching its !recurrent_decode condition exactly.
+        let prefill_scratch = if !(self.cache_len > 0 && seq == 1) {
+            let text = &self.config.text;
+            Some(prefill_gdn_scratch(
+                self.ctx(),
+                text.linear_num_value_heads,
+                text.linear_key_head_dim,
+                text.linear_value_head_dim,
+                seq.div_ceil(GDN_CHUNK) * GDN_CHUNK,
+            )?)
+        } else {
+            None
+        };
         for layer_idx in 0..self.config.text.n_layers {
             let is_full = matches!(
                 &self.weights.layers[layer_idx],
                 MixerWeights::FullAttention(_)
             );
-            // TEMP-DIAG (implement_r2): per-layer prefill heartbeat; the last printed k names the hanging layer; revert in the acceptance-bound revision.
-            // TEMP-DIAG (implement_r11): fire only during prefill (seq > 1); the 64 single-token
-            // decode forwards flooded the head-limited receipt (~2048 lines) and truncated
-            // gen_entry/vision_entry/mha signature/prefill_done/decode_step in r10.
-            if seq > 1 {
-                eprintln!("[qwen_drive] prefill_layer k={} kind={} ms_since_prev={:.1}", layer_idx, if is_full { "full" } else { "gdn" }, layer_t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            layer_t0 = std::time::Instant::now();
             hidden = if is_full {
                 self.forward_full_attention(hidden, layer_idx, &cos, &sin, seq)?
             } else {
-                self.forward_gdn(hidden, layer_idx, seq)?
+                self.forward_gdn(hidden, layer_idx, seq, prefill_scratch.as_ref())?
             };
             if seq > 1 { trace_rows(&format!("model_language_model_layers_{layer_idx}"), &hidden)?; }
         }
@@ -1134,6 +1222,28 @@ impl QwenDriveModel {
             upload_u32(self.ctx(), token_ids)?
         };
         // Qwen uses the raw embedding table; lookup_bf16 applies Gemma scaling.
+        // implement_port r5 (analysis/r5_change_selection): on the single-token
+        // decode path write the lookup into the model-owned [1, hidden] buffer
+        // (same FFI kernel via embedding::lookup_into, no per-step output
+        // cudaMalloc/memset); run_text's first rms_norm reads it before any
+        // later write (write-before-read), and the returned tensor is consumed
+        // entirely within the step. The multi-token path is unchanged.
+        if token_ids.len() == 1 {
+            let output = self.decode_ws.embed_out.clone();
+            let table = DeviceBuffer::from_tensor(&self.weights.embed_tokens).map_err(Error::Cuda)?;
+            let out_buf = DeviceBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+            embedding::lookup_into(
+                self.ctx(),
+                DType::BF16,
+                &table,
+                ids.address(),
+                &out_buf,
+                self.config.text.hidden_size,
+                1,
+            )?;
+            trace_rows("model_language_model_embed_tokens", &output)?;
+            return Ok(output);
+        }
         let output = embedding::lookup(self.ctx(), &self.weights.embed_tokens, &ids, token_ids.len())?;
         trace_rows("model_language_model_embed_tokens", &output)?;
         Ok(output)
@@ -1179,8 +1289,6 @@ impl QwenDriveModel {
         let grids = if let Some((pixels, grid_thw)) = image {
             let pixels = self.upload_pixels(pixels)?;
             let vis = vision::forward(&self.config, &self.weights.vision, self.ctx(), &pixels, grid_thw)?;
-            // TEMP-DIAG (implement_r2): vision-tower completion marker; revert in the acceptance-bound revision.
-            eprintln!("[qwen_drive] vision_done vision_rows={}", vis.primary.shape().dims()[0]);
             trace_rows("model_visual", &vis.primary)?;
             let vis_primary = &vis.primary;
             let image_tok = self.config.image_token_id;
@@ -1207,21 +1315,8 @@ impl QwenDriveModel {
                     }
                 })
                 .collect();
-            // TEMP-DIAG (implement_r15): scatter-mapping tail for the receipt (host data, zero
-            // GPU cost); expected at the measured prompt: image_rows=10416,
-            // last_image_prompt_row=10441, last_src_row=10415; revert in the acceptance-bound revision.
-            {
-                let mapped = row_map.iter().filter(|&&m| m != u32::MAX).count();
-                let (last_pr, last_src) = row_map.iter().enumerate().rev()
-                    .find(|(_, &m)| m != u32::MAX).map(|(i, &m)| (i, m)).unwrap_or((usize::MAX, u32::MAX));
-                self.diag_digest.push(format!(
-                    "[qwen_drive] scatter_tail image_rows={} last_image_prompt_row={} last_src_row={}",
-                    mapped, last_pr, last_src));
-            }
             let row_map_dev = upload_u32(self.ctx(), &row_map)?;
-            x = elementwise::replace_rows_bf16(self.ctx(), &x, vis_primary, &row_map_dev)?; // TEMP-DIAG (implement_r13): scatter source retargeted to the (possibly ablated) tensor
-            // TEMP-DIAG (implement_r2): image-embedding scatter completion marker; revert in the acceptance-bound revision.
-            eprintln!("[qwen_drive] embed_scatter_done");
+            x = elementwise::replace_rows_bf16(self.ctx(), &x, vis_primary, &row_map_dev)?;
             grid_thw
         } else {
             empty_grids
@@ -1233,37 +1328,8 @@ impl QwenDriveModel {
             .max()
             .unwrap_or(0) as i64;
         self.rope_delta = max_pos + 1 - token_ids.len() as i64;
-        // TEMP-DIAG (implement_r14): position-id tail captured into the digest sink (a live
-        // eprintln here would sit above the 80-line capture window); revert in the
-        // acceptance-bound revision.
-        self.diag_digest.push(format!("[qwen_drive] pos_tail last4={:?} max_pos={} rope_delta={}", &positions[positions.len().saturating_sub(4)..], max_pos, self.rope_delta));
         if self.cache_len + token_ids.len() > self.max_seq_len {
             return Err(Error::Other("qwen_drive: prompt exceeds the cache capacity".into()));
-        }
-        // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2 support): publish the
-        // per-row segment map (1=prefix-text, 2=image, 3=vision-marker, 4=tail-text) for the
-        // attn_mix probe's token-id-driven segment masses; revert in the acceptance-bound revision.
-        {
-            let img_tok = self.config.image_token_id;
-            let vs_tok = self.config.vision_start_token_id;
-            let ve_tok = self.config.vision_end_token_id;
-            let last_img = token_ids.iter().rposition(|&tok| tok == img_tok).unwrap_or(0);
-            let seg_map: Vec<u8> = token_ids
-                .iter()
-                .enumerate()
-                .map(|(r, &tok)| {
-                    if tok == vs_tok || tok == ve_tok {
-                        3u8
-                    } else if tok == img_tok {
-                        2u8
-                    } else if r > last_img {
-                        4u8
-                    } else {
-                        1u8
-                    }
-                })
-                .collect();
-            attention::set_attn_seg_map(seg_map);
         }
         self.run_text(x, &positions)
     }
@@ -1309,14 +1375,15 @@ impl QwenDriveModel {
         min_new_tokens: usize,
         eos_token_ids: &[u32],
     ) -> Result<Vec<u32>> {
-        // TEMP-DIAG (implement_r2): generate() entry marker (channel vs pre-entry stall disambiguator); revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] gen_entry prompt_tokens={} has_pixels={} max_new_tokens={}", token_ids.len(), pixel_values.is_some(), max_new_tokens);
-        // TEMP-DIAG (implement_r12): last-16 prompt ids close the prompt-divergence candidate;
-        // revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
+        // implement_port r5 (analysis/r5_change_selection): removed the residual
+        // TEMP-DIAG instrumentation from the generation hot path (gen_entry,
+        // prompt_tail x2, prefill_done clock+eprintln, decode heartbeat every 25
+        // steps, decode_exit, and the diag_digest drain) plus the per-layer
+        // prefill timing in run_text; this class previously measured 1.013x
+        // paired geomean and all instances were marked revert-in-acceptance.
+        // The greedy sampling, suppress_logits, EOS handling and token-count
+        // semantics are byte-identical to the baseline.
         self.reset_state()?;
-        // TEMP-DIAG (implement_r1): generation-entry clock for prefill/decode timing; revert in the acceptance-bound revision.
-        let diag_start = std::time::Instant::now();
         let mut sampler = self.backend.create_token_sampler(TokenSamplingSpec {
             vocab_size: self.config.text.vocab_size,
             max_sequence_len: token_ids.len() + max_new_tokens + 1,
@@ -1327,23 +1394,8 @@ impl QwenDriveModel {
             rng: RngKey::default(),
         })?;
         let mut logits = self.prefill_impl(token_ids, pixel_values)?;
-        // TEMP-DIAG (implement_r1): prefill completion marker + decode heartbeat clock; revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] prefill_done prompt_tokens={} elapsed_ms={:.1}", token_ids.len(), diag_start.elapsed().as_secs_f64() * 1000.0);
-        // TEMP-DIAG (implement_r3 / synthesis_r3): drain the composed-causal attention
-        // P-invariant probe lines (emitted during prefill at layer 3) into the digest so
-        // they land inside the receipt window; revert in the acceptance-bound revision.
-        for line in attention::take_attn_diag_lines() {
-            self.diag_digest.push(line);
-        }
-        // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 3 L5): drain the vision
-        // pos-embed corner-anchor line into the digest; revert in the acceptance-bound revision.
-        for line in vision::take_vision_diag_lines() {
-            self.diag_digest.push(line);
-        }
-        let mut diag_last_step = std::time::Instant::now();
         let eos_dev = upload_u32(self.ctx(), eos_token_ids)?;
         let mut generated = Vec::new();
-        let mut diag_eos = false;
         for step in 0..max_new_tokens {
             if step < min_new_tokens {
                 let row = logits.shape().dims()[0] - 1;
@@ -1351,27 +1403,11 @@ impl QwenDriveModel {
             }
             let sample = sampler.sample(NextTokenLogits::last(&logits, self.config.text.vocab_size)?)?;
             generated.push(sample.token_id);
-            // TEMP-DIAG (implement_r1): heartbeat at step 0 and every 25 steps; revert in the acceptance-bound revision.
-            if step % 25 == 0 {
-                eprintln!("[qwen_drive] decode_step k={} token_id={} ms_since_last={:.1}", step, sample.token_id, diag_last_step.elapsed().as_secs_f64() * 1000.0);
-                diag_last_step = std::time::Instant::now();
-            }
             if eos_token_ids.contains(&sample.token_id) || step + 1 == max_new_tokens {
-                diag_eos = eos_token_ids.contains(&sample.token_id);
                 break;
             }
             logits = self.forward_tokens(&[sample.token_id])?;
         }
-        // TEMP-DIAG (implement_r13): evidence-accessibility digest -- re-emit the r12 vis_fp,
-        // prompt_tail and hidden_norm k=0/k=31 values as short lines here so they land inside the
-        // receipt's trailing capture window; revert in the repair revision.
-        eprintln!("[qwen_drive] diag_digest zero_vision={} captured={}", DIAG_ZERO_VISION as u8, self.diag_digest.len());
-        eprintln!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
-        for line in self.diag_digest.drain(..) {
-            eprintln!("{line}");
-        }
-        // TEMP-DIAG (implement_r1): exit summary with the first 8 generated ids; revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] decode_exit steps={} eos={} first_ids={:?}", generated.len(), diag_eos, &generated[..generated.len().min(8)]);
         Ok(generated)
     }
 

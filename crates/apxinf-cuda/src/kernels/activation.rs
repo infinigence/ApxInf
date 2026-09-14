@@ -273,6 +273,44 @@ pub fn swiglu_bf16_rounded(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor
     Ok(matrix_tensor(ctx, rows, inner, output))
 }
 
+/// implement_port r5 (analysis/r5_change_selection): `swiglu_bf16_rounded`
+/// variant writing into a caller-provided `[rows, inner]` BF16 output tensor
+/// (model-owned decode-workspace reuse); identical validation and the same
+/// `apxinf_swiglu_bf16_rounded` FFI kernel, with the per-call output
+/// allocation removed. Mirrors the r4 `*_into` out-parameter pattern.
+pub fn swiglu_bf16_rounded_into(ctx: &CudaContext, gate_up: &Tensor, out: &Tensor) -> Result<()> {
+    let (rows, cols) = matrix_shape(gate_up, "rounded SwiGLU")?;
+    if gate_up.dtype() != DType::BF16 || cols == 0 || cols % 2 != 0 || rows == 0 {
+        return Err(Error::Other(
+            "rounded SwiGLU expects nonempty BF16 [rows,2*inner]".into(),
+        ));
+    }
+    if gate_up.device() != apxinf_core::Device::Cuda(ctx.device_id()) {
+        return Err(Error::Other(
+            "rounded SwiGLU input is on the wrong device".into(),
+        ));
+    }
+    let inner = cols / 2;
+    if out.dtype() != DType::BF16 || out.shape().dims() != [rows, inner] {
+        return Err(Error::Other(
+            "rounded SwiGLU output shape/dtype mismatch".into(),
+        ));
+    }
+    let r = i32::try_from(rows).map_err(|_| Error::Other("SwiGLU rows overflow".into()))?;
+    let n = i32::try_from(inner).map_err(|_| Error::Other("SwiGLU inner overflow".into()))?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_swiglu_bf16_rounded(
+            gpu_ptr(gate_up)?,
+            gpu_ptr(out)?,
+            r,
+            n,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(())
+}
+
 /// Fuse optional bias, SwiGLU, and dynamic per-row E4M3 quantization.
 pub fn swiglu_quantize_rows_bf16_e4m3(
     ctx: &CudaContext,
