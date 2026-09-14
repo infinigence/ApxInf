@@ -350,7 +350,7 @@ pub fn plan(
                 &shift_attn,
                 eps,
             )?;
-            let qkv = gemm::matmul(ctx, &x, &layer.qkv_w)?;
+            let qkv = gemm::bf16(ctx, &x, &layer.qkv_w)?;
             if index == trace_step && layer_index == trace_layer {
                 trace_rows("expert_modulation", &modulation)?;
                 trace_rows("expert_adaln_input", &x)?;
@@ -399,7 +399,7 @@ pub fn plan(
             }
             la::expert_sigmoid_gate_mul(ctx, &attn, &gate_out)?;
             let attn = attn.reshape(vec![length, heads * head_dim])?;
-            let proj = gemm::matmul(ctx, &attn, &layer.o_w)?;
+            let proj = gemm::bf16(ctx, &attn, &layer.o_w)?;
             if index == trace_step && layer_index == trace_layer {
                 trace_rows("expert_o_proj", &proj)?;
             }
@@ -407,9 +407,9 @@ pub fn plan(
 
             let x2 =
                 la::adaln_rms_norm(ctx, &hidden, &layer.post_norm, &scale_ffn, &shift_ffn, eps)?;
-            let gu = gemm::matmul(ctx, &x2, &layer.gate_up_w)?;
+            let gu = gemm::bf16(ctx, &x2, &layer.gate_up_w)?;
             let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
-            let down = gemm::matmul(ctx, &act, &layer.down_w)?;
+            let down = gemm::bf16(ctx, &act, &layer.down_w)?;
             if index == trace_step && layer_index == trace_layer {
                 trace_rows("expert_adaln_ffn", &x2)?;
                 trace_rows("expert_gate_up", &gu)?;

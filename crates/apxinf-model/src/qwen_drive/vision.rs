@@ -99,7 +99,7 @@ pub fn forward(
     let offsets_dev = upload_u32(ctx, &offsets)?;
 
     // Patch embedding: [N, patch_vec] @ [patch_vec, hidden] + bias.
-    let mut x = gemm::matmul(ctx, pixel_values, &weights.patch_w)?;
+    let mut x = gemm::bf16(ctx, pixel_values, &weights.patch_w)?;
     x = elementwise::bias_bf16(ctx, &x, Some(&weights.patch_b))?;
     super::general::trace_rows("model_visual_patch_embed", &x)?;
 

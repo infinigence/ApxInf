@@ -52,6 +52,29 @@ pub(super) fn diagnostics_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("APXINF_QWEN_DIAG").is_some())
 }
 
+/// Attribute one stage of the GDN prefill scan.
+///
+/// The five scan kernels launch asynchronously, so attributing time between
+/// them means synchronizing the stream at each boundary. That serializes the
+/// launches and is not free, which is why every call site sits behind
+/// [`diagnostics_enabled`].
+fn gdn_stage_mark(
+    ctx: &Context,
+    layer_idx: usize,
+    name: &str,
+    since: &mut std::time::Instant,
+) -> Result<()> {
+    ctx.synchronize().map_err(Error::Cuda)?;
+    eprintln!(
+        "[qwen_drive] gdn_stage layer={} {} ms={:.2}",
+        layer_idx,
+        name,
+        since.elapsed().as_secs_f64() * 1000.0
+    );
+    *since = std::time::Instant::now();
+    Ok(())
+}
+
 // Private takeover checkpoint probe; opt-in and removed before product acceptance.
 pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else { return Ok(()); };
@@ -591,7 +614,7 @@ impl QwenDriveModel {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
         let normed = la::rms_norm_plus1(ctx, &x, post_norm, eps)?;
-        let gu = gemm::matmul(ctx, &normed, gate_up_w)?;
+        let gu = gemm::bf16(ctx, &normed, gate_up_w)?;
         let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
         let down = linear_checkpoint(ctx, &act, down_w)?;
         if trace {
@@ -787,10 +810,29 @@ impl QwenDriveModel {
             let t_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * GDN_CHUNK * DType::F32.size_in_bytes())?;
             let vt_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_v * DType::F32.size_in_bytes())?;
             let kcd_buf = alloc_zeros(ctx, num_v_heads * chunks * GDN_CHUNK * head_k * DType::F32.size_in_bytes())?;
+            // GDN prefill dominates this model's prefill on Orin, so the scan is
+            // attributable stage by stage. Off by default: each mark synchronizes.
+            let gdn_timed = diagnostics_enabled();
+            let mut gdn_since = std::time::Instant::now();
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "alloc", &mut gdn_since)?;
+            }
             la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "cumsum", &mut gdn_since)?;
+            }
             la::gdn_attn_raw(ctx, &q_buf, &k_buf, &beta_buf, &g_cum, &a_buf, &t_buf, seq_pad, num_v_heads, head_k, GDN_CHUNK)?;
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "attn_raw", &mut gdn_since)?;
+            }
             la::gdn_tri_solve(ctx, &a_buf, num_v_heads * chunks, GDN_CHUNK)?;
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "tri_solve", &mut gdn_since)?;
+            }
             la::gdn_chunk_gemm(ctx, &a_buf, &v_buf, &k_buf, &beta_buf, &g_cum, &vt_buf, &kcd_buf, seq_pad, num_v_heads, head_k, head_v, GDN_CHUNK)?;
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "chunk_gemm", &mut gdn_since)?;
+            }
             la::gdn_chunk_state(
                 ctx,
                 &q_buf,
@@ -807,6 +849,9 @@ impl QwenDriveModel {
                 head_v,
                 GDN_CHUNK,
             )?;
+            if gdn_timed {
+                gdn_stage_mark(ctx, layer_idx, "chunk_state", &mut gdn_since)?;
+            }
         }
         if layer_idx == 0 && seq > 1 { trace_rows("text0_core", &gdn_out)?; }
         // TEMP-DIAG (implement_r16): GDN layer-0 zero-history fingerprint (shift_gdn_r15 P2) --
