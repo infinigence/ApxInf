@@ -137,6 +137,22 @@ fn alloc_zeros(ctx: &Context, bytes: usize) -> Result<DeviceBuffer> {
         .map_err(Error::Cuda)
 }
 
+/// GDN scan scratch.
+///
+/// The scan pads the sequence up to a chunk boundary and the prep kernels only
+/// reach the real tokens, so the padding tail has to start at zero. When there
+/// is no padding -- every decode step, where seq_pad and seq are both 1 -- the
+/// clear covers nothing and is pure cost: it accounted for most of the 14,064
+/// memsets one VQA inference issued after operator outputs stopped being
+/// cleared.
+fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<DeviceBuffer> {
+    if padded {
+        alloc_zeros(ctx, bytes)
+    } else {
+        DeviceBuffer::alloc(bytes.max(1), ctx.device_id()).map_err(Error::Cuda)
+    }
+}
+
 /// Apply a BF16 linear weight in its original checkpoint [out,in] layout.
 fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let x=input.shape().dims();let w=weight.shape().dims();
@@ -780,11 +796,12 @@ impl QwenDriveModel {
 
         let recurrent_decode = has_state && seq == 1;
         let seq_pad = if recurrent_decode { 1 } else { seq.div_ceil(GDN_CHUNK) * GDN_CHUNK };
-        let q_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?;
-        let k_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes())?;
-        let v_buf = alloc_zeros(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes())?;
-        let beta_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
-        let g_buf = alloc_zeros(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes())?;
+        let scan_padded = seq_pad != seq;
+        let q_buf = alloc_scan_scratch(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes(), scan_padded)?;
+        let k_buf = alloc_scan_scratch(ctx, num_v_heads * seq_pad * head_k * DType::F32.size_in_bytes(), scan_padded)?;
+        let v_buf = alloc_scan_scratch(ctx, num_v_heads * seq_pad * head_v * DType::F32.size_in_bytes(), scan_padded)?;
+        let beta_buf = alloc_scan_scratch(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes(), scan_padded)?;
+        let g_buf = alloc_scan_scratch(ctx, num_v_heads * seq_pad * DType::F32.size_in_bytes(), scan_padded)?;
         if gdn_timed {
             gdn_stage_mark(ctx, layer_idx, "qkvbg_alloc", &mut gdn_since)?;
         }
