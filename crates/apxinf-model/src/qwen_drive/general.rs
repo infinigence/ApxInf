@@ -75,6 +75,17 @@ fn gdn_stage_mark(
     Ok(())
 }
 
+/// The decode step the divergence probes should fire at, from
+/// `APXINF_QWEN_TRACE_DECODE_STEP`. Unset means no step.
+fn trace_decode_step() -> Option<usize> {
+    static STEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("APXINF_QWEN_TRACE_DECODE_STEP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    })
+}
+
 // Private takeover checkpoint probe; opt-in and removed before product acceptance.
 pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else { return Ok(()); };
@@ -245,6 +256,10 @@ pub struct QwenDriveModel {
     // the captured r12 marker strings are re-printed just before decode_exit so the
     // decisive values land inside the receipt's trailing capture window; revert in the repair revision.
     diag_digest: Vec<String>,
+    /// Decode step currently being executed, so the per-layer trace can fire at
+    /// one step instead of overwriting itself on every one of them. `None`
+    /// outside the decode loop.
+    decode_step: Option<usize>,
 }
 
 /// Install the CUDA GEMM tactic store for this device.
@@ -355,6 +370,7 @@ impl QwenDriveModel {
             max_seq_len,
             last_position: 0,
             diag_digest: Vec::new(),
+            decode_step: None,
         })
     }
 
@@ -987,7 +1003,11 @@ impl QwenDriveModel {
                 self.forward_gdn(hidden, layer_idx, seq)?
             };
             if seq > 1 { trace_rows(&format!("model_language_model_layers_{layer_idx}"), &hidden)?; }
-            if seq == 1 { trace_rows(&format!("decode_layer_{layer_idx}"), &hidden)?; }
+            // Per-layer decode trace for the divergence hunt. Without the step
+            // gate every step overwrote the previous one, leaving only the last.
+            if seq == 1 && self.decode_step.is_some() && self.decode_step == trace_decode_step() {
+                trace_rows(&format!("decode_layer_{layer_idx}"), &hidden)?;
+            }
             if let Some((pre0, pre1)) = pre_l2 {
                 let (post0, post1) = hidden_row_l2_pair(&hidden)?;
                 self.diag_digest.push(format!(
@@ -1435,6 +1455,7 @@ impl QwenDriveModel {
         let trace_decode_step = std::env::var("APXINF_QWEN_TRACE_DECODE_STEP")
             .ok().and_then(|value| value.parse::<usize>().ok());
         for step in 0..max_new_tokens {
+            self.decode_step = Some(step);
             if step < min_new_tokens {
                 let row = logits.shape().dims()[0] - 1;
                 la::suppress_logits(self.ctx(), &logits, row, &eos_dev)?;
@@ -1691,6 +1712,7 @@ impl QwenDriveModel {
         let eos_dev = upload_u32(self.ctx(), terminator_ids)?;
         let mut generated: Vec<u32> = Vec::new();
         for step in 0..max_new_tokens {
+            self.decode_step = Some(step);
             if step < min_new_tokens {
                 let row = logits.shape().dims()[0] - 1;
                 la::suppress_logits(self.ctx(), &logits, row, &eos_dev)?;
