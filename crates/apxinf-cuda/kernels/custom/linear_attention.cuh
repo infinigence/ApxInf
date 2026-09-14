@@ -307,13 +307,35 @@ __global__ void gdn_chunk_gemm_kernel(
   const int64_t a_base = (static_cast<int64_t>(head) * gridDim.x + chunk) * chunk_size * chunk_size;
   const int64_t vt_base = (static_cast<int64_t>(head) * gridDim.x + chunk) * chunk_size * head_v_dim;
   const int64_t kcd_base = (static_cast<int64_t>(head) * gridDim.x + chunk) * chunk_size * head_k_dim;
+  // vb and kb depend only on (m, j), never on i, but the inner loops rebuilt
+  // them for every one of the chunk_size values of i: chunk_size-fold redundant
+  // multiplies, BF16 round trips, and -- for kb -- exp2 calls. Precompute each
+  // tile once. Threads in a warp hold consecutive j and read tile[m * dim + j],
+  // so these stay conflict-free without padding.
+  extern __shared__ float gdn_gemm_smem[];
+  float* vb_tile = gdn_gemm_smem;
+  float* kb_tile = gdn_gemm_smem + chunk_size * head_v_dim;
+  for (int idx = threadIdx.x; idx < chunk_size * head_v_dim; idx += blockDim.x) {
+    const int m = idx / head_v_dim;
+    const int j = idx - m * head_v_dim;
+    vb_tile[idx] = __bfloat162float(__float2bfloat16(
+        v[(token_base + m) * head_v_dim + j] * beta[token_base + m]));
+  }
+  for (int idx = threadIdx.x; idx < chunk_size * head_k_dim; idx += blockDim.x) {
+    const int m = idx / head_k_dim;
+    const int j = idx - m * head_k_dim;
+    const float kb0 = __bfloat162float(__float2bfloat16(
+        k[(token_base + m) * head_k_dim + j] * beta[token_base + m]));
+    kb_tile[idx] = __bfloat162float(
+        __float2bfloat16(kb0 * gdn_exp2_approx(g_cum[token_base + m])));
+  }
+  __syncthreads();
   for (int cell = threadIdx.x; cell < chunk_size * head_v_dim; cell += blockDim.x) {
     const int i = cell / head_v_dim;
     const int j = cell - i * head_v_dim;
     float vt = 0.0f;
     for (int m = 0; m < chunk_size; ++m) {
-      const float vb = __bfloat162float(__float2bfloat16(v[(token_base + m) * head_v_dim + j] * beta[token_base + m]));
-      vt += a[a_base + i * chunk_size + m] * vb;
+      vt += a[a_base + i * chunk_size + m] * vb_tile[m * head_v_dim + j];
     }
     vt_out[vt_base + cell] = __bfloat162float(__float2bfloat16(vt));
   }
@@ -322,9 +344,7 @@ __global__ void gdn_chunk_gemm_kernel(
     const int j = cell - i * head_k_dim;
     float kcd = 0.0f;
     for (int m = 0; m < chunk_size; ++m) {
-      const float kb0 = __bfloat162float(__float2bfloat16(k[(token_base + m) * head_k_dim + j] * beta[token_base + m]));
-      const float kb = __bfloat162float(__float2bfloat16(kb0 * gdn_exp2_approx(g_cum[token_base + m])));
-      kcd += a[a_base + i * chunk_size + m] * kb;
+      kcd += a[a_base + i * chunk_size + m] * kb_tile[m * head_k_dim + j];
     }
     kcd_out[kcd_base + cell] = __bfloat162float(__float2bfloat16(kcd));
   }

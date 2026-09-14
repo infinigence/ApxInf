@@ -1054,7 +1054,23 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
-  gdn_chunk_gemm_kernel<<<dim3(chunks, num_v_heads), 256, 0, stream>>>(
+  // vb and kb tiles, precomputed once per chunk (see the kernel comment).
+  const size_t gemm_smem =
+      static_cast<size_t>(chunk_size) * (head_v_dim + head_k_dim) * sizeof(float);
+  if (gemm_smem > 48u * 1024u) {
+    static bool gemm_opted_in = false;
+    if (!gemm_opted_in) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(gdn_chunk_gemm_kernel),
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(gemm_smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      gemm_opted_in = true;
+    }
+  }
+  gdn_chunk_gemm_kernel<<<dim3(chunks, num_v_heads), 256, gemm_smem, stream>>>(
       static_cast<const float*>(a), static_cast<const float*>(v),
       static_cast<const float*>(k), static_cast<const float*>(beta),
       static_cast<const float*>(g_cum),
@@ -1077,6 +1093,31 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       out_row_width != num_v_heads * head_v_dim) {
     return cudaErrorInvalidValue;
   }
+  // The chunk loop is sequential because the state is recurrent, so the only
+  // parallelism is inside a chunk: chunk_size*head_v_dim cells against one
+  // block per head. At the shipped shape that is 32 blocks of 256 threads on
+  // 16 SMs, a third of the threads an SM can hold. A wider block raises
+  // occupancy without touching the arithmetic -- each cell is independent and
+  // keeps its own accumulation order. Must stay a multiple of head_v_dim so a
+  // thread's column index remains fixed (see the kernel comment), and no
+  // larger than the per-thread attn_inter budget allows.
+  const int cells_per_chunk = chunk_size * head_v_dim;
+  auto block_ok = [&](int threads) {
+    return threads >= 32 && threads <= 1024 && threads % 32 == 0 &&
+           head_v_dim % 32 == 0 && threads % head_v_dim == 0 &&
+           cells_per_chunk % threads == 0 && cells_per_chunk / threads <= 32;
+  };
+  // 512 measured best at the shipped shape: 49.01ms per layer at 256, 33.27ms
+  // at 512, 36.35ms at 1024. 1024 loses because two such blocks exceed the
+  // 1536 threads an SM holds, so it drops to one block per SM while also
+  // leaving each thread too few cells to overlap.
+  int block_threads = block_ok(512) ? 512 : 256;
+  if (const char* tuned = std::getenv("APXINF_GDN_CHUNK_STATE_THREADS")) {
+    const int requested = std::atoi(tuned);
+    if (block_ok(requested)) {
+      block_threads = requested;
+    }
+  }
   // v_new, plus a BF16 copy of the carried state (see the kernel comment).
   const size_t smem =
       static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float) +
@@ -1097,7 +1138,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       opted_in = true;
     }
   }
-  gdn_chunk_state_kernel<<<num_v_heads, 256, smem, stream>>>(
+  gdn_chunk_state_kernel<<<num_v_heads, block_threads, smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
       static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
       static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
