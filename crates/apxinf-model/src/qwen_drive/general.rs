@@ -154,7 +154,12 @@ pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else { return Ok(()); };
     let width = *tensor.shape().dims().last().unwrap();
     let count = tensor.numel() / width;
-    let rows = if count < 4 { (0..count).collect::<Vec<_>>() } else { vec![0,1,2,count-1] };
+    // Four sampled rows cannot tell a layer that is itself nondeterministic
+    // from one that merely mixes in a neighbour's unsampled row, and every
+    // sequence mixer here does mix across positions. APXINF_QWEN_TRACE_FULL
+    // dumps the whole tensor so the first affected layer is the real one.
+    let full = std::env::var_os("APXINF_QWEN_TRACE_FULL").is_some();
+    let rows = if full || count < 4 { (0..count).collect::<Vec<_>>() } else { vec![0,1,2,count-1] };
     let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
     let mut bytes = Vec::new();
     for row in rows {

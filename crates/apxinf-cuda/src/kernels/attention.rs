@@ -1620,8 +1620,18 @@ pub fn causal_gqa_bf16(
         // Use the head256 specialization for complete causal prefill and
         // single-token decode. Unequal multi-token prefixes use composed GQA.
         if q_shape[2] == 256 {
+            // Diagnostic: the head-256 causal prefill kernel is the only
+            // operation in this model that does not reproduce itself. Same
+            // q, k and v bit for bit, and roughly one output element in ten
+            // thousand lands one BF16 ULP away from the previous run, which
+            // moves where the generation first differs from the reference.
+            // This routes the same call through the composed path instead, to
+            // separate the kernel from everything around it.
             #[cfg(apxinf_fa2_sm80)]
-            if q_shape[0] == key_tokens && q_shape[0] > 1 {
+            if q_shape[0] == key_tokens
+                && q_shape[0] > 1
+                && std::env::var_os("APXINF_ATTN_COMPOSED_PREFILL").is_none()
+            {
                 return fa2_attention_causal(ctx,q,k,v,q_shape[0],key_tokens,q_shape[1],k_shape[1],q_shape[2]);
             }
             #[cfg(apxinf_fa2_sm80)]

@@ -1118,10 +1118,13 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       block_threads = requested;
     }
   }
-  // v_new, plus a BF16 copy of the carried state (see the kernel comment).
+  // v_new, a BF16 copy of the carried state, and a BF16 tile holding v_new's
+  // round trip for the chunk (see the kernel comment). 32KB + 32KB + 16KB at
+  // the shipped shape, so two blocks still fit in an SM's 164KB.
   const size_t smem =
       static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float) +
-      static_cast<size_t>(head_k_dim) * head_v_dim * sizeof(__nv_bfloat16);
+      static_cast<size_t>(head_k_dim) * head_v_dim * sizeof(__nv_bfloat16) +
+      static_cast<size_t>(chunk_size) * head_v_dim * sizeof(__nv_bfloat16);
   // At the shipped shape this lands at 64KB, past the 48KB a kernel receives
   // without asking. Opt in once; a device that refuses keeps the error rather
   // than launching with too little shared memory.

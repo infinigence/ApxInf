@@ -379,6 +379,14 @@ __global__ void gdn_chunk_state_kernel(
   // 64x redundancy at the shipped shape.
   __nv_bfloat16* state_cache =
       reinterpret_cast<__nv_bfloat16*>(gdn_chunk_smem + cells);
+  // Both loops below consume v_new only through a BF16 round trip, and each
+  // element is rounded once per row of the matrix it is multiplied against:
+  // chunk_size times in the intra term, head_k_dim times in the state update,
+  // which at the shipped shape is 64x and 128x. The state update also calls
+  // exp2 on a value that depends only on the chunk row, once per cell. Rounding
+  // each element once into this tile, twice per chunk, is the same arithmetic
+  // on the same values -- the expressions are unchanged, only their count is.
+  __nv_bfloat16* v_round = state_cache + state_cells_total;
   for (int c = 0; c < total_chunks; ++c) {
     for (int cell = threadIdx.x; cell < state_cells_total; cell += blockDim.x) {
       state_cache[cell] = __float2bfloat16(state_head[cell]);
@@ -404,12 +412,16 @@ __global__ void gdn_chunk_state_kernel(
       attn_inter[it] = ai * qg;
     }
     __syncthreads();
+    for (int cell = threadIdx.x; cell < cells; cell += blockDim.x) {
+      v_round[cell] = __float2bfloat16(v_new[cell]);
+    }
+    __syncthreads();
     for (int cell = threadIdx.x, it = 0; cell < cells; cell += blockDim.x, ++it) {
       const int i = cell / head_v_dim;
       const int j = cell - i * head_v_dim;
       float intra = 0.0f;
       for (int m = 0; m < chunk_size; ++m) {
-        intra += t_in[a_base + i * chunk_size + m] * __bfloat162float(__float2bfloat16(v_new[m * head_v_dim + j]));
+        intra += t_in[a_base + i * chunk_size + m] * __bfloat162float(v_round[m * head_v_dim + j]);
       }
       const float acc = attn_inter[it] * scale + intra * scale;
       const int token = c * chunk_size + i;
@@ -422,13 +434,19 @@ __global__ void gdn_chunk_state_kernel(
     const float g_last = g_cum[token_base + chunk_size - 1];
     const float decay = gdn_exp2_approx(g_last);
     const int state_cells = head_k_dim * head_v_dim;
+    for (int cell = threadIdx.x; cell < cells; cell += blockDim.x) {
+      const int i = cell / head_v_dim;
+      v_round[cell] = __float2bfloat16(
+          v_new[cell] * gdn_exp2_approx(g_last - g_cum[token_base + i]));
+    }
+    __syncthreads();
     for (int cell = threadIdx.x; cell < state_cells; cell += blockDim.x) {
       const int m = cell / head_v_dim;
       const int j = cell - m * head_v_dim;
       float acc = 0.0f;
       for (int i = 0; i < chunk_size; ++i) {
-        const float value = __bfloat162float(__float2bfloat16(v_new[i * head_v_dim + j] * gdn_exp2_approx(g_last - g_cum[token_base + i])));
-        acc += k[(token_base + i) * head_k_dim + m] * value;
+        acc += k[(token_base + i) * head_k_dim + m] *
+               __bfloat162float(v_round[i * head_v_dim + j]);
       }
       state_head[cell] = state_head[cell] * decay + acc;
     }
