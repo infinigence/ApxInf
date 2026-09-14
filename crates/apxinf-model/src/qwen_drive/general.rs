@@ -24,7 +24,8 @@ use crate::accelerator::create_backend;
 use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 
 use super::backend::{
-    downcast_arc, kernels, transfers, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
+    downcast_arc, kernels, transfers, tuning, Context, CublasTranspose, DeviceBuffer,
+    RuntimeBackend,
 };
 use kernels::{activation, attention, elementwise, embedding, gemm, linear_attention as la};
 
@@ -201,6 +202,58 @@ pub struct QwenDriveModel {
     diag_digest: Vec<String>,
 }
 
+/// Install the CUDA GEMM tactic store for this device.
+///
+/// Every model reached through `AutoModel` picks up its tactic database in
+/// `configure_cuda_tuning`, but `QwenDriveModel::load` builds its backend
+/// directly and the Python binding calls it directly too, so these GEMMs ran
+/// on cuBLASLt heuristics and never consulted
+/// `configs/tuning/nvidia/<device>/tactics.json` at all.
+///
+/// `APXINF_QWEN_TUNING_DIR` overrides the search root, which otherwise matches
+/// `AutoModel`: `configs/tuning`, resolved against the working directory. A
+/// missing tactics file is not an error -- the kernels fall back to the same
+/// heuristics they used before. `APXINF_QWEN_AUTOTUNE` selects online
+/// autotuning, which measures the shapes real requests produce and writes them
+/// back to that directory; leave it unset for inference.
+fn configure_gemm_tuning(cuda: &RuntimeBackend) -> Result<()> {
+    let root = std::env::var_os("APXINF_QWEN_TUNING_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("configs/tuning"));
+    let paths = tuning::TuningPaths::for_cuda(&root, cuda.context().caps());
+    let database = paths
+        .tactics
+        .is_file()
+        .then(|| tuning::TuningDb::from_json_file(&paths.tactics))
+        .transpose()?;
+    let autotune = std::env::var_os("APXINF_QWEN_AUTOTUNE").is_some();
+    // Installing an empty store is not the same as installing none: with no
+    // record to match, the resolver pins each shape to its safe inference
+    // fallback instead of letting cuBLASLt pick, which measured 54% slower on
+    // Orin (19.3s vs 12.5s per 64-token VQA scene). So configure tuning only
+    // when there is something to configure it with.
+    if database.is_none() && !autotune {
+        return Ok(());
+    }
+    let mode = if autotune {
+        tuning::TuningMode::AutoTune
+    } else {
+        tuning::TuningMode::Inference
+    };
+    eprintln!(
+        "[qwen_drive] gemm tuning: mode={:?} store={} loaded={}",
+        mode,
+        paths.tactics.display(),
+        database.is_some()
+    );
+    gemm::configure_tuning(
+        cuda.context(),
+        mode,
+        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
+        Some(paths),
+    )
+}
+
 impl QwenDriveModel {
     /// Load the VLM (and optional planner head) onto a CUDA device.
     pub fn load(model_dir: &Path, planner_dir: Option<&Path>, device: Device) -> Result<Self> {
@@ -220,6 +273,7 @@ impl QwenDriveModel {
                     .into(),
             )
         })?;
+        configure_gemm_tuning(&cuda)?;
         let config = QwenDriveConfig::from_json_file(&model_dir.join("config.json"))?;
         eprintln!("[qwen_drive] loading VLM weights from {}", model_dir.display());
         let (tensors, _meta) = apxinf_loader::safetensors::load_native_path(model_dir)
