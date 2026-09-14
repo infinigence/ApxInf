@@ -225,18 +225,41 @@ __global__ void gdn_attn_raw_kernel(
   const int chunk = blockIdx.x;
   const int64_t token_base = static_cast<int64_t>(head) * seq_pad + static_cast<int64_t>(chunk) * chunk_size;
   const int64_t matrix_base = (static_cast<int64_t>(head) * gridDim.x + chunk) * chunk_size * chunk_size;
+  // This block forms K.K^T and Q.K^T over one chunk, and every cell walked the
+  // same head_k_dim rows straight out of global memory: three rows per cell,
+  // chunk_size*chunk_size cells, against only two chunk_size*head_k_dim tiles
+  // of distinct data -- 96x redundancy at the shipped shape. Staging the tiles
+  // in shared memory leaves the arithmetic untouched (same d order, same FP32
+  // accumulation) and only changes where the operands are read from.
+  extern __shared__ float gdn_attn_smem[];
+  // Rows are padded by one float. Adjacent threads in a warp hold adjacent j
+  // and read k_tile[j * stride + d]; with an unpadded stride of head_k_dim the
+  // whole warp lands on one bank (head_k_dim is a multiple of 32), which costs
+  // a 32-way conflict and gives back what the staging saves. A stride of
+  // head_k_dim + 1 moves each j to its own bank.
+  const int tile_stride = head_k_dim + 1;
+  float* k_tile = gdn_attn_smem;
+  float* q_tile = gdn_attn_smem + chunk_size * tile_stride;
+  for (int idx = threadIdx.x; idx < chunk_size * head_k_dim; idx += blockDim.x) {
+    const int t = idx / head_k_dim;
+    const int d = idx - t * head_k_dim;
+    const int64_t src = (token_base + t) * head_k_dim + d;
+    k_tile[t * tile_stride + d] = k[src];
+    q_tile[t * tile_stride + d] = q[src];
+  }
+  __syncthreads();
   for (int cell = threadIdx.x; cell < chunk_size * chunk_size; cell += blockDim.x) {
     const int i = cell / chunk_size;
     const int j = cell - i * chunk_size;
-    const int64_t row_i = (token_base + i) * head_k_dim;
-    const int64_t row_j = (token_base + j) * head_k_dim;
+    const int row_i = i * tile_stride;
+    const int row_j = j * tile_stride;
     float a1 = 0.0f;
     float a2 = 0.0f;
     const float beta_i = beta[token_base + i];
     for (int d = 0; d < head_k_dim; ++d) {
-      const float k_j = k[row_j + d];
-      a1 += k[row_i + d] * k_j;
-      a2 += q[row_i + d] * k_j;
+      const float k_j = k_tile[row_j + d];
+      a1 += k_tile[row_i + d] * k_j;
+      a2 += q_tile[row_i + d] * k_j;
     }
     const float decay = gdn_exp2_approx(g_cum[token_base + i] - g_cum[token_base + j]);
     a_out[matrix_base + cell] = (j < i) ? -__fmul_rn(__fmul_rn(a1, decay), beta_i) : 0.0f;

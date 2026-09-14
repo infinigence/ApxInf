@@ -1001,7 +1001,24 @@ extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
-  gdn_attn_raw_kernel<<<dim3(chunks, num_v_heads), 256, 0, stream>>>(
+  // One K tile and one Q tile for the chunk, rows padded by one float to keep
+  // the warp off a single shared-memory bank (see the kernel comment).
+  const size_t attn_smem =
+      2u * static_cast<size_t>(chunk_size) * (head_k_dim + 1) * sizeof(float);
+  if (attn_smem > 48u * 1024u) {
+    static bool attn_opted_in = false;
+    if (!attn_opted_in) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(gdn_attn_raw_kernel),
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(attn_smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      attn_opted_in = true;
+    }
+  }
+  gdn_attn_raw_kernel<<<dim3(chunks, num_v_heads), 256, attn_smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
       static_cast<const float*>(beta), static_cast<const float*>(g_cum),
       static_cast<float*>(a_out), static_cast<float*>(t_out),
