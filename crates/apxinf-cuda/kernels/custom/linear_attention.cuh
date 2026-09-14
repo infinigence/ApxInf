@@ -321,11 +321,26 @@ __global__ void gdn_chunk_state_kernel(
     int seq, int seq_pad, int head_k_dim, int head_v_dim, int chunk_size,
     int total_chunks, int out_row_width, float scale) {
   const int head = blockIdx.x;
-  extern __shared__ float v_new[];
+  extern __shared__ float gdn_chunk_smem[];
+  float* v_new = gdn_chunk_smem;
   const int64_t head_token_base = static_cast<int64_t>(head) * seq_pad;
   float* state_head = state + static_cast<int64_t>(head) * head_k_dim * head_v_dim;
   const int cells = chunk_size * head_v_dim;
+  const int state_cells_total = head_k_dim * head_v_dim;
+  // The inter-chunk term reads the carried state only through a BF16 round
+  // trip, so a BF16 copy is bit-identical to re-reading the FP32 state from
+  // global memory. Caching it pays here: each thread walks a full head_k_dim
+  // column per cell, and because blockDim is a multiple of head_v_dim a
+  // thread's column index is fixed, so the same values were fetched once per
+  // cell -- chunk_size*head_v_dim reads of a head_k_dim*head_v_dim matrix,
+  // 64x redundancy at the shipped shape.
+  __nv_bfloat16* state_cache =
+      reinterpret_cast<__nv_bfloat16*>(gdn_chunk_smem + cells);
   for (int c = 0; c < total_chunks; ++c) {
+    for (int cell = threadIdx.x; cell < state_cells_total; cell += blockDim.x) {
+      state_cache[cell] = __float2bfloat16(state_head[cell]);
+    }
+    __syncthreads();
     const int64_t token_base = head_token_base + static_cast<int64_t>(c) * chunk_size;
     const int64_t vt_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * head_v_dim;
     const int64_t kcd_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * head_k_dim;
@@ -338,7 +353,7 @@ __global__ void gdn_chunk_state_kernel(
       float ai = 0.0f;
       const float qg = gdn_exp2_approx(g_cum[token_base + i]);
       for (int m = 0; m < head_k_dim; ++m) {
-        const float s = __bfloat162float(__float2bfloat16(state_head[m * head_v_dim + j]));
+        const float s = __bfloat162float(state_cache[m * head_v_dim + j]);
         vp += kcd_in[kcd_base + i * head_k_dim + m] * s;
         ai += q[(token_base + i) * head_k_dim + m] * s;
       }

@@ -1060,8 +1060,26 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       out_row_width != num_v_heads * head_v_dim) {
     return cudaErrorInvalidValue;
   }
+  // v_new, plus a BF16 copy of the carried state (see the kernel comment).
   const size_t smem =
-      static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float);
+      static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float) +
+      static_cast<size_t>(head_k_dim) * head_v_dim * sizeof(__nv_bfloat16);
+  // At the shipped shape this lands at 64KB, past the 48KB a kernel receives
+  // without asking. Opt in once; a device that refuses keeps the error rather
+  // than launching with too little shared memory.
+  if (smem > 48u * 1024u) {
+    static bool opted_in = false;
+    if (!opted_in) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(gdn_chunk_state_kernel),
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      opted_in = true;
+    }
+  }
   gdn_chunk_state_kernel<<<num_v_heads, 256, smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
       static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
