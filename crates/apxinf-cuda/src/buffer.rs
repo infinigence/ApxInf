@@ -31,6 +31,75 @@ impl CudaDeviceAddress {
 
 struct CudaAllocation {
     ptr: *mut c_void,
+    len: usize,
+    device: usize,
+}
+
+/// Device-memory free list, keyed by device and exact byte size.
+///
+/// One Qwen-Drive VQA inference issued 43,811 cudaMalloc/cudaFree pairs and
+/// spent 13.6s of host time inside them, against 7.9s of total kernel time:
+/// every per-layer intermediate took a fresh block and returned it. The shapes
+/// repeat exactly from layer to layer and from decode step to decode step, so
+/// an exact-size free list turns nearly all of that into a pointer pop.
+///
+/// Opt-in through `APXINF_CUDA_ALLOC_CACHE` until it has been measured across
+/// the other model families. `APXINF_CUDA_ALLOC_CACHE_MB` caps retained bytes,
+/// default 4096, so a long-running process cannot grow without bound; past the
+/// cap a block is released to the driver as before.
+struct AllocCache {
+    /// Pointers held as `usize`; `*mut c_void` is not `Send`.
+    blocks: std::collections::HashMap<(usize, usize), Vec<usize>>,
+    retained: usize,
+    cap: usize,
+}
+
+fn alloc_cache() -> Option<&'static std::sync::Mutex<AllocCache>> {
+    static CACHE: std::sync::OnceLock<Option<std::sync::Mutex<AllocCache>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var_os("APXINF_CUDA_ALLOC_CACHE")?;
+            let cap = std::env::var("APXINF_CUDA_ALLOC_CACHE_MB")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(4096)
+                .saturating_mul(1024 * 1024);
+            Some(std::sync::Mutex::new(AllocCache {
+                blocks: std::collections::HashMap::new(),
+                retained: 0,
+                cap,
+            }))
+        })
+        .as_ref()
+}
+
+/// Take a cached block of exactly `num_bytes` on `device`, if one is held.
+fn cache_take(num_bytes: usize, device: usize) -> Option<*mut c_void> {
+    let mut cache = alloc_cache()?.lock().ok()?;
+    let ptr = cache.blocks.get_mut(&(device, num_bytes))?.pop()?;
+    cache.retained = cache.retained.saturating_sub(num_bytes);
+    Some(ptr as *mut c_void)
+}
+
+/// Retain a block for reuse. Returns false when the caller must free it.
+fn cache_put(ptr: *mut c_void, num_bytes: usize, device: usize) -> bool {
+    let Some(cache) = alloc_cache() else {
+        return false;
+    };
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    if cache.retained.saturating_add(num_bytes) > cache.cap {
+        return false;
+    }
+    cache.retained += num_bytes;
+    cache
+        .blocks
+        .entry((device, num_bytes))
+        .or_default()
+        .push(ptr as usize);
+    true
 }
 
 // SAFETY: this allocation is released through the CUDA runtime and its raw
@@ -40,10 +109,14 @@ unsafe impl Sync for CudaAllocation {}
 
 impl Drop for CudaAllocation {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                let _ = ffi::cudaFree(self.ptr);
-            }
+        if self.ptr.is_null() {
+            return;
+        }
+        if cache_put(self.ptr, self.len, self.device) {
+            return;
+        }
+        unsafe {
+            let _ = ffi::cudaFree(self.ptr);
         }
     }
 }
@@ -67,11 +140,21 @@ impl CudaBuffer {
         unsafe {
             ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
         }
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
-        }
-        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
+        let ptr: *mut c_void = match cache_take(num_bytes, device) {
+            Some(cached) => cached,
+            None => {
+                let mut fresh: *mut c_void = std::ptr::null_mut();
+                unsafe {
+                    ffi::check_cuda(ffi::cudaMalloc(&mut fresh, num_bytes))?;
+                }
+                fresh
+            }
+        };
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation {
+            ptr,
+            len: num_bytes,
+            device,
+        });
         Ok(Self {
             ptr,
             len: num_bytes,
