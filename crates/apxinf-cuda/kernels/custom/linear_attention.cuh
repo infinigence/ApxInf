@@ -297,6 +297,12 @@ __global__ void gdn_tri_solve_kernel(float* a, int chunk_size) {
 }
 
 // VT/U = bf16(A @ bf16(V * beta)); W = bf16(A @ bf16(bf16(K * beta) * exp2(g))).
+// Same shape of redundancy as the chunk-state kernel, and the same fix: a
+// thread's column is fixed, so the tile read in the inner loop does not depend
+// on which cell is being accumulated, and a compile-time tile of accumulators
+// lets it move out. See chunk_state_tile() for why the width is measured
+// rather than chosen.
+template <int GEMM_TILE>
 __global__ void gdn_chunk_gemm_kernel(
     const float* a, const float* v, const float* k, const float* beta,
     const float* g_cum, float* vt_out, float* kcd_out,
@@ -330,23 +336,75 @@ __global__ void gdn_chunk_gemm_kernel(
         __float2bfloat16(kb0 * gdn_exp2_approx(g_cum[token_base + m])));
   }
   __syncthreads();
-  for (int cell = threadIdx.x; cell < chunk_size * head_v_dim; cell += blockDim.x) {
-    const int i = cell / head_v_dim;
-    const int j = cell - i * head_v_dim;
-    float vt = 0.0f;
-    for (int m = 0; m < chunk_size; ++m) {
-      vt += a[a_base + i * chunk_size + m] * vb_tile[m * head_v_dim + j];
+  const int v_cells = chunk_size * head_v_dim;
+  const int k_cells = chunk_size * head_k_dim;
+  const int v_span = static_cast<int>(blockDim.x) * GEMM_TILE;
+  const int k_span = v_span;
+  if (v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
+    const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
+    for (int base = threadIdx.x; base < v_cells; base += v_span) {
+      const int row0 = base / head_v_dim;
+      const int j = base - row0 * head_v_dim;
+      float vt[GEMM_TILE];
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) vt[s] = 0.0f;
+      for (int m = 0; m < chunk_size; ++m) {
+        const float vv = vb_tile[m * head_v_dim + j];
+        #pragma unroll
+        for (int s = 0; s < GEMM_TILE; ++s) {
+          const int i = row0 + s * row_step;
+          vt[s] += a[a_base + i * chunk_size + m] * vv;
+        }
+      }
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) {
+        vt_out[vt_base + base + s * static_cast<int>(blockDim.x)] =
+            __bfloat162float(__float2bfloat16(vt[s]));
+      }
     }
-    vt_out[vt_base + cell] = __bfloat162float(__float2bfloat16(vt));
+  } else {
+    for (int cell = threadIdx.x; cell < v_cells; cell += blockDim.x) {
+      const int i = cell / head_v_dim;
+      const int j = cell - i * head_v_dim;
+      float vt = 0.0f;
+      for (int m = 0; m < chunk_size; ++m) {
+        vt += a[a_base + i * chunk_size + m] * vb_tile[m * head_v_dim + j];
+      }
+      vt_out[vt_base + cell] = __bfloat162float(__float2bfloat16(vt));
+    }
   }
-  for (int cell = threadIdx.x; cell < chunk_size * head_k_dim; cell += blockDim.x) {
-    const int i = cell / head_k_dim;
-    const int j = cell - i * head_k_dim;
-    float kcd = 0.0f;
-    for (int m = 0; m < chunk_size; ++m) {
-      kcd += a[a_base + i * chunk_size + m] * kb_tile[m * head_k_dim + j];
+  if (k_cells % k_span == 0 && blockDim.x % head_k_dim == 0) {
+    const int row_step = static_cast<int>(blockDim.x) / head_k_dim;
+    for (int base = threadIdx.x; base < k_cells; base += k_span) {
+      const int row0 = base / head_k_dim;
+      const int j = base - row0 * head_k_dim;
+      float kcd[GEMM_TILE];
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) kcd[s] = 0.0f;
+      for (int m = 0; m < chunk_size; ++m) {
+        const float kv = kb_tile[m * head_k_dim + j];
+        #pragma unroll
+        for (int s = 0; s < GEMM_TILE; ++s) {
+          const int i = row0 + s * row_step;
+          kcd[s] += a[a_base + i * chunk_size + m] * kv;
+        }
+      }
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) {
+        kcd_out[kcd_base + base + s * static_cast<int>(blockDim.x)] =
+            __bfloat162float(__float2bfloat16(kcd[s]));
+      }
     }
-    kcd_out[kcd_base + cell] = __bfloat162float(__float2bfloat16(kcd));
+  } else {
+    for (int cell = threadIdx.x; cell < k_cells; cell += blockDim.x) {
+      const int i = cell / head_k_dim;
+      const int j = cell - i * head_k_dim;
+      float kcd = 0.0f;
+      for (int m = 0; m < chunk_size; ++m) {
+        kcd += a[a_base + i * chunk_size + m] * kb_tile[m * head_k_dim + j];
+      }
+      kcd_out[kcd_base + cell] = __bfloat162float(__float2bfloat16(kcd));
+    }
   }
 }
 

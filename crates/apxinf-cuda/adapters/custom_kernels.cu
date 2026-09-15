@@ -1042,6 +1042,54 @@ extern "C" cudaError_t apxinf_static_gdn_tri_solve_f32(
   return cudaGetLastError();
 }
 
+
+// Tile width for the chunk-gemm kernel; APXINF_GDN_CHUNK_GEMM_TILE re-sweeps it.
+static int chunk_gemm_tile() {
+  static const int tile = [] {
+    if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_TILE")) {
+      const int requested = std::atoi(v);
+      if (requested == 1 || requested == 2 || requested == 4 ||
+          requested == 8 || requested == 16 || requested == 32) {
+        return requested;
+      }
+    }
+    return 16;
+  }();
+  return tile;
+}
+
+#define CHUNK_GEMM_ARGS                                                    \
+  chunks, num_v_heads, gemm_smem, stream, a, v, k, beta, g_cum, vt_out,    \
+      kcd_out, seq_pad, head_k_dim, head_v_dim, chunk_size
+
+template <int TILE>
+static cudaError_t launch_chunk_gemm(
+    int chunks, int num_v_heads, size_t gemm_smem, cudaStream_t stream,
+    const void* a, const void* v, const void* k, const void* beta,
+    const void* g_cum, void* vt_out, void* kcd_out, int seq_pad,
+    int head_k_dim, int head_v_dim, int chunk_size) {
+  if (gemm_smem > 48u * 1024u) {
+    static bool gemm_opted_in = false;
+    if (!gemm_opted_in) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          reinterpret_cast<const void*>(gdn_chunk_gemm_kernel<TILE>),
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(gemm_smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      gemm_opted_in = true;
+    }
+  }
+  gdn_chunk_gemm_kernel<TILE><<<dim3(chunks, num_v_heads), 256, gemm_smem, stream>>>(
+      static_cast<const float*>(a), static_cast<const float*>(v),
+      static_cast<const float*>(k), static_cast<const float*>(beta),
+      static_cast<const float*>(g_cum),
+      static_cast<float*>(vt_out), static_cast<float*>(kcd_out),
+      seq_pad, head_k_dim, head_v_dim, chunk_size);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
     const void* a, const void* v, const void* k, const void* beta,
     const void* g_cum, void* vt_out, void* kcd_out,
@@ -1057,26 +1105,14 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   // vb and kb tiles, precomputed once per chunk (see the kernel comment).
   const size_t gemm_smem =
       static_cast<size_t>(chunk_size) * (head_v_dim + head_k_dim) * sizeof(float);
-  if (gemm_smem > 48u * 1024u) {
-    static bool gemm_opted_in = false;
-    if (!gemm_opted_in) {
-      const cudaError_t attr = cudaFuncSetAttribute(
-          reinterpret_cast<const void*>(gdn_chunk_gemm_kernel),
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          static_cast<int>(gemm_smem));
-      if (attr != cudaSuccess) {
-        return attr;
-      }
-      gemm_opted_in = true;
-    }
+  switch (chunk_gemm_tile()) {
+    case 1: return launch_chunk_gemm<1>(CHUNK_GEMM_ARGS);
+    case 2: return launch_chunk_gemm<2>(CHUNK_GEMM_ARGS);
+    case 4: return launch_chunk_gemm<4>(CHUNK_GEMM_ARGS);
+    case 8: return launch_chunk_gemm<8>(CHUNK_GEMM_ARGS);
+    case 32: return launch_chunk_gemm<32>(CHUNK_GEMM_ARGS);
+    default: return launch_chunk_gemm<16>(CHUNK_GEMM_ARGS);
   }
-  gdn_chunk_gemm_kernel<<<dim3(chunks, num_v_heads), 256, gemm_smem, stream>>>(
-      static_cast<const float*>(a), static_cast<const float*>(v),
-      static_cast<const float*>(k), static_cast<const float*>(beta),
-      static_cast<const float*>(g_cum),
-      static_cast<float*>(vt_out), static_cast<float*>(kcd_out),
-      seq_pad, head_k_dim, head_v_dim, chunk_size);
-  return cudaGetLastError();
 }
 
 

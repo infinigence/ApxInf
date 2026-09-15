@@ -232,10 +232,26 @@ fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<Devic
 }
 
 /// Apply a BF16 linear weight in its original checkpoint [out,in] layout.
+/// Whether the projection GEMMs go through the tuned path.
+///
+/// `write_ex` is a raw cuBLAS call: no tactic lookup, no cuBLASLt plan, and
+/// invisible to autotune. Every projection except gate_up takes it, which is
+/// why an autotune pass over this model writes exactly one record and why the
+/// store holds only n=18432. Routing them through `gemm::bf16` makes them
+/// tunable -- but it also lets a different kernel be chosen, so it changes the
+/// BF16 reduction order and is not bit-exact. Opt-in until that is measured.
+fn tuned_projection() -> bool {
+    static TUNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TUNED.get_or_init(|| std::env::var_os("APXINF_QWEN_LINEAR_TUNED").is_some())
+}
+
 fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let x=input.shape().dims();let w=weight.shape().dims();
     if x.len()!=2 || w.len()!=2 || x[1]!=w[1] || input.dtype()!=DType::BF16 || weight.dtype()!=DType::BF16 {
         return Err(Error::Other("qwen_drive: checkpoint linear shape/dtype mismatch".into()));
+    }
+    if tuned_projection() {
+        return gemm::bf16(ctx, input, weight);
     }
     let stride=i32::try_from(x[1]).map_err(|_|Error::Other("linear input stride overflow".into()))?;
     let columns=i32::try_from(w[0]).map_err(|_|Error::Other("linear output stride overflow".into()))?;
