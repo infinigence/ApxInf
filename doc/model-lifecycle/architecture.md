@@ -1,7 +1,7 @@
 # Model architecture: current implementation and refactor specification
 
 Status: agreed design direction; target interfaces are proposals except in the
-explicitly marked implemented-slice sections. Reviewed source baseline: upstream/main
+explicitly marked implemented PI0.5 section. Reviewed source baseline: upstream/main
 `7baa69b281ef862e6afa32c476c58143d3964241` (GR00T N1.7 merged).
 This document supersedes the earlier GR00T PR snapshot in this directory.
 Stage 1 has since merged upstream/main `ee42185` (documentation-only changes
@@ -12,7 +12,7 @@ Read [lifecycle contracts](lifecycle.md) and the [staged rollout](migration.md).
 The existing [model-layer reference](../model-layer-architecture.md) describes
 implementation guidance until individual migrations update it.
 
-## Current logical view
+## Baseline logical view (selected main)
 
 ```mermaid
 flowchart TB
@@ -208,46 +208,94 @@ More files or renamed executors do not prove improvement. Each migration must
 show that these changes have predictable owners and that hidden invariants have
 become explicit contracts. See migration.md for evidence and documentation gates.
 
-## Implemented migration slices (not complete target architecture)
+## Implemented PI0.5 pilot (Stage 2)
 
-PI0.5 slice A candidate moves BF16 computation to `pi05/network.rs`:
-
-```mermaid
-flowchart LR
-    V[VlaRuntime: existing public contract] --> R[BF16 runtime: resources and capture]
-    R -->|eager or capture traversal| N[Pi05Bf16Network: fixed assets and computation]
-    N --> B[Existing bf16_executor: Block computations]
-    R --> G[Captured graph: retains Network and workspace]
-    B --> K[Unchanged safe kernels]
-    G -->|replay| K
-```
-
-Public runtime methods remain compatibility delegations for benchmark and other
-existing callers. Prefix cache types retain their previous re-export path.
-FP8/W8A8 and public preparation guarantees are unchanged in this slice. The
-Network currently holds BF16 math; generalizing precision and reorganizing
-semantic Blocks remain explicit later work, not claimed by this extraction.
-
-
-### Slice B: concrete Session ownership
+This view describes the refactor branch, not unmigrated model families.
 
 ```mermaid
 flowchart TB
-    U[LoadedModel Rust facade] --> I[VLA explicit preparation interface]
-    I --> S[pi05/session.rs: Pi05Session]
-    S --> L[Load precision weights and time embeddings]
-    S --> C[One implicit plan cache]
-    S --> P[Pi05PreparedInference: mode, fallback, generation, inputs and RNG binding]
-    P --> R[Precision runtime: graph and workspace]
-    R --> N[BF16 Network: computation and fixed weights]
-    N --> B[Existing Blocks / executors]
-    P --> T[Backend: scoped autotune suppression]
+    U[Python Policy: encode / decode context] --> A[LoadedModel / VlaRuntime]
+    A --> S[Pi05Session: load selection, compatibility, preparation, implicit cache]
+    S --> P[PreparedInference: policy result, tactic identity, inputs and RNG]
+    P --> R[Precision runtime adapters: binding, workspace, graph ownership]
+    R --> N[One Pi05Network of B: vision → prefix/KV → flow schedule]
+    N --> B[Blocks: BF16 / FP8 / W8A8 backbones, layers, fixed weights]
+    B --> K[Safe CUDA kernels]
+    R --> G[CapturedGraph: graph + Network + workspace + input/output buffers]
+    G --> K
+    R --> C[CUDA backend: scoped capture cleanup]
 ```
 
-`pi05/vla_runtime.rs` becomes `pi05/session.rs`; `Pi05VlaRuntime` remains a public
-alias for `Pi05Session`. This is a file replacement, not a new parallel hierarchy.
-`vla/mod.rs` owns the small cross-family interface vocabulary; families opt in
-explicitly. `auto.rs` forwards it through LoadedModel. Backend tuning owns the
-thread-local suppression mechanism; neither Network nor Blocks know about
-preparation policy. The Session still contains loading dispatch; separating
-construction and completing FP8/W8A8 Network extraction remain later slices.
+Network owns the complete model order and flow step count/dt. Blocks own major
+vision, prefix and action computations, including backbone layer loops, fusion,
+physical weights and precision-specific intermediate types. They do not decide
+preparation policy or hold request caches. `Pi05Network<B>` is statically
+dispatched: the three type aliases instantiate one source body; there is no
+runtime dtype switch in Network or per-layer virtual dispatch.
+
+```text
+pi05/
+  session.rs             construction selection, prepare/run policy, cached plan
+  network.rs             shared model schedule and diagnostic traversal
+  blocks/
+    mod.rs               internal Blocks contract, associated Prefix and Styles
+    bf16.rs              BF16 backbones and existing layer functions
+    fp8.rs               FP8 backbones and existing layer functions
+    w8a8.rs               W8A8 backbones and existing layer functions
+  bf16_runtime.rs        BF16 binding / capture resource adapter, compatibility API
+  runtime.rs             FP8 binding / capture resource adapter, compatibility API
+  int8_runtime.rs        W8A8 binding / capture resource adapter, compatibility API
+  static_weights.rs      existing weight materialization and activation scales
+```
+
+This is three executor file moves plus one small Blocks interface, not three
+parallel Network trees. The per-precision Block files group existing functions
+to keep this pilot reviewable; splitting each into vision/language/action files
+is optional when independent changes justify it. Broad weight consolidation is
+Stage 5. Existing weight files/types remain because packing and calibration are
+outside this structural migration. Activation scales belong to fixed assets;
+the previous public import through runtime remains a re-export.
+
+The runtime filenames remain compatibility boundaries for existing benchmark
+and library users. Their remaining duplication is input materialization and
+capture resource management, not model mathematics. Stage 3 tests which resource
+mechanisms WallOSS actually shares before extracting another common framework.
+A universal Network factory or a new public Blocks API is not required.
+
+### Internal interfaces and change ownership
+
+```rust
+// Abbreviated signatures; the callable implementation lives in blocks/mod.rs.
+trait Blocks {
+    type Prefix;   // precision-specific KV representation
+    type Styles;   // fixed per-step modulation tensors
+    fn vision(patches, native_representation) -> Tensor;
+    fn embed_prefix(vision, token_ids, token_count) -> Tensor;
+    fn prefix(embeddings) -> Self::Prefix;
+    fn prepare_styles(time_embeddings) -> Vec<Self::Styles>;
+    fn eager_styles(time_embeddings) -> Option<Vec<Self::Styles>>;
+    fn step(state, time_embedding, prefix, dt) -> Tensor;
+    fn step_with_styles(state, styles, prefix, dt) -> Tensor;
+}
+fn network_infer(input, noise, time_embeddings) {
+    styles = blocks.eager_styles(time_embeddings);
+    vision = blocks.vision(input.patches, input.is_native);
+    prefix = blocks.prefix(blocks.embed_prefix(vision, input.ids, input.count));
+    for index in 0..config.num_flow_steps {
+        noise = match styles {
+            Some(styles) => blocks.step_with_styles(noise, styles[index], prefix, dt),
+            None => blocks.step(noise, time_embeddings[index], prefix, dt),
+        };
+    }
+    return noise;
+}
+```
+
+`Prefix` and `Styles` keep physical representations behind the Block boundary.
+The native-input flag is an internal materialization contract: callers already
+validate and construct the expected representation. It does not select dtype.
+BF16/W8A8 eager styles remain precomputed before vision; FP8 eager styles remain
+computed per flow step after prefix. Capture prepares fixed styles beforehand.
+Preserving this order avoids mixing algorithm/rounding changes into migration.
+A fusion or backbone implementation change stays in its Block; changing how
+vision conditions language/action or the flow schedule belongs in Network.

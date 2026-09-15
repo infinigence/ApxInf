@@ -236,10 +236,10 @@ and output lifetime as applicable. Measure cold preparation, steady-state latenc
 LLM TTFT/TPOT, and device memory separately. A documentation or CPU check does not
 qualify native GPU execution; unsupported or untested matrix cells remain explicit.
 
-## Implemented PI0.5 preparation contract (Stage 2 slice B)
+## Implemented PI0.5 preparation contract
 
-These Rust interfaces are implemented on the refactor branch. They are not yet a
-claim of full Stage 2 qualification; see the [migration tracker](migration.md).
+These Rust interfaces are implemented on the refactor branch. Hardware evidence
+and model coverage are recorded in the [migration tracker](migration.md).
 PI0.5 supports them for all three RuntimeVariant choices. Other VLA families
 retain their existing prepare path and return an unsupported error for the new
 policy methods; their default status is RuntimeManaged, never a fabricated Ready.
@@ -310,16 +310,67 @@ match plan.status() {
 | Eager preparation | No graph attempt; native eager allocations may still occur during run |
 | PreferGraph | Capture attempted during preparation; failure reason retained in Ready(Eager) |
 | RequireGraph | Capture error propagates; no eager plan returned |
-| Ready | Fixed spec and current tuning generation; not readiness for all shapes or models |
-| Tactic generation changes | Graph and eager plans report Invalidated; run rejects them |
+| Ready | Fixed spec and current tuning store identity/generation; not readiness for all shapes or models |
+| Tactic store replacement or generation changes | Graph and eager plans report Invalidated; run rejects them |
 | Invalid input | Run returns an error without automatic plan eviction or recapture |
 | execution_mode on Session | Reports the implicit cache only; use plan.status() for explicitly owned plans |
-| clear_prepared | Synchronizes and evicts the session's implicit cache; explicit plans remain owned by caller |
+| clear_prepared | Synchronizes and evicts the session's implicit cache; caller-owned plans and output allocation views remain alive |
 | Request reset | PI0.5 binds every input and full RNG key per call; no implicit episode counter to reset |
 | Output | Device tensor; captured result aliases reusable output storage until next run; Tensor clone is not a value snapshot |
 | Concurrency | Fixed-buffer plans run serially; thread-local tuning suppression does not add thread safety |
 
-This slice does not promise allocation-free eager execution, cancellation, a
-full resource budget, or precision-neutral Network construction. Processor
+The pilot does not promise allocation-free eager execution or cancellation, and
+resource measurements apply only to the tested profiles. Processor
 encode/decode context stays in the existing Python Policy helpers. Broader
 lifecycle guarantees above remain targets until separately implemented and tested.
+
+
+### Stage 2 resource preparation and invalidation details
+
+```mermaid
+sequenceDiagram
+    participant S as Session
+    participant R as Precision resource adapter
+    participant N as Shared Network / Blocks
+    participant C as CUDA backend
+    S->>R: prepare captured region (autotuning suppressed)
+    R->>N: prepare fixed per-step styles
+    R->>R: allocate GraphWorkspace and stable inputs
+    R->>N: warm traversal with workspace; synchronize
+    R->>C: capture_graph(closure)
+    C->>C: begin capture
+    C->>N: traverse same Network with workspace
+    alt successful capture
+        C->>C: end capture and instantiate executable graph
+        C-->>R: graph handle and output
+        R-->>S: retain graph + workspace + Network + inputs/styles/output
+    else closure error or unwind
+        C->>C: end capture, discard graph, clear known capture error
+        C-->>S: original error / unwind
+    end
+```
+
+Graph handles are in-process objects, not serialized cache files. The captured
+resource owner retains Network and therefore every referenced fixed weight,
+plus workspace, style tensors, input buffers and reusable output. Request data
+is rebound before replay. Dropping the Session does not invalidate a separately
+owned prepared plan. Retained plans may therefore keep considerable GPU memory
+alive; explicit cache eviction releases only the Session's implicit plan.
+A captured output Tensor also owns a view of the arena allocation. Keeping that
+Tensor can retain the entire arena after the plan is dropped. Consume/copy the
+value and release old output handles as well as plans when measuring memory
+reclamation. Cloning the Tensor preserves ownership and aliasing; it does not
+create a compact independent output allocation.
+
+A plan records both the tuning store `Arc` identity and its generation. Replacing
+the store with another generation-zero store invalidates old plans just as a
+record update does. Compatible prepared execution suppresses tuning; it never
+refreshes that identity or quietly captures a replacement. Callers prepare a new
+plan after invalidation.
+
+The CUDA scope discards failed captures without instantiating them. Ending an
+invalidated capture releases the stream, but CUDA's last-error slot still needs
+handling before a later kernel launch check. Cleanup consumes only the known
+capture Unsupported/Invalidated errors (900/901); unrelated device errors remain
+visible. No device reset is attempted. See NVIDIA's [stream capture API](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html)
+and [last-error semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__ERROR.html).

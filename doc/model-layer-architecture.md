@@ -214,13 +214,14 @@ cannot determine why an existing family was modified. The
 `apxinf-model` integration test runs the same check during the normal Rust test
 suite.
 
-## In-progress PI0.5 migration
+## PI0.5 migration pilot
 
-The refactor branch's first slice separates BF16 tensor computation into
-`pi05/network.rs` while `bf16_runtime.rs` retains capture and resource ownership.
-Existing public runtime methods delegate for compatibility. Slice B replaces
-`pi05/vla_runtime.rs` with `pi05/session.rs`, preserving the old type alias and
-adding explicit execution policy, readiness, and plan eviction. FP8/W8A8 math is
-unchanged; the new Session policy applies to all three precision variants. See the [migration tracker](model-lifecycle/migration.md)
-for completed evidence versus remaining work; the target diagrams are not a claim
-that all models have already migrated.
+PI0.5 now uses one statically dispatched `network.rs` for BF16/FP8/W8A8.
+`blocks/{bf16,fp8,w8a8}.rs` owns backbones, layers and fixed precision assets;
+`session.rs` owns explicit preparation, readiness, compatibility and cache policy.
+The existing precision runtime files own binding/capture resources and preserve
+public compatibility methods. Python Policy retains encode/decode context.
+See the [implemented component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
+[callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
+WallOSS and GR00T retain their previous implementations pending their own stages.

@@ -1,10 +1,10 @@
-# Stage 1: baseline protocol and current coverage
+# Baseline protocol and qualification record
 
-Status: source inventory and local checks complete; PI0.5 slices A/B pass the
-recorded Thor numerical and Session checks. Full matrix and performance
-qualification remain pending.
-This is the maintained baseline protocol for the refactor, not a new performance
-result. Generated logs, manifests, hashes and probes live in the active worktree's
+Status: PI0.5 Stage 2 primary Thor qualification is complete: lifecycle, public
+entry points, fixed-input parity and performance/resource comparisons passed.
+Supplementary Orin matrix validation is in progress.
+The selected-main inventory and historical slices are retained below; the final
+PI0.5 qualification section is the current candidate record. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
 
 ## Revisions and scope
@@ -19,7 +19,7 @@ ignored `devlocal/model-lifecycle-refactor/` directory.
   selected for parallel validation: NVIDIA Thor, driver 580.00, CUDA 13.0.48.
   Host and asset paths remain in the private Thor manifest.
 
-## Current interface inventory
+## Baseline interface inventory
 
 | Family | Input and entry | Preparation and retained state | Output / reset |
 | --- | --- | --- | --- |
@@ -311,3 +311,156 @@ Private evidence lives under
 policy smoke from the strengthened populated-cache/raw-RGB smoke. Shared-host
 latencies remain descriptive; complete performance/peak-memory and Orin gates
 remain open. Stage 2 computation/Blocks work is tracked in migration.md.
+
+
+## Stage 2 final PI0.5 qualification
+
+Candidate source `7937440`, immutable baseline `c5268b7`; selected upstream source
+`ee42185f9b851c7f20b221973c95019a2e4fcacb` already includes GR00T. This record
+supersedes the slice-specific PI0.5 pending items above; it does not qualify
+unmodified WallOSS/GR00T or the entire Stage 1 matrix.
+
+### Native lifecycle and public entry points
+
+Thor passed the two shared Network order tests, CUDA error/unwind capture cleanup,
+three Session policy/cache tests, tuning suppression, and the explicitly enabled
+real-checkpoint preparation-failure/store-invalidation test. Capture recovery was
+verified by executing the model after the failure and then successfully capturing
+again. Plans retained fixed assets after Session was dropped. Replacing a tuning
+store with another store at the same generation invalidated both eager and graph
+plans. Repeated prepared eager execution in AutoTune mode did not change tactics.
+
+An initial native failure showed CUDA error 901 leaking from canceled capture to
+the next eager kernel check. The failure log is retained; the repaired scope ends
+and discards capture and clears the known capture last-error state. The enhanced
+unit test now checks that slot directly as well as replaying a valid graph.
+
+All three final public smoke runs passed on H50/T21 with two views:
+
+| Precision | Eager/graph max_abs | Raw RGB eager/graph max_abs | Device/CPU RNG max_abs | Cache eviction and retained plan |
+| --- | --- | --- | --- | --- |
+| BF16 | 0 | 0 | 0 | Passed |
+| Static FP8 | 0 | 0 | 0 | Passed |
+| W8A8, Thor vendor path | 0 | 0 | 0 | Passed |
+
+These smoke inputs are diagnostic; fixed real-image comparisons are recorded
+separately. Local checks: 107 Rust CPU tests, CUDA-feature examples/tests
+typecheck, family boundary check and formatting passed. Python suite: 182 passed,
+6 skipped, 5 subtests passed; the local skips require a native binding/checkpoint
+or tokenizer and are not counted as GPU evidence. After whitespace/path
+normalization, 34 moved Block method bodies match their pre-move implementations.
+
+Thor reuses all 23 existing operator objects; no CUDA translation unit was
+compiled for this final candidate. Archive SHA256 remains
+`700eaa20456bb9bba2e5a729689c1003b4a45f30ca62c18692136ab7a8d20ec2`,
+with kernel build ID `kb1-ebd6446d93b8fc684531cb9c73f56b9e`.
+Source manifests, native logs, public smoke summary and retained initial failure
+live in `devlocal/model-lifecycle-refactor/thor-baseline/session-c/`.
+
+
+### Final exact-input comparison
+
+All seven candidate runs passed against the pinned baseline. Baseline/candidate
+comparison and each source's eager/graph comparison are elementwise identical:
+
+| Precision | Views | Horizon | Tokens | Cases | max_abs / relative L2 |
+| --- | --- | --- | --- | --- | --- |
+| BF16 | 2 | 10, 50 | 10, 21 | 4 | 0 / 0 |
+| Static FP8 | 2 | 50 | 10, 21 | 2 | 0 / 0 |
+| W8A8 (Thor) | 2 | 10 | 21 | 1 | 0 / 0 |
+
+The pinned checkpoint, calibration and fixture derivations above are unchanged.
+H50 uses independently seeded noise of the correct shape, not a reshaped H10
+golden output. Full arrays, hashes and comparisons are retained under
+`thor-baseline/session-c/results/`, especially `numerical-summary.json`.
+These are structural parity results against ApxInf's baseline; they are not a new
+model-quality calibration or a closed-loop policy success-rate evaluation.
+
+
+### Orin W8A8 compatibility finding
+
+The unmodified baseline and candidate both failed before graph capture at the
+patch projection (M=512, N=1152, K=588). This was not an incompatible tactic DB:
+the default W8A8 entry selected CUTLASS on SM87 before checking K/N alignment,
+so provider validation failed before the existing vendor fallback could run.
+The quantized-activation entry already checked those alignment conditions.
+
+A separate host-side dispatch correction applies the same K%16/N%8 eligibility
+to the ordinary W8A8 entry. It changes neither CUDA translation units nor tactic
+assets/acceptance thresholds. Native regression tests use the public resolver
+with unaligned K and N and independently known integer-dot outputs; the older
+forced-preference tests bypassed the failing resolver path.
+
+Orin W8A8 structural comparison uses **c5268b7 plus this identical dispatch fix**
+as its baseline, not a claim that unmodified c5268b7 can execute that profile.
+The original failure is retained as
+`thor-baseline/session-c/logs/orin-w8a8-baseline-reproduction.log`.
+
+
+### Thor performance matrix
+
+All eight H10 / 10-flow-step profiles completed with 10 warmup replays and 30
+measured samples per boundary. Baseline/candidate processes were interleaved by
+profile. Graph time includes launch plus synchronization; input-plus-graph also
+includes already resized RGB/tokens/noise updates and device preprocessing. It
+excludes Python decode/resize and checkpoint loading. Three views use base/wrist/
+wrist fixture derivation, not a new real camera. Candidate: `7937440`.
+
+| Precision | Views | T | Baseline graph P50 (ms) | Candidate graph P50 (ms) | Graph delta | Input + graph delta |
+| --- | --- | --- | --- | --- | --- | --- |
+| BF16 | 2 | 10 | 71.944 | 71.991 | +0.07% | +0.05% |
+| BF16 | 2 | 21 | 78.990 | 79.048 | +0.07% | +0.25% |
+| BF16 | 3 | 10 | 89.595 | 89.035 | -0.63% | +0.10% |
+| BF16 | 3 | 21 | 92.632 | 92.928 | +0.32% | +0.37% |
+| FP8 | 2 | 10 | 41.411 | 41.281 | -0.31% | +0.22% |
+| FP8 | 2 | 21 | 42.118 | 42.054 | -0.15% | -0.12% |
+| FP8 | 3 | 10 | 53.556 | 53.494 | -0.11% | +0.16% |
+| FP8 | 3 | 21 | 55.004 | 54.687 | -0.58% | -0.27% |
+
+All eight profiles also have exact baseline/candidate outputs and identical
+workspace reserved/used bytes. Graph P50 deltas span -0.63% to +0.32%; graph P95
+-1.17% to +0.84%. Input-plus-graph P50 spans -0.27% to +0.37%, P95 -0.19% to
++0.39%. These paired observations show no material regression in this run; they
+are not an approved deployment percentage budget or a claimed speedup.
+
+The host retained four other resident GPU services. Load/power/temperature and
+sampled per-process memory are retained alongside each command. This task's
+compilation was paused during timing, and other services were not modified.
+Observed idle conditions do not guarantee exclusive ownership of a shared GPU.
+Workspace counters are exact arena counters, not total or allocator-peak memory;
+external sampling can miss brief peaks. Full distributions and raw samples live
+under `thor-baseline/session-c/performance/`.
+
+The final `7aece37` adds only W8A8 default-dispatch eligibility and its test to
+`7937440`; BF16/FP8 execution is unchanged. Their above results remain tied to the
+actual tested source rather than being relabeled as a different binary.
+
+
+### First preparation, resource retention and Python Policy
+
+A private identical-source probe uses the legacy public `model.prepare(spec)`
+interface on both revisions: fresh process, load, synchronize, first prepare(T10),
+first execution, then prepare(T21). One mode drops the first plan; the other keeps
+it. Both drop the first Action before that branch so output ownership does not
+confound the comparison. Source: baseline `c5268b7`, candidate `7937440`.
+
+| Scenario | First prepare, baseline → candidate (ms) | Next prepare T21 (ms) | Sampled process GPU peak, baseline → candidate (MiB) |
+| --- | --- | --- | --- |
+| Drop first plan | 220.9 → 226.5 | 201.1 → 206.8 | 15696 → 15728 |
+| Retain first plan | 222.1 → 222.2 | 190.4 → 191.0 | 19700 → 19656 |
+
+Outputs are identical. These are single observations per scenario, with a warm
+filesystem cache; they do not establish a cold-start latency distribution.
+Process peaks use 200 ms sampling. Phase `cudaMemGetInfo` values are device-global
+and include unrelated processes/system effects on this integrated GPU. Neither
+is an allocator live/reserved peak trace. Exact graph arena counters and ownership
+checks provide complementary evidence; no new absolute memory SLO is asserted.
+
+On Thor, six tokenizer tests plus the real-checkpoint AutoPolicy layering test
+passed: **7 passed, 0 skipped**. The latter checks RGB-to-normalized actions,
+output unnormalization and `calibrate_observation`, using the actual candidate
+native binding (`7937440`). The JUnit skip count was checked explicitly because
+that test otherwise permits an environment/load failure to become a skip.
+The final `7aece37` W8A8 native alignment regression and public smoke also passed
+on Thor. Probe sources/manifests, phase values, logs and JUnit live in
+`thor-baseline/session-c/extra/`; W8A8 follow-up evidence is recorded separately.

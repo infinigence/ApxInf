@@ -99,12 +99,18 @@ between graph segments are forbidden.
 7. Integrate through the appropriate maintained contract: `LlmTrait` for
    LLM/VLM or `VlaRuntime` plus the Python policy layer for VLA. When changing
    preparation, graph ownership or execution policy, read the
-   [callable PI0.5 lifecycle contract](../../doc/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract-stage-2-slice-b)
+   [callable PI0.5 lifecycle contract](../../doc/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
    and [migration tracker](../../doc/model-lifecycle/migration.md). Record which
    guarantees the family implements. New policy methods default to unsupported;
    legacy prepare success is not proof of graph readiness. For an opted-in
    family, verify explicit mode/fallback, stale-plan rejection, no capture or
    autotuning during compatible prepared run, and output-buffer lifetime.
+   For Network/Block or precision changes, read the
+   [PI0.5 component boundary](../../doc/model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2).
+   Keep model order in one Network and physical representation/fusion in Blocks;
+   preserve existing operation order during structural moves. Verify capture
+   recovery with a subsequent native run, and invalidate plans on tuning-store
+   replacement as well as generation change.
    Completion: interfaces, family support and corresponding native evidence
    agree in the same change.
 8. Verify operators, transformations, intermediate checkpoints, eager and

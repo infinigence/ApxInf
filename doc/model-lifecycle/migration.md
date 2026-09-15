@@ -1,6 +1,7 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Status: staged implementation in progress. No implementation stage is complete.
+Status: PI0.5 Stage 2 implementation and primary Thor qualification are complete;
+supplementary Orin matrix validation is in progress. Later model stages remain open.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -49,8 +50,10 @@ Deliverables:
 Stage 2 may proceed in an isolated candidate while Stage 1 runs on Thor, as
 requested. Keep baseline source and artifacts immutable; compare the candidate
 against that baseline before accepting the slice. Prefer verified existing
-operator libraries; compiling Rust model code does not authorize a CUDA operator
-rebuild. Concurrent GPU loads invalidate formal latency comparisons.
+operator libraries and verify source/flag/architecture identity before reuse.
+If an object is missing or incompatible, record the exact gap and rebuild only
+what is necessary; do not trigger a blanket operator rebuild with Rust changes.
+Concurrent GPU loads invalidate formal latency comparisons.
 
 Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
@@ -117,7 +120,7 @@ plans for both eager and graph. Real-input tuning stays in preparation or the
 legacy infer cache-miss path. Old implicit plans are released before replacement
 tuning allocations. Explicitly held plans are not silently destroyed.
 
-See [the callable lifecycle contract](lifecycle.md#implemented-pi05-preparation-contract-stage-2-slice-b)
+See [the callable lifecycle contract](lifecycle.md#implemented-pi05-preparation-contract)
 for output aliasing and remaining limitations. Host-side tuning suppression is
 scoped and unwind-safe; operator sources and build flags are unchanged.
 
@@ -131,21 +134,49 @@ was compiled. See [slice B evidence](baseline.md#thor-session-slice-b-evidence-2
 Orin, full online tuning/invalidation, forced native capture-failure cleanup,
 resource/performance gates and remaining computation/Blocks work stay open.
 
+### Stage 2 slice C: shared Network and native lifecycle recovery
+
+Candidate `7937440` completes the PI0.5 computation split for BF16, static FP8
+and W8A8. One statically dispatched Network owns the model schedule. Blocks own
+precision backbones/layers and fixed weights; resource adapters retain workspace,
+bindings and graph lifetime. Existing public methods and prefix cache exports
+remain compatible. Activation scales move to fixed assets with a compatibility
+re-export. Broad weight consolidation remains Stage 5.
+
+Prepared plans now bind tuning-store identity as well as generation. The CUDA
+backend provides one capture scope for PI0.5's three adapters; errors/unwind end
+capture without instantiating a discarded graph. Native testing caught a stale
+CUDA last-error slot after invalidated capture; cleanup now consumes known
+capture errors so a later eager kernel check does not inherit them.
+
+Thor native tests pass: two Network schedule tests, the strengthened error/unwind
+capture test, three Session policy/cache tests, the tuning guard test, and the
+explicitly enabled real-checkpoint failure/invalidation test. The latter covers
+RequireGraph failure, PreferGraph eager recovery, replacement of a tactic store
+at the same generation, suppressed tuning during repeated prepared execution,
+re-capture and separately owned plan execution after dropping Session.
+Local checks pass: 107 Rust CPU tests, CUDA-feature examples/tests typecheck,
+family boundaries, formatting, and 182 Python tests (6 skips, 5 subtests).
+
 ### Stage 2 exit checklist
 
-| Requirement | Status after slices A/B |
+| Requirement | Current result |
 | --- | --- |
-| BF16 computation separated from capture/cache | Implemented; slice A native parity passed |
-| Explicit preparation policy and actual readiness | Implemented for PI0.5; BF16/FP8/W8A8 Thor public smoke passed |
-| No hidden capture/autotune in compatible prepared run | Implemented; real-sample tuning is a separate preparation path |
-| Request input/RNG rebinding versus plan eviction | Explicit; retained plans survive implicit-cache eviction |
-| FP8/W8A8 computation separated from resource owners | Pending; Session dispatch is unified but their computation still resides in precision runtimes |
-| Network/semantic Blocks organization | BF16 extraction only; remaining topology cleanup pending |
-| Native failure cleanup and invalidation lifecycle coverage | Policy failure selection tested; forced native failure and full stale-plan lifecycle evidence pending |
-| Resource/performance and requested target matrix | Shared Thor evidence only; Orin and uncontended budgets pending |
+| All three precision computations separated from capture/cache | Implemented in shared Network and precision Blocks |
+| Explicit preparation policy and actual readiness | Implemented; final three-precision Thor public smoke passed |
+| No hidden capture/autotune in compatible prepared run | Native suppression and store invalidation tests passed |
+| Request input/RNG rebinding versus plan eviction | Passed final native retained-plan/cache and RNG checks |
+| Native failure cleanup and invalidation lifecycle coverage | Passed, including recovery through actual model execution |
+| Processor/action decoding context | Python regression suite and real-checkpoint AutoPolicy layering/tokenizer tests passed without native-test skips |
+| Exact-input and latency/resource comparison | All seven exact-input comparisons and eight Thor performance profiles passed; workspace unchanged |
+| Orin | BF16/W8A8 H50 public smoke passed; native alignment regression fixed; supplementary matrix in progress |
 
-Stage 2 remains in progress. Successful public preparation tests do not close
-remaining computation ownership or hardware qualification work.
+The user selected Thor as the primary Stage 2 acceptance target and Orin as the
+last supplementary target. Report same-profile baseline latency and resource
+deltas; no new percentage or absolute memory budget has been approved. A measured
+comparison must not be relabeled as an agreed deployment SLO. Baseline/candidate
+sources and asset identities remain pinned; known resident GPU services are
+recorded rather than stopped. Final evidence belongs in [baseline.md](baseline.md).
 
 ## Stage 3: WallOSS; extract proven common mechanisms
 
