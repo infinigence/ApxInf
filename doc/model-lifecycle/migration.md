@@ -49,7 +49,9 @@ Deliverables:
 Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
 access blocks GPU qualification, not documentation or local structural work.
-Current status: specifications refreshed; runtime baselines and budgets pending.
+Current status: source merge and inventory complete; local checks recorded in
+[Stage 1 baseline protocol](baseline.md). GPU runs, target assets and missing
+budgets remain pending. Stage 1 is not complete.
 
 ## Stage 2: PI0.5 vertical pilot
 
@@ -214,7 +216,7 @@ solely because the documentation or a CPU build passes.
 
 | Scope | Contract / resource migration | GPU parity and budgets | Documentation promotion |
 | --- | --- | --- | --- |
-| Baseline matrix | Pending | Pending | Specification refreshed |
+| Baseline matrix | Source merge and inventory complete | GPU pending; local checks recorded | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
 | PI0.5 | Pending | Pending | Target specified |
 | WallOSS | Pending | Pending | Target specified |

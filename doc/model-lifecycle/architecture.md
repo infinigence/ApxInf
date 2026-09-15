@@ -4,7 +4,8 @@ Status: agreed design direction from the architecture discussion; proposed inter
 not implemented APIs. Reviewed source baseline: upstream/main
 `7baa69b281ef862e6afa32c476c58143d3964241` (GR00T N1.7 merged).
 This document supersedes the earlier GR00T PR snapshot in this directory.
-The documentation worktree itself has not been rebased onto that baseline.
+Stage 1 has since merged upstream/main `ee42185` (documentation-only changes
+since the reviewed implementation); see [baseline protocol](baseline.md).
 No GPU correctness or performance results are claimed by this documentation change.
 
 Read [lifecycle contracts](lifecycle.md) and the [staged rollout](migration.md).
