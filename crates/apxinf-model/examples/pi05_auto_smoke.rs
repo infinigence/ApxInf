@@ -82,8 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fallback_reason: None,
         }
     );
-    // Cache eviction must not destroy a separately owned prepared plan.
+    // Populate the implicit cache so eviction exercises real resource release,
+    // while a separately owned explicit plan remains usable.
+    drop(model.infer(&request)?);
+    assert!(matches!(model.vla()?.execution_mode(), "graph" | "eager"));
     model.clear_prepared()?;
+    assert_eq!(model.vla()?.execution_mode(), "unprepared");
     let mut invalid = observation.clone();
     invalid.token_ids.push(0);
     assert!(prepared
