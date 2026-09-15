@@ -1,7 +1,7 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Status: PI0.5 Stage 2 implementation and primary Thor qualification are complete;
-supplementary Orin matrix validation is in progress. Later model stages remain open.
+Status: PI0.5 Stage 2 is complete, including primary Thor qualification and
+supplementary Orin validation. Later model stages remain open.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -59,8 +59,9 @@ Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
 access blocks GPU qualification, not documentation or local structural work.
 Current status: source merge and inventory complete; local checks recorded in
-[Stage 1 baseline protocol](baseline.md). Thor BF16 slice parity passes; remaining
-GPU matrix cells, target assets and missing budgets remain pending. Stage 1 is not complete.
+[Stage 1 baseline protocol](baseline.md). PI0.5 now passes the final Thor/Orin matrix and lifecycle
+qualification. Other families, their target assets and deployment budgets remain
+open in the broader Stage 1 inventory; this does not block the completed PI0.5 pilot.
 
 ## Stage 2: PI0.5 vertical pilot
 
@@ -86,6 +87,8 @@ Exit: a compatible run performs no hidden capture/tuning; changed compatibility
 enters explicit preparation; capture failure and cleanup obey policy. Exact-input
 results and public action decoding meet declared tolerances and resource/latency
 budgets. Network has no cache/serving logic; Session has no duplicate network body.
+
+The slice A/B records below are historical; the exit checklist records current completion.
 
 ### Stage 2 slice A: BF16 computation ownership
 
@@ -168,8 +171,8 @@ family boundaries, formatting, and 182 Python tests (6 skips, 5 subtests).
 | Request input/RNG rebinding versus plan eviction | Passed final native retained-plan/cache and RNG checks |
 | Native failure cleanup and invalidation lifecycle coverage | Passed, including recovery through actual model execution |
 | Processor/action decoding context | Python regression suite and real-checkpoint AutoPolicy layering/tokenizer tests passed without native-test skips |
-| Exact-input and latency/resource comparison | All seven exact-input comparisons and eight Thor performance profiles passed; workspace unchanged |
-| Orin | BF16/W8A8 H50 public smoke passed; native alignment regression fixed; supplementary matrix in progress |
+| Exact-input and latency/resource comparison | All seven Thor exact-input comparisons and sixteen Thor/Orin performance profiles passed; workspace unchanged; first-prepare and resource-retention comparison recorded |
+| Orin | BF16/W8A8 H50 public smoke and complete eight-profile matrix passed; native alignment regression fixed and tested on both devices |
 
 The user selected Thor as the primary Stage 2 acceptance target and Orin as the
 last supplementary target. Report same-profile baseline latency and resource
@@ -315,9 +318,9 @@ solely because the documentation or a CPU build passes.
 
 | Scope | Contract / resource migration | GPU parity and budgets | Documentation promotion |
 | --- | --- | --- | --- |
-| Baseline matrix | Source merge and inventory complete | Thor BF16 subset passed; remaining matrix pending | baseline.md added |
+| Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Slices A/B: BF16 Network and explicit Session policy | A/B: recorded Thor parity and Session tests passed; complete budgets/matrix pending | Callable interfaces and limits recorded |
+| PI0.5 | Stage 2 complete: shared Network, precision Blocks and explicit Session policy | Thor primary and Orin supplementary parity/lifecycle/performance checks passed | Final contracts, diagrams and evidence recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |

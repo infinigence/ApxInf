@@ -2,7 +2,7 @@
 
 Status: PI0.5 Stage 2 primary Thor qualification is complete: lifecycle, public
 entry points, fixed-input parity and performance/resource comparisons passed.
-Supplementary Orin matrix validation is in progress.
+Supplementary Orin qualification is also complete. PI0.5 Stage 2 is complete.
 The selected-main inventory and historical slices are retained below; the final
 PI0.5 qualification section is the current candidate record. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
@@ -44,9 +44,9 @@ and the corresponding Python policies. All paths are in the selected baseline.
 
 | Model / precision | Target and assets | Stage-1 status |
 | --- | --- | --- |
-| PI0.5 BF16 | Thor SM110 selected and checkpoint hash verified; Orin SM87 remains a later protocol target | Four two-view H10/H50 × T10/T21 parity cases passed; full matrix pending |
-| PI0.5 static FP8 | Thor SM110; checkpoint/calibration identity verified | Slice B public Session smoke and H50 T10/T21 parity passed; full matrix pending |
-| PI0.5 W8A8 | Orin SM87 deployment target; current per-channel weight/per-row activation quantization | Extra Thor vendor-path smoke/H10 T21 parity passed; Orin not run; preserve documented accuracy limitation |
+| PI0.5 BF16 | Thor SM110 and Orin SM87; checkpoint hash verified | Both devices: complete H10 views2/3 × T10/21 matrix; H50 public smoke; additional Thor H10/H50 fixed-input parity passed |
+| PI0.5 static FP8 | Thor SM110; checkpoint/calibration identity verified | Final public Session smoke, H50 T10/T21 parity and full Thor H10 views2/3 × T10/21 matrix passed |
+| PI0.5 W8A8 | Orin SM87 deployment target; current per-channel weight/per-row activation quantization | Thor vendor-path smoke/H10 T21 parity and full Orin matrix/public smoke passed; Orin comparison includes identical baseline dispatch fix; preserve documented accuracy limitation |
 | WallOSS BF16 | CUDA path implemented; actual device, checkpoint and raw fixture pending | GPU not run |
 | WallOSS dynamic FP8 | CUDA path implemented; validate target kernel support; static calibration rejected | GPU not run |
 | WallOSS W8A8 | Loader rejects this precision | Unsupported, not a pending test |
@@ -73,8 +73,8 @@ These are inherited from pi05_bench.rs, not newly selected tolerances:
 The example validates its zero-input reference schema separately; these gates
 do not certify a raw-observation fixture automatically. pi05_auto_smoke requires
 identical repeated outputs for an identical RNG key and cosine >= 0.9999 against
-its CPU-generated latent reference. It is a BF16 smoke path, not all-precision
-or trained-reference acceptance.
+its CPU-generated latent reference. The final smoke covers BF16, static FP8 and W8A8 on Thor, and BF16/W8A8
+on Orin. It is not trained-reference accuracy acceptance.
 
 For pure structural changes, compare the same dtype/checkpoint/input before and
 after, keeping quantization error versus a higher-precision model separate. Exact
@@ -237,7 +237,8 @@ Two points require explicit treatment in implementation reviews:
 - Both use kernel build ID `kb1-ebd6446d93b8fc684531cb9c73f56b9e` and archive SHA256
   `700eaa20456bb9bba2e5a729689c1003b4a45f30ca62c18692136ab7a8d20ec2`.
 - Other GPU workloads were observed; formal uncontended timing is not claimed.
-- Stage 1 completion: pending remaining matrix cells and acceptance inputs. Do not
+- Historical Stage 1 inventory status (superseded for PI0.5 by the final record):
+  pending remaining matrix cells and acceptance inputs. Do not
   mark the matrix qualified on source inspection. The user has authorized Stage 2
   candidate work in parallel with Stage 1 Thor validation; retain isolated baseline
   and candidate sources, and require GPU evidence before accepting a migration.
@@ -464,3 +465,54 @@ that test otherwise permits an environment/load failure to become a skip.
 The final `7aece37` W8A8 native alignment regression and public smoke also passed
 on Thor. Probe sources/manifests, phase values, logs and JUnit live in
 `thor-baseline/session-c/extra/`; W8A8 follow-up evidence is recorded separately.
+
+
+### Final Orin qualification
+
+Orin SM87 at the user-specified host completed all eight BF16/W8A8 H10
+profiles, with 10 flow steps, 10 warmups and 30 samples per boundary. Candidate
+source is `7aece37`; the matrix baseline is `c5268b7` plus the identical
+W8A8 alignment dispatch correction described above (BF16 is unaffected). The
+earlier standalone BF16 two-view/T21 fixture retains its original unchanged
+`c5268b7` versus `7937440` identity. Checkpoint, tokenizer and fixture hashes
+match the pinned assets. Three-view inputs use the same synthetic base/wrist/wrist
+derivation as Thor. BF16/W8A8 H50/T21 public smoke and the native W8A8 alignment
+regression also passed.
+
+| Precision | Views | T | Baseline graph P50 (ms) | Candidate graph P50 (ms) | Graph delta | Input + graph delta |
+| --- | --- | --- | --- | --- | --- | --- |
+| BF16 | 2 | 10 | 162.410 | 162.471 | +0.04% | +0.04% |
+| BF16 | 2 | 21 | 162.823 | 162.770 | -0.03% | -0.02% |
+| BF16 | 3 | 10 | 204.891 | 198.269 | -3.23% | -2.78% |
+| BF16 | 3 | 21 | 203.364 | 204.098 | +0.36% | +0.25% |
+| W8A8 | 2 | 10 | 122.413 | 121.748 | -0.54% | -0.55% |
+| W8A8 | 2 | 21 | 122.277 | 122.187 | -0.07% | -0.03% |
+| W8A8 | 3 | 10 | 161.533 | 161.531 | -0.00% | -0.01% |
+| W8A8 | 3 | 21 | 161.823 | 161.777 | -0.03% | -0.05% |
+
+All eight profiles have elementwise identical baseline/candidate and eager/graph
+outputs and equal workspace capacity/used bytes. Graph P50 changes span -3.23%
+to +0.36%, P95 -3.41% to +0.17%; input-plus-graph P50 -2.78% to +0.25%, P95
+-3.73% to +0.10%. The faster BF16 three-view/T10 observation is not attributed
+to the refactor. These measurements show no material regression in this run;
+shared-device observations do not establish a deployment SLO or a speedup.
+
+The initial continuous load monitor expired before three profiles finished.
+BF16 three-view/T10 and T21 and W8A8 two-view/T10 were repeated as paired
+baseline/candidate runs with per-process monitoring; the table uses those three
+reruns. Original samples are preserved, not silently mixed or discarded. Task
+monitors were stopped after completion, with no paused task build left behind.
+
+The existing Orin cache had no complete compatible archive. Source/include/build
+identity checks allowed reuse of nine objects, including heavy FA2 and CUTLASS
+objects; six changed adapter translation units were compiled once. The candidate
+reused all fifteen objects, and the dispatch fix required only a Rust rebuild.
+Final operator archive SHA256:
+`3a399c498fd488b0b7011e2c77ed1810f1abcdf936e6db3f5d08a7d25715de14`.
+
+Raw samples, command manifests, output arrays and monitoring logs are under
+`devlocal/model-lifecycle-refactor/thor-baseline/session-c/orin/`;
+`reports/final-performance-summary.json` identifies the selected run for every
+cell. Together with Thor's eight profiles, this closes the PI0.5 Stage 2 device
+matrix. Broader family migrations, closed-loop accuracy and deployment budgets
+remain outside this pilot's completion claim.
