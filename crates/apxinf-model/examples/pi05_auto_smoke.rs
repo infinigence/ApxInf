@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{standard_normal_f32, DType, Device, RngKey, Tensor};
 use apxinf_model::{
-    AutoModel, ExecutionMode, ExecutionPolicy, LoadOptions, ModelPrecision, Observation,
-    Pi05Config, PreparationStatus, VisionObservation, VlaRequest,
+    AutoModel, ExecutionMode, ExecutionPolicy, ImageLayout, LoadOptions, ModelPrecision,
+    Observation, Pi05Config, PreparationStatus, VisionObservation, VlaRequest,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -165,10 +165,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if generated_first == different_action {
         return Err("distinct PI0.5 RNG streams produced identical actions".into());
     }
+    // Cover canonical raw RGB -> prepared Session -> device Action as well as
+    // the preprocessed patch route above, without reloading model weights.
+    model.clear_prepared()?;
+    let rgb_observation = Observation {
+        vision: VisionObservation::RgbU8 {
+            bytes: vec![0; config.num_views * config.image_size * config.image_size * 3],
+            layout: ImageLayout::Nhwc,
+        },
+        token_ids: observation.token_ids.clone(),
+        state: None,
+        action_mask: None,
+    };
+    let rgb_request = VlaRequest::provided(&rgb_observation, &noise);
+    let rgb_spec = rgb_observation.inference_spec();
+    let rgb_eager = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::Eager)?;
+    let rgb_eager_values =
+        apxinf_cuda::transfers::to_cpu(rgb_eager.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+    drop(rgb_eager);
+    let rgb_graph = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::RequireGraph)?;
+    let rgb_graph_values =
+        apxinf_cuda::transfers::to_cpu(rgb_graph.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+    let rgb_max_abs = rgb_eager_values
+        .iter()
+        .zip(&rgb_graph_values)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    if rgb_eager_values.len() != rgb_graph_values.len()
+        || rgb_eager_values
+            .iter()
+            .chain(&rgb_graph_values)
+            .any(|v| !v.is_finite())
+        || rgb_max_abs > 0.01
+    {
+        return Err(format!("raw RGB eager/graph mismatch: {rgb_max_abs}").into());
+    }
+    drop(rgb_graph);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "explicit_policy_and_eviction_passed": true,
+            "populated_cache_eviction_passed": true,
+            "raw_rgb_eager_graph_max_abs": rgb_max_abs,
             "eager_graph_max_abs": eager_graph_max_abs,
             "device": cached_action.tensor().device().to_string(),
             "dtype": cached_action.tensor().dtype().to_string(),
