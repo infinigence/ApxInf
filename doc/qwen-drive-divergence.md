@@ -86,6 +86,34 @@ python3 layer_compare.py 0 1 $PWD/trace 8
 the logits readback; without that gate every step overwrote the previous one
 and only the last survived.
 
+## Correction: the index is a sample, not a property
+
+Everything above describes a real mechanism, but the specific index it names is
+not reproducible and should not be used as a regression signal. The same binary
+in the same configuration produced `first_different_index` 121, 121 and 255 on
+three consecutive runs.
+
+The cause is upstream of the recurrence. The FA2 head-256 causal prefill kernel
+does not reproduce itself: given q, k and v identical bit for bit, about one
+output element in ten thousand comes back one BF16 ULP different, and 982 of
+1083 differing elements in a measured pair were exactly one ULP. Full-tensor
+prefill traces place it exactly -- vision reproduces, text layers 0, 1 and 2
+reproduce, and text layer 3, the first full-attention layer, does not; inside
+layer 3 the traced input_norm, fused_qkv, cos, sin, q, k and v are identical
+and only the attention output differs. Under `APXINF_CUDA_SKIP_OUTPUT_ZERO=poison`
+that output contains no NaN, so nothing uninitialised is being read and every
+element is written. It is FP32 accumulation order varying between runs in a
+kernel with no atomics and a fixed grid.
+
+`APXINF_ATTN_COMPOSED_PREFILL=1` routes the same call through the composed path,
+which does reproduce: four runs identical, and the divergence index then holds
+at 121 across repeated runs. It costs about 4.9% on the fixed VQA workload.
+
+Two consequences for anyone working from this document. A single-run token hash
+proves nothing, so any bit-exactness claim has to be made with the composed
+prefill enabled. And a moved divergence index is not by itself evidence that a
+change altered the arithmetic -- repeat it before drawing that conclusion.
+
 ## What would actually move this
 
 Not a hunt for a broken kernel. The question is which operator contributes the

@@ -264,8 +264,9 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
                     CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
                 }
                 OutputFill::Dirty => CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda),
-                OutputFill::Poison => CudaBuffer::alloc_filled(bytes, ctx.device_id(), 0xFF)
-                    .map_err(Error::Cuda),
+                OutputFill::Poison => {
+                    CudaBuffer::alloc_filled(bytes, ctx.device_id(), 0xFF).map_err(Error::Cuda)
+                }
             }
         } else {
             unsafe { &*workspace }.allocate(bytes, ctx.device_id())

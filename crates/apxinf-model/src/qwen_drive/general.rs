@@ -159,7 +159,11 @@ pub(super) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
     // sequence mixer here does mix across positions. APXINF_QWEN_TRACE_FULL
     // dumps the whole tensor so the first affected layer is the real one.
     let full = std::env::var_os("APXINF_QWEN_TRACE_FULL").is_some();
-    let rows = if full || count < 4 { (0..count).collect::<Vec<_>>() } else { vec![0,1,2,count-1] };
+    let rows = if full || count < 4 {
+        (0..count).collect::<Vec<_>>()
+    } else {
+        vec![0, 1, 2, count - 1]
+    };
     let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
     let mut bytes = Vec::new();
     for row in rows {
@@ -265,29 +269,52 @@ fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<T
     if tuned_projection() {
         return gemm::bf16(ctx, input, weight);
     }
-    let x=input.shape().dims();let w=weight.shape().dims();
-    if x.len()!=2 || w.len()!=2 || x[1]!=w[1] || input.dtype()!=DType::BF16 || weight.dtype()!=DType::BF16 {
-        return Err(Error::Other("qwen_drive: checkpoint linear shape/dtype mismatch".into()));
+    let x = input.shape().dims();
+    let w = weight.shape().dims();
+    if x.len() != 2
+        || w.len() != 2
+        || x[1] != w[1]
+        || input.dtype() != DType::BF16
+        || weight.dtype() != DType::BF16
+    {
+        return Err(Error::Other(
+            "qwen_drive: checkpoint linear shape/dtype mismatch".into(),
+        ));
     }
-    let stride=i32::try_from(x[1]).map_err(|_|Error::Other("linear input stride overflow".into()))?;
-    let columns=i32::try_from(w[0]).map_err(|_|Error::Other("linear output stride overflow".into()))?;
-    let output=device_tensor(ctx,&[x[0],w[0]],DType::BF16)?;
-    gemm::write_ex(ctx,DType::BF16,CublasTranspose::None,CublasTranspose::Transpose,x[0],w[0],x[1],
-        1.0,&DeviceBuffer::from_tensor(input).map_err(Error::Cuda)?,stride,
-        &DeviceBuffer::from_tensor(weight).map_err(Error::Cuda)?,stride,0.0,
-        &DeviceBuffer::from_tensor(&output).map_err(Error::Cuda)?,columns)?;
+    let stride =
+        i32::try_from(x[1]).map_err(|_| Error::Other("linear input stride overflow".into()))?;
+    let columns =
+        i32::try_from(w[0]).map_err(|_| Error::Other("linear output stride overflow".into()))?;
+    let output = device_tensor(ctx, &[x[0], w[0]], DType::BF16)?;
+    gemm::write_ex(
+        ctx,
+        DType::BF16,
+        CublasTranspose::None,
+        CublasTranspose::Transpose,
+        x[0],
+        w[0],
+        x[1],
+        1.0,
+        &DeviceBuffer::from_tensor(input).map_err(Error::Cuda)?,
+        stride,
+        &DeviceBuffer::from_tensor(weight).map_err(Error::Cuda)?,
+        stride,
+        0.0,
+        &DeviceBuffer::from_tensor(&output).map_err(Error::Cuda)?,
+        columns,
+    )?;
     Ok(output)
 }
 
 fn project_and_pack(ctx: &Context, input: &Tensor, weights: &[&Tensor]) -> Result<Tensor> {
-    let rows=input.shape().dims()[0];
-    let mut outputs=Vec::with_capacity(weights.len());
+    let rows = input.shape().dims()[0];
+    let mut outputs = Vec::with_capacity(weights.len());
     for weight in weights {
-        let value=linear_checkpoint(ctx,input,weight)?;
-        outputs.push(value.reshape(vec![rows,value.shape().dims()[1],1,1])?);
+        let value = linear_checkpoint(ctx, input, weight)?;
+        outputs.push(value.reshape(vec![rows, value.shape().dims()[1], 1, 1])?);
     }
-    let packed=elementwise::concat_channels_bf16(ctx,&outputs.iter().collect::<Vec<_>>())?;
-    packed.reshape(vec![rows,packed.shape().dims()[1]])
+    let packed = elementwise::concat_channels_bf16(ctx, &outputs.iter().collect::<Vec<_>>())?;
+    packed.reshape(vec![rows, packed.shape().dims()[1]])
 }
 
 fn upload_u32(ctx: &Context, values: &[u32]) -> Result<DeviceBuffer> {
@@ -915,17 +942,10 @@ impl QwenDriveModel {
             self.gdn_graph_prepared = vec![[false, false]; self.weights.layers.len()];
         }
         if self.gdn_graph_workspace.is_none() {
-            // Allocating the arena mid-decode is the one moment this path
-            // perturbs anything: the corruption appears only at the step the
-            // arena is first taken, in a full-attention layer that never uses
-            // it, and is gone by the next step. Drain before and after so the
-            // allocation cannot land among work already in flight.
-            cuda.synchronize()?;
             self.gdn_graph_workspace = Some(kernels::GraphWorkspace::new(
                 DECODE_GRAPH_ARENA_BYTES,
                 ctx.device_id(),
             )?);
-            cuda.synchronize()?;
         }
         // Diagnostic arm: take the arena and then run the body exactly as the
         // eager path does, with no workspace bound, no staging, no capture. The
