@@ -452,6 +452,76 @@ __global__ void quantize_rows_bf16_int8_kernel(
   }
 }
 
+// Produce adaptive LayerNorm's rounded BF16 output and the exact dynamic
+// per-row INT8 representation consumed by W8A8 GEMMs in one kernel.
+__global__ void adaptive_layer_norm_quantize_rows_bf16_int8_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* modulation,
+    __nv_bfloat16* output, int8_t* quantized, float* scales,
+    int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x)
+    sum += __bfloat162float(input[base + col]);
+  const float mean = block_sum(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered = __bfloat162float(input[base + col]) - mean;
+    variance_sum += centered * centered;
+  }
+  const float inverse_std = rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+  float maximum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float normalized =
+        (__bfloat162float(input[base + col]) - mean) * inverse_std;
+    const float scale = __bfloat162float(modulation[col]);
+    const float shift = __bfloat162float(modulation[cols + col]);
+    const __nv_bfloat16 rounded =
+        __float2bfloat16(normalized * (1.0f + scale) + shift);
+    output[base + col] = rounded;
+    maximum = fmaxf(maximum, fabsf(__bfloat162float(rounded)));
+  }
+  const float row_scale = fmaxf(block_max(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = row_scale;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value = roundf(__bfloat162float(output[base + col]) / row_scale);
+    quantized[base + col] =
+        static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, value)));
+  }
+}
+
+__global__ void silu_mul_quantize_rows_bf16_int8_kernel(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    int8_t* output, float* scales, int rows, int cols) {
+  extern __shared__ __nv_bfloat16 rounded[];
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float maximum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float x = __bfloat162float(gate[base + col]);
+    const float y = __bfloat162float(up[base + col]);
+    // Match the existing two-stage SiLU + multiply contract exactly: the
+    // SiLU result is rounded to BF16 before it is multiplied by `up`, and the
+    // product is rounded to BF16 again before row-wise quantization.
+    const __nv_bfloat16 silu = __float2bfloat16(x / (1.0f + expf(-x)));
+    const __nv_bfloat16 value =
+        __float2bfloat16(__bfloat162float(silu) * y);
+    rounded[col] = value;
+    maximum = fmaxf(maximum, fabsf(__bfloat162float(value)));
+  }
+  const float scale = fmaxf(block_max(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = scale;
+  __syncthreads();
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float quantized = roundf(__bfloat162float(rounded[col]) / scale);
+    output[base + col] =
+        static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, quantized)));
+  }
+}
+
 __global__ void dequantize_int32_bf16_kernel(
     const int32_t* accumulators, const float* row_scales,
     const float* column_scales, __nv_bfloat16* output,

@@ -41,7 +41,7 @@ use pyo3::prelude::*;
 use apxinf_core::{Device, RngKey, Shape, Tensor};
 use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
-    SyntheticWeights, VisionObservation, VlaContract, VlaRequest,
+    SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -183,6 +183,14 @@ pub struct Model {
     sampling_draw: Cell<u64>,
 }
 
+struct PreprocessedVlaInput {
+    observation: Observation,
+    latent: Tensor,
+    attention_mask: Vec<u8>,
+    image_grid_thw: Vec<[u32; 3]>,
+    embodiment_id: usize,
+}
+
 impl Model {
     fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
         if self.contract.accepts_rgb_u8 {
@@ -292,6 +300,118 @@ impl Model {
         Ok(RngKey::new(self.sampling_seed.get(), 0, draw))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn preprocessed_vla_input<'py>(
+        &self,
+        method: &str,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: usize,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<PreprocessedVlaInput> {
+        let pixels_shape = pixel_values.shape();
+        if pixels_shape.len() != 2 || pixels_shape[0] == 0 || pixels_shape[1] == 0 {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: pixel_values must be a non-empty rank-2 array, got {pixels_shape:?}"
+            )));
+        }
+        if self.contract.patch_shape[1] != 0 && pixels_shape[1] != self.contract.patch_shape[1] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: pixel width {} does not match model width {}",
+                pixels_shape[1], self.contract.patch_shape[1]
+            )));
+        }
+        let grid_shape = image_grid_thw.shape();
+        if grid_shape.len() != 2 || grid_shape[0] == 0 || grid_shape[1] != 3 {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: image_grid_thw must have shape [images, 3], got {grid_shape:?}"
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: token_ids must be C-contiguous uint32"
+                ))
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mask = attention_mask
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: attention_mask must be C-contiguous uint8"
+                ))
+            })?
+            .to_vec();
+        if mask.len() != tokens.len() {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: attention mask length {} does not match token length {}",
+                mask.len(),
+                tokens.len()
+            )));
+        }
+        let grids = image_grid_thw
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: image_grid_thw must be C-contiguous uint32"
+                ))
+            })?
+            .chunks_exact(3)
+            .map(|row| [row[0], row[1], row[2]])
+            .collect::<Vec<_>>();
+        let pixels = Tensor::from_f32(
+            Shape::new(pixels_shape.to_vec()),
+            pixel_values.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: pixel_values must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let state = Tensor::from_f32(
+            Shape::new(state.shape().to_vec()),
+            state.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: state must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let [horizon, action_dim] = self.action_shape();
+        let noise_shape = noise.shape();
+        if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
+            )));
+        }
+        let latent = Tensor::from_f32(
+            Shape::new(noise_shape.to_vec()),
+            noise.as_slice().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "apxinf_py.{method}: noise must be C-contiguous float32"
+                ))
+            })?,
+        )
+        .map_err(runtime_err)?;
+        Ok(PreprocessedVlaInput {
+            observation: Observation {
+                vision: VisionObservation::Patches(pixels),
+                token_ids: tokens,
+                state: Some(state),
+                action_mask: None,
+            },
+            latent,
+            attention_mask: mask,
+            image_grid_thw: grids,
+            embodiment_id,
+        })
+    }
+
     /// Run with an exact caller-provided latent. This is the correctness and
     /// OpenPI-parity path.
     fn run_provided<'py>(
@@ -348,7 +468,7 @@ impl Model {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -363,6 +483,7 @@ impl Model {
         num_flow_steps: Option<usize>,
         flow_start_time: Option<f32>,
         sampling_seed: u64,
+        assets: Option<BTreeMap<String, PathBuf>>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -406,6 +527,7 @@ impl Model {
             precision: parse_precision(precision)?,
             calibration_path: calibration,
             tuning_path: tactics,
+            assets: assets.unwrap_or_default(),
             autotune,
             config,
             ..LoadOptions::default()
@@ -580,6 +702,98 @@ impl Model {
             }
             None => self.run_generated(py, observation, self.next_sampling_rng()?),
         }
+    }
+
+    /// Internal model-policy bridge for preprocessors that emit patch-grid,
+    /// attention-mask, state, and embodiment metadata in addition to patches.
+    /// The public policy owns all raw-observation processing and action decode.
+    #[pyo3(name = "_infer_preprocessed", signature = (
+        pixel_values,
+        image_grid_thw,
+        token_ids,
+        attention_mask,
+        state,
+        embodiment_id,
+        noise,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_preprocessed<'py>(
+        &self,
+        py: Python<'py>,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: usize,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let input = self.preprocessed_vla_input(
+            "_infer_preprocessed",
+            pixel_values,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+        )?;
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: Some(input.embodiment_id),
+        };
+        let request =
+            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
+    }
+
+    /// Internal bridge used by the public model-neutral calibration runner.
+    /// Preprocessing still belongs to the GR00T policy; the runtime only sees
+    /// the exact typed tensors it executes during normal inference.
+    #[pyo3(name = "_calibrate_preprocessed", signature = (
+        pixel_values,
+        image_grid_thw,
+        token_ids,
+        attention_mask,
+        state,
+        embodiment_id,
+        noise,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn calibrate_preprocessed<'py>(
+        &self,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: usize,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        let input = self.preprocessed_vla_input(
+            "_calibrate_preprocessed",
+            pixel_values,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+        )?;
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: Some(input.embodiment_id),
+        };
+        self.model
+            .calibration_amax(&VlaRequest::provided_with_metadata(
+                &input.observation,
+                &input.latent,
+                metadata,
+            ))
+            .map_err(runtime_err)
     }
 
     /// **L0** seeded variant for runtime tests. The initial standard-normal

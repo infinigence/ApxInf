@@ -28,6 +28,39 @@ extern "C" cudaError_t apxinf_static_quantize_rows_bf16_int8(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_adaptive_layer_norm_quantize_rows_bf16_int8(
+    const void* input, const void* modulation, void* output,
+    void* quantized, void* scales, int rows, int cols, float eps,
+    cudaStream_t stream) {
+  if (input == nullptr || modulation == nullptr || output == nullptr ||
+      quantized == nullptr || scales == nullptr || rows <= 0 || cols <= 0 ||
+      !(eps > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  adaptive_layer_norm_quantize_rows_bf16_int8_kernel<<<
+      rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(modulation),
+      static_cast<__nv_bfloat16*>(output), static_cast<int8_t*>(quantized),
+      static_cast<float*>(scales), rows, cols, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_silu_mul_quantize_rows_bf16_int8(
+    const void* gate, const void* up, void* output, void* scales,
+    int rows, int cols, cudaStream_t stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr || scales == nullptr ||
+      rows <= 0 || cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  silu_mul_quantize_rows_bf16_int8_kernel<<<
+      rows, kThreads, static_cast<size_t>(cols) * sizeof(__nv_bfloat16), stream>>>(
+      static_cast<const __nv_bfloat16*>(gate),
+      static_cast<const __nv_bfloat16*>(up), static_cast<int8_t*>(output),
+      static_cast<float*>(scales), rows, cols);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_dequantize_int32_bf16(
     const void* accumulators, const void* row_scales,
     const void* column_scales, void* output,

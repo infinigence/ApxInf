@@ -93,7 +93,7 @@ struct DecodeWorkspace {
     k_normed: CudaBuffer,     // [n_kv_heads*head_dim] post-QK-norm K
     q_rope: CudaBuffer,       // [hidden]
     k_rope: CudaBuffer,       // [n_kv_heads*head_dim]
-    attn_out: CudaBuffer,     // [hidden]
+    attn_out: CudaBuffer,     // [n_heads*head_dim] raw attention output
     attn_proj: CudaBuffer,    // [hidden]
     ffn_norm_out: CudaBuffer, // [hidden]
     mlp_hidden: CudaBuffer,   // [intermediate]
@@ -108,6 +108,9 @@ impl DecodeWorkspace {
     fn new(device_id: usize, cfg: &Qwen3VLDecodeGraphConfig) -> std::result::Result<Self, String> {
         let h = cfg.hidden_size;
         let kv = cfg.n_kv_heads * cfg.head_dim;
+        // Q projection width is n_heads * head_dim, which is NOT always
+        // hidden_size (Qwen3-VL-4B: 32*128=4096 vs hidden 2560).
+        let q_dim = cfg.n_heads * cfg.head_dim;
         let inter = cfg.intermediate_size;
         let vocab = cfg.vocab_size;
         let elem = cfg.dtype.size_in_bytes();
@@ -117,16 +120,16 @@ impl DecodeWorkspace {
             x: f(h)?,
             logits: f(vocab)?,
             norm_out: f(h)?,
-            q: f(h)?,
+            q: f(q_dim)?,
             k: f(kv)?,
             v: f(kv)?,
-            qkv: f(h + 2 * kv)?,
+            qkv: f(q_dim + 2 * kv)?,
             gate_up: f(2 * inter)?,
-            q_normed: f(h)?,
+            q_normed: f(q_dim)?,
             k_normed: f(kv)?,
-            q_rope: f(h)?,
+            q_rope: f(q_dim)?,
             k_rope: f(kv)?,
-            attn_out: f(h)?,
+            attn_out: f(q_dim)?,
             attn_proj: f(h)?,
             ffn_norm_out: f(h)?,
             mlp_hidden: f(inter)?,
@@ -180,6 +183,7 @@ fn decode_forward_capturable(
     let elem = cfg.dtype.size_in_bytes();
     let dtype = cfg.dtype;
     let kv_proj = n_kv_heads * head_dim;
+    let q_dim = n_heads * head_dim;
 
     if dtype != DType::BF16 {
         return Err(Error::Other("Qwen3-VL decode graph: bf16 only".into()));
@@ -219,14 +223,14 @@ fn decode_forward_capturable(
         let (q_view, k_view, v_view) = if let Some(qkv_w) = layer.qkv_packed {
             let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
             let qkv_wv = weight_view(qkv_w, device_id)?;
-            let fused_n = hidden + 2 * kv_proj;
+            let fused_n = q_dim + 2 * kv_proj;
             kernels::gemm::write(ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv)
                 ?;
             (
-                ws.qkv.view(0, hidden * elem).map_err(Error::Cuda)?,
-                ws.qkv.view(hidden * elem, kv_proj * elem).map_err(Error::Cuda)?,
+                ws.qkv.view(0, q_dim * elem).map_err(Error::Cuda)?,
+                ws.qkv.view(q_dim * elem, kv_proj * elem).map_err(Error::Cuda)?,
                 ws.qkv
-                    .view((hidden + kv_proj) * elem, kv_proj * elem)
+                    .view((q_dim + kv_proj) * elem, kv_proj * elem)
                     .map_err(Error::Cuda)?,
             )
         } else {
@@ -234,7 +238,7 @@ fn decode_forward_capturable(
             let wq_v = weight_view(layer.wq, device_id)?;
             let wk_v = weight_view(layer.wk, device_id)?;
             let wv_v = weight_view(layer.wv, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, hidden, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
+            kernels::gemm::write(ctx, dtype, 1, q_dim, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
             kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k)?;
             kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v)?;
             (
@@ -363,9 +367,11 @@ fn decode_forward_capturable(
         )?;
 
         // ── wo projection ──
-        let ao_view = ws.attn_out.view(0, ws.attn_out.len()).map_err(Error::Cuda)?;
+        // Attention output width is n_heads*head_dim (q_dim), which is NOT
+        // always hidden_size (Qwen3-VL-4B: 32*128=4096 vs hidden 2560).
+        let ao_view = ws.attn_out.view(0, q_dim * elem).map_err(Error::Cuda)?;
         let wo_v = weight_view(layer.wo, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, hidden, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
+        kernels::gemm::write(ctx, dtype, 1, hidden, q_dim, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
 
         // ── Fused post-attn residual add + pre-FFN norm ──
         let ffn_norm_weight = weight_view(layer.ffn_norm_weight, device_id)?;

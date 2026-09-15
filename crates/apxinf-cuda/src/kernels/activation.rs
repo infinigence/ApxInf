@@ -82,6 +82,34 @@ pub fn silu_mul_bf16_into(
     })
 }
 
+/// Fused BF16 `SiLU(gate) * up` for separate, equally-shaped inputs.
+pub fn silu_mul_bf16(ctx: &CudaContext, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 {
+        return Err(Error::Other("SiLU multiply requires BF16 inputs".into()));
+    }
+    if gate.shape() != up.shape() || gate.numel() == 0 {
+        return Err(Error::Other(
+            "SiLU multiply requires equal non-empty input shapes".into(),
+        ));
+    }
+    let output = output_buffer(ctx, gate.size_in_bytes())?;
+    check_cuda(unsafe {
+        ffi::apxinf_silu_mul_separate_bf16(
+            gpu_ptr(gate)?,
+            gpu_ptr(up)?,
+            output.ptr(),
+            gate.numel() as u32,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(make_gpu_tensor(
+        gate.shape().clone(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// SiLU (Swish) activation on CUDA.
 pub fn silu(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let device_id = ctx.device_id();
@@ -108,6 +136,40 @@ pub fn silu(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
         input.dtype(),
         device_id,
         out_buf,
+    ))
+}
+
+/// Fused `BF16(SiLU(gate)) * up -> BF16 -> calibrated E4M3`.
+pub fn silu_mul_quant_bf16_e4m3(
+    ctx: &CudaContext,
+    gate: &Tensor,
+    up: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    if gate.dtype() != DType::BF16 || up.dtype() != DType::BF16 {
+        return Err(Error::Other("silu_mul_quant requires BF16 inputs".into()));
+    }
+    if gate.shape() != up.shape() || gate.numel() == 0 || !(scale > 0.0) {
+        return Err(Error::Other(
+            "silu_mul_quant requires equal non-empty shapes and a positive scale".into(),
+        ));
+    }
+    let output = output_buffer(ctx, gate.numel())?;
+    check_cuda(unsafe {
+        ffi::apxinf_silu_mul_quant_bf16_e4m3(
+            gpu_ptr(gate)?,
+            gpu_ptr(up)?,
+            output.ptr(),
+            gate.numel() as i64,
+            scale,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(make_gpu_tensor(
+        gate.shape().clone(),
+        DType::F8E4M3,
+        ctx.device_id(),
+        output,
     ))
 }
 
@@ -171,6 +233,29 @@ pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>)
 
 pub fn bias_silu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
     bias_activation(ctx, input, value, 2)
+}
+
+pub fn bias_relu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "bias ReLU")?;
+    if input.dtype() != DType::BF16
+        || value.is_some_and(|bias| bias.dtype() != DType::BF16 || bias.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "static inference BF16 bias ReLU has incompatible dtype or shape".into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    check_cuda(unsafe {
+        ffi::apxinf_static_bias_relu_bf16(
+            gpu_ptr(input)?,
+            optional_ptr(value)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
 pub fn geglu_bf16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
@@ -337,6 +422,44 @@ pub fn bias_gelu_quant_f16_e4m3(
         ))
         .map_err(Error::Cuda)?;
     }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, cols]),
+        DType::F8E4M3,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Fused `BF16(bias + GELU(input)) -> calibrated E4M3` using packed-4 IO.
+pub fn bias_gelu_quant_bf16_e4m3(
+    ctx: &CudaContext,
+    input: &Tensor,
+    bias: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "bias GELU quantization")?;
+    if input.dtype() != DType::BF16
+        || bias.dtype() != DType::BF16
+        || bias.shape().dims() != [cols]
+        || cols % 4 != 0
+        || !(scale > 0.0)
+    {
+        return Err(Error::Other(
+            "bias GELU quantization expects a BF16 matrix, matching bias, width divisible by 4, and positive scale".into(),
+        ));
+    }
+    let output = fp8_output(ctx, rows, cols)?;
+    check_cuda(unsafe {
+        ffi::apxinf_static_bias_gelu_quant_bf16_e4m3(
+            gpu_ptr(input)?,
+            gpu_ptr(bias)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            scale,
+            ctx.stream().handle(),
+        )
+    })?;
     Ok(make_gpu_tensor(
         Shape::new(vec![rows, cols]),
         DType::F8E4M3,

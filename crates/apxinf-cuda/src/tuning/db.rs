@@ -491,6 +491,7 @@ fn parse_v1_record(index: usize, value: &serde_json::Value) -> Result<ParsedGemm
         "bf16" => GemmOp::Bf16,
         "w8a8" => GemmOp::W8A8,
         "fp8_f16" => GemmOp::Fp8F16,
+        "fp8_bf16" => GemmOp::Fp8Bf16,
         value => return invalid_field(&label, "op", value),
     };
     let activation_dtype = parse_dtype(required_string(key, "activation_dtype", &label)?, &label)?;

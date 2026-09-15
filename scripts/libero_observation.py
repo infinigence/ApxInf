@@ -1,11 +1,13 @@
 """Translate native LIBERO simulator observations into ApxInf Observations.
 
-**This module is a deliberate mirror of ``apxinf_robo.envs.libero``.** Both
-repositories evaluate on LIBERO — ApxInf so it can regress its own engine
-end-to-end without a downstream checkout, apxinf-robo so a robot deployment can
-be scored — and both need the same two conversions. The duplication is accepted;
-the *divergence* is not, because a changed rotation or a changed state layout
-produces wrong success rates on both sides with no error anywhere.
+**The OpenPI conversion in this module deliberately mirrors
+``apxinf_robo.envs.libero``.** Both repositories evaluate on LIBERO — ApxInf so
+it can regress its own engine end-to-end without a downstream checkout,
+apxinf-robo so a robot deployment can be scored — and both need the same camera
+and seven-value state conversion. GR00T's named eight-value state and decoded
+gripper conversion mirror NVIDIA's official ``LiberoEnv`` instead. The
+duplication is accepted; the *divergence* is not, because a changed rotation,
+state layout, or action convention produces wrong success rates with no error.
 
 If you change ``libero_images`` or ``libero_state`` here, change the mirror. The
 golden values in ``tests/test_libero_observation.py`` (and the matching file in
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import math
 import pathlib
+import pickle
 
 import numpy as np
 
@@ -51,6 +54,50 @@ def libero_state(observation) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
+def libero_gr00t_state(observation) -> dict[str, np.ndarray]:
+    """Preserve NVIDIA GR00T's named 8-DoF LIBERO state contract.
+
+    Unlike the OpenPI wire convention used by :func:`libero_state`, the
+    official GR00T processor consumes both mirrored finger joint positions.
+    Keeping this conversion beside the shared camera/orientation conversion
+    prevents evaluation from silently dropping the second joint.
+    """
+    position = np.asarray(observation["robot0_eef_pos"], dtype=np.float32).reshape(-1)
+    gripper = np.asarray(observation["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)
+    if position.size != 3 or gripper.size != 2:
+        raise ValueError(
+            "GR00T LIBERO state requires eef_pos with 3 values and "
+            f"gripper_qpos with 2 values, got {position.size} and {gripper.size}"
+        )
+    rotation = quat_to_axis_angle(observation["robot0_eef_quat"])
+    return {
+        "x": np.ascontiguousarray(position[0:1]),
+        "y": np.ascontiguousarray(position[1:2]),
+        "z": np.ascontiguousarray(position[2:3]),
+        "roll": np.ascontiguousarray(rotation[0:1]),
+        "pitch": np.ascontiguousarray(rotation[1:2]),
+        "yaw": np.ascontiguousarray(rotation[2:3]),
+        "gripper": np.ascontiguousarray(gripper),
+    }
+
+
+def libero_gr00t_action(action: np.ndarray) -> np.ndarray:
+    """Map decoded GR00T LIBERO actions to robosuite's gripper convention.
+
+    NVIDIA's official ``LiberoEnv`` performs this conversion after policy
+    decode: the dataset uses ``0=closed, 1=open`` while robosuite expects
+    ``+1=closed, -1=open``. The six Cartesian components pass through.
+    """
+    action = np.asarray(action, dtype=np.float32)
+    if action.ndim not in (1, 2) or action.shape[-1] != 7:
+        raise ValueError(f"GR00T LIBERO action must end in 7 values, got {action.shape}")
+    if not np.isfinite(action).all():
+        raise ValueError("GR00T LIBERO action must contain only finite values")
+    result = np.ascontiguousarray(action.copy())
+    result[..., -1] = -np.sign(2.0 * result[..., -1] - 1.0)
+    return result
+
+
 def make_env(task, seed: int):
     """Build the same off-screen LIBERO environment used by evaluation."""
     try:
@@ -70,6 +117,33 @@ def make_env(task, seed: int):
     )
     env.seed(seed)
     return env
+
+
+def load_libero_init_states(suite, task_id: int):
+    """Load LIBERO's trusted bundled init states across PyTorch versions.
+
+    LIBERO releases before PyTorch 2.6 call ``torch.load(path)`` and therefore
+    inherit the new ``weights_only=True`` default, which rejects their NumPy
+    arrays before an episode starts. Keep the vendor call on its normal path;
+    only that exact compatibility failure is retried against LIBERO's bundled,
+    read-only init-state file with the legacy behavior made explicit.
+    """
+    try:
+        return suite.get_task_init_states(task_id)
+    except pickle.UnpicklingError as error:
+        if "Weights only load failed" not in str(error):
+            raise
+
+    import torch
+    from libero.libero import get_libero_path
+
+    task = suite.get_task(task_id)
+    init_states_path = (
+        pathlib.Path(get_libero_path("init_states"))
+        / task.problem_folder
+        / task.init_states_file
+    )
+    return torch.load(init_states_path, weights_only=False)
 
 
 def to_apxinf_observation(
