@@ -15,8 +15,9 @@ use kernels::preprocess;
 
 use super::{sinusoidal_time_embedding, Pi05Config, Pi05ImageLayout, StaticBf16Pi05Weights};
 
-pub use super::network::Bf16PrefixKvCache;
-use super::network::{Bf16StepStyles, Pi05Bf16Network};
+pub use super::blocks::Bf16PrefixKvCache;
+use super::blocks::{Bf16Blocks, Bf16StepStyles};
+use super::network::Pi05Bf16Network;
 
 pub struct Pi05Bf16CapturedGraph {
     graph: Box<dyn Graph>,
@@ -142,11 +143,11 @@ impl Pi05Bf16CudaRuntime {
         config: Arc<Pi05Config>,
         weights: Arc<StaticBf16Pi05Weights>,
     ) -> Result<Self> {
-        let network = Arc::new(Pi05Bf16Network::new(
+        let network = Arc::new(Pi05Bf16Network::from_blocks(Bf16Blocks::new(
             Arc::clone(&backend),
             Arc::clone(&config),
             weights,
-        )?);
+        )?));
         Ok(Self {
             backend,
             config,
@@ -348,25 +349,19 @@ impl Pi05Bf16CudaRuntime {
             ));
         }
 
-        backend.begin_capture()?;
-        let output = match kernels::with_workspace(&workspace, || {
-            self.infer_captured_inputs(
-                &patches,
-                raw_images.as_ref(),
-                raw_image_layout,
-                token_ids,
-                token_count,
-                noise,
-                &styles,
-            )
-        }) {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = backend.end_capture();
-                return Err(error);
-            }
-        };
-        let graph = backend.end_capture()?;
+        let (graph, output) = backend.capture_graph(|| {
+            kernels::with_workspace(&workspace, || {
+                self.infer_captured_inputs(
+                    &patches,
+                    raw_images.as_ref(),
+                    raw_image_layout,
+                    token_ids,
+                    token_count,
+                    noise,
+                    &styles,
+                )
+            })
+        })?;
         Ok(Pi05Bf16CapturedGraph {
             graph,
             output,

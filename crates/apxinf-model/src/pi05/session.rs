@@ -307,10 +307,17 @@ pub struct Pi05PreparedInference {
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     tuning_generation: u64,
+    tuning_session: Arc<tuning::TuningSession>,
     fallback_reason: Option<String>,
 }
 
 impl Pi05PreparedInference {
+    fn is_current(&self) -> bool {
+        let current = self.backend.context().tuning();
+        Arc::ptr_eq(&current, &self.tuning_session)
+            && current.generation() == self.tuning_generation
+    }
+
     fn update_eager_inputs(&self, inputs: &EagerInputs, request: &VlaRequest<'_>) -> Result<()> {
         let observation = request.observation;
         self.backend.synchronize()?;
@@ -444,7 +451,7 @@ impl PreparedInference for Pi05PreparedInference {
     }
 
     fn status(&self) -> PreparationStatus {
-        if self.backend.context().tuning().generation() != self.tuning_generation {
+        if !self.is_current() {
             return PreparationStatus::Invalidated;
         }
         PreparationStatus::Ready {
@@ -463,7 +470,7 @@ impl PreparedInference for Pi05PreparedInference {
 
 impl Pi05PreparedInference {
     fn run_impl(&self, request: &VlaRequest<'_>) -> Result<Action> {
-        if self.backend.context().tuning().generation() != self.tuning_generation {
+        if !self.is_current() {
             return Err(Error::Other(
                 "prepared PI0.5 plan is stale after a tactic update; prepare it again".into(),
             ));
@@ -620,6 +627,7 @@ impl Pi05Session {
             }),
             normal_generator: RefCell::new(normal_generator),
             tuning_generation: cuda.context().tuning().generation(),
+            tuning_session: cuda.context().tuning(),
             fallback_reason: None,
         })
     }
@@ -628,6 +636,17 @@ impl Pi05Session {
         &self,
         spec: &InferenceSpec,
         policy: ExecutionPolicy,
+    ) -> Result<Pi05PreparedInference> {
+        self.build_prepared_using(spec, policy, |patches, tokens, noise| {
+            self.runtime.capture(spec, patches, tokens, noise)
+        })
+    }
+
+    fn build_prepared_using(
+        &self,
+        spec: &InferenceSpec,
+        policy: ExecutionPolicy,
+        capture: impl FnOnce(&Tensor, &DeviceBuffer, &Tensor) -> Result<GraphVariant>,
     ) -> Result<Pi05PreparedInference> {
         if policy == ExecutionPolicy::Eager {
             return self.build_eager(spec);
@@ -642,7 +661,7 @@ impl Pi05Session {
         let raw_rgb = spec.image_layout.is_some();
 
         let (graph, fallback_reason) = select_graph(policy, || {
-            tuning::without_autotune(|| self.runtime.capture(spec, &patches, &token_ids, &noise))
+            tuning::without_autotune(|| capture(&patches, &token_ids, &noise))
         })?;
         if let Some(reason) = &fallback_reason {
             eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
@@ -675,6 +694,7 @@ impl Pi05Session {
             fallback_reason,
             normal_generator: RefCell::new(normal_generator),
             tuning_generation: cuda.context().tuning().generation(),
+            tuning_session: cuda.context().tuning(),
         })
     }
 
@@ -709,14 +729,13 @@ impl VlaRuntime for Pi05Session {
         let observation = request.observation;
         observation.validate()?;
         let spec = observation.inference_spec();
-        let generation = self.backend.context().tuning().generation();
-        let needs_prepare =
-            self.prepared
-                .borrow()
-                .as_ref()
-                .map_or(true, |(cached_spec, prepared)| {
-                    *cached_spec != spec || prepared.tuning_generation != generation
-                });
+        let needs_prepare = self
+            .prepared
+            .borrow()
+            .as_ref()
+            .map_or(true, |(cached_spec, prepared)| {
+                *cached_spec != spec || !prepared.is_current()
+            });
         if needs_prepare {
             // Release the old implicit plan before temporary tuning allocations.
             // Explicitly retained plans are caller-owned and remain alive.
@@ -726,8 +745,7 @@ impl VlaRuntime for Pi05Session {
         let prepared = {
             let mut cache = self.prepared.borrow_mut();
             if cache.as_ref().is_some_and(|(cached_spec, prepared)| {
-                *cached_spec != spec
-                    || prepared.tuning_generation != self.backend.context().tuning().generation()
+                *cached_spec != spec || !prepared.is_current()
             }) {
                 drop(cache.take());
             }
@@ -814,6 +832,16 @@ pub(super) fn load_registered(
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
+    Ok(LoadedModel::Vla(Box::new(load_session(
+        path, backend, options,
+    )?)))
+}
+
+fn load_session(
+    path: &Path,
+    backend: Arc<dyn Backend>,
+    options: &LoadOptions,
+) -> Result<Pi05Session> {
     let backend = crate::accelerator::cuda::downcast_arc(backend)
         .ok_or_else(|| Error::Other("PI0.5 is only registered for CUDA".into()))?;
     let cuda = &*backend;
@@ -912,12 +940,12 @@ pub(super) fn load_registered(
         ModelPrecision::Auto => unreachable!("automatic precision was resolved"),
     };
 
-    Ok(LoadedModel::Vla(Box::new(Pi05Session {
+    Ok(Pi05Session {
         backend,
         config,
         runtime,
         prepared: RefCell::new(None),
-    })))
+    })
 }
 
 fn resolve_precision(
@@ -1030,6 +1058,100 @@ fn normalize_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA and APXINF_PI05_TEST_CHECKPOINT"]
+    fn native_preparation_failure_and_tactic_invalidation() {
+        let path =
+            std::env::var("APXINF_PI05_TEST_CHECKPOINT").expect("fixed real checkpoint required");
+        let backend = Arc::new(RuntimeBackend::new(0).unwrap());
+        let session = load_session(
+            Path::new(&path),
+            backend.clone(),
+            &LoadOptions {
+                precision: ModelPrecision::Bf16,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
+        let observation = Observation {
+            vision: VisionObservation::Patches(Tensor::zeros(
+                patch_shape(&session.config),
+                DType::BF16,
+            )),
+            token_ids: vec![0; 10],
+            state: None,
+            action_mask: None,
+        };
+        let noise = Tensor::zeros(noise_shape(&session.config), DType::BF16);
+        let request = VlaRequest::provided(&observation, &noise);
+        let spec = observation.inference_spec();
+        let failing_capture = |_: &Tensor, _: &DeviceBuffer, _: &Tensor| -> Result<GraphVariant> {
+            backend.capture_graph(|| backend.synchronize())?;
+            panic!("CUDA must reject synchronization during stream capture");
+        };
+        assert!(session
+            .build_prepared_using(&spec, ExecutionPolicy::RequireGraph, failing_capture)
+            .is_err());
+        let fallback = session
+            .build_prepared_using(&spec, ExecutionPolicy::PreferGraph, failing_capture)
+            .unwrap();
+        assert!(matches!(
+            fallback.status(),
+            PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                fallback_reason: Some(_)
+            }
+        ));
+        let expected = backend
+            .to_cpu(fallback.run(&request).unwrap().tensor())
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        drop(fallback);
+        // Same numeric generation, different tactic store: old plans must fail.
+        for policy in [ExecutionPolicy::Eager, ExecutionPolicy::RequireGraph] {
+            let plan = session.prepare_with_policy(&spec, policy).unwrap();
+            backend
+                .context()
+                .install_tuning(tuning::TuningSession::inference(
+                    tuning::TacticStore::default(),
+                ))
+                .unwrap();
+            assert_eq!(plan.status(), PreparationStatus::Invalidated);
+            assert!(plan.run(&request).is_err());
+            drop(plan);
+        }
+        // Prepared eager execution must not tune even in AutoTune mode.
+        backend
+            .context()
+            .install_tuning(tuning::TuningSession::new(
+                tuning::TuningMode::AutoTune,
+                tuning::TacticStore::default(),
+                None,
+            ))
+            .unwrap();
+        let generation = backend.context().tuning().generation();
+        let eager = session
+            .prepare_with_policy(&spec, ExecutionPolicy::Eager)
+            .unwrap();
+        for _ in 0..2 {
+            eager.run(&request).unwrap();
+        }
+        backend.synchronize().unwrap();
+        assert_eq!(backend.context().tuning().generation(), generation);
+        drop(eager);
+        let recovered = session
+            .prepare_with_policy(&spec, ExecutionPolicy::RequireGraph)
+            .unwrap();
+        drop(session);
+        drop(backend);
+        let actual = transfers::to_cpu(recovered.run(&request).unwrap().tensor())
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        assert_eq!(expected, actual);
+    }
 
     #[test]
     fn execution_policy_does_not_hide_capture_failure() {

@@ -1,10 +1,10 @@
 //! π0.5 FP8 CUDA transformer-layer execution.
 
-use super::backend::{kernels, Context};
+use crate::pi05::backend::{kernels, Context};
 use apxinf_core::{Error, Result, Tensor};
 use kernels::{activation, attention, embedding, fused, gemm, norm, quantization, rope};
 
-use super::{DeviceActionLayer, DeviceLanguageLayer, DeviceVisionBlock, GemmaVariantConfig};
+use crate::pi05::{DeviceActionLayer, DeviceLanguageLayer, DeviceVisionBlock, GemmaVariantConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TransformerLayerScales {
@@ -263,10 +263,7 @@ pub fn action_layer(
     let attention = attention::mqa_cached_f16(ctx, &q, prefix_k, prefix_v, key_tokens)?;
     let attention =
         quantization::quantize_f16_e4m3(ctx, &attention, scales.attention_output)?.reshape(
-            vec![
-                input.shape().dims()[0],
-                config.num_heads * config.head_dim,
-            ],
+            vec![input.shape().dims()[0], config.num_heads * config.head_dim],
         )?;
     let projected = gemm::fp8(
         ctx,
@@ -315,7 +312,7 @@ pub fn action_layer(
 
 pub fn vision_patch_embed(
     ctx: &Context,
-    weights: &super::Fp8LinearWeights,
+    weights: &crate::pi05::Fp8LinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
@@ -336,7 +333,7 @@ pub fn vision_patch_embed(
 /// patch tokens. This is the entry used by the fused raw-image graph.
 pub fn vision_patch_embed_fp8(
     ctx: &Context,
-    weights: &super::Fp8LinearWeights,
+    weights: &crate::pi05::Fp8LinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
@@ -594,5 +591,388 @@ mod tests {
         .unwrap();
         let output = backend.to_cpu(&output).unwrap();
         assert_eq!(output.as_f16().unwrap(), source.as_slice());
+    }
+}
+
+// Precision-specific backbone operations share this file with their layers.
+pub(in crate::pi05) mod backbone {
+    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+    use crate::pi05::*;
+    use apxinf_core::{Error, Result, Tensor};
+    use kernels::{activation, cache, elementwise, embedding, gemm, norm, quantization};
+    use std::sync::Arc;
+    pub struct PrefixKvCache {
+        pub keys: Vec<Tensor>,
+        pub values: Vec<Tensor>,
+        pub tokens: usize,
+    }
+
+    pub(in crate::pi05) struct Pi05StepStyles {
+        attention: Vec<Tensor>,
+        mlp: Vec<Tensor>,
+        final_norm: Tensor,
+    }
+    pub(in crate::pi05) struct Fp8Blocks {
+        pub(in crate::pi05) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05) config: Arc<Pi05Config>,
+        pub(in crate::pi05) weights: Arc<StaticFp8Pi05Weights>,
+        scales: Arc<Pi05ActivationScales>,
+        packed_vision_qkv: bool,
+    }
+    impl Fp8Blocks {
+        pub fn new(
+            backend: Arc<RuntimeBackend>,
+            config: Arc<Pi05Config>,
+            weights: Arc<StaticFp8Pi05Weights>,
+            scales: Arc<Pi05ActivationScales>,
+        ) -> Result<Self> {
+            config.validate()?;
+            scales.validate(&config)?;
+            let packed_vision_qkv = vision_qkv_packed_from_env()?;
+            if weights.vision_layers.len() != config.vision_depth
+                || weights.language_layers.len() != config.language.depth
+                || weights.action_layers.len() != config.action_expert.depth
+            {
+                return Err(Error::Other("π0.5 device weight depth mismatch".into()));
+            }
+            Ok(Self {
+                backend,
+                config,
+                weights,
+                scales,
+                packed_vision_qkv,
+            })
+        }
+
+        fn ctx(&self) -> &Context {
+            self.backend.context()
+        }
+
+        pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
+            let patches = quantization::quantize_f16_e4m3(
+                self.ctx(),
+                patches,
+                self.scales.vision_patch_input,
+            )?;
+            self.encode_vision_fp8_patches(&patches)
+        }
+
+        pub fn embed_prefix(
+            &self,
+            vision_tokens: &Tensor,
+            token_ids: &CudaBuffer,
+            token_count: usize,
+        ) -> Result<Tensor> {
+            if token_count == 0 || token_count > self.config.max_token_len {
+                return Err(Error::Other(format!(
+                    "π0.5 token count must be in 1..={}, got {token_count}",
+                    self.config.max_token_len
+                )));
+            }
+            let language = embedding::lookup_f16(
+                self.ctx(),
+                &self.weights.token_embedding,
+                token_ids,
+                token_count,
+            )?;
+            elementwise::concat_rows_f16(self.ctx(), vision_tokens, &language)
+        }
+
+        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<PrefixKvCache> {
+            let mut hidden = prefix.clone();
+            let mut keys = Vec::with_capacity(self.config.language.depth);
+            let mut values = Vec::with_capacity(self.config.language.depth);
+            for (index, (layer, scale)) in self
+                .weights
+                .language_layers
+                .iter()
+                .zip(&self.scales.language_layers)
+                .enumerate()
+            {
+                let output = language_layer(
+                    self.ctx(),
+                    self.config.language,
+                    layer,
+                    *scale,
+                    &hidden,
+                    index + 1 < self.config.language.depth,
+                    0,
+                    self.config.rms_norm_eps,
+                    self.config.rope_theta,
+                )?;
+                hidden = output.hidden;
+                let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
+                keys.push(cache::reserve_prefix_f16(
+                    self.ctx(),
+                    &output.key,
+                    cache_rows,
+                )?);
+                values.push(cache::reserve_prefix_f16(
+                    self.ctx(),
+                    &output.value,
+                    cache_rows,
+                )?);
+            }
+            Ok(PrefixKvCache {
+                keys,
+                values,
+                tokens: prefix.shape().dims()[0],
+            })
+        }
+
+        fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
+            let input = quantization::quantize_f16_e4m3(
+                self.ctx(),
+                time_embedding,
+                self.scales.time_input,
+            )?;
+            let hidden = gemm::fp8(
+                self.ctx(),
+                &input,
+                self.scales.time_input,
+                self.weights.time_mlp_in.as_kernel_view(),
+            )?;
+            let hidden = activation::bias_silu_quant_f16_e4m3(
+                self.ctx(),
+                &hidden,
+                self.weights.time_mlp_in.bias.as_ref(),
+                self.scales.time_hidden,
+            )?;
+            let output = gemm::fp8(
+                self.ctx(),
+                &hidden,
+                self.scales.time_hidden,
+                self.weights.time_mlp_out.as_kernel_view(),
+            )?;
+            activation::bias_silu_f16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
+        }
+
+        fn style(
+            &self,
+            conditioning: &Tensor,
+            weights: &crate::pi05::Fp8LinearWeights,
+        ) -> Result<Tensor> {
+            let projected = gemm::fp8(
+                self.ctx(),
+                conditioning,
+                self.scales.conditioning,
+                weights.as_kernel_view(),
+            )?;
+            let style = elementwise::bias_f16(self.ctx(), &projected, weights.bias.as_ref())?;
+            style.reshape(vec![style.numel()])
+        }
+
+        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Pi05StepStyles> {
+            let conditioning = self.conditioning(time_embedding)?;
+            let conditioning = quantization::quantize_f16_e4m3(
+                self.ctx(),
+                &conditioning,
+                self.scales.conditioning,
+            )?;
+            let mut attention = Vec::with_capacity(self.config.action_expert.depth);
+            let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
+            for layer in &self.weights.action_layers {
+                attention.push(self.style(&conditioning, &layer.input_style)?);
+                mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
+            }
+            let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
+            Ok(Pi05StepStyles {
+                attention,
+                mlp,
+                final_norm,
+            })
+        }
+
+        fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<Pi05StepStyles>> {
+            if time_embeddings.len() != self.config.num_flow_steps {
+                return Err(Error::Other(format!(
+                    "π0.5 expected {} timestep embeddings, got {}",
+                    self.config.num_flow_steps,
+                    time_embeddings.len()
+                )));
+            }
+            time_embeddings
+                .iter()
+                .map(|embedding| self.prepare_step_styles(embedding))
+                .collect()
+        }
+
+        fn denoise_step_with_styles(
+            &self,
+            state: &Tensor,
+            styles: &Pi05StepStyles,
+            prefix: &PrefixKvCache,
+            dt: f32,
+        ) -> Result<Tensor> {
+            if prefix.keys.len() != self.config.action_expert.depth
+                || prefix.values.len() != self.config.action_expert.depth
+                || styles.attention.len() != self.config.action_expert.depth
+                || styles.mlp.len() != self.config.action_expert.depth
+            {
+                return Err(Error::Other("π0.5 prefix KV/style depth mismatch".into()));
+            }
+            let state_fp8 =
+                quantization::quantize_f16_e4m3(self.ctx(), state, self.scales.action_input)?;
+            let hidden = gemm::fp8(
+                self.ctx(),
+                &state_fp8,
+                self.scales.action_input,
+                self.weights.action_in.as_kernel_view(),
+            )?;
+            let mut hidden =
+                elementwise::bias_f16(self.ctx(), &hidden, self.weights.action_in.bias.as_ref())?;
+
+            let mut attention_normalized = None;
+            for index in 0..self.config.action_expert.depth {
+                let layer = &self.weights.action_layers[index];
+                let (next_norm_style, next_norm_scale) =
+                    if index + 1 < self.config.action_expert.depth {
+                        (
+                            &styles.attention[index + 1],
+                            self.scales.action_layers[index + 1].attention_norm,
+                        )
+                    } else {
+                        (&styles.final_norm, self.scales.action_final_norm)
+                    };
+                let output = action_layer(
+                    self.ctx(),
+                    self.config.action_expert,
+                    layer,
+                    self.scales.action_layers[index],
+                    &hidden,
+                    attention_normalized.as_ref(),
+                    &styles.attention[index],
+                    &styles.mlp[index],
+                    next_norm_style,
+                    next_norm_scale,
+                    &prefix.keys[index],
+                    &prefix.values[index],
+                    prefix.tokens,
+                    self.config.rms_norm_eps,
+                    self.config.rope_theta,
+                )?;
+                hidden = output.hidden;
+                attention_normalized = Some(output.next_normalized);
+            }
+            let hidden = attention_normalized.ok_or_else(|| {
+                Error::Other("π0.5 action expert must contain at least one layer".into())
+            })?;
+            let velocity = gemm::fp8(
+                self.ctx(),
+                &hidden,
+                self.scales.action_final_norm,
+                self.weights.action_out.as_kernel_view(),
+            )?;
+            let velocity = elementwise::bias_f16(
+                self.ctx(),
+                &velocity,
+                self.weights.action_out.bias.as_ref(),
+            )?;
+            elementwise::euler_update_f16(self.ctx(), state, &velocity, dt)
+        }
+
+        pub fn denoise_step(
+            &self,
+            state: &Tensor,
+            time_embedding: &Tensor,
+            prefix: &PrefixKvCache,
+            dt: f32,
+        ) -> Result<Tensor> {
+            let styles = self.prepare_step_styles(time_embedding)?;
+            self.denoise_step_with_styles(state, &styles, prefix, dt)
+        }
+
+        fn encode_vision_fp8_patches(&self, patches: &Tensor) -> Result<Tensor> {
+            let mut hidden = vision_patch_embed_fp8(
+                self.ctx(),
+                &self.weights.patch_embedding,
+                &self.weights.position_embedding,
+                patches,
+                self.config.patches_per_view(),
+                self.scales.vision_patch_input,
+            )?;
+            for (layer, scale) in self
+                .weights
+                .vision_layers
+                .iter()
+                .zip(&self.scales.vision_layers)
+            {
+                hidden = vision_layer(
+                    self.ctx(),
+                    layer,
+                    *scale,
+                    &hidden,
+                    self.config.patches_per_view(),
+                    self.config.vision_heads,
+                    self.config.vision_head_dim,
+                    self.packed_vision_qkv,
+                    self.config.layer_norm_eps,
+                )?;
+            }
+            let hidden = norm::layer_quant_f16_e4m3(
+                self.ctx(),
+                &hidden,
+                &self.weights.vision_post_norm.weight,
+                &self.weights.vision_post_norm.bias,
+                self.config.layer_norm_eps,
+                self.scales.vision_post_norm,
+            )?;
+            let projected = gemm::fp8(
+                self.ctx(),
+                &hidden,
+                self.scales.vision_post_norm,
+                self.weights.multimodal_projector.as_kernel_view(),
+            )?;
+            elementwise::bias_f16(
+                self.ctx(),
+                &projected,
+                self.weights.multimodal_projector.bias.as_ref(),
+            )
+        }
+    }
+
+    impl super::super::Blocks for Fp8Blocks {
+        type Prefix = PrefixKvCache;
+        type Styles = Pi05StepStyles;
+        fn config(&self) -> &Pi05Config {
+            &self.config
+        }
+        fn vision(&self, patches: &Tensor, native: bool) -> Result<Tensor> {
+            if native {
+                self.encode_vision_fp8_patches(patches)
+            } else {
+                self.encode_vision(patches)
+            }
+        }
+        fn embed_prefix(&self, vision: &Tensor, ids: &CudaBuffer, count: usize) -> Result<Tensor> {
+            self.embed_prefix(vision, ids, count)
+        }
+        fn prefix(&self, input: &Tensor) -> Result<Self::Prefix> {
+            self.prefix_forward(input)
+        }
+        fn prepare_styles(&self, embeddings: &[Tensor]) -> Result<Vec<Self::Styles>> {
+            self.prepare_all_styles(embeddings)
+        }
+        fn eager_styles(&self, _embeddings: &[Tensor]) -> Result<Option<Vec<Self::Styles>>> {
+            Ok(None)
+        }
+        fn step(
+            &self,
+            state: &Tensor,
+            embedding: &Tensor,
+            prefix: &Self::Prefix,
+            dt: f32,
+        ) -> Result<Tensor> {
+            self.denoise_step(state, embedding, prefix, dt)
+        }
+        fn step_with_styles(
+            &self,
+            state: &Tensor,
+            styles: &Self::Styles,
+            prefix: &Self::Prefix,
+            dt: f32,
+        ) -> Result<Tensor> {
+            self.denoise_step_with_styles(state, styles, prefix, dt)
+        }
     }
 }

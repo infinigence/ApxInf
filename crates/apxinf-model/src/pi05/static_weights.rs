@@ -181,3 +181,133 @@ impl DeviceActionLayer {
 fn style_to_device(weights: &AdaRmsNormWeights, backend: &dyn Backend) -> Result<Fp8LinearWeights> {
     Fp8LinearWeights::from_host(&weights.style, backend)
 }
+
+#[cfg(feature = "cuda")]
+pub use activation_scales::Pi05ActivationScales;
+#[cfg(feature = "cuda")]
+mod activation_scales {
+    use crate::pi05::{
+        LayerCalibrationSites, Pi05CalibrationPlan, Pi05Config, StaticFp8Calibration,
+        TransformerLayerScales, VisionLayerScales,
+    };
+    use apxinf_core::{Error, Result};
+    #[derive(Clone, Debug)]
+    pub struct Pi05ActivationScales {
+        pub vision_patch_input: f32,
+        pub vision_layers: Vec<VisionLayerScales>,
+        pub vision_post_norm: f32,
+        pub language_layers: Vec<TransformerLayerScales>,
+        pub action_input: f32,
+        pub time_input: f32,
+        pub time_hidden: f32,
+        pub conditioning: f32,
+        pub action_layers: Vec<TransformerLayerScales>,
+        pub action_final_norm: f32,
+    }
+
+    impl Pi05ActivationScales {
+        /// Resolve every graph activation scale from a named calibration file.
+        pub fn from_calibration(
+            config: &Pi05Config,
+            calibration: &StaticFp8Calibration,
+        ) -> Result<Self> {
+            let plan = Pi05CalibrationPlan::for_config(config);
+            let optional_scale = |site: &Option<String>| -> Result<f32> {
+                site.as_deref()
+                    .map(|name| calibration.scale(name))
+                    .transpose()
+                    .map(|scale| scale.unwrap_or(1.0))
+            };
+            let transformer_layer =
+                |sites: &LayerCalibrationSites| -> Result<TransformerLayerScales> {
+                    Ok(TransformerLayerScales {
+                        attention_norm: calibration.scale(&sites.attention_norm)?,
+                        attention_output: optional_scale(&sites.attention_output)?,
+                        mlp_norm: optional_scale(&sites.mlp_norm)?,
+                        mlp_activation: optional_scale(&sites.mlp_activation)?,
+                    })
+                };
+            let vision_layers = plan
+                .vision_layers()
+                .iter()
+                .map(|sites| {
+                    Ok(VisionLayerScales {
+                        attention_norm: calibration.scale(&sites.attention_norm)?,
+                        attention_output: calibration
+                            .scale(sites.attention_output.as_deref().expect("vision tail site"))?,
+                        mlp_norm: calibration
+                            .scale(sites.mlp_norm.as_deref().expect("vision tail site"))?,
+                        mlp_activation: calibration
+                            .scale(sites.mlp_activation.as_deref().expect("vision tail site"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let language_layers = plan
+                .language_layers()
+                .iter()
+                .map(transformer_layer)
+                .collect::<Result<Vec<_>>>()?;
+            let action_layers = plan
+                .action_layers()
+                .iter()
+                .map(transformer_layer)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                vision_patch_input: calibration.scale("vision.patch_input")?,
+                vision_layers,
+                vision_post_norm: calibration.scale("vision.post_norm")?,
+                language_layers,
+                action_input: calibration.scale("action.input")?,
+                time_input: calibration.scale("time.input")?,
+                time_hidden: calibration.scale("time.hidden")?,
+                conditioning: calibration.scale("action.conditioning")?,
+                action_layers,
+                action_final_norm: calibration.scale("action.final_norm")?,
+            })
+        }
+
+        /// Useful for kernel smoke tests. Production inference should load named,
+        /// measured scales from `StaticFp8Calibration`.
+        pub fn uniform(config: &Pi05Config, scale: f32) -> Result<Self> {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(Error::Other(format!("invalid uniform FP8 scale {scale}")));
+            }
+            let transformer = TransformerLayerScales {
+                attention_norm: scale,
+                attention_output: scale,
+                mlp_norm: scale,
+                mlp_activation: scale,
+            };
+            let vision = VisionLayerScales {
+                attention_norm: scale,
+                attention_output: scale,
+                mlp_norm: scale,
+                mlp_activation: scale,
+            };
+            Ok(Self {
+                vision_patch_input: scale,
+                vision_layers: vec![vision; config.vision_depth],
+                vision_post_norm: scale,
+                language_layers: vec![transformer; config.language.depth],
+                action_input: scale,
+                time_input: scale,
+                time_hidden: scale,
+                conditioning: scale,
+                action_layers: vec![transformer; config.action_expert.depth],
+                action_final_norm: scale,
+            })
+        }
+
+        pub(in crate::pi05) fn validate(&self, config: &Pi05Config) -> Result<()> {
+            if self.vision_layers.len() != config.vision_depth
+                || self.language_layers.len() != config.language.depth
+                || self.action_layers.len() != config.action_expert.depth
+            {
+                return Err(Error::Other(
+                    "π0.5 activation calibration depth mismatch".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
