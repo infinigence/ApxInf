@@ -99,6 +99,21 @@ fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
 /// here instead, the layer issues a single GEMM whose output already has the
 /// layout the pack produced. BF16 through f32 and back is exact, so the values
 /// are unchanged.
+/// Store a projection weight in the layout its GEMM path wants.
+///
+/// These arrive from the checkpoint as `[out, in]`, which the raw `write_ex`
+/// call consumes with a transposed B. The tuned `gemm::bf16` path is row-major
+/// `[m,k] @ [k,n]` and needs `[in, out]`. Transposing once here keeps the
+/// per-call cost at zero; doing it the other way -- leaving the layout alone
+/// and transposing at each call -- would cost more than the tuning saves.
+fn projection(tensor: &Tensor) -> Result<Tensor> {
+    if super::general::tuned_projection() {
+        transpose_2d(tensor)
+    } else {
+        Ok(tensor.clone())
+    }
+}
+
 fn concat_rows_bf16(parts: &[&Tensor]) -> Result<Tensor> {
     let cols = parts
         .first()
@@ -367,7 +382,7 @@ impl QwenDriveDeviceWeights {
             let gate_up_w = up(backend, &concat_columns(&[&gate, &up_w])?)?;
             let down_w = up(
                 backend,
-                &take(&mut language, &format!("{p}.mlp.down_proj.weight"))?,
+                &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?)?,
             )?;
             if text.is_full_attention(index) {
                 let q = take(&mut language, &format!("{p}.self_attn.q_proj.weight"))?;
@@ -383,9 +398,9 @@ impl QwenDriveDeviceWeights {
                 }
                 layers.push(MixerWeights::FullAttention(FullAttentionLayerWeights {
                     input_norm,
-                    q_w: up(backend, &q)?,
-                    k_w: up(backend, &k)?,
-                    v_w: up(backend, &v)?,
+                    q_w: up(backend, &projection(&q)?)?,
+                    k_w: up(backend, &projection(&k)?)?,
+                    v_w: up(backend, &projection(&v)?)?,
                     q_norm: up(
                         backend,
                         &take(&mut language, &format!("{p}.self_attn.q_norm.weight"))?,
@@ -396,7 +411,10 @@ impl QwenDriveDeviceWeights {
                     )?,
                     o_w: up(
                         backend,
-                        &take(&mut language, &format!("{p}.self_attn.o_proj.weight"))?,
+                        &projection(&take(
+                            &mut language,
+                            &format!("{p}.self_attn.o_proj.weight"),
+                        )?)?,
                     )?,
                     post_norm,
                     gate_up_w,
@@ -435,7 +453,7 @@ impl QwenDriveDeviceWeights {
                     input_norm,
                     zba_w: up(
                         backend,
-                        &concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?,
+                        &projection(&concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?)?,
                     )?,
                     conv_w: up(backend, &conv.reshape(vec![conv_dim, kernel])?)?,
                     dt_bias: up(
@@ -452,7 +470,10 @@ impl QwenDriveDeviceWeights {
                     )?,
                     out_w: up(
                         backend,
-                        &take(&mut language, &format!("{p}.linear_attn.out_proj.weight"))?,
+                        &projection(&take(
+                            &mut language,
+                            &format!("{p}.linear_attn.out_proj.weight"),
+                        )?)?,
                     )?,
                     post_norm,
                     gate_up_w,

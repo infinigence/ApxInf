@@ -6,6 +6,10 @@
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1024,
         "layout": "row_major",
@@ -15,22 +19,97 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.020280536264181137,
       "tactic": {
         "backend": "cublaslt",
         "id": 14,
         "implementation_version": 1
-      },
-      "milliseconds": 0.020280536264181137
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 1,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.04295167997479439,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 5,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 4096,
+        "layout": "row_major",
+        "m": 1,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.13294847965240478,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 1,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 9216,
+        "layout": "row_major",
+        "m": 1,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.2804108822345734,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 1,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1024,
         "layout": "row_major",
@@ -40,22 +119,97 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.049890123307704926,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.049890123307704926
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 1,
+        "n": 8192,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.2502809590101242,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 3,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 1,
+        "n": 12352,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.3715187203884125,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 6,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 1,
+        "n": 18432,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 0.5452108788490295,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 3,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1024,
         "layout": "row_major",
@@ -65,22 +219,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.011081600127120813,
       "tactic": {
         "backend": "vendor",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 0.011081600127120813
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 32,
         "layout": "row_major",
@@ -90,22 +244,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.0074965329840779305,
       "tactic": {
         "backend": "cublaslt",
         "id": 1,
         "implementation_version": 1
-      },
-      "milliseconds": 0.0074965329840779305
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -115,22 +269,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.034938666969537735,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.034938666969537735
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 4096,
         "layout": "row_major",
@@ -140,22 +294,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.06356373429298401,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 0.06356373429298401
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1024,
         "layout": "row_major",
@@ -165,22 +319,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.043978672474622726,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.043978672474622726
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1024,
         "layout": "row_major",
@@ -190,22 +344,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.11004374176263809,
       "tactic": {
         "backend": "cublaslt",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 0.11004374176263809
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 588,
         "layout": "row_major",
@@ -215,22 +369,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.06495466753840447,
       "tactic": {
         "backend": "vendor",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 0.06495466753840447
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -240,22 +394,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.06203306466341019,
       "tactic": {
         "backend": "cublaslt",
         "id": 1,
         "implementation_version": 1
-      },
-      "milliseconds": 0.06203306466341019
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 4304,
         "layout": "row_major",
@@ -265,22 +419,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.1811562478542328,
       "tactic": {
         "backend": "cublaslt",
         "id": 2,
         "implementation_version": 1
-      },
-      "milliseconds": 0.1811562478542328
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -290,22 +444,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.07815147191286087,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.07815147191286087
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -315,22 +469,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.1363210678100586,
       "tactic": {
         "backend": "cublaslt",
         "id": 3,
         "implementation_version": 1
-      },
-      "milliseconds": 0.1363210678100586
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -340,22 +494,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.16870294511318207,
       "tactic": {
         "backend": "cublaslt",
         "id": 3,
         "implementation_version": 1
-      },
-      "milliseconds": 0.16870294511318207
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -365,22 +519,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.17826135456562042,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.17826135456562042
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -390,22 +544,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.21048104763031,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 1.21048104763031
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -415,22 +569,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.22926504909992218,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.22926504909992218
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -440,22 +594,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 2.726210355758667,
       "tactic": {
         "backend": "cublaslt",
         "id": 1,
         "implementation_version": 1
-      },
-      "milliseconds": 2.726210355758667
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -465,22 +619,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.17778030037879944,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 0.17778030037879944
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -490,22 +644,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.2163445949554443,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 1.2163445949554443
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -515,22 +669,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.23032423853874207,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.23032423853874207
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -540,22 +694,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 2.746675968170166,
       "tactic": {
         "backend": "cublaslt",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 2.746675968170166
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -565,22 +719,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.17883947491645813,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 0.17883947491645813
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -590,22 +744,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.2015348672866821,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 1.2015348672866821
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -615,22 +769,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.23134933412075043,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.23134933412075043
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -640,22 +794,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 2.690230369567871,
       "tactic": {
         "backend": "cublaslt",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 2.690230369567871
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -665,22 +819,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.1801130622625351,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.1801130622625351
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -690,22 +844,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.267266035079956,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 1.267266035079956
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -715,22 +869,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.23762564361095428,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.23762564361095428
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -740,22 +894,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 2.775639533996582,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 2.775639533996582
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 588,
         "layout": "row_major",
@@ -765,22 +919,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.07355199754238129,
       "tactic": {
         "backend": "cublaslt",
         "id": 1,
         "implementation_version": 1
-      },
-      "milliseconds": 0.07355199754238129
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -790,22 +944,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.0773482620716095,
       "tactic": {
         "backend": "cublaslt",
         "id": 6,
         "implementation_version": 1
-      },
-      "milliseconds": 0.0773482620716095
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 4304,
         "layout": "row_major",
@@ -815,22 +969,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.237881600856781,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.237881600856781
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -840,22 +994,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.11477013677358627,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.11477013677358627
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -865,22 +1019,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.198200523853302,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.198200523853302
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 1152,
         "layout": "row_major",
@@ -890,22 +1044,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.2477664053440094,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 0.2477664053440094
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -915,22 +1069,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.2224874645471573,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.2224874645471573
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -940,22 +1094,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.51486074924469,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 1.51486074924469
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -965,22 +1119,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.27757543325424194,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 0.27757543325424194
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -990,22 +1144,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 3.310112953186035,
       "tactic": {
         "backend": "cublaslt",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 3.310112953186035
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1015,22 +1169,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.22168108820915222,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.22168108820915222
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -1040,22 +1194,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.5144553184509277,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 1.5144553184509277
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1065,22 +1219,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.27764692902565,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 0.27764692902565
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1090,22 +1244,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 3.333339738845825,
       "tactic": {
         "backend": "vendor",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 3.333339738845825
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1115,22 +1269,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.22303465008735657,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 0.22303465008735657
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -1140,22 +1294,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.5116106271743774,
       "tactic": {
         "backend": "cublaslt",
         "id": 4,
         "implementation_version": 1
-      },
-      "milliseconds": 1.5116106271743774
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1165,22 +1319,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.27860477566719055,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
-      },
-      "milliseconds": 0.27860477566719055
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1190,22 +1344,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 3.3645962476730347,
       "tactic": {
         "backend": "vendor",
         "id": 0,
         "implementation_version": 1
-      },
-      "milliseconds": 3.3645962476730347
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1215,22 +1369,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.24060480296611786,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.24060480296611786
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 16384,
         "layout": "row_major",
@@ -1240,22 +1394,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 1.6749345064163208,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 1.6749345064163208
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1265,22 +1419,22 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 0.29696428775787354,
       "tactic": {
         "backend": "cublaslt",
         "id": 7,
         "implementation_version": 1
-      },
-      "milliseconds": 0.29696428775787354
+      }
     },
     {
       "key": {
         "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
         "epilogue": "none",
         "k": 2048,
         "layout": "row_major",
@@ -1290,18 +1444,189 @@
         "output_dtype": "bf16",
         "scale_mode": "none",
         "weight_dtype": "bf16",
-        "workspace_limit": 18446744073709551615,
-        "device": {
-          "sm": 87,
-          "multiprocessor_count": 16
-        }
+        "workspace_limit": 18446744073709551615
       },
+      "milliseconds": 3.724682092666626,
       "tactic": {
         "backend": "cublaslt",
         "id": 5,
         "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
       },
-      "milliseconds": 3.724682092666626
+      "milliseconds": 0.5058560061454773,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 6,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 4096,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 1.8765759897232055,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 6,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 9216,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 2560,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 3.867836170196534,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 8192,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 3.6514112091064455,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 12352,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 5.567413730621338,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 2560,
+        "layout": "row_major",
+        "m": 3095,
+        "n": 18432,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 8.251530227661133,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 4,
+        "implementation_version": 1
+      }
+    },
+    {
+      "key": {
+        "activation_dtype": "bf16",
+        "device": {
+          "multiprocessor_count": 16,
+          "sm": 87
+        },
+        "epilogue": "none",
+        "k": 1536,
+        "layout": "row_major",
+        "m": 12216,
+        "n": 1024,
+        "op": "bf16",
+        "output_dtype": "bf16",
+        "scale_mode": "none",
+        "weight_dtype": "bf16",
+        "workspace_limit": 18446744073709551615
+      },
+      "milliseconds": 1.1066214418411255,
+      "tactic": {
+        "backend": "cublaslt",
+        "id": 0,
+        "implementation_version": 1
+      }
     }
   ],
   "schema": "apxinf.cuda.tuning.v1",

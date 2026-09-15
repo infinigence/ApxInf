@@ -235,23 +235,39 @@ fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<Devic
 /// Whether the projection GEMMs go through the tuned path.
 ///
 /// `write_ex` is a raw cuBLAS call: no tactic lookup, no cuBLASLt plan, and
-/// invisible to autotune. Every projection except gate_up takes it, which is
-/// why an autotune pass over this model writes exactly one record and why the
-/// store holds only n=18432. Routing them through `gemm::bf16` makes them
-/// tunable -- but it also lets a different kernel be chosen, so it changes the
-/// BF16 reduction order and is not bit-exact. Opt-in until that is measured.
-fn tuned_projection() -> bool {
+/// invisible to autotune. Every projection except gate_up used to take it,
+/// which is why an autotune pass over this model wrote exactly one record.
+/// Through `gemm::bf16` they are tunable, and the loader stores them as
+/// `[in, out]` so the GEMM is row-major NN rather than NT.
+///
+/// It is not bit-exact: a different kernel is selected, so the BF16 reduction
+/// order changes. Measured with prefill made deterministic, so the comparison
+/// means something: identical through text layers 0-2, first difference at
+/// layer 3 at 1.8e-3 relative, ULP-scale at the source and amplified by the
+/// residual stream to 2.6e-2 by layer 31. Nothing observable moved -- the
+/// 130-token VQA probe is identical, the gate still diverges at index 121 with
+/// token 357, and both trajectory modes report the same error to every digit.
+/// `APXINF_QWEN_LINEAR_TUNED=0` restores the raw path for anyone who needs the
+/// old arithmetic exactly.
+pub(super) fn tuned_projection() -> bool {
     static TUNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TUNED.get_or_init(|| std::env::var_os("APXINF_QWEN_LINEAR_TUNED").is_some())
+    *TUNED.get_or_init(|| {
+        !matches!(
+            std::env::var("APXINF_QWEN_LINEAR_TUNED").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
 }
 
 fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    // Under the gate the loader has already stored this weight as [in, out],
+    // so the raw path's [out, in] check does not apply to it.
+    if tuned_projection() {
+        return gemm::bf16(ctx, input, weight);
+    }
     let x=input.shape().dims();let w=weight.shape().dims();
     if x.len()!=2 || w.len()!=2 || x[1]!=w[1] || input.dtype()!=DType::BF16 || weight.dtype()!=DType::BF16 {
         return Err(Error::Other("qwen_drive: checkpoint linear shape/dtype mismatch".into()));
-    }
-    if tuned_projection() {
-        return gemm::bf16(ctx, input, weight);
     }
     let stride=i32::try_from(x[1]).map_err(|_|Error::Other("linear input stride overflow".into()))?;
     let columns=i32::try_from(w[0]).map_err(|_|Error::Other("linear output stride overflow".into()))?;
