@@ -207,3 +207,23 @@ reviewed narrow interface. Cross-model reuse is not implied by similar names.
 More files or renamed executors do not prove improvement. Each migration must
 show that these changes have predictable owners and that hidden invariants have
 become explicit contracts. See migration.md for evidence and documentation gates.
+
+## Implemented migration slices (not complete target architecture)
+
+PI0.5 slice A candidate moves BF16 computation to `pi05/network.rs`:
+
+```mermaid
+flowchart LR
+    V[VlaRuntime: existing public contract] --> R[BF16 runtime: resources and capture]
+    R -->|eager or capture traversal| N[Pi05Bf16Network: fixed assets and computation]
+    N --> B[Existing bf16_executor: Block computations]
+    R --> G[Captured graph: retains Network and workspace]
+    B --> K[Unchanged safe kernels]
+    G -->|replay| K
+```
+
+Public runtime methods remain compatibility delegations for benchmark and other
+existing callers. Prefix cache types retain their previous re-export path.
+FP8/W8A8 and public preparation guarantees are unchanged in this slice. The
+Network currently holds BF16 math; generalizing precision and reorganizing
+semantic Blocks remain explicit later work, not claimed by this extraction.

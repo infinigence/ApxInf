@@ -213,3 +213,12 @@ from one model-family directory into another. The check complements review: it
 cannot determine why an existing family was modified. The
 `apxinf-model` integration test runs the same check during the normal Rust test
 suite.
+
+## In-progress PI0.5 migration
+
+The refactor branch's first slice separates BF16 tensor computation into
+`pi05/network.rs` while `bf16_runtime.rs` retains capture and resource ownership.
+Existing public runtime methods delegate for compatibility. FP8/W8A8 and the
+public prepare contract are unchanged. See the [migration tracker](model-lifecycle/migration.md)
+for completed evidence versus remaining work; the target diagrams are not a claim
+that all models have already migrated.

@@ -27,6 +27,8 @@ mod int8_runtime;
 mod int8_weights;
 mod math;
 #[cfg(feature = "cuda")]
+mod network;
+#[cfg(feature = "cuda")]
 mod runtime;
 mod static_bf16_weights;
 #[cfg(feature = "cuda")]

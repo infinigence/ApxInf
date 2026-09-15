@@ -1,6 +1,6 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Status: planning specification. No implementation stage is complete.
+Status: staged implementation in progress. No implementation stage is complete.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -46,6 +46,12 @@ Deliverables:
   checkpoints/datasets in place; record paths and revisions in devlocal evidence.
 - Inventory consumers of existing weight/compute types before moving shared code.
 
+Stage 2 may proceed in an isolated candidate while Stage 1 runs on Thor, as
+requested. Keep baseline source and artifacts immutable; compare the candidate
+against that baseline before accepting the slice. Prefer verified existing
+operator libraries; compiling Rust model code does not authorize a CUDA operator
+rebuild. Concurrent GPU loads invalidate formal latency comparisons.
+
 Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
 access blocks GPU qualification, not documentation or local structural work.
@@ -77,6 +83,25 @@ Exit: a compatible run performs no hidden capture/tuning; changed compatibility
 enters explicit preparation; capture failure and cleanup obey policy. Exact-input
 results and public action decoding meet declared tolerances and resource/latency
 budgets. Network has no cache/serving logic; Session has no duplicate network body.
+
+### Stage 2 slice A: BF16 computation ownership
+
+The first candidate extracts 14 computation/diagnostic methods from
+pi05/bf16_runtime.rs into pi05/network.rs. The BF16 runtime owns capture, input
+updates and workspace lifetime and delegates eager/captured math to the same
+Network. Captured objects retain an Arc to Network, keeping referenced weights
+alive. Existing public methods and Bf16PrefixKvCache export remain compatible.
+
+This slice deliberately leaves preparation semantics and FP8/W8A8 computation
+unchanged. It is not the final precision-neutral Network or full Stage 2 result.
+The current *_executor files remain the Block implementations until subsequent
+semantic grouping is justified. Next slices address the VLA prepared-session
+interface and remaining precision paths with their own validation.
+
+Validation so far: CUDA-feature Rust typecheck including all examples passes on
+macOS without linking CUDA; all 14 moved method bodies match baseline ignoring
+formatting; family dependency check passes. Thor build/parity qualification is
+tracked separately and is required before acceptance. No operator source changed.
 
 ## Stage 3: WallOSS; extract proven common mechanisms
 
@@ -218,7 +243,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | GPU pending; local checks recorded | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Pending | Pending | Target specified |
+| PI0.5 | Stage 2 slice A: BF16 Network extraction candidate | Thor build/parity pending | Actual slice recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |
