@@ -193,14 +193,60 @@ fn compute_pos_embeds(
     ctx: &Context,
     grid_thw: &[[u32; 3]],
 ) -> Result<Tensor> {
+    let timed = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("APXINF_QWEN_VISION_TIMING").is_some())
+    };
+    let cached_enabled = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            !matches!(
+                std::env::var("APXINF_QWEN_POS_CACHE").as_deref(),
+                Ok("0") | Ok("off") | Ok("false")
+            )
+        })
+    };
+    let started = std::time::Instant::now();
+    if cached_enabled {
+        if let Ok(cache) = weights.pos_embed_cache.lock() {
+            if let Some((_, tensor)) = cache.iter().find(|(key, _)| key.as_slice() == grid_thw) {
+                let hit = tensor.clone();
+                if timed {
+                    eprintln!(
+                        "[qwen_drive] pos_embed cache hit {:.2}ms",
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                return Ok(hit);
+            }
+        }
+    }
     let vc = &config.vision;
     let hidden = vc.hidden_size;
     let merge = vc.spatial_merge_size;
     let grid_side = (vc.num_position_embeddings as f64).sqrt().round() as usize;
-    let cpu = transfers::to_cpu(&weights.pos_embed)?;
-    let table = cpu
-        .to_f32_vec()
-        .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
+    // The table is a checkpoint constant, so it is read back once per model
+    // rather than once per request.
+    let table_owned: Vec<f32>;
+    let table: &[f32] = if cached_enabled {
+        if weights.pos_table_host.get().is_none() {
+            let values = transfers::to_cpu(&weights.pos_embed)?
+                .to_f32_vec()
+                .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
+            let _ = weights.pos_table_host.set(values);
+        }
+        weights
+            .pos_table_host
+            .get()
+            .expect("pos_embed table is installed")
+            .as_slice()
+    } else {
+        table_owned = transfers::to_cpu(&weights.pos_embed)?
+            .to_f32_vec()
+            .map_err(|e| Error::Other(format!("qwen_drive vision pos_embed table: {e}")))?;
+        table_owned.as_slice()
+    };
+    let after_readback = started.elapsed();
     if table.len() != grid_side * grid_side * hidden {
         return Err(Error::Other(
             "qwen_drive vision: pos_embed table shape mismatch".into(),
@@ -305,9 +351,33 @@ fn compute_pos_embeds(
             }
         }
     }
+    let after_interp = started.elapsed();
     let rounded: Vec<half::bf16> = out.iter().map(|&v| half::bf16::from_f32(v)).collect();
     let tensor = Tensor::from_bf16(vec![total, hidden], &rounded)?;
-    transfers::to_cuda(&tensor, ctx.device_id())
+    let uploaded = transfers::to_cuda(&tensor, ctx.device_id());
+    if cached_enabled {
+        if let (Ok(value), Ok(mut cache)) = (uploaded.as_ref(), weights.pos_embed_cache.lock()) {
+            // A rig presents a handful of grids; keep the cache small rather
+            // than letting an unexpected stream of shapes grow it without end.
+            const MAX_GRIDS: usize = 4;
+            if cache.len() >= MAX_GRIDS {
+                cache.remove(0);
+            }
+            cache.push((grid_thw.to_vec(), value.clone()));
+        }
+    }
+    if timed {
+        eprintln!(
+            "[qwen_drive] pos_embed total={:.1}ms readback={:.1}ms interp={:.1}ms round+upload={:.1}ms tokens={} hidden={}",
+            started.elapsed().as_secs_f64() * 1e3,
+            after_readback.as_secs_f64() * 1e3,
+            (after_interp - after_readback).as_secs_f64() * 1e3,
+            (started.elapsed() - after_interp).as_secs_f64() * 1e3,
+            total,
+            hidden
+        );
+    }
+    uploaded
 }
 
 /// Vision 2D-RoPE position ids `(h, w)` per patch in the merge-block-major

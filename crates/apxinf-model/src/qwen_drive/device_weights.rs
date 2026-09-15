@@ -243,6 +243,18 @@ pub struct VisionDeviceWeights {
     pub merger_fc1_b: Tensor,
     pub merger_fc2_w: Tensor,
     pub merger_fc2_b: Tensor,
+    /// Host copy of `pos_embed`, read back once instead of once per request.
+    pub pos_table_host: std::sync::OnceLock<Vec<f32>>,
+    /// Interpolated position embeddings, keyed by patch grid.
+    ///
+    /// `compute_pos_embeds` is a pure function of `pos_embed` and `grid_thw`,
+    /// so caching it is exact -- but it costs 41.5 ms per request on Orin (a
+    /// table readback, 12.5M scalar bilinear taps on the host, a BF16 pass and
+    /// a 25MB upload) and a fixed camera rig presents the same grid every time.
+    /// The cache lives on the weights rather than in a process-global map, so
+    /// it cannot outlive the model it belongs to or be shared between two of
+    /// them, and it is bounded because a rig has few distinct grids.
+    pub pos_embed_cache: std::sync::Mutex<Vec<(Vec<[u32; 3]>, Tensor)>>,
 }
 
 pub struct ExpertLayerDeviceWeights {
@@ -601,6 +613,8 @@ impl QwenDriveDeviceWeights {
                 backend,
                 &take(&mut visual, "model.visual.merger.linear_fc2.bias")?,
             )?,
+            pos_table_host: std::sync::OnceLock::new(),
+            pos_embed_cache: std::sync::Mutex::new(Vec::new()),
         };
         if !visual.is_empty() {
             let mut names: Vec<String> = visual.keys().cloned().collect();
