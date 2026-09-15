@@ -1,6 +1,7 @@
 # Stage 1: baseline protocol and current coverage
 
-Status: source inventory and local checks complete; GPU qualification pending.
+Status: source inventory and local checks complete; first PI0.5 BF16 slice passes
+Thor numerical parity. Full matrix and performance qualification remain pending.
 This is the maintained baseline protocol for the refactor, not a new performance
 result. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
@@ -13,8 +14,9 @@ ignored `devlocal/model-lifecycle-refactor/` directory.
   architecture documentation and the previously requested native execution skill.
 - Initial migration targets: PI0.5, then WallOSS. GR00T is inventoried read-only
   and deferred due to concurrent development. LLM/VLM runtime migration is later.
-- Local host: macOS arm64, no nvidia-smi/CUDA device. Configured SSH aliases do
-  not establish an authorized/available benchmark target or checkpoint identity.
+- Local host: macOS arm64, no CUDA device. Thor has now been identified and
+  selected for parallel validation: NVIDIA Thor, driver 580.00, CUDA 13.0.48.
+  Host and asset paths remain in the private Thor manifest.
 
 ## Current interface inventory
 
@@ -41,7 +43,7 @@ and the corresponding Python policies. All paths are in the selected baseline.
 
 | Model / precision | Target and assets | Stage-1 status |
 | --- | --- | --- |
-| PI0.5 BF16 | Thor SM110 and Orin SM87 in existing regression protocol; exact local checkpoint/path pending | GPU not run |
+| PI0.5 BF16 | Thor SM110 selected and checkpoint hash verified; Orin SM87 remains a later protocol target | Four two-view H10/H50 × T10/T21 parity cases passed; full matrix pending |
 | PI0.5 static FP8 | Thor SM110; matching checkpoint and calibration required | GPU not run |
 | PI0.5 W8A8 | Orin SM87; current per-channel weight/per-row activation quantization | GPU not run; preserve documented accuracy limitation |
 | WallOSS BF16 | CUDA path implemented; actual device, checkpoint and raw fixture pending | GPU not run |
@@ -105,8 +107,10 @@ Important reproduction gaps:
    a reproduction of that historical checkpoint/fixture baseline. Locate the
    exact compatible workload/runner before making a regression claim.
 2. The two first-replan NPZ fixtures named by the regression doc are not tracked
-   in this checkout. The doc pins their hashes, but actual asset paths remain
-   pending. Do not manufacture equivalent-looking inputs and claim equivalence.
+   in this checkout. They have now been located on Thor and both hashes match
+   the maintained pins; checkpoint and tokenizer hashes match too. Independent
+   reconstruction verifies derived image/token/noise bytes. H10 uses original
+   NPZ noise; H50 uses separately seeded Gaussian noise, not an H10 golden.
 3. Python bench L0 uses zero patches, whereas L1 uses RGB preprocessing. L2 invokes
    the full policy and may have its own noise behavior. Their latency differences
    alone do not demonstrate numerical equivalence of the three paths.
@@ -219,6 +223,45 @@ Two points require explicit treatment in implementation reviews:
   dependencies and Rust tool versions are in reports/local-test-environment.json.
   Initial missing-pytest attempts are retained separately; successful runs use
   the task-local venv and leave system Python unchanged.
-- GPU runs: not performed; target host and checkpoint/fixture paths pending.
-- Stage 1 completion: pending GPU evidence and missing acceptance inputs. Do not
-  begin the production refactor or mark the matrix qualified on source inspection.
+- Thor: immutable baseline `c5268b7` and candidate `1fc151b` both linked native
+  CUDA examples and passed real-checkpoint `pi05_auto_smoke`. Public AutoModel
+  prepare/run, cached infer and sampling behavior were exercised.
+- PI0.5 checkpoint, tokenizer and task04/task08 fixture hashes match maintained
+  pins. Exact paths and derivation checks are in the private Thor reports.
+- Matching partial operator cache supplied 19 of 23 objects; only four missing
+  FA2 translation units were compiled serially in task-local storage. Candidate
+  reused all 23 objects with zero further CUDA compilation. Shared caches and
+  production operator/build source were unchanged. Private build instrumentation
+  reused objects while retaining the actual kernel build-ID computation.
+- Both use kernel build ID `kb1-ebd6446d93b8fc684531cb9c73f56b9e` and archive SHA256
+  `700eaa20456bb9bba2e5a729689c1003b4a45f30ca62c18692136ab7a8d20ec2`.
+- Other GPU workloads were observed; formal uncontended timing is not claimed.
+- Stage 1 completion: pending remaining matrix cells and acceptance inputs. Do not
+  mark the matrix qualified on source inspection. The user has authorized Stage 2
+  candidate work in parallel with Stage 1 Thor validation; retain isolated baseline
+  and candidate sources, and require GPU evidence before accepting a migration.
+
+## Thor BF16 slice A numerical result (2026-09-15)
+
+Two views, real checkpoint, ten flow steps; baseline versus candidate in both
+execution modes and each variant's eager versus graph output are elementwise
+identical in every case:
+
+| Horizon H | Tokens T | Elements per output | max_abs | Relative L2 | Cosine |
+| --- | --- | --- | --- | --- | --- |
+| 50 | 21 | 1600 | 0 | 0 | 1 |
+| 50 | 10 | 1600 | 0 | 0 | 1 |
+| 10 | 21 | 320 | 0 | 0 | 1 |
+| 10 | 10 | 320 | 0 | 0 | 1 |
+
+The H50 profile changes only num_views to 2; H10 additionally sets chunk_size to
+10. Original checkpoint assets are unchanged. Identical private runner
+instrumentation only dumps already-read output arrays after graph execution.
+Full outputs and statistics are retained at
+`devlocal/model-lifecycle-refactor/thor-baseline/results/all-numerical-summary.json`,
+with asset, operator and instrumentation manifests in the sibling reports directory.
+
+This qualifies numerical parity for this BF16 structural slice. It does not
+qualify reference-policy accuracy, 500 episodes, FP8/W8A8, WallOSS, Orin or the
+remaining shape matrix. Timings are descriptive on the shared GPU; arena
+capacity/used bytes are not total or peak GPU memory. These gates remain open.

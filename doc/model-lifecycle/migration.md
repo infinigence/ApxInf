@@ -56,8 +56,8 @@ Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
 access blocks GPU qualification, not documentation or local structural work.
 Current status: source merge and inventory complete; local checks recorded in
-[Stage 1 baseline protocol](baseline.md). GPU runs, target assets and missing
-budgets remain pending. Stage 1 is not complete.
+[Stage 1 baseline protocol](baseline.md). Thor BF16 slice parity passes; remaining
+GPU matrix cells, target assets and missing budgets remain pending. Stage 1 is not complete.
 
 ## Stage 2: PI0.5 vertical pilot
 
@@ -100,8 +100,11 @@ interface and remaining precision paths with their own validation.
 
 Validation so far: CUDA-feature Rust typecheck including all examples passes on
 macOS without linking CUDA; all 14 moved method bodies match baseline ignoring
-formatting; family dependency check passes. Thor build/parity qualification is
-tracked separately and is required before acceptance. No operator source changed.
+formatting; family dependency check passes. Thor native AutoModel smoke passes
+for baseline and candidate. All four two-view H10/H50 × T10/T21 cases show exact
+baseline/candidate and eager/graph parity (max_abs=0, relative L2=0, cosine=1).
+See [baseline evidence and limits](baseline.md#thor-bf16-slice-a-numerical-result-2026-09-15).
+Performance and full matrix qualification remain open. No operator source changed.
 
 ## Stage 3: WallOSS; extract proven common mechanisms
 
@@ -236,14 +239,14 @@ into every file; link to the maintained contract and document local exceptions.
 
 ## Implementation tracker
 
-All entries below are pending implementation. This table must not be marked done
+Implementation and validation are tracked separately. No stage may be marked done
 solely because the documentation or a CPU build passes.
 
 | Scope | Contract / resource migration | GPU parity and budgets | Documentation promotion |
 | --- | --- | --- | --- |
-| Baseline matrix | Source merge and inventory complete | GPU pending; local checks recorded | baseline.md added |
+| Baseline matrix | Source merge and inventory complete | Thor BF16 subset passed; remaining matrix pending | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Stage 2 slice A: BF16 Network extraction candidate | Thor build/parity pending | Actual slice recorded |
+| PI0.5 | Stage 2 slice A: BF16 Network extraction implemented | Thor four-case parity passed; performance/full stage pending | Actual slice recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |
