@@ -97,7 +97,16 @@ between graph segments are forbidden.
    implementations prove the seam. Run
    `scripts/check_model_family_boundaries.sh` before review.
 7. Integrate through the appropriate maintained contract: `LlmTrait` for
-   LLM/VLM or `VlaRuntime` plus the Python policy layer for VLA.
+   LLM/VLM or `VlaRuntime` plus the Python policy layer for VLA. When changing
+   preparation, graph ownership or execution policy, read the
+   [callable PI0.5 lifecycle contract](../../doc/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract-stage-2-slice-b)
+   and [migration tracker](../../doc/model-lifecycle/migration.md). Record which
+   guarantees the family implements. New policy methods default to unsupported;
+   legacy prepare success is not proof of graph readiness. For an opted-in
+   family, verify explicit mode/fallback, stale-plan rejection, no capture or
+   autotuning during compatible prepared run, and output-buffer lifetime.
+   Completion: interfaces, family support and corresponding native evidence
+   agree in the same change.
 8. Verify operators, transformations, intermediate checkpoints, eager and
    captured inference, host-transfer audit, public serving/policy integration,
    and requested performance. Prove that tensor computation between public

@@ -1,4 +1,4 @@
-//! Owning VLA frontend for the three PI0.5 execution variants.
+//! PI0.5 session: preparation, bounded plan cache, and per-call input binding.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -13,8 +13,8 @@ use half::{bf16, f16};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
-    VisionObservation, VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
@@ -22,10 +22,10 @@ use super::backend::{
 };
 use super::{
     checkpoint_identity, upload_time_embeddings, upload_time_embeddings_bf16,
-    upload_time_embeddings_int8, Pi05ActivationScales, Pi05Bf16CapturedGraph,
-    Pi05Bf16CudaRuntime, Pi05CapturedGraph, Pi05Config, Pi05CudaRuntime, Pi05Int8CapturedGraph,
-    Pi05Int8CudaRuntime, Pi05Weights, StaticBf16Pi05Weights, StaticFp8Calibration,
-    StaticFp8Pi05Weights, StaticInt8Pi05Weights,
+    upload_time_embeddings_int8, Pi05ActivationScales, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime,
+    Pi05CapturedGraph, Pi05Config, Pi05CudaRuntime, Pi05Int8CapturedGraph, Pi05Int8CudaRuntime,
+    Pi05Weights, StaticBf16Pi05Weights, StaticFp8Calibration, StaticFp8Pi05Weights,
+    StaticInt8Pi05Weights,
 };
 
 #[derive(Clone)]
@@ -295,7 +295,10 @@ enum ExecStrategy {
     Eager(EagerInputs),
 }
 
-/// Owning prepared PI0.5 inference plan.
+/// Owning prepared PI0.5 inference plan. Runs neither capture nor autotune.
+/// Graph actions alias reusable device output: copy to host/device storage before
+/// the next run if a stable result is needed. Runs are serialized on this session.
+/// Each call fully binds input and RNG key; there is no implicit episode counter.
 pub struct Pi05PreparedInference {
     spec: InferenceSpec,
     backend: Arc<RuntimeBackend>,
@@ -304,6 +307,7 @@ pub struct Pi05PreparedInference {
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     tuning_generation: u64,
+    fallback_reason: Option<String>,
 }
 
 impl Pi05PreparedInference {
@@ -439,12 +443,29 @@ impl PreparedInference for Pi05PreparedInference {
         &self.spec
     }
 
+    fn status(&self) -> PreparationStatus {
+        if self.backend.context().tuning().generation() != self.tuning_generation {
+            return PreparationStatus::Invalidated;
+        }
+        PreparationStatus::Ready {
+            mode: match self.strategy {
+                ExecStrategy::Graph(_) => ExecutionMode::Graph,
+                ExecStrategy::Eager(_) => ExecutionMode::Eager,
+            },
+            fallback_reason: self.fallback_reason.clone(),
+        }
+    }
+
     fn run(&self, request: &VlaRequest<'_>) -> Result<Action> {
-        if matches!(&self.strategy, ExecStrategy::Graph(_))
-            && self.backend.context().tuning().generation() != self.tuning_generation
-        {
+        tuning::without_autotune(|| self.run_impl(request))
+    }
+}
+
+impl Pi05PreparedInference {
+    fn run_impl(&self, request: &VlaRequest<'_>) -> Result<Action> {
+        if self.backend.context().tuning().generation() != self.tuning_generation {
             return Err(Error::Other(
-                "prepared PI0.5 graph is stale after a tactic update; prepare it again".into(),
+                "prepared PI0.5 plan is stale after a tactic update; prepare it again".into(),
             ));
         }
         let observation = request.observation;
@@ -498,11 +519,26 @@ impl PreparedInference for Pi05PreparedInference {
 /// A graph workspace can reserve multiple GiB, so the implicit `infer` path
 /// retains only the most recently used shape. Callers that need more than one
 /// simultaneously prepared shape can own those plans explicitly via `prepare`.
-pub struct Pi05VlaRuntime {
+pub struct Pi05Session {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi05Config>,
     runtime: RuntimeVariant,
     prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
+}
+
+// Keep policy selection testable without inducing a real GPU capture failure.
+fn select_graph<G>(
+    policy: ExecutionPolicy,
+    capture: impl FnOnce() -> Result<G>,
+) -> Result<(Option<G>, Option<String>)> {
+    match policy {
+        ExecutionPolicy::Eager => Ok((None, None)),
+        ExecutionPolicy::RequireGraph => capture().map(|graph| (Some(graph), None)),
+        ExecutionPolicy::PreferGraph => match capture() {
+            Ok(graph) => Ok((Some(graph), None)),
+            Err(error) => Ok((None, Some(error.to_string()))),
+        },
+    }
 }
 
 fn cached_or_build<K, V>(
@@ -527,7 +563,7 @@ where
     Ok(value)
 }
 
-impl Pi05VlaRuntime {
+impl Pi05Session {
     fn allocate_prepared_buffers(&self, spec: &InferenceSpec) -> Result<PreparedBuffers> {
         spec.validate()?;
         if spec.token_count > self.config.max_token_len {
@@ -584,10 +620,18 @@ impl Pi05VlaRuntime {
             }),
             normal_generator: RefCell::new(normal_generator),
             tuning_generation: cuda.context().tuning().generation(),
+            fallback_reason: None,
         })
     }
 
-    fn build_prepared(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
+    fn build_prepared(
+        &self,
+        spec: &InferenceSpec,
+        policy: ExecutionPolicy,
+    ) -> Result<Pi05PreparedInference> {
+        if policy == ExecutionPolicy::Eager {
+            return self.build_eager(spec);
+        }
         let PreparedBuffers {
             patches,
             noise,
@@ -597,11 +641,15 @@ impl Pi05VlaRuntime {
         let cuda = &*self.backend;
         let raw_rgb = spec.image_layout.is_some();
 
-        let graph = self.runtime.capture(spec, &patches, &token_ids, &noise);
+        let (graph, fallback_reason) = select_graph(policy, || {
+            tuning::without_autotune(|| self.runtime.capture(spec, &patches, &token_ids, &noise))
+        })?;
+        if let Some(reason) = &fallback_reason {
+            eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
+        }
         let strategy = match graph {
-            Ok(graph) => ExecStrategy::Graph(graph),
-            Err(error) => {
-                eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {error}");
+            Some(graph) => ExecStrategy::Graph(graph),
+            None => {
                 let raw_images = if raw_rgb {
                     Some(
                         DeviceBuffer::alloc_zeros(image_bytes(&self.config), cuda.device_id())
@@ -624,43 +672,24 @@ impl Pi05VlaRuntime {
             config: Arc::clone(&self.config),
             runtime: self.runtime.clone(),
             strategy,
+            fallback_reason,
             normal_generator: RefCell::new(normal_generator),
             tuning_generation: cuda.context().tuning().generation(),
         })
     }
 
-    fn build_calibration_prepared(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
-        let PreparedBuffers {
-            patches,
-            noise,
-            token_ids,
-            normal_generator,
-        } = self.allocate_prepared_buffers(spec)?;
-        let raw_rgb = spec.image_layout.is_some();
-        let raw_images = raw_rgb
-            .then(|| {
-                DeviceBuffer::alloc_zeros(image_bytes(&self.config), self.backend.device_id())
-            })
-            .transpose()
-            .map_err(Error::Cuda)?;
-        Ok(Pi05PreparedInference {
-            spec: *spec,
-            backend: Arc::clone(&self.backend),
-            config: Arc::clone(&self.config),
-            runtime: self.runtime.clone(),
-            strategy: ExecStrategy::Eager(EagerInputs {
-                patches,
-                raw_images,
-                noise,
-                token_ids,
-            }),
-            normal_generator: RefCell::new(normal_generator),
-            tuning_generation: self.backend.context().tuning().generation(),
-        })
+    fn tune_sample(&self, request: &VlaRequest<'_>) -> Result<()> {
+        if self.backend.context().tuning().mode() == tuning::TuningMode::AutoTune {
+            let eager = self.build_eager(&request.observation.inference_spec())?;
+            let output = eager.run_impl(request)?;
+            self.backend.synchronize()?;
+            drop(output);
+        }
+        Ok(())
     }
 }
 
-impl VlaRuntime for Pi05VlaRuntime {
+impl VlaRuntime for Pi05Session {
     fn contract(&self) -> crate::VlaContract {
         crate::VlaContract {
             action_shape: [self.config.action_horizon, self.config.action_dim],
@@ -688,13 +717,11 @@ impl VlaRuntime for Pi05VlaRuntime {
                 .map_or(true, |(cached_spec, prepared)| {
                     *cached_spec != spec || prepared.tuning_generation != generation
                 });
-        if needs_prepare && self.backend.context().tuning().mode() == tuning::TuningMode::AutoTune {
-            // Only this eager traversal sees the real request. GEMM tuning is
-            // suppressed during the later placeholder prepare traversal.
-            let eager = self.build_eager(&spec)?;
-            let tuned_output = eager.run(request)?;
-            self.backend.synchronize()?;
-            drop(tuned_output);
+        if needs_prepare {
+            // Release the old implicit plan before temporary tuning allocations.
+            // Explicitly retained plans are caller-owned and remain alive.
+            self.clear_prepared()?;
+            self.tune_sample(request)?;
         }
         let prepared = {
             let mut cache = self.prepared.borrow_mut();
@@ -704,13 +731,60 @@ impl VlaRuntime for Pi05VlaRuntime {
             }) {
                 drop(cache.take());
             }
-            cached_or_build(&mut cache, spec, || self.build_prepared(&spec))?
+            cached_or_build(&mut cache, spec, || {
+                self.build_prepared(&spec, ExecutionPolicy::PreferGraph)
+            })?
         };
         prepared.run(request)
     }
 
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
-        Ok(Box::new(self.build_prepared(spec)?))
+        self.prepare_with_policy(spec, ExecutionPolicy::PreferGraph)
+    }
+
+    fn prepare_with_policy(
+        &self,
+        spec: &InferenceSpec,
+        policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        Ok(Box::new(self.build_prepared(spec, policy)?))
+    }
+
+    fn prepare_for(
+        &self,
+        sample: &VlaRequest<'_>,
+        policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        sample.observation.validate()?;
+        self.tune_sample(sample)?;
+        self.prepare_with_policy(&sample.observation.inference_spec(), policy)
+    }
+
+    fn execution_mode(&self) -> &'static str {
+        match self
+            .prepared
+            .borrow()
+            .as_ref()
+            .map(|(_, plan)| plan.status())
+        {
+            None => "unprepared",
+            Some(PreparationStatus::Ready {
+                mode: ExecutionMode::Graph,
+                ..
+            }) => "graph",
+            Some(PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                ..
+            }) => "eager",
+            Some(PreparationStatus::Invalidated) => "invalidated",
+            Some(PreparationStatus::RuntimeManaged) => "runtime-managed",
+        }
+    }
+
+    fn clear_prepared(&self) -> Result<()> {
+        self.backend.synchronize()?;
+        drop(self.prepared.borrow_mut().take());
+        Ok(())
     }
 
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
@@ -720,7 +794,7 @@ impl VlaRuntime for Pi05VlaRuntime {
 
     fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         request.observation.validate()?;
-        let prepared = self.build_calibration_prepared(&request.observation.inference_spec())?;
+        let prepared = self.build_eager(&request.observation.inference_spec())?;
         let ExecStrategy::Eager(inputs) = &prepared.strategy else {
             unreachable!("calibration plan is always eager")
         };
@@ -782,11 +856,8 @@ pub(super) fn load_registered(
                     )
                 })?;
                 let checkpoint = checkpoint_identity(path)?;
-                let calibration = StaticFp8Calibration::from_json_file(
-                    &calibration_path,
-                    &config,
-                    &checkpoint,
-                )?;
+                let calibration =
+                    StaticFp8Calibration::from_json_file(&calibration_path, &config, &checkpoint)?;
                 Arc::new(Pi05ActivationScales::from_calibration(
                     &config,
                     &calibration,
@@ -841,7 +912,7 @@ pub(super) fn load_registered(
         ModelPrecision::Auto => unreachable!("automatic precision was resolved"),
     };
 
-    Ok(LoadedModel::Vla(Box::new(Pi05VlaRuntime {
+    Ok(LoadedModel::Vla(Box::new(Pi05Session {
         backend,
         config,
         runtime,
@@ -959,6 +1030,21 @@ fn normalize_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_policy_does_not_hide_capture_failure() {
+        let failure = || Err::<(), _>(Error::Other("capture fixture failure".into()));
+        assert!(select_graph(ExecutionPolicy::RequireGraph, failure).is_err());
+        let (graph, reason) = select_graph(ExecutionPolicy::PreferGraph, failure).unwrap();
+        assert!(graph.is_none());
+        assert!(reason.unwrap().contains("capture fixture failure"));
+        let eager = select_graph::<()>(ExecutionPolicy::Eager, || panic!("eager must not capture"));
+        assert_eq!(eager.unwrap(), (None, None));
+        assert_eq!(
+            select_graph(ExecutionPolicy::RequireGraph, || Ok(7)).unwrap(),
+            (Some(7), None)
+        );
+    }
 
     #[test]
     fn most_recent_cache_reuses_and_drops_before_replacement() {

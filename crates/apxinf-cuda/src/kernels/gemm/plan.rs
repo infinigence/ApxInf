@@ -84,6 +84,7 @@ impl GemmPlanCache {
         let needs_exact = !matches!(resolved, Some(value) if value.source == TacticMatch::Exact);
         if needs_exact
             && session.mode() == TuningMode::AutoTune
+            && !crate::tuning::autotune_suppressed()
             && crate::workspace::may_prepare_native_resources()
             && !crate::workspace::is_preparing_workspace()
         {

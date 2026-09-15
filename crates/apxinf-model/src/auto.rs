@@ -191,6 +191,26 @@ impl LoadedModel {
     pub fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
         self.vla()?.prepare(spec)
     }
+
+    pub fn prepare_with_policy(
+        &self,
+        spec: &InferenceSpec,
+        policy: crate::ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        self.vla()?.prepare_with_policy(spec, policy)
+    }
+
+    pub fn prepare_for(
+        &self,
+        sample: &VlaRequest<'_>,
+        policy: crate::ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        self.vla()?.prepare_for(sample, policy)
+    }
+
+    pub fn clear_prepared(&self) -> Result<()> {
+        self.vla()?.clear_prepared()
+    }
 }
 
 /// Stateless unified frontend. It creates one shared backend, loads weights,

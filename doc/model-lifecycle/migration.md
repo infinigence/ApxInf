@@ -106,6 +106,26 @@ baseline/candidate and eager/graph parity (max_abs=0, relative L2=0, cosine=1).
 See [baseline evidence and limits](baseline.md#thor-bf16-slice-a-numerical-result-2026-09-15).
 Performance and full matrix qualification remain open. No operator source changed.
 
+### Stage 2 slice B: explicit PI0.5 Session preparation
+
+Implemented: `session.rs` replaces `vla_runtime.rs`, with `Pi05Session` and a
+compatible `Pi05VlaRuntime` alias. LoadedModel and VlaRuntime expose
+prepare_with_policy, prepare_for and clear_prepared. PreparedInference reports
+actual mode, fallback reason and invalidation. Eager/PreferGraph/RequireGraph
+have distinct behavior; prepared run suppresses autotuning and rejects stale
+plans for both eager and graph. Real-input tuning stays in preparation or the
+legacy infer cache-miss path. Old implicit plans are released before replacement
+tuning allocations. Explicitly held plans are not silently destroyed.
+
+See [the callable lifecycle contract](lifecycle.md#implemented-pi05-preparation-contract-stage-2-slice-b)
+for output aliasing and remaining limitations. Host-side tuning suppression is
+scoped and unwind-safe; operator sources and build flags are unchanged.
+
+Validation: local CUDA-feature examples/tests typecheck; macOS native test
+linking is unavailable without CUDA. Thor BF16/FP8 native policy and parity
+qualification is in progress. W8A8/Orin, forced native capture-failure cleanup,
+full resource/performance gates and later Stage 2 slices remain open.
+
 ## Stage 3: WallOSS; extract proven common mechanisms
 
 Deliverables:
@@ -218,10 +238,9 @@ PR. A separate documentation follow-up is not the default completion criterion.
 | New model implementation checklist | ../../skills/model-port-workflow/SKILL.md and ../adding-a-new-model.md |
 | User-visible behavior | Binding/facade documentation and examples |
 
-The port skill is not rewritten to describe unimplemented APIs in this docs-only
-change. Update its reading links and staged checklist when the first implementation
-slice establishes callable contracts; preserve existing native GPU verification
-requirements. Keep proposed and implemented requirements explicitly distinguished.
+The port skill now links the callable PI0.5 preparation contract and requires
+family-specific evidence before declaring support. Preserve native GPU verification
+requirements and distinguish implemented guarantees from the broader target.
 
 Every implementation review includes:
 
@@ -246,7 +265,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | Thor BF16 subset passed; remaining matrix pending | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Stage 2 slice A: BF16 Network extraction implemented | Thor four-case parity passed; performance/full stage pending | Actual slice recorded |
+| PI0.5 | Slices A/B: BF16 Network and explicit Session policy | A: Thor parity passed; B: native verification in progress | Callable interfaces and limits recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |

@@ -30,12 +30,12 @@ mod math;
 mod network;
 #[cfg(feature = "cuda")]
 mod runtime;
+#[cfg(feature = "cuda")]
+mod session;
 mod static_bf16_weights;
 #[cfg(feature = "cuda")]
 mod static_int8_weights;
 mod static_weights;
-#[cfg(feature = "cuda")]
-mod vla_runtime;
 mod weights;
 
 #[cfg(feature = "cuda")]
@@ -80,6 +80,10 @@ pub use runtime::{
     upload_time_embeddings, Pi05ActivationScales, Pi05CapturedGraph, Pi05CudaRuntime,
     Pi05ImageLayout, PrefixKvCache,
 };
+#[cfg(feature = "cuda")]
+pub use session::Pi05Session as Pi05VlaRuntime;
+#[cfg(feature = "cuda")]
+pub use session::{Pi05PreparedInference, Pi05Session};
 pub use static_bf16_weights::{
     Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceLayerNorm, Bf16DeviceVisionBlock,
     StaticBf16Pi05Weights,
@@ -93,8 +97,6 @@ pub use static_weights::{
     DeviceActionLayer, DeviceLanguageLayer, DeviceLayerNorm, DeviceVisionBlock,
     StaticFp8Pi05Weights,
 };
-#[cfg(feature = "cuda")]
-pub use vla_runtime::{Pi05PreparedInference, Pi05VlaRuntime};
 pub use weights::{
     ActionLayerWeights, AdaRmsNormWeights, GemmaAttentionWeights, GemmaMlpWeights,
     LanguageLayerWeights, LayerNormWeights, LinearWeights, Pi05Weights, VisionBlockWeights,
@@ -103,5 +105,5 @@ pub use weights::{
 
 #[cfg(feature = "cuda")]
 pub(crate) fn register_builtin() {
-    crate::registry::register("pi05-cuda", vla_runtime::load_registered);
+    crate::registry::register("pi05-cuda", session::load_registered);
 }

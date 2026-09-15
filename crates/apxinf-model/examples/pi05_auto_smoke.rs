@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{standard_normal_f32, DType, Device, RngKey, Tensor};
 use apxinf_model::{
-    AutoModel, LoadOptions, ModelPrecision, Observation, Pi05Config,
-    VisionObservation, VlaRequest,
+    AutoModel, ExecutionMode, ExecutionPolicy, LoadOptions, ModelPrecision, Observation,
+    Pi05Config, PreparationStatus, VisionObservation, VlaRequest,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.len() < 2 || arguments.len() > 3 {
+    if arguments.len() < 2 || arguments.len() > 4 {
         return Err(format!(
-            "usage: {} <checkpoint-or-directory> [token-count=21]",
+            "usage: {} <checkpoint-or-directory> [token-count=21] [bf16|fp8|w8a8]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -40,7 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = LoadOptions {
         model_name: Some("pi05".to_owned()),
-        precision: ModelPrecision::Bf16,
+        precision: match arguments.get(3).map(String::as_str).unwrap_or("bf16") {
+            "bf16" => ModelPrecision::Bf16,
+            "fp8" => ModelPrecision::Fp8,
+            "w8a8" => ModelPrecision::W8A8,
+            other => return Err(format!("unsupported precision {other}").into()),
+        },
         ..LoadOptions::default()
     };
     let model = AutoModel::load_model(Device::Cuda(0), &checkpoint, &options)?;
@@ -57,8 +62,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let noise = Tensor::zeros(vec![config.action_horizon, config.action_dim], DType::F32);
     let request = VlaRequest::provided(&observation, &noise);
-    let prepared = model.prepare(&observation.inference_spec())?;
+    let spec = observation.inference_spec();
+    let eager = model.prepare_with_policy(&spec, ExecutionPolicy::Eager)?;
+    assert_eq!(
+        eager.status(),
+        PreparationStatus::Ready {
+            mode: ExecutionMode::Eager,
+            fallback_reason: None,
+        }
+    );
+    let eager_values =
+        apxinf_cuda::transfers::to_cpu(eager.run(&request)?.tensor())?.to_f32_vec()?;
+    drop(eager);
+    let prepared = model.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+    assert_eq!(
+        prepared.status(),
+        PreparationStatus::Ready {
+            mode: ExecutionMode::Graph,
+            fallback_reason: None,
+        }
+    );
+    // Cache eviction must not destroy a separately owned prepared plan.
+    model.clear_prepared()?;
+    let mut invalid = observation.clone();
+    invalid.token_ids.push(0);
+    assert!(prepared
+        .run(&VlaRequest::provided(&invalid, &noise))
+        .is_err());
     let prepared_action = prepared.run(&request)?;
+    let graph_values = apxinf_cuda::transfers::to_cpu(prepared_action.tensor())?.to_f32_vec()?;
+    let eager_graph_max_abs = eager_values
+        .iter()
+        .zip(&graph_values)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    if eager_values.len() != graph_values.len()
+        || eager_values
+            .iter()
+            .chain(&graph_values)
+            .any(|v| !v.is_finite())
+        || eager_graph_max_abs > 0.01
+    {
+        return Err(format!("explicit eager/graph mismatch: {eager_graph_max_abs}").into());
+    }
     drop(prepared);
     let inferred_action = model.infer(&request)?;
     let cached_action = model.infer(&request)?;
@@ -84,7 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(&provided_rng_action)
         .map(|(left, right)| left * right)
         .sum::<f32>();
-    let left_norm = generated_first.iter().map(|value| value * value).sum::<f32>();
+    let left_norm = generated_first
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
     let right_norm = provided_rng_action
         .iter()
         .map(|value| value * value)
@@ -115,6 +164,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "explicit_policy_and_eviction_passed": true,
+            "eager_graph_max_abs": eager_graph_max_abs,
             "device": cached_action.tensor().device().to_string(),
             "dtype": cached_action.tensor().dtype().to_string(),
             "prepared_shape": prepared_action.tensor().shape().dims(),

@@ -227,3 +227,27 @@ existing callers. Prefix cache types retain their previous re-export path.
 FP8/W8A8 and public preparation guarantees are unchanged in this slice. The
 Network currently holds BF16 math; generalizing precision and reorganizing
 semantic Blocks remain explicit later work, not claimed by this extraction.
+
+
+### Slice B: concrete Session ownership
+
+```mermaid
+flowchart TB
+    U[LoadedModel Rust facade] --> I[VLA explicit preparation interface]
+    I --> S[pi05/session.rs: Pi05Session]
+    S --> L[Load precision weights and time embeddings]
+    S --> C[One implicit plan cache]
+    S --> P[Pi05PreparedInference: mode, fallback, generation, inputs and RNG binding]
+    P --> R[Precision runtime: graph and workspace]
+    R --> N[BF16 Network: computation and fixed weights]
+    N --> B[Existing Blocks / executors]
+    P --> T[Backend: scoped autotune suppression]
+```
+
+`pi05/vla_runtime.rs` becomes `pi05/session.rs`; `Pi05VlaRuntime` remains a public
+alias for `Pi05Session`. This is a file replacement, not a new parallel hierarchy.
+`vla/mod.rs` owns the small cross-family interface vocabulary; families opt in
+explicitly. `auto.rs` forwards it through LoadedModel. Backend tuning owns the
+thread-local suppression mechanism; neither Network nor Blocks know about
+preparation policy. The Session still contains loading dispatch; separating
+construction and completing FP8/W8A8 Network extraction remain later slices.

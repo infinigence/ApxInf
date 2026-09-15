@@ -31,6 +31,7 @@ pub use profiling::GenerationProfile;
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use registry::{get, list, register};
 pub use vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    VlaRuntime,
 };

@@ -1,6 +1,6 @@
 # Model lifecycle contracts
 
-Status: target specification, not implemented APIs. Current-source baseline and
+Status: target specification plus explicitly marked implemented slices. Current-source baseline and
 module responsibilities are in [architecture.md](architecture.md).
 Implementation order and tracking are in [migration.md](migration.md).
 
@@ -235,3 +235,90 @@ graph parity, state reset, graph reuse/invalidation, fallback/cleanup, cancellat
 and output lifetime as applicable. Measure cold preparation, steady-state latency,
 LLM TTFT/TPOT, and device memory separately. A documentation or CPU check does not
 qualify native GPU execution; unsupported or untested matrix cells remain explicit.
+
+## Implemented PI0.5 preparation contract (Stage 2 slice B)
+
+These Rust interfaces are implemented on the refactor branch. They are not yet a
+claim of full Stage 2 qualification; see the [migration tracker](migration.md).
+PI0.5 supports them for all three RuntimeVariant choices. Other VLA families
+retain their existing prepare path and return an unsupported error for the new
+policy methods; their default status is RuntimeManaged, never a fabricated Ready.
+Python policy behavior and public action decoding are unchanged.
+
+```mermaid
+sequenceDiagram
+    participant C as Rust caller / Policy integration
+    participant S as Pi05Session
+    participant T as Backend tactics
+    participant P as PreparedInference
+    participant N as Network / precision runtime
+    C->>S: prepare_for(real sample, policy)
+    opt backend in AutoTune mode
+        S->>N: eager traversal on real input
+        N->>T: resolve/tune choices
+        S->>S: synchronize and release temporary output
+    end
+    S->>S: allocate fixed inputs and noise generator
+    alt Eager
+        S->>P: retain eager input resources
+    else PreferGraph or RequireGraph
+        S->>N: prepare resources and capture (autotune suppressed)
+        alt capture succeeds
+            S->>P: retain graph and referenced resources
+        else capture fails
+            S->>P: PreferGraph: eager + reason; RequireGraph: error
+        end
+    end
+    S-->>C: owned plan, Ready(Eager/Graph)
+    C->>P: run(request with compatible spec)
+    P->>P: reject stale tactics or mismatched input
+    P->>N: eager or replay, no capture/autotune
+    P-->>C: device Action
+    C->>C: copy output before reusing graph output buffer
+```
+
+`prepare_with_policy(spec, policy)` skips real-input tuning and selects existing
+or default tactics; it never tunes on placeholder data. `prepare_for(sample,
+policy)` permits tuning on the sample first. Legacy `prepare(spec)` maps to
+PreferGraph. Legacy `infer(request)` remains the convenience path that can tune
+and prepare on a cache miss; it is not the fixed-plan low-latency contract.
+
+```rust
+// Callable interfaces, abbreviated result/error types only.
+LoadedModel::prepare_with_policy(&InferenceSpec, ExecutionPolicy)
+    -> Result<Box<dyn PreparedInference>>;
+LoadedModel::prepare_for(&VlaRequest, ExecutionPolicy)
+    -> Result<Box<dyn PreparedInference>>;
+PreparedInference::status() -> PreparationStatus;
+PreparedInference::run(&VlaRequest) -> Result<Action>;
+LoadedModel::clear_prepared() -> Result<()>;
+
+// Example: strict captured inference, explicit re-preparation on invalidation.
+let plan = model.prepare_for(&sample, ExecutionPolicy::RequireGraph)?;
+match plan.status() {
+    PreparationStatus::Ready { mode: ExecutionMode::Graph, .. } => {
+        let action = plan.run(&request)?;
+        // Consume/copy action before another run writes this graph's output.
+    }
+    PreparationStatus::Invalidated => { /* prepare a replacement */ }
+    _ => { /* unsupported or unexpected state for this policy */ }
+}
+```
+
+| Interface / event | Actual guarantee |
+| --- | --- |
+| Eager preparation | No graph attempt; native eager allocations may still occur during run |
+| PreferGraph | Capture attempted during preparation; failure reason retained in Ready(Eager) |
+| RequireGraph | Capture error propagates; no eager plan returned |
+| Ready | Fixed spec and current tuning generation; not readiness for all shapes or models |
+| Tactic generation changes | Graph and eager plans report Invalidated; run rejects them |
+| Invalid input | Run returns an error without automatic plan eviction or recapture |
+| clear_prepared | Synchronizes and evicts the session's implicit cache; explicit plans remain owned by caller |
+| Request reset | PI0.5 binds every input and full RNG key per call; no implicit episode counter to reset |
+| Output | Device tensor; captured result aliases reusable output storage until next run; Tensor clone is not a value snapshot |
+| Concurrency | Fixed-buffer plans run serially; thread-local tuning suppression does not add thread safety |
+
+This slice does not promise allocation-free eager execution, cancellation, a
+full resource budget, or precision-neutral Network construction. Processor
+encode/decode context stays in the existing Python Policy helpers. Broader
+lifecycle guarantees above remain targets until separately implemented and tested.

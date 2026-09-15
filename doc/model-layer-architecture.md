@@ -218,7 +218,9 @@ suite.
 
 The refactor branch's first slice separates BF16 tensor computation into
 `pi05/network.rs` while `bf16_runtime.rs` retains capture and resource ownership.
-Existing public runtime methods delegate for compatibility. FP8/W8A8 and the
-public prepare contract are unchanged. See the [migration tracker](model-lifecycle/migration.md)
+Existing public runtime methods delegate for compatibility. Slice B replaces
+`pi05/vla_runtime.rs` with `pi05/session.rs`, preserving the old type alias and
+adding explicit execution policy, readiness, and plan eviction. FP8/W8A8 math is
+unchanged; the new Session policy applies to all three precision variants. See the [migration tracker](model-lifecycle/migration.md)
 for completed evidence versus remaining work; the target diagrams are not a claim
 that all models have already migrated.
