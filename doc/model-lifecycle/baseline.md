@@ -1,7 +1,8 @@
 # Stage 1: baseline protocol and current coverage
 
-Status: source inventory and local checks complete; first PI0.5 BF16 slice passes
-Thor numerical parity. Full matrix and performance qualification remain pending.
+Status: source inventory and local checks complete; PI0.5 slices A/B pass the
+recorded Thor numerical and Session checks. Full matrix and performance
+qualification remain pending.
 This is the maintained baseline protocol for the refactor, not a new performance
 result. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
@@ -44,8 +45,8 @@ and the corresponding Python policies. All paths are in the selected baseline.
 | Model / precision | Target and assets | Stage-1 status |
 | --- | --- | --- |
 | PI0.5 BF16 | Thor SM110 selected and checkpoint hash verified; Orin SM87 remains a later protocol target | Four two-view H10/H50 × T10/T21 parity cases passed; full matrix pending |
-| PI0.5 static FP8 | Thor SM110; matching checkpoint and calibration required | GPU not run |
-| PI0.5 W8A8 | Orin SM87; current per-channel weight/per-row activation quantization | GPU not run; preserve documented accuracy limitation |
+| PI0.5 static FP8 | Thor SM110; checkpoint/calibration identity verified | Slice B public Session smoke and H50 T10/T21 parity passed; full matrix pending |
+| PI0.5 W8A8 | Orin SM87 deployment target; current per-channel weight/per-row activation quantization | Extra Thor vendor-path smoke/H10 T21 parity passed; Orin not run; preserve documented accuracy limitation |
 | WallOSS BF16 | CUDA path implemented; actual device, checkpoint and raw fixture pending | GPU not run |
 | WallOSS dynamic FP8 | CUDA path implemented; validate target kernel support; static calibration rejected | GPU not run |
 | WallOSS W8A8 | Loader rejects this precision | Unsupported, not a pending test |
@@ -265,3 +266,48 @@ This qualifies numerical parity for this BF16 structural slice. It does not
 qualify reference-policy accuracy, 500 episodes, FP8/W8A8, WallOSS, Orin or the
 remaining shape matrix. Timings are descriptive on the shared GPU; arena
 capacity/used bytes are not total or peak GPU memory. These gates remain open.
+
+## Thor Session slice B evidence (2026-09-15)
+
+Library candidate `f81d02d`; strengthened public smoke `3884257`; immutable
+baseline `c5268b7`. The Session change applies to BF16, static FP8 and W8A8.
+All three precisions pass the strengthened public Session smoke. All seven
+fixed-input comparisons are complete. W8A8 uses the Thor native cuBLAS INT8
+route; this is additional path coverage, not Orin deployment qualification.
+
+| Precision | Two-view fixed-input workloads | Baseline/candidate and eager/graph |
+| --- | --- | --- |
+| BF16 | H10/H50 × T10/T21 | All four elementwise identical; max_abs=0, relative L2=0 |
+| Static FP8 | H50 × T10/T21 | Both elementwise identical; max_abs=0, relative L2=0 |
+| W8A8 (Thor vendor path) | H10, T21 | Elementwise identical; max_abs=0, relative L2=0 |
+
+The final BF16/FP8/W8A8 public smoke tests Eager and RequireGraph, actual Ready mode,
+invalid-spec rejection followed by reuse of the same plan, populated implicit
+cache eviction to unprepared while an explicit plan survives, generated/provided
+noise and deterministic RNG streams. It also exercises raw RGB through public
+Session eager/graph paths on diagnostic zero images. Fixed-image numerical
+fixtures remain separate low-level comparisons, not a claim of closed-loop
+policy success or full processor/action-decoding qualification.
+
+The FP8 profile's full runtime checkpoint identity matches the selected weights;
+256 calibration sites and scale metadata passed preflight. Representative-sample
+quality is inherited from that profile, not newly calibrated in this run.
+Task-local profiles reference existing weights/calibration/tactics; originals
+remain unchanged. Kernel build ID and archive SHA256 remain the slice A values.
+All 23 operator objects were reused, with zero CUDA translation-unit compilation
+in this slice. Host Rust code and test runners were relinked.
+
+Local CPU tests: 107 passed. CUDA-feature examples/tests typecheck passes on
+macOS, but native linking there is unavailable without CUDA. Thor native Session
+unit tests: 3 passed; nested/thread-local/unwind-safe autotune guard test: 1 passed.
+The native smoke uses configured inference tactics; it does not establish full
+online tuning/invalidation or forced capture-failure recovery coverage.
+
+Private evidence lives under
+`devlocal/model-lifecycle-refactor/thor-baseline/session-b/`: public smoke logs,
+`reports/validation.md`, source/build manifests and
+`results/numerical-summary.json`, `results/w8a8-summary.json` and
+`results/final-public-smoke-summary.json`. Source fingerprints distinguish the original
+policy smoke from the strengthened populated-cache/raw-RGB smoke. Shared-host
+latencies remain descriptive; complete performance/peak-memory and Orin gates
+remain open. Stage 2 computation/Blocks work is tracked in migration.md.

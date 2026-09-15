@@ -313,6 +313,7 @@ match plan.status() {
 | Ready | Fixed spec and current tuning generation; not readiness for all shapes or models |
 | Tactic generation changes | Graph and eager plans report Invalidated; run rejects them |
 | Invalid input | Run returns an error without automatic plan eviction or recapture |
+| execution_mode on Session | Reports the implicit cache only; use plan.status() for explicitly owned plans |
 | clear_prepared | Synchronizes and evicts the session's implicit cache; explicit plans remain owned by caller |
 | Request reset | PI0.5 binds every input and full RNG key per call; no implicit episode counter to reset |
 | Output | Device tensor; captured result aliases reusable output storage until next run; Tensor clone is not a value snapshot |

@@ -121,10 +121,31 @@ See [the callable lifecycle contract](lifecycle.md#implemented-pi05-preparation-
 for output aliasing and remaining limitations. Host-side tuning suppression is
 scoped and unwind-safe; operator sources and build flags are unchanged.
 
-Validation: local CUDA-feature examples/tests typecheck; macOS native test
-linking is unavailable without CUDA. Thor BF16/FP8 native policy and parity
-qualification is in progress. W8A8/Orin, forced native capture-failure cleanup,
-full resource/performance gates and later Stage 2 slices remain open.
+Validation: 107 local CPU tests and CUDA-feature examples/tests typecheck pass;
+macOS native CUDA test linking is unavailable. Thor passes three Session unit
+tests and one tuning-guard test. Final public smoke `3884257` passes on BF16,
+FP8 and W8A8: actual Eager/RequireGraph, populated cache eviction, invalid-spec
+recovery, RNG and raw RGB paths. All seven fixed-input comparisons are exact
+(four BF16, two FP8, one Thor W8A8). Library code is `f81d02d`; no CUDA operator
+was compiled. See [slice B evidence](baseline.md#thor-session-slice-b-evidence-2026-09-15).
+Orin, full online tuning/invalidation, forced native capture-failure cleanup,
+resource/performance gates and remaining computation/Blocks work stay open.
+
+### Stage 2 exit checklist
+
+| Requirement | Status after slices A/B |
+| --- | --- |
+| BF16 computation separated from capture/cache | Implemented; slice A native parity passed |
+| Explicit preparation policy and actual readiness | Implemented for PI0.5; BF16/FP8/W8A8 Thor public smoke passed |
+| No hidden capture/autotune in compatible prepared run | Implemented; real-sample tuning is a separate preparation path |
+| Request input/RNG rebinding versus plan eviction | Explicit; retained plans survive implicit-cache eviction |
+| FP8/W8A8 computation separated from resource owners | Pending; Session dispatch is unified but their computation still resides in precision runtimes |
+| Network/semantic Blocks organization | BF16 extraction only; remaining topology cleanup pending |
+| Native failure cleanup and invalidation lifecycle coverage | Policy failure selection tested; forced native failure and full stale-plan lifecycle evidence pending |
+| Resource/performance and requested target matrix | Shared Thor evidence only; Orin and uncontended budgets pending |
+
+Stage 2 remains in progress. Successful public preparation tests do not close
+remaining computation ownership or hardware qualification work.
 
 ## Stage 3: WallOSS; extract proven common mechanisms
 
@@ -265,7 +286,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | Thor BF16 subset passed; remaining matrix pending | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Slices A/B: BF16 Network and explicit Session policy | A: Thor parity passed; B: native verification in progress | Callable interfaces and limits recorded |
+| PI0.5 | Slices A/B: BF16 Network and explicit Session policy | A/B: recorded Thor parity and Session tests passed; complete budgets/matrix pending | Callable interfaces and limits recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |
