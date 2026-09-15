@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace {
 #include "../kernels/custom/math.cuh"
@@ -324,6 +325,82 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
+    const void* images, void* patches, int views, int image_size,
+    int patch_size, int temporal_patch_size, int merge_size, int layout,
+    double rescale_factor, float mean0, float mean1, float mean2,
+    float std0, float std1, float std2,
+    cudaStream_t stream) {
+  if (images == nullptr || patches == nullptr || views <= 0 ||
+      image_size <= 0 || patch_size <= 0 || temporal_patch_size <= 0 ||
+      merge_size <= 0 || (layout != 0 && layout != 1) ||
+      !std::isfinite(rescale_factor) || !(rescale_factor > 0.0f) ||
+      !std::isfinite(mean0) || !std::isfinite(mean1) ||
+      !std::isfinite(mean2) || !std::isfinite(std0) ||
+      !std::isfinite(std1) || !std::isfinite(std2) || !(std0 > 0.0f) ||
+      !(std1 > 0.0f) || !(std2 > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+
+  constexpr int64_t kMaxKernelInt = std::numeric_limits<int>::max();
+  constexpr int64_t kMaxKernelIndex = std::numeric_limits<int64_t>::max();
+  const int64_t patch_merge =
+      static_cast<int64_t>(patch_size) * merge_size;
+  if (patch_merge > image_size || image_size % patch_merge != 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int64_t grid_size64 = image_size / patch_size;
+  const int64_t rows_per_view64 = grid_size64 * grid_size64;
+  const int64_t patch_area64 =
+      static_cast<int64_t>(patch_size) * patch_size;
+  if (rows_per_view64 > kMaxKernelInt || patch_area64 > kMaxKernelInt) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t three_patch_area64 = 3 * patch_area64;
+  if (temporal_patch_size > kMaxKernelInt / three_patch_area64 ||
+      views > kMaxKernelInt / rows_per_view64) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t patch_width64 =
+      static_cast<int64_t>(temporal_patch_size) * three_patch_area64;
+  const int64_t patch_rows64 =
+      static_cast<int64_t>(views) * rows_per_view64;
+  if (patch_rows64 > kMaxKernelIndex / patch_width64) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t pixels_per_view64 =
+      static_cast<int64_t>(image_size) * image_size;
+  if (pixels_per_view64 > kMaxKernelIndex / 3 ||
+      views > kMaxKernelIndex / (3 * pixels_per_view64)) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int grid_size = static_cast<int>(grid_size64);
+  const int patch_width = static_cast<int>(patch_width64);
+  const int64_t count = patch_rows64 * patch_width64;
+  constexpr int threads = 256;
+  // Avoid overflowing at the accepted int64_t element-count boundary.
+  const int64_t requested_blocks =
+      count / threads + (count % threads != 0 ? 1 : 0);
+  const int blocks =
+      static_cast<int>(requested_blocks > 1024 ? 1024 : requested_blocks);
+  if (layout == 0) {
+    rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel<true><<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(images),
+        static_cast<__nv_bfloat16*>(patches), views, image_size, patch_size,
+        temporal_patch_size, merge_size, rescale_factor, mean0, mean1, mean2,
+        std0, std1, std2);
+  } else {
+    rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel<false><<<blocks, threads, 0, stream>>>(
+        static_cast<const uint8_t*>(images),
+        static_cast<__nv_bfloat16*>(patches), views, image_size, patch_size,
+        temporal_patch_size, merge_size, rescale_factor, mean0, mean1, mean2,
+        std0, std1, std2);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_mqa_flash_f16(
     const void* q, const void* prefix_k, const void* prefix_v,
     const void* suffix_k, const void* suffix_v, void* output,
@@ -353,6 +430,24 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+  const int threads = 256;
+  layer_norm_quant_bf16_e4m3_kernel<<<rows, threads, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), rows, cols, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_layer_norm_quant_f16_e4m3(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
@@ -374,6 +469,25 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_f16_e4m3(
   bias_gelu_quant_f16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const half*>(input), static_cast<const half*>(bias),
       static_cast<__nv_fp8_e4m3*>(output), count, cols, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  const int64_t quad_count = static_cast<int64_t>(rows) * cols / 4;
+  int blocks = static_cast<int>((quad_count + threads - 1) / threads);
+  blocks = blocks > 1024 ? 1024 : blocks;
+  bias_gelu_quant_bf16_e4m3_packed4_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), quad_count, cols, 1.0f / scale);
   return cudaGetLastError();
 }
 

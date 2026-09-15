@@ -1,0 +1,15 @@
+#pragma once
+
+#include <stdint.h>
+
+typedef int32_t apxinf_status_t;
+
+enum {
+  APXINF_STATUS_OK = 0,
+  APXINF_STATUS_INVALID_ARGUMENT = 1,
+  APXINF_STATUS_UNSUPPORTED = 2,
+  APXINF_STATUS_CUDA_ERROR = 3,
+  APXINF_STATUS_PROVIDER_ERROR = 4,
+  APXINF_STATUS_CACHE_MISS = 5,
+  APXINF_STATUS_INTERNAL_ERROR = 6,
+};

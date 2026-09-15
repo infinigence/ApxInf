@@ -32,7 +32,7 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
         TacticBackend::Vendor if tactic.value == 0 => match key.op {
             // Native FP8 uses cuBLASLt even for the safe default. Explicitly
             // restore rank zero after candidate probing mutates its plan map.
-            GemmOp::Fp8F16 => cublaslt::prepare(
+            GemmOp::Fp8F16 | GemmOp::Fp8Bf16 => cublaslt::prepare(
                 key,
                 TacticId {
                     backend: TacticBackend::CublasLt,
@@ -61,7 +61,7 @@ pub(super) fn candidates(
             value: 0,
         },
     });
-    if matches!(key.op, GemmOp::Bf16 | GemmOp::Fp8F16) {
+    if matches!(key.op, GemmOp::Bf16 | GemmOp::Fp8F16 | GemmOp::Fp8Bf16) {
         tactics.extend(
             cublaslt::candidates(key, max_cublaslt_algorithms)
                 .into_iter()

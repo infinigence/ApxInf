@@ -21,16 +21,22 @@ resize remains inside the selected policy.
 key is ``(suite, task_id, trial_id)`` so multiple suites share one resumable
 account without ``task_id=0`` colliding across suites.
 
-Adding a new model needs no change here: register a policy in ``apxinf.policies``
-(``@register_policy("<name>")``) and run ``--backend in-process --model-type
-<name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
+Model loading remains registry-driven. Dataset/model-specific state or action
+conventions are explicit adapters in ``scripts/libero_observation.py`` rather
+than being hidden in the shared rollout loop.
+
+This script exists so a kernel change, an FP8 recalibration or a tactic bump can
+be regressed end-to-end against ApxInf's own published LIBERO numbers. The
+observation conversion it uses is mirrored elsewhere; see
+``scripts/libero_observation.py`` on keeping the two in step.
 
     # websocket (server already running)
     python scripts/eval_libero.py --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
 
-    # in-process (no server)
+    # in-process GR00T (no server)
     python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+        --backbone /path/to/Cosmos-Reason2-2B \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -39,29 +45,47 @@ from __future__ import annotations
 
 import argparse
 import collections
-import functools
 import json
 import os
 import pathlib
 import sys
 import time
 import traceback
-from typing import Optional, Protocol, Tuple
+from typing import Any, NamedTuple, Optional, Protocol, Tuple
 
 import numpy as np
 
 if __package__:
-    from .libero_observation import libero_images, libero_state, make_env
+    from .libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 else:
-    from libero_observation import libero_images, libero_state, make_env
+    from libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 
 # --- rollout protocol constants (OpenPI's public PI0.5 LIBERO configuration) ---
 LIBERO_ACTION_DIM = 7
 
-#: The preset whose wire contract this evaluator drives. The keys themselves are
-#: *not* restated here: they are read from the table below, so the evaluator and
-#: the server cannot drift into two different dialects of "LIBERO".
-LIBERO_PRESET = "franka_libero"
+#: LIBERO's wire dialect, mirroring openpi's ``LiberoInputs``. Stated here rather
+#: than looked up: this file *is* the LIBERO evaluator, and LIBERO's keys are
+#: fixed by the published benchmark, so naming them is not a second source of
+#: truth for anything that varies. ``--image-keys`` / ``--state-key`` override
+#: them so a checkpoint trained under other keys can still be scored on the suite.
+LIBERO_IMAGE_KEYS = ("observation/image", "observation/wrist_image")
+LIBERO_STATE_KEY = "observation/state"
+LIBERO_PROMPT_KEY = "prompt"
+
 MAX_STEPS = 520
 WAIT_STEPS = 10
 REPLAN_STEPS = 5
@@ -78,6 +102,38 @@ ALL_SUITES = (
 LedgerKey = Tuple[str, int, int]  # (suite, task_id, trial_id)
 
 
+class WireKeys(NamedTuple):
+    """What this evaluator puts on the wire, resolved once from the arguments."""
+
+    image_keys: Tuple[str, str]
+    state_key: str
+    prompt_key: str
+
+
+def _two_image_keys(value: str) -> Tuple[str, str]:
+    """Parse ``--image-keys base,wrist``.
+
+    Rejects any other count here rather than in the policy: LIBERO renders exactly
+    two cameras, and a third name would silently address a view the simulator
+    never fills.
+    """
+    keys = tuple(part.strip() for part in value.split(",") if part.strip())
+    if len(keys) != 2:
+        raise argparse.ArgumentTypeError(
+            f"expected two comma-separated keys (base,wrist), got {len(keys)}: {value!r}"
+        )
+    return keys
+
+
+def resolve_wire_keys(args: argparse.Namespace) -> WireKeys:
+    image_keys = getattr(args, "image_keys", None) or LIBERO_IMAGE_KEYS
+    return WireKeys(
+        image_keys=(image_keys[0], image_keys[1]),
+        state_key=getattr(args, "state_key", None) or LIBERO_STATE_KEY,
+        prompt_key=getattr(args, "prompt_key", None) or LIBERO_PROMPT_KEY,
+    )
+
+
 def _add_apxinf_to_path() -> None:
     """Make ``import apxinf`` work from a source checkout, idempotently."""
     package_dir = pathlib.Path(__file__).resolve().parents[1] / "python" / "apxinf"
@@ -85,25 +141,16 @@ def _add_apxinf_to_path() -> None:
         sys.path.insert(0, str(package_dir))
 
 
-@functools.lru_cache(maxsize=1)
-def libero_convention():
-    """LIBERO's wire dialect, read from the preset table rather than restated.
-
-    Both backends send the same observation, so both resolve it here: the keys
-    the evaluator writes are by construction the keys ``--robot franka_libero``
-    serves. Importing ``apxinf`` costs no CUDA (the binding is loaded lazily by
-    ``from_pretrained``), so the websocket backend pays nothing for this.
-    """
-    _add_apxinf_to_path()
-    from apxinf import get_robot_preset
-
-    return get_robot_preset(LIBERO_PRESET).convention
-
-
 # --- LIBERO harness (inlined; was scripts/libero_harness.py) ------------------
 
 
-def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
+def completed_runs(
+    path: pathlib.Path,
+    precision: str,
+    *,
+    max_steps: Optional[int] = None,
+    replan_steps: Optional[int] = None,
+) -> dict[LedgerKey, dict]:
     """Load the ``status == "completed"`` rows from a resumable ledger.
 
     Keyed by ``(suite, task_id, trial_id)`` so one ledger can hold several suites
@@ -124,6 +171,22 @@ def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
                 f"at line {line_number}"
             )
         if item.get("status") == "completed":
+            # Rows written before rollout-protocol fields were added used the
+            # evaluator's historical OpenPI defaults (520/5). Preserve their
+            # resumability while still rejecting an attempt to reuse them for
+            # an explicitly different protocol such as GR00T's 720/8.
+            item_max_steps = item.get("max_steps", MAX_STEPS)
+            item_replan_steps = item.get("replan_steps", REPLAN_STEPS)
+            if max_steps is not None and item_max_steps != max_steps:
+                raise ValueError(
+                    f"ledger max_steps is {item_max_steps!r}, requested "
+                    f"{max_steps!r} at line {line_number}"
+                )
+            if replan_steps is not None and item_replan_steps != replan_steps:
+                raise ValueError(
+                    f"ledger replan_steps is {item_replan_steps!r}, requested "
+                    f"{replan_steps!r} at line {line_number}"
+                )
             key: LedgerKey = (
                 str(item["suite"]),
                 int(item["task_id"]),
@@ -149,6 +212,9 @@ def write_summary(
     expected_keys: set[LedgerKey],
     precision: str,
     transport: str,
+    *,
+    max_steps: int = MAX_STEPS,
+    replan_steps: int = REPLAN_STEPS,
 ) -> None:
     """Write the aggregate summary, grouped per-suite then per-task."""
     per_suite: dict[str, dict] = {}
@@ -182,6 +248,11 @@ def write_summary(
         "suites": sorted({key[0] for key in expected_keys}),
         "transport": transport,
         "precision": precision,
+        "rollout_protocol": {
+            "max_steps": max_steps,
+            "replan_steps": replan_steps,
+            "wait_steps": WAIT_STEPS,
+        },
         "expected_runs": len(expected_keys),
         "completed_runs": len(rows),
         "missing_runs": [
@@ -258,11 +329,15 @@ class Backend(Protocol):
     #: Static description sent by / read from the underlying policy.
     metadata: dict
 
+    def state_from_observation(self, observation) -> Any:
+        """Return the state representation expected by the selected policy."""
+        ...
+
     def infer(
         self,
         base: np.ndarray,
         wrist: np.ndarray,
-        state: np.ndarray,
+        state: Any,
         prompt: str,
         noise: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
@@ -273,22 +348,24 @@ class Backend(Protocol):
         ...
 
 
-def _observation(base, wrist, state, prompt) -> dict:
+def _observation(base, wrist, state: Any, prompt, keys: WireKeys) -> dict:
     """The OpenPI LIBERO observation both backends consume, identical on the wire
-    and in-process. Keys come from the preset table, not from constants here."""
-    convention = libero_convention()
+    and in-process. The keys are resolved once per run, so what the evaluator
+    sends and what the policy is built to read cannot drift apart mid-rollout."""
     return {
-        convention.image_keys[0]: base,
-        convention.image_keys[1]: wrist,
-        convention.state_key: state,
-        convention.prompt_key: prompt,
+        keys.image_keys[0]: base,
+        keys.image_keys[1]: wrist,
+        keys.state_key: state,
+        keys.prompt_key: prompt,
     }
 
 
 class WebsocketBackend:
     """Reach an OpenPI-compatible server through the unmodified ``openpi_client``."""
 
-    def __init__(self, host: str, port: int, expected_precision: str) -> None:
+    def __init__(
+        self, host: str, port: int, expected_precision: str, keys: WireKeys
+    ) -> None:
         from openpi_client import websocket_client_policy
 
         # WebsocketClientPolicy honours the ambient proxy; exempt the target host
@@ -301,19 +378,47 @@ class WebsocketBackend:
             os.environ[variable] = ",".join(entries)
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port)
         self.metadata = self._client.get_server_metadata()
+        self._keys = keys
         actual_precision = self.metadata.get("precision")
         if actual_precision != expected_precision:
             self.close()
             raise RuntimeError(
                 f"server precision is {actual_precision!r}, expected {expected_precision!r}"
             )
+        self._assert_server_speaks_the_same_dialect()
+
+    def _assert_server_speaks_the_same_dialect(self) -> None:
+        """Fail at connect rather than score a run on ignored observations.
+
+        The server publishes the keys it will actually read. Sending different
+        ones does not raise for the *state* key — it is simply absent, the policy
+        proceeds without proprioception, and the run finishes with a plausible,
+        wrong success rate. Compare what the metadata reports, when it reports it.
+        """
+        served_images = self.metadata.get("image_keys")
+        if served_images is not None and tuple(served_images) != self._keys.image_keys:
+            self.close()
+            raise RuntimeError(
+                f"server serves image_keys={list(served_images)} but this run sends "
+                f"{list(self._keys.image_keys)}; pass --image-keys to match it"
+            )
+        if "state_key" in self.metadata:
+            served_state = self.metadata["state_key"]
+            if served_state is not None and served_state != self._keys.state_key:
+                self.close()
+                raise RuntimeError(
+                    f"server serves state_key={served_state!r} but this run sends "
+                    f"{self._keys.state_key!r}; pass --state-key to match it"
+                )
 
     def infer(
         self, base, wrist, state, prompt, noise=None
     ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
         if noise is not None:
             raise RuntimeError("warm-start noise requires --backend in-process")
-        response = self._client.infer(_observation(base, wrist, state, prompt))
+        response = self._client.infer(
+            _observation(base, wrist, state, prompt, self._keys)
+        )
         actions = np.asarray(response["actions"], dtype=np.float32)
         # Only OpenPI-contract keys ride the wire; ``policy_timing`` /
         # ``server_timing`` are the server's tolerated diagnostic namespaces.
@@ -333,6 +438,11 @@ class WebsocketBackend:
             "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
         }
 
+    def state_from_observation(self, observation) -> np.ndarray:
+        # Preserve the established OpenPI wire contract. A GR00T websocket
+        # server can expose its own adapter without changing this evaluator.
+        return libero_state(observation)
+
     def close(self) -> None:
         connection = getattr(self._client, "_ws", None)
         if connection is not None:
@@ -347,13 +457,15 @@ class InProcessBackend:
     so a future ``GrootPolicy`` runs here with no change to this file.
     """
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, keys: WireKeys) -> None:
         # Lazy: importing apxinf pulls in the policy stack; websocket-only users
         # never pay for it. Make ``import apxinf`` work from a source checkout.
         _add_apxinf_to_path()
         from apxinf import AutoPolicy
 
+        self._keys = keys
         options = {
+            "backbone": args.backbone,
             "checkpoint": args.checkpoint,
             "calibration": args.calibration,
             "tactics": args.tactics,
@@ -367,30 +479,39 @@ class InProcessBackend:
             "discrete_state": args.discrete_state,
             "seed": args.model_seed if args.model_seed is not None else args.seed,
         }
-        convention = libero_convention()
         self._policy = AutoPolicy.from_pretrained(
             args.model_dir,
             model_type=args.model_type,
             device=args.device,
             precision=args.precision,
             action_dim=(args.action_dim or None),
-            # LIBERO's wire keys, read from the ``franka_libero`` preset rather
-            # than restated: the policy layer holds no dataset's convention as a
-            # default, and this evaluator should not become a second source of
-            # truth for what "LIBERO keys" means.
-            image_keys=convention.image_keys,
-            state_key=convention.state_key,
-            prompt_key=convention.prompt_key,
+            # The same keys the websocket backend puts on the wire, so the two
+            # backends are comparable by construction: the policy layer holds no
+            # dataset's keys as a default, and a run that scored one dialect
+            # in-process and another over the wire would be meaningless.
+            image_keys=keys.image_keys,
+            state_key=keys.state_key,
+            prompt_key=keys.prompt_key,
             metadata={"precision": args.precision, "policy": "libero"},
             **{name: value for name, value in options.items() if value is not None},
         )
         self.metadata = dict(getattr(self._policy, "metadata", {}))
+        self._is_gr00t = self.metadata.get("model_type") == "gr00t"
+
+    def state_from_observation(self, observation):
+        if self._is_gr00t:
+            return libero_gr00t_state(observation)
+        return libero_state(observation)
 
     def infer(
         self, base, wrist, state, prompt, noise=None
     ) -> Tuple[np.ndarray, np.ndarray, dict]:
-        result = self._policy.infer(_observation(base, wrist, state, prompt), noise=noise)
+        result = self._policy.infer(
+            _observation(base, wrist, state, prompt, self._keys), noise=noise
+        )
         actions = np.asarray(result["actions"], dtype=np.float32)
+        if self._is_gr00t:
+            actions = libero_gr00t_action(actions)
         normalized = np.asarray(result["normalized_actions"], dtype=np.float32)
         timing = result.get("timing", {}) or {}
         model_ms = float(timing.get("model_ms", 0.0))
@@ -407,9 +528,10 @@ class InProcessBackend:
 
 
 def build_backend(args: argparse.Namespace) -> Backend:
+    keys = resolve_wire_keys(args)
     if args.backend == "websocket":
-        return WebsocketBackend(args.host, args.port, args.precision)
-    return InProcessBackend(args)
+        return WebsocketBackend(args.host, args.port, args.precision, keys)
+    return InProcessBackend(args, keys)
 
 
 # --- rollout ------------------------------------------------------------------
@@ -429,6 +551,7 @@ def run_episode(
     warm_start_alpha: float,
     replan_steps: int = REPLAN_STEPS,
     settle_gripper: float = -1.0,
+    max_steps: int = MAX_STEPS,
 ) -> dict:
     episode_started = time.perf_counter()
     env.reset()
@@ -460,14 +583,14 @@ def run_episode(
     warm_noise_checksum = None
     rng = np.random.default_rng(seed + 1_000_003 * task_id + 10_007 * trial_id)
 
-    while action_steps < MAX_STEPS:
+    while action_steps < max_steps:
         if not action_plan:
             preprocess_started = time.perf_counter()
             images = libero_images(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
             )
-            state = libero_state(observation)
+            state = backend.state_from_observation(observation)
             preprocess_seconds += time.perf_counter() - preprocess_started
 
             noise = None
@@ -563,6 +686,8 @@ def run_episode(
         "transport": transport,
         "image_input": "openpi_uint8_hwc",
         "seed": seed,
+        "max_steps": max_steps,
+        "replan_steps": replan_steps,
     }
 
 
@@ -589,6 +714,12 @@ def parse_args() -> argparse.Namespace:
         help="in-process model sampling seed (default: reuse --seed)",
     )
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"maximum simulator action steps per episode (default: {MAX_STEPS})",
+    )
+    parser.add_argument(
         "--replan-steps",
         type=int,
         default=REPLAN_STEPS,
@@ -604,6 +735,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-jsonl", required=True, type=pathlib.Path)
     parser.add_argument("--summary-json", required=True, type=pathlib.Path)
 
+    wire = parser.add_argument_group(
+        "wire keys",
+        "Override the names this evaluator sends observations under. The defaults "
+        "are LIBERO's own; change them only to score a checkpoint that was trained "
+        "against a differently named recording of the same suite.",
+    )
+    wire.add_argument(
+        "--image-keys",
+        type=_two_image_keys,
+        metavar="BASE,WRIST",
+        help=f"default: {','.join(LIBERO_IMAGE_KEYS)}",
+    )
+    wire.add_argument("--state-key", help=f"default: {LIBERO_STATE_KEY}")
+    wire.add_argument("--prompt-key", help=f"default: {LIBERO_PROMPT_KEY}")
+
     websocket = parser.add_argument_group("websocket backend")
     websocket.add_argument("--host", default="127.0.0.1")
     websocket.add_argument("--port", type=int, default=8000)
@@ -611,6 +757,11 @@ def parse_args() -> argparse.Namespace:
     in_process = parser.add_argument_group("in-process backend")
     in_process.add_argument("--model-dir", type=pathlib.Path)
     in_process.add_argument("--model-type", default=None, help="override config.json model type")
+    in_process.add_argument(
+        "--backbone",
+        type=pathlib.Path,
+        help="named backbone asset required by models such as GR00T N1.7",
+    )
     in_process.add_argument("--checkpoint", type=pathlib.Path)
     in_process.add_argument("--device", default="cuda:0")
     in_process.add_argument("--calibration", type=pathlib.Path)
@@ -718,6 +869,8 @@ def parse_args() -> argparse.Namespace:
             )
     if args.replan_steps <= 0:
         parser.error("--replan-steps must be positive")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
     if args.trials_per_task <= 0 or args.trials_per_task > 50:
         parser.error("--trials-per-task must be in 1..=50")
     return args
@@ -767,13 +920,26 @@ def main() -> None:
         for task_id in task_ids
         for trial_id in range(args.trials_per_task)
     }
-    ledger = completed_runs(args.results_jsonl, args.precision)
+    ledger = completed_runs(
+        args.results_jsonl,
+        args.precision,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     unexpected = set(ledger) - expected_keys
     if unexpected:
         raise ValueError(
             f"ledger contains runs outside requested scope: {sorted(unexpected)}"
         )
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
 
     backend = build_backend(args)
     print(f"backend={args.backend} metadata={backend.metadata}", flush=True)
@@ -791,7 +957,7 @@ def main() -> None:
                     print(f"{name} task {task_id}: already complete", flush=True)
                     continue
                 print(f"{name} task {task_id}: pending trials {pending}", flush=True)
-                initial_states = suite.get_task_init_states(task_id)
+                initial_states = load_libero_init_states(suite, task_id)
                 env = make_env(task, args.seed)
                 try:
                     for trial_id in pending:
@@ -809,8 +975,9 @@ def main() -> None:
                                     args.seed,
                                     args.warm_start,
                                     args.warm_start_alpha,
-                                    args.replan_steps,
-                                    args.settle_gripper,
+                                    replan_steps=args.replan_steps,
+                                    settle_gripper=args.settle_gripper,
+                                    max_steps=args.max_steps,
                                 )
                                 record["attempt"] = attempt
                                 record["precision"] = args.precision
@@ -819,6 +986,8 @@ def main() -> None:
                                 write_summary(
                                     args.summary_json, ledger, expected_keys,
                                     args.precision, transport,
+                                    max_steps=args.max_steps,
+                                    replan_steps=args.replan_steps,
                                 )
                                 print(
                                     f"{name} task={task_id} trial={trial_id} "
@@ -855,7 +1024,15 @@ def main() -> None:
     finally:
         backend.close()
 
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     missing = expected_keys - set(ledger)
     if missing:
         raise RuntimeError(f"evaluation incomplete; missing {sorted(missing)}")

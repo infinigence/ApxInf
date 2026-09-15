@@ -63,12 +63,27 @@ pub enum InitialLatent<'a> {
     Provided(&'a Tensor),
 }
 
+/// Optional typed metadata emitted by preprocessors for VLA families whose
+/// inputs include more than image patches and token IDs.
+///
+/// Keeping these fields on the request preserves the stable observation shape
+/// used by existing PI0.5 and WallOSS callers. A runtime that requires one of
+/// these fields validates it explicitly; other runtimes ignore the empty
+/// default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VlaMetadata<'a> {
+    pub attention_mask: Option<&'a [u8]>,
+    pub image_grid_thw: Option<&'a [[u32; 3]]>,
+    pub embodiment_id: Option<usize>,
+}
+
 /// Complete VLA request: an environment observation plus the model-generation
 /// input that is deliberately not part of the observation itself.
 #[derive(Clone, Copy, Debug)]
 pub struct VlaRequest<'a> {
     pub observation: &'a Observation,
     pub initial_latent: InitialLatent<'a>,
+    pub metadata: VlaMetadata<'a>,
 }
 
 impl<'a> VlaRequest<'a> {
@@ -76,6 +91,11 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Generate { rng },
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+            },
         }
     }
 
@@ -83,6 +103,35 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Provided(latent),
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+            },
+        }
+    }
+
+    pub const fn generated_with_metadata(
+        observation: &'a Observation,
+        rng: RngKey,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Generate { rng },
+            metadata,
+        }
+    }
+
+    pub const fn provided_with_metadata(
+        observation: &'a Observation,
+        latent: &'a Tensor,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Provided(latent),
+            metadata,
         }
     }
 }
@@ -169,6 +218,12 @@ pub trait VlaRuntime {
 
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
+
+    /// Current execution path for diagnostics and benchmarks. Implementations
+    /// should report an eager fallback explicitly after a graph attempt.
+    fn execution_mode(&self) -> &'static str {
+        "runtime-managed"
+    }
 
     /// Run inference and copy the resulting action to host as `f32`.
     ///

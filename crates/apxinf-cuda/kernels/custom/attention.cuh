@@ -57,8 +57,12 @@ __global__ void attention_softmax_f32_kernel(
     const float* scores, float* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads)
 {
-    uint32_t row = blockIdx.y;
-    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    // Grid is 1-D: one block per (row, col-tile). Recover the row from the
+    // flat block id because dim3.y is capped at 65535 and rows can exceed it
+    // (seq_len * n_heads for long prefills, e.g. Qwen3-VL-4B image prefill).
+    uint32_t n_col_blocks = (cols + blockDim.x - 1) / blockDim.x;
+    uint32_t row = blockIdx.x / n_col_blocks;
+    uint32_t col = (blockIdx.x % n_col_blocks) * blockDim.x + threadIdx.x;
     if (row >= rows) return;
 
     // Map row index to sequence position: each position has n_heads rows
@@ -169,8 +173,11 @@ __global__ void attention_softmax_bf16_kernel(
     const __nv_bfloat16* scores, __nv_bfloat16* output,
     uint32_t cols, uint32_t rows, uint32_t kv_offset, uint32_t n_heads)
 {
-    uint32_t row = blockIdx.y;
-    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    // Grid is 1-D (see attention_softmax_f32_kernel): dim3.y is capped at
+    // 65535 but rows = seq_len * n_heads can exceed it on multimodal prefills.
+    uint32_t n_col_blocks = (cols + blockDim.x - 1) / blockDim.x;
+    uint32_t row = blockIdx.x / n_col_blocks;
+    uint32_t col = (blockIdx.x % n_col_blocks) * blockDim.x + threadIdx.x;
     if (row >= rows) return;
 
     uint32_t seq_pos = row / n_heads;
@@ -249,33 +256,37 @@ __global__ void vision_sdpa_bf16_kernel(
     uint32_t head = blockIdx.y;
     uint32_t qi   = blockIdx.x;
     if (qi >= seq_len) return;
-    int tid = threadIdx.x;       // 0..31
-    int half = head_dim / 2;     // 32 for head_dim=64
-    int d0 = tid;                // first element this thread owns
-    int d1 = tid + half;         // second element
+    int tid = threadIdx.x;          // 0..31 (one warp)
+
+    // Generic head_dim: each thread owns columns d = tid + 32*j. Works for
+    // head_dim=64 (2 cols/thread) and head_dim=72 (3 cols for the first 8
+    // threads, 2 for the rest). Out-of-range lanes are masked but stay
+    // converged so every __shfl_xor_sync uses the full warp mask.
+    int n_per = (head_dim + 31) / 32;
 
     extern __shared__ float smem[];
-    float* scores = smem;        // [seq_len] + 1 scratch slot
+    float* scores = smem;           // [seq_len] + 1 scratch slot
 
-    const __nv_bfloat16* q_row = q  + qi * n_heads * head_dim + head * head_dim;
-    float q0 = __bfloat162float(q_row[d0]);
-    float q1 = __bfloat162float(q_row[d1]);
+    const __nv_bfloat16* q_row = q + qi * n_heads * head_dim + head * head_dim;
 
-    // Phase 1: scores[ki] = (Q[qi] · K[ki]) * scale. All threads iterate
-    // every ki so the shfl reduction stays converged.
+    // Phase 1: scores[ki] = (Q[qi] . K[ki]) * scale. All threads iterate
+    // every ki so the warp stays converged; per-thread partial dots are
+    // summed with a full-mask shuffle reduction.
     for (uint32_t ki = 0; ki < seq_len; ki++) {
         const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
-        float dot = q0 * __bfloat162float(k_row[d0])
-                  + q1 * __bfloat162float(k_row[d1]);
-        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+        float dot = 0.0f;
+        for (int j = 0; j < n_per; j++) {
+            int d = tid + 32 * j;
+            if (d < (int)head_dim)
+                dot += __bfloat162float(q_row[d]) * __bfloat162float(k_row[d]);
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffff, dot, off);
         if (tid == 0) scores[ki] = dot * scale;
     }
     __syncthreads();
 
-    // Phase 2: softmax (max → exp → sum → normalize).
-    // For seq_len > 32, the max/sum reductions are strided — but the shfl
-    // only needs the threads that have data. Use mask = __activemask() to
-    // avoid deadlocks when some threads drop out.
+    // Phase 2: online-style softmax over seq_len scores (strided reads).
     float max_val = -INFINITY;
     for (uint32_t ki = tid; ki < seq_len; ki += 32u)
         max_val = fmaxf(max_val, scores[ki]);
@@ -299,18 +310,118 @@ __global__ void vision_sdpa_bf16_kernel(
     for (uint32_t ki = tid; ki < seq_len; ki += 32u) scores[ki] *= inv_sum;
     __syncthreads();
 
+    // Phase 3: out[qi, head, d] = sum_k scores[k] * V[k, head, d]. Each
+    // thread accumulates its owned columns independently (no reduction).
+    for (int j = 0; j < n_per; j++) {
+        int d = tid + 32 * j;
+        if (d < (int)head_dim) {
+            float acc = 0.0f;
+            for (uint32_t ki = 0; ki < seq_len; ki++) {
+                const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
+                acc += scores[ki] * __bfloat162float(v_row[d]);
+            }
+            __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
+            out_row[d] = __float2bfloat16(acc);
+        }
+    }
+}
+
+
+
+// ── General non-causal SDPA (bf16) ───────────────────────────────────────
+//
+// Q:       [query_len, n_heads, head_dim] bf16 (contiguous, row-major)
+// K, V:    [key_value_len, n_heads, head_dim] bf16
+// Output:  [query_len, n_heads * head_dim] bf16
+//
+// Non-causal: every query attends to every key. One block per (head, query).
+// 32 threads (= 1 warp); active threads handle 2 head_dim elements. Even
+// Head dimensions up to 64 fit in one warp.
+//
+// IMPORTANT: all 32 threads must reach every __shfl_xor_sync call (full mask
+// 0xffffffff). The inner loops are therefore non-strided — every thread
+// iterates every ki so the warp stays converged. (A strided `ki += 32` loop
+// would deadlock when seq_len < 32 because some threads would exit early.)
+//
+// Shared mem: (key_value_len + 1) floats for scores + max/sum scratch.
+
+__global__ void noncausal_sdpa_bf16_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out,
+    uint32_t query_len, uint32_t key_value_len,
+    uint32_t n_heads, uint32_t head_dim, float scale)
+{
+    uint32_t head = blockIdx.y;
+    uint32_t qi   = blockIdx.x;
+    if (qi >= query_len) return;
+    int tid = threadIdx.x;       // 0..31
+    int half = head_dim / 2;
+    bool active = tid < half;
+    int d0 = tid;                // first element this thread owns
+    int d1 = tid + half;         // second element
+
+    extern __shared__ float smem[];
+    float* scores = smem;        // [key_value_len] + 1 scratch slot
+
+    const __nv_bfloat16* q_row = q  + qi * n_heads * head_dim + head * head_dim;
+    float q0 = active ? __bfloat162float(q_row[d0]) : 0.0f;
+    float q1 = active ? __bfloat162float(q_row[d1]) : 0.0f;
+
+    // Phase 1: scores[ki] = (Q[qi] · K[ki]) * scale. All threads iterate
+    // every ki so the shfl reduction stays converged.
+    for (uint32_t ki = 0; ki < key_value_len; ki++) {
+        const __nv_bfloat16* k_row = k + ki * n_heads * head_dim + head * head_dim;
+        float dot = active
+            ? q0 * __bfloat162float(k_row[d0]) + q1 * __bfloat162float(k_row[d1])
+            : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+        if (tid == 0) scores[ki] = dot * scale;
+    }
+    __syncthreads();
+
+    // Phase 2: softmax (max → exp → sum → normalize).
+    // For seq_len > 32, the max/sum reductions are strided — but the shfl
+    // only needs the threads that have data. Use mask = __activemask() to
+    // avoid deadlocks when some threads drop out.
+    float max_val = -INFINITY;
+    for (uint32_t ki = tid; ki < key_value_len; ki += 32u)
+        max_val = fmaxf(max_val, scores[ki]);
+    unsigned mask = __activemask();
+    for (int off = 16; off > 0; off >>= 1)
+        max_val = fmaxf(max_val, __shfl_xor_sync(mask, max_val, off));
+    if (tid == 0) scores[key_value_len] = max_val;
+    __syncthreads();
+    max_val = scores[key_value_len];
+
+    float sum = 0.0f;
+    for (uint32_t ki = tid; ki < key_value_len; ki += 32u) {
+        float e = expf(scores[ki] - max_val);
+        scores[ki] = e;
+        sum += e;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(mask, sum, off);
+    if (tid == 0) scores[key_value_len] = sum;
+    __syncthreads();
+    float inv_sum = 1.0f / scores[key_value_len];
+    for (uint32_t ki = tid; ki < key_value_len; ki += 32u) scores[ki] *= inv_sum;
+    __syncthreads();
+
     // Phase 3: out[qi, head, d0|d1] = sum_k scores[k] * V[k, head, d0|d1].
     // All threads iterate every ki (d0/d1 differ per thread so no divergence).
     float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint32_t ki = 0; ki < seq_len; ki++) {
+    for (uint32_t ki = 0; ki < key_value_len; ki++) {
         float s = scores[ki];
         const __nv_bfloat16* v_row = v + ki * n_heads * head_dim + head * head_dim;
-        acc0 += s * __bfloat162float(v_row[d0]);
-        acc1 += s * __bfloat162float(v_row[d1]);
+        if (active) {
+            acc0 += s * __bfloat162float(v_row[d0]);
+            acc1 += s * __bfloat162float(v_row[d1]);
+        }
     }
     __nv_bfloat16* out_row = out + qi * n_heads * head_dim + head * head_dim;
-    out_row[d0] = __float2bfloat16(acc0);
-    out_row[d1] = __float2bfloat16(acc1);
+    if (active) {
+        out_row[d0] = __float2bfloat16(acc0);
+        out_row[d1] = __float2bfloat16(acc1);
+    }
 }
 
 
@@ -934,5 +1045,4 @@ __global__ void segmented_mha_bf16_kernel(
         __float2bfloat16(accumulator);
   }
 }
-
 

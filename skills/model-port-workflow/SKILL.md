@@ -7,7 +7,8 @@ description: Port a reference LLM, VLM, or VLA model into an ApxInf-native, full
 
 ## Required reading
 
-Read these repository documents before changing code:
+Read the project root [AGENTS.md](../../AGENTS.md#development-artifacts)
+for artifact placement, then read these repository documents before changing code:
 
 1. [`doc/porting-workflow.md`](../../doc/porting-workflow.md) for the complete
    evidence and acceptance sequence.
@@ -108,11 +109,12 @@ between graph segments are forbidden.
    with performance debt`, or `blocked`). Performance is best effort unless
    explicitly declared a release gate, but applicable existing optimized paths
    must be investigated.
-9. Prepare a product-only diff. Keep checkpoints, captures, generated reports,
-   temporary adapters, replay scripts, generated engine plans, and agent state
-   outside the repository. Do not open a model-port review until correctness
-   scaffolds are removed, required capture/replay passes, and this execution
-   contract passes.
+9. Prepare a product-only diff. Store generated captures, reports, temporary
+   adapters, replay scripts, generated plans, and agent state in the ignored
+   `<project-root>/devlocal/<feat-name>/` directory according to `AGENTS.md`.
+   Reuse existing external checkpoints and reference checkouts in place.
+   Do not open a model-port review until correctness scaffolds are removed,
+   required capture/replay passes, and this execution contract passes.
 
 ## Stop conditions
 

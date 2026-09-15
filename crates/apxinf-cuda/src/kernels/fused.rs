@@ -182,6 +182,38 @@ pub fn bias_residual_bf16(
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+pub fn bias_then_residual_bf16(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(projection, "bias then residual")?;
+    if projection.dtype() != DType::BF16
+        || residual.dtype() != DType::BF16
+        || residual.shape() != projection.shape()
+        || bias.is_some_and(|value| value.dtype() != DType::BF16 || value.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "static inference BF16 bias-then-residual has incompatible dtype or shape".into(),
+        ));
+    }
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_then_residual_bf16(
+            gpu_ptr(projection)?,
+            optional_ptr(bias)?,
+            gpu_ptr(residual)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
 pub fn bias_residual_f16_bf16(
     ctx: &CudaContext,
     projection: &Tensor,

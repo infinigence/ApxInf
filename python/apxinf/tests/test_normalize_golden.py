@@ -12,7 +12,7 @@ EPS = 1e-6
 
 
 def ref_unnormalize(normalized: np.ndarray, q01: np.ndarray, q99: np.ndarray) -> np.ndarray:
-    # Exact formula from scripts/pi05_openpi_websocket_server.py.
+    # Exact formula OpenPI's serving path applies, kept here as the golden reference.
     return (
         (normalized + 1.0) * (q99 - q01 + np.float32(1.0e-6)) / 2.0 + q01
     ).astype(np.float32)

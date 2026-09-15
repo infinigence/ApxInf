@@ -1,6 +1,6 @@
 """Prompt construction + tokenization step.
 
-Wraps a SentencePiece model exactly as the OpenPI-derived reference did: the
+Wraps ApxInf's native SentencePiece runtime exactly as the OpenPI-derived reference did: the
 prompt is cleaned (``strip`` + ``_``/newline -> space), encoded with a BOS, and
 a trailing newline token is appended; the result is validated to
 ``1..=max_token_len`` tokens.
@@ -9,7 +9,7 @@ State injection (proprioception) is a **reserved** capability, matching the Rust
 ``pi05_prompt`` / ``discretize_state`` path but **off by default** so behavior is
 identical to the current serving link. When ``discrete_state=True`` the prompt
 becomes ``"Task: {task}, State: {s0 s1 ...};\nAction: "`` with the state
-discretized to ``-1..=255`` — see :func:`discretize_state`. sentencepiece is
+discretized to ``-1..=255`` — see :func:`discretize_state`. The native binding is
 imported lazily so the rest of the processor library stays importable without it.
 """
 
@@ -109,12 +109,17 @@ class PromptTokenizer(ProcessorStep):
     PARAMS = ("max_token_len", "discrete_state")
 
     def __init__(self, model_path, max_token_len: int = 200, discrete_state: bool = False):
-        import sentencepiece  # lazy: keeps the rest of the library importable without it
+        try:
+            import apxinf_py
+        except ImportError as error:  # pragma: no cover - dependency error is user-facing
+            raise ImportError(
+                "PromptTokenizer requires the native apxinf-py package"
+            ) from error
 
         self.model_path = str(model_path)
         self.max_token_len = int(max_token_len)
         self.discrete_state = bool(discrete_state)
-        self._tokenizer = sentencepiece.SentencePieceProcessor(model_file=self.model_path)
+        self._tokenizer = apxinf_py.SentencePieceTokenizer.from_file(self.model_path)
 
     def __call__(self, prompt: str, state: Optional[Sequence[float]] = None) -> np.ndarray:
         if not isinstance(prompt, str):

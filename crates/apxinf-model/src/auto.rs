@@ -47,6 +47,10 @@ pub struct LoadOptions {
     pub text_weight_dtype: Option<DType>,
     pub calibration_path: Option<PathBuf>,
     pub tuning_path: Option<PathBuf>,
+    /// Additional named model artifacts that are not embedded in the primary
+    /// checkpoint. Model loaders must reject missing or unknown required
+    /// assets instead of discovering them through process-global state.
+    pub assets: BTreeMap<String, PathBuf>,
     /// Enable online GEMM autotuning from real inference requests. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,

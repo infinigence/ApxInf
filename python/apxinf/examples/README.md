@@ -27,8 +27,10 @@ model-specific example only when it demonstrates a genuinely distinct workflow.
 - The `*_infer.py` examples and servers need the **`apxinf_py` CUDA
   binding** (see [Build ApxInf](../../../README.md#build-apxinf))
   and a compatible checkpoint directory.
-- Using a WallOSS checkpoint additionally needs `pip install -e "python/apxinf[walloss]"`
-  for its Qwen2.5-VL tokenizer/image processor and serialized normalizers.
+- Built-in PI0.5 and WallOSS tokenizers run through the installed `apxinf-py`
+  native extension.
+  Image patchification and serialized normalizer loading need no Torch or
+  Transformers installation.
 - `openpi_server.py` also needs the transport deps
   ([`scripts/requirements-pi05-websocket.txt`](../../../scripts/requirements-pi05-websocket.txt)).
 - `openpi_client.py` needs the upstream `openpi_client` package and a running
@@ -55,17 +57,18 @@ python examples/autopolicy_infer.py \
 
 python examples/openpi_server.py \
   --model-dir /path/to/wall-oss-0.5 \
-  --robot franka_libero \
+  --image-keys observation/image,observation/wrist_image \
+  --state-key observation/state \
   --policy-options '{"norm_key":"x2_normal"}'
 ```
 
-Without `--robot` or `--action-dim`, both generic launchers keep the action width
-inferred from the checkpoint weights (currently deployed WallOSS checkpoints may
-be either 7 or 26 channels). A user-supplied `--action-dim` wins; otherwise a
-named robot preset supplies its deployable width; otherwise the checkpoint width
-is used. Prefix trimming is valid only when the selected normalizer and the
+Without `--action-dim`, both generic launchers keep the action width inferred
+from the checkpoint weights (currently deployed WallOSS checkpoints may be either
+7 or 26 channels). A user-supplied `--action-dim` wins; otherwise the checkpoint
+width is used. Prefix trimming is valid only when the selected normalizer and the
 checkpoint's leading-channel layout match the target robot. Non-prefix layouts
-need a robot adapter rather than a different `--action-dim`.
+need a body-aware adapter around the policy — one layer up, pairing named bodies
+with named wire dialects — rather than a different `--action-dim`.
 
 WallOSS state-token binning is likewise loaded from checkpoint metadata
 (`config.json`, then legacy `config.yml`) and falls back to 256 only when absent.

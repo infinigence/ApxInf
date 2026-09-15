@@ -7,6 +7,25 @@ import numpy.typing as npt
 
 __version__: str
 
+class HfTokenizer:
+    """Rust-backed Hugging Face ``tokenizer.json`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "HfTokenizer": ...
+    def encode(self, text: str) -> list[int]: ...
+    def decode(self, token_ids: list[int]) -> str: ...
+    def add_tokens(self, tokens: list[str]) -> int: ...
+    def token_to_id(self, token: str) -> int | None: ...
+    @property
+    def vocab_size(self) -> int: ...
+
+class SentencePieceTokenizer:
+    """Native SentencePiece ``.model`` runtime."""
+
+    @staticmethod
+    def from_file(path: str) -> "SentencePieceTokenizer": ...
+    def encode(self, text: str, add_bos: bool = ...) -> list[int]: ...
+
 class Model:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
@@ -25,6 +44,7 @@ class Model:
         num_flow_steps: int | None = ...,
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
+        assets: dict[str, str] | None = ...,
     ) -> "Model":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
@@ -42,6 +62,32 @@ class Model:
         """
         ...
 
+    def _infer_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int,
+        noise: npt.NDArray[np.float32],
+    ) -> npt.NDArray[np.float32]:
+        """Private L0 path for processor-produced typed VLA inputs."""
+        ...
+
+    def _calibrate_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int,
+        noise: npt.NDArray[np.float32],
+    ) -> dict[str, float]:
+        """Private activation probe used by the common calibration runner."""
+        ...
+
     def _infer_patches(
         self,
         patches: npt.NDArray[np.float32],
@@ -57,7 +103,8 @@ class Model:
         rgb_u8: npt.NDArray[np.uint8],
         layout: str,
         token_ids: npt.NDArray[np.uint32],
-        noise: npt.NDArray[np.float32],
+        noise: npt.NDArray[np.float32] | None = ...,
+        action_mask: npt.NDArray[np.float32] | None = ...,
     ) -> npt.NDArray[np.float32]:
         """L1: infer from resized RGB uint8. Returns normalized-domain action."""
         ...
@@ -88,3 +135,5 @@ class Model:
     def patches_per_view(self) -> int: ...
     @property
     def max_token_len(self) -> int: ...
+    @property
+    def accepts_rgb_u8(self) -> bool: ...

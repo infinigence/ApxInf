@@ -199,6 +199,37 @@ int fa2_causal(
   return static_cast<int>(cudaSuccess);
 }
 
+template <typename Element>
+int fa2_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  if (qkv == nullptr || output == nullptr || softmax_lse == nullptr ||
+      batch <= 0 || tokens <= 0 || heads <= 0 || head_dim <= 0 ||
+      head_dim > 256) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const int hidden = heads * head_dim;
+  const auto* base = static_cast<const Element*>(qkv);
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, std::is_same<Element, cutlass::bfloat16_t>::value,
+              base, base + hidden, base + 2 * hidden, output, softmax_lse,
+              batch, tokens, tokens, heads, heads, head_dim, softmax_scale);
+  const int64_t row_stride = static_cast<int64_t>(3) * hidden;
+  params.q_batch_stride = static_cast<int64_t>(tokens) * row_stride;
+  params.k_batch_stride = params.q_batch_stride;
+  params.v_batch_stride = params.q_batch_stride;
+  params.q_row_stride = row_stride;
+  params.k_row_stride = row_stride;
+  params.v_row_stride = row_stride;
+  if (head_dim <= 96) {
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
+  } else {
+    FLASH_NAMESPACE::run_mha_fwd_<Element, 256, false>(params, stream);
+  }
+  return static_cast<int>(cudaSuccess);
+}
+
 #if defined(APXINF_FA2_SPLITKV)
 template <typename Element, bool IsCausal>
 int fa2_splitkv(
@@ -264,6 +295,15 @@ int fa2_bf16_causal(
   return fa2_causal<cutlass::bfloat16_t>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+int fa2_bf16_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  return fa2_strided_qkv<cutlass::bfloat16_t>(
+      qkv, output, softmax_lse, batch, tokens, heads, head_dim,
+      softmax_scale, stream);
 }
 
 #if defined(APXINF_FA2_SPLITKV)

@@ -12,8 +12,8 @@ use apxinf_core::{
 use crate::accelerator::cuda::tuning;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, InferenceSpec, InitialLatent, PreparedInference, VisionObservation, VlaRequest,
-    VlaRuntime,
+    Action, ImageLayout, InferenceSpec, InitialLatent, PreparedInference, VisionObservation,
+    VlaRequest, VlaRuntime,
 };
 
 use super::backend::{kernels, transfers, DeviceBuffer, RuntimeBackend};
@@ -23,7 +23,8 @@ use super::bf16_executor::{
 };
 use super::{
     multimodal_position_ids, sinusoidal_time_embedding, solver_times, DeviceVisionGeometry,
-    VisionGeometry, WallossConfig, WallossDynamicFp8Weights, WallossWeights,
+    VisionGeometry, WallossConfig, WallossDynamicFp8Weights, WallossImageProcessorConfig,
+    WallossWeights,
 };
 
 const DEFAULT_GRIDS: [[usize; 3]; 2] = [[1, 18, 18], [1, 18, 18]];
@@ -32,6 +33,7 @@ const BF16_WORKSPACE_BYTES: usize = 12 * 1024 * 1024 * 1024;
 pub struct WallossBf16Runtime {
     backend: Arc<RuntimeBackend>,
     config: Arc<WallossConfig>,
+    image_processor: Option<Arc<WallossImageProcessorConfig>>,
     weights: Arc<WallossDeviceWeights>,
     grids: Arc<Vec<[usize; 3]>>,
     geometry: Arc<DeviceVisionGeometry>,
@@ -42,6 +44,7 @@ pub struct WallossPreparedInference {
     spec: InferenceSpec,
     backend: Arc<RuntimeBackend>,
     config: Arc<WallossConfig>,
+    image_processor: Option<Arc<WallossImageProcessorConfig>>,
     weights: Arc<WallossDeviceWeights>,
     grids: Arc<Vec<[usize; 3]>>,
     geometry: Arc<DeviceVisionGeometry>,
@@ -51,8 +54,22 @@ pub struct WallossPreparedInference {
     captured: RefCell<Option<WallossBf16CapturedGraph>>,
 }
 
+enum WallossHostVision {
+    Patches(Tensor),
+    RgbU8 { bytes: Vec<u8>, layout: ImageLayout },
+}
+
+impl WallossHostVision {
+    fn mode(&self) -> WallossVisionMode {
+        match self {
+            Self::Patches(_) => WallossVisionMode::Patches,
+            Self::RgbU8 { layout, .. } => WallossVisionMode::RgbU8(*layout),
+        }
+    }
+}
+
 struct WallossHostInputs {
-    patches: Tensor,
+    vision: WallossHostVision,
     prefix_ids: Vec<u32>,
     vision_row_map: Vec<u32>,
     prefix_position_ids: Vec<u32>,
@@ -64,6 +81,7 @@ struct WallossHostInputs {
 
 struct WallossDeviceInputs {
     patches: Tensor,
+    vision: WallossDeviceVision,
     prefix_ids: DeviceBuffer,
     vision_row_map: DeviceBuffer,
     prefix_position_ids: DeviceBuffer,
@@ -73,6 +91,41 @@ struct WallossDeviceInputs {
     time_embeddings: Vec<Tensor>,
     prefix_tokens: usize,
     generated_latent: bool,
+}
+
+enum WallossDeviceVision {
+    Patches,
+    RgbU8 {
+        raw_images: DeviceBuffer,
+        layout: ImageLayout,
+    },
+}
+
+impl WallossDeviceVision {
+    fn mode(&self) -> WallossVisionMode {
+        match self {
+            Self::Patches => WallossVisionMode::Patches,
+            Self::RgbU8 { layout, .. } => WallossVisionMode::RgbU8(*layout),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WallossVisionMode {
+    Patches,
+    RgbU8(ImageLayout),
+}
+
+fn ensure_captured_vision_mode(
+    requested: WallossVisionMode,
+    captured: WallossVisionMode,
+) -> Result<()> {
+    if requested != captured {
+        return Err(Error::Other(format!(
+            "walloss captured inference cannot switch vision input mode from {captured:?} to {requested:?}"
+        )));
+    }
+    Ok(())
 }
 
 struct WallossBf16CapturedGraph {
@@ -86,38 +139,69 @@ enum WallossDeviceWeights {
     DynamicFp8(WallossDynamicFp8Weights),
 }
 
+enum InitialRun<C, O> {
+    Eager(O),
+    Captured { state: C, output: O },
+}
+
+fn run_captured_lifecycle<C, O>(
+    captured: &mut Option<C>,
+    replay: impl FnOnce(&mut C) -> Result<O>,
+    initialize: impl FnOnce() -> Result<InitialRun<C, O>>,
+) -> Result<O> {
+    if let Some(captured) = captured.as_mut() {
+        return replay(captured);
+    }
+    match initialize()? {
+        InitialRun::Eager(output) => Ok(output),
+        InitialRun::Captured { state, output } => {
+            *captured = Some(state);
+            Ok(output)
+        }
+    }
+}
+
 impl WallossPreparedInference {
     fn run_impl(&self, request: &VlaRequest<'_>) -> Result<Action> {
         let host = self.prepare_host_inputs(request)?;
-        if let Some(captured) = self.captured.borrow_mut().as_mut() {
-            self.update_device_inputs(&mut captured.inputs, &host)?;
-            captured.graph.replay()?;
-            return Ok(Action::new(captured.output.clone()));
-        }
+        let output = run_captured_lifecycle(
+            &mut self.captured.borrow_mut(),
+            |captured| {
+                self.update_device_inputs(&mut captured.inputs, &host)?;
+                captured.graph.replay()?;
+                Ok(captured.output.clone())
+            },
+            || {
+                let inputs = self.upload_inputs(&host)?;
+                let eager_output =
+                    kernels::prepare_with_workspace(&self.workspace, || self.execute(&inputs))?;
+                if std::env::var_os("APXINF_WALLOSS_NO_GRAPH").is_some() {
+                    return Ok(InitialRun::Eager(eager_output));
+                }
+                self.backend.synchronize()?;
+                drop(eager_output);
 
-        let inputs = self.upload_inputs(&host)?;
-        let eager_output =
-            kernels::prepare_with_workspace(&self.workspace, || self.execute(&inputs))?;
-        if std::env::var_os("APXINF_WALLOSS_NO_GRAPH").is_some() {
-            return Ok(Action::new(eager_output));
-        }
-        self.backend.synchronize()?;
-        drop(eager_output);
-
-        self.backend.begin_capture()?;
-        let output = match kernels::with_workspace(&self.workspace, || self.execute(&inputs)) {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = self.backend.end_capture();
-                return Err(error);
-            }
-        };
-        let graph = self.backend.end_capture()?;
-        *self.captured.borrow_mut() = Some(WallossBf16CapturedGraph {
-            graph,
-            output: output.clone(),
-            inputs,
-        });
+                self.backend.begin_capture()?;
+                let output =
+                    match kernels::with_workspace(&self.workspace, || self.execute(&inputs)) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            let _ = self.backend.end_capture();
+                            return Err(error);
+                        }
+                    };
+                let graph = self.backend.end_capture()?;
+                graph.replay()?;
+                Ok(InitialRun::Captured {
+                    state: WallossBf16CapturedGraph {
+                        graph,
+                        output: output.clone(),
+                        inputs,
+                    },
+                    output,
+                })
+            },
+        )?;
         Ok(Action::new(output))
     }
 
@@ -131,21 +215,29 @@ impl WallossPreparedInference {
                 observation.inference_spec()
             )));
         }
-        let patches =
-            match &observation.vision {
-                VisionObservation::Patches(value) => normalize_host_bf16(
-                    value,
-                    vec![
-                        self.geometry.patch_order.len() / 4,
-                        patch_width(&self.config),
-                    ],
-                    "patches",
-                )?,
-                VisionObservation::RgbU8 { .. } => return Err(Error::Other(
-                    "walloss raw RGB preprocessing is not connected yet; pass preprocessed patches"
-                        .into(),
-                )),
-            };
+        let vision = match &observation.vision {
+            VisionObservation::Patches(value) => WallossHostVision::Patches(normalize_host_bf16(
+                value,
+                vec![
+                    self.geometry.patch_order.len() / 4,
+                    patch_width(&self.config),
+                ],
+                "patches",
+            )?),
+            VisionObservation::RgbU8 { bytes, layout } => {
+                let expected = image_bytes(&self.config);
+                if bytes.len() != expected {
+                    return Err(Error::Other(format!(
+                        "walloss expected {expected} resized RGB bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                WallossHostVision::RgbU8 {
+                    bytes: bytes.clone(),
+                    layout: *layout,
+                }
+            }
+        };
         let action_tokens = self.config.action.action_horizon;
         let prefix_tokens = observation.token_ids.len() - action_tokens;
         let prefix_ids = observation.token_ids[..prefix_tokens].to_vec();
@@ -212,7 +304,7 @@ impl WallossPreparedInference {
             )?);
         }
         Ok(WallossHostInputs {
-            patches,
+            vision,
             prefix_ids,
             vision_row_map,
             prefix_position_ids: position_ids[..prefix_tokens * 3].to_vec(),
@@ -225,8 +317,33 @@ impl WallossPreparedInference {
 
     fn upload_inputs(&self, host: &WallossHostInputs) -> Result<WallossDeviceInputs> {
         let device = self.backend.context().device_id();
+        let (patches, vision) = match &host.vision {
+            WallossHostVision::Patches(patches) => (
+                self.backend.to_device(patches)?,
+                WallossDeviceVision::Patches,
+            ),
+            WallossHostVision::RgbU8 { bytes, layout } => {
+                let patches = self.backend.to_device(&Tensor::zeros(
+                    (
+                        self.geometry.patch_order.len() / 4,
+                        patch_width(&self.config),
+                    ),
+                    DType::BF16,
+                ))?;
+                let raw = DeviceBuffer::alloc_zeros(bytes.len(), device).map_err(Error::Cuda)?;
+                raw.copy_from_host(bytes).map_err(Error::Cuda)?;
+                (
+                    patches,
+                    WallossDeviceVision::RgbU8 {
+                        raw_images: raw,
+                        layout: *layout,
+                    },
+                )
+            }
+        };
         Ok(WallossDeviceInputs {
-            patches: self.backend.to_device(&host.patches)?,
+            patches,
+            vision,
             prefix_ids: upload_u32(device, &host.prefix_ids)?,
             vision_row_map: upload_u32(device, &host.vision_row_map)?,
             prefix_position_ids: upload_u32(device, &host.prefix_position_ids)?,
@@ -257,7 +374,23 @@ impl WallossPreparedInference {
             ));
         }
         self.backend.synchronize()?;
-        transfers::copy_cpu_to_cuda(&host.patches, &device.patches)?;
+        ensure_captured_vision_mode(host.vision.mode(), device.vision.mode())?;
+        match (&host.vision, &device.vision) {
+            (WallossHostVision::Patches(patches), WallossDeviceVision::Patches) => {
+                transfers::copy_cpu_to_cuda(patches, &device.patches)?;
+            }
+            (
+                WallossHostVision::RgbU8 { bytes, layout },
+                WallossDeviceVision::RgbU8 {
+                    raw_images,
+                    layout: captured_layout,
+                },
+            ) => {
+                debug_assert_eq!(layout, captured_layout);
+                raw_images.copy_from_host(bytes).map_err(Error::Cuda)?;
+            }
+            _ => unreachable!("vision mode equality was checked above"),
+        }
         transfers::copy_cpu_to_cuda(&host.action_mask, &device.action_mask)?;
         if let Some(state) = &host.initial_state {
             transfers::copy_cpu_to_cuda(state, &device.initial_state)?;
@@ -270,6 +403,27 @@ impl WallossPreparedInference {
     }
 
     fn execute(&self, inputs: &WallossDeviceInputs) -> Result<Tensor> {
+        if let WallossDeviceVision::RgbU8 { raw_images, layout } = &inputs.vision {
+            let image_processor = self.image_processor.as_ref().ok_or_else(|| {
+                Error::Other(
+                    "walloss RGB input requires checkpoint preprocessor_config.json".into(),
+                )
+            })?;
+            kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+                self.backend.context(),
+                raw_images,
+                &inputs.patches,
+                self.grids.len(),
+                18 * self.config.vision.patch_size,
+                self.config.vision.patch_size,
+                self.config.vision.temporal_patch_size,
+                self.config.vision.spatial_merge_size,
+                kernel_image_layout(*layout),
+                image_processor.rescale_factor,
+                image_processor.image_mean,
+                image_processor.image_std,
+            )?;
+        }
         match self.weights.as_ref() {
             WallossDeviceWeights::Bf16(weights) => self.execute_with(
                 inputs,
@@ -399,6 +553,7 @@ impl WallossBf16Runtime {
             spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
+            image_processor: self.image_processor.clone(),
             weights: Arc::clone(&self.weights),
             grids: Arc::clone(&self.grids),
             geometry: Arc::clone(&self.geometry),
@@ -422,7 +577,7 @@ impl VlaRuntime for WallossBf16Runtime {
             num_views: 2,
             image_size: 18 * self.config.vision.patch_size,
             patch_size: self.config.vision.patch_size,
-            accepts_rgb_u8: false,
+            accepts_rgb_u8: self.image_processor.is_some(),
         }
     }
 
@@ -479,6 +634,12 @@ pub(super) fn load_registered(
         path.parent().unwrap_or_else(|| Path::new("."))
     };
     let mut config = WallossConfig::from_json_file(&root.join("config.json"))?;
+    let image_processor_path = root.join("preprocessor_config.json");
+    let image_processor = image_processor_path
+        .is_file()
+        .then(|| WallossImageProcessorConfig::from_json_file(&image_processor_path, &config.vision))
+        .transpose()?
+        .map(Arc::new);
     let host_weights = WallossWeights::from_safetensors(&mut config, path)?;
     let dynamic_fp8 = matches!(options.precision, ModelPrecision::Fp8);
     let tuning_path = options.tuning_path.clone().or_else(|| {
@@ -508,6 +669,7 @@ pub(super) fn load_registered(
     Ok(LoadedModel::Vla(Box::new(WallossBf16Runtime {
         backend,
         config: Arc::new(config),
+        image_processor,
         weights,
         grids,
         geometry,
@@ -517,6 +679,18 @@ pub(super) fn load_registered(
 
 fn patch_width(config: &WallossConfig) -> usize {
     3 * config.vision.temporal_patch_size * config.vision.patch_size * config.vision.patch_size
+}
+
+fn image_bytes(config: &WallossConfig) -> usize {
+    let image_size = 18 * config.vision.patch_size;
+    2 * image_size * image_size * 3
+}
+
+fn kernel_image_layout(layout: ImageLayout) -> kernels::preprocess::ImageLayout {
+    match layout {
+        ImageLayout::Nhwc => kernels::preprocess::ImageLayout::Nhwc,
+        ImageLayout::Nchw => kernels::preprocess::ImageLayout::Nchw,
+    }
 }
 
 fn normalize_host_bf16(value: &Tensor, shape: Vec<usize>, name: &str) -> Result<Tensor> {
@@ -557,4 +731,211 @@ fn copy_u32(buffer: &DeviceBuffer, values: &[u32]) -> Result<()> {
         )));
     }
     buffer.copy_from_host(&bytes).map_err(Error::Cuda)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    const TEST_VIEWS: usize = 2;
+    const TEST_IMAGE_SIZE: usize = 8;
+    const TEST_PATCH_SIZE: usize = 2;
+    const TEST_TEMPORAL_PATCH_SIZE: usize = 2;
+    const TEST_MERGE_SIZE: usize = 2;
+    const TEST_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_72];
+    const TEST_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
+
+    #[derive(Debug)]
+    struct MockCaptured {
+        input: i32,
+        output: i32,
+    }
+
+    fn replay_mock(state: &mut MockCaptured, input: i32, replays: &Cell<usize>) -> Result<i32> {
+        state.input = input;
+        state.output = state.input * 3;
+        replays.set(replays.get() + 1);
+        Ok(state.output)
+    }
+
+    #[test]
+    fn captured_lifecycle_captures_once_replays_repeatedly_and_observes_changed_input() {
+        let captures = Cell::new(0);
+        let replays = Cell::new(0);
+        let mut captured = None;
+
+        let output = run_captured_lifecycle(
+            &mut captured,
+            |_| panic!("a fresh plan must capture before replay"),
+            || {
+                captures.set(captures.get() + 1);
+                let mut state = MockCaptured {
+                    input: 2,
+                    output: 0,
+                };
+                let output = replay_mock(&mut state, 2, &replays)?;
+                Ok(InitialRun::Captured { state, output })
+            },
+        )
+        .unwrap();
+        assert_eq!(output, 6);
+        assert_eq!(captures.get(), 1);
+        assert_eq!(replays.get(), 1);
+
+        let output = run_captured_lifecycle(
+            &mut captured,
+            |state| replay_mock(state, 2, &replays),
+            || panic!("an installed graph must be replayed"),
+        )
+        .unwrap();
+        assert_eq!(output, 6);
+
+        let output = run_captured_lifecycle(
+            &mut captured,
+            |state| replay_mock(state, 2, &replays),
+            || panic!("an installed graph must be replayed"),
+        )
+        .unwrap();
+        assert_eq!(output, 6);
+
+        let output = run_captured_lifecycle(
+            &mut captured,
+            |state| replay_mock(state, 7, &replays),
+            || panic!("an installed graph must be replayed"),
+        )
+        .unwrap();
+        assert_eq!(output, 21);
+        assert_eq!(captures.get(), 1);
+        assert_eq!(replays.get(), 4);
+    }
+
+    #[test]
+    fn eager_only_lifecycle_does_not_install_a_graph() {
+        let mut captured: Option<MockCaptured> = None;
+        let output = run_captured_lifecycle(
+            &mut captured,
+            |_| panic!("eager-only execution must not replay"),
+            || Ok(InitialRun::Eager(11)),
+        )
+        .unwrap();
+
+        assert_eq!(output, 11);
+        assert!(captured.is_none());
+    }
+
+    #[test]
+    fn captured_plan_rejects_rgb_patch_and_layout_switches() {
+        assert!(ensure_captured_vision_mode(
+            WallossVisionMode::RgbU8(ImageLayout::Nhwc),
+            WallossVisionMode::RgbU8(ImageLayout::Nhwc),
+        )
+        .is_ok());
+        assert!(ensure_captured_vision_mode(
+            WallossVisionMode::Patches,
+            WallossVisionMode::Patches,
+        )
+        .is_ok());
+
+        let rgb_to_patches = ensure_captured_vision_mode(
+            WallossVisionMode::Patches,
+            WallossVisionMode::RgbU8(ImageLayout::Nhwc),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rgb_to_patches.contains("cannot switch vision input mode"));
+
+        let layout_switch = ensure_captured_vision_mode(
+            WallossVisionMode::RgbU8(ImageLayout::Nchw),
+            WallossVisionMode::RgbU8(ImageLayout::Nhwc),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(layout_switch.contains("cannot switch vision input mode"));
+    }
+
+    #[test]
+    fn native_rgb_preprocess_cuda_graph_replays_and_observes_updates() {
+        let backend = RuntimeBackend::new(0).unwrap();
+        let byte_count = TEST_VIEWS * TEST_IMAGE_SIZE * TEST_IMAGE_SIZE * 3;
+        let patch_rows = TEST_VIEWS * (TEST_IMAGE_SIZE / TEST_PATCH_SIZE).pow(2);
+        let patch_width = 3 * TEST_TEMPORAL_PATCH_SIZE * TEST_PATCH_SIZE * TEST_PATCH_SIZE;
+        let input = DeviceBuffer::alloc(byte_count, backend.device_id()).unwrap();
+        let output = backend
+            .to_device(&Tensor::zeros((patch_rows, patch_width), DType::BF16))
+            .unwrap();
+        let reference_output = backend
+            .to_device(&Tensor::zeros((patch_rows, patch_width), DType::BF16))
+            .unwrap();
+        let first = (0..byte_count)
+            .map(|index| (index * 17 % 256) as u8)
+            .collect::<Vec<_>>();
+        let changed = (0..byte_count)
+            .map(|index| (255 - (index * 29 % 256)) as u8)
+            .collect::<Vec<_>>();
+
+        input.copy_from_host(&changed).unwrap();
+        run_test_preprocess(&backend, &input, &reference_output);
+        backend.synchronize().unwrap();
+        let expected_changed = backend.to_cpu(&reference_output).unwrap();
+
+        input.copy_from_host(&first).unwrap();
+        run_test_preprocess(&backend, &input, &output);
+        backend.synchronize().unwrap();
+        let expected_first = backend.to_cpu(&output).unwrap();
+
+        backend.begin_capture().unwrap();
+        run_test_preprocess(&backend, &input, &output);
+        let graph = backend.end_capture().unwrap();
+
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+        assert_eq!(
+            backend.to_cpu(&output).unwrap().as_bf16().unwrap(),
+            expected_first.as_bf16().unwrap(),
+            "captured preprocessing must match eager execution"
+        );
+
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+        assert_eq!(
+            backend.to_cpu(&output).unwrap().as_bf16().unwrap(),
+            expected_first.as_bf16().unwrap(),
+            "repeated replay must remain deterministic"
+        );
+
+        input.copy_from_host(&changed).unwrap();
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+        let actual_changed = backend.to_cpu(&output).unwrap();
+        assert_eq!(
+            actual_changed.as_bf16().unwrap(),
+            expected_changed.as_bf16().unwrap(),
+            "replay must consume updated RGB bytes at the stable input address"
+        );
+        assert_ne!(
+            actual_changed.as_bf16().unwrap(),
+            expected_first.as_bf16().unwrap(),
+            "the changed fixture must produce a distinguishable output"
+        );
+    }
+
+    fn run_test_preprocess(backend: &RuntimeBackend, input: &DeviceBuffer, output: &Tensor) {
+        kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+            backend.context(),
+            input,
+            output,
+            TEST_VIEWS,
+            TEST_IMAGE_SIZE,
+            TEST_PATCH_SIZE,
+            TEST_TEMPORAL_PATCH_SIZE,
+            TEST_MERGE_SIZE,
+            kernels::preprocess::ImageLayout::Nhwc,
+            1.0 / 255.0,
+            TEST_MEAN,
+            TEST_STD,
+        )
+        .unwrap();
+    }
 }

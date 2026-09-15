@@ -533,6 +533,17 @@ fn main() {
                             cmd.arg("-DAPXINF_FA2_SM80=1");
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
+                        // Compile-time prune of never-used FA2 feature axes.
+                        // The runtime never enables dropout, ALiBi, softcap, or
+                        // local/window attention. Removing those template axes
+                        // avoids the hdim128 cicc explosion on SM87 while
+                        // preserving every kernel configuration we dispatch.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
+                        ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
@@ -548,6 +559,13 @@ fn main() {
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2_direct_e4m3",
                             "-DAPXINF_FA2_DIRECT_E4M3=1",
+                        ]);
+                        // The direct-E4M3 path uses the same fixed feature set.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
                         ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));

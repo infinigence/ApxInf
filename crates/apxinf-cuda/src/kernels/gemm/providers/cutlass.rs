@@ -22,7 +22,7 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
         TacticBackend::Cutlass => match key.op {
             GemmOp::Fp8F16 => fp8_supported(key, tactic.value),
             GemmOp::W8A8 => w8a8_supported(key, tactic.value),
-            GemmOp::Bf16 => false,
+            GemmOp::Bf16 | GemmOp::Fp8Bf16 => false,
         },
         TacticBackend::CutlassFp8DualGeGlu => {
             key.op == GemmOp::Fp8F16

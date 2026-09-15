@@ -1,6 +1,6 @@
 # apxinf (Python frontend)
 
-Pure-Python (numpy/PIL/sentencepiece) processor library + the **L2** policy
+Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 `apxinf.Model` so you never import `apxinf_py` directly.
@@ -17,8 +17,9 @@ apxinf/
 │   └── impls/        concrete per-model policies (the part that grows)
 │       ├── pi05.py       Pi05Policy (registered as "pi05")
 │       └── walloss.py    WallossPolicy (registered as "walloss")
-├── adapters/     downstream: expose a Policy through a foreign API (lazy imports)
-│   └── lerobot.py   ApxInfPolicy — drop-in policy for a lerobot control loop
+├── checkpoints/  read a checkpoint's layout, norm stats and metadata; the
+│                 `.pth` sidecar reader here is tensor-only (no Torch import)
+├── serving/      the L3 layer — the OpenPI-compatible websocket server
 └── __init__.py   facade: Model (lazy), concrete policies, AutoPolicy, Policy, steps
 ```
 
@@ -30,15 +31,21 @@ apxinf/
 
 - **Processor steps** (`apxinf.processors`) — each an independently-callable
   `ProcessorStep`: `ParseImage`, `ResizeWithPad`, `PromptTokenizer`,
-  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. No GPU /
-  no Rust dependency; unit-tests run offline. sentencepiece is imported lazily
-  by the tokenizer only.
+  `Normalizer`/`Unnormalizer`, `GaussianNoise`, chained by `Pipeline`. The
+  package remains importable without a GPU or native extension; built-in
+  tokenization loads `apxinf-py` lazily when the tokenizer is constructed.
+- **WallOSS processor** — its family-local policy reads `tokenizer.json`
+  through `apxinf-py`. Pillow performs smart resize;
+  the native runtime performs Qwen2.5-VL normalization and patchification in
+  CUDA, while NumPy retains a compatible patch path for custom processors. Its
+  legacy `.pth` normalizer sidecars are read by a restricted tensor-only loader,
+  without importing Torch or Transformers.
 - **L2 policies** (`apxinf.Pi05Policy`, `apxinf.WallossPolicy`, or
   `apxinf.AutoPolicy`) — own each model family's pre/post contract around a
   bare-model handle and return deployable actions from one
   `infer(obs_dict) -> {actions, timing, ...}` call. `import apxinf`
-  stays CUDA-free; only `apxinf.Model` and a policy's `from_pretrained` pull in
-  `apxinf_py`.
+  stays CUDA-free; built-in tokenizer construction and model loading import
+  `apxinf_py` lazily.
 
 ## Domains
 
@@ -68,6 +75,13 @@ Two layers of `ProcessorStep` live here, and they extend differently:
   a few data-dict keys, **delegate to an injected natural step**, and write an
   output key. They define a *role* (which key they produce), not an
   implementation.
+
+WallOSS also accepts a callable `processor=` in `WallossPolicy.from_pretrained`.
+It must return `(patches_f32, token_ids_u32, action_mask_f32)` using the model's
+canonical shapes. The built-in processor remains the checkpoint-compatible
+default and sends resized RGB to runtimes that advertise that capability, so
+normalization and patchification run in the CUDA graph. This seam lets Python
+applications customize observation handling without forking the Rust runtime.
 
 **A new implementation should not touch `transforms.py`.** The swap seam is
 dependency injection at pipeline-assembly time, not the transform classes:
@@ -152,52 +166,25 @@ required, structural typing only.
 
 ## lerobot interop
 
-`apxinf.adapters.lerobot.ApxInfPolicy` wraps any `Policy` in the surface a
-**hand-written lerobot control loop** calls, so a lerobot user keeps their robot,
-cameras, dataset-feature plumbing and action dispatch and swaps only the policy:
+Not here: wrapping a `Policy` in lerobot's surface means translating *its*
+robot/camera/dataset-feature vocabulary, which is a property of the robot stack
+rather than of the checkpoint. An adaptor built one layer up wraps any `Policy`
+satisfying the contract above, so a lerobot user keeps their robot, cameras,
+feature plumbing and action dispatch and swaps only the policy.
 
-```python
-from apxinf.adapters.lerobot import ApxInfPolicy
-
-model = ApxInfPolicy.from_pretrained(ckpt_dir, device="cuda:0", precision="bf16")
-preprocess, postprocess = model.make_pre_post_processors()
-
-obs   = robot.get_observation()                                   # lerobot's
-frame = model.build_inference_frame(obs, ds_features=feats, task=task)
-action = postprocess(model.select_action(preprocess(frame)))
-robot.send_action(make_robot_action(action, feats))               # lerobot's
-```
-
-See `examples/lerobot_loop.py` (runs with `--mock-robot`, no hardware needed).
-
-**Supported:** lerobot `robots`/`cameras`/`teleoperators`, `hw_to_dataset_features`,
-`build_dataset_frame`, `make_robot_action`, `LeRobotDataset` recording,
-hand-written gym eval loops, chunk-at-a-time via `predict_action_chunk`.
-
-**Not supported:** the `lerobot-eval` / `lerobot-rollout` CLIs and `make_policy`
-(they resolve a policy class out of lerobot's registry — that needs a
-`lerobot_policy_*` plugin distribution); training / fine-tuning / PEFT
-(structurally impossible — the engine has no autograd); RTC inference; lerobot's
-async-inference server (`apxinf.serving` covers that need); `torch.compile`.
-
-**Two seams, one default.** lerobot's `build_inference_frame` is
-`build_dataset_frame` (numpy `HWC` `uint8`) followed by
-`prepare_observation_for_inference` (H2D, `/255`, `CHW`, batch dim). The adapter's
-`build_inference_frame` runs **only the first** — that layer is already what
-`Policy.infer` eats. A frame that went through the second is also accepted and
-undone, but costs a device→host copy per tick, so the numpy seam is the default.
+Two notes that are the engine's to make, because they are about what this package
+does and does not run:
 
 **Whose pre/post runs: ours.** apxinf's `Pipeline` does resize, tokenize, and
 unnormalize; the model runtime generates prior noise unless it is supplied
 explicitly. lerobot splits the same work differently (resize and prior noise live
-*inside* its policy; normalize lives in its processor pipeline), so pipelines from its
-`make_pre_post_processors` are **not** interchangeable with ours — feeding their
-output here would drop resize and double-normalize. `ApxInfPolicy`'s own
-`make_pre_post_processors()` therefore returns pass-throughs that preserve the
-call shape and nothing more.
+*inside* its policy; normalize lives in its processor pipeline), so pipelines from
+its `make_pre_post_processors` are **not** interchangeable with ours — feeding
+their output here would drop resize and double-normalize.
 
-Install with `pip install -e '.[lerobot]'` (adds torch for the tensor boundary;
-lerobot itself is not pinned — bring your own version).
+**No training path.** Fine-tuning / PEFT through this engine is structurally
+impossible: there is no autograd behind `infer`. Train elsewhere, export, serve
+here.
 
 ## Camera views
 
@@ -207,13 +194,38 @@ slots — the openpi convention for masked/missing cameras — so 2 cameras driv
 3-slot model. Passing more keys than slots is an error; disable padding with
 `pad_missing_views=False`.
 
-## State gap (reserved, not wired)
+## State injection
 
-pi05 expects proprioception injected as a **discretized state** spliced into the
-prompt (`build_prompt(..., discrete_state=True)`, aligned with Rust
-`pi05_prompt`). The current serving link omits it: `observation/state` is read
-but **dropped**. The interface slot exists (construct the tokenizer with
-`discrete_state=True`); the default path matches today's behavior.
+PI0.5 supports state injection with `discrete_state=True`. The policy normalizes
+raw state using the checkpoint-selected transform, discretizes it and builds the
+`Task/State/Action` prompt. This requires an explicit `state_key`; robot presets
+may supply both settings. Direct policy construction leaves injection off by
+default. Choose normalization dtype according to the checkpoint/reference:
+rounding near a bin edge can change the prompt tokens.
+
+## Built-in family contracts
+
+Tokenizer execution is native, while prompt/state orchestration and action
+postprocessing remain Python. The shared lifecycle and ownership rules are in
+[Model Lifecycle and Contracts](../../doc/model-lifecycle.md).
+
+| Contract | PI0.5 | WallOSS |
+| --- | --- | --- |
+| State encoding | optional 256-bin encoding, preserving underflow bin `-1`; normalization dtype is significant | required configured bins, clipping to range and selecting active state dimensions |
+| Token sequence | SentencePiece BOS; without state, append a separately encoded newline | HF added tokens, camera labels, image placeholder expansion and action tokens |
+| Image/model input | configured resized RGB views and token IDs | built-in resized RGB with two `18x18` grids; custom processor returns canonical patches, token IDs and action mask |
+| Output | trimmed, checkpoint-transformed actions plus normalized model actions | trimmed, inverse-normalized actions plus normalized model actions |
+| Customization | replaceable Python input/output pipelines | explicit `processor=` callable; custom processing does not implicitly select native RGB |
+
+For WallOSS, each image placeholder expands to
+`product(grid_thw) / merge_size^2` tokens. Camera order, labels and grid metadata
+must agree. A one-dimensional DOF mask broadcasts to
+`[action_horizon, action_dim]`; the active-state mask supplies its default.
+For PI0.5, separately encoding the trailing newline is part of the non-state
+sequence contract; concatenating it to the task before encoding is not an
+established equivalent. Both models return checkpoint-domain policy actions;
+external robot units, actuator ordering and command encoding remain adapter
+responsibilities. These differences must survive a future native prompt builder.
 
 ## Tests
 
@@ -222,6 +234,7 @@ pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
 
-Tokenizer-encode tests need a SentencePiece model (`APXINF_TOKENIZER` or
+Native tokenizer differential tests need the Python `sentencepiece` reference
+and a SentencePiece model (`APXINF_TOKENIZER` or
 `APXINF_PI05_MODEL_DIR`); the real-model layering test needs a CUDA `apxinf_py`
 build plus `APXINF_PI05_MODEL_DIR`.
