@@ -1,254 +1,208 @@
-# Model lifecycle refactor: architecture proposal
+# Model architecture: current implementation and refactor specification
 
-Status: proposal; not the current implementation or an accepted ADR.
+Status: agreed design direction from the architecture discussion; proposed interfaces,
+not implemented APIs. Reviewed source baseline: upstream/main
+`7baa69b281ef862e6afa32c476c58143d3964241` (GR00T N1.7 merged).
+This document supersedes the earlier GR00T PR snapshot in this directory.
+The documentation worktree itself has not been rebased onto that baseline.
+No GPU correctness or performance results are claimed by this documentation change.
 
-This proposal separates model semantics from execution resource management.
-Policy owns end-to-end input/output semantics; Network owns model mathematics;
-ExecutionSession owns preparation and repeated execution. It preserves direct
-safe CUDA kernel calls and precision specialization.
-
-The implementation baseline is `7126992` on upstream main. PI0.5 and WallOSS
-observations below refer to that baseline. GR00T observations refer separately
-to [PR #42](https://github.com/infinigence/ApxInf/pull/42), head
-`01ad172474dfcc3d00c8fae3b5970e387ae1eb25`; they are not claims about merged code.
-The PR author account is `Casten-Wang`. Its performance evidence has not been
-reproduced for this design document.
-
-Read [lifecycle contracts and migration](lifecycle.md) for stage guarantees,
-resource lifetimes, acceptance criteria, and implementation slices. Existing
-[model-layer architecture](../model-layer-architecture.md) remains the current
-reference until a separately reviewed implementation changes it.
+Read [lifecycle contracts](lifecycle.md) and the [staged rollout](migration.md).
+The existing [model-layer reference](../model-layer-architecture.md) describes
+implementation guidance until individual migrations update it.
 
 ## Current logical view
 
 ```mermaid
 flowchart TB
-    O[Images, state, instruction] --> P[PI0.5 Policy and processors]
-    O --> W[WallOSS Policy and processor]
-    O --> G[GR00T Policy and NVIDIA processor adapter - PR]
-    P --> V[Generic VLA input and native Model]
-    W --> V
-    G --> GI[Gr00tObservation and Gr00tModel - PR]
-    V --> PR[PI0.5 runtimes: network, solver, buffers, graph]
-    V --> WR[WallOSS runtime: loading, network, buffers, graph]
-    GI --> GR[GR00T runtime: weights, network, buffers, graph - PR]
-    PR --> PE[Precision executors: mostly layer computations]
-    WR --> WE[Executor: layers and larger network computations]
-    GR --> Q[Qwen3-VL internals - PR dependency]
-    PE --> K[Shared safe CUDA kernels]
-    WE --> K
-    Q --> K
-    GR --> K
+    VLA[VLA Python Policies and model Processors] --> PY[Generic native Model binding]
+    PY --> VR[VlaRuntime: contract / prepare / infer]
+    VR --> PI[PI0.5 runtimes: network, solver, resources, graph]
+    PI --> PE[Precision executors: mainly layer computation]
+    VR --> WA[WallOSS runtime and executor]
+    VR --> GA[GR00T VlaRuntime: typed request adaptation]
+    GA --> GE[GR00T generic executor: network, resources, graph]
+    GE --> GB[GR00T private backbone]
+    TEXT[Tokenizer / prepared multimodal input] --> LOOP[Shared LLM and VLM generation loop]
+    LOOP --> LM[Llama / Qwen3-VL: network, KV state, decode graph]
+    PE --> BE[Shared backend / kernels / memory / graph]
+    WA --> BE
+    GE --> BE
+    GB --> BE
+    LM --> BE
 ```
 
-The directory isolation is useful, but `runtime` has no consistent narrow
-meaning. PI0.5 and WallOSS both keep network composition and solver orchestration
-inside runtime files. GR00T's roughly 3,052-line runtime also holds device weight
-conversion and capture management. Its `execution.rs` describes attention
-selection and token grouping: those are network semantics, despite the name.
+GR00T now uses the generic Model/VlaRuntime entry and owns its backbone directory.
+It is not an independent public Gr00tModel and does not need the earlier proposed
+exception for importing sibling Qwen3-VL internals. Do not reintroduce a shared
+backbone extraction merely to satisfy the obsolete proposal.
 
-The generic VLA contract does not express all GR00T inputs. Its PR deliberately
-uses a separate input and native entry point instead of widening that contract.
-This is evidence for a common lifecycle protocol with typed model-specific
-payloads, not for a universal optional-field tensor bag.
+The remaining problems are semantic: `prepare` has different guarantees,
+compatibility constraints are partly private, output residency differs, and
+`runtime`/`executor` do not identify a consistent responsibility. LLM/VLM already
+share a generation loop, but graph preparation and request state remain in models.
 
 ## Target logical view
 
 ```mermaid
 flowchart TB
-    O[External observation] --> A[Adapter: external fields and conventions]
-    subgraph POLICY[Policy: one end-to-end request]
-        A --> E[Input Processor: prompt, tokenizer, images, state]
-        E --> I[EncodedInput: model input payload]
-        E --> C[DecodeContext: request-local decoding information]
-        I --> S[ExecutionSession: prepare, bind, run, invalidate]
-        S --> R[ModelOutput]
-        R --> D[Output Processor: denormalize and interpret actions]
-        C --> D
-    end
-    L[Load model package] --> M[Model: configuration, device weights, constants]
-    L --> E
-    L --> D
-    M --> S
-    S -->|eager or capture| N[Network: topology and layer mathematics]
-    N --> T[Schedule: model-specific solver mathematics]
-    N --> K[Safe kernel interfaces]
-    S -->|captured execution| G[Graph replay]
-    D --> OUT[Deployable actions]
+    U[Caller] --> F[Policy / TextModel facade]
+    F --> P[Processor: encode and incremental or final decode]
+    P --> I[Typed encoded input]
+    P --> C[Request-local output context]
+    F --> S[ExecutionSession: resources, readiness, reset, execution]
+    I --> S
+    M[Loaded Model: config, weights, capabilities] --> S
+    S --> D[Native algorithm driver: generation or model algorithm]
+    D --> E[Prepared execution regions]
+    E --> N[Model Network: stage interfaces and major dataflow]
+    N --> B[Semantic Blocks: backbone, attention, action head]
+    B --> K[Backend kernels and device weight views]
+    E --> G[Graph replay]
+    G --> K
+    S --> O[Output with device, completion and lifetime contract]
+    O --> P
+    C --> P
+    P --> F
 ```
 
-| Module | Owns | Does not own |
+The driver is a responsibility, often an existing function, not a mandatory class.
+Algorithm control remains in native code; do not round-trip through Python per
+network layer or denoising step. A fixed flow loop may be captured as one region.
+
+| Module | Interface role | Owns |
 | --- | --- | --- |
-| Adapter | External field names, recording conventions and coordinate mappings | Tokenization, neural network mathematics |
-| Policy | Encode/run/decode orchestration and request context | CUDA buffer layouts |
-| Processor | Prompt templates, tokenizer use, image/state encoding, output decoding | Capture lifecycle or tactic invalidation |
-| Loader / Model | Checkpoint interpretation, device weights, fixed assets and capabilities | Mutable per-request state |
-| Network / Schedule | Layer ordering, conditioning, solver rules and precision specialization | Session cache policy or capture recovery |
-| ExecutionSession | Input binding, workspaces, KV/latent state, RNG execution, capture/replay and invalidation | Prompt meaning or duplicated model mathematics |
-| Backend | Model-neutral kernels, device memory and graph facilities | Family-specific scheduling decisions |
+| Policy / TextModel | infer / generate | Encode-execute-decode orchestration |
+| Processor | encode -> typed input + context; decode -> user output | Prompt, tokenizer, image/state semantics, incremental text or action decoding |
+| Loaded Model | load; create_session | Config, resident weights, capabilities and network construction |
+| ExecutionSession | prepare; infer/generate; reset_request; clear_plans | Stable buffers, workspace, KV/latent storage, plans, invalidation and completion |
+| Algorithm driver | generate or model-specific inference algorithm | Sampling, EOS, iteration/update rules; request progression |
+| Network | prefill/decode or encode_condition/predict_velocity | Model-level tensor interfaces and major subnetwork connections |
+| Block | Typed tensor/state transformation | Internal layer composition and precision-specific implementation |
+| Backend | Kernels, allocation, capture/replay, events | Device mechanisms, not model semantics |
 
-`DecodeContext` is request-local. GR00T's processor decodes actions using the
-original state from the same request. Preserve this explicit dependency rather
-than using mutable global "last observation" state. Other models may use an
-empty context or retain state needed by relative-action transforms.
+Processor is not synonymous with CPU execution. GPU preprocessing can be captured
+without transferring formula ownership to Session. A learned vision encoder is a
+Network/Block, not a tokenizer/image Processor. Sampling and EOS belong to the
+algorithm; text detokenization belongs to Processor.
 
-CPU/GPU placement does not determine semantic ownership. A Processor may define
-an image normalization/patchification operation implemented by a backend kernel
-and scheduled inside a captured Session. The formula has one owner while the
-Session owns buffers and execution. Do not force CPU processing or materialize
-an unnecessary host intermediate to satisfy the diagram.
+## Network / Block seam
 
-## Current development view
+Each model has one maintained Network definition where practical. A Block is an
+internally cohesive transformation, not necessarily one transformer layer.
+Backbones and action heads are large Blocks and may contain smaller Blocks.
+Preserve meaningful names such as `vision` and `action`, rather than renaming
+all types to generic Block names.
 
-Paths below are relative to the repository root. GR00T entries exist in PR #42.
+Network connects major subnetworks and exposes computation stages. Blocks hide
+local topology, physical layouts and precision-specific fusion. A change to the
+vision-to-language connection belongs in Network; changing QKV packing or fused
+norm/quantization belongs in the relevant Block and its weight materialization.
+If reusable quantized input spans projections, group those projections rather
+than exposing that temporary to Network. Do not force conversions at every Block
+boundary to make interfaces look uniform. Typed internal values or a larger Block
+may preserve a continuous quantized path.
 
-```text
-python/apxinf/apxinf/
-  policies/impls/
-    pi05.py             policy, loading and processor composition
-    walloss.py          policy and model processor
-    gr00t.py [PR]       policy and NVIDIA processor adapter
-  processors/           shared processing utilities
-  checkpoints/          checkpoint layouts and assets
-  adapters/             external integrations
-
-crates/apxinf-py/src/
-  lib.rs                generic VLA binding, PI0.5 options, GR00T class in PR
-
-crates/apxinf-model/src/
-  auto.rs / registry.rs / builtin.rs
-  vla/mod.rs            common VLA interfaces
-  pi05/
-    *_executor.rs       layer computations
-    *_runtime.rs        network composition, resources, capture
-    vla_runtime.rs      input routing, variants, prepared cache
-  walloss/
-    bf16_executor.rs    BF16 and dynamic FP8 computation
-    bf16_runtime.rs     loading, network composition, execution
-  gr00t/ [PR]
-    input.rs            dedicated observation and inference specification
-    execution.rs        attention semantics and token grouping
-    checkpoint.rs / weights.rs / math.rs
-    runtime.rs          multiple responsibilities
+```rust
+// Conceptual pseudocode; no mandatory public generic framework.
+struct GrootNetwork<V, L, A> { vision: V, language: L, action: A }
+fn encode_condition(input, state, ctx) -> Condition {
+    images = vision.forward(input.pixels, input.grid, ctx);
+    language.prefill(input.tokens, images, input.mask, state, ctx)
+}
+fn predict_velocity(condition, latent, time, state, ctx) -> Tensor {
+    action.forward(condition, latent, time, state, ctx)
+}
+// A concrete FFN implementation may fuse norm + quantization + projections.
+// It exposes the FFN result, not its internal quantized scratch buffers.
 ```
+
+A Block can describe resource requirements; Session owns their allocation and
+lifetime. ExecContext provides bounded device/resource access, not arbitrary
+access to the whole Session. Network does not manage graph caching or serving.
+Eager and capture must use the same maintained computation semantics. Proven
+precision-specific fusion is permitted; a duplicate capture-only network is not
+the default architecture. Public Network factories and per-layer dynamic Block
+traits are not required. Select precision at construction and retain static
+specialization in hot paths.
+
+## Weight and precision ownership
+
+| Current file/content | Target responsibility |
+| --- | --- |
+| runtime loading | Model construction |
+| runtime/executor capture, buffers, cache | Session |
+| runtime/executor major computation | Network |
+| executor attention/FFN computation | Blocks |
+| generation loop / flow update | Native algorithm driver or model algorithm function |
+| weights.rs checkpoint mappings and validation | Model weights/loading |
+| static_*_weights.rs whole-model resident tree | Model resident weights, parameterized when structure matches |
+| device_weights.rs matrix representation and compute | Shared or Block-local weight/compute implementation |
+| kernel weight views | Backend's non-owning device interface |
+
+Names currently mean different things: PI0.5 device_weights.rs holds FP8 linear
+storage and packing; static_weights.rs holds the PI0.5-wide resident weight tree.
+GR00T device_weights.rs is a private precision-neutral computation contract.
+Backend FP8/W8A8 weight views are already model-neutral. Do not move an entire
+model weight tree into shared code just because its filename says static.
+
+Reuse model structure and checkpoint mapping across precision implementations.
+Keep genuinely different scales, layouts, quantization, packing and fused compute.
+Precision may differ between vision, text and action; one dtype parameter for all
+fields is not a requirement. GR00T already has a precision-parameterized executor:
+preserve that progress rather than creating three copies of Network.
 
 ## Target development view
 
-Keep the current packages and useful files. Responsibilities are not a file
-checklist: do not create an assets module, loader module, processor package or
-shared execution framework merely to mirror the logical diagram. Preserve
-existing public imports. Split a file only when independent changes become
-hard to locate or verify.
-
-The minimal target adds one clear separation inside each model: network
-mathematics versus session resource management. Loading and typed input
-contracts can remain with the model entry point; schedule can remain with the
-network. Existing well-scoped config, input and weight files may stay separate.
+Prefer semantic grouping before dtype grouping. This is a placement guide, not a
+mandatory file checklist. Small Blocks and weights can remain single files.
 
 ```text
-python/apxinf/apxinf/
-  policies/impls/
-    pi05.py / walloss.py / gr00t.py   policy + encode/decode; private helpers OK
-  processors/                       keep existing reusable transformations
-  checkpoints/ / adapters/          keep existing responsibilities
-
-crates/apxinf-py/src/
-  lib.rs                            keep bindings here while manageable
-
 crates/apxinf-model/src/
-  auto.rs / registry.rs / builtin.rs keep registration and loading entry points
-  vla/mod.rs                        lifecycle guarantees, not a new framework
-  <pi05 | walloss | gr00t>/
-    mod.rs                          model entry, loading, capabilities
-    config.rs / weights*.rs         retain useful existing files
-    network.rs                      network mathematics and schedule
-    session.rs                      mutable buffers, prepare/run/invalidate
-    ...                             retain justified precision/input files
-
-crates/apxinf-cuda/
-  kernels/ / workspace.rs / graph.rs keep existing device mechanisms
+  auto.rs / registry.rs / builtin.rs   existing model construction
+  llm_trait.rs or generation.rs        shared native generation algorithm
+  vla/                                VLA public contracts
+  <model>/
+    mod.rs                            model entry and capabilities
+    network.rs                        one major dataflow definition
+    session.rs                        model-specific bindings and plan requirements
+    weights.rs                        checkpoint schema and resident weight tree
+    blocks/
+      vision/                         backbone and its inner blocks
+      language/
+      action/
+        mod.rs                        semantic interface / shared implementation
+        bf16.rs / fp8.rs / w8a8.rs     only where implementations actually differ
+crates/apxinf-cuda*/                   backend mechanisms and kernel weight views
+python/apxinf/.../policies/            VLA facade and model processing
+crates/apxinf-tokenizer/               existing tokenizer capability
 ```
 
-`network.rs` and `session.rs` are responsibility labels, not mandatory filenames
-or size limits. Existing executors can become the network implementation without
-being merged into one large file. Session can initially remain named runtime
-while its mathematical responsibilities are removed. No new shared execution
-directory is required: first reuse existing backend mechanisms, then extract a
-small helper only when equivalent maintained callers demonstrate a need.
+Do not create three parallel complete trees under blocks/bf16, blocks/fp8,
+blocks/w8a8 by default. A model-wide precision directory is not required; local
+compute specialization belongs beside its semantic Block, common matrix storage
+belongs in a demonstrated shared module, and quantization selection belongs in
+construction. Keep checkpoint mapping separate from kernel physical layout.
 
-```mermaid
-flowchart LR
-    R[Current runtime] --> M[Model entry: loading and fixed weights]
-    R --> N[Network: model mathematics]
-    R --> S[Session: mutable execution resources]
-    P[Current policy] --> P2[Keep policy: encode and decode]
-```
+Independent correctness/performance reference implementations are harnesses,
+not alternate production Networks. Maintained reusable harnesses belong in the
+established tests/benchmark locations; temporary comparisons, scripts and logs
+belong in ignored `devlocal/model-lifecycle-refactor/` within the active worktree.
+Do not create a shared backbone without multiple maintained consumers and a
+reviewed narrow interface. Cross-model reuse is not implied by similar names.
 
-## What must actually improve?
+## Change-locality acceptance
 
-Clear names and more files alone do not constitute improvement. The proposal
-must reduce the independent places that own the same rule and the knowledge
-needed to make a change. Validate these outcomes before calling a slice complete:
+| Change | Expected owner |
+| --- | --- |
+| Prompt or action interpretation | Processor |
+| FP8 FFN fusion | Corresponding Block implementation |
+| QKV physical layout | Block weight materialization and compute |
+| Compatible backbone replacement | Block implementation and model construction |
+| Vision/language connection | Network |
+| Capture recovery or cache eviction | Session/backend mechanism |
+| EOS or sampling policy | Generation driver / sampler |
 
-| Change or question | Current friction | Target evidence |
-| --- | --- | --- |
-| Change prompt or state encoding | Processor and binding responsibilities are not always obvious | Change model processing code without editing capture or network mathematics |
-| Change solver mathematics | Network rules also live in runtime files, repeated by precision | One semantic owner, all supported precision paths checked against it |
-| Fix capture cleanup or plan invalidation | Each runtime independently maintains lifecycle rules | Equivalent callers share the proven mechanism, or an explicit justified difference |
-| Know whether preparation is complete | Prepare and first-run behavior differ across models | Same Ready guarantee, explicit execution strategy and measured first-run work |
-| Determine if a graph is reusable | Some compatibility constraints are implicit | Each model declares all bound conditions and rejects incompatible requests |
-| Add another model | Need to discover hidden shared-entry special cases | Predictable model-local implementation plus deliberate registration/contract changes |
-
-No fixed file-count or LOC reduction target is useful before implementation.
-Track touched responsibilities, duplicated invariants, public concepts callers
-must understand, and correctness/performance evidence. Do not introduce a
-pass-through module that merely forwards arguments to another module.
-
-Dependency rules:
-
-- Loader assembles Model; weights do not depend on Session.
-- Session references Model and invokes Network; Network does not inspect
-  serving state, graph cache policy, or capture strategy.
-- Eager and captured execution use the same maintained network body.
-- Model-local execution owns model-specific buffer layouts. Shared execution
-  contains mechanisms supported by multiple implementations, without family switches.
-- Raw CUDA mechanisms remain in `apxinf-cuda`; do not build a duplicate allocator
-  or graph abstraction solely for this reorganization.
-- Keep LLM/VLM token-generation and VLA action-generation contracts distinct.
-  The initial implementation scope is these three VLA families.
-
-## GR00T backbone reuse
-
-PR #42 imports Qwen3-VL internals and modifies the family dependency checker to
-allow that edge. This differs from main's copy-first family-isolation policy.
-Do not silently treat the PR exception as an accepted architecture decision.
-
-The proposed resolution is a deliberately reviewed backbone interface exposing
-only required configuration/loading and feature computation. Start by narrowing
-exports within Qwen3-VL; extract a shared backbone module only if both maintained
-callers justify it. GR00T should not depend on arbitrary Qwen3-VL internal files.
-
-```mermaid
-flowchart LR
-    subgraph CURRENT[PR implementation]
-        G1[GR00T runtime] --> Q1[Qwen3-VL internals]
-    end
-    subgraph TARGET[Proposed explicit reuse]
-        G2[GR00T Network] --> B[Reviewed backbone interface]
-        Q2[Standalone Qwen3-VL] --> B
-        B --> Q3[Backbone implementation]
-    end
-```
-
-## Evidence anchors
-
-- `crates/apxinf-model/src/vla/mod.rs`: current Observation, InferenceSpec,
-  VlaContract and PreparedInference.
-- `crates/apxinf-model/src/pi05/vla_runtime.rs`: prepare-time capture, eager
-  fallback, tactic-generation invalidation and cache replacement.
-- `crates/apxinf-model/src/walloss/bf16_runtime.rs`: first-run capture, fixed
-  workspace budget and captured latent-mode constraint.
-- `python/apxinf/apxinf/policies/impls/{pi05,walloss}.py`: current encoding and decoding.
-- PR #42 `gr00t/input.rs`, `gr00t/runtime.rs`, `policies/impls/gr00t.py` and
-  `scripts/check_model_family_boundaries.sh`: specialized inputs, capture key,
-  request-local decode state and the proposed Qwen3-VL dependency exception.
+More files or renamed executors do not prove improvement. Each migration must
+show that these changes have predictable owners and that hidden invariants have
+become explicit contracts. See migration.md for evidence and documentation gates.

@@ -1,198 +1,237 @@
-# Model lifecycle: contracts and migration proposal
+# Model lifecycle contracts
 
-Status: proposal; interfaces below describe roles, not APIs already implemented.
-See [architecture and directory diagrams](architecture.md) for scope and source revisions.
+Status: target specification, not implemented APIs. Current-source baseline and
+module responsibilities are in [architecture.md](architecture.md).
+Implementation order and tracking are in [migration.md](migration.md).
 
-## What is common across three models?
+## Current lifecycle differences at upstream/main 7baa69b
 
-Unify stage guarantees, not internal tokenizer steps or a universal payload.
+| Family | Preparation and capture | State / output observations |
+| --- | --- | --- |
+| PI0.5 | Explicit prepare allocates and attempts capture, with eager fallback; automatic infer may tune on a real request first | Prepared plan owns resources; tuning-generation checks; device Action |
+| WallOSS | prepare allocates; first run initializes and captures; explicit no-graph path; capture errors otherwise propagate | Private input/noise-mode constraints; device Action |
+| GR00T | prepare returns a wrapper sharing engine; infer checks private graph key and captures on demand, with eager fallback | Engine owns graph; explicit noise required; Action already on CPU |
+| Llama | Shared generation resets state, attempts decode prewarm, then prefill/decode | Actual decode implementation uses one capacity-bound graph; lazy capture still possible |
+| Qwen3-VL | Shared generation; prewarm hook is default no-op; decode captures on new KV-length bucket | Image processing in prefill; KV and rope delta reset; power-of-two decode buckets |
 
-| Stage | PI0.5 on main | WallOSS on main | GR00T PR #42 |
-| --- | --- | --- | --- |
-| Language/state encoding | Prompt, optionally discretized state | Discretized state in prompt | NVIDIA processor, continuous state and embodiment |
-| Visual input | RGB or preprocessed patches | Patches and visual tokens | Pixel values, grids and attention mask |
-| Network | Vision, prefix and action flow | Vision, two experts and solver | Qwen backbone, state/action encoding and DiT |
-| Decode | Action denormalization and transforms | Action denormalization and transforms | Official decode with original request state |
-| Capture lifecycle | Prepare attempts capture; eager fallback | First run prepares and captures | Dedicated runtime and graph key, whole/split graph code |
-
-A model may need image geometry before assembling prompt tokens. Another may
-encode state first. Processor owns this ordering. Session validates the encoded
-contract; it does not choose tokenization or state semantics.
-
-```mermaid
-flowchart LR
-    P[PI0.5 Processor] --> PI[PI0.5 typed input]
-    W[WallOSS Processor] --> WI[WallOSS typed input]
-    G[GR00T Processor] --> GI[GR00T typed input]
-    PI --> C[Common guarantees: validate, describe, prepare, run]
-    WI --> C
-    GI --> C
-    C --> D[Model-specific output decoding]
-```
-
-## Lifecycle
+VLA public InferenceSpec currently contains only token_count and image_layout;
+private model constraints are richer. Generic Action device-residency comments
+are not matched by GR00T's current host-return behavior. These are migration
+inputs, not claims that numerical results are incorrect.
 
 ```mermaid
 flowchart TB
-    A[Start] --> L[Load weights and processing assets]
-    L --> M[Model and Policy ready]
-    M --> O[Receive observation]
-    O --> E[Encode input and retain decode context]
-    E --> V[Validate and derive execution specification]
-    V --> Q{Compatible valid Session exists?}
-    Q -->|no| P[Prepare: budget, buffers, warmup, optional capture]
-    Q -->|yes| B[Bind request and RNG]
-    P --> B
-    B --> R[Run eager or replay]
-    R --> D[Decode using this request context]
-    D --> OUT[Return actions]
-    OUT --> O
-    M --> X[Close: release Sessions before model resources]
+    L[Load model] --> V{VLA implementation}
+    V --> P[PI0.5 prepare: allocate and capture]
+    V --> W[WallOSS prepare: allocate]
+    W --> WR[First run: initialize and capture]
+    V --> G[GR00T prepare: shared engine wrapper]
+    G --> GR[Infer: graph-key lookup and capture]
+    L --> T[LLM/VLM: reset and prewarm hook]
+    T --> LL[Llama: attempt decode pre-capture]
+    T --> Q[Qwen3-VL: no prewarm implementation]
+    LL --> PF[Prefill then token decode]
+    Q --> PF
+    PF --> QC[Missing graph: capture during decode]
 ```
 
-| Interface role | Input -> output | Required guarantee |
-| --- | --- | --- |
-| Load | Asset locations and options -> Model and Processor | Weights, config, tokenizer and statistics are compatible; optional calibration is validated only for paths that need it |
-| Encode | Observation -> EncodedInput and DecodeContext | Field meaning, units, layout and padding are explicit; context belongs to this request |
-| Describe | EncodedInput and execution options -> ExecutionSpec | Captures all allocation, dispatch and capture compatibility conditions |
-| Prepare | Spec and representative input when required -> Ready Session | Budget checked, stable resources allocated, required warmup/capture completed; reports eager/captured strategy |
-| Run | EncodedInput and RNG/provided latent -> ModelOutput | Validates compatibility and execution dependencies; output device and lifetime are explicit |
-| Decode | ModelOutput and DecodeContext -> Actions | Units, coordinates, selected dimensions and request association are correct |
-| Reset / Close | Policy or Session state -> reset/released state | Distinguishes history, RNG and cache reset from releasing all resources |
-
-EncodedInput is a role, not a proposal for one optional-field-heavy struct.
-Use typed payloads per model and explicit adapters for shared orchestration.
-DecodeContext does not pass through the neural network merely to preserve it.
-RNG or exact initial latent belongs to run options, separate from the environment
-observation. Do not require a host noise tensor when the model supports device RNG.
-
-ExecutionSpec must include more than shape when behavior is bound into a graph.
-GR00T's PR key includes pixel shape, image positions and embodiment. WallOSS's
-captured latent source mode is currently an additional implicit restriction.
-Each implementation must declare whether such values are updateable inputs or
-part of plan compatibility. Tactic revisions and device/precision dependencies
-must also participate in validity, though they need not be public request fields.
-
-## State and lifetime guarantees
+## Three lifetimes
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Loaded
-    Loaded --> Preparing: choose spec and strategy
-    Preparing --> Ready: required preparation succeeds
-    Preparing --> Failed: explicit error
-    Ready --> Running: compatible request
-    Running --> Ready: completed
-    Running --> Invalid: execution cannot be safely reused
-    Ready --> Invalid: bound dependency changed
-    Invalid --> Preparing: rebuild within budget
-    Ready --> Released: close
-    Failed --> Released: cleanup
-    Invalid --> Released: close
-    Released --> [*]
+flowchart LR
+    subgraph ModelAssets[Model assets]
+        A[Load and materialize weights] --> B[Loaded] --> C[Unload]
+    end
+    subgraph Plans[Execution resources]
+        D[Describe region and compatibility] --> E[Prepare]
+        E --> F[EagerReady / GraphReady]
+        F --> G[Repeated execution]
+        G --> F
+        F --> H[Invalidate or evict]
+        H --> D
+    end
+    subgraph Request[Request state]
+        I[Encode] --> J[Initialize state]
+        J --> K[Run algorithm]
+        K --> O[Decode or stream output]
+        O --> R[Finish / cancel / reset]
+    end
+    B -. fixed assets .-> E
+    I -. execution needs .-> D
+    F -. execution capability .-> K
 ```
 
-Recoverable request validation errors leave a ready session usable. Capture or
-execution failures must specify whether resources are reusable or invalidated.
-An eager fallback is an explicit strategy result, subject to caller performance
-policy; it must not masquerade as successful graph preparation.
+KV storage is reusable; its valid content/length belongs to a generation.
+Latent storage is reusable; latent values belong to an inference. Request reset
+is not plan eviction or model unload. Conversation/episode state, when needed,
+has an explicit owner and reset scope; it is not inferred from a socket closing.
+Sessions are serial by default, not implicitly thread-safe or concurrent.
 
-```text
-Model lifetime    |---- weights, tokenizer, templates, fixed constants --------|
-Session lifetime       |--- spec A: buffers, caches, graph ---|
-                                                           |--- spec B -----|
-Request lifetime       | encode -> run -> decode |
-                              | encode -> run -> decode |
+## Preparation and CUDA Graph contract
+
+Prepare establishes readiness for an execution region and compatible input range,
+not one boolean for an entire model. Load normally performs checkpoint parsing,
+weight packing/quantization and upload. Processor encodes user input. Prepare
+ensures execution resources and choices are ready; already available work is reused.
+Calibration profiles are loaded/validated assets, not collected on every prepare.
+
+```mermaid
+flowchart TB
+    S[Describe region and compatibility] --> A[Allocate stable resources]
+    A --> P{Execution policy}
+    P -->|Eager| ER[EagerReady]
+    P -->|PreferGraph / RequireGraph| W[Warmup / tune if required]
+    W --> F[Freeze addresses and execution choices]
+    F --> C[Capture and instantiate]
+    C --> OK{Success?}
+    OK -->|yes| GR[GraphReady]
+    OK -->|no, fallback allowed| ER
+    OK -->|no, graph required| X[Preparation failure and cleanup]
+    ER --> B[Bind compatible current inputs]
+    GR --> B
+    B --> R[Execute / replay]
+    R --> O[Output and completion]
+    O --> B
+    GR -. dependency change .-> I[Invalidate]
+    ER -. dependency change .-> I
+    I --> S
 ```
 
-- Model owns immutable device weights and fixed constants; Session retains
-  references so graph resources cannot outlive the weights they reference.
-- Session owns mutable buffers, RNG execution state, caches, and graph resources.
-- Session is serial by default; this proposal does not introduce a worker pool
-  or claim thread safety for the current unsendable Python handles.
-- Fixed schedules and embeddings are computed at the widest valid lifetime,
-  not reconstructed for every request when unchanged.
-- Report workspace budget per spec. Distinguish reserved arena size, cumulative
-  allocation volume and peak live memory; do not silently equate them.
-- Cache replacement observes a memory budget; avoid allocating the replacement
-  while retaining an obsolete multi-GiB workspace unless the budget permits it.
-- ModelOutput declares whether it is owned or a borrowed/reused buffer. A Policy
-  must consume/copy it before the Session reuses storage; device output remains
-  available without an unconditional host transfer.
+Required invariants:
 
-## One request: cooperating modules
+- Ready means the selected region will not secretly allocate new capacity, tune
+  or capture inside execute. A convenient infer/generate may call ensure_prepared.
+- Unknown decode ranges may cause an explicit preparation transition mid-request;
+  predictable ranges may be prewarmed. Report preparation separately from execution.
+- A whole VLA loop, a decode step, or a smaller supported region may be captured.
+  Stage uniformity does not require identical graph topology or graph count.
+- Warmup/tuning uses isolated or safely restored state. It must not consume the
+  real request RNG sequence, advance KV state or denoising steps. Extending a plan
+  during generation must preserve the active request, not reset it.
+- Plan validity covers actual bound shape/layout, capacity, model/weight identity,
+  device, precision and tuning dependencies. Ordinary data updates should use
+  stable buffers, not unnecessarily enter the cache key.
+- PreferGraph fallback is observable with its reason; RequireGraph fails on
+  capture failure. Failed capture cleans up handles/resources and declares reuse.
+- Invalid requests do not automatically destroy an otherwise healthy plan.
+
+Graph storage is an in-process executable handle, not checkpoint serialization.
+Current backend wrappers retain graph/exec handles and destroy them on drop.
+The owning plan must keep every referenced buffer, workspace, weight and device
+context alive. Graph handles alone do not own all user memory they reference.
+
+```rust
+// Pseudocode: ownership can be shared rather than duplicated per plan.
+struct PreparedPlan {
+    compatibility: PlanKey,
+    mode: EagerOrGraph,
+    inputs_outputs: StableBuffers,
+    workspace: Workspace,
+    resources: RetainedDependencies, // model/state storage/context references
+}
+struct Session {
+    model: SharedModel,
+    plans: BoundedPlanCache,
+    state_storage: StateStorage,
+    request_state: RequestState,
+}
+```
+
+Session decides budgets and lifetime; backend supplies allocator/graph mechanisms.
+Reuse existing GraphWorkspace initially rather than introducing a second allocator.
+Current GR00T and WallOSS reservations are 4 GiB and 12 GiB respectively, not
+intrinsic graph requirements. Report reserved, cumulative allocated and peak live
+bytes separately. Replacement must respect total budget and wait for safe resource
+release. Writable fixed-buffer plans cannot be concurrently reused without isolation.
+
+## Interfaces and module interaction
+
+| Role | Conceptual interface | Contract |
+| --- | --- | --- |
+| Model | load(options); create_session(limits, policy) | Fixed assets and declared capabilities; no implicit request state sharing |
+| Processor | encode(raw) -> typed input + output context | Model-specific semantics, validated layout/units and per-request context |
+| Network | describe(region, input, options); compute(region, state_view, ctx) | Execution needs and tensor computation; no plan eviction or prompt interpretation |
+| Session | prepare(input, options) -> ReadyReport | Per-region mode, preparation work and fallback reason |
+| Session | infer / generate_stream | Native algorithm execution using compatible resources |
+| Driver | generate / infer_action | Sampling, EOS and algorithm iteration/update rules |
+| Processor | decode(output, context) | Final actions or incremental text; preserve request association |
+| Session | reset_request; clear_plans; close/drop | Separate semantic reset, cache eviction and resource release |
+
+These roles do not mandate one universal trait or optional-field-heavy input bag.
+VLA action inference and LLM/VLM generation retain distinct public capabilities.
+Initial noise or RNG is a run option, not an environment observation field.
 
 ```mermaid
 sequenceDiagram
     participant U as Caller
-    participant P as Policy
-    participant C as Processor
-    participant M as Model
+    participant F as Policy / TextModel
+    participant P as Processor
     participant S as Session
-    participant N as Network
-    U->>P: infer(observation)
-    P->>C: encode(observation)
-    C-->>P: encoded + decode_context
-    P->>M: describe(encoded, run_options)
-    M-->>P: execution_spec
-    opt Missing or invalid Session
-        P->>M: prepare(spec, representative_input)
-        M->>S: allocate and prepare
-        S->>N: warmup / capture maintained network
-        M-->>P: Ready Session + strategy
+    participant D as Native algorithm
+    participant N as Network / Blocks
+    participant B as Backend
+    U->>F: infer / generate
+    F->>P: encode
+    P-->>F: typed input + context
+    F->>S: prepare(input, options)
+    S->>N: describe regions
+    S->>B: allocate; optional warmup/capture
+    S-->>F: ReadyReport
+    F->>S: infer / generate_stream
+    S->>D: run algorithm
+    loop Required computation
+        D->>S: execute region
+        alt Eager
+            S->>N: tensor computation
+            N->>B: kernels
+        else Captured
+            S->>B: bind and replay
+        end
+        S-->>D: device result
+        D->>D: sample / update / stop
     end
-    P->>S: run(encoded, rng_or_latent)
-    alt Eager
-        S->>N: execute
-    else Captured
-        S->>S: graph replay
-    end
-    S-->>P: model_output
-    P->>C: decode(model_output, decode_context)
-    C-->>P: actions
-    P-->>U: actions
+    D-->>F: output or events
+    F->>P: decode(output, context)
+    P-->>U: actions or text
 ```
 
-The public API may remain `policy.infer(observation)`. Explicit preparation is
-also useful for deployment and benchmarking, but callers should not need to
-manually orchestrate these internal stages for ordinary inference.
+```rust
+fn generate(session, prompt, options, emit) {
+    session.reset_request();
+    sampler.begin(options);
+    logits = session.execute(Prefill, prompt);
+    for index in 0..options.max_new_tokens {
+        token = sampler.sample(logits);
+        emit(token);
+        if is_eos(token) || index + 1 == options.max_new_tokens { break; }
+        session.ensure_decode_ready(next_position); // explicit if needed
+        logits = session.execute(Decode, token);
+    }
+}
+// VLM changes prefill (vision + feature merge), not the per-token generation loop.
+fn flow_inference(input, options) {
+    condition = network.encode_condition(input);
+    latent = initialize_latent(options.noise);
+    for time in schedule {
+        velocity = network.predict_velocity(condition, latent, time);
+        latent = solver.update(latent, velocity, time);
+    }
+    return latent;
+}
+// A fixed flow body may be captured as one region; no host step loop is required.
+```
 
-## Migration slices and acceptance
+ModelOutput specifies device, completion ordering and ownership. Device results
+must remain available without an unconditional host transfer. A borrowed output
+must state when the next run overwrites it; the facade consumes or copies before
+reuse. Cross-stream or host consumption observes completion. DecodeContext stays
+outside Network; LLM incremental detokenization may retain request-local state.
 
-Do not begin with a directory-wide rename or create one file per lifecycle stage.
-First characterize behavior, separate mathematical ownership from execution
-state inside existing model implementations, and only then extract demonstrated
-common mechanisms. Policy encode/decode helpers may stay in the existing file.
+## Verification contract
 
-
-This draft changes documentation only. It does not claim implementation LOC,
-GPU correctness, or latency results. The following slices describe expected code
-scope; estimate actual diff size after each bounded implementation is prepared.
-
-| Slice | Expected scope | Acceptance evidence |
-| --- | --- | --- |
-| 1. Contract characterization | Existing policies, native inputs, public-path tests | Record each model's shape, dtype, decode context, reset and output-lifetime behavior |
-| 2. Policy and processor separation | Existing Python policy files and thin bindings | Same raw observations yield equivalent encoded inputs and decoded actions; preserve imports |
-| 3. Network extraction | PI0.5/WallOSS runtimes; GR00T after coordination with PR #42 | Reference checkpoints and exact-input eager results remain within declared tolerances |
-| 4. Session lifecycle | Model session implementations and proven shared helpers | Prepare/replay parity, invalidation, latent-mode changes, failure cleanup and memory-budget checks |
-| 5. Common registration and backbone seam | Loaders, bindings, reviewed Qwen3-VL reuse | All three have maintained loading/serving paths; no dependency-check bypass without reviewed interface |
-| 6. Qualification | Requested hardware and precision paths | Raw observation-to-action checks, eager/captured parity, latency and memory compared with baseline |
-
-GR00T is a separate open PR. Do not merge it into this branch or rewrite its
-implementation merely to complete these documents. Coordinate the contract and
-backbone decisions before rebasing or implementing its migration.
-
-Calibrated PI0.5/GR00T paths and dynamic FP8 WallOSS need different quantization
-behavior. Common loading validates declared capabilities; it must not force
-static calibration on every FP8 model. Keep numerical tolerances and performance
-budgets explicit per supported target/precision tuple.
-
-## Deliberately outside this proposal
-
-- A universal graph IR, processor DSL, model inheritance tree or mandatory
-  dynamic dispatch in kernel hot paths.
-- Moving all preprocessing to CPU, or moving prompt semantics into Session.
-- Making every model use identical input fields, schedule, precision strategy
-  or CUDA capture topology.
-- Rewriting LLM/VLM generation before the VLA lifecycle contracts are validated.
-- Automatically publishing private port evidence or project workflow artifacts.
+Every migrated model/precision declares accepted inputs, exact-noise/seed behavior,
+output tolerances and supported hardware. Verify public raw-input paths, eager vs
+graph parity, state reset, graph reuse/invalidation, fallback/cleanup, cancellation
+and output lifetime as applicable. Measure cold preparation, steady-state latency,
+LLM TTFT/TPOT, and device memory separately. A documentation or CPU check does not
+qualify native GPU execution; unsupported or untested matrix cells remain explicit.

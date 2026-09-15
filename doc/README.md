@@ -7,7 +7,9 @@ the ApxInf source code.
 ## Architecture proposals
 
 - [Model lifecycle refactor: current and target architecture](model-lifecycle/architecture.md)
-- [Model lifecycle contracts and migration slices](model-lifecycle/lifecycle.md)
+- [Model lifecycle and interface contracts](model-lifecycle/lifecycle.md)
 
-These documents are proposals; current implementation guidance remains in
+- [Model lifecycle staged rollout and documentation gates](model-lifecycle/migration.md)
+
+These documents specify target behavior and track pending implementation; current implementation guidance remains in
 [Model Layer Architecture](model-layer-architecture.md).
