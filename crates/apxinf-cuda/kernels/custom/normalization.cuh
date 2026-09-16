@@ -276,6 +276,52 @@ __global__ void rms_norm_bf16_kernel(
   }
 }
 
+// The row is read three times by the loop below -- once to sum, once for the
+// variance, once to normalise -- and at 96.8% occupancy there are no more warps
+// to hide that with, which is why ncu attributes 60% of this kernel's stalls to
+// long_scoreboard. Each thread owns only cols/blockDim values, four at the
+// shipped shape, so they fit in registers and the row need only be read once.
+//
+// A thread keeps exactly the columns it kept before, in the same order, so both
+// block reductions see the same partial sums and the result is unchanged. That
+// is also why the loads stay strided rather than becoming 16-byte reads:
+// widening them would reassign columns between threads and change the
+// summation order.
+template <int PER_THREAD>
+__global__ void layer_norm_bf16_cached_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_bfloat16* output,
+    int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float cache[PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    cache[i] = __bfloat162float(
+        input[base + threadIdx.x + i * static_cast<int64_t>(blockDim.x)]);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) sum += cache[i];
+  const float mean = block_sum(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  const float inverse_std = rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const float value = (cache[i] - mean) * inverse_std *
+                            __bfloat162float(weight[col]) +
+                        __bfloat162float(bias[col]);
+    output[base + col] = __float2bfloat16(value);
+  }
+}
+
 __global__ void layer_norm_bf16_kernel(
     const __nv_bfloat16* input, const __nv_bfloat16* weight,
     const __nv_bfloat16* bias, __nv_bfloat16* output,
