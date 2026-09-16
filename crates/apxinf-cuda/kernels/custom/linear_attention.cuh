@@ -468,19 +468,59 @@ __global__ void gdn_chunk_state_kernel(
     const int64_t kcd_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * head_k_dim;
     const int64_t a_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * chunk_size;
     float attn_inter[32];
-    for (int cell = threadIdx.x, it = 0; cell < cells; cell += blockDim.x, ++it) {
-      const int i = cell / head_v_dim;
-      const int j = cell - i * head_v_dim;
-      float vp = 0.0f;
-      float ai = 0.0f;
-      const float qg = gdn_exp2_approx(g_cum[token_base + i]);
-      for (int m = 0; m < head_k_dim; ++m) {
-        const float s = __bfloat162float(state_cache[m * head_v_dim + j]);
-        vp += kcd_in[kcd_base + i * head_k_dim + m] * s;
-        ai += q[(token_base + i) * head_k_dim + m] * s;
+    // The inter term was the one loop here still reading the state cache once
+    // per cell. A thread's column j is fixed, so state_cache[m][j] is the same
+    // value for every cell it owns -- sixteen of them at the shipped shape --
+    // and ncu puts this kernel at 56% of the L1 pipeline with the cache reads
+    // dominating. Carrying a tile of accumulators moves the read outside, the
+    // same way the intra and state-update loops below already do. Each cell
+    // still sums over m in increasing order, so the values do not change.
+    const int inter_span = static_cast<int>(blockDim.x) * GDN_TILE;
+    if (cells % inter_span == 0 && blockDim.x % head_v_dim == 0) {
+      const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
+      for (int base = threadIdx.x, it = 0; base < cells; base += inter_span) {
+        const int row0 = base / head_v_dim;
+        const int j = base - row0 * head_v_dim;
+        float vp[GDN_TILE];
+        float ai[GDN_TILE];
+#pragma unroll
+        for (int t = 0; t < GDN_TILE; ++t) {
+          vp[t] = 0.0f;
+          ai[t] = 0.0f;
+        }
+        for (int m = 0; m < head_k_dim; ++m) {
+          const float sv = __bfloat162float(state_cache[m * head_v_dim + j]);
+#pragma unroll
+          for (int t = 0; t < GDN_TILE; ++t) {
+            const int i = row0 + t * row_step;
+            vp[t] += kcd_in[kcd_base + i * head_k_dim + m] * sv;
+            ai[t] += q[(token_base + i) * head_k_dim + m] * sv;
+          }
+        }
+#pragma unroll
+        for (int t = 0; t < GDN_TILE; ++t, ++it) {
+          const int i = row0 + t * row_step;
+          const int cell = base + t * static_cast<int>(blockDim.x);
+          const float qg = gdn_exp2_approx(g_cum[token_base + i]);
+          v_new[cell] = vt_in[vt_base + cell] - vp[t];
+          attn_inter[it] = ai[t] * qg;
+        }
       }
-      v_new[cell] = vt_in[vt_base + cell] - vp;
-      attn_inter[it] = ai * qg;
+    } else {
+      for (int cell = threadIdx.x, it = 0; cell < cells; cell += blockDim.x, ++it) {
+        const int i = cell / head_v_dim;
+        const int j = cell - i * head_v_dim;
+        float vp = 0.0f;
+        float ai = 0.0f;
+        const float qg = gdn_exp2_approx(g_cum[token_base + i]);
+        for (int m = 0; m < head_k_dim; ++m) {
+          const float s = __bfloat162float(state_cache[m * head_v_dim + j]);
+          vp += kcd_in[kcd_base + i * head_k_dim + m] * s;
+          ai += q[(token_base + i) * head_k_dim + m] * s;
+        }
+        v_new[cell] = vt_in[vt_base + cell] - vp;
+        attn_inter[it] = ai * qg;
+      }
     }
     __syncthreads();
     for (int cell = threadIdx.x; cell < cells; cell += blockDim.x) {
