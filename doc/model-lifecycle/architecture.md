@@ -127,6 +127,52 @@ the default architecture. Public Network factories and per-layer dynamic Block
 traits are not required. Select precision at construction and retain static
 specialization in hot paths.
 
+## Compute implementation selection (agreed target)
+
+Use `compute_variant` for the single user-facing choice of a model's compute
+implementation. It selects a compatible bundle of Blocks, physical weight
+representations and preparation requirements; it is not merely a dtype or a
+checkpoint/model-size variant. Do not add independently combinable quantization
+and implementation fields until a real use case requires them.
+
+The field name and selection contract are shared across models. Supported values
+belong to each model: do not create one global enum containing every model's
+implementations. Within a model module, use `ComputeVariant`; if a flattened
+public export is needed, an alias such as `Pi05ComputeVariant` disambiguates it.
+The prefix identifies ownership, not a different lifecycle contract.
+
+```rust
+// Proposed naming, not the currently shipped loading API.
+mod pi05 {
+    pub enum ComputeVariant { Auto, Bf16, StaticFp8, W8A8 }
+    pub struct LoadOptions {
+        pub compute_variant: ComputeVariant,
+    }
+}
+// pi05::ComputeVariant today; walloss::ComputeVariant when migrated.
+// A flat export may use: pub use pi05::ComputeVariant as Pi05ComputeVariant;
+```
+
+A future common model loader uses the same `compute_variant` field and resolves
+its value against the selected model. Typed callers may use model-specific enums;
+a configuration/binding entry can resolve a model-local identifier. The transport
+representation is deferred until the second model demonstrates the need; do not
+introduce a generic options hierarchy or registration framework for naming alone.
+
+Each loader resolves `Auto` or an explicit variant once, checks device and asset
+compatibility, creates matching Blocks, and injects them into `Network::new(blocks)`.
+Network does not receive or branch on the selection enum. One centralized match
+at construction is acceptable; selection must not spread through Network and
+Session execution. Record the resolved variant for diagnostics and reproducible
+qualification. Same-precision alternatives may add model-local variant values
+when actually implemented. Selection tables or registration are later options
+only if selection complexity or independent extension justifies them.
+
+This is an agreed target for subsequent migration, not a claim that Stage 2 has
+renamed existing precision APIs or removed its runtime compatibility adapters.
+Stage 3 should validate the shared selection contract with PI0.5 and WallOSS;
+GR00T and text-model migrations adopt it in their respective stages.
+
 ## Weight and precision ownership
 
 | Current file/content | Target responsibility |

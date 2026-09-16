@@ -185,6 +185,10 @@ recorded rather than stopped. Final evidence belongs in [baseline.md](baseline.m
 
 Deliverables:
 
+- Adopt the shared `compute_variant` selection contract with model-owned values;
+  validate naming and construction with PI0.5 and WallOSS before generalizing the
+  common loader representation. See [compute selection](architecture.md#compute-implementation-selection-agreed-target).
+
 - Use WallOSS as the second implementation to test which PI0.5 mechanisms are
   actually shared, rather than exporting PI0.5-specific assumptions as a framework.
 - Make first-run initialization/capture an explicit preparation transition;
