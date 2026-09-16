@@ -653,16 +653,34 @@ __global__ void gdn_recurrent_kernel(
   const float beta_h = beta[head];
   const float g_exp = expf(g[head]);
   float* state_head = state + static_cast<int64_t>(head) * head_k_dim * head_v_dim;
+  // The decayed state used to be written back here and read again below. It
+  // does not need to be: the second pass can apply the same `* g_exp` to the
+  // value it reads, which is the identical float operation, so the stored
+  // result is unchanged. That removes a full write and a full read of the
+  // state per step -- the kernel moved four passes over 128x128 floats per
+  // head and now moves three -- and leaves the first pass's lines clean, so
+  // the second pass can be served by L2 (the whole state is 2MB against a 4MB
+  // cache) instead of waiting on writebacks.
+  // __fmul_rn, not `*`. The store this loop used to do forced the decay to be
+  // materialised as a rounded float; with the store gone and --use_fast_math
+  // on, the optimiser is free to reassociate it into the surrounding
+  // arithmetic, and the 130-token probe moves. The intrinsic pins the same
+  // round-to-nearest product the stored value used to be.
   float kv_mem = 0.0f;
   for (int m = 0; m < head_k_dim; ++m) {
-    const float decayed = state_head[m * head_v_dim + j] * g_exp;
-    state_head[m * head_v_dim + j] = decayed;
+    const float decayed = __fmul_rn(state_head[m * head_v_dim + j], g_exp);
     kv_mem += decayed * k_row[m];
   }
   const float delta = (v[static_cast<int64_t>(head) * head_v_dim + j] - kv_mem) * beta_h;
   float acc = 0.0f;
   for (int m = 0; m < head_k_dim; ++m) {
-    const float updated = state_head[m * head_v_dim + j] + k_row[m] * delta;
+    // Keep `decayed` a separate product rather than folding it into the sum.
+    // Written as one expression the compiler contracts it into an FMA, which
+    // rounds differently from the multiply-then-add the stored value used to
+    // go through, and the 130-token probe moves. This shape matches what the
+    // old second pass computed: a rounded product, then added to k*delta.
+    const float decayed = __fmul_rn(state_head[m * head_v_dim + j], g_exp);
+    const float updated = decayed + k_row[m] * delta;
     state_head[m * head_v_dim + j] = updated;
     acc += updated * q_row[m];
   }
