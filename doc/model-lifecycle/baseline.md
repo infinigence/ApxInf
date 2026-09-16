@@ -1,11 +1,12 @@
 # Baseline protocol and qualification record
 
-Status: slice D PI0.5 implementation, functional/numerical qualification and
-Orin performance qualification are complete. Thor performance remains unqualified
-because concurrent GPU work prevents a reliable comparison. Historical
-measurements below retain their original source IDs.
-The selected-main inventory and historical slices are retained below; the final
-slice D section records the current candidate separately from slice C. Generated logs, manifests, hashes and probes live in the active worktree's
+Status: the final PI0.5 module candidate is qualified for the Stage 2 scope.
+Session G completes a fresh Thor performance comparison on 0f23048 and closes
+the earlier contention blocker. Orin performance retains its slice D source,
+with final module-native checks in Session F. Historical failed/blocked samples
+below retain their original source IDs and conclusions at the time.
+The selected-main inventory and historical slices are retained below; the
+Session G section records final Thor acceptance separately from historical slices. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
 
 ## Revisions and scope
@@ -685,9 +686,70 @@ other services were untouched.
 
 No Python source or public binding interface changed, so the previous native Python
 record remains historical evidence rather than a claimed new run. The full sixteen
-performance profiles were not rerun for this module-only follow-up. Thor's earlier
-performance gate remains open; new functional success does not clear it.
+performance profiles were not rerun for this module-only follow-up. At the end of Session F, Thor's earlier performance gate remained open;
+functional success alone did not clear it. Session G below records its later closure.
 
 Private logs, commands, overlay/asset identities and output comparisons are under
 `devlocal/model-lifecycle-refactor/thor-baseline/session-f/`; local checks live in
 `devlocal/model-lifecycle-refactor/session-f/`.
+
+
+## Session G: final Thor performance qualification
+
+The user requested a fresh condition check before marking PR #50 ready for review.
+Thor no longer had the earlier external Ray rollout. The initial observation
+showed 0–1% GPU use over 12 seconds with the four known resident processes left
+untouched. Baseline/candidate runs used per-process load monitoring throughout;
+this comparison replaces the blocked timing conclusion, not the retained raw
+Session D observations.
+
+Candidate computation source is `0f230485cc89ae68b822cae7b993cfe1e07de47b`;
+`b13296b` and the acceptance commit only change documentation. Baseline remains
+`c5268b7`. Both runners were verified against prior binary hash manifests and
+reused directly: **no build and no CUDA compilation** in this round. The original
+assets, tactics and third-view derivation remain pinned.
+
+Eight fresh paired profiles cover BF16/static-FP8 × views2/3 × T10/T21, H10,
+10 flow steps, 10 warmups and 30 measured samples per boundary. Every complete
+baseline/candidate and eager/graph output is elementwise identical; all workspace
+capacity/used counters match.
+
+| Variant | Views | T | Baseline graph P50 (ms) | Candidate graph P50 (ms) | Graph delta | Input + graph delta |
+| --- | --- | --- | --- | --- | --- | --- |
+| bf16 | 2 | 10 | 71.857 | 71.788 | -0.10% | -0.18% |
+| bf16 | 2 | 21 | 78.965 | 78.643 | -0.41% | -0.04% |
+| bf16 | 3 | 10 | 88.985 | 89.133 | +0.17% | +0.09% |
+| bf16 | 3 | 21 | 92.899 | 92.957 | +0.06% | +0.07% |
+| fp8_static | 2 | 10 | 41.474 | 41.351 | -0.30% | -0.57% |
+| fp8_static | 2 | 21 | 41.969 | 42.035 | +0.16% | +0.24% |
+| fp8_static | 3 | 10 | 53.700 | 53.244 | -0.85% | -0.79% |
+| fp8_static | 3 | 21 | 54.442 | 54.841 | +0.73% | -0.37% |
+
+Graph P50 changes span -0.848% to +0.732%, P95 -1.505% to +0.721%.
+Input-update-plus-graph P50 changes span -0.792% to +0.240%, P95 -1.497% to +0.284%.
+The comparable paired observations show no material regression and close the
+Thor performance gate for this PI0.5 refactor. They do not establish an absolute
+deployment SLO or prove a speedup. Three-view fixtures duplicate the wrist image;
+this is not three-camera policy-accuracy qualification. No new Orin performance
+run, closed-loop campaign or model migration is claimed.
+
+Full samples, output arrays, command/source identities, monitoring and cleanup
+records live in `devlocal/model-lifecycle-refactor/thor-baseline/session-g/`.
+The latest PR source was mergeable and had no reported GitHub check runs or
+unresolved current review threads at the initial readiness check; native evidence
+above is reported explicitly rather than described as GitHub CI passing.
+
+The authoritative eight-cell table is `session-g/accepted/performance/summary.json`.
+The last pair was repeated once after a short external FMHA process was observed.
+A second short observation in the repeated baseline was checked against original
+remote stderr mtimes and benchmark source order: it ended about 80 seconds before
+the capture message, with warmup and measurement afterward. No external process
+was observed in the later timed window; this is not full-run exclusivity or a
+claim that one-second monitoring excludes every transient. Original and repeated
+samples, phase evidence and acceptance-source mapping are retained. All task
+workers and monitors were cleaned up; resident services were untouched.
+
+Documentation follow-up also ran all five `pi05::math` tests without CUDA, and
+parsed/rendered the five PR Mermaid diagrams successfully. Code examples in the
+interface sections are excerpts or explicitly simplified sketches, not standalone
+compiled examples.

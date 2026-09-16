@@ -434,10 +434,12 @@ pi05/
   load.rs                      checkpoint loading and module assembly
   backend.rs                   model-wide accelerator seam
   math.rs                      CPU-capable model math helpers
+
   execution/
     mod.rs                     Session / plan / low-level capture exports
     session.rs                 private state, input binding, cache and validity
     prepare.rs                 allocation, warmup, capture and graph ownership
+
   network/
     mod.rs                     model dataflow and computation/resource interface
     compute.rs                 construction, LoadedCompute and static dispatch
@@ -447,6 +449,7 @@ pi05/
       bf16.rs                  BF16 backbone and layers
       fp8_static.rs            static FP8 backbone and layers
       int8_dynamic.rs          dynamic-activation INT8 backbone and layers
+
   weights/
     mod.rs                     fixed-asset exports
     host.rs                    PI0.5 checkpoint mapping and logical weight tree
@@ -455,6 +458,7 @@ pi05/
     fp8_static.rs              static FP8 linear storage and device model tree
     int8_dynamic.rs            INT8 linear storage and device model tree
     fp8_static_calibration.rs  calibration profile and fixed scales
+
 ```
 
 The tree has 22 Rust files (20 before this module encapsulation); the model
@@ -488,6 +492,106 @@ Low-level diagnostic callers construct a Network with `build_*_network`, call
 its computation methods, and explicitly use `capture_patches` or `capture_rgb`.
 Ordinary callers use AutoModel and prepare/run.
 
+### 与周边 crate 的 Interface / seam
+
+PI0.5 位于 `apxinf-model` crate；execution、network、weights 是它内部的三个 Rust
+module，不是三个 crate。模型层定义模型语义与执行生命周期，CUDA crate 提供设备
+资源和算子。当前实际连接的是 **apxinf-cuda**，不是 apxinf-cuda-new。
+
+```mermaid
+flowchart TD
+    U[Python Policy / native Model] -->|已处理的请求与结果| M[apxinf-model：PI0.5]
+    C[apxinf-core：Tensor、Backend、Graph 等契约] -.-> M
+    L[apxinf-loader：checkpoint 读取] -->|CPU Tensor| W[pi05/weights]
+    M --> E[execution：执行资源]
+    M --> N[network：计算流程]
+    M --> W
+    E --> B[pi05/backend.rs：模型级导入 seam]
+    N --> B
+    W --> B
+    B --> A[apxinf-model/accelerator.rs：CUDA 类型映射]
+    A --> D[apxinf-cuda：CudaBackend、Buffer、Graph、kernels]
+    D --> G[CUDA runtime / 原生算子库]
+```
+
+| 对接方 | Interface 与职责 |
+| --- | --- |
+| Python Policy / apxinf-py | processors 留在 Policy；native Model 持有 LoadedModel::Vla，向 Session 传模型请求，接收动作输出 |
+| apxinf-core | 提供 Tensor、Device、Backend、Graph、RNG 等基础类型和契约；加载入口使用 Arc&lt;dyn Backend&gt; |
+| apxinf-loader | 读取 SafeTensors 等资产；PI0.5 weights 解释 checkpoint 键名、形状和模型专属转换 |
+| apxinf-cuda | 实现 CUDA buffer/传输、graph scope、workspace、tactics 和算子；不决定 PI0.5 的 vision/prefix/flow 顺序 |
+
+加载器通过 `accelerator::create_backend` 获取统一 Backend；PI0.5 loader 检查并
+将其转换为具体 CUDA backend。`RuntimeBackend` 当前是 `CudaBackend` 的类型别名，
+`DeviceBuffer` 对应 `CudaBuffer`。Blocks 通过 `kernels` 直接调用 CUDA 专属算子，
+不要求把融合算子都塞进通用 Backend trait，也不增加逐层动态派发。
+
+具体使用分工：weights 转换/打包并上传固定资产；network/Blocks 调用计算算子；
+execution 管理输入、RNG、workspace、预热、capture 和 replay。底层分配、传输及
+capture 清理由 CUDA crate 实现。backend.rs 只集中导入/别名，不持有 Session 状态，
+因此留在根目录供三者共同使用；放进 execution 会引入反向依赖。这个 seam 不是承诺
+替换一个文件就能支持其他设备：新后端仍需实现实际使用的算子和资源契约。
+
+`math.rs` 则不依赖 CUDA，保留无 CUDA 构建可用的纯函数与语义测试。例如：
+
+```rust
+use apxinf_model::pi05::{discretize_state, pi05_prompt};
+assert_eq!(discretize_state(&[-1.0, 0.0, 1.0]), vec![0, 128, 255]);
+assert_eq!(pi05_prompt("pick_up", &[], false), "pick up\n");
+```
+
+这不表示 PI0.5 有完整 CPU 推理实现，也不表示 Python processor 正在调用上述
+Rust prompt 函数。当前无 CUDA 构建直接覆盖这些函数的单元测试；CUDA 加载路径还
+使用 sinusoidal_time_embedding 在 CPU 生成时间嵌入，再转换并上传。network module
+目前整体以 CUDA feature 编译，根目录 math 保留了独立测试与调用能力。
+
+
+#### CUDA 对接不只发生在 Blocks
+
+`backend.rs` 是集中导入的位置，**实际调用接口的位置分布在三个模块中**。
+下面是当前实现的节选；省略外围函数、校验与错误清理，不是独立可运行程序。
+
+```rust
+// network/blocks/bf16.rs：使用设备权重调用 CUDA 算子。
+use crate::pi05::backend::{kernels, Context};
+use kernels::{gemm, norm};
+
+let normalized = norm::rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
+let qkv = gemm::bf16(ctx, &normalized, &weights.qkv.weight)?;
+```
+
+这里 Blocks 决定用哪些算子、什么布局以及如何融合；CUDA crate 实现算子。
+`kernels` 经 `pi05/backend.rs → accelerator::cuda` 重导出，不是 Blocks 自己实现的 GPU 库。
+
+```rust
+// weights/bf16.rs：CPU 转换/打包结束后，通过 Backend 契约上传。
+// PI0.5 CUDA 加载路径中，backend 的实际对象是 CudaBackend。
+backend.to_device(&Tensor::from_bf16(
+    tensor.shape().dims().to_vec(),
+    &values,
+)?)
+```
+
+这条路径使用 `apxinf-core::Backend` 的通用接口，不要求每个 weights 文件直接
+导入 CUDA crate；具体 CUDA 类型、buffer 和专属布局仍通过模型的 backend seam 使用。
+
+```rust
+// execution/prepare.rs：CUDA workspace 分配与 capture 由执行层发起。
+fn allocate_workspace(
+    requirements: &WorkspaceRequirements,
+    device: usize,
+) -> Result<kernels::GraphWorkspace> {
+    match requirements.fp8_scratch {
+        Some((a, w)) => kernels::GraphWorkspace::new_fp8(requirements.bytes, a, w, device),
+        None => kernels::GraphWorkspace::new(requirements.bytes, device),
+    }
+}
+```
+
+同一文件还调用 `backend.capture_graph(...)`，把 network 的计算调用放进 capture
+闭包，并把 graph、workspace、输入 buffer 和计算对象保存在 `CapturedGraph` 中。
+因此不能把全部 CUDA 对接挪进 Blocks：那会让 Blocks 同时负责权重加载和请求生命周期。
+
 ### 三个 module 的 Interface 与依赖约束
 
 ```mermaid
@@ -514,6 +618,84 @@ flowchart TD
 - `backend.rs` 留在根目录，因为 weights、network、execution 都使用它。
   `math.rs` 保持 CPU 可用，不被 CUDA 专属 network 模块的 feature gate 隐藏。
   BF16 校准遍历归 network 内部，以便不向 execution 暴露 Blocks/权重字段。
+
+
+#### 模块间的接口：先交需求，再执行计算
+
+下面同样按当前源码摘录或简化，`...` 表示省略参数/字段，不是可直接编译的代码。
+
+```rust
+// network/mod.rs：给执行层的数据契约，查询本身不分配显存。
+pub struct WorkspaceRequirements {
+    pub bytes: usize,
+    pub fp8_scratch: Option<(usize, usize)>,
+}
+
+impl<B: PrepareBlocks> Pi05Network<B> {
+    pub(in crate::pi05) fn workspace_requirements(
+        &self, tokens: usize,
+    ) -> Result<WorkspaceRequirements> {
+        self.blocks.workspace_requirements(tokens)
+    }
+}
+
+// execution/prepare.rs：查询需求 → 分配 → 预热/调优稳定 → capture。
+let requirements = self.network.workspace_requirements(token_count)?;
+let workspace = allocate_workspace(&requirements, self.ctx().device_id())?;
+// 此处先执行现有的预热与 tactic 稳定性检查。
+let (graph, output) = backend.capture_graph(|| {
+    kernels::with_workspace(&workspace, || self.infer_captured_inputs(...))
+})?;
+```
+
+**network 说“计算需要多少资源”，execution 决定何时申请、是否录图、保留多久。**
+`PrepareBlocks` 是计算能力/资源需求契约，不是另一个 Session prepare 生命周期入口。
+
+```rust
+// network/compute.rs：由 network 定义，避免 network 反向依赖 execution。
+pub(in crate::pi05) trait NetworkOperation {
+    type Output;
+    fn run<B: PrepareBlocks>(
+        self,
+        network: &Arc<Pi05Network<B>>,
+        embeddings: &[Tensor],
+    ) -> Result<Self::Output>;
+}
+
+// execution/prepare.rs：执行层提供 capture 操作，返回类型也由执行层决定。
+impl NetworkOperation for CaptureOperation<'_> {
+    type Output = CapturedGraph;
+    fn run<B: PrepareBlocks>(
+        self,
+        network: &Arc<Pi05Network<B>>,
+        embeddings: &[Tensor],
+    ) -> Result<Self::Output> {
+        capture(network, self.input, self.tokens, self.count, self.noise, embeddings)
+    }
+}
+// execution 调用；network 内部 match 一次具体 variant，再调用 operation.run。
+compute.with_network(CaptureOperation { ... })
+```
+
+这里是**执行层调用计算层提供的类型分派接口**，由计算层回调执行层传入的操作。
+network 不导入 `CapturedGraph` 或 Session，execution 不匹配 BF16/FP8/INT8。
+这不是逐层动态派发，也不是面向外部用户的插件注册接口。
+
+```rust
+// load.rs 的组装流程（简化）：weights → network → execution。
+// 固定资产通过 Arc 交给 Blocks；weights 不认识 Network 或 Session。
+let network = build_bf16_network(backend, config, weights)?;
+
+// network/mod.rs：顶层流程通过语义接口调用 Blocks，不取出权重字段。
+pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
+    self.blocks.vision(patches, false)
+}
+```
+
+模块间交接的是设备权重类型、计算对象、资源需求和操作契约。
+Blocks 再读取例如 `weights.qkv.weight` 的具体表示并调用算子；Session 不越过
+network 去操作这些字段。新增量化/融合实现主要改 Blocks 与相应 weights，
+执行策略变化主要改 execution。
 
 普通用户仍通过 Policy/Model 使用 Session；已有低层构造、计算和 capture 导出
 供仓库诊断/benchmark 使用，不新增转发对象。目录层级服务职责封装，不要求每个文件

@@ -1,10 +1,10 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Status: Stage 2 has been extended to finish PI0.5 runtime removal, fixed-asset
-organization and compute_variant naming. Slice D implementation and functional
-qualification are complete, including Orin performance. Thor performance remains
-open because concurrent GPU work prevents a reliable comparison. Later model
-stages remain open.
+Status: PI0.5 Stage 2 is complete for the agreed refactor scope: runtime removal,
+fixed-asset organization, compute_variant naming and module encapsulation.
+Session G qualifies final-source Thor performance after the earlier contention
+window; Orin performance and final native checks retain their separately recorded
+sources. Later model stages remain open.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -180,8 +180,8 @@ examples/tests typecheck and family-boundary checks passed. Python and calibrati
 tokenizer/AutoPolicy: 7 passed, 0 skipped. Both devices passed native lifecycle
 tests and public smokes. Orin completed eight performance profiles; its one
 load-contaminated cell was independently rerun after the load subsided. Thor
-performance is not qualified under concurrent GPU work. See the slice D section
-of baseline.md for current evidence; slice C results retain their original source IDs.
+performance was not qualified in that concurrent-load window. See the slice D
+section of baseline.md for the historical evidence and Session G for final acceptance; slice C results retain their original source IDs.
 
 ### PI0.5 module encapsulation follow-up
 
@@ -194,21 +194,21 @@ math remain model-wide utilities. No numerical, packing or memory algorithm chan
 Both hosts passed native Network/Session/real-checkpoint lifecycle tests; Thor
 passed all three public smokes and seven exact-output fixtures. Local CPU tests,
 CUDA-feature typechecking and dependency guards passed. Details are tracked
-separately in baseline.md. This closes module encapsulation, not the still-open
-Thor performance gate.
+separately in baseline.md. Session G additionally completes final-source Thor performance qualification
+and closes the earlier contention blocker; historical samples remain recorded.
 
-### Stage 2 exit checklist (slice D)
+### Stage 2 exit checklist (final PI0.5 candidate)
 
 | Requirement | Current result |
 | --- | --- |
 | All three compute variants separated from capture/cache | One Network, variant Blocks, shared prepare/CapturedGraph; no runtime adapters |
 | Explicit preparation policy and actual readiness | Implemented; final three-precision Thor public smoke passed |
-| No hidden capture/autotune in compatible prepared run | Native suppression and store invalidation tests passed on both hosts; final e3ff0bf native link and Session tests passed on both |
+| No hidden capture/autotune in compatible prepared run | Native suppression and store invalidation tests passed on both hosts; final 0f23048 native link and Network/Session/real-checkpoint lifecycle tests passed on both |
 | Request input/RNG rebinding versus plan eviction | Passed final native retained-plan/cache and RNG checks |
 | Native failure cleanup and invalidation lifecycle coverage | Passed, including recovery through actual model execution |
 | Processor/action decoding context | Python regression suite and real-checkpoint AutoPolicy layering/tokenizer tests passed without native-test skips |
-| Exact-input and latency/resource comparison | Seven Thor exact-input fixtures passed; resource retention recorded. Orin eight-profile performance qualified; Thor performance gate remains open under concurrent GPU load |
-| Orin | BF16/dynamic-INT8 H50 public smoke and eight-profile matrix passed; final e3ff0bf native link and Session tests passed |
+| Exact-input and latency/resource comparison | Seven Thor exact-input fixtures passed; resource retention recorded. Orin eight-profile performance qualified in slice D; final-source Thor eight-profile comparison qualified in Session G |
+| Orin | BF16/dynamic-INT8 H50 public smoke and eight-profile matrix passed; final 0f23048 native link and Network/Session/real-checkpoint lifecycle tests passed |
 
 The user selected Thor as the primary Stage 2 acceptance target and Orin as the
 last supplementary target. Report same-profile baseline latency and resource
@@ -360,7 +360,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Slice D implemented: no runtime adapters, shared prepare, organized weights and compute_variant | D functionality and Orin performance qualified; Thor performance blocked by concurrent GPU load | Current tree, breaking interfaces and contracts recorded |
+| PI0.5 | Complete: execution/network/weights encapsulation, no runtime adapters, shared preparation and compute_variant | Final module functionality qualified on both hosts; Thor final-source performance qualified in G; Orin performance retains D evidence | Current tree, breaking interfaces and contracts recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |
