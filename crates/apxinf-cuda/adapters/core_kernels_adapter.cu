@@ -459,6 +459,19 @@ extern "C" cudaError_t apxinf_layer_norm_bf16(
 extern "C" cudaError_t apxinf_gelu_tanh_bf16(
     const void* input, void* output, uint32_t count, void* stream)
 {
+    // Take the wide path when the shape and both pointers allow it; device
+    // allocations and workspace views are 256-byte aligned, so in practice it
+    // is always taken. The scalar kernel stays for anything else.
+    const uintptr_t in_addr = reinterpret_cast<uintptr_t>(input);
+    const uintptr_t out_addr = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (in_addr % 16u) == 0u && (out_addr % 16u) == 0u) {
+        const uint32_t vec_count = count / 8u;
+        uint32_t blocks = (vec_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (blocks > 4096u) blocks = 4096u;
+        gelu_tanh_bf16_vec8_kernel<<<blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)input, (float4*)output, vec_count);
+        return cudaGetLastError();
+    }
     dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     gelu_tanh_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(

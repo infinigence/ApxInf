@@ -65,18 +65,45 @@ __global__ void silu_mul_bf16_kernel(
 // PyTorch's `gelu_pytorch_tanh` (a.k.a. hidden_act="gelu_pytorch_tanh"):
 //     y = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 
+// The one place the expression lives, so the scalar and vector paths cannot
+// drift apart. sqrt(2/pi) ~= 0.7978845608028654.
+__device__ __forceinline__ __nv_bfloat16 gelu_tanh_bf16_one(__nv_bfloat16 value)
+{
+    float x = __bfloat162float(value);
+    const float kBeta  = 0.7978845608028654f;
+    const float kAlpha = 0.044715f;
+    float inner = kBeta * (x + kAlpha * x * x * x);
+    float y = 0.5f * x * (1.0f + tanhf(inner));
+    return __float2bfloat16(y);
+}
+
 __global__ void gelu_tanh_bf16_kernel(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= count) return;
-    float x = __bfloat162float(input[gid]);
-    // sqrt(2/pi) ~= 0.7978845608028654
-    const float kBeta  = 0.7978845608028654f;
-    const float kAlpha = 0.044715f;
-    float inner = kBeta * (x + kAlpha * x * x * x);
-    float y = 0.5f * x * (1.0f + tanhf(inner));
-    output[gid] = __float2bfloat16(y);
+    output[gid] = gelu_tanh_bf16_one(input[gid]);
+}
+
+// Eight elements per thread through a 16-byte access. One bf16 per thread has a
+// warp fetching 64 bytes of a 128-byte sector and discarding half of every
+// transaction, which is why ncu measured the scalar kernel at 31% of memory,
+// 39% of compute and 11% of L1 -- saturating nothing at 58.9ms. The arithmetic
+// is per element and unchanged.
+__global__ void gelu_tanh_bf16_vec8_kernel(
+    const float4* __restrict__ input, float4* __restrict__ output,
+    uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 packed = input[v];
+        __nv_bfloat16* lane = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lane[i] = gelu_tanh_bf16_one(lane[i]);
+        }
+        output[v] = packed;
+    }
 }
 
 
