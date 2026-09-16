@@ -1277,6 +1277,15 @@ extern "C" cudaError_t apxinf_static_gated_rms_silu_bf16(
       !(eps > 0.0f)) {
     return cudaErrorInvalidValue;
   }
+  if (cols == 128) {
+    gated_rms_silu_bf16_rowfit_kernel<<<rows, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x),
+        static_cast<const __nv_bfloat16*>(z),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(out),
+        cols, z_heads, z_row_stride, z_col_offset, eps);
+    return cudaGetLastError();
+  }
   const size_t smem = static_cast<size_t>(cols) * sizeof(float);
   gated_rms_silu_bf16_kernel<<<rows, 128, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(x),

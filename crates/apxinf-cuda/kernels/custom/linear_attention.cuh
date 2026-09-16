@@ -690,6 +690,54 @@ __global__ void gdn_recurrent_kernel(
 // Fused gated RMSNorm: FP32 normalization, weight and SiLU gate; one BF16 store.
 // x rows are [rows, cols]; z rows are strided slices z[(row/z_heads) *
 // z_row_stride + z_col_offset + (row%z_heads)*cols].
+// One element per thread at the shipped shape (cols 128, blockDim 128), which
+// leaves each thread with a single load in flight; ncu attributes 55% of the
+// stalls to long_scoreboard at 94% occupancy, so there are no more warps to
+// hide that with. Two things follow.
+//
+// The shared staging array is not needed: `la_gated[i]` is written and read by
+// the same thread, never shared, so a register does it and the shared round
+// trip goes away.
+//
+// And z and weight do not depend on the reduction, so their loads can be issued
+// before it rather than after the two barriers it needs. Three loads in flight
+// instead of one, with two of the latencies overlapping the reduction.
+//
+// Values, expressions and the reduction tree are all unchanged.
+__global__ void gated_rms_silu_bf16_rowfit_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ z,
+    const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ out,
+    int cols, int z_heads, int64_t z_row_stride, int64_t z_col_offset,
+    float eps) {
+  const int row = blockIdx.x;
+  const int i = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  const int64_t z_base = static_cast<int64_t>(row / z_heads) * z_row_stride +
+                         z_col_offset + static_cast<int64_t>(row % z_heads) * cols;
+  const float xv = __bfloat162float(x[base + i]);
+  const float zf = __bfloat162float(z[z_base + i]);
+  const float wv = __bfloat162float(weight[i]);
+  float partial = xv * xv;
+  __shared__ float warp_sums[32];
+  for (int offset = 16; offset > 0; offset >>= 1)
+    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_sums[warp] = partial;
+  __syncthreads();
+  if (warp == 0) {
+    float v = (lane < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+      v += __shfl_xor_sync(0xffffffff, v, offset);
+    if (lane == 0) warp_sums[0] = v;
+  }
+  __syncthreads();
+  const float rms = rsqrtf(warp_sums[0] / cols + eps);
+  const float y1 = wv * (xv * rms);
+  out[base + i] = __float2bfloat16(
+      __fmul_rn(__fmul_rn(y1, zf), la_triton_sigmoid(zf)));
+}
+
 __global__ void gated_rms_silu_bf16_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* z, const __nv_bfloat16* weight,
     __nv_bfloat16* out, int cols, int z_heads, int64_t z_row_stride,
