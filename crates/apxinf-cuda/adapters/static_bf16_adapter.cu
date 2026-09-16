@@ -171,6 +171,12 @@ extern "C" cudaError_t apxinf_static_swiglu_bf16(
   const int64_t count = static_cast<int64_t>(rows) * inner;
   if (gate_up == nullptr || output == nullptr || rows <= 0 || inner <= 0)
     return cudaErrorInvalidValue;
+  if (swiglu_vec8_ok(gate_up, output, inner)) {
+    swiglu_bf16_vec8_kernel<<<blocks_for(count / 8), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate_up),
+        static_cast<__nv_bfloat16*>(output), rows, inner);
+    return cudaGetLastError();
+  }
   swiglu_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(gate_up),
       static_cast<__nv_bfloat16*>(output), rows, inner);
