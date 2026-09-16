@@ -4,6 +4,9 @@ Status: target specification plus explicitly marked implemented slices. Current-
 module responsibilities are in [architecture.md](architecture.md).
 Implementation order and tracking are in [migration.md](migration.md).
 
+当前 PI0.5 的[完整 Session 时序与 prepare 参数](#implemented-pi05-preparation-contract)
+在 implemented 章节；前面的跨模型生命周期仍是历史对比和目标规范。
+
 ## Current lifecycle differences at upstream/main 7baa69b
 
 | Family | Preparation and capture | State / output observations |
@@ -246,43 +249,142 @@ policy methods; their default status is RuntimeManaged, never a fabricated Ready
 Python processing and action decoding are unchanged; PI0.5 loading uses the new
 compute_variant field. See the architecture document for breaking entry changes.
 
+### Session 生命周期：准备、执行、失效与释放
+
+Session 是长期对象；`prepare.rs` 是被调用的模块，没有一个长期运行的 Prepare
+对象。Session 决定执行策略并分配请求输入/noise buffer；prepare 模块负责 graph
+workspace、固定 styles、预热、录制和 CapturedGraph 封装。PreparedInference
+是准备结果，既可以使用 Eager，也可以使用 Graph。
+时序图从上向下阅读：实线箭头是调用/操作，虚线箭头是返回；
+alt 是互斥分支，opt 是满足条件才执行。它们与类图的持有箭头含义不同。
+
 ```mermaid
 sequenceDiagram
-    participant C as Rust caller / Policy integration
+    participant U as Rust 调用方或 native Model
     participant S as Pi05Session
-    participant T as Backend tactics
-    participant P as PreparedInference
-    participant N as Network / shared prepare
-    C->>S: prepare_for(real sample, policy)
-    opt backend in AutoTune mode
-        S->>N: eager traversal on real input
-        N->>T: resolve/tune choices
-        S->>S: synchronize and release temporary output
-    end
-    S->>S: allocate fixed inputs and noise generator
-    alt Eager
-        S->>P: retain eager input resources
-    else PreferGraph or RequireGraph
-        S->>N: prepare resources and capture (autotune suppressed)
-        alt capture succeeds
-            S->>P: retain graph and referenced resources
-        else capture fails
-            S->>P: PreferGraph: eager + reason; RequireGraph: error
+    participant C as LoadedCompute
+    participant P as prepare.rs
+    participant N as Network
+    participant R as PreparedInference
+    participant G as CapturedGraph
+
+    Note over U,S: load 完成：已有计算资产，尚无隐式计划
+    alt 便利入口 infer(request)
+        U->>S: infer(request)
+        S->>S: 校验输入，检查 spec 与 tactics 身份和代次
+        alt 缓存有效且 spec 相同
+            S->>R: 复用缓存计划
+        else 缓存缺失、规格变化或失效
+            S->>S: 清除旧隐式缓存
+            opt 后端配置为 AutoTune
+                S->>C: 使用真实 request 进行允许调优的 eager 执行
+                C->>N: 运行并按需选择 tactics
+            end
+            Note over S,G: 进入下方共同建计划流程，默认 PreferGraph
+        end
+    else 显式准备，不查询隐式缓存
+        U->>S: prepare(spec) 或 prepare_with_policy(spec, mode)
+        Note over U,S: prepare(spec) 等价于 mode=PreferGraph；不做样本调优
+    else 带样本的显式准备
+        U->>S: prepare_for(sample, mode)
+        S->>S: 校验 sample，提取 spec
+        opt 后端配置为 AutoTune
+            S->>C: 使用 sample 进行允许调优的 eager 执行
+            C->>N: 运行并按需选择 tactics
         end
     end
-    S-->>C: owned plan, Ready(Eager/Graph)
-    C->>P: run(request with compatible spec)
-    P->>P: reject stale tactics or mismatched input
-    P->>N: eager or replay, no capture/autotune
-    P-->>C: device Action
-    C->>C: copy output before reusing graph output buffer
+
+    opt 需要创建新计划
+        S->>S: 校验 spec，分配输入/noise buffer，创建生成器
+        alt mode 为 Eager
+            S->>R: 创建 Eager 计划并保留输入资源
+        else mode 为 PreferGraph 或 RequireGraph
+            S->>C: capture(spec, buffers)
+            C->>P: 分派到泛型 capture
+            P->>N: 读取 Blocks 资源需求，准备 styles
+            P->>P: 分配 workspace 和录制所需资源
+            P->>N: 预热并录制（禁止 autotune）
+            alt 录制成功
+                P->>G: 保留 graph、buffer、workspace、Network/styles
+                P-->>S: CapturedGraph（经 LoadedCompute 返回）
+                S->>R: 创建 Graph 计划
+            else 录制失败且 PreferGraph
+                P-->>S: 录制错误（经 LoadedCompute 返回）
+                S->>R: 创建 Eager 计划并记录回退原因
+            else 录制失败且 RequireGraph
+                P-->>S: 录制错误（经 LoadedCompute 返回）
+                S-->>U: 返回 Err，不返回计划
+            end
+        end
+    end
+
+    opt 成功取得计划
+        alt 便利 infer
+            S->>S: 缓存计划
+            S->>R: run(request)
+        else 显式 prepare
+            S-->>U: 返回独立持有的计划
+            U->>R: run(request)，可重复调用
+        end
+        R->>R: 校验 spec 和有效性；绑定本次输入及噪声
+        alt 输入不匹配或 tactics 已变化
+            R-->>U: Err，不自行重新 prepare
+        else 有效 Graph 计划
+            R->>G: replay()
+            G-->>R: 可复用设备输出
+        else 有效 Eager 计划
+            R->>C: infer(inputs)，不触发 prepare
+            C->>N: infer(inputs)
+            N-->>R: 设备输出
+        end
+        Note over U,R: 成功时返回 Action；便利调用经 Session 返回
+    end
+    U->>S: clear_prepared() 或释放 Session
+    S->>S: 释放隐式缓存引用
+    Note over U,G: 显式计划仍可持有资源；没有计划到 Session 的反向引用
+    U->>R: 释放最后一个计划引用
+    Note over R,G: 释放拥有的资源；仍持有的输出 Tensor 可能继续保留 arena
 ```
 
-`prepare_with_policy(spec, policy)` skips real-input tuning and selects existing
-or default tactics; it never tunes on placeholder data. `prepare_for(sample,
-policy)` permits tuning on the sample first. Legacy `prepare(spec)` maps to
-PreferGraph. Legacy `infer(request)` remains the convenience path that can tune
-and prepare on a cache miss; it is not the fixed-plan low-latency contract.
+### 参数、返回值和调优开关
+
+`ExecutionPolicy` 是执行选项，与 Python `Pi05Policy` 不是同一个概念。
+`spec` 当前只有 token_count 和 image_layout（None 表示 patches）；视图数、
+动作长度等固定尺寸来自模型 config。`sample` 是包含实际 RGB/patches、token IDs
+和初始噪声或 RNG key 的 VlaRequest，不是原始 prompt 文本。
+
+| 接口 | 行为与场景 |
+| --- | --- |
+| prepare(spec) | 等价于 prepare_with_policy(spec, PreferGraph)；已知规格，使用默认策略 |
+| prepare_with_policy(spec, mode) | 不做样本调优；已有 tactics 或使用默认选择，需要明确控制执行方式 |
+| prepare_for(sample, mode) | 从样本提取 spec；仅后端加载时开启 autotune 才先进行允许调优的样本执行 |
+| Session.infer(request) | 维护最近一个隐式计划；缓存有效则跳过准备，否则按需样本调优再以 PreferGraph 建计划 |
+| LoadedCompute.infer(inputs) | 只转发到对应 Network，不检查计划缓存，也不自动 prepare |
+
+三个显式 prepare 均返回 `Result<Box<dyn PreparedInference>>`，创建独立计划，
+不查询或填入 Session.infer 的隐式缓存。`autotune=true` 在加载时选择后端 AutoTune
+模式；调优选择算子 tactics，不训练、不改权重，已有条目可以复用。它与 Eager/Graph
+是独立选项。prepare_with_policy 的预热/录制以及计划 run 均禁止 autotune。
+
+| ExecutionPolicy | 准备结果 |
+| --- | --- |
+| Eager | 不尝试录图；分配输入/noise/RGB 等资源并创建 Eager 计划；run 仍可能分配临时内存 |
+| PreferGraph | 成功为 Graph；录制失败可返回 Eager 和 fallback_reason；输入/分配错误仍可能报错 |
+| RequireGraph | 必须返回 Graph 计划；录制失败返回 Err，不回退 |
+
+`strategy` 是 `Eager(EagerInputs)` 或 `Graph(CapturedGraph)`；Graph 分支就是 enum
+变体，不是额外阶段。`status()` 返回 Ready(Eager/Graph) 或 Invalidated，不是准备
+进度条。tactics store 身份或 generation 变化会使计划失效；显式 run 报错，由调用方
+重新准备，便利 Session.infer 则自动替换失效缓存。
+
+所谓 RNG buffer 更准确地说是**初始噪声 buffer**：prepare 分配固定地址并绑定生成器，
+每次 run 根据 seed/sequence/draw 生成噪声，或复制用户提供的噪声。复用地址不代表
+复用噪声值。样本调优使用的图像与 token 也不会固定到后续计划中。
+
+`prepare.rs` 的内部 capture 共用一条录制机制；公开 capture_patches/capture_rgb
+仅按输入形式提供两个低层入口，不是三个录制阶段。普通 Python Pi05Policy.infer
+经过 Model.infer_rgb 调用 Session.infer，默认 PreferGraph；当前 Python Policy
+没有直接暴露上述显式 prepare / ExecutionPolicy 选项。
 
 ```rust
 // Callable interfaces, abbreviated result/error types only.
@@ -328,29 +430,12 @@ lifecycle guarantees above remain targets until separately implemented and teste
 
 ### Stage 2 resource preparation and invalidation details
 
-```mermaid
-sequenceDiagram
-    participant S as Session
-    participant R as Shared prepare
-    participant N as Shared Network / Blocks
-    participant C as CUDA backend
-    S->>R: prepare captured region (autotuning suppressed)
-    R->>N: prepare fixed per-step styles
-    R->>N: query Block workspace/layout requirements
-    R->>R: allocate GraphWorkspace and stable inputs
-    R->>N: warm traversal with workspace; synchronize
-    R->>C: capture_graph(closure)
-    C->>C: begin capture
-    C->>N: traverse same Network with workspace
-    alt successful capture
-        C->>C: end capture and instantiate executable graph
-        C-->>R: graph handle and output
-        R-->>S: retain graph + workspace + Network + inputs/styles/output
-    else closure error or unwind
-        C->>C: end capture, discard graph, clear known capture error
-        C-->>S: original error / unwind
-    end
-```
+The complete sequence above replaces the previous diagram that merged Network
+and prepare into one participant. CUDA backend capture uses a scoped cleanup
+mechanism: errors/unwind end and discard capture, and known capture errors are
+cleared before later execution. Session reaches this through LoadedCompute and
+the shared prepare module, not through a second long-lived preparation object.
+
 
 Graph handles are in-process objects, not serialized cache files. The captured
 resource owner retains Network and therefore every referenced fixed weight,

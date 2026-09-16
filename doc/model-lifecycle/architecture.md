@@ -12,6 +12,9 @@ Read [lifecycle contracts](lifecycle.md) and the [staged rollout](migration.md).
 The existing [model-layer reference](../model-layer-architecture.md) describes
 implementation guidance until individual migrations update it.
 
+阅读当前 PI0.5 实现请直接查看[对象关系、加载调用链与权重结构](#implemented-pi05-pilot-stage-2)。
+前面的 baseline/target 图用于历史对比，不代表本分支当前的对象持有关系。
+
 ## Baseline logical view (selected main)
 
 ```mermaid
@@ -261,24 +264,167 @@ compatibility types. This view describes the refactor branch, not unmigrated
 families. The implemented CPU/CUDA checks and native qualification status are
 tracked separately in [baseline.md](baseline.md).
 
+### 对象关系：谁持有谁
+
+本图只表达持有关系，不表达加载顺序或调用顺序。`*--` 实心菱形表示
+拥有成员；`o--` 空心菱形表示共享持有，具体以 Rust 的 `Arc` / `Rc` 为准。
+菱形位于持有者一端。`..>` 表示调用依赖，留给时序图表达，不混入本图。
+
 ```mermaid
-flowchart TB
-    U[Python Policy: encode / decode context] --> A[AutoModel / LoadedModel]
-    A --> L[load: resolve compute_variant, materialize assets, construct Blocks]
-    L --> S[Session: execution policy, implicit cache, prepare/run]
-    L --> N[One Network: vision → prefix/KV → flow schedule]
-    N --> B[Blocks: bf16 / fp8_static / int8_dynamic]
-    W[weights: host mapping, device trees, fixed calibration] --> B
-    S --> P[PreparedInference: validity, request inputs and RNG]
-    S --> R[prepare: requirements → allocation → warmup → capture]
-    B -->|layout and workspace requirements| R
-    R -->|record same computation| N
-    R --> G[CapturedGraph: executable + stable resources + Network]
-    P -->|eager| N
-    P -->|replay| G
-    B --> K[CUDA kernels]
-    R --> C[CUDA backend: scoped capture and cleanup]
+classDiagram
+    direction TB
+    class Pi05Policy {
+        input_pipeline
+        output_pipeline
+        infer(observation)
+    }
+    class Model {
+        LoadedModel model
+    }
+    class LoadedModel {
+        <<enum>>
+        Text
+        Vla
+    }
+    class Pi05Session {
+        LoadedCompute compute
+        optional prepared_cache
+        infer(request)
+        prepare_with_policy(spec, execution_policy)
+        prepare_for(sample, execution_policy)
+    }
+    class Pi05PreparedInference {
+        InferenceSpec spec
+        LoadedCompute compute
+        ExecStrategy strategy
+        status()
+        run(request)
+    }
+    class LoadedCompute {
+        <<enum>>
+        Bf16
+        Fp8Static
+        Int8Dynamic
+        infer(inputs)
+        capture(inputs)
+    }
+    class Pi05Network {
+        B blocks
+        infer(inputs)
+    }
+    class BlocksImplementation {
+        Bf16Blocks
+        Fp8StaticBlocks
+        Int8DynamicBlocks
+    }
+    class DeviceWeights {
+        Bf16Weights
+        Fp8StaticWeights
+        Int8DynamicWeights
+    }
+    class ExecStrategy {
+        <<enum>>
+        Eager(EagerInputs)
+        Graph(CapturedGraph)
+    }
+    class CapturedGraph {
+        graph
+        workspace
+        stable_inputs_outputs
+        retained_network_and_styles
+        replay()
+    }
+    Pi05Policy *-- Model : native 模型句柄
+    Model *-- LoadedModel
+    LoadedModel *-- Pi05Session : Vla 中的具体对象
+    Pi05Session *-- LoadedCompute
+    Pi05Session o-- Pi05PreparedInference : Rc 最近一个隐式计划
+    Pi05PreparedInference *-- LoadedCompute
+    Pi05PreparedInference *-- ExecStrategy
+    LoadedCompute o-- Pi05Network : Arc 三选一
+    Pi05Network *-- BlocksImplementation : 泛型 B
+    BlocksImplementation o-- DeviceWeights : Arc 对应实现
+    ExecStrategy *-- CapturedGraph : 仅 Graph 变体
+    CapturedGraph o-- Pi05Network : 保持固定资产存活
 ```
+
+`Pi05Policy` 在 Python 层，`Model` 是 native binding 对象，其余是 Rust 类型。
+`BlocksImplementation` 和 `DeviceWeights` 仅为图中的分组，不是实际基类；
+三种 Blocks 分别实现 `Blocks` 与 `PrepareBlocks` trait。`Pi05Network<B>`
+共享一份源码，由 Rust 静态特化。`LoadedCompute` 是带数据的 enum，其方法集中
+转发到对应 Network，不重复实现模型数学计算，也不管理计划缓存。
+
+- **Policy = Model + 输入/输出 pipelines**。Model 不包含 tokenizer 或动作反归一化。
+- **Model 间接持有 Session**，是包含执行状态的用户侧句柄。`LoadedModel::Vla`
+  是统一容器的一个变体，不是另一个名叫 LoadedVla 的执行对象。
+- **LoadedCompute 是 PI0.5 内部的已加载计算实现**，含 Network 和时间嵌入。
+  `LoadedModel` 区分 Text/VLA 接口；`LoadedCompute` 区分 PI0.5 的计算实现。
+- **Session 和计划没有互相持有**。计划不引用 Session；两者共享 Network。
+  清除隐式缓存或释放 Session，不会销毁调用方仍持有的显式计划。
+- **CapturedGraph 拥有 graph 和工作区，并保留 Network 引用**。CUDA Graph 使用
+  设备地址，不会自动替 Rust 持有权重；这条引用链防止 graph 活着而权重先释放。
+  共享引用不复制权重。graph 先于其引用的内存释放。
+
+### 加载调用链：谁创建这些对象
+
+AutoPolicy 选择 Policy 类；AutoModel 是统一 native 加载入口，也接受明确的
+模型名称。它们不是必须成对使用的对象。直接调用 Pi05Policy 只跳过 AutoPolicy；
+当前没有独立的 Python Pi05Model 类。所有分派发生在加载时，不是每次推理时。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant AP as AutoPolicy
+    participant P as Pi05Policy
+    participant M as Model.load
+    participant A as AutoModel
+    participant L as pi05/load.rs
+    alt 自动选择 Policy
+        U->>AP: from_pretrained(model_dir)
+        AP->>P: 选择后调用 from_pretrained
+    else 明确使用 PI0.5
+        U->>P: from_pretrained(model_dir)
+    end
+    P->>P: 解析模型与处理器元数据
+    opt 未注入现成的 Model
+        P->>M: load(pi05, checkpoint, options)
+        M->>A: load_model(device, path, options)
+        A->>L: 按明确模型名称分派
+        L->>L: 读取 config、checkpoint、calibration
+        L->>L: 创建设备权重、Blocks、Network、时间嵌入
+        L->>L: 包装 LoadedCompute，创建 Pi05Session
+        L-->>A: LoadedModel::Vla(Session)
+        A-->>M: LoadedModel
+        M-->>P: Model 句柄
+    end
+    P->>P: 完成 pipelines 并组装 Policy
+    P-->>U: Policy（经 AutoPolicy 或直接返回）
+```
+
+`Model.load()` 返回 Model，不返回 LoadedCompute。普通 Python 调用为
+`policy = Pi05Policy.from_pretrained(path, compute_variant="bf16")`，随后
+`policy.infer(observation)`。它执行 input_pipeline → Model.infer_rgb →
+Session.infer → output_pipeline。处理后的 observation 还会传给输出 pipeline，
+供状态相关的机器人适配使用。encode/decode 是概念描述，不是同名 Rust 接口。
+
+### 权重结构与归属
+
+`weights/host.rs` 的 `Pi05Weights` 是共同的 PI0.5 checkpoint 逻辑树：vision、
+language_layers、action_layers、norm、action_in/out 和 time_mlp_in/out。
+加载时转换为三种并列的设备结构，由对应 Blocks 持有，Network 不访问具体布局。
+
+| 文件 | 内容 |
+| --- | --- |
+| host.rs | checkpoint 映射和 PI0.5 逻辑权重树；不是跨模型统一权重树 |
+| packing.rs | 共用矩阵拼接工具，不依附 FP8 实现 |
+| bf16.rs | Bf16Weights；linear 存储含 BF16 Tensor、bias 和可选特殊布局 |
+| fp8_static.rs | Fp8StaticWeights；linear 存储含 E4M3 Tensor、weight scale 和布局 |
+| int8_dynamic.rs | Int8DynamicWeights；INT8 buffer、每输出通道 weight scales、bias |
+| fp8_static_calibration.rs | FP8 表示、校准 profile 和固定激活 scales |
+
+静态 FP8 的激活 scales 来自校准；动态 INT8 的激活 scales 在运行时按行生成，
+权重 scales 仍固定。每种设备文件内部包含 linear 子模块和模型聚合结构，
+没有另建三套 Network，也没有把通用打包操作放在某个 dtype 的文件下。
 
 ```text
 pi05/
@@ -320,7 +466,8 @@ Rust statically specializes the Network for each implementation. `load.rs` wraps
 these types for the public Session; no per-layer virtual calls are introduced.
 
 Blocks report workspace requirements and perform their native input conversion.
-`prepare.rs` allocates resources, prepares fixed styles, warms up until tactics
+Session allocates request/noise buffers; `prepare.rs` allocates graph workspace
+and capture-specific resources, prepares fixed styles, warms up until tactics
 stabilize, captures with the shared CUDA scope, and returns a single CapturedGraph
 for every variant. Its erased fixed-resource owner retains the concrete Network
 and style tensors; this erases ownership storage only, not computation dispatch.
