@@ -121,16 +121,22 @@ ahead of the second example.
 
 ## Policy
 
+PI0.5 selects its implementation with `compute_variant`: `auto`, `bf16`,
+`fp8_static` or `int8_dynamic`. Static FP8 uses calibrated activation scales;
+dynamic INT8 uses per-row activation scales and fixed per-channel weight scales.
+The previous PI0.5 `precision` keyword is no longer accepted. Other model families
+retain their own loading options until migrated.
+
 Two entry points, both returning something that satisfies the `Policy` contract:
 
 ```python
 from apxinf import AutoPolicy, Pi05Policy
 
 # Generic: read config.json's model type and dispatch to the right class.
-policy = AutoPolicy.from_pretrained("model_dir", precision="bf16", action_dim=7)
+policy = AutoPolicy.from_pretrained("model_dir", compute_variant="bf16", action_dim=7)
 
 # Concrete: when you need model-specific knobs.
-policy = Pi05Policy.from_pretrained("model_dir", precision="bf16", action_dim=7)
+policy = Pi05Policy.from_pretrained("model_dir", compute_variant="bf16", action_dim=7)
 
 result = policy.infer({
     "observation/image": base_rgb,
@@ -146,7 +152,7 @@ For bare-model (L1) use, the binding is reachable as `apxinf.Model`:
 
 ```python
 from apxinf import Model
-model = Model.load("pi05", "model.safetensors", precision="bf16")
+model = Model.load("pi05", "model.safetensors", compute_variant="bf16")
 model.infer_rgb(rgb_u8, "nhwc", token_ids)          # internal device sampling
 model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # exact external noise
 ```

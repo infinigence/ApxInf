@@ -1,7 +1,8 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Status: PI0.5 Stage 2 is complete, including primary Thor qualification and
-supplementary Orin validation. Later model stages remain open.
+Status: Stage 2 has been extended to finish PI0.5 runtime removal, fixed-asset
+organization and compute_variant naming. Slice C remains qualified; the new
+slice D candidate is undergoing fresh native qualification. Later model stages remain open.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -161,7 +162,23 @@ re-capture and separately owned plan execution after dropping Session.
 Local checks pass: 107 Rust CPU tests, CUDA-feature examples/tests typecheck,
 family boundaries, formatting, and 182 Python tests (6 skips, 5 subtests).
 
-### Stage 2 exit checklist
+### Stage 2 slice D: complete PI0.5 organization
+
+The user extended this stage and explicitly allowed breaking low-level interfaces.
+Candidate `883e55c` removes all runtime files, shares preparation and graph
+ownership, moves construction/typed dispatch to load.rs, organizes fixed assets
+under weights/, and exposes compute_variant with bf16/fp8_static/int8_dynamic.
+Network no longer imports any concrete Block variant. Repository Rust/Python
+callers and diagnostic examples use the new interfaces. The architecture document
+contains the full directory tree and migration table.
+
+Local model CPU suite: 95 passed; benchmark argument tests: 2 passed. CUDA-feature
+examples/tests typecheck and family-boundary checks passed. Python: 182 passed,
+6 environment skips and 5 subtests. Native candidate qualification is in progress;
+previous slice C hardware results below are retained as historical evidence and
+must not be relabeled as testing the new candidate.
+
+### Stage 2 exit checklist (slice C evidence; D rerun pending)
 
 | Requirement | Current result |
 | --- | --- |
@@ -324,7 +341,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Stage 2 complete: shared Network, precision Blocks and explicit Session policy | Thor primary and Orin supplementary parity/lifecycle/performance checks passed | Final contracts, diagrams and evidence recorded |
+| PI0.5 | Slice D implemented: no runtime adapters, shared prepare, organized weights and compute_variant | Slice C qualified; fresh D hardware results pending | Current tree, breaking interfaces and contracts recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |

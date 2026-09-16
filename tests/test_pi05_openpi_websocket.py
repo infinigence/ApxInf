@@ -92,7 +92,7 @@ def build_policy() -> Pi05Policy:
         input_pipeline=input_pipeline,
         output_pipeline=output_pipeline,
         image_keys=LIBERO_IMAGE_KEYS,
-        metadata={"precision": "int8", "protocol": "openpi.websocket_policy"},
+        metadata={"compute_variant": "int8_dynamic", "protocol": "openpi.websocket_policy"},
     )
 
 
@@ -157,7 +157,7 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         )
         metadata = client.get_server_metadata()
         # Policy metadata (model_type, shapes) merged with the server-injected tags.
-        self.assertEqual(metadata["precision"], "int8")
+        self.assertEqual(metadata["compute_variant"], "int8_dynamic")
         self.assertEqual(metadata["model_type"], "pi05")
         observation = {
             "observation/image": np.full((3, 224, 224), 0.5, dtype=np.float32),

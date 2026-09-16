@@ -107,6 +107,10 @@ between graph segments are forbidden.
    autotuning during compatible prepared run, and output-buffer lifetime.
    For Network/Block or precision changes, read the
    [PI0.5 component boundary](../../doc/model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2).
+   For the PI0.5 pilot, select `compute_variant` in loading; inject constructed
+   Blocks into Network. Report workspace/layout requirements from Blocks and
+   allocate/capture in shared prepare. Fixed checkpoint/device/calibration assets
+   belong under weights/. Follow the linked migration table for renamed entries.
    Keep model order in one Network and physical representation/fusion in Blocks;
    preserve existing operation order during structural moves. Verify capture
    recovery with a subsequent native run, and invalidate plans on tuning-store

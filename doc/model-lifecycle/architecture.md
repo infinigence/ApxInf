@@ -124,7 +124,7 @@ access to the whole Session. Network does not manage graph caching or serving.
 Eager and capture must use the same maintained computation semantics. Proven
 precision-specific fusion is permitted; a duplicate capture-only network is not
 the default architecture. Public Network factories and per-layer dynamic Block
-traits are not required. Select precision at construction and retain static
+traits are not required. Select the compute variant at construction and retain static
 specialization in hot paths.
 
 ## Compute implementation selection (agreed target)
@@ -142,36 +142,36 @@ public export is needed, an alias such as `Pi05ComputeVariant` disambiguates it.
 The prefix identifies ownership, not a different lifecycle contract.
 
 ```rust
-// Proposed naming, not the currently shipped loading API.
-mod pi05 {
-    pub enum ComputeVariant { Auto, Bf16, StaticFp8, W8A8 }
-    pub struct LoadOptions {
-        pub compute_variant: ComputeVariant,
-    }
-}
-// pi05::ComputeVariant today; walloss::ComputeVariant when migrated.
-// A flat export may use: pub use pi05::ComputeVariant as Pi05ComputeVariant;
+// Implemented PI0.5 selection. Shared LoadOptions carries a model-local ID.
+let options = LoadOptions {
+    compute_variant: Some(pi05::ComputeVariant::Fp8Static.as_str().into()),
+    ..LoadOptions::default()
+};
+// pi05::ComputeVariant::{Auto, Bf16, Fp8Static, Int8Dynamic}
 ```
 
-A future common model loader uses the same `compute_variant` field and resolves
-its value against the selected model. Typed callers may use model-specific enums;
-a configuration/binding entry can resolve a model-local identifier. The transport
-representation is deferred until the second model demonstrates the need; do not
-introduce a generic options hierarchy or registration framework for naming alone.
+Rust and Python use `compute_variant`; canonical values are `auto`, `bf16`,
+`fp8_static`, `int8_dynamic`. PI0.5 rejects explicit legacy `precision` and
+ambiguous IDs such as `fp8` or `w8a8`. Other models retain their existing precision
+interfaces until migrated and reject compute_variant through the current common
+loader. Stage 3 extends this support when WallOSS migrates; it does not introduce
+a global enum of every model's variants or a registration framework.
 
-Each loader resolves `Auto` or an explicit variant once, checks device and asset
-compatibility, creates matching Blocks, and injects them into `Network::new(blocks)`.
-Network does not receive or branch on the selection enum. One centralized match
-at construction is acceptable; selection must not spread through Network and
-Session execution. Record the resolved variant for diagnostics and reproducible
-qualification. Same-precision alternatives may add model-local variant values
-when actually implemented. Selection tables or registration are later options
-only if selection complexity or independent extension justifies them.
+`Auto` is resolved once during loading: static FP8 on SM100+ with calibration
+(or explicitly supplied uniform diagnostic scales), dynamic INT8 on SM80–SM99,
+and BF16 otherwise. Explicit choices retain existing kernel fallback behavior;
+this selection rule is not a declaration that all hardware/profile combinations
+are qualified. The resolved ID is logged. The loader creates matching Blocks and
+injects them into `Pi05Network::from_blocks`. Selection and typed dispatch are
+centralized in `load.rs`; Network and Session do not match the variant enum.
 
-This is an agreed target for subsequent migration, not a claim that Stage 2 has
-renamed existing precision APIs or removed its runtime compatibility adapters.
-Stage 3 should validate the shared selection contract with PI0.5 and WallOSS;
-GR00T and text-model migrations adopt it in their respective stages.
+Each value selects a complete compute implementation, including numerical
+formats and preparation requirements. `fp8_static` means fixed calibration-based
+activation scales. `int8_dynamic` means fixed per-output-channel weight scales
+and runtime per-row activation scales; it is not a dynamically changing model
+or a static-activation INT8 implementation. W8A8 remains useful kernel storage
+terminology but is not the model's variant ID. Same-precision alternatives can
+add values when actually implemented.
 
 ## Weight and precision ownership
 
@@ -219,14 +219,14 @@ crates/apxinf-model/src/
       language/
       action/
         mod.rs                        semantic interface / shared implementation
-        bf16.rs / fp8.rs / w8a8.rs     only where implementations actually differ
+        bf16.rs / fp8_static.rs / int8_dynamic.rs     only where implementations actually differ
 crates/apxinf-cuda*/                   backend mechanisms and kernel weight views
 python/apxinf/.../policies/            VLA facade and model processing
 crates/apxinf-tokenizer/               existing tokenizer capability
 ```
 
-Do not create three parallel complete trees under blocks/bf16, blocks/fp8,
-blocks/w8a8 by default. A model-wide precision directory is not required; local
+Do not create three parallel complete trees under blocks/bf16, blocks/fp8_static,
+blocks/int8_dynamic by default. A model-wide precision directory is not required; local
 compute specialization belongs beside its semantic Block, common matrix storage
 belongs in a demonstrated shared module, and quantization selection belongs in
 construction. Keep checkpoint mapping separate from kernel physical layout.
@@ -256,57 +256,109 @@ become explicit contracts. See migration.md for evidence and documentation gates
 
 ## Implemented PI0.5 pilot (Stage 2)
 
-This view describes the refactor branch, not unmigrated model families.
+The extended Stage 2 candidate removes all three PI0.5 runtime files and their
+compatibility types. This view describes the refactor branch, not unmigrated
+families. The implemented CPU/CUDA checks and native qualification status are
+tracked separately in [baseline.md](baseline.md).
 
 ```mermaid
 flowchart TB
-    U[Python Policy: encode / decode context] --> A[LoadedModel / VlaRuntime]
-    A --> S[Pi05Session: load selection, compatibility, preparation, implicit cache]
-    S --> P[PreparedInference: policy result, tactic identity, inputs and RNG]
-    P --> R[Precision runtime adapters: binding, workspace, graph ownership]
-    R --> N[One Pi05Network of B: vision → prefix/KV → flow schedule]
-    N --> B[Blocks: BF16 / FP8 / W8A8 backbones, layers, fixed weights]
-    B --> K[Safe CUDA kernels]
-    R --> G[CapturedGraph: graph + Network + workspace + input/output buffers]
-    G --> K
-    R --> C[CUDA backend: scoped capture cleanup]
+    U[Python Policy: encode / decode context] --> A[AutoModel / LoadedModel]
+    A --> L[load: resolve compute_variant, materialize assets, construct Blocks]
+    L --> S[Session: execution policy, implicit cache, prepare/run]
+    L --> N[One Network: vision → prefix/KV → flow schedule]
+    N --> B[Blocks: bf16 / fp8_static / int8_dynamic]
+    W[weights: host mapping, device trees, fixed calibration] --> B
+    S --> P[PreparedInference: validity, request inputs and RNG]
+    S --> R[prepare: requirements → allocation → warmup → capture]
+    B -->|layout and workspace requirements| R
+    R -->|record same computation| N
+    R --> G[CapturedGraph: executable + stable resources + Network]
+    P -->|eager| N
+    P -->|replay| G
+    B --> K[CUDA kernels]
+    R --> C[CUDA backend: scoped capture and cleanup]
 ```
-
-Network owns the complete model order and flow step count/dt. Blocks own major
-vision, prefix and action computations, including backbone layer loops, fusion,
-physical weights and precision-specific intermediate types. They do not decide
-preparation policy or hold request caches. `Pi05Network<B>` is statically
-dispatched: the three type aliases instantiate one source body; there is no
-runtime dtype switch in Network or per-layer virtual dispatch.
 
 ```text
 pi05/
-  session.rs             construction selection, prepare/run policy, cached plan
-  network.rs             shared model schedule and diagnostic traversal
+  mod.rs                       public entry and registration
+  config.rs                    model shape and ComputeVariant names
+  load.rs                      asset loading, selection, typed compute dispatch
+  session.rs                   policy, prepared requests, validity and implicit cache
+  prepare.rs                   one warmup/capture path and CapturedGraph resource owner
+  network.rs                   one model schedule, independent of concrete variants
+  calibration.rs               BF16 observer and diagnostic Network traversal
+  backend.rs                   model-local CUDA/kernel imports
+  math.rs                      prompt/state/time mathematical helpers
   blocks/
-    mod.rs               internal Blocks contract, associated Prefix and Styles
-    bf16.rs              BF16 backbones and existing layer functions
-    fp8.rs               FP8 backbones and existing layer functions
-    w8a8.rs               W8A8 backbones and existing layer functions
-  bf16_runtime.rs        BF16 binding / capture resource adapter, compatibility API
-  runtime.rs             FP8 binding / capture resource adapter, compatibility API
-  int8_runtime.rs        W8A8 binding / capture resource adapter, compatibility API
-  static_weights.rs      existing weight materialization and activation scales
+    mod.rs                     semantic Blocks interface; Prefix and Styles types
+    bf16.rs                    BF16 backbone/layers and resource requirements
+    fp8_static.rs              static FP8 backbone/layers and resource requirements
+    int8_dynamic.rs            dynamic-activation INT8 backbone/layers and requirements
+  weights/
+    mod.rs                     fixed-asset exports
+    host.rs                    checkpoint mapping and common logical weight tree
+    packing.rs                 shared host matrix packing
+    bf16.rs                    BF16 linear storage and device model tree
+    fp8_static.rs              static FP8 linear storage and device model tree
+    int8_dynamic.rs            INT8 linear storage and device model tree
+    fp8_static_calibration.rs  E4M3 representation, calibration profile and fixed scales
 ```
 
-This is three executor file moves plus one small Blocks interface, not three
-parallel Network trees. The per-precision Block files group existing functions
-to keep this pilot reviewable; splitting each into vision/language/action files
-is optional when independent changes justify it. Broad weight consolidation is
-Stage 5. Existing weight files/types remain because packing and calibration are
-outside this structural migration. Activation scales belong to fixed assets;
-the previous public import through runtime remains a re-export.
+The tree has 20 Rust files (22 before slice D); the model root has nine files
+(previously eighteen). Each device-weight file groups its linear storage in
+an internal module and its aggregate model tree in the same file. Backbone/layer
+code also remains grouped per variant instead of expanding into many one-function
+files. Cross-model matrix/view reuse remains a later evidence-driven extraction;
+PI0.5's own weight organization is complete in this stage.
 
-The runtime filenames remain compatibility boundaries for existing benchmark
-and library users. Their remaining duplication is input materialization and
-capture resource management, not model mathematics. Stage 3 tests which resource
-mechanisms WallOSS actually shares before extracting another common framework.
-A universal Network factory or a new public Blocks API is not required.
+Network owns the full model order and flow step count/dt. Blocks own backbone
+layer loops, fusion, physical layout and fixed weights. The Network source imports
+only the Blocks contract; BF16-only calibration traversal lives in calibration.rs.
+Rust statically specializes the Network for each implementation. `load.rs` wraps
+these types for the public Session; no per-layer virtual calls are introduced.
+
+Blocks report workspace requirements and perform their native input conversion.
+`prepare.rs` allocates resources, prepares fixed styles, warms up until tactics
+stabilize, captures with the shared CUDA scope, and returns a single CapturedGraph
+for every variant. Its erased fixed-resource owner retains the concrete Network
+and style tensors; this erases ownership storage only, not computation dispatch.
+The executable graph is dropped before the memory it references.
+
+Session owns the preparation policy, request validation, RNG rebinding, tactic
+invalidation and implicit cache. It does not choose FP8/INT8 implementations or
+manage separate precision graph types. There is no replacement runtime facade.
+Low-level diagnostic callers construct a Network with `build_*_network`, call
+its computation methods, and explicitly use `capture_patches` or `capture_rgb`.
+Ordinary callers use AutoModel and prepare/run.
+
+### Breaking interface migration
+
+| Previous PI0.5 entry | Current entry |
+| --- | --- |
+| precision=fp8 / bf16 / int8 or w8a8 | compute_variant=fp8_static / bf16 / int8_dynamic |
+| Pi05CudaRuntime::new | build_fp8_static_network |
+| Pi05Bf16CudaRuntime::new | build_bf16_network |
+| Pi05Int8CudaRuntime::new | build_int8_dynamic_network |
+| runtime.capture_infer / capture_infer_rgb_u8 | capture_patches(&network, ...) / capture_rgb(&network, ...) |
+| Three precision CapturedGraph types | CapturedGraph |
+| StaticFp8Pi05Weights / StaticBf16Pi05Weights / StaticInt8Pi05Weights | Fp8StaticWeights / Bf16Weights / Int8DynamicWeights |
+| Pi05ActivationScales / StaticFp8Calibration | Fp8StaticActivationScales / Fp8StaticCalibration |
+| Unprefixed FP8 layer functions/types | Explicit fp8_static / Fp8Static names |
+| Pi05VlaRuntime alias | Pi05Session |
+| pi05_bench --dtype fp8; JSON precision key | --compute-variant fp8_static; JSON compute_variant key |
+| Python Model.random(precision=...) | Model.random(compute_variant=...) |
+
+Repository callers are migrated. External low-level Rust callers, Python keyword
+callers and benchmark parsers must update. Existing checkpoint/calibration/tactic
+asset schemas are preserved; operator names such as W8A8 are not renamed globally.
+GR00T/WallOSS numerical implementations are unchanged. The shared LoadOptions
+still contains legacy precision for those families, not a second PI0.5 selector.
+Dedicated PI0.5 benchmark/server tools use compute_variant. The multi-model LIBERO
+campaign tool retains its numerical precision ledger category, translating that
+category to PI0.5's implementation ID at loading; historical campaign ledgers
+are not rewritten. Its websocket boundary recognizes the new server metadata.
 
 ### Internal interfaces and change ownership
 
@@ -340,7 +392,7 @@ fn network_infer(input, noise, time_embeddings) {
 `Prefix` and `Styles` keep physical representations behind the Block boundary.
 The native-input flag is an internal materialization contract: callers already
 validate and construct the expected representation. It does not select dtype.
-BF16/W8A8 eager styles remain precomputed before vision; FP8 eager styles remain
+BF16/dynamic INT8 eager styles remain precomputed before vision; static FP8 eager styles remain
 computed per flow step after prefix. Capture prepares fixed styles beforehand.
 Preserving this order avoids mixing algorithm/rounding changes into migration.
 A fusion or backbone implementation change stays in its Block; changing how

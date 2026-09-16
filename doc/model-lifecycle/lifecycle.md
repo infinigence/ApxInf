@@ -240,10 +240,11 @@ qualify native GPU execution; unsupported or untested matrix cells remain explic
 
 These Rust interfaces are implemented on the refactor branch. Hardware evidence
 and model coverage are recorded in the [migration tracker](migration.md).
-PI0.5 supports them for all three RuntimeVariant choices. Other VLA families
+PI0.5 supports them for all three ComputeVariant choices. Other VLA families
 retain their existing prepare path and return an unsupported error for the new
 policy methods; their default status is RuntimeManaged, never a fabricated Ready.
-Python policy behavior and public action decoding are unchanged.
+Python processing and action decoding are unchanged; PI0.5 loading uses the new
+compute_variant field. See the architecture document for breaking entry changes.
 
 ```mermaid
 sequenceDiagram
@@ -251,7 +252,7 @@ sequenceDiagram
     participant S as Pi05Session
     participant T as Backend tactics
     participant P as PreparedInference
-    participant N as Network / precision runtime
+    participant N as Network / shared prepare
     C->>S: prepare_for(real sample, policy)
     opt backend in AutoTune mode
         S->>N: eager traversal on real input
@@ -330,11 +331,12 @@ lifecycle guarantees above remain targets until separately implemented and teste
 ```mermaid
 sequenceDiagram
     participant S as Session
-    participant R as Precision resource adapter
+    participant R as Shared prepare
     participant N as Shared Network / Blocks
     participant C as CUDA backend
     S->>R: prepare captured region (autotuning suppressed)
     R->>N: prepare fixed per-step styles
+    R->>N: query Block workspace/layout requirements
     R->>R: allocate GraphWorkspace and stable inputs
     R->>N: warm traversal with workspace; synchronize
     R->>C: capture_graph(closure)

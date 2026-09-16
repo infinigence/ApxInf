@@ -446,7 +446,7 @@ def _load_policy(args, checkpoint: pathlib.Path, policy_factory=None):
     policy_options = {
         "checkpoint": checkpoint,
         "device": args.device,
-        "precision": "bf16",
+        "compute_variant": "bf16",
         "seed": args.seed,
         "prompt_key": args.prompt_key,
         "state_key": args.state_key,

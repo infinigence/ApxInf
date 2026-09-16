@@ -1,8 +1,8 @@
 # Baseline protocol and qualification record
 
-Status: PI0.5 Stage 2 primary Thor qualification is complete: lifecycle, public
-entry points, fixed-input parity and performance/resource comparisons passed.
-Supplementary Orin qualification is also complete. PI0.5 Stage 2 is complete.
+Status: slice C PI0.5 qualification is complete. The extended Stage 2 slice D
+removes runtime adapters and reorganizes assets; its fresh native qualification
+is in progress. Historical measurements below retain their original source IDs.
 The selected-main inventory and historical slices are retained below; the final
 PI0.5 qualification section is the current candidate record. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
@@ -471,7 +471,8 @@ on Thor. Probe sources/manifests, phase values, logs and JUnit live in
 
 Orin SM87 at the user-specified host completed all eight BF16/W8A8 H10
 profiles, with 10 flow steps, 10 warmups and 30 samples per boundary. Candidate
-source is `7aece37`; the matrix baseline is `c5268b7` plus the identical
+source is `7aece37` except the original BF16 two-view/T21 row (`7937440`);
+the matrix baseline is `c5268b7` plus the identical
 W8A8 alignment dispatch correction described above (BF16 is unaffected). The
 earlier standalone BF16 two-view/T21 fixture retains its original unchanged
 `c5268b7` versus `7937440` identity. Checkpoint, tokenizer and fixture hashes

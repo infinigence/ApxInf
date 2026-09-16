@@ -216,11 +216,12 @@ suite.
 
 ## PI0.5 migration pilot
 
-PI0.5 now uses one statically dispatched `network.rs` for BF16/FP8/W8A8.
-`blocks/{bf16,fp8,w8a8}.rs` owns backbones, layers and fixed precision assets;
-`session.rs` owns explicit preparation, readiness, compatibility and cache policy.
-The existing precision runtime files own binding/capture resources and preserve
-public compatibility methods. Python Policy retains encode/decode context.
+PI0.5 uses one statically dispatched Network with bf16/fp8_static/int8_dynamic
+Blocks. `load.rs` selects compute_variant and materializes fixed assets;
+`session.rs` owns request policy and plan validity; `prepare.rs` owns the shared
+warmup/capture path and graph resources. `weights/` groups checkpoint mapping,
+parallel device representations and fixed calibration data. Runtime compatibility
+files and aliases have been removed. Python Policy retains encode/decode context.
 See the [implemented component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
 [callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
