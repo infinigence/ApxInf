@@ -1216,11 +1216,18 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
            head_v_dim % 32 == 0 && threads % head_v_dim == 0 &&
            cells_per_chunk % threads == 0 && cells_per_chunk / threads <= 32;
   };
-  // 512 measured best at the shipped shape: 49.01ms per layer at 256, 33.27ms
-  // at 512, 36.35ms at 1024. 1024 loses because two such blocks exceed the
-  // 1536 threads an SM holds, so it drops to one block per SM while also
-  // leaving each thread too few cells to overlap.
-  int block_threads = block_ok(512) ? 512 : 256;
+  // 1024. That is not what an earlier sweep found -- on the CUDA 12.6 board,
+  // before this kernel was tiled, 512 won at 33.27ms per layer against 36.35ms
+  // at 1024, and the reasoning was that two 1024-thread blocks exceed the 1536
+  // threads an SM holds. The tiling changed which side of that trade wins: with
+  // eight cells carried per thread there is enough work in flight for one block
+  // per SM to keep the pipes busy, and the wider block cuts the per-block
+  // prologue. Re-measured on orin2, four interleaved pairs, every 1024 sample
+  // faster than every 512 sample: 5.9319 s/scene mean against 5.9564, 0.41%.
+  //
+  // Re-sweep with APXINF_GDN_CHUNK_STATE_THREADS after changing this kernel;
+  // the optimum has now moved once and will again.
+  int block_threads = block_ok(1024) ? 1024 : (block_ok(512) ? 512 : 256);
   if (const char* tuned = std::getenv("APXINF_GDN_CHUNK_STATE_THREADS")) {
     const int requested = std::atoi(tuned);
     if (block_ok(requested)) {
