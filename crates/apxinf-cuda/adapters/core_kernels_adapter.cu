@@ -272,6 +272,18 @@ extern "C" cudaError_t apxinf_rope_bf16(
 extern "C" cudaError_t apxinf_add_bf16(
     const void* a, const void* b, void* output, uint32_t count, void* stream)
 {
+    const uintptr_t aa = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
+    const uintptr_t oa = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (aa % 16u) == 0u && (ba % 16u) == 0u &&
+        (oa % 16u) == 0u) {
+        const uint32_t vec_count = count / 8u;
+        uint32_t blocks = (vec_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (blocks > 4096u) blocks = 4096u;
+        add_bf16_vec8_kernel<<<blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)a, (const float4*)b, (float4*)output, vec_count);
+        return cudaGetLastError();
+    }
     dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     add_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
