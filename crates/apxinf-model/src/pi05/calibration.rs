@@ -7,7 +7,7 @@ use std::sync::Arc;
 use apxinf_core::{Backend, Error, Result, Tensor};
 use apxinf_cuda::kernels::gemm::Bf16ActivationObserver;
 
-use super::{backend::RuntimeBackend, Pi05CalibrationPlan, Pi05Config, StaticBf16Pi05Weights};
+use super::{backend::RuntimeBackend, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
 
 pub struct Pi05CalibrationObserver {
     backend: Arc<RuntimeBackend>,
@@ -20,14 +20,15 @@ impl Pi05CalibrationObserver {
     pub fn new(
         backend: Arc<RuntimeBackend>,
         config: &Pi05Config,
-        weights: &StaticBf16Pi05Weights,
+        weights: &Bf16Weights,
     ) -> Result<Self> {
         let mut sites = HashMap::new();
         let plan = Pi05CalibrationPlan::for_config(config);
         let mut insert = |tensor: &Tensor, name: String| -> Result<()> {
-            let handle = tensor.storage().as_gpu().ok_or_else(|| {
-                Error::Other(format!("calibration weight {name} is not on CUDA"))
-            })?;
+            let handle = tensor
+                .storage()
+                .as_gpu()
+                .ok_or_else(|| Error::Other(format!("calibration weight {name} is not on CUDA")))?;
             sites.insert(handle.ptr, name);
             Ok(())
         };
@@ -48,7 +49,10 @@ impl Pi05CalibrationObserver {
                 names.mlp_activation.clone().expect("vision tail site"),
             )?;
         }
-        insert(&weights.multimodal_projector.weight, "vision.post_norm".into())?;
+        insert(
+            &weights.multimodal_projector.weight,
+            "vision.post_norm".into(),
+        )?;
         for (layer, names) in weights.language_layers.iter().zip(plan.language_layers()) {
             insert(&layer.qkv.weight, names.attention_norm.clone())?;
             if let Some(attention_output) = &names.attention_output {
@@ -68,9 +72,15 @@ impl Pi05CalibrationObserver {
         insert(&weights.time_mlp_out.weight, "time.hidden".into())?;
         for layer in &weights.action_layers {
             insert(&layer.input_style.weight, "action.conditioning".into())?;
-            insert(&layer.post_attention_style.weight, "action.conditioning".into())?;
+            insert(
+                &layer.post_attention_style.weight,
+                "action.conditioning".into(),
+            )?;
         }
-        insert(&weights.action_final_style.weight, "action.conditioning".into())?;
+        insert(
+            &weights.action_final_style.weight,
+            "action.conditioning".into(),
+        )?;
         for (layer, names) in weights.action_layers.iter().zip(plan.action_layers()) {
             insert(&layer.qkv.weight, names.attention_norm.clone())?;
             insert(
@@ -156,5 +166,31 @@ mod tests {
         assert!(finite_amax([1.0, f32::NAN], "test.site").is_err());
         assert!(finite_amax([f32::INFINITY], "test.site").is_err());
         assert_eq!(finite_amax([-2.0, 1.0], "test.site").unwrap(), 2.0);
+    }
+}
+
+use super::backend::DeviceBuffer as CudaBuffer;
+use super::blocks::Bf16Blocks;
+use super::network::Pi05Network;
+impl Pi05Network<Bf16Blocks> {
+    /// Explicit diagnostic traversal of the same Network; no second model body.
+    pub fn calibrate(
+        &self,
+        patches: &Tensor,
+        ids: &CudaBuffer,
+        count: usize,
+        noise: &Tensor,
+        embeddings: &[Tensor],
+    ) -> Result<std::collections::BTreeMap<String, f32>> {
+        use apxinf_core::Backend;
+        let observer = std::rc::Rc::new(super::Pi05CalibrationObserver::new(
+            self.blocks.backend.clone(),
+            &self.blocks.config,
+            &self.blocks.weights,
+        )?);
+        let _guard = super::backend::kernels::gemm::install_bf16_observer(observer.clone())?;
+        self.infer(patches, ids, count, noise, embeddings)?;
+        self.blocks.backend.synchronize()?;
+        observer.records()
     }
 }

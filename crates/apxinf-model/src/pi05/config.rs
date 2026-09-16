@@ -631,3 +631,76 @@ mod tests {
         assert_eq!(max_weight, weight);
     }
 }
+
+/// A PI0.5 compute implementation, including its weight and activation formats.
+/// Values are model-local; the loading field `compute_variant` is shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComputeVariant {
+    #[default]
+    Auto,
+    Bf16,
+    Fp8Static,
+    Int8Dynamic,
+}
+impl ComputeVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bf16 => "bf16",
+            Self::Fp8Static => "fp8_static",
+            Self::Int8Dynamic => "int8_dynamic",
+        }
+    }
+    pub fn resolve(self, sm: u32, has_fp8_scales: bool) -> Self {
+        match self {
+            Self::Auto if sm >= 100 && has_fp8_scales => Self::Fp8Static,
+            Self::Auto if (80..100).contains(&sm) => Self::Int8Dynamic,
+            Self::Auto => Self::Bf16,
+            explicit => explicit,
+        }
+    }
+}
+impl std::str::FromStr for ComputeVariant {
+    type Err = apxinf_core::Error;
+    fn from_str(value: &str) -> apxinf_core::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
+            "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 compute_variant {value:?}; expected auto, bf16, fp8_static or int8_dynamic"))),
+        }
+    }
+}
+#[cfg(test)]
+mod compute_variant_tests {
+    use super::ComputeVariant;
+    #[test]
+    fn selection_and_identifiers_are_unambiguous() {
+        for v in [
+            ComputeVariant::Auto,
+            ComputeVariant::Bf16,
+            ComputeVariant::Fp8Static,
+            ComputeVariant::Int8Dynamic,
+        ] {
+            assert_eq!(v.as_str().parse::<ComputeVariant>().unwrap(), v);
+        }
+        for ambiguous in ["fp8", "int8", "w8a8", "unknown"] {
+            assert!(ambiguous.parse::<ComputeVariant>().is_err());
+        }
+        assert_eq!(
+            ComputeVariant::Auto.resolve(110, true),
+            ComputeVariant::Fp8Static
+        );
+        assert_eq!(
+            ComputeVariant::Auto.resolve(110, false),
+            ComputeVariant::Bf16
+        );
+        assert_eq!(
+            ComputeVariant::Auto.resolve(87, false),
+            ComputeVariant::Int8Dynamic
+        );
+        assert_eq!(
+            ComputeVariant::Bf16.resolve(110, true),
+            ComputeVariant::Bf16
+        );
+    }
+}

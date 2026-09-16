@@ -1,7 +1,7 @@
 //! Native-BF16 π0.5 transformer-layer execution.
 
 use crate::pi05::backend::{kernels, Context};
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
 use kernels::{activation, attention, embedding, fused, gemm, norm, rope};
 
 use crate::pi05::{
@@ -240,21 +240,21 @@ pub(in crate::pi05) mod backbone {
         pub tokens: usize,
     }
 
-    pub(in crate::pi05) struct Bf16StepStyles {
+    pub struct Bf16StepStyles {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
-    pub(in crate::pi05) struct Bf16Blocks {
+    pub struct Bf16Blocks {
         pub(in crate::pi05) backend: Arc<RuntimeBackend>,
         pub(in crate::pi05) config: Arc<Pi05Config>,
-        pub(in crate::pi05) weights: Arc<StaticBf16Pi05Weights>,
+        pub(in crate::pi05) weights: Arc<Bf16Weights>,
     }
     impl Bf16Blocks {
         pub fn new(
             backend: Arc<RuntimeBackend>,
             config: Arc<Pi05Config>,
-            weights: Arc<StaticBf16Pi05Weights>,
+            weights: Arc<Bf16Weights>,
         ) -> Result<Self> {
             config.validate()?;
             if weights.vision_layers.len() != config.vision_depth
@@ -533,5 +533,81 @@ pub(in crate::pi05) mod backbone {
         ) -> Result<Tensor> {
             self.denoise_step_with_styles(state, styles, prefix, dt)
         }
+    }
+}
+
+impl crate::pi05::prepare::PrepareBlocks for backbone::Bf16Blocks {
+    fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
+        &self.backend
+    }
+    fn workspace_requirements(
+        &self,
+        tokens: usize,
+    ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
+        Ok(crate::pi05::prepare::WorkspaceRequirements {
+            bytes: self.graph_workspace_bytes(tokens)?,
+            fp8_scratch: None,
+        })
+    }
+    fn raw_patch_dtype(&self) -> apxinf_core::DType {
+        apxinf_core::DType::BF16
+    }
+    fn preprocess(
+        &self,
+        images: &crate::pi05::backend::DeviceBuffer,
+        patches: &Tensor,
+        layout: crate::pi05::Pi05ImageLayout,
+    ) -> Result<()> {
+        crate::pi05::backend::kernels::preprocess::rgb_u8_to_patches_bf16(
+            self.backend.context(),
+            images,
+            patches,
+            self.config.num_views,
+            self.config.image_size,
+            self.config.patch_size,
+            layout,
+        )
+    }
+}
+impl backbone::Bf16Blocks {
+    fn graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let mut bytes = self.config.cuda_graph_workspace_bytes_bf16(token_count)?;
+        if self.backend.context().caps().arch_family == apxinf_cuda::CudaArchFamily::Sm80 {
+            bytes = bytes
+                .checked_add(self.splitkv_workspace_bytes(token_count)?)
+                .ok_or_else(|| Error::Other("pi05 BF16 split-KV workspace overflow".into()))?;
+        }
+        Ok(bytes)
+    }
+
+    fn splitkv_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let patches = self.config.num_views * self.config.patches_per_view();
+        let prefix = patches
+            .checked_add(token_count)
+            .ok_or_else(|| Error::Other("pi05 split-KV prefix length overflow".into()))?;
+        let horizon = self.config.action_horizon;
+        let action = self.config.action_expert;
+        if action.num_heads <= action.num_kv_heads || action.head_dim != 256 || horizon > 64 {
+            return Ok(0);
+        }
+        let key_tokens = prefix
+            .checked_add(horizon)
+            .ok_or_else(|| Error::Other("pi05 split-KV key length overflow".into()))?;
+        let max_splits = key_tokens.div_ceil(64).min(128);
+        let lse = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV LSE workspace overflow".into()))?;
+        let output = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(action.head_dim))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV output workspace overflow".into()))?;
+        lse.checked_add(output)
+            .and_then(|value| value.checked_mul(self.config.action_expert.depth))
+            .and_then(|value| value.checked_mul(self.config.num_flow_steps))
+            .ok_or_else(|| Error::Other("pi05 split-KV workspace overflow".into()))
     }
 }

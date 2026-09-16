@@ -14,12 +14,12 @@ class Pi05TacticSelectionTest(unittest.TestCase):
         cases = [
             (87, "bf16", "orin-sm87"),
             (89, "bf16", "rtx4090-sm89"),
-            (101, "fp8", "thor-sm101"),
+            (101, "fp8_static", "thor-sm101"),
             (110, "bf16", "thor-sm110"),
-            (110, "fp8", "thor-sm110"),
+            (110, "fp8_static", "thor-sm110"),
         ]
-        for sm, precision, directory in cases:
-            with self.subTest(sm=sm, precision=precision), tempfile.TemporaryDirectory() as root:
+        for sm, compute_variant, directory in cases:
+            with self.subTest(sm=sm, compute_variant=compute_variant), tempfile.TemporaryDirectory() as root:
                 root = pathlib.Path(root)
                 path = root / "configs" / "tuning" / "nvidia" / directory / "tactics.json"
                 path.parent.mkdir(parents=True)
@@ -27,7 +27,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
                 with mock.patch.object(_tactics, "_SOURCE_ROOT", root), mock.patch.object(
                     _tactics, "cuda_sm", return_value=sm
                 ):
-                    selected = _tactics.resolve_pi05_tactics("cuda:0", precision)
+                    selected = _tactics.resolve_pi05_tactics("cuda:0", compute_variant)
                 self.assertEqual(selected, path)
 
     def test_checkpoint_tactics_precede_source_default(self):
@@ -50,7 +50,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             with mock.patch.object(_tactics, "_SOURCE_ROOT", root), mock.patch.object(
                 _tactics, "cuda_sm", return_value=87
             ):
-                self.assertEqual(_tactics.resolve_pi05_tactics("cuda:0", "int8"), path)
+                self.assertEqual(_tactics.resolve_pi05_tactics("cuda:0", "int8_dynamic"), path)
 
     def test_autotune_can_create_missing_hardware_database(self):
         with tempfile.TemporaryDirectory() as root:
@@ -61,7 +61,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             ):
                 self.assertEqual(
                     _tactics.resolve_pi05_tactics(
-                        "cuda:0", "fp8", allow_missing=True
+                        "cuda:0", "fp8_static", allow_missing=True
                     ),
                     expected,
                 )
@@ -123,7 +123,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             pi05.Pi05Policy.from_pretrained(
                 model_dir,
                 device="cuda:0",
-                precision="bf16",
+                compute_variant="bf16",
                 autotune=True,
                 tokenizer_path=str(tokenizer_path),
             )

@@ -2,7 +2,6 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,266 +10,51 @@ use apxinf_core::{
 };
 use half::{bf16, f16};
 
-use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
     PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
-    kernels, transfers, tuning, DeviceBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
+    transfers, tuning, DeviceBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
-use super::{
-    checkpoint_identity, upload_time_embeddings, upload_time_embeddings_bf16,
-    upload_time_embeddings_int8, Pi05ActivationScales, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime,
-    Pi05CapturedGraph, Pi05Config, Pi05CudaRuntime, Pi05Int8CapturedGraph, Pi05Int8CudaRuntime,
-    Pi05Weights, StaticBf16Pi05Weights, StaticFp8Calibration, StaticFp8Pi05Weights,
-    StaticInt8Pi05Weights,
-};
+use super::load::LoadedCompute;
+use super::{CapturedGraph, Pi05Config};
 
-#[derive(Clone)]
-enum RuntimeVariant {
-    Fp8 {
-        runtime: Pi05CudaRuntime,
-        time_embeddings: Arc<Vec<Tensor>>,
-        vision_scale: f32,
-    },
-    Bf16 {
-        runtime: Pi05Bf16CudaRuntime,
-        time_embeddings: Arc<Vec<Tensor>>,
-    },
-    W8A8 {
-        runtime: Pi05Int8CudaRuntime,
-        time_embeddings: Arc<Vec<Tensor>>,
-    },
-}
-
-impl RuntimeVariant {
-    fn input_dtype(&self) -> DType {
-        match self {
-            Self::Fp8 { .. } => DType::F16,
-            Self::Bf16 { .. } | Self::W8A8 { .. } => DType::BF16,
-        }
-    }
-
-    fn captured_patch_dtype(&self, raw_rgb: bool) -> DType {
-        match (self, raw_rgb) {
-            (Self::Fp8 { .. }, true) => DType::F8E4M3,
-            _ => self.input_dtype(),
-        }
-    }
-
-    fn infer(
-        &self,
-        patches: &Tensor,
-        token_ids: &DeviceBuffer,
-        token_count: usize,
-        noise: &Tensor,
-        prequantized_fp8_patches: bool,
-    ) -> Result<Tensor> {
-        match self {
-            Self::Fp8 {
-                runtime,
-                time_embeddings,
-                ..
-            } if prequantized_fp8_patches => {
-                runtime.infer_fp8_patches(patches, token_ids, token_count, noise, time_embeddings)
-            }
-            Self::Fp8 {
-                runtime,
-                time_embeddings,
-                ..
-            } => runtime.infer(patches, token_ids, token_count, noise, time_embeddings),
-            Self::Bf16 {
-                runtime,
-                time_embeddings,
-            } => runtime.infer(patches, token_ids, token_count, noise, time_embeddings),
-            Self::W8A8 {
-                runtime,
-                time_embeddings,
-            } => runtime.infer(patches, token_ids, token_count, noise, time_embeddings),
-        }
-    }
-
-    fn capture(
-        &self,
-        spec: &InferenceSpec,
-        patches: &Tensor,
-        token_ids: &DeviceBuffer,
-        noise: &Tensor,
-    ) -> Result<GraphVariant> {
-        let layout = spec.image_layout.map(kernel_image_layout);
-        match (self, layout) {
-            (
-                Self::Fp8 {
-                    runtime,
-                    time_embeddings,
-                    ..
-                },
-                None,
-            ) => Ok(GraphVariant::Fp8(runtime.capture_infer(
-                patches,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-            (
-                Self::Fp8 {
-                    runtime,
-                    time_embeddings,
-                    ..
-                },
-                Some(layout),
-            ) => Ok(GraphVariant::Fp8(runtime.capture_infer_rgb_u8(
-                layout,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-            (
-                Self::Bf16 {
-                    runtime,
-                    time_embeddings,
-                },
-                None,
-            ) => Ok(GraphVariant::Bf16(runtime.capture_infer(
-                patches,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-            (
-                Self::Bf16 {
-                    runtime,
-                    time_embeddings,
-                },
-                Some(layout),
-            ) => Ok(GraphVariant::Bf16(runtime.capture_infer_rgb_u8(
-                layout,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-            (
-                Self::W8A8 {
-                    runtime,
-                    time_embeddings,
-                },
-                None,
-            ) => Ok(GraphVariant::W8A8(runtime.capture_infer(
-                patches,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-            (
-                Self::W8A8 {
-                    runtime,
-                    time_embeddings,
-                },
-                Some(layout),
-            ) => Ok(GraphVariant::W8A8(runtime.capture_infer_rgb_u8(
-                layout,
-                token_ids,
-                spec.token_count,
-                noise,
-                time_embeddings,
-            )?)),
-        }
-    }
-}
-
-enum GraphVariant {
-    Fp8(Pi05CapturedGraph),
-    Bf16(Pi05Bf16CapturedGraph),
-    W8A8(Pi05Int8CapturedGraph),
-}
-
-impl GraphVariant {
+impl CapturedGraph {
     fn update(
         &self,
         observation: &Observation,
         noise: &Tensor,
         patches: Option<&Tensor>,
     ) -> Result<()> {
-        match (&observation.vision, self) {
-            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph.update_inputs(
+        match &observation.vision {
+            VisionObservation::Patches(_) => self.update_inputs(
                 patches.expect("validated patches"),
                 &observation.token_ids,
                 noise,
             ),
-            (VisionObservation::Patches(_), Self::Bf16(graph)) => graph.update_inputs(
-                patches.expect("validated patches"),
-                &observation.token_ids,
-                noise,
-            ),
-            (VisionObservation::Patches(_), Self::W8A8(graph)) => graph.update_inputs(
-                patches.expect("validated patches"),
-                &observation.token_ids,
-                noise,
-            ),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => {
-                graph.update_raw_image_inputs(bytes, &observation.token_ids, noise)
-            }
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => {
-                graph.update_raw_image_inputs(bytes, &observation.token_ids, noise)
-            }
-            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => {
-                graph.update_raw_image_inputs(bytes, &observation.token_ids, noise)
+            VisionObservation::RgbU8 { bytes, .. } => {
+                self.update_raw_image_inputs(bytes, &observation.token_ids, noise)
             }
         }
     }
-
-    fn replay(&self) -> Result<Tensor> {
-        match self {
-            Self::Fp8(graph) => {
-                graph.replay()?;
-                Ok(graph.output().clone())
-            }
-            Self::Bf16(graph) => {
-                graph.replay()?;
-                Ok(graph.output().clone())
-            }
-            Self::W8A8(graph) => {
-                graph.replay()?;
-                Ok(graph.output().clone())
-            }
-        }
+    fn replay_output(&self) -> Result<Tensor> {
+        self.replay()?;
+        Ok(self.output().clone())
     }
-
     fn update_without_noise(
         &self,
         observation: &Observation,
         patches: Option<&Tensor>,
     ) -> Result<()> {
-        match (&observation.vision, self) {
-            (VisionObservation::Patches(_), Self::Fp8(graph)) => graph.update_inputs_without_noise(
+        match &observation.vision {
+            VisionObservation::Patches(_) => self.update_inputs_without_noise(
                 patches.expect("validated patches"),
                 &observation.token_ids,
             ),
-            (VisionObservation::Patches(_), Self::Bf16(graph)) => graph
-                .update_inputs_without_noise(
-                    patches.expect("validated patches"),
-                    &observation.token_ids,
-                ),
-            (VisionObservation::Patches(_), Self::W8A8(graph)) => graph
-                .update_inputs_without_noise(
-                    patches.expect("validated patches"),
-                    &observation.token_ids,
-                ),
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Fp8(graph)) => {
-                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
-            }
-            (VisionObservation::RgbU8 { bytes, .. }, Self::Bf16(graph)) => {
-                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
-            }
-            (VisionObservation::RgbU8 { bytes, .. }, Self::W8A8(graph)) => {
-                graph.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
+            VisionObservation::RgbU8 { bytes, .. } => {
+                self.update_raw_image_inputs_without_noise(bytes, &observation.token_ids)
             }
         }
     }
@@ -291,7 +75,7 @@ struct PreparedBuffers {
 }
 
 enum ExecStrategy {
-    Graph(GraphVariant),
+    Graph(CapturedGraph),
     Eager(EagerInputs),
 }
 
@@ -303,7 +87,7 @@ pub struct Pi05PreparedInference {
     spec: InferenceSpec,
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi05Config>,
-    runtime: RuntimeVariant,
+    network: LoadedCompute,
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     tuning_generation: u64,
@@ -337,11 +121,15 @@ impl Pi05PreparedInference {
                         )));
                     }
                     raw.copy_from_host(bytes).map_err(Error::Cuda)?;
-                    self.preprocess_rgb(raw, &inputs.patches, *layout)?;
+                    self.network.preprocess_rgb(
+                        raw,
+                        &inputs.patches,
+                        kernel_image_layout(*layout),
+                    )?;
                     None
                 }
             },
-            self.runtime.input_dtype(),
+            self.network.input_dtype(),
             patch_shape(&self.config),
             "patches",
         )?;
@@ -352,7 +140,7 @@ impl Pi05PreparedInference {
             InitialLatent::Provided(latent) => {
                 let noise = normalize_tensor(
                     Some(latent),
-                    self.runtime.input_dtype(),
+                    self.network.input_dtype(),
                     noise_shape(&self.config),
                     "initial latent",
                 )?
@@ -370,7 +158,7 @@ impl Pi05PreparedInference {
     fn run_eager(&self, inputs: &EagerInputs, request: &VlaRequest<'_>) -> Result<Action> {
         let observation = request.observation;
         self.update_eager_inputs(inputs, request)?;
-        Ok(Action::new(self.runtime.infer(
+        Ok(Action::new(self.network.infer(
             &inputs.patches,
             &inputs.token_ids,
             self.spec.token_count,
@@ -385,63 +173,12 @@ impl Pi05PreparedInference {
         request: &VlaRequest<'_>,
     ) -> Result<BTreeMap<String, f32>> {
         self.update_eager_inputs(inputs, request)?;
-        match &self.runtime {
-            RuntimeVariant::Bf16 {
-                runtime,
-                time_embeddings,
-            } => runtime.calibrate(
-                &inputs.patches,
-                &inputs.token_ids,
-                self.spec.token_count,
-                &inputs.noise,
-                time_embeddings,
-            ),
-            _ => Err(Error::Other(
-                "PI0.5 activation calibration requires a BF16 model".into(),
-            )),
-        }
-    }
-
-    fn preprocess_rgb(
-        &self,
-        images: &DeviceBuffer,
-        patches: &Tensor,
-        layout: ImageLayout,
-    ) -> Result<()> {
-        let cuda = &*self.backend;
-        let layout = kernel_image_layout(layout);
-        match &self.runtime {
-            RuntimeVariant::Fp8 { vision_scale, .. } => {
-                kernels::preprocess::rgb_u8_to_patches_e4m3(
-                    cuda.context(),
-                    images,
-                    patches,
-                    self.config.num_views,
-                    self.config.image_size,
-                    self.config.patch_size,
-                    layout,
-                    *vision_scale,
-                )
-            }
-            RuntimeVariant::Bf16 { .. } => kernels::preprocess::rgb_u8_to_patches_bf16(
-                cuda.context(),
-                images,
-                patches,
-                self.config.num_views,
-                self.config.image_size,
-                self.config.patch_size,
-                layout,
-            ),
-            RuntimeVariant::W8A8 { .. } => kernels::preprocess::rgb_u8_to_patches_bf16(
-                cuda.context(),
-                images,
-                patches,
-                self.config.num_views,
-                self.config.image_size,
-                self.config.patch_size,
-                layout,
-            ),
-        }
+        self.network.calibrate(
+            &inputs.patches,
+            &inputs.token_ids,
+            self.spec.token_count,
+            &inputs.noise,
+        )
     }
 }
 
@@ -487,7 +224,7 @@ impl Pi05PreparedInference {
         let patches = match &observation.vision {
             VisionObservation::Patches(tensor) => normalize_tensor(
                 Some(tensor),
-                self.runtime.input_dtype(),
+                self.network.input_dtype(),
                 patch_shape(&self.config),
                 "patches",
             )?,
@@ -502,7 +239,7 @@ impl Pi05PreparedInference {
                     InitialLatent::Provided(latent) => {
                         let noise = normalize_tensor(
                             Some(latent),
-                            self.runtime.input_dtype(),
+                            self.network.input_dtype(),
                             noise_shape(&self.config),
                             "initial latent",
                         )?
@@ -514,23 +251,23 @@ impl Pi05PreparedInference {
                         self.normal_generator.borrow_mut().generate(rng)?;
                     }
                 }
-                Ok(Action::new(graph.replay()?))
+                Ok(Action::new(graph.replay_output()?))
             }
             ExecStrategy::Eager(inputs) => self.run_eager(inputs, request),
         }
     }
 }
 
-/// PI0.5 runtime whose cached prepared plan owns all graph-visible resources.
+/// PI0.5 network whose cached prepared plan owns all graph-visible resources.
 ///
 /// A graph workspace can reserve multiple GiB, so the implicit `infer` path
 /// retains only the most recently used shape. Callers that need more than one
 /// simultaneously prepared shape can own those plans explicitly via `prepare`.
 pub struct Pi05Session {
-    backend: Arc<RuntimeBackend>,
-    config: Arc<Pi05Config>,
-    runtime: RuntimeVariant,
-    prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
+    pub(super) backend: Arc<RuntimeBackend>,
+    pub(super) config: Arc<Pi05Config>,
+    pub(super) network: LoadedCompute,
+    pub(super) prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
 }
 
 // Keep policy selection testable without inducing a real GPU capture failure.
@@ -580,11 +317,11 @@ impl Pi05Session {
             )));
         }
         let cuda = &*self.backend;
-        let dtype = self.runtime.input_dtype();
+        let dtype = self.network.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
         let patches = self.backend.to_device(&Tensor::zeros(
             patch_shape(&self.config),
-            self.runtime.captured_patch_dtype(raw_rgb),
+            self.network.captured_patch_dtype(raw_rgb),
         ))?;
         let noise = self
             .backend
@@ -618,7 +355,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            runtime: self.runtime.clone(),
+            network: self.network.clone(),
             strategy: ExecStrategy::Eager(EagerInputs {
                 patches,
                 raw_images,
@@ -638,7 +375,7 @@ impl Pi05Session {
         policy: ExecutionPolicy,
     ) -> Result<Pi05PreparedInference> {
         self.build_prepared_using(spec, policy, |patches, tokens, noise| {
-            self.runtime.capture(spec, patches, tokens, noise)
+            self.network.capture(spec, patches, tokens, noise)
         })
     }
 
@@ -646,7 +383,7 @@ impl Pi05Session {
         &self,
         spec: &InferenceSpec,
         policy: ExecutionPolicy,
-        capture: impl FnOnce(&Tensor, &DeviceBuffer, &Tensor) -> Result<GraphVariant>,
+        capture: impl FnOnce(&Tensor, &DeviceBuffer, &Tensor) -> Result<CapturedGraph>,
     ) -> Result<Pi05PreparedInference> {
         if policy == ExecutionPolicy::Eager {
             return self.build_eager(spec);
@@ -689,7 +426,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            runtime: self.runtime.clone(),
+            network: self.network.clone(),
             strategy,
             fallback_reason,
             normal_generator: RefCell::new(normal_generator),
@@ -795,7 +532,7 @@ impl VlaRuntime for Pi05Session {
                 ..
             }) => "eager",
             Some(PreparationStatus::Invalidated) => "invalidated",
-            Some(PreparationStatus::RuntimeManaged) => "runtime-managed",
+            Some(PreparationStatus::RuntimeManaged) => "network-managed",
         }
     }
 
@@ -826,154 +563,7 @@ impl VlaRuntime for Pi05Session {
     }
 }
 
-pub(super) fn load_registered(
-    path: &Path,
-    _device: Device,
-    backend: Arc<dyn Backend>,
-    options: &LoadOptions,
-) -> Result<LoadedModel> {
-    Ok(LoadedModel::Vla(Box::new(load_session(
-        path, backend, options,
-    )?)))
-}
-
-fn load_session(
-    path: &Path,
-    backend: Arc<dyn Backend>,
-    options: &LoadOptions,
-) -> Result<Pi05Session> {
-    let backend = crate::accelerator::cuda::downcast_arc(backend)
-        .ok_or_else(|| Error::Other("PI0.5 is only registered for CUDA".into()))?;
-    let cuda = &*backend;
-    let root = artifact_root(path);
-    let config_path = root.join("config.json");
-    let config = Arc::new(if let Some(cfg) = options.config.clone() {
-        cfg
-    } else if config_path.is_file() {
-        Pi05Config::from_json_file(&config_path)?
-    } else {
-        Pi05Config::default()
-    });
-    let synthetic = options.synthetic;
-    let host_weights = match synthetic {
-        Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
-        None => Pi05Weights::from_safetensors(&config, path)?,
-    };
-    // Synthetic (checkpoint-free) loads must not pick up stray calibration/tuning
-    // files from the working directory; only honor explicitly passed paths.
-    let calibration_path = options.calibration_path.clone().or_else(|| {
-        (synthetic.is_none())
-            .then(|| existing(root.join("calibration.json")))
-            .flatten()
-    });
-    let precision = resolve_precision(
-        options.precision,
-        cuda.context().caps().sm,
-        calibration_path.is_some(),
-    );
-
-    let runtime = match precision {
-        ModelPrecision::Fp8 => {
-            let scales = if let Some(scale) = options.uniform_fp8_scale {
-                Arc::new(Pi05ActivationScales::uniform(&config, scale)?)
-            } else {
-                let calibration_path = calibration_path.ok_or_else(|| {
-                    Error::Other(
-                        "FP8 PI0.5 requires LoadOptions.calibration_path or calibration.json"
-                            .into(),
-                    )
-                })?;
-                let checkpoint = checkpoint_identity(path)?;
-                let calibration =
-                    StaticFp8Calibration::from_json_file(&calibration_path, &config, &checkpoint)?;
-                Arc::new(Pi05ActivationScales::from_calibration(
-                    &config,
-                    &calibration,
-                )?)
-            };
-            let weights = Arc::new(StaticFp8Pi05Weights::from_host(
-                &host_weights,
-                &*backend,
-                config.language_dual_geglu_shape_possible(),
-            )?);
-            let time_embeddings = Arc::new(upload_time_embeddings(&config, &*backend)?);
-            let vision_scale = scales.vision_patch_input;
-            RuntimeVariant::Fp8 {
-                runtime: Pi05CudaRuntime::new(
-                    Arc::clone(&backend),
-                    Arc::clone(&config),
-                    weights,
-                    scales,
-                )?,
-                time_embeddings,
-                vision_scale,
-            }
-        }
-        ModelPrecision::Bf16 => {
-            let weights = Arc::new(StaticBf16Pi05Weights::from_host(
-                &host_weights,
-                &*backend,
-                config.language_dual_geglu_shape_possible(),
-            )?);
-            let time_embeddings = Arc::new(upload_time_embeddings_bf16(&config, &*backend)?);
-            RuntimeVariant::Bf16 {
-                runtime: Pi05Bf16CudaRuntime::new(
-                    Arc::clone(&backend),
-                    Arc::clone(&config),
-                    weights,
-                )?,
-                time_embeddings,
-            }
-        }
-        ModelPrecision::W8A8 => {
-            let weights = Arc::new(StaticInt8Pi05Weights::from_host(&host_weights, cuda)?);
-            let time_embeddings = Arc::new(upload_time_embeddings_int8(&config, &*backend)?);
-            RuntimeVariant::W8A8 {
-                runtime: Pi05Int8CudaRuntime::new(
-                    Arc::clone(&backend),
-                    Arc::clone(&config),
-                    weights,
-                )?,
-                time_embeddings,
-            }
-        }
-        ModelPrecision::Auto => unreachable!("automatic precision was resolved"),
-    };
-
-    Ok(Pi05Session {
-        backend,
-        config,
-        runtime,
-        prepared: RefCell::new(None),
-    })
-}
-
-fn resolve_precision(
-    requested: ModelPrecision,
-    sm: u32,
-    has_fp8_calibration: bool,
-) -> ModelPrecision {
-    match requested {
-        ModelPrecision::Auto if sm >= 100 && has_fp8_calibration => ModelPrecision::Fp8,
-        ModelPrecision::Auto if (80..100).contains(&sm) => ModelPrecision::W8A8,
-        ModelPrecision::Auto => ModelPrecision::Bf16,
-        explicit => explicit,
-    }
-}
-
-fn artifact_root(path: &Path) -> &Path {
-    if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or_else(|| Path::new("."))
-    }
-}
-
-fn existing(path: PathBuf) -> Option<PathBuf> {
-    path.is_file().then_some(path)
-}
-
-fn kernel_image_layout(layout: ImageLayout) -> KernelImageLayout {
+pub(super) fn kernel_image_layout(layout: ImageLayout) -> KernelImageLayout {
     match layout {
         ImageLayout::Nhwc => KernelImageLayout::Nhwc,
         ImageLayout::Nchw => KernelImageLayout::Nchw,
@@ -1057,7 +647,10 @@ fn normalize_tensor(
 
 #[cfg(test)]
 mod tests {
+    use super::super::load::load_session;
     use super::*;
+    use crate::LoadOptions;
+    use std::path::Path;
 
     #[test]
     #[ignore = "requires CUDA and APXINF_PI05_TEST_CHECKPOINT"]
@@ -1069,7 +662,7 @@ mod tests {
             Path::new(&path),
             backend.clone(),
             &LoadOptions {
-                precision: ModelPrecision::Bf16,
+                compute_variant: Some("bf16".into()),
                 ..LoadOptions::default()
             },
         )
@@ -1086,7 +679,7 @@ mod tests {
         let noise = Tensor::zeros(noise_shape(&session.config), DType::BF16);
         let request = VlaRequest::provided(&observation, &noise);
         let spec = observation.inference_spec();
-        let failing_capture = |_: &Tensor, _: &DeviceBuffer, _: &Tensor| -> Result<GraphVariant> {
+        let failing_capture = |_: &Tensor, _: &DeviceBuffer, _: &Tensor| -> Result<CapturedGraph> {
             backend.capture_graph(|| backend.synchronize())?;
             panic!("CUDA must reject synchronization during stream capture");
         };
@@ -1201,21 +794,5 @@ mod tests {
         drop(replacement);
         drop(cache);
         assert_eq!(drops.get(), 2);
-    }
-
-    #[test]
-    fn auto_precision_matches_thor_and_orin_policy() {
-        assert_eq!(
-            resolve_precision(ModelPrecision::Auto, 110, true),
-            ModelPrecision::Fp8
-        );
-        assert_eq!(
-            resolve_precision(ModelPrecision::Auto, 110, false),
-            ModelPrecision::Bf16
-        );
-        assert_eq!(
-            resolve_precision(ModelPrecision::Auto, 87, true),
-            ModelPrecision::W8A8
-        );
     }
 }

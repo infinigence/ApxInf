@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use half::bf16;
 use apxinf_core::{DType, Error, Result, Tensor};
+use half::bf16;
 
-use super::{GemmaVariantConfig, Pi05Config};
+use crate::pi05::{GemmaVariantConfig, Pi05Config};
 
 const ROOT: &str = "paligemma_with_expert";
 

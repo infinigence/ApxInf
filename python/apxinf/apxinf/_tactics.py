@@ -48,7 +48,7 @@ def cuda_sm(device: str) -> int | None:
 
 def resolve_pi05_tactics(
     device: str,
-    precision: str,
+    compute_variant: str,
     *,
     model_dir: Path | None = None,
     override: Path | None = None,

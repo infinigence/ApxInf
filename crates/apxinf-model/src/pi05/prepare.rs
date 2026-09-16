@@ -1,34 +1,52 @@
-//! Fixed-shape W8A8 INT8 π0.5 inference runtime.
-
+//! Shared PI0.5 preparation and captured resource ownership.
+use super::backend::{kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use super::blocks::Blocks;
+use super::network::Pi05Network;
+use super::{Pi05Config, Pi05ImageLayout};
+use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
-use super::backend::{kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
-use half::bf16;
-use kernels::preprocess;
-
-use super::{sinusoidal_time_embedding, Pi05Config, Pi05ImageLayout, StaticInt8Pi05Weights};
-
-pub use super::blocks::Int8PrefixKvCache;
-use super::blocks::{Int8StepStyles, W8A8Blocks};
-use super::network::Pi05Int8Network;
-
-pub struct Pi05Int8CapturedGraph {
+/// Resource requirements supplied by a compute implementation. Allocation,
+/// warmup, capture and lifetime remain centralized here.
+pub struct WorkspaceRequirements {
+    pub bytes: usize,
+    pub fp8_scratch: Option<(usize, usize)>,
+}
+impl WorkspaceRequirements {
+    fn allocate(&self, device: usize) -> Result<kernels::GraphWorkspace> {
+        match self.fp8_scratch {
+            Some((a, w)) => kernels::GraphWorkspace::new_fp8(self.bytes, a, w, device),
+            None => kernels::GraphWorkspace::new(self.bytes, device),
+        }
+    }
+}
+pub trait PrepareBlocks: Blocks + 'static {
+    fn backend(&self) -> &Arc<RuntimeBackend>;
+    fn workspace_requirements(&self, tokens: usize) -> Result<WorkspaceRequirements>;
+    fn raw_patch_dtype(&self) -> DType;
+    fn preprocess(
+        &self,
+        images: &CudaBuffer,
+        patches: &Tensor,
+        layout: Pi05ImageLayout,
+    ) -> Result<()>;
+}
+pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
     patches: Tensor,
     raw_images: Option<CudaBuffer>,
     raw_image_layout: Option<Pi05ImageLayout>,
     noise: Tensor,
-    _styles: Vec<Int8StepStyles>,
     token_ids: CudaBuffer,
     token_count: usize,
     backend: Arc<RuntimeBackend>,
-    _network: Arc<Pi05Int8Network>,
+    // Retain every fixed weight referenced by the captured computation.
+    _fixed: Box<dyn std::any::Any>,
     workspace: kernels::GraphWorkspace,
 }
 
-impl Pi05Int8CapturedGraph {
+impl CapturedGraph {
     pub fn replay(&self) -> Result<()> {
         self.graph.replay()
     }
@@ -62,12 +80,12 @@ impl Pi05Int8CapturedGraph {
     pub fn update_inputs_without_noise(&self, patches: &Tensor, token_ids: &[u32]) -> Result<()> {
         if self.raw_images.is_some() {
             return Err(Error::Other(
-                "π0.5 INT8 graph uses raw RGB input; call update_raw_image_inputs".into(),
+                "π0.5 graph uses raw RGB input; call update_raw_image_inputs".into(),
             ));
         }
         if token_ids.len() != self.token_count {
             return Err(Error::Other(format!(
-                "π0.5 INT8 graph expects {} token IDs, got {}",
+                "π0.5 graph expects {} token IDs, got {}",
                 self.token_count,
                 token_ids.len()
             )));
@@ -93,18 +111,18 @@ impl Pi05Int8CapturedGraph {
         token_ids: &[u32],
     ) -> Result<()> {
         let raw_images = self.raw_images.as_ref().ok_or_else(|| {
-            Error::Other("π0.5 INT8 graph uses patch input; call update_inputs".into())
+            Error::Other("π0.5 graph uses patch input; call update_inputs".into())
         })?;
         if images.len() != raw_images.len() {
             return Err(Error::Other(format!(
-                "π0.5 INT8 graph expects {} raw image bytes, got {}",
+                "π0.5 graph expects {} raw image bytes, got {}",
                 raw_images.len(),
                 images.len()
             )));
         }
         if token_ids.len() != self.token_count {
             return Err(Error::Other(format!(
-                "π0.5 INT8 graph expects {} token IDs, got {}",
+                "π0.5 graph expects {} token IDs, got {}",
                 self.token_count,
                 token_ids.len()
             )));
@@ -123,101 +141,15 @@ impl Pi05Int8CapturedGraph {
     }
 }
 
-#[derive(Clone)]
-pub struct Pi05Int8CudaRuntime {
-    backend: Arc<RuntimeBackend>,
-    config: Arc<Pi05Config>,
-    network: Arc<Pi05Int8Network>,
+struct CaptureBuilder<'a, B: PrepareBlocks> {
+    network: &'a Arc<Pi05Network<B>>,
+    backend: &'a Arc<RuntimeBackend>,
+    config: &'a Pi05Config,
 }
-
-impl Pi05Int8CudaRuntime {
-    pub fn new(
-        backend: Arc<RuntimeBackend>,
-        config: Arc<Pi05Config>,
-        weights: Arc<StaticInt8Pi05Weights>,
-    ) -> Result<Self> {
-        let network = Arc::new(Pi05Int8Network::from_blocks(W8A8Blocks::new(
-            Arc::clone(&backend),
-            Arc::clone(&config),
-            weights,
-        )?));
-        Ok(Self {
-            backend,
-            config,
-            network,
-        })
-    }
-
+impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
     fn ctx(&self) -> &Context {
         self.backend.context()
     }
-
-    pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
-        self.network.encode_vision(patches)
-    }
-
-    pub fn embed_prefix(
-        &self,
-        vision_tokens: &Tensor,
-        token_ids: &CudaBuffer,
-        token_count: usize,
-    ) -> Result<Tensor> {
-        self.network
-            .embed_prefix(vision_tokens, token_ids, token_count)
-    }
-
-    pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Int8PrefixKvCache> {
-        self.network.prefix_forward(prefix)
-    }
-
-    fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<Int8StepStyles>> {
-        self.network.prepare_all_styles(time_embeddings)
-    }
-
-    pub fn denoise_step(
-        &self,
-        state: &Tensor,
-        time_embedding: &Tensor,
-        prefix: &Int8PrefixKvCache,
-        dt: f32,
-    ) -> Result<Tensor> {
-        self.network.denoise_step(state, time_embedding, prefix, dt)
-    }
-
-    pub fn denoise_all_steps(
-        &self,
-        noise: &Tensor,
-        time_embeddings: &[Tensor],
-        prefix: &Int8PrefixKvCache,
-    ) -> Result<Tensor> {
-        self.network
-            .denoise_all_steps(noise, time_embeddings, prefix)
-    }
-
-    fn infer_with_styles(
-        &self,
-        patches: &Tensor,
-        token_ids: &CudaBuffer,
-        token_count: usize,
-        noise: &Tensor,
-        styles: &[Int8StepStyles],
-    ) -> Result<Tensor> {
-        self.network
-            .infer_with_styles(patches, token_ids, token_count, noise, styles)
-    }
-
-    pub fn infer(
-        &self,
-        patches: &Tensor,
-        token_ids: &CudaBuffer,
-        token_count: usize,
-        noise: &Tensor,
-        time_embeddings: &[Tensor],
-    ) -> Result<Tensor> {
-        self.network
-            .infer(patches, token_ids, token_count, noise, time_embeddings)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn infer_captured_inputs(
         &self,
@@ -227,24 +159,25 @@ impl Pi05Int8CudaRuntime {
         token_ids: &CudaBuffer,
         token_count: usize,
         noise: &Tensor,
-        styles: &[Int8StepStyles],
+        styles: &[B::Styles],
     ) -> Result<Tensor> {
         match (raw_images, raw_image_layout) {
-            (None, None) => self.infer_with_styles(patches, token_ids, token_count, noise, styles),
+            (None, None) => {
+                self.network
+                    .infer_with_styles(patches, token_ids, token_count, noise, styles)
+            }
             (Some(images), Some(layout)) => {
-                preprocess::rgb_u8_to_patches_bf16(
-                    self.ctx(),
-                    images,
+                self.network.blocks.preprocess(images, patches, layout)?;
+                self.network.infer_with_native_styles(
                     patches,
-                    self.config.num_views,
-                    self.config.image_size,
-                    self.config.patch_size,
-                    layout,
-                )?;
-                self.infer_with_styles(patches, token_ids, token_count, noise, styles)
+                    token_ids,
+                    token_count,
+                    noise,
+                    styles,
+                )
             }
             _ => Err(Error::Other(
-                "π0.5 INT8 raw image capture state is inconsistent".into(),
+                "π0.5 raw image capture state is inconsistent".into(),
             )),
         }
     }
@@ -259,19 +192,20 @@ impl Pi05Int8CudaRuntime {
         token_count: usize,
         noise: &Tensor,
         time_embeddings: &[Tensor],
-    ) -> Result<Pi05Int8CapturedGraph> {
+    ) -> Result<CapturedGraph> {
         let backend = &self.backend;
         if raw_images.is_some() != raw_image_layout.is_some() {
             return Err(Error::Other(
-                "π0.5 INT8 raw image capture state is inconsistent".into(),
+                "π0.5 raw image capture state is inconsistent".into(),
             ));
         }
-        let styles = self.prepare_all_styles(time_embeddings)?;
+        let styles = self.network.prepare_all_styles(time_embeddings)?;
         backend.synchronize()?;
-        let workspace = kernels::GraphWorkspace::new(
-            self.config.cuda_graph_workspace_bytes_int8(token_count)?,
-            self.ctx().device_id(),
-        )?;
+        let workspace = self
+            .network
+            .blocks
+            .workspace_requirements(token_count)?
+            .allocate(self.ctx().device_id())?;
         let mut stable = false;
         for _ in 0..4 {
             let generation = self.ctx().tuning().generation();
@@ -295,7 +229,7 @@ impl Pi05Int8CudaRuntime {
         }
         if !stable {
             return Err(Error::Other(
-                "GEMM tactic store did not stabilize before PI0.5 INT8 graph capture".into(),
+                "GEMM tactic store did not stabilize before PI0.5 graph capture".into(),
             ));
         }
 
@@ -312,18 +246,17 @@ impl Pi05Int8CudaRuntime {
                 )
             })
         })?;
-        Ok(Pi05Int8CapturedGraph {
+        Ok(CapturedGraph {
             graph,
             output,
             patches,
             raw_images,
             raw_image_layout,
             noise: noise.clone(),
-            _styles: styles,
             token_ids: token_ids.clone(),
             token_count,
             backend: Arc::clone(&self.backend),
-            _network: Arc::clone(&self.network),
+            _fixed: Box::new((Arc::clone(&self.network), styles)),
             workspace,
         })
     }
@@ -335,7 +268,7 @@ impl Pi05Int8CudaRuntime {
         token_count: usize,
         noise: &Tensor,
         time_embeddings: &[Tensor],
-    ) -> Result<Pi05Int8CapturedGraph> {
+    ) -> Result<CapturedGraph> {
         self.capture_infer_impl(
             patches.clone(),
             None,
@@ -354,16 +287,23 @@ impl Pi05Int8CudaRuntime {
         token_count: usize,
         noise: &Tensor,
         time_embeddings: &[Tensor],
-    ) -> Result<Pi05Int8CapturedGraph> {
+    ) -> Result<CapturedGraph> {
         let backend = &self.backend;
-        let raw_image_bytes =
-            self.config.num_views * 3 * self.config.image_size * self.config.image_size;
+        let raw_image_bytes = self
+            .config
+            .num_views
+            .checked_mul(3)
+            .and_then(|n| n.checked_mul(self.config.image_size))
+            .and_then(|n| n.checked_mul(self.config.image_size))
+            .ok_or_else(|| Error::Other("PI0.5 raw image size overflow".into()))?;
         let raw_images = CudaBuffer::alloc_zeros(raw_image_bytes, self.ctx().device_id())
             .map_err(Error::Cuda)?;
         let patch_rows = self.config.num_views * self.config.patches_per_view();
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
-        let patches =
-            backend.to_device(&Tensor::zeros(vec![patch_rows, patch_width], DType::BF16))?;
+        let patches = backend.to_device(&Tensor::zeros(
+            vec![patch_rows, patch_width],
+            self.network.blocks.raw_patch_dtype(),
+        ))?;
         self.capture_infer_impl(
             patches,
             Some(raw_images),
@@ -376,26 +316,66 @@ impl Pi05Int8CudaRuntime {
     }
 }
 
-pub fn upload_time_embeddings_int8(
-    config: &Pi05Config,
-    backend: &dyn Backend,
-) -> Result<Vec<Tensor>> {
-    (0..config.num_flow_steps)
-        .map(|step| {
-            let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
-            let values = sinusoidal_time_embedding(
-                time,
-                config.action_expert.width,
-                config.time_min_period,
-                config.time_max_period,
-            )
-            .into_iter()
-            .map(bf16::from_f32)
-            .collect::<Vec<_>>();
-            backend.to_device(&Tensor::from_bf16(
-                vec![1, config.action_expert.width],
-                &values,
-            )?)
-        })
-        .collect()
+pub(super) enum CaptureInput<'a> {
+    Patches(&'a Tensor),
+    Rgb(Pi05ImageLayout),
+}
+pub(super) fn capture<B: PrepareBlocks>(
+    network: &Arc<Pi05Network<B>>,
+    input: CaptureInput<'_>,
+    tokens: &CudaBuffer,
+    count: usize,
+    noise: &Tensor,
+    embeddings: &[Tensor],
+) -> Result<CapturedGraph> {
+    let builder = CaptureBuilder {
+        network,
+        backend: network.blocks.backend(),
+        config: network.blocks.config(),
+    };
+    match input {
+        CaptureInput::Rgb(layout) => {
+            builder.capture_infer_rgb_u8(layout, tokens, count, noise, embeddings)
+        }
+        CaptureInput::Patches(patches) => {
+            builder.capture_infer(patches, tokens, count, noise, embeddings)
+        }
+    }
+}
+/// Prepare a low-level graph with caller-owned stable patch/token/noise tensors.
+/// Their storage is retained; sizes and addresses cannot change between replays.
+pub fn capture_patches<B: PrepareBlocks>(
+    network: &Arc<Pi05Network<B>>,
+    patches: &Tensor,
+    tokens: &CudaBuffer,
+    count: usize,
+    noise: &Tensor,
+    embeddings: &[Tensor],
+) -> Result<CapturedGraph> {
+    capture(
+        network,
+        CaptureInput::Patches(patches),
+        tokens,
+        count,
+        noise,
+        embeddings,
+    )
+}
+/// Prepare a graph that owns RGB input storage and device preprocessing.
+pub fn capture_rgb<B: PrepareBlocks>(
+    network: &Arc<Pi05Network<B>>,
+    layout: Pi05ImageLayout,
+    tokens: &CudaBuffer,
+    count: usize,
+    noise: &Tensor,
+    embeddings: &[Tensor],
+) -> Result<CapturedGraph> {
+    capture(
+        network,
+        CaptureInput::Rgb(layout),
+        tokens,
+        count,
+        noise,
+        embeddings,
+    )
 }

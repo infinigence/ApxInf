@@ -333,7 +333,7 @@ class Pi05Policy:
         model_name: str = "pi05",
         checkpoint=None,
         device: str = "cuda:0",
-        precision: str = "auto",
+        compute_variant: str = "auto",
         calibration=None,
         tactics=None,
         autotune: bool = False,
@@ -401,7 +401,7 @@ class Pi05Policy:
         the vision tower has no per-slot parameters) and skips their patch tokens.
 
         Unless ``tactics`` is explicitly supplied, CUDA deployments select the
-        validated tactic database for their compute capability and precision.
+        validated tactic database for their compute capability and compute_variant.
         A checkpoint-local ``tactics.json`` takes precedence over source-tree
         defaults, so normal Python and serving callers share the same routing.
 
@@ -463,7 +463,7 @@ class Pi05Policy:
             ckpt = str(checkpoint) if checkpoint is not None else str(model_dir / "model.safetensors")
             tactics = resolve_pi05_tactics(
                 device,
-                precision,
+                compute_variant,
                 model_dir=model_dir,
                 override=Path(tactics) if tactics is not None else None,
                 allow_missing=bool(autotune),
@@ -473,7 +473,7 @@ class Pi05Policy:
                 model_name,
                 ckpt,
                 device=device,
-                precision=precision,
+                compute_variant=compute_variant,
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 autotune=bool(autotune),

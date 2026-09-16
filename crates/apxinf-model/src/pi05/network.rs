@@ -1,17 +1,13 @@
 //! One PI0.5 dataflow: vision -> prefix/KV -> fixed-step action generation.
 //! Precision, fused topology and physical weight representations live in Blocks.
-//! Session/runtime adapters own graph capture, workspace and host input binding.
+//! Session and prepare own execution policy, capture, workspaces and input binding.
 
 use super::backend::DeviceBuffer as CudaBuffer;
-use super::blocks::{Bf16Blocks, Blocks, Fp8Blocks, W8A8Blocks};
+use super::blocks::Blocks;
 use apxinf_core::{Error, Result, Tensor};
 
-pub(super) type Pi05Bf16Network = Pi05Network<Bf16Blocks>;
-pub(super) type Pi05Fp8Network = Pi05Network<Fp8Blocks>;
-pub(super) type Pi05Int8Network = Pi05Network<W8A8Blocks>;
-
-pub(super) struct Pi05Network<B: Blocks> {
-    blocks: B,
+pub struct Pi05Network<B: Blocks> {
+    pub(super) blocks: B,
 }
 
 impl<B: Blocks> Pi05Network<B> {
@@ -167,29 +163,6 @@ impl<B: Blocks> Pi05Network<B> {
         styles: &[B::Styles],
     ) -> Result<Tensor> {
         self.infer_styles_impl(patches, ids, count, noise, styles, true)
-    }
-}
-
-impl Pi05Network<Bf16Blocks> {
-    /// Explicit diagnostic traversal of the same Network; no second model body.
-    pub fn calibrate(
-        &self,
-        patches: &Tensor,
-        ids: &CudaBuffer,
-        count: usize,
-        noise: &Tensor,
-        embeddings: &[Tensor],
-    ) -> Result<std::collections::BTreeMap<String, f32>> {
-        use apxinf_core::Backend;
-        let observer = std::rc::Rc::new(super::Pi05CalibrationObserver::new(
-            self.blocks.backend.clone(),
-            &self.blocks.config,
-            &self.blocks.weights,
-        )?);
-        let _guard = super::backend::kernels::gemm::install_bf16_observer(observer.clone())?;
-        self.infer(patches, ids, count, noise, embeddings)?;
-        self.blocks.backend.synchronize()?;
-        observer.records()
     }
 }
 

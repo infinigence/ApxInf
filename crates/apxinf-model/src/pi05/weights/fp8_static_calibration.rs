@@ -15,7 +15,7 @@ use apxinf_core::{Error, Result, Tensor};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use super::Pi05Config;
+use crate::pi05::Pi05Config;
 
 /// Largest finite NVIDIA/CUDA E4M3 value (`0x7e`).
 pub const E4M3_MAX: f32 = 448.0;
@@ -111,13 +111,15 @@ fn layer_sites(prefix: &str, index: usize, compute_tail: bool) -> LayerCalibrati
 fn extend_sites(sites: &mut Vec<String>, layers: &[LayerCalibrationSites]) {
     for layer in layers {
         sites.push(layer.attention_norm.clone());
-        sites.extend([
-            layer.attention_output.clone(),
-            layer.mlp_norm.clone(),
-            layer.mlp_activation.clone(),
-        ]
-        .into_iter()
-        .flatten());
+        sites.extend(
+            [
+                layer.attention_output.clone(),
+                layer.mlp_norm.clone(),
+                layer.mlp_activation.clone(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
     }
 }
 
@@ -232,11 +234,7 @@ impl<'de> Visitor<'de> for ScaleMapVisitor {
 }
 
 impl StaticFp8Calibration {
-    pub fn from_json_file(
-        path: &Path,
-        config: &Pi05Config,
-        checkpoint: &str,
-    ) -> Result<Self> {
+    pub fn from_json_file(path: &Path, config: &Pi05Config, checkpoint: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
         let calibration = Self::from_json_str(&raw, config, checkpoint)?;
@@ -281,7 +279,9 @@ impl StaticFp8Calibration {
             ));
         }
         if !profile.quantization.margin.is_finite() || profile.quantization.margin < 1.0 {
-            return Err(Error::Other("π0.5 FP8 calibration has invalid margin".into()));
+            return Err(Error::Other(
+                "π0.5 FP8 calibration has invalid margin".into(),
+            ));
         }
         if profile.calibration_data.identity.is_empty()
             || profile.calibration_data.kind.is_empty()
@@ -293,7 +293,9 @@ impl StaticFp8Calibration {
             || profile.seed_policy.algorithm.is_empty()
             || profile.seed_policy.sample_sequence.is_empty()
         {
-            return Err(Error::Other("π0.5 FP8 calibration manifest is incomplete".into()));
+            return Err(Error::Other(
+                "π0.5 FP8 calibration manifest is incomplete".into(),
+            ));
         }
         match (
             profile.calibration_data.kind.as_str(),
@@ -464,7 +466,8 @@ pub fn checkpoint_identity(path: &Path) -> Result<String> {
             .map_err(|error| Error::Other(format!("read {}: {error}", file.display())))?;
         let mut buffer = [0u8; 1024 * 1024];
         loop {
-            let count = handle.read(&mut buffer)
+            let count = handle
+                .read(&mut buffer)
                 .map_err(|error| Error::Other(format!("read {}: {error}", file.display())))?;
             if count == 0 {
                 break;
@@ -509,7 +512,9 @@ fn collect_safetensors(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()>
     for entry in std::fs::read_dir(directory)
         .map_err(|error| Error::Other(format!("read {}: {error}", directory.display())))?
     {
-        let path = entry.map_err(|error| Error::Other(error.to_string()))?.path();
+        let path = entry
+            .map_err(|error| Error::Other(error.to_string()))?
+            .path();
         if path.is_dir() {
             collect_safetensors(&path, files)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("safetensors") {
@@ -529,8 +534,8 @@ impl Sha256 {
     fn new() -> Self {
         Self {
             state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
-                0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buffer: Vec::with_capacity(64),
             bytes: 0,
@@ -578,17 +583,16 @@ impl Sha256 {
 
     fn compress(&mut self, block: &[u8; 64]) {
         const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-            0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
         ];
         let mut words = [0u32; 64];
         for (index, bytes) in block.chunks_exact(4).enumerate() {
@@ -831,15 +835,14 @@ mod tests {
     fn strict_profile_accepts_exact_execution_plan() {
         let config = test_config();
         let plan = Pi05CalibrationPlan::for_config(&config);
-        assert!(plan.sites().contains(&"language.layers.0.attention_norm".to_owned()));
+        assert!(plan
+            .sites()
+            .contains(&"language.layers.0.attention_norm".to_owned()));
         assert!(!plan
             .sites()
             .contains(&"language.layers.0.attention_output".to_owned()));
         let calibration = parse(&profile(&config), &config).unwrap();
-        assert_eq!(
-            calibration.len(),
-            plan.sites().len()
-        );
+        assert_eq!(calibration.len(), plan.sites().len());
         assert_eq!(calibration.scale("vision.patch_input").unwrap(), 1.0);
     }
 
@@ -896,8 +899,7 @@ mod tests {
         for entry in overflow["scales"].as_object_mut().unwrap().values_mut() {
             entry["scale"] = serde_json::json!(2.0);
         }
-        overflow["scales"]["vision.patch_input"]["amax"] =
-            serde_json::json!(f32::MAX);
+        overflow["scales"]["vision.patch_input"]["amax"] = serde_json::json!(f32::MAX);
         assert!(parse(&overflow, &config).is_err());
 
         let mut mislabeled = profile(&config);
@@ -909,14 +911,10 @@ mod tests {
             "\"scales\":{",
             "\"scales\":{\"vision.patch_input\":{\"amax\":448.0,\"scale\":1.0},",
         );
-        assert!(StaticFp8Calibration::from_json_str(
-            &duplicate,
-            &config,
-            "sha256:test"
-        )
-        .is_err());
+        assert!(StaticFp8Calibration::from_json_str(&duplicate, &config, "sha256:test").is_err());
 
-        let raw = serde_json::to_string(&profile(&config)).unwrap()
+        let raw = serde_json::to_string(&profile(&config))
+            .unwrap()
             .replace("\"amax\":448.0", "\"amax\":1e400");
         assert!(StaticFp8Calibration::from_json_str(&raw, &config, "sha256:test").is_err());
     }
@@ -933,8 +931,8 @@ mod tests {
 
     #[test]
     fn checkpoint_identity_matches_shared_cross_language_fixture() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/checkpoint_identity");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/checkpoint_identity");
         let expected = std::fs::read_to_string(fixture.join("expected.sha256"))
             .unwrap()
             .trim()
@@ -946,4 +944,154 @@ mod tests {
             expected
         );
     }
+}
+
+#[cfg(feature = "cuda")]
+pub use activation_scales::Fp8StaticActivationScales;
+#[cfg(feature = "cuda")]
+mod activation_scales {
+    use crate::pi05::{
+        Fp8StaticTransformerLayerScales, Fp8StaticVisionLayerScales, LayerCalibrationSites,
+        Pi05CalibrationPlan, Pi05Config, StaticFp8Calibration,
+    };
+    use apxinf_core::{Error, Result};
+    #[derive(Clone, Debug)]
+    pub struct Fp8StaticActivationScales {
+        pub vision_patch_input: f32,
+        pub vision_layers: Vec<Fp8StaticVisionLayerScales>,
+        pub vision_post_norm: f32,
+        pub language_layers: Vec<Fp8StaticTransformerLayerScales>,
+        pub action_input: f32,
+        pub time_input: f32,
+        pub time_hidden: f32,
+        pub conditioning: f32,
+        pub action_layers: Vec<Fp8StaticTransformerLayerScales>,
+        pub action_final_norm: f32,
+    }
+
+    impl Fp8StaticActivationScales {
+        /// Resolve every graph activation scale from a named calibration file.
+        pub fn from_calibration(
+            config: &Pi05Config,
+            calibration: &StaticFp8Calibration,
+        ) -> Result<Self> {
+            let plan = Pi05CalibrationPlan::for_config(config);
+            let optional_scale = |site: &Option<String>| -> Result<f32> {
+                site.as_deref()
+                    .map(|name| calibration.scale(name))
+                    .transpose()
+                    .map(|scale| scale.unwrap_or(1.0))
+            };
+            let transformer_layer =
+                |sites: &LayerCalibrationSites| -> Result<Fp8StaticTransformerLayerScales> {
+                    Ok(Fp8StaticTransformerLayerScales {
+                        attention_norm: calibration.scale(&sites.attention_norm)?,
+                        attention_output: optional_scale(&sites.attention_output)?,
+                        mlp_norm: optional_scale(&sites.mlp_norm)?,
+                        mlp_activation: optional_scale(&sites.mlp_activation)?,
+                    })
+                };
+            let vision_layers = plan
+                .vision_layers()
+                .iter()
+                .map(|sites| {
+                    Ok(Fp8StaticVisionLayerScales {
+                        attention_norm: calibration.scale(&sites.attention_norm)?,
+                        attention_output: calibration
+                            .scale(sites.attention_output.as_deref().expect("vision tail site"))?,
+                        mlp_norm: calibration
+                            .scale(sites.mlp_norm.as_deref().expect("vision tail site"))?,
+                        mlp_activation: calibration
+                            .scale(sites.mlp_activation.as_deref().expect("vision tail site"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let language_layers = plan
+                .language_layers()
+                .iter()
+                .map(transformer_layer)
+                .collect::<Result<Vec<_>>>()?;
+            let action_layers = plan
+                .action_layers()
+                .iter()
+                .map(transformer_layer)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                vision_patch_input: calibration.scale("vision.patch_input")?,
+                vision_layers,
+                vision_post_norm: calibration.scale("vision.post_norm")?,
+                language_layers,
+                action_input: calibration.scale("action.input")?,
+                time_input: calibration.scale("time.input")?,
+                time_hidden: calibration.scale("time.hidden")?,
+                conditioning: calibration.scale("action.conditioning")?,
+                action_layers,
+                action_final_norm: calibration.scale("action.final_norm")?,
+            })
+        }
+
+        /// Useful for kernel smoke tests. Production inference should load named,
+        /// measured scales from `StaticFp8Calibration`.
+        pub fn uniform(config: &Pi05Config, scale: f32) -> Result<Self> {
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(Error::Other(format!("invalid uniform FP8 scale {scale}")));
+            }
+            let transformer = Fp8StaticTransformerLayerScales {
+                attention_norm: scale,
+                attention_output: scale,
+                mlp_norm: scale,
+                mlp_activation: scale,
+            };
+            let vision = Fp8StaticVisionLayerScales {
+                attention_norm: scale,
+                attention_output: scale,
+                mlp_norm: scale,
+                mlp_activation: scale,
+            };
+            Ok(Self {
+                vision_patch_input: scale,
+                vision_layers: vec![vision; config.vision_depth],
+                vision_post_norm: scale,
+                language_layers: vec![transformer; config.language.depth],
+                action_input: scale,
+                time_input: scale,
+                time_hidden: scale,
+                conditioning: scale,
+                action_layers: vec![transformer; config.action_expert.depth],
+                action_final_norm: scale,
+            })
+        }
+
+        pub(in crate::pi05) fn validate(&self, config: &Pi05Config) -> Result<()> {
+            if self.vision_layers.len() != config.vision_depth
+                || self.language_layers.len() != config.language.depth
+                || self.action_layers.len() != config.action_expert.depth
+            {
+                return Err(Error::Other(
+                    "π0.5 activation calibration depth mismatch".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Fp8StaticTransformerLayerScales {
+    /// Output scale for the first (Ada)RMSNorm.
+    pub attention_norm: f32,
+    /// Input scale for the attention output projection.
+    pub attention_output: f32,
+    /// Output scale for the second (Ada)RMSNorm.
+    pub mlp_norm: f32,
+    /// Output scale for GELU-tanh(gate) * up.
+    pub mlp_activation: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Fp8StaticVisionLayerScales {
+    pub attention_norm: f32,
+    pub attention_output: f32,
+    pub mlp_norm: f32,
+    pub mlp_activation: f32,
 }

@@ -5,32 +5,32 @@ use apxinf_core::{Result, Tensor};
 use kernels::{activation, attention, embedding, fused, norm, rope};
 
 use crate::pi05::{
-    GemmaVariantConfig, Int8DeviceActionLayer, Int8DeviceLanguageLayer, Int8DeviceVisionBlock,
-    Int8LinearWeights,
+    GemmaVariantConfig, Int8DynamicDeviceActionLayer, Int8DynamicDeviceLanguageLayer,
+    Int8DynamicDeviceVisionBlock, Int8DynamicLinearWeights,
 };
 
-pub struct Int8LanguageLayerOutput {
+pub struct Int8DynamicLanguageLayerOutput {
     pub hidden: Tensor,
     pub key: Tensor,
     pub value: Tensor,
 }
 
-pub struct Int8ActionLayerOutput {
+pub struct Int8DynamicActionLayerOutput {
     pub hidden: Tensor,
     pub next_normalized: Tensor,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn language_layer_int8(
+pub fn language_layer_int8_dynamic(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &Int8DeviceLanguageLayer,
+    weights: &Int8DynamicDeviceLanguageLayer,
     input: &Tensor,
     compute_tail: bool,
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<Int8LanguageLayerOutput> {
+) -> Result<Int8DynamicLanguageLayerOutput> {
     let normalized = norm::rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
     let qkv = weights.qkv.gemm(ctx, &normalized)?;
     let qkv = rope::split_qkv_apply_bf16(
@@ -45,7 +45,7 @@ pub fn language_layer_int8(
     )?;
     let tokens = input.shape().dims()[0];
     if !compute_tail {
-        return Ok(Int8LanguageLayerOutput {
+        return Ok(Int8DynamicLanguageLayerOutput {
             hidden: input.clone(),
             key: qkv.key_2d(tokens, config.head_dim)?,
             value: qkv.value_2d(tokens, config.head_dim)?,
@@ -67,7 +67,7 @@ pub fn language_layer_int8(
     let projected = weights.down.gemm(ctx, &activated)?;
     let hidden =
         fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
-    Ok(Int8LanguageLayerOutput {
+    Ok(Int8DynamicLanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
         value: qkv.value_2d(tokens, config.head_dim)?,
@@ -75,10 +75,10 @@ pub fn language_layer_int8(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn action_layer_int8(
+pub fn action_layer_int8_dynamic(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &Int8DeviceActionLayer,
+    weights: &Int8DynamicDeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
     attention_style: &Tensor,
@@ -89,7 +89,7 @@ pub fn action_layer_int8(
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<Int8ActionLayerOutput> {
+) -> Result<Int8DynamicActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
         None => norm::adaptive_rms_bf16(ctx, input, attention_style, rms_eps)?,
@@ -139,15 +139,15 @@ pub fn action_layer_int8(
         next_norm_style,
         rms_eps,
     )?;
-    Ok(Int8ActionLayerOutput {
+    Ok(Int8DynamicActionLayerOutput {
         hidden: fused.hidden,
         next_normalized: fused.normalized,
     })
 }
 
-pub fn vision_patch_embed_int8(
+pub fn vision_patch_embed_int8_dynamic(
     ctx: &Context,
-    weights: &Int8LinearWeights,
+    weights: &Int8DynamicLinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
@@ -163,9 +163,9 @@ pub fn vision_patch_embed_int8(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn vision_layer_int8(
+pub fn vision_layer_int8_dynamic(
     ctx: &Context,
-    weights: &Int8DeviceVisionBlock,
+    weights: &Int8DynamicDeviceVisionBlock,
     input: &Tensor,
     patches_per_view: usize,
     heads: usize,
@@ -222,27 +222,27 @@ pub(in crate::pi05) mod backbone {
     use apxinf_core::{DType, Error, Result, Tensor};
     use kernels::{activation, cache, elementwise, embedding, norm};
     use std::sync::Arc;
-    pub struct Int8PrefixKvCache {
+    pub struct Int8DynamicPrefixKvCache {
         pub keys: Vec<Tensor>,
         pub values: Vec<Tensor>,
         pub tokens: usize,
     }
 
-    pub(in crate::pi05) struct Int8StepStyles {
+    pub struct Int8DynamicStepStyles {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
-    pub(in crate::pi05) struct W8A8Blocks {
+    pub struct Int8DynamicBlocks {
         pub(in crate::pi05) backend: Arc<RuntimeBackend>,
         pub(in crate::pi05) config: Arc<Pi05Config>,
-        pub(in crate::pi05) weights: Arc<StaticInt8Pi05Weights>,
+        pub(in crate::pi05) weights: Arc<Int8DynamicWeights>,
     }
-    impl W8A8Blocks {
+    impl Int8DynamicBlocks {
         pub fn new(
             backend: Arc<RuntimeBackend>,
             config: Arc<Pi05Config>,
-            weights: Arc<StaticInt8Pi05Weights>,
+            weights: Arc<Int8DynamicWeights>,
         ) -> Result<Self> {
             config.validate()?;
             if weights.vision_layers.len() != config.vision_depth
@@ -271,7 +271,7 @@ pub(in crate::pi05) mod backbone {
                     got: patches.dtype(),
                 });
             }
-            let mut hidden = vision_patch_embed_int8(
+            let mut hidden = vision_patch_embed_int8_dynamic(
                 self.ctx(),
                 &self.weights.patch_embedding,
                 &self.weights.position_embedding,
@@ -279,7 +279,7 @@ pub(in crate::pi05) mod backbone {
                 self.config.patches_per_view(),
             )?;
             for layer in &self.weights.vision_layers {
-                hidden = vision_layer_int8(
+                hidden = vision_layer_int8_dynamic(
                     self.ctx(),
                     layer,
                     &hidden,
@@ -328,12 +328,12 @@ pub(in crate::pi05) mod backbone {
             elementwise::concat_rows_bf16(self.ctx(), vision_tokens, &language)
         }
 
-        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Int8PrefixKvCache> {
+        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Int8DynamicPrefixKvCache> {
             let mut hidden = prefix.clone();
             let mut keys = Vec::with_capacity(self.config.language.depth);
             let mut values = Vec::with_capacity(self.config.language.depth);
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                let output = language_layer_int8(
+                let output = language_layer_int8_dynamic(
                     self.ctx(),
                     self.config.language,
                     layer,
@@ -356,7 +356,7 @@ pub(in crate::pi05) mod backbone {
                     cache_rows,
                 )?);
             }
-            Ok(Int8PrefixKvCache {
+            Ok(Int8DynamicPrefixKvCache {
                 keys,
                 values,
                 tokens: prefix.shape().dims()[0],
@@ -374,13 +374,17 @@ pub(in crate::pi05) mod backbone {
             activation::bias_silu_bf16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
         }
 
-        fn style(&self, conditioning: &Tensor, weights: &Int8LinearWeights) -> Result<Tensor> {
+        fn style(
+            &self,
+            conditioning: &Tensor,
+            weights: &Int8DynamicLinearWeights,
+        ) -> Result<Tensor> {
             let projected = weights.gemm(self.ctx(), conditioning)?;
             let style = elementwise::bias_bf16(self.ctx(), &projected, weights.bias.as_ref())?;
             style.reshape(vec![style.numel()])
         }
 
-        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Int8StepStyles> {
+        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Int8DynamicStepStyles> {
             let conditioning = self.conditioning(time_embedding)?;
             let mut attention = Vec::with_capacity(self.config.action_expert.depth);
             let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
@@ -389,14 +393,17 @@ pub(in crate::pi05) mod backbone {
                 mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
             }
             let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
-            Ok(Int8StepStyles {
+            Ok(Int8DynamicStepStyles {
                 attention,
                 mlp,
                 final_norm,
             })
         }
 
-        fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<Int8StepStyles>> {
+        fn prepare_all_styles(
+            &self,
+            time_embeddings: &[Tensor],
+        ) -> Result<Vec<Int8DynamicStepStyles>> {
             if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
@@ -413,8 +420,8 @@ pub(in crate::pi05) mod backbone {
         fn denoise_step_with_styles(
             &self,
             state: &Tensor,
-            styles: &Int8StepStyles,
-            prefix: &Int8PrefixKvCache,
+            styles: &Int8DynamicStepStyles,
+            prefix: &Int8DynamicPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
@@ -435,7 +442,7 @@ pub(in crate::pi05) mod backbone {
                 } else {
                     &styles.final_norm
                 };
-                let output = action_layer_int8(
+                let output = action_layer_int8_dynamic(
                     self.ctx(),
                     self.config.action_expert,
                     layer,
@@ -469,7 +476,7 @@ pub(in crate::pi05) mod backbone {
             &self,
             state: &Tensor,
             time_embedding: &Tensor,
-            prefix: &Int8PrefixKvCache,
+            prefix: &Int8DynamicPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             let styles = self.prepare_step_styles(time_embedding)?;
@@ -477,9 +484,9 @@ pub(in crate::pi05) mod backbone {
         }
     }
 
-    impl super::super::Blocks for W8A8Blocks {
-        type Prefix = Int8PrefixKvCache;
-        type Styles = Int8StepStyles;
+    impl super::super::Blocks for Int8DynamicBlocks {
+        type Prefix = Int8DynamicPrefixKvCache;
+        type Styles = Int8DynamicStepStyles;
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -517,5 +524,39 @@ pub(in crate::pi05) mod backbone {
         ) -> Result<Tensor> {
             self.denoise_step_with_styles(state, styles, prefix, dt)
         }
+    }
+}
+
+impl crate::pi05::prepare::PrepareBlocks for backbone::Int8DynamicBlocks {
+    fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
+        &self.backend
+    }
+    fn workspace_requirements(
+        &self,
+        tokens: usize,
+    ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
+        Ok(crate::pi05::prepare::WorkspaceRequirements {
+            bytes: self.config.cuda_graph_workspace_bytes_int8(tokens)?,
+            fp8_scratch: None,
+        })
+    }
+    fn raw_patch_dtype(&self) -> apxinf_core::DType {
+        apxinf_core::DType::BF16
+    }
+    fn preprocess(
+        &self,
+        images: &crate::pi05::backend::DeviceBuffer,
+        patches: &Tensor,
+        layout: crate::pi05::Pi05ImageLayout,
+    ) -> Result<()> {
+        crate::pi05::backend::kernels::preprocess::rgb_u8_to_patches_bf16(
+            self.backend.context(),
+            images,
+            patches,
+            self.config.num_views,
+            self.config.image_size,
+            self.config.patch_size,
+            layout,
+        )
     }
 }

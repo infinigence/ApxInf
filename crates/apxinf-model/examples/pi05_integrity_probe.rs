@@ -1,19 +1,20 @@
 //! Low-level numerical integrity probe for PI0.5.
 //!
 //! This example intentionally bypasses the unified `AutoModel`/`infer` frontend
-//! to reach `Pi05CudaRuntime` internals and `apxinf_cuda` tuning/kernel
+//! to reach `Fp8StaticNetwork` internals and `apxinf_cuda` tuning/kernel
 //! signatures directly, which the model abstraction does not (and should not)
 //! expose. See `pi05_auto_smoke` for the abstraction-level entry point.
 
+use apxinf_model::pi05::build_fp8_static_network;
 use std::path::Path;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, DType, Tensor};
 use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
-    upload_time_embeddings, vision_layer, vision_patch_embed, vision_qkv_packed_from_env,
-    Pi05ActivationScales, Pi05Config, Pi05CudaRuntime, Pi05Weights, StaticFp8Calibration,
-    StaticFp8Pi05Weights,
+    upload_time_embeddings_fp8_static, vision_layer_fp8_static, vision_patch_embed_fp8_static,
+    vision_qkv_packed_from_env, Fp8StaticActivationScales, Fp8StaticWeights, Pi05Config,
+    Pi05Weights, StaticFp8Calibration,
 };
 
 fn signature(values: &[f32]) -> serde_json::Value {
@@ -73,12 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_count = arguments[4].parse::<usize>()?;
     let config = Arc::new(Pi05Config::thor_two_view());
     let checkpoint = apxinf_model::pi05::checkpoint_identity(Path::new(&arguments[1]))?;
-    let calibration = StaticFp8Calibration::from_json_file(
-        Path::new(&arguments[2]),
-        &config,
-        &checkpoint,
-    )?;
-    let scales = Arc::new(Pi05ActivationScales::from_calibration(
+    let calibration =
+        StaticFp8Calibration::from_json_file(Path::new(&arguments[2]), &config, &checkpoint)?;
+    let scales = Arc::new(Fp8StaticActivationScales::from_calibration(
         &config,
         &calibration,
     )?);
@@ -88,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("loading π0.5 checkpoint...");
     let host_weights = Pi05Weights::from_safetensors(&config, Path::new(&arguments[1]))?;
     eprintln!("quantizing and uploading static FP8 weights...");
-    let device_weights = Arc::new(StaticFp8Pi05Weights::from_host(
+    let device_weights = Arc::new(Fp8StaticWeights::from_host(
         &host_weights,
         &*backend,
         config.language_dual_geglu_shape_possible(),
@@ -104,8 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
     let token_ids = CudaBuffer::alloc_zeros(token_count * 4, backend.device_id())
         .map_err(std::io::Error::other)?;
-    let time_embeddings = upload_time_embeddings(&config, &*backend)?;
-    let runtime = Pi05CudaRuntime::new(
+    let time_embeddings = upload_time_embeddings_fp8_static(&config, &*backend)?;
+    let runtime = build_fp8_static_network(
         backend.clone(),
         config.clone(),
         device_weights.clone(),
@@ -114,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut signatures = serde_json::Map::new();
     eprintln!("probing patch embedding and each vision layer...");
-    let mut vision_hidden = vision_patch_embed(
+    let mut vision_hidden = vision_patch_embed_fp8_static(
         backend.context(),
         &device_weights.patch_embedding,
         &device_weights.position_embedding,
@@ -123,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scales.vision_patch_input,
     )?;
     signatures.insert(
-        "vision_patch_embed".into(),
+        "vision_patch_embed_fp8_static".into(),
         device_signature(&backend, &vision_hidden)?,
     );
     let packed_vision_qkv = vision_qkv_packed_from_env()?;
@@ -133,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(&scales.vision_layers)
         .enumerate()
     {
-        vision_hidden = vision_layer(
+        vision_hidden = vision_layer_fp8_static(
             backend.context(),
             weights,
             *layer_scales,

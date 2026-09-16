@@ -888,7 +888,7 @@ def _load_with_fake_binding(monkeypatch, model_dir, **kwargs):
     )
     (Path(model_dir) / "paligemma_tokenizer.model").write_bytes(b"sp")
     captured["policy"] = pi05.Pi05Policy.from_pretrained(
-        model_dir, device="cuda:0", precision="bf16", **kwargs
+        model_dir, device="cuda:0", compute_variant="bf16", **kwargs
     )
     return captured
 

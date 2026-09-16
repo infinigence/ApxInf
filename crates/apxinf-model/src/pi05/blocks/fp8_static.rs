@@ -4,36 +4,21 @@ use crate::pi05::backend::{kernels, Context};
 use apxinf_core::{Error, Result, Tensor};
 use kernels::{activation, attention, embedding, fused, gemm, norm, quantization, rope};
 
-use crate::pi05::{DeviceActionLayer, DeviceLanguageLayer, DeviceVisionBlock, GemmaVariantConfig};
+use crate::pi05::{
+    Fp8StaticDeviceActionLayer, Fp8StaticDeviceLanguageLayer, Fp8StaticDeviceVisionBlock,
+    GemmaVariantConfig,
+};
 
-#[derive(Clone, Copy, Debug)]
-pub struct TransformerLayerScales {
-    /// Output scale for the first (Ada)RMSNorm.
-    pub attention_norm: f32,
-    /// Input scale for the attention output projection.
-    pub attention_output: f32,
-    /// Output scale for the second (Ada)RMSNorm.
-    pub mlp_norm: f32,
-    /// Output scale for GELU-tanh(gate) * up.
-    pub mlp_activation: f32,
-}
+use crate::pi05::{Fp8StaticTransformerLayerScales, Fp8StaticVisionLayerScales};
 
-#[derive(Clone, Copy, Debug)]
-pub struct VisionLayerScales {
-    pub attention_norm: f32,
-    pub attention_output: f32,
-    pub mlp_norm: f32,
-    pub mlp_activation: f32,
-}
-
-pub struct LanguageLayerOutput {
+pub struct Fp8StaticLanguageLayerOutput {
     pub hidden: Tensor,
     /// Prefix K/V are retained per layer for the paired action expert.
     pub key: Tensor,
     pub value: Tensor,
 }
 
-pub struct ActionLayerOutput {
+pub struct Fp8StaticActionLayerOutput {
     pub hidden: Tensor,
     pub next_normalized: Tensor,
 }
@@ -72,17 +57,17 @@ fn fa2_direct_e4m3_exact_shape(q: &Tensor, k: &Tensor, v: &Tensor) -> bool {
         && v.shape().dims() == [522, 1, 256]
 }
 
-pub fn language_layer(
+pub fn language_layer_fp8_static(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &DeviceLanguageLayer,
-    scales: TransformerLayerScales,
+    weights: &Fp8StaticDeviceLanguageLayer,
+    scales: Fp8StaticTransformerLayerScales,
     input: &Tensor,
     compute_tail: bool,
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<LanguageLayerOutput> {
+) -> Result<Fp8StaticLanguageLayerOutput> {
     let normalized = norm::rms_quant_f16_e4m3(
         ctx,
         input,
@@ -108,7 +93,7 @@ pub fn language_layer(
     )?;
     let tokens = input.shape().dims()[0];
     if !compute_tail {
-        return Ok(LanguageLayerOutput {
+        return Ok(Fp8StaticLanguageLayerOutput {
             hidden: input.clone(),
             key: qkv.k.reshape(vec![tokens, config.head_dim])?,
             value: qkv.v.reshape(vec![tokens, config.head_dim])?,
@@ -173,7 +158,7 @@ pub fn language_layer(
         scales.mlp_activation,
         weights.down.weight_scale,
     )?;
-    Ok(LanguageLayerOutput {
+    Ok(Fp8StaticLanguageLayerOutput {
         hidden,
         key: qkv.k.reshape(vec![tokens, config.head_dim])?,
         value: qkv.v.reshape(vec![tokens, config.head_dim])?,
@@ -213,11 +198,11 @@ mod fa2_direct_e4m3_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn action_layer(
+pub fn action_layer_fp8_static(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &DeviceActionLayer,
-    scales: TransformerLayerScales,
+    weights: &Fp8StaticDeviceActionLayer,
+    scales: Fp8StaticTransformerLayerScales,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
     attention_style: &Tensor,
@@ -229,7 +214,7 @@ pub fn action_layer(
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<ActionLayerOutput> {
+) -> Result<Fp8StaticActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(normalized) => normalized.clone(),
         None => norm::adaptive_rms_quant_f16_e4m3(
@@ -304,22 +289,22 @@ pub fn action_layer(
         rms_eps,
         next_norm_scale,
     )?;
-    Ok(ActionLayerOutput {
+    Ok(Fp8StaticActionLayerOutput {
         hidden: fused.hidden,
         next_normalized: fused.normalized,
     })
 }
 
-pub fn vision_patch_embed(
+pub fn vision_patch_embed_fp8_static(
     ctx: &Context,
-    weights: &crate::pi05::Fp8LinearWeights,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
     input_scale: f32,
 ) -> Result<Tensor> {
     let patches = quantization::quantize_f16_e4m3(ctx, patches, input_scale)?;
-    vision_patch_embed_fp8(
+    vision_patch_embed_fp8_static_native(
         ctx,
         weights,
         position_embedding,
@@ -331,9 +316,9 @@ pub fn vision_patch_embed(
 
 /// Patch projection when preprocessing has already produced calibrated E4M3
 /// patch tokens. This is the entry used by the fused raw-image graph.
-pub fn vision_patch_embed_fp8(
+pub fn vision_patch_embed_fp8_static_native(
     ctx: &Context,
-    weights: &crate::pi05::Fp8LinearWeights,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
@@ -366,10 +351,10 @@ pub fn vision_qkv_packed_from_env() -> Result<bool> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn vision_layer(
+pub fn vision_layer_fp8_static(
     ctx: &Context,
-    weights: &DeviceVisionBlock,
-    scales: VisionLayerScales,
+    weights: &Fp8StaticDeviceVisionBlock,
+    scales: Fp8StaticVisionLayerScales,
     input: &Tensor,
     patches_per_view: usize,
     heads: usize,
@@ -465,10 +450,12 @@ mod tests {
 
     use super::*;
     use crate::pi05::backend::RuntimeBackend as CudaBackend;
-    use crate::pi05::{DeviceLayerNorm, DeviceVisionBlock, Fp8LinearWeights, LinearWeights};
+    use crate::pi05::{
+        Fp8StaticDeviceLayerNorm, Fp8StaticDeviceVisionBlock, Fp8StaticLinearWeights, LinearWeights,
+    };
 
-    fn zero_linear(input: usize, output: usize, backend: &dyn Backend) -> Fp8LinearWeights {
-        Fp8LinearWeights::from_host(
+    fn zero_linear(input: usize, output: usize, backend: &dyn Backend) -> Fp8StaticLinearWeights {
+        Fp8StaticLinearWeights::from_host(
             &LinearWeights {
                 weight: Tensor::from_f32(vec![input, output], &vec![0.0; input * output]).unwrap(),
                 bias: None,
@@ -482,8 +469,8 @@ mod tests {
         input: usize,
         output: usize,
         backend: &dyn Backend,
-    ) -> Fp8LinearWeights {
-        Fp8LinearWeights::from_host(
+    ) -> Fp8StaticLinearWeights {
+        Fp8StaticLinearWeights::from_host(
             &LinearWeights {
                 weight: Tensor::from_f32(vec![input, output], &vec![0.0; input * output]).unwrap(),
                 bias: Some(Tensor::from_f32(vec![output], &vec![0.0; output]).unwrap()),
@@ -505,7 +492,7 @@ mod tests {
             head_dim: 8,
         };
         let norm = Tensor::from_f16(vec![16], &vec![f16::ONE; 16]).unwrap();
-        let weights = DeviceLanguageLayer {
+        let weights = Fp8StaticDeviceLanguageLayer {
             input_norm_scale: backend.to_device(&norm).unwrap(),
             qkv: zero_linear(16, 32, &backend),
             output: zero_linear(16, 16, &backend),
@@ -519,11 +506,11 @@ mod tests {
         let input = backend
             .to_device(&Tensor::from_f16(vec![4, 16], &source).unwrap())
             .unwrap();
-        let output = language_layer(
+        let output = language_layer_fp8_static(
             backend.context(),
             config,
             &weights,
-            TransformerLayerScales {
+            Fp8StaticTransformerLayerScales {
                 attention_norm: 0.01,
                 attention_output: 0.01,
                 mlp_norm: 0.01,
@@ -547,7 +534,7 @@ mod tests {
         let inner = 32;
         let heads = 2;
         let head_dim = 8;
-        let affine = DeviceLayerNorm {
+        let affine = Fp8StaticDeviceLayerNorm {
             weight: backend
                 .to_device(&Tensor::from_f16(vec![width], &vec![f16::ONE; width]).unwrap())
                 .unwrap(),
@@ -555,8 +542,8 @@ mod tests {
                 .to_device(&Tensor::from_f16(vec![width], &vec![f16::ZERO; width]).unwrap())
                 .unwrap(),
         };
-        let weights = DeviceVisionBlock {
-            norm1: DeviceLayerNorm {
+        let weights = Fp8StaticDeviceVisionBlock {
+            norm1: Fp8StaticDeviceLayerNorm {
                 weight: affine.weight.clone(),
                 bias: affine.bias.clone(),
             },
@@ -572,10 +559,10 @@ mod tests {
         let input = backend
             .to_device(&Tensor::from_f16(vec![8, width], &source).unwrap())
             .unwrap();
-        let output = vision_layer(
+        let output = vision_layer_fp8_static(
             backend.context(),
             &weights,
-            VisionLayerScales {
+            Fp8StaticVisionLayerScales {
                 attention_norm: 0.01,
                 attention_output: 0.01,
                 mlp_norm: 0.01,
@@ -601,30 +588,30 @@ pub(in crate::pi05) mod backbone {
     use apxinf_core::{Error, Result, Tensor};
     use kernels::{activation, cache, elementwise, embedding, gemm, norm, quantization};
     use std::sync::Arc;
-    pub struct PrefixKvCache {
+    pub struct Fp8StaticPrefixKvCache {
         pub keys: Vec<Tensor>,
         pub values: Vec<Tensor>,
         pub tokens: usize,
     }
 
-    pub(in crate::pi05) struct Pi05StepStyles {
+    pub struct Fp8StaticStepStyles {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
-    pub(in crate::pi05) struct Fp8Blocks {
+    pub struct Fp8StaticBlocks {
         pub(in crate::pi05) backend: Arc<RuntimeBackend>,
         pub(in crate::pi05) config: Arc<Pi05Config>,
-        pub(in crate::pi05) weights: Arc<StaticFp8Pi05Weights>,
-        scales: Arc<Pi05ActivationScales>,
+        pub(in crate::pi05) weights: Arc<Fp8StaticWeights>,
+        pub(in crate::pi05) scales: Arc<Fp8StaticActivationScales>,
         packed_vision_qkv: bool,
     }
-    impl Fp8Blocks {
+    impl Fp8StaticBlocks {
         pub fn new(
             backend: Arc<RuntimeBackend>,
             config: Arc<Pi05Config>,
-            weights: Arc<StaticFp8Pi05Weights>,
-            scales: Arc<Pi05ActivationScales>,
+            weights: Arc<Fp8StaticWeights>,
+            scales: Arc<Fp8StaticActivationScales>,
         ) -> Result<Self> {
             config.validate()?;
             scales.validate(&config)?;
@@ -678,7 +665,7 @@ pub(in crate::pi05) mod backbone {
             elementwise::concat_rows_f16(self.ctx(), vision_tokens, &language)
         }
 
-        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<PrefixKvCache> {
+        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Fp8StaticPrefixKvCache> {
             let mut hidden = prefix.clone();
             let mut keys = Vec::with_capacity(self.config.language.depth);
             let mut values = Vec::with_capacity(self.config.language.depth);
@@ -689,7 +676,7 @@ pub(in crate::pi05) mod backbone {
                 .zip(&self.scales.language_layers)
                 .enumerate()
             {
-                let output = language_layer(
+                let output = language_layer_fp8_static(
                     self.ctx(),
                     self.config.language,
                     layer,
@@ -713,7 +700,7 @@ pub(in crate::pi05) mod backbone {
                     cache_rows,
                 )?);
             }
-            Ok(PrefixKvCache {
+            Ok(Fp8StaticPrefixKvCache {
                 keys,
                 values,
                 tokens: prefix.shape().dims()[0],
@@ -750,7 +737,7 @@ pub(in crate::pi05) mod backbone {
         fn style(
             &self,
             conditioning: &Tensor,
-            weights: &crate::pi05::Fp8LinearWeights,
+            weights: &crate::pi05::Fp8StaticLinearWeights,
         ) -> Result<Tensor> {
             let projected = gemm::fp8(
                 self.ctx(),
@@ -762,7 +749,7 @@ pub(in crate::pi05) mod backbone {
             style.reshape(vec![style.numel()])
         }
 
-        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Pi05StepStyles> {
+        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Fp8StaticStepStyles> {
             let conditioning = self.conditioning(time_embedding)?;
             let conditioning = quantization::quantize_f16_e4m3(
                 self.ctx(),
@@ -776,14 +763,17 @@ pub(in crate::pi05) mod backbone {
                 mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
             }
             let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
-            Ok(Pi05StepStyles {
+            Ok(Fp8StaticStepStyles {
                 attention,
                 mlp,
                 final_norm,
             })
         }
 
-        fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<Pi05StepStyles>> {
+        fn prepare_all_styles(
+            &self,
+            time_embeddings: &[Tensor],
+        ) -> Result<Vec<Fp8StaticStepStyles>> {
             if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
@@ -800,8 +790,8 @@ pub(in crate::pi05) mod backbone {
         fn denoise_step_with_styles(
             &self,
             state: &Tensor,
-            styles: &Pi05StepStyles,
-            prefix: &PrefixKvCache,
+            styles: &Fp8StaticStepStyles,
+            prefix: &Fp8StaticPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
@@ -834,7 +824,7 @@ pub(in crate::pi05) mod backbone {
                     } else {
                         (&styles.final_norm, self.scales.action_final_norm)
                     };
-                let output = action_layer(
+                let output = action_layer_fp8_static(
                     self.ctx(),
                     self.config.action_expert,
                     layer,
@@ -875,7 +865,7 @@ pub(in crate::pi05) mod backbone {
             &self,
             state: &Tensor,
             time_embedding: &Tensor,
-            prefix: &PrefixKvCache,
+            prefix: &Fp8StaticPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             let styles = self.prepare_step_styles(time_embedding)?;
@@ -883,7 +873,7 @@ pub(in crate::pi05) mod backbone {
         }
 
         fn encode_vision_fp8_patches(&self, patches: &Tensor) -> Result<Tensor> {
-            let mut hidden = vision_patch_embed_fp8(
+            let mut hidden = vision_patch_embed_fp8_static_native(
                 self.ctx(),
                 &self.weights.patch_embedding,
                 &self.weights.position_embedding,
@@ -897,7 +887,7 @@ pub(in crate::pi05) mod backbone {
                 .iter()
                 .zip(&self.scales.vision_layers)
             {
-                hidden = vision_layer(
+                hidden = vision_layer_fp8_static(
                     self.ctx(),
                     layer,
                     *scale,
@@ -931,9 +921,9 @@ pub(in crate::pi05) mod backbone {
         }
     }
 
-    impl super::super::Blocks for Fp8Blocks {
-        type Prefix = PrefixKvCache;
-        type Styles = Pi05StepStyles;
+    impl super::super::Blocks for Fp8StaticBlocks {
+        type Prefix = Fp8StaticPrefixKvCache;
+        type Styles = Fp8StaticStepStyles;
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -974,5 +964,40 @@ pub(in crate::pi05) mod backbone {
         ) -> Result<Tensor> {
             self.denoise_step_with_styles(state, styles, prefix, dt)
         }
+    }
+}
+
+impl crate::pi05::prepare::PrepareBlocks for backbone::Fp8StaticBlocks {
+    fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
+        &self.backend
+    }
+    fn workspace_requirements(
+        &self,
+        tokens: usize,
+    ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
+        Ok(crate::pi05::prepare::WorkspaceRequirements {
+            bytes: self.config.cuda_graph_workspace_bytes(tokens)?,
+            fp8_scratch: Some(self.config.fp8_emulation_scratch_elements(tokens)?),
+        })
+    }
+    fn raw_patch_dtype(&self) -> apxinf_core::DType {
+        apxinf_core::DType::F8E4M3
+    }
+    fn preprocess(
+        &self,
+        images: &crate::pi05::backend::DeviceBuffer,
+        patches: &Tensor,
+        layout: crate::pi05::Pi05ImageLayout,
+    ) -> Result<()> {
+        crate::pi05::backend::kernels::preprocess::rgb_u8_to_patches_e4m3(
+            self.backend.context(),
+            images,
+            patches,
+            self.config.num_views,
+            self.config.image_size,
+            self.config.patch_size,
+            layout,
+            self.scales.vision_patch_input,
+        )
     }
 }

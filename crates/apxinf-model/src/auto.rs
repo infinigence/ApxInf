@@ -41,6 +41,10 @@ pub struct LoadOptions {
     /// Registry name override. `None` detects the model from
     /// `config.json:model_type`.
     pub model_name: Option<String>,
+    /// Model-local compute implementation identifier. PI0.5 accepts
+    /// auto, bf16, fp8_static and int8_dynamic. Other families migrate separately.
+    pub compute_variant: Option<String>,
+    /// Legacy selection for model families not yet migrated to compute_variant.
     pub precision: ModelPrecision,
     /// Optional text-model weight dtype. `None` preserves checkpoint dtype
     /// (except CPU backends, which currently require f32).
@@ -263,6 +267,11 @@ impl AutoModel {
             }
         };
 
+        if options.compute_variant.is_some() && !matches!(model_name, "pi05" | "pi05-cuda") {
+            return Err(Error::Other(format!(
+                "model {model_name} does not yet support compute_variant"
+            )));
+        }
         register_builtin_models();
         let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]

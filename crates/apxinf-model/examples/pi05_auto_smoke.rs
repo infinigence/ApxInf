@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{standard_normal_f32, DType, Device, RngKey, Tensor};
 use apxinf_model::{
-    AutoModel, ExecutionMode, ExecutionPolicy, ImageLayout, LoadOptions, ModelPrecision,
-    Observation, Pi05Config, PreparationStatus, VisionObservation, VlaRequest,
+    AutoModel, ExecutionMode, ExecutionPolicy, ImageLayout, LoadOptions, Observation, Pi05Config,
+    PreparationStatus, VisionObservation, VlaRequest,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,12 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = LoadOptions {
         model_name: Some("pi05".to_owned()),
-        precision: match arguments.get(3).map(String::as_str).unwrap_or("bf16") {
-            "bf16" => ModelPrecision::Bf16,
-            "fp8" => ModelPrecision::Fp8,
-            "w8a8" => ModelPrecision::W8A8,
-            other => return Err(format!("unsupported precision {other}").into()),
-        },
+        compute_variant: Some(
+            arguments
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("bf16")
+                .parse::<apxinf_model::pi05::ComputeVariant>()?
+                .as_str()
+                .into(),
+        ),
         ..LoadOptions::default()
     };
     let model = AutoModel::load_model(Device::Cuda(0), &checkpoint, &options)?;

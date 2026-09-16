@@ -354,14 +354,14 @@ def test_real_model_layering(model_dir):
     apxinf_py = pytest.importorskip("apxinf_py")
     from apxinf import AutoPolicy
 
-    precision = os.environ.get("APXINF_PI05_PRECISION", "bf16")
+    compute_variant = os.environ.get("APXINF_PI05_COMPUTE_VARIANT", "bf16")
     try:
         # AutoPolicy reads config.json (type="pi05") and dispatches to Pi05Policy,
         # exercising the real registry path end to end.
         policy = AutoPolicy.from_pretrained(
             model_dir,
             device=os.environ.get("APXINF_PI05_DEVICE", "cuda:0"),
-            precision=precision,
+            compute_variant=compute_variant,
             action_dim=LIBERO_DIM,
             # make_obs() speaks the openpi wire; the fallback would be the
             # model's own view slots, which that observation does not carry.
