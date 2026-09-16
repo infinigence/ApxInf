@@ -98,6 +98,52 @@ fn emit_rerun_if_changed_tree(root: &std::path::Path) {
     }
 }
 
+/// The full argv of an nvcc invocation, in a form that changes whenever any
+/// flag, include path, define or architecture changes.
+fn describe_command(command: &std::process::Command) -> String {
+    let mut text = command.get_program().to_string_lossy().into_owned();
+    for argument in command.get_args() {
+        text.push('\u{1f}');
+        text.push_str(&argument.to_string_lossy());
+    }
+    text
+}
+
+/// True when `object` can be reused: it exists, the recorded command line is
+/// identical, a dependency list exists, and every file in that list is older
+/// than the object. Anything missing or unreadable means "rebuild" -- the
+/// cache never decides to skip on incomplete information.
+fn nvcc_object_is_current(object: &str, deps: &str, stamp: &str, cmdline: &str) -> bool {
+    let Ok(object_time) = std::fs::metadata(object).and_then(|m| m.modified()) else {
+        return false;
+    };
+    if std::fs::read_to_string(stamp).ok().as_deref() != Some(cmdline) {
+        return false;
+    }
+    let Ok(rule) = std::fs::read_to_string(deps) else {
+        return false;
+    };
+    // A make rule: "target: dep dep \\\n dep ...". Drop everything up to the
+    // first unescaped colon, then split on unescaped whitespace.
+    let Some((_, prerequisites)) = rule.split_once(':') else {
+        return false;
+    };
+    let mut any = false;
+    for prerequisite in prerequisites.split_whitespace() {
+        if prerequisite == "\\" {
+            continue;
+        }
+        any = true;
+        let Ok(time) = std::fs::metadata(prerequisite).and_then(|m| m.modified()) else {
+            return false;
+        };
+        if time > object_time {
+            return false;
+        }
+    }
+    any
+}
+
 fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
@@ -593,9 +639,28 @@ fn main() {
                             cmd.arg(format!("-I{}", include.display()));
                         }
                     }
+                    // Every rerun of this script used to re-run nvcc for all
+                    // ~25 translation units, which is about 40 minutes on this
+                    // board and is paid for editing one line of Rust. Make the
+                    // step incremental the way make is: nvcc writes a
+                    // dependency list next to the object, and the object is
+                    // reused when it is newer than every file in that list and
+                    // the command line that produced it is unchanged.
+                    let deps = format!("{out_dir}/{stem}.d");
+                    let stamp = format!("{out_dir}/{stem}.cmdline");
+                    let cmdline = describe_command(&cmd);
+                    if nvcc_object_is_current(&obj, &deps, &stamp, &cmdline) {
+                        continue;
+                    }
+                    cmd.arg("-MD").arg("-MF").arg(&deps);
                     let status = cmd.status().expect("failed to run nvcc");
 
                     assert!(status.success(), "nvcc failed for {}", entry.display());
+                    // Written only after nvcc succeeded, so an interrupted or
+                    // failed compile cannot leave a stamp that hides a stale
+                    // object from the next build.
+                    std::fs::write(&stamp, &cmdline)
+                        .unwrap_or_else(|error| panic!("write {stamp}: {error}"));
                 }
 
                 // Create a static library from all kernel objects
