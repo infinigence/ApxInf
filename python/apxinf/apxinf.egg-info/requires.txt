@@ -1,0 +1,14 @@
+numpy>=1.21
+Pillow>=9.0.0
+PyYAML>=6
+
+[policy]
+apxinf-py>=0.1.0
+
+[serving]
+msgpack>=1.0.5
+websockets>=14.0
+
+[test]
+pytest>=7
+sentencepiece>=0.1.99

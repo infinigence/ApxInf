@@ -2451,6 +2451,7 @@ pub fn mha_f16(
                 output.ptr(),
                 batches as i32,
                 tokens_per_batch as i32,
+                tokens_per_batch as i32,
                 shape[1] as i32,
                 shape[1] as i32,
                 shape[2] as i32,
@@ -2458,7 +2459,7 @@ pub fn mha_f16(
             );
             if status == 0 {
                 return Ok(make_gpu_tensor(
-                    Shape::new(vec![tokens, heads, head_dim]),
+                    q.shape().clone(),
                     DType::F16,
                     ctx.device_id(),
                     output,
