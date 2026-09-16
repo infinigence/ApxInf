@@ -1,10 +1,11 @@
 # Baseline protocol and qualification record
 
-Status: slice C PI0.5 qualification is complete. The extended Stage 2 slice D
-removes runtime adapters and reorganizes assets; its fresh native qualification
-is in progress. Historical measurements below retain their original source IDs.
+Status: slice D PI0.5 implementation, functional/numerical qualification and
+Orin performance qualification are complete. Thor performance remains unqualified
+because concurrent GPU work prevents a reliable comparison. Historical
+measurements below retain their original source IDs.
 The selected-main inventory and historical slices are retained below; the final
-PI0.5 qualification section is the current candidate record. Generated logs, manifests, hashes and probes live in the active worktree's
+slice D section records the current candidate separately from slice C. Generated logs, manifests, hashes and probes live in the active worktree's
 ignored `devlocal/model-lifecycle-refactor/` directory.
 
 ## Revisions and scope
@@ -517,3 +518,137 @@ Raw samples, command manifests, output arrays and monitoring logs are under
 cell. Together with Thor's eight profiles, this closes the PI0.5 Stage 2 device
 matrix. Broader family migrations, closed-loop accuracy and deployment budgets
 remain outside this pilot's completion claim.
+
+
+## Stage 2 slice D: runtime removal and compute assets
+
+This extends the earlier slice C qualification to the consolidated PI0.5 tree.
+The native numerical, lifecycle, Python and performance candidate is `883e55c`;
+follow-up `e3ff0bf` restores the framework's `runtime-managed` fallback status
+label and makes a diagnostic Python import lazy. The status branch is not used
+by PI0.5 and changes no compute path. Final incremental native verification is
+recorded separately from the matrix source, rather than relabeling its binaries.
+
+### Functional and ownership evidence
+
+Both Thor SM110 and Orin SM87 passed native Network (2), Session (2), variant
+selection (1), capture cleanup (1), real-checkpoint lifecycle (1), and tuning
+guard (1) tests. Thor passed BF16/static-FP8/dynamic-INT8 public H50/T21 smokes;
+Orin passed BF16/dynamic-INT8. These cover actual eager/graph readiness, invalid
+request recovery, input/RGB and RNG rebinding, populated implicit-cache eviction,
+and continued execution of a separately retained plan.
+
+All seven Thor fixed fixtures have elementwise identical baseline/candidate and
+eager/graph outputs, with maximum absolute difference zero. They cover BF16
+H10/H50 × T10/T21, static FP8 H50 × T10/T21, and dynamic INT8 H10/T21. The
+baseline arrays retain their original pinned source and asset identities in
+`session-d/reports/numerical-increment.json`.
+
+The real native Python tokenizer/AutoPolicy suite passed **7 tests, 0 skipped**
+(36.96 seconds), including image processing, normalized action execution,
+unnormalization and calibration entry points. Local checks additionally passed
+95 model CPU tests, 2 benchmark argument tests, CUDA-feature typechecking,
+model-family boundary checks, 233 Python/tool tests (6 environment skips,
+5 subtests), an OpenPI client/server roundtrip, and seven tool help entry points.
+The local environment skips are not counted as native GPU coverage.
+
+### First preparation and plan retention
+
+Fresh processes compare baseline `c5268b7` with candidate `883e55c`, dropping the
+first Action before either dropping or retaining its plan, then preparing T21.
+
+| Scenario | First prepare baseline → candidate (ms) | Second prepare (ms) | Sampled process peak baseline → candidate (MiB) |
+| --- | --- | --- | --- |
+| Drop first plan | 737.6 → 237.1 | 649.3 → 204.8 | 15712 → 15693 |
+| Retain first plan | 227.3 → 221.6 | 217.0 → 192.7 | 19668 → 19700 |
+
+Outputs are exact in both comparisons. The first baseline process ran under a
+different system load and was much slower than the subsequent baseline process;
+these single observations do **not** establish a preparation speedup. Peaks use
+200 ms process sampling and may miss transients. Device-global free memory is
+also recorded, but includes other processes and is not an allocator peak. Explicit
+plan retention still intentionally retains its graph resources and fixed assets.
+
+Raw evidence lives under
+`devlocal/model-lifecycle-refactor/thor-baseline/session-d/`, including
+`extra/resource-summary.json`, `extra/python-tests.xml`, and per-device native
+summaries. All sixteen performance configurations have now run; the Thor timing
+limitation below keeps the overall slice D performance gate open.
+
+### Slice D Orin performance
+
+Eight H10 profiles use 10 flow steps, 10 warmups and 30 samples per boundary.
+Baseline is `c5268b7` plus the identical existing INT8 alignment correction from
+`7aece37`; candidate is `883e55c`. All profiles have exact baseline/candidate and
+eager/graph outputs and equal workspace capacity/used bytes.
+
+| Variant | Views | T | Baseline graph P50 (ms) | Candidate graph P50 (ms) | Graph delta | Input + graph delta |
+| --- | --- | --- | --- | --- | --- | --- |
+| bf16 | 2 | 10 | 162.912 | 163.069 | +0.10% | +0.13% |
+| bf16 | 2 | 21 | 163.295 | 163.372 | +0.05% | +0.10% |
+| bf16 | 3 | 10 | 209.206 | 205.045 | -1.99% | -1.59% |
+| bf16 | 3 | 21 | 207.539 | 204.329 | -1.55% | -1.77% |
+| int8_dynamic | 2 | 10 | 122.336 | 122.225 | -0.09% | -0.05% |
+| int8_dynamic | 2 | 21 | 122.634 | 122.614 | -0.02% | -0.09% |
+| int8_dynamic | 3 | 10 | 161.482 | 161.243 | -0.15% | -0.14% |
+| int8_dynamic | 3 | 21 | 162.389 | 161.738 | -0.40% | -0.42% |
+
+The initial dynamic-INT8 three-view/T10 pair measured 161.59 → 356.17 ms
+(+120.42%) during a substantially different memory/load state. That original
+sample is retained. After observed GPU activity returned to zero and RAM usage
+fell, one independent paired rerun measured 161.482 → 161.243 ms; the table
+uses this rerun for that cell and the original runs for the other seven cells.
+`orin/reports/final-performance-summary.json` identifies the selected results.
+The rerun was motivated by the observed load change; global monitoring alone
+does not prove the exact cause of the original anomaly. Both runs remain auditable.
+
+Graph P50 changes span -1.989% to +0.097%, P95 -2.462% to +0.053%; maximum
+input-plus-graph increases are +0.125% P50 and +0.113% P95. This run shows no
+material regression on Orin; it is not a deployment SLO or a claimed speedup.
+Three-view fixtures are synthetic base/wrist/wrist, not a three-camera accuracy
+qualification. Final `e3ff0bf` incremental native linking and both Session tests
+also passed on Orin, separately from the matrix candidate.
+
+### Slice D Thor performance: gate remains open
+
+Eight fresh paired profiles completed, with BF16/static-FP8 × views2/3 ×
+T10/T21, H10, 10 flow steps, 10 warmups and 30 samples per boundary. Baseline
+is unchanged `c5268b7`; candidate is `883e55c`. All sixteen processes exited
+successfully. Complete eager/graph and baseline/candidate outputs are exact in
+every cell; workspace capacity and used bytes are equal.
+
+| Variant | Views | T | Baseline graph P50 (ms) | Candidate graph P50 (ms) | Graph delta | Input + graph delta |
+| --- | --- | --- | --- | --- | --- | --- |
+| bf16 | 2 | 10 | 118.593 | 94.187 | -20.58% | -30.35% |
+| bf16 | 2 | 21 | 81.969 | 113.350 | +38.28% | +22.20% |
+| bf16 | 3 | 10 | 116.059 | 124.266 | +7.07% | +0.29% |
+| bf16 | 3 | 21 | 116.230 | 96.980 | -16.56% | -12.06% |
+| fp8_static | 2 | 10 | 53.555 | 57.355 | +7.09% | +3.69% |
+| fp8_static | 2 | 21 | 54.102 | 54.643 | +1.00% | +0.47% |
+| fp8_static | 3 | 10 | 71.427 | 67.881 | -4.97% | +0.70% |
+| fp8_static | 3 | 21 | 72.828 | 73.440 | +0.84% | -1.37% |
+
+An external `ray::ApxInfRolloutWorker.evaluate` process appeared during this
+matrix and remained alongside the existing resident services. Per-process memory
+and device utilization/temperature/power records are retained for every run.
+Available monitoring cannot establish equivalent per-process SM contention
+between the baseline and candidate. Graph P50 changes of -20.58% to +38.28%
+therefore do not support either a speedup claim or a no-regression conclusion.
+The performance gate remains **open**, despite the exact numerical results.
+No other service was stopped, and no samples were repeatedly rerun to obtain a
+passing value. Resume Thor performance qualification in a comparable load window.
+Raw runs and the complete table are in `session-d/performance/`.
+
+Both devices reused the existing native operator archives: Thor 23 objects and
+Orin 15 objects, with **zero CUDA translation units compiled in slice D**.
+Missing objects were configured to fail the private build instead of compiling.
+The archive identities remain those recorded above for slice C. The scope is
+PI0.5 architecture and execution equivalence; no closed-loop 500-episode campaign,
+WallOSS/GR00T migration, or absolute performance/memory SLO is claimed.
+
+Final `e3ff0bf` native linkage and both Session tests also passed on Thor.
+`session-d/reports/final-summary.json` records the separate source identities
+and per-device gate status. All task workers/monitors finished, with no paused
+compiler left behind; external services were untouched. Implementation and
+functional qualification are complete, while the Thor performance gate remains
+blocked by the observed concurrent workload.

@@ -1,8 +1,10 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
 Status: Stage 2 has been extended to finish PI0.5 runtime removal, fixed-asset
-organization and compute_variant naming. Slice C remains qualified; the new
-slice D candidate is undergoing fresh native qualification. Later model stages remain open.
+organization and compute_variant naming. Slice D implementation and functional
+qualification are complete, including Orin performance. Thor performance remains
+open because concurrent GPU work prevents a reliable comparison. Later model
+stages remain open.
 Architecture and interface decisions live in [architecture.md](architecture.md)
 and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
@@ -173,23 +175,26 @@ callers and diagnostic examples use the new interfaces. The architecture documen
 contains the full directory tree and migration table.
 
 Local model CPU suite: 95 passed; benchmark argument tests: 2 passed. CUDA-feature
-examples/tests typecheck and family-boundary checks passed. Python: 182 passed,
-6 environment skips and 5 subtests. Native candidate qualification is in progress;
-previous slice C hardware results below are retained as historical evidence and
-must not be relabeled as testing the new candidate.
+examples/tests typecheck and family-boundary checks passed. Python and calibration/evaluation tools: 233 passed,
+6 environment skips and 5 subtests; local OpenPI roundtrip: 1 passed. Thor native
+tokenizer/AutoPolicy: 7 passed, 0 skipped. Both devices passed native lifecycle
+tests and public smokes. Orin completed eight performance profiles; its one
+load-contaminated cell was independently rerun after the load subsided. Thor
+performance is not qualified under concurrent GPU work. See the slice D section
+of baseline.md for current evidence; slice C results retain their original source IDs.
 
-### Stage 2 exit checklist (slice C evidence; D rerun pending)
+### Stage 2 exit checklist (slice D)
 
 | Requirement | Current result |
 | --- | --- |
-| All three precision computations separated from capture/cache | Implemented in shared Network and precision Blocks |
+| All three compute variants separated from capture/cache | One Network, variant Blocks, shared prepare/CapturedGraph; no runtime adapters |
 | Explicit preparation policy and actual readiness | Implemented; final three-precision Thor public smoke passed |
-| No hidden capture/autotune in compatible prepared run | Native suppression and store invalidation tests passed |
+| No hidden capture/autotune in compatible prepared run | Native suppression and store invalidation tests passed on both hosts; final e3ff0bf native link and Session tests passed on both |
 | Request input/RNG rebinding versus plan eviction | Passed final native retained-plan/cache and RNG checks |
 | Native failure cleanup and invalidation lifecycle coverage | Passed, including recovery through actual model execution |
 | Processor/action decoding context | Python regression suite and real-checkpoint AutoPolicy layering/tokenizer tests passed without native-test skips |
-| Exact-input and latency/resource comparison | All seven Thor exact-input comparisons and sixteen Thor/Orin performance profiles passed; workspace unchanged; first-prepare and resource-retention comparison recorded |
-| Orin | BF16/W8A8 H50 public smoke and complete eight-profile matrix passed; native alignment regression fixed and tested on both devices |
+| Exact-input and latency/resource comparison | Seven Thor exact-input fixtures passed; resource retention recorded. Orin eight-profile performance qualified; Thor performance gate remains open under concurrent GPU load |
+| Orin | BF16/dynamic-INT8 H50 public smoke and eight-profile matrix passed; final e3ff0bf native link and Session tests passed |
 
 The user selected Thor as the primary Stage 2 acceptance target and Orin as the
 last supplementary target. Report same-profile baseline latency and resource
@@ -341,7 +346,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Slice D implemented: no runtime adapters, shared prepare, organized weights and compute_variant | Slice C qualified; fresh D hardware results pending | Current tree, breaking interfaces and contracts recorded |
+| PI0.5 | Slice D implemented: no runtime adapters, shared prepare, organized weights and compute_variant | D functionality and Orin performance qualified; Thor performance blocked by concurrent GPU load | Current tree, breaking interfaces and contracts recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |
