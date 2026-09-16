@@ -1,38 +1,38 @@
-//! Dynamic-activation INT8 π0.5 transformer-layer execution.
+//! Native-BF16 π0.5 transformer-layer execution.
 
 use crate::pi05::backend::{kernels, Context};
-use apxinf_core::{Result, Tensor};
-use kernels::{activation, attention, embedding, fused, norm, rope};
+use apxinf_core::{Error, Result, Tensor};
+use kernels::{activation, attention, embedding, fused, gemm, norm, rope};
 
 use crate::pi05::{
-    GemmaVariantConfig, Int8DynamicDeviceActionLayer, Int8DynamicDeviceLanguageLayer,
-    Int8DynamicDeviceVisionBlock, Int8DynamicLinearWeights,
+    Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Bf16LinearWeights,
+    GemmaVariantConfig,
 };
 
-pub struct Int8DynamicLanguageLayerOutput {
+pub struct Bf16LanguageLayerOutput {
     pub hidden: Tensor,
     pub key: Tensor,
     pub value: Tensor,
 }
 
-pub struct Int8DynamicActionLayerOutput {
+pub struct Bf16ActionLayerOutput {
     pub hidden: Tensor,
     pub next_normalized: Tensor,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn language_layer_int8_dynamic(
+pub fn language_layer_bf16(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &Int8DynamicDeviceLanguageLayer,
+    weights: &Bf16DeviceLanguageLayer,
     input: &Tensor,
     compute_tail: bool,
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<Int8DynamicLanguageLayerOutput> {
+) -> Result<Bf16LanguageLayerOutput> {
     let normalized = norm::rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
-    let qkv = weights.qkv.gemm(ctx, &normalized)?;
+    let qkv = gemm::bf16(ctx, &normalized, &weights.qkv.weight)?;
     let qkv = rope::split_qkv_apply_bf16(
         ctx,
         &qkv,
@@ -45,7 +45,7 @@ pub fn language_layer_int8_dynamic(
     )?;
     let tokens = input.shape().dims()[0];
     if !compute_tail {
-        return Ok(Int8DynamicLanguageLayerOutput {
+        return Ok(Bf16LanguageLayerOutput {
             hidden: input.clone(),
             key: qkv.key_2d(tokens, config.head_dim)?,
             value: qkv.value_2d(tokens, config.head_dim)?,
@@ -53,7 +53,7 @@ pub fn language_layer_int8_dynamic(
     }
     let attention = attention::mqa_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
-    let projected = weights.output.gemm(ctx, &attention)?;
+    let projected = gemm::bf16(ctx, &attention, &weights.output.weight)?;
     let fused = fused::bias_residual_rms_bf16(
         ctx,
         &projected,
@@ -62,12 +62,18 @@ pub fn language_layer_int8_dynamic(
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let gate_up = weights.gate_up.gemm(ctx, &fused.normalized)?;
-    let activated = activation::geglu_bf16(ctx, &gate_up)?;
-    let projected = weights.down.gemm(ctx, &activated)?;
+    let activated = gemm::bf16_geglu_fused(
+        ctx,
+        &fused.normalized,
+        &weights.gate_up.weight,
+        weights.gate_up.bf16_dual_geglu_interleaved,
+        weights.gate_up.bf16_dual_geglu_auto_interleaved.as_ref(),
+        weights.gate_up.bf16_sm89_geglu_interleaved.as_ref(),
+    )?;
+    let projected = gemm::bf16(ctx, &activated, &weights.down.weight)?;
     let hidden =
         fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
-    Ok(Int8DynamicLanguageLayerOutput {
+    Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
         value: qkv.value_2d(tokens, config.head_dim)?,
@@ -75,10 +81,10 @@ pub fn language_layer_int8_dynamic(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn action_layer_int8_dynamic(
+pub fn action_layer_bf16(
     ctx: &Context,
     config: GemmaVariantConfig,
-    weights: &Int8DynamicDeviceActionLayer,
+    weights: &Bf16DeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
     attention_style: &Tensor,
@@ -89,12 +95,12 @@ pub fn action_layer_int8_dynamic(
     position_offset: usize,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<Int8DynamicActionLayerOutput> {
+) -> Result<Bf16ActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
         None => norm::adaptive_rms_bf16(ctx, input, attention_style, rms_eps)?,
     };
-    let qkv = weights.qkv.gemm(ctx, &normalized)?;
+    let qkv = gemm::bf16(ctx, &normalized, &weights.qkv.weight)?;
     let q = rope::apply_q_write_kv_bf16(
         ctx,
         &qkv,
@@ -119,7 +125,7 @@ pub fn action_layer_int8_dynamic(
         input.shape().dims()[0],
         config.num_heads * config.head_dim,
     ])?;
-    let projected = weights.output.gemm(ctx, &attention)?;
+    let projected = gemm::bf16(ctx, &attention, &weights.output.weight)?;
     let fused = fused::adaptive_gate_residual_rms_bf16(
         ctx,
         &projected,
@@ -128,9 +134,15 @@ pub fn action_layer_int8_dynamic(
         mlp_style,
         rms_eps,
     )?;
-    let gate_up = weights.gate_up.gemm(ctx, &fused.normalized)?;
-    let activated = activation::geglu_bf16(ctx, &gate_up)?;
-    let projected = weights.down.gemm(ctx, &activated)?;
+    let activated = gemm::bf16_geglu_fused(
+        ctx,
+        &fused.normalized,
+        &weights.gate_up.weight,
+        weights.gate_up.bf16_dual_geglu_interleaved,
+        weights.gate_up.bf16_dual_geglu_auto_interleaved.as_ref(),
+        weights.gate_up.bf16_sm89_geglu_interleaved.as_ref(),
+    )?;
+    let projected = gemm::bf16(ctx, &activated, &weights.down.weight)?;
     let fused = fused::adaptive_gate_residual_rms_bf16(
         ctx,
         &projected,
@@ -139,20 +151,20 @@ pub fn action_layer_int8_dynamic(
         next_norm_style,
         rms_eps,
     )?;
-    Ok(Int8DynamicActionLayerOutput {
+    Ok(Bf16ActionLayerOutput {
         hidden: fused.hidden,
         next_normalized: fused.normalized,
     })
 }
 
-pub fn vision_patch_embed_int8_dynamic(
+pub fn vision_patch_embed_bf16(
     ctx: &Context,
-    weights: &Int8DynamicLinearWeights,
+    weights: &Bf16LinearWeights,
     position_embedding: &Tensor,
     patches: &Tensor,
     patches_per_view: usize,
 ) -> Result<Tensor> {
-    let projection = weights.gemm(ctx, patches)?;
+    let projection = gemm::bf16(ctx, patches, &weights.weight)?;
     embedding::add_position_bf16(
         ctx,
         &projection,
@@ -163,9 +175,9 @@ pub fn vision_patch_embed_int8_dynamic(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn vision_layer_int8_dynamic(
+pub fn vision_layer_bf16(
     ctx: &Context,
-    weights: &Int8DynamicDeviceVisionBlock,
+    weights: &Bf16DeviceVisionBlock,
     input: &Tensor,
     patches_per_view: usize,
     heads: usize,
@@ -179,12 +191,12 @@ pub fn vision_layer_int8_dynamic(
         &weights.norm1.bias,
         layer_norm_eps,
     )?;
-    let qkv = weights.qkv.gemm(ctx, &normalized)?;
+    let qkv = gemm::bf16(ctx, &normalized, &weights.qkv.weight)?;
     let qkv =
         attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
     let attention = attention::mha_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
-    let projection = weights.output.gemm(ctx, &attention)?;
+    let projection = gemm::bf16(ctx, &attention, &weights.output.weight)?;
     let fused = fused::bias_residual_layer_bf16(
         ctx,
         &projection,
@@ -194,9 +206,9 @@ pub fn vision_layer_int8_dynamic(
         &weights.norm2.bias,
         layer_norm_eps,
     )?;
-    let activation = weights.fc1.gemm(ctx, &fused.normalized)?;
+    let activation = gemm::bf16(ctx, &fused.normalized, &weights.fc1.weight)?;
     let activation = activation::bias_gelu_bf16(ctx, &activation, weights.fc1.bias.as_ref())?;
-    let projection = weights.fc2.gemm(ctx, &activation)?;
+    let projection = gemm::bf16(ctx, &activation, &weights.fc2.weight)?;
     fused::bias_residual_bf16(ctx, &projection, weights.fc2.bias.as_ref(), &fused.hidden)
 }
 
@@ -216,33 +228,35 @@ impl QkvViews for rope::QkvTensors {
 }
 
 // Precision-specific backbone operations share this file with their layers.
-pub(in crate::pi05) mod backbone {
+pub(in crate::pi05::network) mod backbone {
     use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-    use crate::pi05::*;
+    use super::*;
+    use crate::pi05::weights::*;
+    use crate::pi05::Pi05Config;
     use apxinf_core::{DType, Error, Result, Tensor};
-    use kernels::{activation, cache, elementwise, embedding, norm};
+    use kernels::{activation, cache, elementwise, embedding, gemm, norm};
     use std::sync::Arc;
-    pub struct Int8DynamicPrefixKvCache {
+    pub struct Bf16PrefixKvCache {
         pub keys: Vec<Tensor>,
         pub values: Vec<Tensor>,
         pub tokens: usize,
     }
 
-    pub struct Int8DynamicStepStyles {
+    pub struct Bf16StepStyles {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
-    pub struct Int8DynamicBlocks {
-        pub(in crate::pi05) backend: Arc<RuntimeBackend>,
-        pub(in crate::pi05) config: Arc<Pi05Config>,
-        pub(in crate::pi05) weights: Arc<Int8DynamicWeights>,
+    pub struct Bf16Blocks {
+        pub(in crate::pi05::network) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05::network) config: Arc<Pi05Config>,
+        pub(in crate::pi05::network) weights: Arc<Bf16Weights>,
     }
-    impl Int8DynamicBlocks {
+    impl Bf16Blocks {
         pub fn new(
             backend: Arc<RuntimeBackend>,
             config: Arc<Pi05Config>,
-            weights: Arc<Int8DynamicWeights>,
+            weights: Arc<Bf16Weights>,
         ) -> Result<Self> {
             config.validate()?;
             if weights.vision_layers.len() != config.vision_depth
@@ -250,7 +264,7 @@ pub(in crate::pi05) mod backbone {
                 || weights.action_layers.len() != config.action_expert.depth
             {
                 return Err(Error::Other(
-                    "π0.5 INT8 device weight depth mismatch".into(),
+                    "π0.5 BF16 device weight depth mismatch".into(),
                 ));
             }
             Ok(Self {
@@ -271,7 +285,7 @@ pub(in crate::pi05) mod backbone {
                     got: patches.dtype(),
                 });
             }
-            let mut hidden = vision_patch_embed_int8_dynamic(
+            let mut hidden = vision_patch_embed_bf16(
                 self.ctx(),
                 &self.weights.patch_embedding,
                 &self.weights.position_embedding,
@@ -279,7 +293,7 @@ pub(in crate::pi05) mod backbone {
                 self.config.patches_per_view(),
             )?;
             for layer in &self.weights.vision_layers {
-                hidden = vision_layer_int8_dynamic(
+                hidden = vision_layer_bf16(
                     self.ctx(),
                     layer,
                     &hidden,
@@ -296,10 +310,11 @@ pub(in crate::pi05) mod backbone {
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
             )?;
-            let projected = self
-                .weights
-                .multimodal_projector
-                .gemm(self.ctx(), &hidden)?;
+            let projected = gemm::bf16(
+                self.ctx(),
+                &hidden,
+                &self.weights.multimodal_projector.weight,
+            )?;
             elementwise::bias_bf16(
                 self.ctx(),
                 &projected,
@@ -328,12 +343,12 @@ pub(in crate::pi05) mod backbone {
             elementwise::concat_rows_bf16(self.ctx(), vision_tokens, &language)
         }
 
-        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Int8DynamicPrefixKvCache> {
+        pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Bf16PrefixKvCache> {
             let mut hidden = prefix.clone();
             let mut keys = Vec::with_capacity(self.config.language.depth);
             let mut values = Vec::with_capacity(self.config.language.depth);
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                let output = language_layer_int8_dynamic(
+                let output = language_layer_bf16(
                     self.ctx(),
                     self.config.language,
                     layer,
@@ -356,7 +371,7 @@ pub(in crate::pi05) mod backbone {
                     cache_rows,
                 )?);
             }
-            Ok(Int8DynamicPrefixKvCache {
+            Ok(Bf16PrefixKvCache {
                 keys,
                 values,
                 tokens: prefix.shape().dims()[0],
@@ -364,27 +379,23 @@ pub(in crate::pi05) mod backbone {
         }
 
         fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
-            let hidden = self.weights.time_mlp_in.gemm(self.ctx(), time_embedding)?;
+            let hidden = gemm::bf16(self.ctx(), time_embedding, &self.weights.time_mlp_in.weight)?;
             let hidden = activation::bias_silu_bf16(
                 self.ctx(),
                 &hidden,
                 self.weights.time_mlp_in.bias.as_ref(),
             )?;
-            let output = self.weights.time_mlp_out.gemm(self.ctx(), &hidden)?;
+            let output = gemm::bf16(self.ctx(), &hidden, &self.weights.time_mlp_out.weight)?;
             activation::bias_silu_bf16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
         }
 
-        fn style(
-            &self,
-            conditioning: &Tensor,
-            weights: &Int8DynamicLinearWeights,
-        ) -> Result<Tensor> {
-            let projected = weights.gemm(self.ctx(), conditioning)?;
+        fn style(&self, conditioning: &Tensor, weights: &Bf16LinearWeights) -> Result<Tensor> {
+            let projected = gemm::bf16(self.ctx(), conditioning, &weights.weight)?;
             let style = elementwise::bias_bf16(self.ctx(), &projected, weights.bias.as_ref())?;
             style.reshape(vec![style.numel()])
         }
 
-        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Int8DynamicStepStyles> {
+        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Bf16StepStyles> {
             let conditioning = self.conditioning(time_embedding)?;
             let mut attention = Vec::with_capacity(self.config.action_expert.depth);
             let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
@@ -393,17 +404,17 @@ pub(in crate::pi05) mod backbone {
                 mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
             }
             let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
-            Ok(Int8DynamicStepStyles {
+            Ok(Bf16StepStyles {
                 attention,
                 mlp,
                 final_norm,
             })
         }
 
-        fn prepare_all_styles(
+        pub(super) fn prepare_all_styles(
             &self,
             time_embeddings: &[Tensor],
-        ) -> Result<Vec<Int8DynamicStepStyles>> {
+        ) -> Result<Vec<Bf16StepStyles>> {
             if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
@@ -420,8 +431,8 @@ pub(in crate::pi05) mod backbone {
         fn denoise_step_with_styles(
             &self,
             state: &Tensor,
-            styles: &Int8DynamicStepStyles,
-            prefix: &Int8DynamicPrefixKvCache,
+            styles: &Bf16StepStyles,
+            prefix: &Bf16PrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
@@ -429,9 +440,9 @@ pub(in crate::pi05) mod backbone {
                 || styles.attention.len() != self.config.action_expert.depth
                 || styles.mlp.len() != self.config.action_expert.depth
             {
-                return Err(Error::Other("π0.5 INT8 prefix/style depth mismatch".into()));
+                return Err(Error::Other("π0.5 BF16 prefix/style depth mismatch".into()));
             }
-            let hidden = self.weights.action_in.gemm(self.ctx(), state)?;
+            let hidden = gemm::bf16(self.ctx(), state, &self.weights.action_in.weight)?;
             let mut hidden =
                 elementwise::bias_bf16(self.ctx(), &hidden, self.weights.action_in.bias.as_ref())?;
             let mut attention_normalized = None;
@@ -442,7 +453,7 @@ pub(in crate::pi05) mod backbone {
                 } else {
                     &styles.final_norm
                 };
-                let output = action_layer_int8_dynamic(
+                let output = action_layer_bf16(
                     self.ctx(),
                     self.config.action_expert,
                     layer,
@@ -463,7 +474,7 @@ pub(in crate::pi05) mod backbone {
             let hidden = attention_normalized.ok_or_else(|| {
                 Error::Other("π0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = self.weights.action_out.gemm(self.ctx(), &hidden)?;
+            let velocity = gemm::bf16(self.ctx(), &hidden, &self.weights.action_out.weight)?;
             let velocity = elementwise::bias_bf16(
                 self.ctx(),
                 &velocity,
@@ -476,7 +487,7 @@ pub(in crate::pi05) mod backbone {
             &self,
             state: &Tensor,
             time_embedding: &Tensor,
-            prefix: &Int8DynamicPrefixKvCache,
+            prefix: &Bf16PrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             let styles = self.prepare_step_styles(time_embedding)?;
@@ -484,9 +495,9 @@ pub(in crate::pi05) mod backbone {
         }
     }
 
-    impl super::super::Blocks for Int8DynamicBlocks {
-        type Prefix = Int8DynamicPrefixKvCache;
-        type Styles = Int8DynamicStepStyles;
+    impl super::super::Blocks for Bf16Blocks {
+        type Prefix = Bf16PrefixKvCache;
+        type Styles = Bf16StepStyles;
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -527,18 +538,16 @@ pub(in crate::pi05) mod backbone {
     }
 }
 
-impl crate::pi05::prepare::PrepareBlocks for backbone::Int8DynamicBlocks {
+impl crate::pi05::network::PrepareBlocks for backbone::Bf16Blocks {
     fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
         &self.backend
     }
     fn workspace_requirements(
         &self,
         tokens: usize,
-    ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
-        Ok(crate::pi05::prepare::WorkspaceRequirements {
-            bytes: self
-                .config
-                .cuda_graph_workspace_bytes_int8_dynamic(tokens)?,
+    ) -> apxinf_core::Result<crate::pi05::network::WorkspaceRequirements> {
+        Ok(crate::pi05::network::WorkspaceRequirements {
+            bytes: self.graph_workspace_bytes(tokens)?,
             fp8_scratch: None,
         })
     }
@@ -560,5 +569,47 @@ impl crate::pi05::prepare::PrepareBlocks for backbone::Int8DynamicBlocks {
             self.config.patch_size,
             layout,
         )
+    }
+}
+impl backbone::Bf16Blocks {
+    fn graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let mut bytes = self.config.cuda_graph_workspace_bytes_bf16(token_count)?;
+        if self.backend.context().caps().arch_family == apxinf_cuda::CudaArchFamily::Sm80 {
+            bytes = bytes
+                .checked_add(self.splitkv_workspace_bytes(token_count)?)
+                .ok_or_else(|| Error::Other("pi05 BF16 split-KV workspace overflow".into()))?;
+        }
+        Ok(bytes)
+    }
+
+    fn splitkv_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+        let patches = self.config.num_views * self.config.patches_per_view();
+        let prefix = patches
+            .checked_add(token_count)
+            .ok_or_else(|| Error::Other("pi05 split-KV prefix length overflow".into()))?;
+        let horizon = self.config.action_horizon;
+        let action = self.config.action_expert;
+        if action.num_heads <= action.num_kv_heads || action.head_dim != 256 || horizon > 64 {
+            return Ok(0);
+        }
+        let key_tokens = prefix
+            .checked_add(horizon)
+            .ok_or_else(|| Error::Other("pi05 split-KV key length overflow".into()))?;
+        let max_splits = key_tokens.div_ceil(64).min(128);
+        let lse = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV LSE workspace overflow".into()))?;
+        let output = max_splits
+            .checked_mul(horizon)
+            .and_then(|value| value.checked_mul(action.num_heads))
+            .and_then(|value| value.checked_mul(action.head_dim))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Other("pi05 split-KV output workspace overflow".into()))?;
+        lse.checked_add(output)
+            .and_then(|value| value.checked_mul(self.config.action_expert.depth))
+            .and_then(|value| value.checked_mul(self.config.num_flow_steps))
+            .ok_or_else(|| Error::Other("pi05 split-KV workspace overflow".into()))
     }
 }

@@ -15,11 +15,12 @@ use crate::vla::{
     PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
 };
 
-use super::backend::{
+use super::prepare::CapturedGraph;
+use crate::pi05::backend::{
     transfers, tuning, DeviceBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
-use super::load::LoadedCompute;
-use super::{CapturedGraph, Pi05Config};
+use crate::pi05::network::LoadedCompute;
+use crate::pi05::Pi05Config;
 
 impl CapturedGraph {
     fn update(
@@ -264,10 +265,10 @@ impl Pi05PreparedInference {
 /// retains only the most recently used shape. Callers that need more than one
 /// simultaneously prepared shape can own those plans explicitly via `prepare`.
 pub struct Pi05Session {
-    pub(super) backend: Arc<RuntimeBackend>,
-    pub(super) config: Arc<Pi05Config>,
-    pub(super) compute: LoadedCompute,
-    pub(super) prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
+    backend: Arc<RuntimeBackend>,
+    config: Arc<Pi05Config>,
+    compute: LoadedCompute,
+    prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
 }
 
 // Keep policy selection testable without inducing a real GPU capture failure.
@@ -308,6 +309,19 @@ where
 }
 
 impl Pi05Session {
+    pub(in crate::pi05) fn new(
+        backend: Arc<RuntimeBackend>,
+        config: Arc<Pi05Config>,
+        compute: LoadedCompute,
+    ) -> Self {
+        Self {
+            backend,
+            config,
+            compute,
+            prepared: RefCell::new(None),
+        }
+    }
+
     fn allocate_prepared_buffers(&self, spec: &InferenceSpec) -> Result<PreparedBuffers> {
         spec.validate()?;
         if spec.token_count > self.config.max_token_len {
@@ -375,7 +389,7 @@ impl Pi05Session {
         policy: ExecutionPolicy,
     ) -> Result<Pi05PreparedInference> {
         self.build_prepared_using(spec, policy, |patches, tokens, noise| {
-            self.compute.capture(spec, patches, tokens, noise)
+            super::prepare::capture_loaded(&self.compute, spec, patches, tokens, noise)
         })
     }
 
@@ -557,7 +571,7 @@ impl VlaRuntime for Pi05Session {
     }
 
     fn calibration_plan(&self) -> Result<Vec<String>> {
-        Ok(super::Pi05CalibrationPlan::for_config(&self.config)
+        Ok(crate::pi05::Pi05CalibrationPlan::for_config(&self.config)
             .sites()
             .to_vec())
     }
@@ -647,8 +661,8 @@ fn normalize_tensor(
 
 #[cfg(test)]
 mod tests {
-    use super::super::load::load_session;
     use super::*;
+    use crate::pi05::load::load_session;
     use crate::LoadOptions;
     use std::path::Path;
 

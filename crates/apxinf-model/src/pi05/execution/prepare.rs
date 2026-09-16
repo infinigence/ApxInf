@@ -1,35 +1,21 @@
 //! Shared PI0.5 preparation and captured resource ownership.
-use super::backend::{kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use super::blocks::Blocks;
-use super::network::Pi05Network;
-use super::{Pi05Config, Pi05ImageLayout};
-use apxinf_core::{Backend, DType, Error, Graph, Result, Tensor};
+use crate::pi05::backend::{
+    kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend,
+};
+use crate::pi05::network::Pi05Network;
+use crate::pi05::network::{LoadedCompute, NetworkOperation, PrepareBlocks, WorkspaceRequirements};
+use crate::pi05::{Pi05Config, Pi05ImageLayout};
+use apxinf_core::{Backend, Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
-/// Resource requirements supplied by a compute implementation. Allocation,
-/// warmup, capture and lifetime remain centralized here.
-pub struct WorkspaceRequirements {
-    pub bytes: usize,
-    pub fp8_scratch: Option<(usize, usize)>,
-}
-impl WorkspaceRequirements {
-    fn allocate(&self, device: usize) -> Result<kernels::GraphWorkspace> {
-        match self.fp8_scratch {
-            Some((a, w)) => kernels::GraphWorkspace::new_fp8(self.bytes, a, w, device),
-            None => kernels::GraphWorkspace::new(self.bytes, device),
-        }
+fn allocate_workspace(
+    requirements: &WorkspaceRequirements,
+    device: usize,
+) -> Result<kernels::GraphWorkspace> {
+    match requirements.fp8_scratch {
+        Some((a, w)) => kernels::GraphWorkspace::new_fp8(requirements.bytes, a, w, device),
+        None => kernels::GraphWorkspace::new(requirements.bytes, device),
     }
-}
-pub trait PrepareBlocks: Blocks + 'static {
-    fn backend(&self) -> &Arc<RuntimeBackend>;
-    fn workspace_requirements(&self, tokens: usize) -> Result<WorkspaceRequirements>;
-    fn raw_patch_dtype(&self) -> DType;
-    fn preprocess(
-        &self,
-        images: &CudaBuffer,
-        patches: &Tensor,
-        layout: Pi05ImageLayout,
-    ) -> Result<()>;
 }
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
@@ -167,7 +153,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                     .infer_with_styles(patches, token_ids, token_count, noise, styles)
             }
             (Some(images), Some(layout)) => {
-                self.network.blocks.preprocess(images, patches, layout)?;
+                self.network.preprocess(images, patches, layout)?;
                 self.network.infer_with_native_styles(
                     patches,
                     token_ids,
@@ -201,11 +187,10 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         }
         let styles = self.network.prepare_all_styles(time_embeddings)?;
         backend.synchronize()?;
-        let workspace = self
-            .network
-            .blocks
-            .workspace_requirements(token_count)?
-            .allocate(self.ctx().device_id())?;
+        let workspace = allocate_workspace(
+            &self.network.workspace_requirements(token_count)?,
+            self.ctx().device_id(),
+        )?;
         let mut stable = false;
         for _ in 0..4 {
             let generation = self.ctx().tuning().generation();
@@ -302,7 +287,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
         let patches = backend.to_device(&Tensor::zeros(
             vec![patch_rows, patch_width],
-            self.network.blocks.raw_patch_dtype(),
+            self.network.raw_patch_dtype(),
         ))?;
         self.capture_infer_impl(
             patches,
@@ -330,8 +315,8 @@ pub(super) fn capture<B: PrepareBlocks>(
 ) -> Result<CapturedGraph> {
     let builder = CaptureBuilder {
         network,
-        backend: network.blocks.backend(),
-        config: network.blocks.config(),
+        backend: network.backend(),
+        config: network.config(),
     };
     match input {
         CaptureInput::Rgb(layout) => {
@@ -378,4 +363,46 @@ pub fn capture_rgb<B: PrepareBlocks>(
         noise,
         embeddings,
     )
+}
+
+pub(super) fn capture_loaded(
+    compute: &LoadedCompute,
+    spec: &crate::vla::InferenceSpec,
+    patches: &Tensor,
+    tokens: &CudaBuffer,
+    noise: &Tensor,
+) -> Result<CapturedGraph> {
+    struct CaptureOperation<'a> {
+        input: CaptureInput<'a>,
+        tokens: &'a CudaBuffer,
+        count: usize,
+        noise: &'a Tensor,
+    }
+    impl NetworkOperation for CaptureOperation<'_> {
+        type Output = CapturedGraph;
+        fn run<B: PrepareBlocks>(
+            self,
+            network: &Arc<Pi05Network<B>>,
+            embeddings: &[Tensor],
+        ) -> Result<Self::Output> {
+            capture(
+                network,
+                self.input,
+                self.tokens,
+                self.count,
+                self.noise,
+                embeddings,
+            )
+        }
+    }
+    let input = match spec.image_layout {
+        Some(layout) => CaptureInput::Rgb(super::session::kernel_image_layout(layout)),
+        None => CaptureInput::Patches(patches),
+    };
+    compute.with_network(CaptureOperation {
+        input,
+        tokens,
+        count: spec.token_count,
+        noise,
+    })
 }

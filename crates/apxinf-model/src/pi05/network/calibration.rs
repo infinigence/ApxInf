@@ -7,7 +7,7 @@ use std::sync::Arc;
 use apxinf_core::{Backend, Error, Result, Tensor};
 use apxinf_cuda::kernels::gemm::Bf16ActivationObserver;
 
-use super::{backend::RuntimeBackend, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
+use crate::pi05::{backend::RuntimeBackend, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
 
 pub struct Pi05CalibrationObserver {
     backend: Arc<RuntimeBackend>,
@@ -169,9 +169,9 @@ mod tests {
     }
 }
 
-use super::backend::DeviceBuffer as CudaBuffer;
 use super::blocks::Bf16Blocks;
-use super::network::Pi05Network;
+use super::Pi05Network;
+use crate::pi05::backend::DeviceBuffer as CudaBuffer;
 impl Pi05Network<Bf16Blocks> {
     /// Explicit diagnostic traversal of the same Network; no second model body.
     pub fn calibrate(
@@ -183,12 +183,12 @@ impl Pi05Network<Bf16Blocks> {
         embeddings: &[Tensor],
     ) -> Result<std::collections::BTreeMap<String, f32>> {
         use apxinf_core::Backend;
-        let observer = std::rc::Rc::new(super::Pi05CalibrationObserver::new(
+        let observer = std::rc::Rc::new(Pi05CalibrationObserver::new(
             self.blocks.backend.clone(),
             &self.blocks.config,
             &self.blocks.weights,
         )?);
-        let _guard = super::backend::kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard = crate::pi05::backend::kernels::gemm::install_bf16_observer(observer.clone())?;
         self.infer(patches, ids, count, noise, embeddings)?;
         self.blocks.backend.synchronize()?;
         observer.records()

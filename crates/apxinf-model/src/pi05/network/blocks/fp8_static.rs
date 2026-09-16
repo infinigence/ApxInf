@@ -582,9 +582,11 @@ mod tests {
 }
 
 // Precision-specific backbone operations share this file with their layers.
-pub(in crate::pi05) mod backbone {
+pub(in crate::pi05::network) mod backbone {
     use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-    use crate::pi05::*;
+    use super::*;
+    use crate::pi05::weights::*;
+    use crate::pi05::Pi05Config;
     use apxinf_core::{Error, Result, Tensor};
     use kernels::{activation, cache, elementwise, embedding, gemm, norm, quantization};
     use std::sync::Arc;
@@ -600,10 +602,10 @@ pub(in crate::pi05) mod backbone {
         final_norm: Tensor,
     }
     pub struct Fp8StaticBlocks {
-        pub(in crate::pi05) backend: Arc<RuntimeBackend>,
-        pub(in crate::pi05) config: Arc<Pi05Config>,
-        pub(in crate::pi05) weights: Arc<Fp8StaticWeights>,
-        pub(in crate::pi05) scales: Arc<Fp8StaticActivationScales>,
+        pub(in crate::pi05::network) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05::network) config: Arc<Pi05Config>,
+        pub(in crate::pi05::network) weights: Arc<Fp8StaticWeights>,
+        pub(in crate::pi05::network) scales: Arc<Fp8StaticActivationScales>,
         packed_vision_qkv: bool,
     }
     impl Fp8StaticBlocks {
@@ -967,15 +969,15 @@ pub(in crate::pi05) mod backbone {
     }
 }
 
-impl crate::pi05::prepare::PrepareBlocks for backbone::Fp8StaticBlocks {
+impl crate::pi05::network::PrepareBlocks for backbone::Fp8StaticBlocks {
     fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
         &self.backend
     }
     fn workspace_requirements(
         &self,
         tokens: usize,
-    ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
-        Ok(crate::pi05::prepare::WorkspaceRequirements {
+    ) -> apxinf_core::Result<crate::pi05::network::WorkspaceRequirements> {
+        Ok(crate::pi05::network::WorkspaceRequirements {
             bytes: self.config.cuda_graph_workspace_bytes_fp8_static(tokens)?,
             fp8_scratch: Some(self.config.fp8_emulation_scratch_elements(tokens)?),
         })

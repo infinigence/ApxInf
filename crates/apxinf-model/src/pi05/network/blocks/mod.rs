@@ -13,7 +13,7 @@ pub use fp8_static::backbone::Fp8StaticPrefixKvCache;
 pub(super) use int8_dynamic::backbone::Int8DynamicBlocks;
 pub use int8_dynamic::backbone::Int8DynamicPrefixKvCache;
 
-use super::{backend::DeviceBuffer, Pi05Config};
+use crate::pi05::{backend::DeviceBuffer, Pi05Config};
 use apxinf_core::{Result, Tensor};
 
 /// Internal, statically dispatched seam. The associated state types retain

@@ -3,11 +3,91 @@
 //! Session and prepare own execution policy, capture, workspaces and input binding.
 
 use super::backend::DeviceBuffer as CudaBuffer;
-use super::blocks::Blocks;
 use apxinf_core::{Error, Result, Tensor};
+use blocks::Blocks;
+
+mod blocks;
+mod calibration;
+mod compute;
+pub use calibration::Pi05CalibrationObserver;
+pub use compute::{
+    build_bf16_network, build_fp8_static_network, build_int8_dynamic_network,
+    upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
+    upload_time_embeddings_int8_dynamic,
+};
+pub(super) use compute::{LoadedCompute, NetworkOperation};
+
+use crate::pi05::backend::{DeviceBuffer, RuntimeBackend};
+use crate::pi05::Pi05ImageLayout;
+use apxinf_core::DType;
+use std::sync::Arc;
+/// Resource requirements supplied by a compute implementation. Execution owns
+/// allocation, warmup, capture and lifetime; this description allocates nothing.
+pub struct WorkspaceRequirements {
+    pub bytes: usize,
+    pub fp8_scratch: Option<(usize, usize)>,
+}
+pub trait PrepareBlocks: Blocks + 'static {
+    fn backend(&self) -> &Arc<RuntimeBackend>;
+    fn workspace_requirements(&self, tokens: usize) -> Result<WorkspaceRequirements>;
+    fn raw_patch_dtype(&self) -> DType;
+    fn preprocess(
+        &self,
+        images: &DeviceBuffer,
+        patches: &Tensor,
+        layout: Pi05ImageLayout,
+    ) -> Result<()>;
+}
+
+impl<B: PrepareBlocks> Pi05Network<B> {
+    pub(in crate::pi05) fn backend(&self) -> &Arc<RuntimeBackend> {
+        self.blocks.backend()
+    }
+    pub(in crate::pi05) fn config(&self) -> &crate::pi05::Pi05Config {
+        self.blocks.config()
+    }
+    pub(in crate::pi05) fn workspace_requirements(
+        &self,
+        tokens: usize,
+    ) -> Result<WorkspaceRequirements> {
+        self.blocks.workspace_requirements(tokens)
+    }
+}
+
+pub use blocks::bf16::{
+    action_layer_bf16, language_layer_bf16, vision_layer_bf16, vision_patch_embed_bf16,
+    Bf16ActionLayerOutput, Bf16LanguageLayerOutput,
+};
+pub use blocks::fp8_static::{
+    action_layer_fp8_static, language_layer_fp8_static, vision_layer_fp8_static,
+    vision_patch_embed_fp8_static, vision_patch_embed_fp8_static_native,
+    vision_qkv_packed_from_env, Fp8StaticActionLayerOutput, Fp8StaticLanguageLayerOutput,
+};
+pub use blocks::int8_dynamic::{
+    action_layer_int8_dynamic, language_layer_int8_dynamic, vision_layer_int8_dynamic,
+    vision_patch_embed_int8_dynamic, Int8DynamicActionLayerOutput, Int8DynamicLanguageLayerOutput,
+};
+pub use blocks::{Bf16PrefixKvCache, Fp8StaticPrefixKvCache, Int8DynamicPrefixKvCache};
+pub type Bf16Network = std::sync::Arc<Pi05Network<blocks::Bf16Blocks>>;
+pub type Fp8StaticNetwork = std::sync::Arc<Pi05Network<blocks::Fp8StaticBlocks>>;
+pub type Int8DynamicNetwork = std::sync::Arc<Pi05Network<blocks::Int8DynamicBlocks>>;
+
+impl<B: PrepareBlocks> Pi05Network<B> {
+    pub(in crate::pi05) fn preprocess(
+        &self,
+        images: &DeviceBuffer,
+        patches: &Tensor,
+        layout: Pi05ImageLayout,
+    ) -> Result<()> {
+        self.blocks.preprocess(images, patches, layout)
+    }
+    pub(in crate::pi05) fn raw_patch_dtype(&self) -> DType {
+        self.blocks.raw_patch_dtype()
+    }
+}
 
 pub struct Pi05Network<B: Blocks> {
-    pub(super) blocks: B,
+    blocks: B,
 }
 
 impl<B: Blocks> Pi05Network<B> {
