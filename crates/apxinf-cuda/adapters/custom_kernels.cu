@@ -1052,6 +1052,24 @@ extern "C" cudaError_t apxinf_static_gdn_tri_solve_f32(
 }
 
 
+// Compute-capability major of the current device, cached. The two GDN tile
+// widths below are not portable constants: each was swept on one board and the
+// optimum is not the same on the next one, so the default has to know which
+// board it is on.
+static int device_capability_major() {
+  static const int major = [] {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 8;
+    int value = 8;
+    if (cudaDeviceGetAttribute(&value, cudaDevAttrComputeCapabilityMajor, device) !=
+        cudaSuccess) {
+      return 8;
+    }
+    return value;
+  }();
+  return major;
+}
+
 // Tile width for the chunk-gemm kernel; APXINF_GDN_CHUNK_GEMM_TILE re-sweeps it.
 // Was 16 while the tiles were float and an SM held two blocks. With the tiles in
 // BF16 an SM holds four, occupancy goes 33% to 66%, and the optimum moves to 32:
@@ -1065,7 +1083,11 @@ static int chunk_gemm_tile() {
         return requested;
       }
     }
-    return 32;
+    // Orin (sm_87) swept to 16 with float tiles and to 32 once they were BF16.
+    // Thor (sm_110) swept to 4 either way: with float tiles 2.1706/2.1722 s of
+    // fixed cost at 4 against 2.1800/2.1834 at 16, and with BF16 tiles
+    // 1.5086 at 4 against 1.5290, 1.5324 and 1.5473 at 8, 16 and 32.
+    return device_capability_major() >= 10 ? 4 : 32;
   }();
   return tile;
 }
@@ -1131,12 +1153,18 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
 
 
 // Tile width for the chunk-state kernel, one instantiation per value.
-// Prefill seconds at the shipped shape, one binary, same session:
+// Orin (sm_87) prefill seconds at the shipped shape, one binary, one session:
 //   tile  1 -> 3.262   2 -> 3.261   4 -> 3.193   8 -> 2.830   16 -> 3.057
 // Reuse rises with the tile and so does register pressure, and 8 is where the
 // two cross: past it the block loses an SM slot and gives back more than the
 // saved shared reads were worth. Not a value worth guessing -- 16 looked like
 // the obvious choice and is 8% slower than 8.
+//
+// Thor (sm_110) crosses one step earlier. Fixed cost, same sweep:
+//   tile  1 -> 2.277   2 -> 2.253   4 -> 2.181   8 -> 2.246   16 -> 2.823
+// 4 is 2.9% better than Orin's 8, and 16 is now 26% worse rather than 8%.
+// Thor has 20 SMs against Orin's 16 and 228 KB of shared memory per SM against
+// 164 KB, so the occupancy step that decides this sits at a different tile.
 // APXINF_GDN_CHUNK_TILE overrides it for re-sweeps on other shapes.
 static int chunk_state_tile() {
   static const int tile = [] {
@@ -1147,7 +1175,7 @@ static int chunk_state_tile() {
         return requested;
       }
     }
-    return 8;
+    return device_capability_major() >= 10 ? 4 : 8;
   }();
   return tile;
 }
