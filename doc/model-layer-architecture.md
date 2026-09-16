@@ -218,10 +218,14 @@ suite.
 
 PI0.5 uses one statically dispatched Network with bf16/fp8_static/int8_dynamic
 Blocks. `load.rs` selects compute_variant and materializes fixed assets;
-`session.rs` owns request policy and plan validity; `prepare.rs` owns the shared
+`execution/session.rs` owns private request state and plan validity;
+`execution/prepare.rs` owns the shared
 warmup/capture path and graph resources. `weights/` groups checkpoint mapping,
 parallel device representations and fixed calibration data. Runtime compatibility
-files and aliases have been removed. Python Policy retains encode/decode context.
+files and aliases have been removed. Typed computation dispatch and BF16 calibration
+are private to network/. Preparation resource contracts also belong to network;
+execution owns allocation/capture and invokes calculation without a reverse
+network-to-execution dependency. Python Policy retains encode/decode context.
 See the [implemented component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
 [callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.

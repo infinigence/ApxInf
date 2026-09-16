@@ -652,3 +652,42 @@ and per-device gate status. All task workers/monitors finished, with no paused
 compiler left behind; external services were untouched. Implementation and
 functional qualification are complete, while the Thor performance gate remains
 blocked by the observed concurrent workload.
+
+## PI0.5 module encapsulation qualification (0f23048)
+
+This follow-up enforces execution/network/weights module ownership without changing
+packing, quantization, model mathematics or allocation algorithms. Candidate source
+is `0f230485cc89ae68b822cae7b993cfe1e07de47b`. The matrix and Python
+results above keep their original slice D source; they are not relabeled as tests
+of this follow-up.
+
+Local verification passed: 95 model CPU tests (216.50 seconds), two benchmark
+argument tests, CUDA-feature model/examples/tests typechecking, formatting checks
+for the edited module files, model-family and PI0.5 dependency guards. Positive and
+four negative guard probes verify forbidden module edges and direct Session field
+construction are rejected. Ninety-eight existing Block function bodies, including
+helpers/tests, are identical after normalizing the resource-contract module path;
+this is a static comparison, not a replacement for native execution.
+
+Both Thor and Orin linked all examples/tests using the existing 23/15 native
+operator objects, with zero CUDA translation units compiled. Each host passed two
+Network tests, two Session tests and the real-checkpoint preparation failure/tactic
+invalidation test; filters were checked for nonzero execution counts. Thor's BF16,
+static-FP8 and dynamic-INT8 public smokes passed, including retained explicit plans
+after cache eviction and RGB eager/graph equality. All seven fixed-input comparisons
+against the preserved c5268b7 baseline arrays passed with elementwise exact complete
+action outputs and exact eager/graph equality (maximum absolute difference zero).
+They cover BF16 H10/H50 × T10/T21, static FP8 H50 × T10/T21, and dynamic INT8
+H10/T21. Per-fixture baseline paths and identities are retained in numerical-summary.json.
+Both hosts finished with no task worker or paused compiler left behind; no monitor
+was started for this round. Final object/archive hashes match the initial cache;
+other services were untouched.
+
+No Python source or public binding interface changed, so the previous native Python
+record remains historical evidence rather than a claimed new run. The full sixteen
+performance profiles were not rerun for this module-only follow-up. Thor's earlier
+performance gate remains open; new functional success does not clear it.
+
+Private logs, commands, overlay/asset identities and output comparisons are under
+`devlocal/model-lifecycle-refactor/thor-baseline/session-f/`; local checks live in
+`devlocal/model-lifecycle-refactor/session-f/`.

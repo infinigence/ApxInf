@@ -166,7 +166,8 @@ and BF16 otherwise. Explicit choices retain existing kernel fallback behavior;
 this selection rule is not a declaration that all hardware/profile combinations
 are qualified. The resolved ID is logged. The loader creates matching Blocks and
 injects them into `Pi05Network::from_blocks`. Selection and typed dispatch are
-centralized in `load.rs`; Network and Session do not match the variant enum.
+split by lifetime: `load.rs` selects during loading, while `network/compute.rs`
+owns typed execution dispatch. Session and the model dataflow do not match variants.
 
 Each value selects a complete compute implementation, including numerical
 formats and preparation requirements. `fp8_static` means fixed calibration-based
@@ -306,7 +307,7 @@ classDiagram
         Fp8Static
         Int8Dynamic
         infer(inputs)
-        capture(inputs)
+        with_network(operation)
     }
     class Pi05Network {
         B blocks
@@ -428,45 +429,52 @@ language_layers、action_layers、norm、action_in/out 和 time_mlp_in/out。
 
 ```text
 pi05/
-  mod.rs                       public entry and registration
-  config.rs                    model shape and ComputeVariant names
-  load.rs                      asset loading, selection, typed compute dispatch
-  session.rs                   policy, prepared requests, validity and implicit cache
-  prepare.rs                   one warmup/capture path and CapturedGraph resource owner
-  network.rs                   one model schedule, independent of concrete variants
-  calibration.rs               BF16 observer and diagnostic Network traversal
-  backend.rs                   model-local CUDA/kernel imports
-  math.rs                      prompt/state/time mathematical helpers
-  blocks/
-    mod.rs                     semantic Blocks interface; Prefix and Styles types
-    bf16.rs                    BF16 backbone/layers and resource requirements
-    fp8_static.rs              static FP8 backbone/layers and resource requirements
-    int8_dynamic.rs            dynamic-activation INT8 backbone/layers and requirements
+  mod.rs                       public exports and registration
+  config.rs                    fixed model configuration and compute_variant
+  load.rs                      checkpoint loading and module assembly
+  backend.rs                   model-wide accelerator seam
+  math.rs                      CPU-capable model math helpers
+  execution/
+    mod.rs                     Session / plan / low-level capture exports
+    session.rs                 private state, input binding, cache and validity
+    prepare.rs                 allocation, warmup, capture and graph ownership
+  network/
+    mod.rs                     model dataflow and computation/resource interface
+    compute.rs                 construction, LoadedCompute and static dispatch
+    calibration.rs             private BF16 observer and diagnostic traversal
+    blocks/
+      mod.rs                   semantic Blocks contract
+      bf16.rs                  BF16 backbone and layers
+      fp8_static.rs            static FP8 backbone and layers
+      int8_dynamic.rs          dynamic-activation INT8 backbone and layers
   weights/
     mod.rs                     fixed-asset exports
-    host.rs                    checkpoint mapping and common logical weight tree
-    packing.rs                 shared host matrix packing
+    host.rs                    PI0.5 checkpoint mapping and logical weight tree
+    packing.rs                 shared model-local host matrix packing
     bf16.rs                    BF16 linear storage and device model tree
     fp8_static.rs              static FP8 linear storage and device model tree
     int8_dynamic.rs            INT8 linear storage and device model tree
-    fp8_static_calibration.rs  E4M3 representation, calibration profile and fixed scales
+    fp8_static_calibration.rs  calibration profile and fixed scales
 ```
 
-The tree has 20 Rust files (22 before slice D); the model root has nine files
-(previously eighteen). Each device-weight file groups its linear storage in
+The tree has 22 Rust files (20 before this module encapsulation); the model
+root has five files. The extra files are execution/mod.rs and network/compute.rs,
+which provide module ownership and loaded-computation dispatch rather than new
+per-layer abstractions. Each device-weight file groups its linear storage in
 an internal module and its aggregate model tree in the same file. Backbone/layer
 code also remains grouped per variant instead of expanding into many one-function
 files. Cross-model matrix/view reuse remains a later evidence-driven extraction;
 PI0.5's own weight organization is complete in this stage.
 
 Network owns the full model order and flow step count/dt. Blocks own backbone
-layer loops, fusion, physical layout and fixed weights. The Network source imports
-only the Blocks contract; BF16-only calibration traversal lives in calibration.rs.
-Rust statically specializes the Network for each implementation. `load.rs` wraps
+layer loops, fusion, physical layout and fixed weights. The model dataflow methods depend on the Blocks contract; the network module
+exports and compute adapter select concrete implementations. BF16-only calibration
+traversal lives privately in network/calibration.rs.
+Rust statically specializes the Network for each implementation. `network/compute.rs` wraps
 these types for the public Session; no per-layer virtual calls are introduced.
 
 Blocks report workspace requirements and perform their native input conversion.
-Session allocates request/noise buffers; `prepare.rs` allocates graph workspace
+Session allocates request/noise buffers; `execution/prepare.rs` allocates graph workspace
 and capture-specific resources, prepares fixed styles, warms up until tactics
 stabilize, captures with the shared CUDA scope, and returns a single CapturedGraph
 for every variant. Its erased fixed-resource owner retains the concrete Network
@@ -479,6 +487,50 @@ manage separate precision graph types. There is no replacement runtime facade.
 Low-level diagnostic callers construct a Network with `build_*_network`, call
 its computation methods, and explicitly use `capture_patches` or `capture_rgb`.
 Ordinary callers use AutoModel and prepare/run.
+
+### 三个 module 的 Interface 与依赖约束
+
+```mermaid
+flowchart TD
+    L[load：读取资产并组装] --> E[execution：Session 与执行计划]
+    L --> N[network：已加载计算实现]
+    L --> W[weights：固定资产]
+    E -->|计算与资源契约| N
+    N -->|使用对应资产| W
+```
+
+- `execution` 拥有策略、缓存、有效性、输入/noise buffer 和 graph 资源。
+  Session 字段私有；load 调用 `Pi05Session::new`，不能初始化或修改缓存字段。
+- `network` 拥有 LoadedCompute、时间嵌入、具体实现分派和 Blocks。计算顺序仍是
+  一份 `Pi05Network<B>`。Blocks 成员和实现模块私有，执行层不能直接访问。
+- `weights` 保留模型逻辑权重树和设备表示，不依赖 network 或 execution。
+  本轮不提取跨模型权重、不修改 packing、量化或设备内存算法。
+- `PrepareBlocks` 和 `WorkspaceRequirements` 归 network，描述所需资源，不执行分配。
+  execution 通过 Network 方法查询需求并分配，network 不认识执行策略或 CapturedGraph。
+- 录图分派由 execution 的 `CaptureOperation` 发起：调用
+  `LoadedCompute::with_network(operation)`，后者按具体实现调用泛型 `operation.run`。
+  `NetworkOperation` 只是 PI0.5 内部的静态分派 Interface，network 不导入 execution；
+  execution 不 match 具体 variant，也没有逐层动态派发。
+- `backend.rs` 留在根目录，因为 weights、network、execution 都使用它。
+  `math.rs` 保持 CPU 可用，不被 CUDA 专属 network 模块的 feature gate 隐藏。
+  BF16 校准遍历归 network 内部，以便不向 execution 暴露 Blocks/权重字段。
+
+普通用户仍通过 Policy/Model 使用 Session；已有低层构造、计算和 capture 导出
+供仓库诊断/benchmark 使用，不新增转发对象。目录层级服务职责封装，不要求每个文件
+都有独立公共类型。未使用全面 `pub(crate)` 放开字段来迁就移动。
+
+`scripts/check_model_family_boundaries.sh` 同时执行
+`check_pi05_module_boundaries.py`：检查 network 不依赖 execution/Session/执行策略，
+weights 不依赖 network/execution，execution 不依赖具体 Blocks 或 match
+LoadedCompute 变体，load 不直接构造 Session 字段。Rust 隐私检查进一步限制访问。
+该脚本检查显式依赖，不代替编译器或完整 Rust AST 分析。
+
+| 修改任务 | 所属 module | 验证入口 |
+| --- | --- | --- |
+| 缓存、策略、失效和计划寿命 | execution | Session/lifecycle tests |
+| 模型流程或某种 Blocks | network | 固定输入 eager/graph 数值对照 |
+| checkpoint 映射和设备布局 | weights | 权重测试与实际 checkpoint 集成 |
+| 模型加载组装 | load | 加载与 public smoke |
 
 ### Breaking interface migration
 
@@ -510,7 +562,7 @@ are not rewritten. Its websocket boundary recognizes the new server metadata.
 ### Internal interfaces and change ownership
 
 ```rust
-// Abbreviated signatures; the callable implementation lives in blocks/mod.rs.
+// Abbreviated signatures; the callable implementation lives in network/blocks/mod.rs.
 trait Blocks {
     type Prefix;   // precision-specific KV representation
     type Styles;   // fixed per-step modulation tensors

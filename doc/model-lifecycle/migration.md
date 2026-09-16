@@ -183,6 +183,20 @@ load-contaminated cell was independently rerun after the load subsided. Thor
 performance is not qualified under concurrent GPU work. See the slice D section
 of baseline.md for current evidence; slice C results retain their original source IDs.
 
+### PI0.5 module encapsulation follow-up
+
+Candidate `0f23048` groups execution, network and weights with enforced Interfaces.
+Session fields and Network Blocks are private; load uses a constructor. LoadedCompute
+moves into network/compute.rs; execution owns capture through a static generic
+NetworkOperation supplied by execution, with no reverse module dependency. Resource
+requirements are network-owned data; allocation stays in execution. Backend and CPU
+math remain model-wide utilities. No numerical, packing or memory algorithm changed.
+Both hosts passed native Network/Session/real-checkpoint lifecycle tests; Thor
+passed all three public smokes and seven exact-output fixtures. Local CPU tests,
+CUDA-feature typechecking and dependency guards passed. Details are tracked
+separately in baseline.md. This closes module encapsulation, not the still-open
+Thor performance gate.
+
 ### Stage 2 exit checklist (slice D)
 
 | Requirement | Current result |

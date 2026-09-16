@@ -251,7 +251,7 @@ compute_variant field. See the architecture document for breaking entry changes.
 
 ### Session 生命周期：准备、执行、失效与释放
 
-Session 是长期对象；`prepare.rs` 是被调用的模块，没有一个长期运行的 Prepare
+Session 是长期对象；`execution/prepare.rs` 是被调用的模块，没有一个长期运行的 Prepare
 对象。Session 决定执行策略并分配请求输入/noise buffer；prepare 模块负责 graph
 workspace、固定 styles、预热、录制和 CapturedGraph 封装。PreparedInference
 是准备结果，既可以使用 Eager，也可以使用 Graph。
@@ -262,8 +262,8 @@ alt 是互斥分支，opt 是满足条件才执行。它们与类图的持有箭
 sequenceDiagram
     participant U as Rust 调用方或 native Model
     participant S as Pi05Session
-    participant C as LoadedCompute
-    participant P as prepare.rs
+    participant C as network/LoadedCompute
+    participant P as execution/prepare.rs
     participant N as Network
     participant R as PreparedInference
     participant G as CapturedGraph
@@ -299,20 +299,22 @@ sequenceDiagram
         alt mode 为 Eager
             S->>R: 创建 Eager 计划并保留输入资源
         else mode 为 PreferGraph 或 RequireGraph
-            S->>C: capture(spec, buffers)
-            C->>P: 分派到泛型 capture
+            S->>P: capture_loaded(compute, spec, buffers)
+            P->>C: with_network(CaptureOperation)
+            C->>P: operation.run(network, embeddings)
+            Note over C,P: 静态泛型回调；network 不导入 execution
             P->>N: 读取 Blocks 资源需求，准备 styles
             P->>P: 分配 workspace 和录制所需资源
             P->>N: 预热并录制（禁止 autotune）
             alt 录制成功
                 P->>G: 保留 graph、buffer、workspace、Network/styles
-                P-->>S: CapturedGraph（经 LoadedCompute 返回）
+                P-->>S: CapturedGraph（内部静态派发完成后）
                 S->>R: 创建 Graph 计划
             else 录制失败且 PreferGraph
-                P-->>S: 录制错误（经 LoadedCompute 返回）
+                P-->>S: 录制错误（内部静态派发完成后）
                 S->>R: 创建 Eager 计划并记录回退原因
             else 录制失败且 RequireGraph
-                P-->>S: 录制错误（经 LoadedCompute 返回）
+                P-->>S: 录制错误（内部静态派发完成后）
                 S-->>U: 返回 Err，不返回计划
             end
         end
@@ -381,7 +383,7 @@ sequenceDiagram
 每次 run 根据 seed/sequence/draw 生成噪声，或复制用户提供的噪声。复用地址不代表
 复用噪声值。样本调优使用的图像与 token 也不会固定到后续计划中。
 
-`prepare.rs` 的内部 capture 共用一条录制机制；公开 capture_patches/capture_rgb
+`execution/prepare.rs` 的内部 capture 共用一条录制机制；公开 capture_patches/capture_rgb
 仅按输入形式提供两个低层入口，不是三个录制阶段。普通 Python Pi05Policy.infer
 经过 Model.infer_rgb 调用 Session.infer，默认 PreferGraph；当前 Python Policy
 没有直接暴露上述显式 prepare / ExecutionPolicy 选项。
@@ -433,8 +435,9 @@ lifecycle guarantees above remain targets until separately implemented and teste
 The complete sequence above replaces the previous diagram that merged Network
 and prepare into one participant. CUDA backend capture uses a scoped cleanup
 mechanism: errors/unwind end and discard capture, and known capture errors are
-cleared before later execution. Session reaches this through LoadedCompute and
-the shared prepare module, not through a second long-lived preparation object.
+cleared before later execution. Session calls execution/prepare, which uses the internal NetworkOperation seam
+to run the selected Network. Network does not depend on execution or a
+long-lived preparation object.
 
 
 Graph handles are in-process objects, not serialized cache files. The captured
