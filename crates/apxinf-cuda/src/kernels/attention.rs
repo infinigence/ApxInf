@@ -1627,15 +1627,35 @@ pub fn causal_gqa_bf16(
             // moves where the generation first differs from the reference.
             // This routes the same call through the composed path instead, to
             // separate the kernel from everything around it.
-            #[cfg(apxinf_fa2_sm80)]
+            // Causal prefill through the head-256 kernel is worth 9.3% of
+            // the fixed cost on Thor, and it is also the more accurate path.
+            // The four-mode gate says otherwise, but the gate reports one
+            // number: scene 0's maximum trajectory error, which on this
+            // checkpoint only ever takes the two adjacent BF16 output ULPs
+            // 0.0403 and 0.0806, so it flips on changes that move nothing.
+            // Measured over all four scenes of all three runnable modes
+            // (control/precision_probe.py), against composed prefill:
+            //   VQA token agreement   0.3505 -> 0.6551
+            //   VQA first difference  99.25  -> 170.5  (mean over scenes)
+            //   direct  traj mean/rms 0.012919/0.035024 -> 0.011955/0.031668
+            //   reasoning   mean/rms  0.013858/0.036120 -> 0.014291/0.036760
+            // Three of the four move the right way and the fourth by 3%, so
+            // this stays the default, as it is on the sm_80 family.
+            #[cfg(apxinf_fa2_head_special)]
             if q_shape[0] == key_tokens
                 && q_shape[0] > 1
                 && std::env::var_os("APXINF_ATTN_COMPOSED_PREFILL").is_none()
             {
                 return fa2_attention_causal(ctx,q,k,v,q_shape[0],key_tokens,q_shape[1],k_shape[1],q_shape[2]);
             }
-            #[cfg(apxinf_fa2_sm80)]
-            if q_shape[0] == 1 {
+            // Single-token decode. `APXINF_ATTN_COMPOSED_DECODE` routes it
+            // back through the composed path, which is what this branch did
+            // before the head-256 specialisation reached the SM100 family. It
+            // exists so the two halves of that change stay separately
+            // measurable on one binary, the way APXINF_ATTN_COMPOSED_PREFILL
+            // already does for prefill.
+            #[cfg(apxinf_fa2_head_special)]
+            if q_shape[0] == 1 && std::env::var_os("APXINF_ATTN_COMPOSED_DECODE").is_none() {
                 return fa2_attention_splitkv(ctx,q,k,v,1,1,key_tokens,q_shape[1],k_shape[1],q_shape[2],false);
             }
             return composed_gqa_bf16(ctx, q, k, v, key_tokens, true);

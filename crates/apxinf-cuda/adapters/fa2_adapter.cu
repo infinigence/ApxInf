@@ -3,7 +3,7 @@
 
 #include "../kernels/cutlass/fa2_bf16_sm80.cu"
 
-#if defined(APXINF_FA2_SM80)
+#if defined(APXINF_FA2_HEAD_SPECIAL)
 namespace FLASH_NAMESPACE {
 int run_bf16_head64_splitkv(Flash_fwd_params& params, cudaStream_t stream);
 int run_bf16_head256_causal(Flash_fwd_params& params, cudaStream_t stream);
@@ -26,7 +26,7 @@ extern "C" int apxinf_static_fa2_bf16_causal(
     void* softmax_lse, int batch, int query_tokens, int key_tokens,
     int query_heads, int kv_heads, int head_dim, float softmax_scale,
     cudaStream_t stream) {
-#if defined(APXINF_FA2_SM80)
+#if defined(APXINF_FA2_HEAD_SPECIAL)
   if(head_dim==256 && query_tokens==key_tokens && query_tokens>1) {
     if(!q||!k||!v||!output||!softmax_lse||batch<=0||query_heads<=0||kv_heads<=0||query_heads%kv_heads)
       return static_cast<int>(cudaErrorInvalidValue);
@@ -48,7 +48,7 @@ extern "C" int apxinf_static_fa2_bf16_splitkv(
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
     int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
-#if defined(APXINF_FA2_SM80)
+#if defined(APXINF_FA2_HEAD_SPECIAL)
   if(head_dim==256 && query_tokens>0 && query_tokens<=64) {
     if(!q||!k||!v||!output||!softmax_lse||!softmax_lse_accum||!o_accum||batch<=0||key_tokens<=0||
         query_heads<=0||kv_heads<=0||query_heads%kv_heads||num_sms<=0)

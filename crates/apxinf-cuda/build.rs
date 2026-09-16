@@ -160,6 +160,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_bf16_sm89)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_int8_sm80)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_sm80)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_head_special)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_f16_sm100)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_direct_e4m3_sm100)");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -433,6 +434,7 @@ fn main() {
             let mut fa2_includes = Vec::new();
             let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
+            let fa2_head_special = fa2_sm80 || fa2_f16_sm100;
             if fa2_sm80 || fa2_f16_sm100 {
                 let fa2_hdim96 = fa2_root.join("flash_attn/flash_fwd_hdim96_bf16_sm80.cu");
                 let fa2_hdim128 = fa2_root.join("flash_attn/flash_fwd_hdim128_bf16_sm80.cu");
@@ -468,7 +470,13 @@ fn main() {
                     fa2_root.display()
                 );
                 fa2_sources.push(fa2_split_hdim256);
-                if fa2_sm80 {
+                // The head-64 and head-256 specialisations are ordinary
+                // Ampere-MMA FA2 kernels; Blackwell runs them. They were tied
+                // to the SM80 family only because that was the first device
+                // that needed them. `fa2_head_special` is the axis that
+                // decides whether the specialised dispatch exists, and it is
+                // now on wherever the underlying hdim kernels are compiled.
+                if fa2_head_special {
                     fa2_sources
                         .push(std::path::Path::new(&adapters_dir).join("fa2_head64_adapter.cu"));
                     fa2_sources.push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
@@ -493,6 +501,9 @@ fn main() {
                 kernel_files.extend(fa2_sources.iter().cloned());
                 if fa2_sm80 {
                     println!("cargo:rustc-cfg=apxinf_fa2_sm80");
+                }
+                if fa2_head_special {
+                    println!("cargo:rustc-cfg=apxinf_fa2_head_special");
                 }
                 emit_rerun_if_changed_tree(&fa2_root);
             }
@@ -590,6 +601,16 @@ fn main() {
                         ]);
                         if fa2_sm80 {
                             cmd.arg("-DAPXINF_FA2_SM80=1");
+                        }
+                        // Only the dispatch adapter and the two specialisations
+                        // read this; the hdim kernels do not, and putting it on
+                        // their command line would rebuild them for nothing.
+                        if fa2_head_special
+                            && (entry == &fa2_wrapper
+                                || entry.ends_with("fa2_head64_adapter.cu")
+                                || entry.ends_with("fa2_head256_adapter.cu"))
+                        {
+                            cmd.arg("-DAPXINF_FA2_HEAD_SPECIAL=1");
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
                         // Drop the FlashAttention-2 feature axes this adapter never
