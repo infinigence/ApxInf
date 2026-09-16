@@ -1789,6 +1789,33 @@ pub fn mha_bf16(
     ))
 }
 
+/// Whether the vision tower's head-64 segments use the FlashAttention-2
+/// specialisation. On by default wherever it is compiled.
+///
+/// The end-to-end metrics argue against it -- taking it moves the direct
+/// trajectory RMS 0.031668 -> 0.036036 and the reasoning RMS 0.036760 ->
+/// 0.042260 -- but those metrics cannot answer this question. They measure
+/// where a chain of chaotic amplification lands, and the same swap moves the
+/// VQA token agreement the other way, 0.655 -> 0.733. The operator compared
+/// against a double-precision reference of its own math, on one fixed input,
+/// says the opposite and says it cleanly
+/// (tests::operators::vision_segmented_mha_error_against_fp64_oracle):
+///
+///   composed, fp32 scores on CUDA cores   rel L1 2.317668e-3
+///   composed, BF16 scores on tensor cores rel L1 2.317622e-3
+///   FA2 head-64                           rel L1 2.305103e-3
+///
+/// The three agree to within 0.5% of each other and FA2 is the most accurate
+/// of them. `APXINF_VISION_FA2=0` selects the composed route, and
+/// `APXINF_VISION_SCORES_FP32` then puts its scores back on the CUDA cores.
+#[cfg(apxinf_fa2_head_special)]
+fn vision_fa2_enabled() -> bool {
+    !matches!(
+        std::env::var("APXINF_VISION_FA2").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 pub fn segmented_mha_bf16(
     ctx: &CudaContext,
     q: &Tensor,
@@ -1840,8 +1867,16 @@ pub fn segmented_mha_bf16(
         // stay fp32 end-to-end and P is rounded to bf16 for the PV MMA exactly as FA2 does.
         // Revert/replace in the acceptance-bound revision per the prevailing marker policy.
         let orig_head_dim = shape[2]; // FIX (implement_r6)
-        #[cfg(apxinf_fa2_sm80)]
-        if orig_head_dim == 64 {
+        // The head-64 specialisation, not the sm_80 family. `run_bf16_head64_splitkv`
+        // is compiled wherever `fa2_head_special` is on, and the composed arm
+        // below exists because the vendored FA2 forward family was measured
+        // pathological on sm_89 -- which is a statement about sm_89, not about
+        // every device outside the sm_80 family. On Thor the composed arm is
+        // 628.6 ms of the 4.435 s scene: 369.8 ms of cutlass_80_simt_sgemm and
+        // 258.8 ms of row_softmax_f32_bf16, all of it fp32 on CUDA cores, the
+        // one unit where Thor is only 1.59x Orin.
+        #[cfg(apxinf_fa2_head_special)]
+        if orig_head_dim == 64 && vision_fa2_enabled() {
             if host_offsets.first() != Some(&0)
                 || host_offsets.last().map(|&v| v as usize) != Some(shape[0])
                 || host_offsets
@@ -1895,20 +1930,33 @@ pub fn segmented_mha_bf16(
         #[cfg(not(apxinf_fa2_sm80))]
         if orig_head_dim == 64 {
             // FIX (implement_r8): composed per-segment attention at the true dim
-            let qf32_buf =
-                CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
-                    .map_err(Error::Cuda)?; // FIX (implement_r8)
-            let qf32_t = qf32_buf
-                .as_tensor(q.shape().clone(), DType::F32)
-                .map_err(Error::Cuda)?; // FIX (implement_r8)
-            super::linear_attention::cast_bf16_to_f32(ctx, q, &qf32_t)?; // FIX (implement_r8)
-            let kf32_buf =
-                CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
-                    .map_err(Error::Cuda)?; // FIX (implement_r8)
-            let kf32_t = kf32_buf
-                .as_tensor(k.shape().clone(), DType::F32)
-                .map_err(Error::Cuda)?; // FIX (implement_r8)
-            super::linear_attention::cast_bf16_to_f32(ctx, k, &kf32_t)?; // FIX (implement_r8)
+            // Q and K stay BF16. Widening them to fp32 and calling the fp32
+            // GEMM does not make the scores more accurate -- every product is
+            // one BF16 times another, exact in fp32 either way, accumulated in
+            // fp32 in both cases -- it only moves the multiply onto the CUDA
+            // cores and pays for two casts. Scores stay fp32 for the softmax.
+            // `APXINF_VISION_SCORES_FP32` keeps the old widening, so the two
+            // score paths stay comparable on one binary against the fp64
+            // oracle in tests::operators::vision_segmented_mha_*.
+            let widen = std::env::var_os("APXINF_VISION_SCORES_FP32").is_some();
+            let scores_dtype = if widen { DType::F32 } else { DType::BF16 };
+            let elem = if widen { 4 } else { 2 };
+            let (q_buf, k_buf) = if widen {
+                let qf32 = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?;
+                let qt = qf32.as_tensor(q.shape().clone(), DType::F32).map_err(Error::Cuda)?;
+                super::linear_attention::cast_bf16_to_f32(ctx, q, &qt)?;
+                let kf32 = CudaBuffer::alloc(shape[0] * shape[1] * orig_head_dim * 4, ctx.device_id())
+                    .map_err(Error::Cuda)?;
+                let kt = kf32.as_tensor(k.shape().clone(), DType::F32).map_err(Error::Cuda)?;
+                super::linear_attention::cast_bf16_to_f32(ctx, k, &kt)?;
+                (qf32, kf32)
+            } else {
+                (
+                    CudaBuffer::from_tensor(q).map_err(Error::Cuda)?,
+                    CudaBuffer::from_tensor(k).map_err(Error::Cuda)?,
+                )
+            };
             let output = output_buffer(ctx, q.size_in_bytes())?; // FIX (implement_r8): packed [T,16,64]; out_bytes=85,327,872 signs the composed route
                                                                  // TEMP-DIAG (implement_r4): entry-alloc bracket; revert in the acceptance-bound revision.
             if mha_diag {
@@ -1943,19 +1991,21 @@ pub fn segmented_mha_bf16(
                     .map_err(Error::Cuda)?; // FIX (implement_r8): bf16 [heads,tokens,tokens]
                 for head in 0..shape[1] {
                     let q_head = buffer_slice(
-                        &qf32_buf,
-                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
-                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
-                    )?; // FIX (implement_r8)
+                        &q_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * elem,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * elem,
+                    )?;
                     let k_head = buffer_slice(
-                        &kf32_buf,
-                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * 4,
-                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * 4,
-                    )?; // FIX (implement_r8)
+                        &k_buf,
+                        (start * shape[1] * orig_head_dim + head * orig_head_dim) * elem,
+                        ((tokens - 1) * shape[1] * orig_head_dim + orig_head_dim) * elem,
+                    )?;
                     let scores_head =
                         buffer_slice(&scores, head * tokens * tokens * 4, tokens * tokens * 4)?; // FIX (implement_r8)
-                    ctx.cublas()
-                        .gemm_ex(
+                    // Q*K^T; alpha folds the softmax scale bound to the true dim 64.
+                    let cublas = ctx.cublas();
+                    let call = if scores_dtype == DType::F32 {
+                        cublas.gemm_ex(
                             DType::F32,
                             CublasTranspose::None,
                             CublasTranspose::Transpose,
@@ -1971,7 +2021,24 @@ pub fn segmented_mha_bf16(
                             &scores_head,
                             tokens as i32,
                         )
-                        .map_err(Error::Cuda)?; // FIX (implement_r8): Q*K^T; alpha folds the softmax scale bound to the true dim 64
+                    } else {
+                        cublas.gemm_bf16_f32_ex(
+                            CublasTranspose::None,
+                            CublasTranspose::Transpose,
+                            tokens,
+                            tokens,
+                            orig_head_dim,
+                            (orig_head_dim as f32).sqrt().recip(),
+                            &q_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            &k_head,
+                            (shape[1] * orig_head_dim) as i32,
+                            0.0,
+                            &scores_head,
+                            tokens as i32,
+                        )
+                    };
+                    call.map_err(Error::Cuda)?;
                 }
                 unsafe {
                     ffi::check_cuda(ffi::apxinf_static_row_softmax_f32_bf16(

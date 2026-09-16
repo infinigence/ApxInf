@@ -673,6 +673,137 @@ fn attention_softmax_bf16_matches_fp32_reference() {
     assert_bf16_close_reduction(&download_bf16_as_fp32(&out).unwrap(), &expected);
 }
 
+// ── vision segmented MHA against an fp64 oracle ───────────────────
+//
+// The end-to-end gate cannot decide whether a change to this operator cost
+// precision. It reports where greedy decoding first leaves a reference the
+// port does not match anyway, and that index is a chaotic function of last-bit
+// rounding: the same kernel swap moves it 170 -> 102 while moving the
+// trajectory RMS by 6%. This compares the operator itself, on one fixed input,
+// against a double-precision reference of the same math, so a route can be
+// called more or less accurate on its own terms.
+//
+// Run it per route:
+//   cargo test --release -p apxinf-cuda vision_segmented_mha -- --nocapture
+//   APXINF_VISION_FA2=1 cargo test ... (FlashAttention-2 head-64)
+#[test]
+fn vision_segmented_mha_error_against_fp64_oracle() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, dim, seg_tokens, segments) = (16usize, 64usize, 256usize, 2usize);
+    let tokens = seg_tokens * segments;
+
+    // Deterministic operands in the range a post-norm projection produces.
+    let gen = |salt: u64| -> Vec<f32> {
+        (0..tokens * heads * dim)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                ((x & 0xFFFF) as f32 / 32768.0 - 1.0) * 0.8
+            })
+            .collect()
+    };
+    let (qh, kh, vh) = (gen(1), gen(2), gen(3));
+    let shape = vec![tokens, heads, dim];
+    let q = upload_fp32_as_bf16(&ctx, &qh, shape.clone()).unwrap();
+    let k = upload_fp32_as_bf16(&ctx, &kh, shape.clone()).unwrap();
+    let v = upload_fp32_as_bf16(&ctx, &vh, shape.clone()).unwrap();
+
+    // The operands the device sees are the BF16 roundings of the vectors
+    // above, so the oracle has to start from those, not from the fp32 draws.
+    let to_bf16 = |x: f32| -> f64 {
+        let bits = x.to_bits();
+        let rounded = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32
+            | ((bits >> 16) & 1)))) << 16;
+        f32::from_bits(rounded) as f64
+    };
+
+    let host_offsets: Vec<u32> = (0..=segments).map(|s| (s * seg_tokens) as u32).collect();
+    let offsets = CudaBuffer::alloc(host_offsets.len() * 4, 0).unwrap();
+    unsafe {
+        crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+            offsets.ptr(),
+            host_offsets.as_ptr() as *const std::ffi::c_void,
+            host_offsets.len() * 4,
+            crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+        ))
+        .unwrap();
+    }
+
+    let out = crate::kernels::attention::segmented_mha_bf16(
+        &ctx, &q, &k, &v, &offsets, &host_offsets, segments, seg_tokens,
+    )
+    .unwrap();
+    let got = download_bf16_as_fp32(&out).unwrap();
+
+    // fp64 reference: per segment, per head, scores/sqrt(dim), softmax, P*V.
+    let scale = 1.0f64 / (dim as f64).sqrt();
+    let mut worst = 0.0f64;
+    let mut sum_abs = 0.0f64;
+    let mut sum_ref = 0.0f64;
+    let mut count = 0usize;
+    let mut row = vec![0.0f64; seg_tokens];
+    for seg in 0..segments {
+        let base = seg * seg_tokens;
+        for h in 0..heads {
+            let at = |t: usize, d: usize, src: &Vec<f32>| -> f64 {
+                to_bf16(src[((base + t) * heads + h) * dim + d])
+            };
+            for i in 0..seg_tokens {
+                let mut max = f64::NEG_INFINITY;
+                for j in 0..seg_tokens {
+                    let mut acc = 0.0f64;
+                    for d in 0..dim {
+                        acc += at(i, d, &qh) * at(j, d, &kh);
+                    }
+                    row[j] = acc * scale;
+                    if row[j] > max {
+                        max = row[j];
+                    }
+                }
+                let mut denom = 0.0f64;
+                for j in 0..seg_tokens {
+                    row[j] = (row[j] - max).exp();
+                    denom += row[j];
+                }
+                for d in 0..dim {
+                    let mut acc = 0.0f64;
+                    for j in 0..seg_tokens {
+                        acc += row[j] * at(j, d, &vh);
+                    }
+                    let expect = acc / denom;
+                    let actual = got[((base + i) * heads + h) * dim + d] as f64;
+                    let delta = (actual - expect).abs();
+                    worst = worst.max(delta / expect.abs().max(1e-6));
+                    sum_abs += delta;
+                    sum_ref += expect.abs();
+                    count += 1;
+                }
+            }
+        }
+    }
+    let route = if std::env::var_os("APXINF_VISION_FA2").is_some() {
+        "fa2-head64"
+    } else {
+        "composed"
+    };
+    println!(
+        "vision_mha_oracle route={route} elements={count} \
+         mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
+        sum_abs / count as f64,
+        sum_abs / sum_ref,
+        worst
+    );
+    // A BF16 output carries about 2^-8 of relative resolution, so an aggregate
+    // relative L1 above a few times that is a real loss, not rounding.
+    assert!(
+        sum_abs / sum_ref < 0.02,
+        "vision segmented MHA relative L1 {} against fp64",
+        sum_abs / sum_ref
+    );
+}
+
 // ── KV cache append ───────────────────────────────────────────────
 
 #[test]
