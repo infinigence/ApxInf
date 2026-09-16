@@ -25,8 +25,6 @@ import time
 
 import numpy as np
 
-import apxinf_py
-
 
 def metrics(actual: np.ndarray, expected: np.ndarray) -> dict[str, float | None]:
     actual = np.asarray(actual, dtype=np.float64).reshape(-1)
@@ -81,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    import apxinf_py  # Native binding is needed only for execution, not --help.
     fixture_paths = list(args.fixture)
     if args.fixture_dir is not None:
         fixture_paths.extend(sorted(args.fixture_dir.glob("*.npz")))

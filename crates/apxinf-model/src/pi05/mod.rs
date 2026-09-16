@@ -1,9 +1,9 @@
 //! Physical Intelligence π0.5 vision-language-action model.
 //!
 //! OpenPI defines the model math, LeRobot defines the distributed checkpoint
-//! contract, and the CUDA fast path is specialized for the static two-view
-//! Thor inference shape.  Keep architecture orchestration in this module;
-//! CUDA crates expose only kernels and device primitives.
+//! contract. Loading selects compute Blocks; Network owns model dataflow;
+//! Session and prepare own execution policy and stable graph resources.
+//! CUDA crates expose kernels and device primitives.
 
 #[cfg(feature = "cuda")]
 mod backend;

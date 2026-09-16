@@ -532,7 +532,7 @@ impl VlaRuntime for Pi05Session {
                 ..
             }) => "eager",
             Some(PreparationStatus::Invalidated) => "invalidated",
-            Some(PreparationStatus::RuntimeManaged) => "network-managed",
+            Some(PreparationStatus::RuntimeManaged) => "runtime-managed",
         }
     }
 

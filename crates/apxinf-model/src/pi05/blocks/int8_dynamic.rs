@@ -1,4 +1,4 @@
-//! W8A8 INT8 π0.5 transformer-layer execution.
+//! Dynamic-activation INT8 π0.5 transformer-layer execution.
 
 use crate::pi05::backend::{kernels, Context};
 use apxinf_core::{Result, Tensor};
