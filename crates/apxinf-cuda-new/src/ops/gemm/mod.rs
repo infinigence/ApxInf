@@ -5,7 +5,7 @@ pub(crate) mod gemm_execution;
 mod gemm_geglu;
 mod gemm_gelu;
 
-pub use contracts::{GemmArgs, GemmPolicy, GemmQuantization, WeightVersion};
+pub use contracts::{GemmArgs, GemmPolicy, GemmQuantization, WeightVersion, NVFP4_BLOCK_SIZE};
 pub use gemm::gemm;
 pub use gemm_bias::{gemm_bias, GemmBiasArgs};
 pub use gemm_geglu::{gemm_geglu, GemmGegluArgs};

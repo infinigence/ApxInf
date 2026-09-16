@@ -143,7 +143,12 @@ pub(super) fn f32_tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Te
 }
 
 pub(super) fn zeros_tensor(device: usize, shape: Vec<usize>, dtype: DType) -> Tensor {
-    let bytes = vec![0; shape.iter().product::<usize>() * dtype.size_in_bytes()];
+    let bytes = vec![
+        0;
+        dtype
+            .storage_bytes_for(shape.iter().product::<usize>())
+            .unwrap()
+    ];
     let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer.as_tensor(Shape::new(shape), dtype).unwrap()
@@ -152,7 +157,9 @@ pub(super) fn zeros_tensor(device: usize, shape: Vec<usize>, dtype: DType) -> Te
 pub(super) fn bytes_tensor(device: usize, shape: Vec<usize>, dtype: DType, bytes: &[u8]) -> Tensor {
     assert_eq!(
         bytes.len(),
-        shape.iter().product::<usize>() * dtype.size_in_bytes()
+        dtype
+            .storage_bytes_for(shape.iter().product::<usize>())
+            .unwrap()
     );
     let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
     buffer.copy_from_host(bytes).unwrap();
@@ -300,7 +307,7 @@ pub(super) fn values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-fn f16_values(tensor: &Tensor) -> Vec<f32> {
+pub(super) fn f16_values(tensor: &Tensor) -> Vec<f32> {
     assert_eq!(tensor.dtype(), DType::F16);
     let buffer = CudaBuffer::from_tensor(tensor).unwrap();
     let mut bytes = vec![0; buffer.len()];

@@ -24,11 +24,11 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 4 || spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-      spec.a_dtype > APXINF_DTYPE_I8 || spec.b_dtype > APXINF_DTYPE_I8 ||
+  if (spec.version != 5 || spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+      spec.a_dtype > APXINF_DTYPE_UE4M3 || spec.b_dtype > APXINF_DTYPE_UE4M3 ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
       spec.output_dtype > APXINF_DTYPE_E4M3 ||
-      spec.quantization > APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL || spec.m <= 0 ||
+      spec.quantization > APXINF_GEMM_QUANT_NVFP4_BLOCK16 || spec.m <= 0 ||
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
@@ -73,9 +73,24 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "FP8 quantization requires two E4M3 inputs");
   }
+  if (spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK16 &&
+      (spec.a_dtype != APXINF_DTYPE_E2M1 ||
+       spec.b_dtype != APXINF_DTYPE_E2M1 ||
+       spec.accumulation_dtype != APXINF_DTYPE_F32 ||
+       spec.output_dtype != APXINF_DTYPE_F16 ||
+       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM &&
+        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU &&
+        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_GEGLU) ||
+       spec.k % 16 != 0 ||
+       spec.n % 16 != 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid NVFP4 block-scaled GEMM contract");
+  }
   if (spec.quantization == APXINF_GEMM_QUANT_NONE &&
       (spec.a_dtype == APXINF_DTYPE_E4M3 ||
        spec.a_dtype == APXINF_DTYPE_I8 ||
+       spec.a_dtype == APXINF_DTYPE_E2M1 ||
+       spec.a_dtype == APXINF_DTYPE_UE4M3 ||
        spec.a_dtype != spec.b_dtype)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "plain GEMM requires matching non-quantized inputs");
@@ -110,8 +125,7 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
   const bool needs_bias =
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
-  const bool needs_scales =
-      apxinf::gemm::has_row_channel_scales(spec);
+  const bool needs_scales = apxinf::gemm::has_quantization_scales(spec);
   if (bindings.a == nullptr || bindings.b == nullptr ||
       (require_output && bindings.output == nullptr) ||
       (needs_bias && bindings.bias == nullptr) ||

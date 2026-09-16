@@ -4,7 +4,8 @@ use std::ops::Range;
 use crate::ffi::abi::gemm as abi;
 use crate::{CudaBuffer, CudaContext};
 
-/// Caller-managed version of an immutable GEMM weight allocation.
+/// Caller-managed version of an immutable GEMM weight allocation and its
+/// associated quantization metadata, such as block scales.
 ///
 /// A version is meaningful together with the weight tensor's allocation
 /// identity. Supplying it asserts that the allocation's contents will not be
@@ -12,6 +13,9 @@ use crate::{CudaBuffer, CudaContext};
 /// the version before preparing again after changing the contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WeightVersion(u64);
+
+/// Number of values covered by one NVFP4 UE4M3 scale factor.
+pub const NVFP4_BLOCK_SIZE: usize = 16;
 
 impl WeightVersion {
     pub const fn new(version: u64) -> Self {
@@ -64,10 +68,10 @@ pub struct GemmArgs<'a> {
     pub policy: GemmPolicy,
     /// Explicit opt-in for candidate-specific prepared-weight caching.
     ///
-    /// `None` means the weight may change between launches, so candidates
-    /// must not retain a transformed copy. The token never replaces allocation
-    /// identity: both the tensor address and this version identify a prepared
-    /// weight.
+    /// `None` means the weight or its quantization metadata may change between
+    /// launches, so candidates must not retain a transformed copy. The token
+    /// never replaces allocation identity: allocation addresses and this
+    /// version together identify prepared weight data.
     pub weight_version: Option<WeightVersion>,
 }
 
@@ -94,6 +98,15 @@ pub enum GemmQuantization<'a> {
     /// FP8 inputs whose values already include the intended scaling.
     /// This supports existing FP8 kernels which do not consume scale tensors.
     Fp8UnitScale,
+    /// NVIDIA FP4 E2M1 operands with one unsigned-E4M3 scale per 16 values
+    /// along K. All public inputs use canonical contiguous row-major storage:
+    /// A is `[M,K]`, B is `[K,N]`, A scales are `[M,K/16]`, and B scales are
+    /// `[N,K/16]`. Candidate-specific packing and scale swizzling stay below
+    /// this L3 contract.
+    NvFp4 {
+        a_block_scales: &'a Tensor,
+        b_block_scales: &'a Tensor,
+    },
 }
 
 impl<'a> GemmArgs<'a> {
@@ -160,6 +173,30 @@ impl<'a> GemmArgs<'a> {
         }
     }
 
+    /// Create an NVFP4 GEMM. NVFP4 uses fixed block size 16 and FP32
+    /// accumulation; the current high-performance candidates produce F16.
+    pub fn nvfp4(
+        a: &'a Tensor,
+        a_block_scales: &'a Tensor,
+        b: &'a Tensor,
+        b_block_scales: &'a Tensor,
+        out: &'a mut Tensor,
+    ) -> Self {
+        Self {
+            a,
+            b,
+            out,
+            quantization: GemmQuantization::NvFp4 {
+                a_block_scales,
+                b_block_scales,
+            },
+            alpha: 1.0,
+            output_scale: 1.0,
+            policy: GemmPolicy::default(),
+            weight_version: None,
+        }
+    }
+
     /// Assert that `b` is immutable for the lifetime of prepared executions
     /// created from these arguments and attach its caller-managed version.
     pub fn with_immutable_weight(mut self, version: WeightVersion) -> Self {
@@ -195,15 +232,18 @@ pub(crate) fn dtype(dtype: DType) -> Result<u32> {
         DType::F8E4M3 => Ok(3),
         DType::I8 => Ok(4),
         DType::I32 => Ok(5),
+        DType::F4E2M1 => Ok(6),
+        DType::F8UE4M3 => Ok(7),
     }
 }
 
 fn required_bytes(dtype: DType, shape: &[usize]) -> Result<usize> {
-    shape
+    let elements = shape
         .iter()
-        .try_fold(dtype.size_in_bytes(), |bytes, dimension| {
-            bytes.checked_mul(*dimension)
-        })
+        .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+        .ok_or_else(|| invalid("GEMM size overflow"))?;
+    dtype
+        .storage_bytes_for(elements)
         .ok_or_else(|| invalid("GEMM size overflow"))
 }
 
@@ -266,7 +306,7 @@ pub(crate) fn tensor_storage(
     if buffer.len() < expected_bytes {
         return Err(invalid("GEMM storage is too small"));
     }
-    let dtype_alignment = expected_dtype.size_in_bytes();
+    let dtype_alignment = expected_dtype.alignment_in_bytes();
     if (buffer.ptr() as usize) % dtype_alignment != 0 {
         return Err(invalid(format!(
             "GEMM tensor storage is not aligned to its {}-byte dtype",
@@ -311,10 +351,12 @@ pub(crate) fn normalize<'a>(
     if bias.is_some() != needs_bias {
         return Err(invalid("fused operands do not match the semantic operator"));
     }
-    let (quantization, row_scales, channel_scales) = match args.quantization {
+    let (quantization, a_scales, b_scales) = match args.quantization {
         GemmQuantization::None => {
-            if matches!(args.a.dtype(), DType::F8E4M3 | DType::I8)
-                || args.a.dtype() != args.b.dtype()
+            if matches!(
+                args.a.dtype(),
+                DType::F8E4M3 | DType::F4E2M1 | DType::F8UE4M3 | DType::I8
+            ) || args.a.dtype() != args.b.dtype()
             {
                 return Err(invalid(
                     "plain GEMM requires matching non-quantized input dtypes",
@@ -350,6 +392,26 @@ pub(crate) fn normalize<'a>(
                 return Err(invalid("invalid W8A8 GEMM contract"));
             }
             (3, Some(row_scales), Some(channel_scales))
+        }
+        GemmQuantization::NvFp4 {
+            a_block_scales,
+            b_block_scales,
+        } => {
+            let supported_semantic = matches!(
+                semantic,
+                Semantic::Gemm | Semantic::GemmBiasGelu | Semantic::GemmGeglu
+            );
+            if args.a.dtype() != DType::F4E2M1
+                || args.b.dtype() != DType::F4E2M1
+                || args.out.dtype() != DType::F16
+                || args.policy.accumulation_dtype != DType::F32
+                || !supported_semantic
+                || k % NVFP4_BLOCK_SIZE != 0
+                || n % 16 != 0
+            {
+                return Err(invalid("invalid NVFP4 GEMM contract"));
+            }
+            (4, Some(a_block_scales), Some(b_block_scales))
         }
     };
     let has_row_channel_scales = matches!(quantization, 2 | 3);
@@ -396,7 +458,9 @@ pub(crate) fn normalize<'a>(
         output_scale: args.output_scale,
     };
 
-    let projection_dtype = if has_row_channel_scales {
+    let projection_dtype = if quantization == 4 {
+        DType::F16
+    } else if has_row_channel_scales {
         args.out.dtype()
     } else if args.a.dtype() == DType::F8E4M3 {
         if args.out.dtype() == DType::F16 {
@@ -410,10 +474,19 @@ pub(crate) fn normalize<'a>(
     } else {
         args.a.dtype()
     };
+    let (scale_dtype, a_scale_shape, b_scale_shape) = if quantization == 4 {
+        (
+            DType::F8UE4M3,
+            vec![m, k / NVFP4_BLOCK_SIZE],
+            vec![n, k / NVFP4_BLOCK_SIZE],
+        )
+    } else {
+        (DType::F32, vec![m], vec![n])
+    };
     for (tensor, expected_dtype, expected_shape, slot, name) in [
         (bias, projection_dtype, vec![n], 0, "bias"),
-        (row_scales, DType::F32, vec![m], 2, "row scale"),
-        (channel_scales, DType::F32, vec![n], 3, "channel scale"),
+        (a_scales, scale_dtype, a_scale_shape, 2, "A scale"),
+        (b_scales, scale_dtype, b_scale_shape, 3, "B scale"),
     ] {
         if let Some(tensor) = tensor {
             let buffer = tensor_storage(ctx, tensor, expected_dtype, &expected_shape)?;
@@ -436,7 +509,7 @@ pub(crate) fn normalize<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 4,
+            version: 5,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,

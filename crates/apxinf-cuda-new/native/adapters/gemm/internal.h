@@ -66,7 +66,8 @@ inline size_t dtype_bytes(uint32_t dtype) {
   if (dtype == APXINF_DTYPE_F32 || dtype == APXINF_DTYPE_I32) {
     return 4;
   }
-  if (dtype == APXINF_DTYPE_E4M3 || dtype == APXINF_DTYPE_I8) {
+  if (dtype == APXINF_DTYPE_E4M3 || dtype == APXINF_DTYPE_I8 ||
+      dtype == APXINF_DTYPE_E2M1 || dtype == APXINF_DTYPE_UE4M3) {
     return 1;
   }
   return 2;
@@ -75,6 +76,11 @@ inline size_t dtype_bytes(uint32_t dtype) {
 inline bool has_row_channel_scales(const Spec& spec) {
   return spec.quantization == APXINF_GEMM_QUANT_FP8_ROW_CHANNEL ||
          spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL;
+}
+
+inline bool has_quantization_scales(const Spec& spec) {
+  return has_row_channel_scales(spec) ||
+         spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK16;
 }
 
 struct Execution;
@@ -126,9 +132,9 @@ inline bool supports_alignment(const Implementation& implementation,
                                      ? required.bias
                                      : 0) &&
          spec.a_scales_alignment >=
-             (has_row_channel_scales(spec) ? required.a_scales : 0) &&
+             (has_quantization_scales(spec) ? required.a_scales : 0) &&
          spec.b_scales_alignment >=
-             (has_row_channel_scales(spec) ? required.b_scales : 0) &&
+             (has_quantization_scales(spec) ? required.b_scales : 0) &&
          spec.output_alignment >= required.output;
 }
 
@@ -189,12 +195,16 @@ void destroy_cublaslt(Execution& execution) noexcept;
 cudaError_t launch_cublaslt(Execution& execution);
 void prepare_cutlass_fp8_gemm(Execution& execution);
 void prepare_cutlass_geglu(Execution& execution);
+void prepare_cutlass_nvfp4_gemm(Execution& execution);
 size_t cutlass_fp8_resource_requirements(const Spec& spec);
 size_t cutlass_geglu_resource_requirements(const Spec& spec);
+size_t cutlass_nvfp4_resource_requirements(const Spec& spec);
 void destroy_cutlass(Execution& execution) noexcept;
+void destroy_cutlass_nvfp4(Execution& execution) noexcept;
 cudaError_t launch_cutlass_fp8_gemm(Execution& execution);
 cudaError_t launch_cutlass_fp8_geglu(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu(Execution& execution);
+cudaError_t launch_cutlass_nvfp4_gemm(Execution& execution);
 uint64_t cutlass_weight_prepack_count(const Execution& execution);
 
 TuningKeys tuning_keys(const Spec& spec,

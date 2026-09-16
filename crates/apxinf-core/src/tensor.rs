@@ -15,12 +15,14 @@ impl Tensor {
     // ── Constructors ────────────────────────────────────────────────
 
     /// Create a tensor from raw bytes. Caller must ensure `data` length
-    /// matches `shape.numel() * dtype.size_in_bytes()`.
+    /// matches `dtype.storage_bytes_for(shape.numel())`.
     pub fn from_raw(shape: Shape, dtype: DType, device: Device, data: Vec<u8>) -> Result<Self> {
         if device != Device::Cpu {
             return Err(Error::UnsupportedDevice(device));
         }
-        let expected = shape.numel() * dtype.size_in_bytes();
+        let expected = dtype
+            .storage_bytes_for(shape.numel())
+            .ok_or_else(|| Error::Other("tensor byte size overflow".into()))?;
         if data.len() != expected {
             return Err(Error::DataLengthMismatch {
                 expected,
@@ -52,8 +54,8 @@ impl Tensor {
     /// # Safety
     ///
     /// `storage` must belong to `device`, remain valid for the returned
-    /// tensor's lifetime, and contain at least `shape.numel() *
-    /// dtype.size_in_bytes()` accessible bytes without arithmetic overflow.
+    /// tensor's lifetime, and contain at least
+    /// `dtype.storage_bytes_for(shape.numel())` accessible bytes.
     pub unsafe fn from_raw_parts_unchecked(
         shape: Shape,
         dtype: DType,
@@ -71,7 +73,9 @@ impl Tensor {
     /// Create a zero-filled tensor on CPU.
     pub fn zeros(shape: impl Into<Shape>, dtype: DType) -> Self {
         let shape = shape.into();
-        let num_bytes = shape.numel() * dtype.size_in_bytes();
+        let num_bytes = dtype
+            .storage_bytes_for(shape.numel())
+            .expect("tensor byte size overflow");
         Self {
             shape,
             dtype,
@@ -193,7 +197,9 @@ impl Tensor {
 
     /// Total bytes used by this tensor's data.
     pub fn size_in_bytes(&self) -> usize {
-        self.numel() * self.dtype.size_in_bytes()
+        self.dtype
+            .storage_bytes_for(self.numel())
+            .expect("tensor byte size overflow")
     }
 
     // ── CPU data access ─────────────────────────────────────────────
@@ -257,6 +263,14 @@ impl Tensor {
             DType::BF16 => Ok(self.as_bf16()?.iter().map(|x| x.to_f32()).collect()),
             DType::F8E4M3 => Err(Error::Other(
                 "raw E4M3 conversion requires an explicit quantization scale".into(),
+            )),
+            #[cfg(feature = "quantized-dtypes")]
+            DType::F4E2M1 => Err(Error::Other(
+                "packed E2M1 conversion requires explicit NVFP4 block scales".into(),
+            )),
+            #[cfg(feature = "quantized-dtypes")]
+            DType::F8UE4M3 => Err(Error::Other(
+                "raw UE4M3 scale-factor conversion requires NVFP4 metadata".into(),
             )),
             #[cfg(feature = "quantized-dtypes")]
             DType::I8 => Err(Error::Other(
@@ -506,5 +520,27 @@ mod tests {
             format!("{t}"),
             "Tensor(shape=[2, 3], dtype=f32, device=cpu)"
         );
+    }
+
+    #[cfg(feature = "quantized-dtypes")]
+    #[test]
+    fn packed_e2m1_uses_two_elements_per_byte() {
+        let tensor = Tensor::from_raw(
+            Shape::new(vec![3, 4]),
+            DType::F4E2M1,
+            Device::Cpu,
+            vec![0x22; 6],
+        )
+        .unwrap();
+        assert_eq!(tensor.dtype(), DType::F4E2M1);
+        assert_eq!(tensor.numel(), 12);
+        assert_eq!(tensor.size_in_bytes(), 6);
+        assert!(Tensor::from_raw(
+            Shape::new(vec![3, 4]),
+            DType::F4E2M1,
+            Device::Cpu,
+            vec![0x22; 12],
+        )
+        .is_err());
     }
 }

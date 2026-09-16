@@ -8,7 +8,13 @@ constexpr uint32_t kProviderCublasLt = 2;
 constexpr uint32_t kProviderCutlass = 3;
 
 bool supports_vendor(const Spec& spec) {
-  return spec.a_dtype == spec.b_dtype &&
+  const bool supported_input =
+      spec.a_dtype == APXINF_DTYPE_F32 ||
+      spec.a_dtype == APXINF_DTYPE_F16 ||
+      spec.a_dtype == APXINF_DTYPE_BF16 ||
+      spec.a_dtype == APXINF_DTYPE_E4M3 ||
+      spec.a_dtype == APXINF_DTYPE_I8;
+  return supported_input && spec.a_dtype == spec.b_dtype &&
          ((spec.a_dtype == APXINF_DTYPE_I8 &&
            spec.accumulation_dtype == APXINF_DTYPE_I32) ||
           (spec.a_dtype != APXINF_DTYPE_I8 &&
@@ -53,6 +59,18 @@ AlignmentRequirements cutlass_geglu_alignment(const Spec& spec) {
     requirements.a = 32;
     requirements.output = 16;
   }
+  return requirements;
+}
+
+AlignmentRequirements cutlass_nvfp4_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  // A and output are consumed directly by CUTLASS. Canonical B and scale
+  // tensors are byte-packed into provider-private aligned storage.
+  requirements.a = 16;
+  requirements.b = 1;
+  requirements.a_scales = 1;
+  requirements.b_scales = 1;
+  requirements.output = 16;
   return requirements;
 }
 #endif
@@ -101,6 +119,36 @@ bool supports_cutlass_bf16_geglu(const Spec& spec) {
          spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
          spec.quantization == APXINF_GEMM_QUANT_NONE &&
          spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU;
+}
+
+bool supports_cutlass_nvfp4_common(const Spec& spec) {
+  return spec.a_dtype == APXINF_DTYPE_E2M1 &&
+         spec.b_dtype == APXINF_DTYPE_E2M1 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.output_dtype == APXINF_DTYPE_F16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK16 &&
+         spec.n % 16 == 0 && spec.k % 16 == 0;
+}
+
+bool supports_cutlass_nvfp4_gemm(const Spec& spec) {
+  return supports_cutlass_nvfp4_common(spec) &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM;
+}
+
+bool supports_cutlass_nvfp4_bias_gelu(const Spec& spec) {
+  return supports_cutlass_nvfp4_common(spec) &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
+}
+
+bool supports_cutlass_nvfp4_geglu(const Spec& spec) {
+  return supports_cutlass_nvfp4_common(spec) &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU;
+}
+
+void cutlass_nvfp4_configurations(const Spec&, std::vector<int>& configs) {
+  for (int configuration = 0; configuration < 3; ++configuration) {
+    configs.push_back(configuration);
+  }
 }
 
 void cutlass_configurations(const Spec&,
@@ -154,6 +202,14 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
+#ifdef APXINF_GEMM_CUTLASS
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-bias-gelu",
+       kDeviceFeatureCutlassSm100, true, true,
+       supports_cutlass_nvfp4_bias_gelu, cutlass_nvfp4_alignment,
+       cutlass_nvfp4_resource_requirements, cutlass_nvfp4_configurations,
+       prepare_cutlass_nvfp4_gemm, launch_cutlass_nvfp4_gemm,
+       destroy_cutlass_nvfp4},
+#endif
   };
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
@@ -184,6 +240,11 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-block16",
+       kDeviceFeatureCutlassSm100, true, true, supports_cutlass_nvfp4_gemm,
+       cutlass_nvfp4_alignment, cutlass_nvfp4_resource_requirements,
+       cutlass_nvfp4_configurations, prepare_cutlass_nvfp4_gemm,
+       launch_cutlass_nvfp4_gemm, destroy_cutlass_nvfp4},
 #endif
   };
   static const std::vector<Implementation> gemm_geglu_entries = {
@@ -204,6 +265,11 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        cutlass_geglu_alignment, cutlass_geglu_resource_requirements,
        one_configuration, prepare_cutlass_geglu,
        launch_cutlass_bf16_geglu, destroy_cutlass},
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-geglu",
+       kDeviceFeatureCutlassSm100, true, true, supports_cutlass_nvfp4_geglu,
+       cutlass_nvfp4_alignment, cutlass_nvfp4_resource_requirements,
+       cutlass_nvfp4_configurations, prepare_cutlass_nvfp4_gemm,
+       launch_cutlass_nvfp4_gemm, destroy_cutlass_nvfp4},
 #endif
   };
   switch (semantic) {

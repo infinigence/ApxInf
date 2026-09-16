@@ -215,9 +215,8 @@ impl CudaBuffer {
     /// The caller must ensure the requested shape and dtype exactly describe
     /// the underlying bytes.
     pub fn as_tensor(&self, shape: Shape, dtype: DType) -> Result<Tensor, String> {
-        let expected = shape
-            .numel()
-            .checked_mul(dtype.size_in_bytes())
+        let expected = dtype
+            .storage_bytes_for(shape.numel())
             .ok_or_else(|| "CUDA tensor byte size overflow".to_string())?;
         if expected != self.len {
             return Err(format!(

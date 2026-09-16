@@ -110,7 +110,8 @@ cudaError_t launch_postprocess(const Spec& spec,
       has_row_channel_scales(spec)
           ? spec.output_dtype
           : resources.projection_dtype,
-      bindings.a_scales, bindings.b_scales, spec.m, spec.n,
+      static_cast<const float*>(bindings.a_scales),
+      static_cast<const float*>(bindings.b_scales), spec.m, spec.n,
       static_cast<int>(spec.semantic),
       has_row_channel_scales(spec) ? 1 : 0,
       has_row_channel_scales(spec) ? bindings.alpha : 1.0F,

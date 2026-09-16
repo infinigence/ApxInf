@@ -7,7 +7,10 @@
 use apxinf_core::{DType, Shape, Tensor};
 use apxinf_cuda::{
     capture,
-    ops::{gemm, prepare_with_session, with_session, ExecutionSession, GemmArgs},
+    ops::{
+        gemm, gemm_bias_gelu, gemm_geglu, prepare_with_session, with_session, ExecutionSession,
+        GemmArgs, GemmBiasGeluArgs, GemmGegluArgs,
+    },
     CudaBuffer, CudaContext,
 };
 use half::bf16;
@@ -21,6 +24,22 @@ fn bf16_tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Tensor {
     let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer.as_tensor(Shape::new(shape), DType::BF16).unwrap()
+}
+
+fn raw_tensor(device: usize, shape: Vec<usize>, dtype: DType, bytes: &[u8]) -> Tensor {
+    let buffer = CudaBuffer::alloc(bytes.len(), device).unwrap();
+    buffer.copy_from_host(bytes).unwrap();
+    buffer.as_tensor(Shape::new(shape), dtype).unwrap()
+}
+
+fn f16_values(tensor: &Tensor) -> Vec<f32> {
+    let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(2)
+        .map(|value| half::f16::from_bits(u16::from_ne_bytes([value[0], value[1]])).to_f32())
+        .collect()
 }
 
 fn values(tensor: &Tensor) -> Vec<f32> {
@@ -42,6 +61,82 @@ fn run_gemm(
     let mut args = GemmArgs::new(a, b, out);
     args.policy.online_tune = false;
     gemm(ctx, args)
+}
+
+#[test]
+fn public_nvfp4_gemm_contract_is_callable() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, n, k) = (16, 256, 128);
+    let a = raw_tensor(0, vec![m, k], DType::F4E2M1, &vec![0x22; m * k / 2]);
+    let b = raw_tensor(0, vec![k, n], DType::F4E2M1, &vec![0x22; n * k / 2]);
+    let scale_bytes = |rows: usize| rows * (k / 16);
+    let a_scales = raw_tensor(
+        0,
+        vec![m, k / 16],
+        DType::F8UE4M3,
+        &vec![0x38; scale_bytes(m)],
+    );
+    let b_scales = raw_tensor(
+        0,
+        vec![n, k / 16],
+        DType::F8UE4M3,
+        &vec![0x38; scale_bytes(n)],
+    );
+    let mut out = raw_tensor(0, vec![m, n], DType::F16, &vec![0; m * n * 2]);
+
+    let mut args = GemmArgs::nvfp4(&a, &a_scales, &b, &b_scales, &mut out);
+    args.policy.online_tune = false;
+    gemm(&ctx, args).unwrap();
+    assert!(f16_values(&out).iter().all(|&value| value == k as f32));
+}
+
+#[test]
+fn public_nvfp4_fused_contracts_are_callable() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, n, k) = (16, 256, 128);
+    let a = raw_tensor(0, vec![m, k], DType::F4E2M1, &vec![0x22; m * k / 2]);
+    let b = raw_tensor(0, vec![k, n], DType::F4E2M1, &vec![0x22; k * n / 2]);
+    let b_geglu = raw_tensor(0, vec![k, 2 * n], DType::F4E2M1, &vec![0x22; k * n]);
+    let a_scales = raw_tensor(
+        0,
+        vec![m, k / 16],
+        DType::F8UE4M3,
+        &vec![0x38; m * (k / 16)],
+    );
+    let b_scales = raw_tensor(
+        0,
+        vec![n, k / 16],
+        DType::F8UE4M3,
+        &vec![0x38; n * (k / 16)],
+    );
+    let b_geglu_scales = raw_tensor(
+        0,
+        vec![2 * n, k / 16],
+        DType::F8UE4M3,
+        &vec![0x38; 2 * n * (k / 16)],
+    );
+    let bias = raw_tensor(0, vec![n], DType::F16, &vec![0; n * 2]);
+    let mut gelu_out = raw_tensor(0, vec![m, n], DType::F16, &vec![0; m * n * 2]);
+    let mut geglu_out = raw_tensor(0, vec![m, n], DType::F16, &vec![0; m * n * 2]);
+
+    let mut gelu_args = GemmArgs::nvfp4(&a, &a_scales, &b, &b_scales, &mut gelu_out);
+    gelu_args.policy.online_tune = false;
+    gemm_bias_gelu(
+        &ctx,
+        GemmBiasGeluArgs {
+            gemm: gelu_args,
+            bias: &bias,
+        },
+    )
+    .unwrap();
+    let mut geglu_args = GemmArgs::nvfp4(&a, &a_scales, &b_geglu, &b_geglu_scales, &mut geglu_out);
+    geglu_args.policy.online_tune = false;
+    gemm_geglu(&ctx, GemmGegluArgs { gemm: geglu_args }).unwrap();
+
+    assert!(f16_values(&gelu_out).iter().all(|&value| value == 128.0));
+    assert!(f16_values(&geglu_out)
+        .iter()
+        .all(|&value| value == 16_384.0));
 }
 
 #[test]

@@ -12,6 +12,8 @@ typedef enum {
   APXINF_DTYPE_E4M3 = 3,
   APXINF_DTYPE_I8 = 4,
   APXINF_DTYPE_I32 = 5,
+  APXINF_DTYPE_E2M1 = 6,
+  APXINF_DTYPE_UE4M3 = 7,
 } apxinf_dtype_t;
 
 typedef enum {
@@ -25,6 +27,7 @@ typedef enum {
   APXINF_GEMM_QUANT_FP8_UNIT_SCALE = 1,
   APXINF_GEMM_QUANT_FP8_ROW_CHANNEL = 2,
   APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL = 3,
+  APXINF_GEMM_QUANT_NVFP4_BLOCK16 = 4,
 } apxinf_gemm_quantization_t;
 
 typedef enum {
@@ -79,8 +82,9 @@ typedef struct {
   uint64_t b_version;
   uint32_t b_is_immutable;
   const void* bias;
-  const float* a_scales;
-  const float* b_scales;
+  /* F32 for row/channel quantization; raw UE4M3 bytes for NVFP4. */
+  const void* a_scales;
+  const void* b_scales;
   void* output;
   apxinf_cuda_stream_t stream;
   /* Numeric scales are per-call data: they change the result but never which

@@ -187,6 +187,7 @@ fn main() {
                 "gemm_e4m3_geglu_interleaved_sm100.cu",
                 "gemm_bf16_geglu_sm100.cu",
                 "gemm_bf16_geglu_interleaved_sm100.cu",
+                "gemm_nvfp4_sm100.cu",
             ]
             .map(|source| operators.join(source)),
         );
