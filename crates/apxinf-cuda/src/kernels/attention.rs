@@ -233,7 +233,10 @@ pub fn sdpa(
         let kv_shape = Shape::new(vec![seq_len, n_kv_heads, head_dim]);
         let k_t = make_gpu_tensor(kv_shape.clone(), DType::BF16, ctx.device_id(), k_buf);
         let v_t = make_gpu_tensor(kv_shape, DType::BF16, ctx.device_id(), v_buf);
-        return causal_gqa_bf16(ctx, &query, &k_t, &v_t, seq_len);
+        let out = causal_gqa_bf16(ctx, query, &k_t, &v_t, seq_len)?;
+        // Match the materialized path's output contract for callers that
+        // project the attention result directly (for example LlamaModel).
+        return out.reshape(vec![seq_len, n_heads * head_dim]);
     }
 
     let scores = CudaBuffer::alloc(seq_len * n_heads * kv_len * element_bytes, ctx.device_id())

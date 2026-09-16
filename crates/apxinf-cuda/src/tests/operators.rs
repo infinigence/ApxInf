@@ -26,6 +26,61 @@ fn silu_ref(x: f32) -> f32 {
     x / (1.0f32 + (-x).exp())
 }
 
+#[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+#[test]
+fn sdpa_fa2_prefill_supports_direct_output_projection() {
+    assert!(
+        std::env::var_os("APXINF_PREFILL_SDPA_LEGACY").is_none(),
+        "unset APXINF_PREFILL_SDPA_LEGACY to exercise the FA2 fast path"
+    );
+    let _guard = super::gpu_smem_guard();
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kv_heads, head_dim, max_seq) = (4, 2, 128, 8);
+    let width = heads * head_dim;
+    // Select one channel per head, as a small stand-in for Llama's wo.
+    let mut weights = vec![0.0; width * heads];
+    for head in 0..heads {
+        weights[(head * head_dim) * heads + head] = 1.0;
+    }
+    let wo = upload_fp32_as_bf16(&ctx, &weights, vec![width, heads]).unwrap();
+    for tokens in [1, 5] {
+        let q = upload_fp32_as_bf16(
+            &ctx,
+            &vec![0.0; tokens * width],
+            vec![tokens, heads, head_dim],
+        )
+        .unwrap();
+        let kv_shape = vec![tokens, kv_heads, head_dim];
+        let k = upload_fp32_as_bf16(
+            &ctx,
+            &vec![0.0; tokens * kv_heads * head_dim],
+            kv_shape.clone(),
+        )
+        .unwrap();
+        let values: Vec<f32> = (0..tokens * kv_heads * head_dim)
+            .map(|i| (i / (kv_heads * head_dim) + 1) as f32)
+            .collect();
+        let v = upload_fp32_as_bf16(&ctx, &values, kv_shape).unwrap();
+        let cache = crate::CudaKVCache::new(0, 1, kv_heads, head_dim, max_seq).unwrap();
+        cache.append(&ctx, 0, &k, &v, tokens).unwrap();
+        let out = crate::kernels::attention::sdpa(
+            &ctx, &q, &cache, 0, heads, kv_heads, head_dim, tokens, max_seq, 0,
+        )
+        .unwrap();
+        assert_eq!(out.shape().dims(), &[tokens, width]);
+        // No caller-side reshape: this is the LlamaModel calling convention.
+        let projected = crate::kernels::gemm::matmul(&ctx, &out, &wo).unwrap();
+        assert_eq!(projected.shape().dims(), &[tokens, heads]);
+        // Zero Q/K gives uniform causal attention: mean of values 1..=t+1.
+        let expected: Vec<f32> = (0..tokens * heads)
+            .map(|i| (i / heads + 2) as f32 / 2.0)
+            .collect();
+        let actual = download_bf16_as_fp32(&projected).unwrap();
+        assert!(actual.iter().all(|x| x.is_finite()));
+        assert_bf16_close_reduction(&actual, &expected);
+    }
+}
+
 #[test]
 fn silu_bf16_matches_fp32_reference() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
