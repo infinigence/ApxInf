@@ -976,7 +976,7 @@ impl crate::pi05::prepare::PrepareBlocks for backbone::Fp8StaticBlocks {
         tokens: usize,
     ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
         Ok(crate::pi05::prepare::WorkspaceRequirements {
-            bytes: self.config.cuda_graph_workspace_bytes(tokens)?,
+            bytes: self.config.cuda_graph_workspace_bytes_fp8_static(tokens)?,
             fp8_scratch: Some(self.config.fp8_emulation_scratch_elements(tokens)?),
         })
     }

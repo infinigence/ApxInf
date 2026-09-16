@@ -146,7 +146,7 @@ pub(super) fn load_session(
         compute_variant.as_str()
     );
 
-    let network = match compute_variant {
+    let compute = match compute_variant {
         ComputeVariant::Fp8Static => {
             let scales = if let Some(scale) = options.uniform_fp8_scale {
                 Arc::new(Fp8StaticActivationScales::uniform(&config, scale)?)
@@ -159,7 +159,7 @@ pub(super) fn load_session(
                 })?;
                 let checkpoint = checkpoint_identity(path)?;
                 let calibration =
-                    StaticFp8Calibration::from_json_file(&calibration_path, &config, &checkpoint)?;
+                    Fp8StaticCalibration::from_json_file(&calibration_path, &config, &checkpoint)?;
                 Arc::new(Fp8StaticActivationScales::from_calibration(
                     &config,
                     &calibration,
@@ -212,7 +212,7 @@ pub(super) fn load_session(
     Ok(Pi05Session {
         backend,
         config,
-        network,
+        compute,
         prepared: RefCell::new(None),
     })
 }

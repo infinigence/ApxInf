@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
     if arguments.len() < 2 || arguments.len() > 4 {
         return Err(format!(
-            "usage: {} <checkpoint-or-directory> [token-count=21] [bf16|fp8|w8a8]",
+            "usage: {} <checkpoint-or-directory> [token-count=21] [bf16|fp8_static|int8_dynamic]",
             arguments
                 .first()
                 .map(String::as_str)

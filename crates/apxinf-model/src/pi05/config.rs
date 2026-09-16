@@ -199,7 +199,7 @@ impl Pi05Config {
     /// The current graph intentionally gives every intermediate a stable
     /// address. A later liveness planner can reuse slots and reduce this
     /// reservation without changing the captured execution contract.
-    pub fn cuda_graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
         if token_count == 0 || token_count > self.max_token_len {
             return Err(Error::Other(format!(
                 "pi05 token count must be in 1..={}, got {token_count}",
@@ -415,7 +415,7 @@ impl Pi05Config {
     /// doubling the validated FP8 bound is therefore safe while keeping the
     /// shape calculation in one place.
     pub fn cuda_graph_workspace_bytes_bf16(&self, token_count: usize) -> Result<usize> {
-        self.cuda_graph_workspace_bytes(token_count)?
+        self.cuda_graph_workspace_bytes_fp8_static(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 BF16 CUDA workspace exceeds address space".into()))
     }
@@ -427,7 +427,7 @@ impl Pi05Config {
     /// unaligned patch projection additionally stores one INT32 accumulator.
     /// Twice the BF16 arena remains a simple conservative upper bound and also
     /// leaves room for the optional dual-backend correctness verifier.
-    pub fn cuda_graph_workspace_bytes_int8(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_int8_dynamic(&self, token_count: usize) -> Result<usize> {
         self.cuda_graph_workspace_bytes_bf16(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 INT8 CUDA workspace exceeds address space".into()))
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn thor_graph_workspace_is_bounded() {
         let bytes = Pi05Config::thor_two_view()
-            .cuda_graph_workspace_bytes(200)
+            .cuda_graph_workspace_bytes_fp8_static(200)
             .unwrap();
         assert!(bytes > 1_800_000_000);
         assert!(bytes < 2_500_000_000);

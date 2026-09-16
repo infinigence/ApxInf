@@ -13,8 +13,8 @@ use apxinf_core::{Backend, DType, Tensor};
 use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
     upload_time_embeddings_fp8_static, vision_layer_fp8_static, vision_patch_embed_fp8_static,
-    vision_qkv_packed_from_env, Fp8StaticActivationScales, Fp8StaticWeights, Pi05Config,
-    Pi05Weights, StaticFp8Calibration,
+    vision_qkv_packed_from_env, Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticWeights,
+    Pi05Config, Pi05Weights,
 };
 
 fn signature(values: &[f32]) -> serde_json::Value {
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Pi05Config::thor_two_view());
     let checkpoint = apxinf_model::pi05::checkpoint_identity(Path::new(&arguments[1]))?;
     let calibration =
-        StaticFp8Calibration::from_json_file(Path::new(&arguments[2]), &config, &checkpoint)?;
+        Fp8StaticCalibration::from_json_file(Path::new(&arguments[2]), &config, &checkpoint)?;
     let scales = Arc::new(Fp8StaticActivationScales::from_calibration(
         &config,
         &calibration,

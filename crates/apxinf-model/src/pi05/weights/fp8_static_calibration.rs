@@ -124,7 +124,7 @@ fn extend_sites(sites: &mut Vec<String>, layers: &[LayerCalibrationSites]) {
 }
 
 #[derive(Debug, Clone)]
-pub struct StaticFp8Calibration {
+pub struct Fp8StaticCalibration {
     scales: HashMap<String, f32>,
     warnings: Vec<String>,
 }
@@ -233,7 +233,7 @@ impl<'de> Visitor<'de> for ScaleMapVisitor {
     }
 }
 
-impl StaticFp8Calibration {
+impl Fp8StaticCalibration {
     pub fn from_json_file(path: &Path, config: &Pi05Config, checkpoint: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
@@ -823,8 +823,8 @@ mod tests {
         })
     }
 
-    fn parse(value: &serde_json::Value, config: &Pi05Config) -> Result<StaticFp8Calibration> {
-        StaticFp8Calibration::from_json_str(
+    fn parse(value: &serde_json::Value, config: &Pi05Config) -> Result<Fp8StaticCalibration> {
+        Fp8StaticCalibration::from_json_str(
             &serde_json::to_string(value).unwrap(),
             config,
             "sha256:test",
@@ -911,12 +911,12 @@ mod tests {
             "\"scales\":{",
             "\"scales\":{\"vision.patch_input\":{\"amax\":448.0,\"scale\":1.0},",
         );
-        assert!(StaticFp8Calibration::from_json_str(&duplicate, &config, "sha256:test").is_err());
+        assert!(Fp8StaticCalibration::from_json_str(&duplicate, &config, "sha256:test").is_err());
 
         let raw = serde_json::to_string(&profile(&config))
             .unwrap()
             .replace("\"amax\":448.0", "\"amax\":1e400");
-        assert!(StaticFp8Calibration::from_json_str(&raw, &config, "sha256:test").is_err());
+        assert!(Fp8StaticCalibration::from_json_str(&raw, &config, "sha256:test").is_err());
     }
 
     #[test]
@@ -951,8 +951,8 @@ pub use activation_scales::Fp8StaticActivationScales;
 #[cfg(feature = "cuda")]
 mod activation_scales {
     use crate::pi05::{
-        Fp8StaticTransformerLayerScales, Fp8StaticVisionLayerScales, LayerCalibrationSites,
-        Pi05CalibrationPlan, Pi05Config, StaticFp8Calibration,
+        Fp8StaticCalibration, Fp8StaticTransformerLayerScales, Fp8StaticVisionLayerScales,
+        LayerCalibrationSites, Pi05CalibrationPlan, Pi05Config,
     };
     use apxinf_core::{Error, Result};
     #[derive(Clone, Debug)]
@@ -973,7 +973,7 @@ mod activation_scales {
         /// Resolve every graph activation scale from a named calibration file.
         pub fn from_calibration(
             config: &Pi05Config,
-            calibration: &StaticFp8Calibration,
+            calibration: &Fp8StaticCalibration,
         ) -> Result<Self> {
             let plan = Pi05CalibrationPlan::for_config(config);
             let optional_scale = |site: &Option<String>| -> Result<f32> {
@@ -1031,7 +1031,7 @@ mod activation_scales {
         }
 
         /// Useful for kernel smoke tests. Production inference should load named,
-        /// measured scales from `StaticFp8Calibration`.
+        /// measured scales from `Fp8StaticCalibration`.
         pub fn uniform(config: &Pi05Config, scale: f32) -> Result<Self> {
             if !scale.is_finite() || scale <= 0.0 {
                 return Err(Error::Other(format!("invalid uniform FP8 scale {scale}")));

@@ -87,7 +87,7 @@ pub struct Pi05PreparedInference {
     spec: InferenceSpec,
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi05Config>,
-    network: LoadedCompute,
+    compute: LoadedCompute,
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     tuning_generation: u64,
@@ -121,7 +121,7 @@ impl Pi05PreparedInference {
                         )));
                     }
                     raw.copy_from_host(bytes).map_err(Error::Cuda)?;
-                    self.network.preprocess_rgb(
+                    self.compute.preprocess_rgb(
                         raw,
                         &inputs.patches,
                         kernel_image_layout(*layout),
@@ -129,7 +129,7 @@ impl Pi05PreparedInference {
                     None
                 }
             },
-            self.network.input_dtype(),
+            self.compute.input_dtype(),
             patch_shape(&self.config),
             "patches",
         )?;
@@ -140,7 +140,7 @@ impl Pi05PreparedInference {
             InitialLatent::Provided(latent) => {
                 let noise = normalize_tensor(
                     Some(latent),
-                    self.network.input_dtype(),
+                    self.compute.input_dtype(),
                     noise_shape(&self.config),
                     "initial latent",
                 )?
@@ -158,7 +158,7 @@ impl Pi05PreparedInference {
     fn run_eager(&self, inputs: &EagerInputs, request: &VlaRequest<'_>) -> Result<Action> {
         let observation = request.observation;
         self.update_eager_inputs(inputs, request)?;
-        Ok(Action::new(self.network.infer(
+        Ok(Action::new(self.compute.infer(
             &inputs.patches,
             &inputs.token_ids,
             self.spec.token_count,
@@ -173,7 +173,7 @@ impl Pi05PreparedInference {
         request: &VlaRequest<'_>,
     ) -> Result<BTreeMap<String, f32>> {
         self.update_eager_inputs(inputs, request)?;
-        self.network.calibrate(
+        self.compute.calibrate(
             &inputs.patches,
             &inputs.token_ids,
             self.spec.token_count,
@@ -224,7 +224,7 @@ impl Pi05PreparedInference {
         let patches = match &observation.vision {
             VisionObservation::Patches(tensor) => normalize_tensor(
                 Some(tensor),
-                self.network.input_dtype(),
+                self.compute.input_dtype(),
                 patch_shape(&self.config),
                 "patches",
             )?,
@@ -239,7 +239,7 @@ impl Pi05PreparedInference {
                     InitialLatent::Provided(latent) => {
                         let noise = normalize_tensor(
                             Some(latent),
-                            self.network.input_dtype(),
+                            self.compute.input_dtype(),
                             noise_shape(&self.config),
                             "initial latent",
                         )?
@@ -266,7 +266,7 @@ impl Pi05PreparedInference {
 pub struct Pi05Session {
     pub(super) backend: Arc<RuntimeBackend>,
     pub(super) config: Arc<Pi05Config>,
-    pub(super) network: LoadedCompute,
+    pub(super) compute: LoadedCompute,
     pub(super) prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
 }
 
@@ -317,11 +317,11 @@ impl Pi05Session {
             )));
         }
         let cuda = &*self.backend;
-        let dtype = self.network.input_dtype();
+        let dtype = self.compute.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
         let patches = self.backend.to_device(&Tensor::zeros(
             patch_shape(&self.config),
-            self.network.captured_patch_dtype(raw_rgb),
+            self.compute.captured_patch_dtype(raw_rgb),
         ))?;
         let noise = self
             .backend
@@ -355,7 +355,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            network: self.network.clone(),
+            compute: self.compute.clone(),
             strategy: ExecStrategy::Eager(EagerInputs {
                 patches,
                 raw_images,
@@ -375,7 +375,7 @@ impl Pi05Session {
         policy: ExecutionPolicy,
     ) -> Result<Pi05PreparedInference> {
         self.build_prepared_using(spec, policy, |patches, tokens, noise| {
-            self.network.capture(spec, patches, tokens, noise)
+            self.compute.capture(spec, patches, tokens, noise)
         })
     }
 
@@ -426,7 +426,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            network: self.network.clone(),
+            compute: self.compute.clone(),
             strategy,
             fallback_reason,
             normal_generator: RefCell::new(normal_generator),

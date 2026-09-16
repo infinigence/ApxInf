@@ -40,8 +40,8 @@ use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic, Bf16Network, Bf16Weights, CapturedGraph,
-    Fp8StaticActivationScales, Fp8StaticNetwork, Fp8StaticWeights, Int8DynamicNetwork,
-    Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights, StaticFp8Calibration,
+    Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticNetwork, Fp8StaticWeights,
+    Int8DynamicNetwork, Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -946,7 +946,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let checkpoint =
                         apxinf_model::pi05::checkpoint_identity(Path::new(&args.source))?;
-                    let calibration = StaticFp8Calibration::from_json_file(
+                    let calibration = Fp8StaticCalibration::from_json_file(
                         Path::new(path),
                         &config,
                         &checkpoint,

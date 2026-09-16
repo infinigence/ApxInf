@@ -536,7 +536,9 @@ impl crate::pi05::prepare::PrepareBlocks for backbone::Int8DynamicBlocks {
         tokens: usize,
     ) -> apxinf_core::Result<crate::pi05::prepare::WorkspaceRequirements> {
         Ok(crate::pi05::prepare::WorkspaceRequirements {
-            bytes: self.config.cuda_graph_workspace_bytes_int8(tokens)?,
+            bytes: self
+                .config
+                .cuda_graph_workspace_bytes_int8_dynamic(tokens)?,
             fp8_scratch: None,
         })
     }
