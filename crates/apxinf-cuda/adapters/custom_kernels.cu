@@ -1044,6 +1044,9 @@ extern "C" cudaError_t apxinf_static_gdn_tri_solve_f32(
 
 
 // Tile width for the chunk-gemm kernel; APXINF_GDN_CHUNK_GEMM_TILE re-sweeps it.
+// Was 16 while the tiles were float and an SM held two blocks. With the tiles in
+// BF16 an SM holds four, occupancy goes 33% to 66%, and the optimum moves to 32:
+// 6.174 s/scene against 16's 6.183, consistently across repeats.
 static int chunk_gemm_tile() {
   static const int tile = [] {
     if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_TILE")) {
@@ -1053,7 +1056,7 @@ static int chunk_gemm_tile() {
         return requested;
       }
     }
-    return 16;
+    return 32;
   }();
   return tile;
 }
@@ -1102,9 +1105,11 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
-  // vb and kb tiles, precomputed once per chunk (see the kernel comment).
-  const size_t gemm_smem =
-      static_cast<size_t>(chunk_size) * (head_v_dim + head_k_dim) * sizeof(float);
+  // vb and kb tiles, precomputed once per chunk and held in BF16 because every
+  // value in them is already on the BF16 grid (see the kernel comment). 32KB at
+  // the shipped shape rather than 64KB.
+  const size_t gemm_smem = static_cast<size_t>(chunk_size) *
+                           (head_v_dim + head_k_dim) * sizeof(__nv_bfloat16);
   switch (chunk_gemm_tile()) {
     case 1: return launch_chunk_gemm<1>(CHUNK_GEMM_ARGS);
     case 2: return launch_chunk_gemm<2>(CHUNK_GEMM_ARGS);
