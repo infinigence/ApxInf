@@ -143,3 +143,53 @@ root-level driver setting, `NVreg_RestrictProfilingToAdminUsers=0`.
   process the same five variants came out non-monotonic and reordered between
   builds, and one BF16 reference measured 596 us in a cold process and 217 in a
   warm one.
+
+---
+
+# The megakernel question, answered with engine numbers
+
+Asked directly: would a megakernel or persistent runtime over the decode step
+help? The ceiling and the entry price are both measurable, and they are close
+enough together that the answer is no without a change of premise.
+
+**Ceiling.** One scene's kernels, split at the prefill/decode boundary:
+
+    DECODE   2428 ms over 35181 launches
+      four cuBLAS GEMV families   2189 ms   90.2%   8.41 GB/token at ~250 GB/s
+      splitKreduce                  80 ms    3.3%
+      everything a fusion absorbs  159 ms    6.5%   = 4.1% of the scene
+
+**Entry price.** To fuse anything into those GEMVs they have to be ours.
+`APXINF_PLAIN_GEMV=1` routes every batch-1 projection through a hand-written
+kernel over the loader's [k, n] weight -- one thread per output column walking
+k, four columns per thread, one coalesced line per warp per step, x[k] a
+broadcast, no cross-lane reduction:
+
+    cuBLAS         38.100 ms/token
+    hand-written  109.362 ms/token     2.9x slower
+
+The design has parallelism n/4 -- 640 threads at n=2560, 4608 at n=18432,
+against 30720 slots -- which is exactly what cuBLAS's split-K tactics exist to
+fix. Matching them is not a step on the way to a megakernel, it is the work.
+And the arithmetic is unforgiving: being 5% off on 2189 ms of GEMV costs
+109 ms and cancels two thirds of the 159 ms the fusion could win.
+
+# What each remaining lever is worth
+
+Measured or computed from measured quantities, against the current 3.588 s:
+
+| lever | per scene | vs Thor baseline | what it costs |
+|---|---:|---:|---|
+| now | 3.588 s | 1.43x | nothing |
+| + the three changes measured and left off | ~3.40 s | 1.51x | end-to-end accuracy metrics move |
+| + FP8 weights (W8A16) | ~2.52 s | 2.04x | weight quantisation |
+| + NVFP4 weights | ~1.94 s | 2.65x | 4-bit weights |
+| + prefill in FP8/FP4 as well | ~1.44 s | 3.57x | low precision throughout |
+| + speculative decoding at 2.5 accepted | ~0.97 s | 5.3x | all of the above, plus a draft model this checkpoint does not contain |
+
+Stacking every one of them lands near 5.3x. 10x would need the fixed cost and
+the decode both near zero, and at 4 bits the weight sweep still costs 0.79 s
+while the fixed cost keeps 1.15 s of vision tower and GEMM that quantisation
+alone does not touch. On this model and this board, 10x is not a kernel
+problem; it is a different model, a different token budget, or a different
+board.
