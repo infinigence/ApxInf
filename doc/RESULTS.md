@@ -9,15 +9,30 @@ Fixed four-scene 64-token VQA workload, warm median, `control/verify_perf_orin.p
 
 | | per scene | fixed cost | decode |
 |---|---:|---:|---:|
-| Orin, PR72 | 6.0143 s | 2.49 s | 55.2 ms/token |
-| Thor, PR72 as ported | 5.1395 s | 2.421 s | 42.48 ms/token |
-| Thor, this branch | **3.594 s** | **1.152 s** | **37.9 ms/token** |
+| Orin, PR #72 | 6.0143 s | 2.49 s | 55.2 ms/token |
+| Thor, PR #72 head (80b0ecc) | 5.196 s | 2.498 s | 42.03 ms/token |
+| Thor, this branch | **3.534 s** | **1.084 s** | **38.28 ms/token** |
 
-Official geomean against the Thor baseline: **1.4296x** (1.424 / 1.435 / 1.427 /
-1.433 across the four scenes). Against Orin's PR72: 1.67x.
+Geomean against that baseline: **1.4707x** (1.473 / 1.472 / 1.469 / 1.469 across
+the four scenes). Against Orin's PR #72: 1.70x. The fixed cost carried it,
+2.498 -> 1.084 s, 57% off; decode moved 8.9% and cannot move much further.
 
-The fixed cost carried it: 2.421 -> 1.152 s, 52% off. Decode moved 11% and
-cannot move much further; the reason is below.
+Two things about the baseline are worth stating, because both are reasons this
+branch exists.
+
+**PR #72's head does not build on Thor.** `mha_f16`'s CUTLASS FMHA branch is
+compiled for the first time on this device -- every earlier target is outside
+the SM100 family, so the branch had never been through a compiler -- and it
+does not compile: three undefined identifiers and an arity mismatch in
+`attention.rs`. The first commit here fixes that, and the baseline above is
+PR #72's head with only that commit applied.
+
+**And with it applied, it does not run.** `80b0ecc` sets the chunk-state block
+to 1024 threads unconditionally, measured on Orin; on Thor that kernel's
+register demand at 1024 exceeds the budget and the launch fails with CUDA 701,
+"too many resources requested". The baseline was taken with
+`APXINF_GDN_CHUNK_STATE_THREADS=512`. This branch replaces that kernel on the
+SM100 family with a tensor-core form that does not have the problem.
 
 ## What landed
 
