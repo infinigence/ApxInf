@@ -16,6 +16,7 @@ use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
 use crate::workspace::output_buffer;
+use crate::kernels::gdn_policy::GdnLaunchPolicy;
 
 fn expect_bf16(tensor: &Tensor, name: &str) -> Result<()> {
     if tensor.dtype() != DType::BF16 {
@@ -324,6 +325,7 @@ pub fn gdn_attn_raw(
             ("t", t, f32_bytes(num_v_heads * chunks * matrix)?),
         ],
     )?;
+    let policy = GdnLaunchPolicy::for_device(ctx.caps());
     unsafe {
         check_cuda(ffi::apxinf_static_gdn_attn_raw_f32(
             q.ptr(),
@@ -336,6 +338,7 @@ pub fn gdn_attn_raw(
             num_v_heads as i32,
             head_k_dim as i32,
             chunk_size as i32,
+            &policy,
             ctx.stream().handle(),
         ))
     }
@@ -412,6 +415,7 @@ pub fn gdn_chunk_gemm(
             ),
         ],
     )?;
+    let policy = GdnLaunchPolicy::for_device(ctx.caps());
     unsafe {
         check_cuda(ffi::apxinf_static_gdn_chunk_gemm_f32(
             a.ptr(),
@@ -426,6 +430,7 @@ pub fn gdn_chunk_gemm(
             head_k_dim as i32,
             head_v_dim as i32,
             chunk_size as i32,
+            &policy,
             ctx.stream().handle(),
         ))
     }
@@ -491,6 +496,7 @@ pub fn gdn_chunk_state(
             ),
         ],
     )?;
+    let policy = GdnLaunchPolicy::for_device(ctx.caps());
     unsafe {
         check_cuda(ffi::apxinf_static_gdn_chunk_state_f32(
             q.ptr(),
@@ -509,6 +515,7 @@ pub fn gdn_chunk_state(
             chunk_size as i32,
             chunks as i32,
             out_width as i32,
+            &policy,
             ctx.stream().handle(),
         ))
     }
@@ -551,6 +558,7 @@ pub fn gdn_recurrent(
             ),
         ],
     )?;
+    let policy = GdnLaunchPolicy::for_device(ctx.caps());
     unsafe {
         check_cuda(ffi::apxinf_static_gdn_recurrent_f32(
             q.ptr(),
@@ -563,6 +571,7 @@ pub fn gdn_recurrent(
             num_v_heads as i32,
             head_k_dim as i32,
             head_v_dim as i32,
+            &policy,
             ctx.stream().handle(),
         ))
     }

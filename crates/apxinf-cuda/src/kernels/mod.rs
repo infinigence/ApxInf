@@ -12,6 +12,7 @@ pub mod convolution;
 pub mod elementwise;
 pub mod embedding;
 pub mod fused;
+pub mod gdn_policy;
 pub mod gemm;
 pub mod linear_attention;
 pub mod norm;

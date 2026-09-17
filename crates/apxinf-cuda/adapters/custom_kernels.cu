@@ -16,6 +16,7 @@
 // BF16 SiLU intermediate rounding matches unfused activation-then-multiply.
 
 namespace {
+#include "../kernels/custom/gdn_policy.h"
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
@@ -1040,27 +1041,12 @@ extern "C" cudaError_t apxinf_static_gdn_cumsum_f32(
   return cudaGetLastError();
 }
 
-static int device_capability_major();
-
-// Tensor-core form of the raw-attention term, off unless asked for. Neither
-// operand is on the BF16 grid here, so `1` runs the three-term split product
-// and `lossy` the single BF16 pass; see the kernel comment.
-static int wmma_attn_raw_mode() {
-  static const int mode = [] {
-    if (const char* v = std::getenv("APXINF_GDN_ATTN_RAW_WMMA")) {
-      if (v[0] == 'l') return 2;
-      if (v[0] == '0' || v[0] == 'f') return 0;
-      return 1;
-    }
-    return 0;
-  }();
-  return mode;
-}
 
 extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     const void* q, const void* k, const void* beta, const void* g_cum,
     void* a_out, void* t_out, int seq_pad, int num_v_heads, int head_k_dim,
-    int chunk_size, cudaStream_t stream) {
+    int chunk_size, const ApxinfGdnPolicy* policy, cudaStream_t stream) {
+  if (policy == nullptr) return cudaErrorInvalidValue;
   if (q == nullptr || k == nullptr || beta == nullptr || g_cum == nullptr ||
       a_out == nullptr || t_out == nullptr || seq_pad <= 0 ||
       num_v_heads <= 0 || head_k_dim <= 0 || chunk_size <= 0 ||
@@ -1068,11 +1054,12 @@ extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
-  if (wmma_attn_raw_mode() != 0 && head_k_dim == 128 && chunk_size == 64) {
+  if (policy->attn_raw_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
+      chunk_size == 64) {
     const size_t smem =
         static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 4 +
         static_cast<size_t>(64 * 64) * sizeof(float) * 2;
-    const bool split = wmma_attn_raw_mode() == 1;
+    const bool split = policy->attn_raw_wmma >= APXINF_GDN_WMMA_SPLIT2;
     const void* entry =
         split ? reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<true>)
               : reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<false>);
@@ -1142,83 +1129,6 @@ extern "C" cudaError_t apxinf_static_gdn_tri_solve_f32(
 }
 
 
-// Which form of the GDN chunk kernels to run:
-//   1 split BF16 passes (default on the SM100 family), 2 one lossy pass,
-//   0 the scalar kernels. APXINF_GDN_CHUNK_STATE_WMMA selects for both.
-static int device_capability_major();
-
-// The same three forms for the chunk GEMM, selected separately and off unless
-// asked for; see the comment at its dispatch.
-static int wmma_chunk_gemm_mode() {
-  static const int mode = [] {
-    if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_WMMA")) {
-      const int n = std::atoi(v);
-      if (n >= 1 && n <= 3) return n;
-      if (v[0] == 'l') return 1;
-      return 0;
-    }
-    // Off by default. Three passes put the operator within 3.947170e-7 of an
-    // fp64 reference against the scalar form's 1.369621e-7 -- four orders of
-    // magnitude below the BF16 grid these results are written on -- but the
-    // end-to-end probe still moves, and 1.9% of the scene is not enough to
-    // decide that on the owner's behalf. Use 3, not 2: it closes 98% of the
-    // oracle gap for the same speed.
-    return 0;
-  }();
-  return mode;
-}
-
-static int wmma_chunk_mode() {
-  static const int mode = [] {
-    if (const char* v = std::getenv("APXINF_GDN_CHUNK_STATE_WMMA")) {
-      if (v[0] == 'l') return 2;
-      if (v[0] == '0' || v[0] == 'f') return 0;
-      return 1;
-    }
-    return device_capability_major() >= 10 ? 1 : 0;
-  }();
-  return mode;
-}
-
-// Compute-capability major of the current device, cached. The two GDN tile
-// widths below are not portable constants: each was swept on one board and the
-// optimum is not the same on the next one, so the default has to know which
-// board it is on.
-static int device_capability_major() {
-  static const int major = [] {
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) return 8;
-    int value = 8;
-    if (cudaDeviceGetAttribute(&value, cudaDevAttrComputeCapabilityMajor, device) !=
-        cudaSuccess) {
-      return 8;
-    }
-    return value;
-  }();
-  return major;
-}
-
-// Tile width for the chunk-gemm kernel; APXINF_GDN_CHUNK_GEMM_TILE re-sweeps it.
-// Was 16 while the tiles were float and an SM held two blocks. With the tiles in
-// BF16 an SM holds four, occupancy goes 33% to 66%, and the optimum moves to 32:
-// 6.174 s/scene against 16's 6.183, consistently across repeats.
-static int chunk_gemm_tile() {
-  static const int tile = [] {
-    if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_TILE")) {
-      const int requested = std::atoi(v);
-      if (requested == 1 || requested == 2 || requested == 4 ||
-          requested == 8 || requested == 16 || requested == 32) {
-        return requested;
-      }
-    }
-    // Orin (sm_87) swept to 16 with float tiles and to 32 once they were BF16.
-    // Thor (sm_110) swept to 4 either way: with float tiles 2.1706/2.1722 s of
-    // fixed cost at 4 against 2.1800/2.1834 at 16, and with BF16 tiles
-    // 1.5086 at 4 against 1.5290, 1.5324 and 1.5473 at 8, 16 and 32.
-    return device_capability_major() >= 10 ? 4 : 32;
-  }();
-  return tile;
-}
 
 #define CHUNK_GEMM_ARGS                                                    \
   chunks, num_v_heads, gemm_smem, stream, a, v, k, beta, g_cum, vt_out,    \
@@ -1256,7 +1166,8 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
     const void* a, const void* v, const void* k, const void* beta,
     const void* g_cum, void* vt_out, void* kcd_out,
     int seq_pad, int num_v_heads, int head_k_dim, int head_v_dim,
-    int chunk_size, cudaStream_t stream) {
+    int chunk_size, const ApxinfGdnPolicy* policy, cudaStream_t stream) {
+  if (policy == nullptr) return cudaErrorInvalidValue;
   if (a == nullptr || v == nullptr || k == nullptr || beta == nullptr ||
       g_cum == nullptr || vt_out == nullptr || kcd_out == nullptr ||
       seq_pad <= 0 || num_v_heads <= 0 || head_k_dim <= 0 ||
@@ -1275,12 +1186,13 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   // 21.6x more, though both sit far below the BF16 grid the results are
   // written on. It is worth 1.9% of the scene and the end-to-end probe moves
   // with it, so it is the owner's call rather than a default.
-  if (wmma_chunk_gemm_mode() != 0 && head_k_dim == 128 && head_v_dim == 128 &&
+  if (policy->chunk_gemm_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
+      head_v_dim == 128 &&
       chunk_size == 64) {
     const size_t smem = static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 2 +
                         static_cast<size_t>(64 * 64) * sizeof(__nv_bfloat16) * 3 +
                         static_cast<size_t>(64 * 128) * sizeof(float);
-    const int passes = wmma_chunk_gemm_mode();
+    const int passes = policy->chunk_gemm_wmma;
     const void* entry =
         passes == 3 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<3>)
         : passes == 2 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<2>)
@@ -1313,7 +1225,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
 #undef GDN_GEMM_WMMA_ARGS
     return cudaGetLastError();
   }
-  switch (chunk_gemm_tile()) {
+  switch (policy->chunk_gemm_tile) {
     case 1: return launch_chunk_gemm<1>(CHUNK_GEMM_ARGS);
     case 2: return launch_chunk_gemm<2>(CHUNK_GEMM_ARGS);
     case 4: return launch_chunk_gemm<4>(CHUNK_GEMM_ARGS);
@@ -1324,33 +1236,6 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
 }
 
 
-// Tile width for the chunk-state kernel, one instantiation per value.
-// Orin (sm_87) prefill seconds at the shipped shape, one binary, one session:
-//   tile  1 -> 3.262   2 -> 3.261   4 -> 3.193   8 -> 2.830   16 -> 3.057
-// Reuse rises with the tile and so does register pressure, and 8 is where the
-// two cross: past it the block loses an SM slot and gives back more than the
-// saved shared reads were worth. Not a value worth guessing -- 16 looked like
-// the obvious choice and is 8% slower than 8.
-//
-// Thor (sm_110) crosses one step earlier. Fixed cost, same sweep:
-//   tile  1 -> 2.277   2 -> 2.253   4 -> 2.181   8 -> 2.246   16 -> 2.823
-// 4 is 2.9% better than Orin's 8, and 16 is now 26% worse rather than 8%.
-// Thor has 20 SMs against Orin's 16 and 228 KB of shared memory per SM against
-// 164 KB, so the occupancy step that decides this sits at a different tile.
-// APXINF_GDN_CHUNK_TILE overrides it for re-sweeps on other shapes.
-static int chunk_state_tile() {
-  static const int tile = [] {
-    if (const char* v = std::getenv("APXINF_GDN_CHUNK_TILE")) {
-      const int requested = std::atoi(v);
-      if (requested == 1 || requested == 2 || requested == 4 ||
-          requested == 8 || requested == 16) {
-        return requested;
-      }
-    }
-    return device_capability_major() >= 10 ? 4 : 8;
-  }();
-  return tile;
-}
 
 #define CHUNK_STATE_ARGS                                                      \
   num_v_heads, block_threads, smem, stream, q, k, g_cum, t_in, vt_in, kcd_in, \
@@ -1393,7 +1278,8 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
     const void* vt_in, const void* kcd_in, void* state, void* out,
     int seq, int seq_pad, int num_v_heads, int head_k_dim, int head_v_dim,
     int chunk_size, int total_chunks, int out_row_width,
-    cudaStream_t stream) {
+    const ApxinfGdnPolicy* policy, cudaStream_t stream) {
+  if (policy == nullptr) return cudaErrorInvalidValue;
   if (q == nullptr || k == nullptr || g_cum == nullptr || t_in == nullptr ||
       vt_in == nullptr || kcd_in == nullptr || state == nullptr ||
       out == nullptr || seq <= 0 || seq_pad < seq || num_v_heads <= 0 ||
@@ -1425,15 +1311,13 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // prologue. Re-measured on orin2, four interleaved pairs, every 1024 sample
   // faster than every 512 sample: 5.9319 s/scene mean against 5.9564, 0.41%.
   //
-  // Re-sweep with APXINF_GDN_CHUNK_STATE_THREADS after changing this kernel;
-  // the optimum has now moved once and will again.
-  int block_threads = block_ok(1024) ? 1024 : (block_ok(512) ? 512 : 256);
-  if (const char* tuned = std::getenv("APXINF_GDN_CHUNK_STATE_THREADS")) {
-    const int requested = std::atoi(tuned);
-    if (block_ok(requested)) {
-      block_threads = requested;
-    }
-  }
+  // Re-sweep after changing this kernel; the optimum has moved once already
+  // and will again. The width comes from the policy table, and anything the
+  // shape cannot take falls back rather than launching something invalid --
+  // 1024 exceeds the register budget for this kernel on some boards.
+  int block_threads = block_ok(policy->chunk_state_threads)
+                          ? policy->chunk_state_threads
+                          : (block_ok(512) ? 512 : 256);
   // v_new, a BF16 copy of the carried state, and a BF16 tile holding v_new's
   // round trip for the chunk (see the kernel comment). 32KB + 32KB + 16KB at
   // the shipped shape, so two blocks still fit in an SM's 164KB.
@@ -1450,15 +1334,16 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   //   unset         -> the scalar kernel
   // Default on where the tensor cores are worth this much: on Thor the split
   // form is 1.4623 -> 1.1909 s of fixed cost at the same error.
-  const int wmma_mode = wmma_chunk_mode();
-  if (wmma_mode != 0 && head_k_dim == 128 && head_v_dim == 128 && chunk_size == 64) {
+  const bool wmma_split = policy->chunk_state_wmma >= APXINF_GDN_WMMA_SPLIT2;
+  if (policy->chunk_state_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
+      head_v_dim == 128 && chunk_size == 64) {
     const size_t wmma_smem =
         static_cast<size_t>(128 * 128) * sizeof(__nv_bfloat16) +  // state
         static_cast<size_t>(64) * 1024 +                          // left operands
         static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) +   // v_round
         static_cast<size_t>(64 * 128) * sizeof(float) * 2;        // v_new, inter/out
     const void* entry =
-        wmma_mode == 1
+        wmma_split
             ? reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<true>)
             : reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<false>);
     static const void* opted_in = nullptr;
@@ -1479,7 +1364,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
       static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),     \
       static_cast<float*>(state), static_cast<__nv_bfloat16*>(out), seq,       \
       seq_pad, total_chunks, out_row_width, chunk_scale
-    if (wmma_mode == 1) {
+    if (wmma_split) {
       gdn_chunk_state_wmma_kernel<true>
           <<<num_v_heads, 1024, wmma_smem, stream>>>(GDN_WMMA_ARGS);
     } else {
@@ -1490,7 +1375,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
     return cudaGetLastError();
   }
 
-  const int tile = chunk_state_tile();
+  const int tile = policy->chunk_state_tile;
   cudaError_t launched = cudaErrorInvalidValue;
   switch (tile) {
     case 1: launched = launch_chunk_state<1>(CHUNK_STATE_ARGS); break;
@@ -1506,7 +1391,9 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
 extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
     const void* q, const void* k, const void* v, const void* beta,
     const void* g, void* state, void* out,
-    int num_v_heads, int head_k_dim, int head_v_dim, cudaStream_t stream) {
+    int num_v_heads, int head_k_dim, int head_v_dim,
+    const ApxinfGdnPolicy* policy, cudaStream_t stream) {
+  if (policy == nullptr) return cudaErrorInvalidValue;
   if (q == nullptr || k == nullptr || v == nullptr || beta == nullptr ||
       g == nullptr || state == nullptr || out == nullptr ||
       num_v_heads <= 0 || head_k_dim <= 0 || head_v_dim <= 0) {
@@ -1515,18 +1402,10 @@ extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
   // Split width for the decode recurrence. The scalar kernel is SPLIT=1 and
   // stays available for any shape the split form is not instantiated for, and
   // for A/B on one binary: APXINF_GDN_RECURRENT_SPLIT=1 selects it.
-  static const int split = [] {
-    if (const char* v = std::getenv("APXINF_GDN_RECURRENT_SPLIT")) {
-      const int requested = std::atoi(v);
-      // 8 asks for 1024 threads each holding 16 registers of state and is
-      // rejected by the launcher with "too many resources requested"; it is
-      // not offered.
-      if (requested == 1 || requested == 2 || requested == 4) {
-        return requested;
-      }
-    }
-    return device_capability_major() >= 10 ? 4 : 1;
-  }();
+  // 8 would ask for 1024 threads each holding 16 registers of state and the
+  // launcher rejects it with "too many resources requested", so the policy
+  // does not offer it.
+  const int split = policy->recurrent_split;
   if (split > 1 && head_k_dim == 128) {
     const size_t smem =
         (static_cast<size_t>(2 * head_k_dim) +

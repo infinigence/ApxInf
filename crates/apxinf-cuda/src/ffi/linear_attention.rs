@@ -3,6 +3,7 @@
 use std::ffi::c_void;
 
 use super::cuda::{cudaError_t, cudaStream_t};
+use crate::kernels::gdn_policy::GdnLaunchPolicy;
 
 extern "C" {
     pub fn apxinf_static_cast_f32_bf16(
@@ -108,6 +109,7 @@ extern "C" {
         num_v_heads: i32,
         head_k_dim: i32,
         chunk_size: i32,
+        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_gdn_tri_solve_f32(
@@ -130,6 +132,7 @@ extern "C" {
         head_k_dim: i32,
         head_v_dim: i32,
         chunk_size: i32,
+        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
@@ -150,6 +153,7 @@ extern "C" {
         chunk_size: i32,
         total_chunks: i32,
         out_row_width: i32,
+        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
@@ -164,6 +168,7 @@ extern "C" {
         num_v_heads: i32,
         head_k_dim: i32,
         head_v_dim: i32,
+        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
