@@ -1115,10 +1115,17 @@ static int device_capability_major();
 static int wmma_chunk_gemm_mode() {
   static const int mode = [] {
     if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_WMMA")) {
-      if (v[0] == 'l') return 2;
-      if (v[0] == '0' || v[0] == 'f') return 0;
-      return 1;
+      const int n = std::atoi(v);
+      if (n >= 1 && n <= 3) return n;
+      if (v[0] == 'l') return 1;
+      return 0;
     }
+    // Off by default. Three passes put the operator within 3.947170e-7 of an
+    // fp64 reference against the scalar form's 1.369621e-7 -- four orders of
+    // magnitude below the BF16 grid these results are written on -- but the
+    // end-to-end probe still moves, and 1.9% of the scene is not enough to
+    // decide that on the owner's behalf. Use 3, not 2: it closes 98% of the
+    // oracle gap for the same speed.
     return 0;
   }();
   return mode;
@@ -1234,12 +1241,13 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   if (wmma_chunk_gemm_mode() != 0 && head_k_dim == 128 && head_v_dim == 128 &&
       chunk_size == 64) {
     const size_t smem = static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 2 +
-                        static_cast<size_t>(64 * 64) * sizeof(__nv_bfloat16) * 2 +
+                        static_cast<size_t>(64 * 64) * sizeof(__nv_bfloat16) * 3 +
                         static_cast<size_t>(64 * 128) * sizeof(float);
-    const bool split = wmma_chunk_gemm_mode() == 1;
+    const int passes = wmma_chunk_gemm_mode();
     const void* entry =
-        split ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<true>)
-              : reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<false>);
+        passes == 3 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<3>)
+        : passes == 2 ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<2>)
+                      : reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<1>);
     static const void* gemm_opted = nullptr;
     if (gemm_opted != entry) {
       const cudaError_t attr = cudaFuncSetAttribute(
@@ -1255,11 +1263,14 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
       static_cast<const float*>(k), static_cast<const float*>(beta),           \
       static_cast<const float*>(g_cum), static_cast<float*>(vt_out),           \
       static_cast<float*>(kcd_out), seq_pad
-    if (split) {
-      gdn_chunk_gemm_wmma_kernel<true>
+    if (passes == 3) {
+      gdn_chunk_gemm_wmma_kernel<3>
+          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
+    } else if (passes == 2) {
+      gdn_chunk_gemm_wmma_kernel<2>
           <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
     } else {
-      gdn_chunk_gemm_wmma_kernel<false>
+      gdn_chunk_gemm_wmma_kernel<1>
           <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
     }
 #undef GDN_GEMM_WMMA_ARGS

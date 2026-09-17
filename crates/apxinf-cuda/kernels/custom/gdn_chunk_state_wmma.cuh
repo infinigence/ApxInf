@@ -34,6 +34,22 @@ __device__ __forceinline__ void gdn_split_bf16(float x, __nv_bfloat16* hi,
   *lo = __float2bfloat16(x - __bfloat162float(h));
 }
 
+// Three BF16 terms rather than two. Two carry the operand to about 2^-16
+// relative, which is below what a BF16 right operand contributes and so is
+// free in the chunk-state scan; it is not free where the product is otherwise
+// nearly exact, and the third term takes the residual to roughly 2^-24, the
+// resolution fp32 itself has.
+__device__ __forceinline__ void gdn_split3_bf16(float x, __nv_bfloat16* hi,
+                                                __nv_bfloat16* mid,
+                                                __nv_bfloat16* lo) {
+  const __nv_bfloat16 h = __float2bfloat16(x);
+  const float r1 = x - __bfloat162float(h);
+  const __nv_bfloat16 m = __float2bfloat16(r1);
+  *hi = h;
+  *mid = m;
+  *lo = __float2bfloat16(r1 - __bfloat162float(m));
+}
+
 // One block per value head, 32 warps, shapes fixed; the launcher checks them.
 // SPLIT selects one pass (left operand rounded to BF16) or two (hi + lo).
 template <bool SPLIT>

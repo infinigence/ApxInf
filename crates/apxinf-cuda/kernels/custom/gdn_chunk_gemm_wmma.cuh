@@ -13,7 +13,10 @@
 // warps, one output column block each.
 #pragma once
 
-template <bool SPLIT>
+// PASSES is how many BF16 terms carry `a`: 1 rounds it, 2 reaches about
+// 2^-16, 3 reaches fp32's own 2^-24. Both outputs here are rounded to BF16, so
+// the scalar form is nearly exact and only 3 matches it.
+template <int PASSES>
 __global__ __launch_bounds__(256) void gdn_chunk_gemm_wmma_kernel(
     const float* __restrict__ a, const float* __restrict__ v,
     const float* __restrict__ k, const float* __restrict__ beta,
@@ -23,7 +26,6 @@ __global__ __launch_bounds__(256) void gdn_chunk_gemm_wmma_kernel(
   constexpr int C = 64;    // chunk_size
   constexpr int V = 128;   // head_v_dim == head_k_dim
   constexpr int T = 16;
-  constexpr int PASSES = SPLIT ? 2 : 1;
 
   const int head = blockIdx.y;
   const int chunk = blockIdx.x;
@@ -41,7 +43,8 @@ __global__ __launch_bounds__(256) void gdn_chunk_gemm_wmma_kernel(
   __nv_bfloat16* s_vb = reinterpret_cast<__nv_bfloat16*>(gdn_gemm_wmma_smem);  // [C][V]
   __nv_bfloat16* s_kb = s_vb + C * V;                                          // [C][V]
   __nv_bfloat16* s_a_hi = s_kb + C * V;                                        // [C][C]
-  __nv_bfloat16* s_a_lo = s_a_hi + C * C;                                      // [C][C]
+  __nv_bfloat16* s_a_mid = s_a_hi + C * C;                                     // [C][C]
+  __nv_bfloat16* s_a_lo = s_a_mid + C * C;                                     // [C][C]
   // The fragment element layout is implementation-defined, so the results are
   // staged here before the BF16 rounding and the strided write. [C][C] of
   // BF16 is a quarter of what [C][V] of float needs, so this is its own.
@@ -56,7 +59,7 @@ __global__ __launch_bounds__(256) void gdn_chunk_gemm_wmma_kernel(
     s_kb[idx] = __float2bfloat16(kb0 * gdn_exp2_approx(g_cum[token_base + m]));
   }
   for (int idx = tid; idx < C * C; idx += nthreads) {
-    gdn_split_bf16(a[a_base + idx], &s_a_hi[idx], &s_a_lo[idx]);
+    gdn_split3_bf16(a[a_base + idx], &s_a_hi[idx], &s_a_mid[idx], &s_a_lo[idx]);
   }
   __syncthreads();
 
@@ -75,7 +78,8 @@ __global__ __launch_bounds__(256) void gdn_chunk_gemm_wmma_kernel(
     wmma::load_matrix_sync(fkb, s_kb + (kk * T) * V + tcol * T, V);
 #pragma unroll
     for (int pass = 0; pass < PASSES; ++pass) {
-      const __nv_bfloat16* ap = pass ? s_a_lo : s_a_hi;
+      const __nv_bfloat16* ap =
+          pass == 0 ? s_a_hi : (pass == 1 ? s_a_mid : s_a_lo);
 #pragma unroll
       for (int r = 0; r < C / T; ++r) {
         wmma::load_matrix_sync(fa, ap + (r * T) * C + kk * T, C);
