@@ -130,6 +130,41 @@ __global__ void packed_gemv_bf16_kernel(
   if (lane == 0) y[col] = __float2bfloat16(acc);
 }
 
+// Plain BF16 batch-1 GEMV over the loader's own `[k, n]` row-major weight.
+//
+// Not for production: it exists to answer whether a hand-written GEMV can
+// match cuBLAS on the decode shapes, which is the precondition for any fused
+// decode kernel. 90% of decode is these GEMVs at 96% of the memory roofline,
+// so a megakernel that replaces them with something slower loses more on the
+// GEMV than fusing every norm and activation into it can win.
+//
+// The `[k, n]` layout wants a different shape of kernel than `[n, k]` does:
+// one thread per output column, walking k. Consecutive threads then hold
+// consecutive n and read consecutive addresses, so every step is one fully
+// coalesced line per warp and x[k] is a broadcast, with no cross-lane
+// reduction at the end. Four columns per thread through a float4.
+__global__ void plain_gemv_kn_bf16_kernel(const __nv_bfloat16* __restrict__ w,
+                                          const __nv_bfloat16* __restrict__ x,
+                                          __nv_bfloat16* __restrict__ y, int n,
+                                          int k) {
+  const int col = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (col >= n) return;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const __nv_bfloat16* wp = w + col;
+  for (int i = 0; i < k; ++i) {
+    const float xv = __bfloat162float(x[i]);
+    const short4 packed = *reinterpret_cast<const short4*>(wp + static_cast<int64_t>(i) * n);
+    const __nv_bfloat16* wl = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = fmaf(__bfloat162float(wl[j]), xv, acc[j]);
+  }
+  short4 out;
+  __nv_bfloat16* ol = reinterpret_cast<__nv_bfloat16*>(&out);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) ol[j] = __float2bfloat16(acc[j]);
+  *reinterpret_cast<short4*>(y + col) = out;
+}
+
 }  // namespace
 
 extern "C" cudaError_t apxinf_pack_bf16_transposed(
@@ -162,5 +197,20 @@ extern "C" cudaError_t apxinf_packed_gemv_bf16(
       static_cast<const uint8_t*>(lo), static_cast<const uint8_t*>(off_lo),
       static_cast<const uint8_t*>(off_hi), static_cast<const uint8_t*>(base),
       static_cast<const __nv_bfloat16*>(x), static_cast<__nv_bfloat16*>(y), n, k);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_plain_gemv_bf16(
+    const void* w, const void* x, void* y, int n, int k, cudaStream_t stream) {
+  if (w == nullptr || x == nullptr || y == nullptr || n <= 0 || k <= 0 ||
+      n % 4 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int threads = 256;
+  const int cols_per_block = threads * 4;
+  plain_gemv_kn_bf16_kernel<<<(n + cols_per_block - 1) / cols_per_block, threads,
+                              0, stream>>>(
+      static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(x),
+      static_cast<__nv_bfloat16*>(y), n, k);
   return cudaGetLastError();
 }

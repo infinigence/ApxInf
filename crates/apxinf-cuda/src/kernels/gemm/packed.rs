@@ -58,6 +58,13 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+/// Whether the hand-written BF16 GEMV replaces cuBLAS for decode. A
+/// diagnostic: it answers what a fused decode kernel would have to start from.
+pub(crate) fn plain_gemv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("APXINF_PLAIN_GEMV").is_some())
+}
+
 /// Narrowest output width worth packing.
 ///
 /// The GEMV over the packed form wins above this and loses badly below it.

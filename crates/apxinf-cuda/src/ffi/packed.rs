@@ -21,6 +21,16 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    /// `y[n] = sum_k w[n][k] * x[k]` over a plain BF16 `[n, k]` weight.
+    pub fn apxinf_plain_gemv_bf16(
+        w: *const c_void,
+        x: *const c_void,
+        y: *mut c_void,
+        n: i32,
+        k: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     /// `y[n] = sum_k w[n][k] * x[k]` over the packed planes.
     pub fn apxinf_packed_gemv_bf16(
         lo: *const c_void,

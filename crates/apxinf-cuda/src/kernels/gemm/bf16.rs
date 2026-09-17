@@ -404,6 +404,24 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
     // One row is a decode step, where the GEMM is a weight sweep and the only
     // thing worth changing is how many bytes the sweep reads. The packed form
     // reconstructs the same sixteen bits, so this returns the same output.
+    // Diagnostic: the hand-written GEMV over the loader's own [k, n] weight,
+    // to compare against cuBLAS in the engine rather than in a microbenchmark.
+    if m == 1 && super::packed::plain_gemv_enabled() && n % 4 == 0 {
+        let vector = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+        let weights = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::apxinf_plain_gemv_bf16(
+                weights.ptr(),
+                vector.ptr(),
+                output.ptr(),
+                n as i32,
+                k as i32,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16));
+    }
     if m == 1 && super::packed::enabled() {
         let vector = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
         if super::packed::gemv(ctx, weight, &vector, &output, k, n)? {
