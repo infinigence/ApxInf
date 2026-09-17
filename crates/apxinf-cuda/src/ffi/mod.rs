@@ -14,6 +14,7 @@ mod cutlass;
 mod driver;
 mod fa2;
 mod linear_attention;
+mod packed;
 
 pub(crate) use cublas::*;
 pub(crate) use cublaslt::*;
@@ -23,3 +24,4 @@ pub(crate) use cutlass::*;
 pub(crate) use driver::*;
 pub(crate) use fa2::*;
 pub(crate) use linear_attention::*;
+pub(crate) use packed::*;

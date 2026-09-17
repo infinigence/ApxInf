@@ -401,6 +401,15 @@ pub fn gemm_bf16(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Res
 
     let (m, k, n) = (activation_shape[0], activation_shape[1], weight_shape[1]);
     let output = output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    // One row is a decode step, where the GEMM is a weight sweep and the only
+    // thing worth changing is how many bytes the sweep reads. The packed form
+    // reconstructs the same sixteen bits, so this returns the same output.
+    if m == 1 && super::packed::enabled() {
+        let vector = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+        if super::packed::gemv(ctx, weight, &vector, &output, k, n)? {
+            return Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16));
+        }
+    }
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     let key = tuning_key(ctx, m, n, k);

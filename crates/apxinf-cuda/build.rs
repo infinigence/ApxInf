@@ -315,6 +315,7 @@ fn main() {
                 std::path::Path::new(&adapters_dir).join("custom_kernels.cu"),
                 std::path::Path::new(&adapters_dir).join("cublas_adapter.cu"),
                 std::path::Path::new(&adapters_dir).join("cublaslt_adapter.cu"),
+                std::path::Path::new(&adapters_dir).join("packed_bf16_adapter.cu"),
             ];
             assert!(
                 kernel_files.iter().all(|path| path.is_file()),
