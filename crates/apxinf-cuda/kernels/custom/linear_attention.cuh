@@ -635,6 +635,97 @@ __global__ void gdn_chunk_state_kernel(
 
 // Rank-1 recurrent update for single-token decode:
 //   S *= exp(g); kv = S^T k; delta = (v - kv) * beta; S += k x delta; out = S^T q
+// Decode-step GDN recurrence, one block per value head, SPLIT threads per
+// output column.
+//
+// The one-thread-per-column form this replaces launches num_v_heads blocks of
+// head_v_dim threads -- 32 x 128 = 4096 threads on a device with 30720 thread
+// slots, 13% occupancy -- and each of those threads walks all head_k_dim rows
+// of the state with a dependent global load per row. It also touches the state
+// four times: read and write in the decay pass, read and write again in the
+// update pass, 8 MB per layer where 4 MB is the work.
+//
+// Here each column is owned by SPLIT threads, each holding head_k_dim/SPLIT
+// decayed rows in registers across the two passes. The state is read once and
+// written once, and the thread count rises by SPLIT.
+//
+// The k-term sums change association: each thread sums its own contiguous
+// stripe and the stripes are then combined in index order through shared
+// memory, instead of one sequential sum over all head_k_dim terms. Same terms,
+// same fp32 arithmetic, different grouping.
+// HEAD_K is a template parameter only so the register stripe has a
+// compile-time size; the launcher dispatches it from head_k_dim and falls
+// back to the scalar kernel for any shape it does not instantiate.
+template <int SPLIT, int HEAD_K>
+__global__ void gdn_recurrent_split_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ beta,
+    const float* __restrict__ g, float* state, __nv_bfloat16* out,
+    int head_k_dim, int head_v_dim) {
+  const int head = blockIdx.x;
+  const int j = threadIdx.x % head_v_dim;       // output column
+  const int slot = threadIdx.x / head_v_dim;    // which stripe of rows
+  constexpr int rows = HEAD_K / SPLIT;          // rows this thread owns
+
+  extern __shared__ float la_split[];
+  float* k_row = la_split;                      // head_k_dim
+  float* q_row = k_row + head_k_dim;            // head_k_dim
+  float* partial = q_row + head_k_dim;          // head_v_dim * SPLIT
+  for (int d = threadIdx.x; d < head_k_dim; d += blockDim.x) {
+    const int64_t base = static_cast<int64_t>(head) * head_k_dim + d;
+    k_row[d] = k[base];
+    q_row[d] = q[base];
+  }
+  __syncthreads();
+
+  const float g_exp = expf(g[head]);
+  float* state_head = state + static_cast<int64_t>(head) * head_k_dim * head_v_dim;
+
+  // Pass 1: decay this thread's stripe, keep it, and sum k . decayed over it.
+  float decayed[rows];
+  float kv_mem = 0.0f;
+#pragma unroll
+  for (int r = 0; r < rows; ++r) {
+    const int m = slot * rows + r;
+    const float d = state_head[static_cast<int64_t>(m) * head_v_dim + j] * g_exp;
+    decayed[r] = d;
+    kv_mem += d * k_row[m];
+  }
+  partial[slot * head_v_dim + j] = kv_mem;
+  __syncthreads();
+
+  // Combine stripes in index order, so the association is deterministic.
+  float kv_total = 0.0f;
+#pragma unroll
+  for (int sp = 0; sp < SPLIT; ++sp) {
+    kv_total += partial[sp * head_v_dim + j];
+  }
+  const float delta =
+      (v[static_cast<int64_t>(head) * head_v_dim + j] - kv_total) * beta[head];
+
+  // Pass 2: update this thread's stripe from registers, write once, and sum
+  // q . updated over it.
+  float acc = 0.0f;
+#pragma unroll
+  for (int r = 0; r < rows; ++r) {
+    const int m = slot * rows + r;
+    const float updated = decayed[r] + k_row[m] * delta;
+    state_head[static_cast<int64_t>(m) * head_v_dim + j] = updated;
+    acc += updated * q_row[m];
+  }
+  __syncthreads();
+  partial[slot * head_v_dim + j] = acc;
+  __syncthreads();
+  if (slot == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int sp = 0; sp < SPLIT; ++sp) {
+      total += partial[sp * head_v_dim + j];
+    }
+    out[static_cast<int64_t>(head) * head_v_dim + j] = __float2bfloat16(total);
+  }
+}
+
 __global__ void gdn_recurrent_kernel(
     const float* q, const float* k, const float* v, const float* beta,
     const float* g, float* state, __nv_bfloat16* out,

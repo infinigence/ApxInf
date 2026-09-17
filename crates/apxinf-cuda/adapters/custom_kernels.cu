@@ -1294,6 +1294,44 @@ extern "C" cudaError_t apxinf_static_gdn_recurrent_f32(
       num_v_heads <= 0 || head_k_dim <= 0 || head_v_dim <= 0) {
     return cudaErrorInvalidValue;
   }
+  // Split width for the decode recurrence. The scalar kernel is SPLIT=1 and
+  // stays available for any shape the split form is not instantiated for, and
+  // for A/B on one binary: APXINF_GDN_RECURRENT_SPLIT=1 selects it.
+  static const int split = [] {
+    if (const char* v = std::getenv("APXINF_GDN_RECURRENT_SPLIT")) {
+      const int requested = std::atoi(v);
+      // 8 asks for 1024 threads each holding 16 registers of state and is
+      // rejected by the launcher with "too many resources requested"; it is
+      // not offered.
+      if (requested == 1 || requested == 2 || requested == 4) {
+        return requested;
+      }
+    }
+    return device_capability_major() >= 10 ? 4 : 1;
+  }();
+  if (split > 1 && head_k_dim == 128) {
+    const size_t smem =
+        (static_cast<size_t>(2 * head_k_dim) +
+         static_cast<size_t>(head_v_dim) * split) * sizeof(float);
+    const dim3 block(static_cast<unsigned>(head_v_dim * split));
+    if (block.x > 1024u) return cudaErrorInvalidValue;
+#define GDN_SPLIT_ARGS                                                        \
+  static_cast<const float*>(q), static_cast<const float*>(k),                 \
+      static_cast<const float*>(v), static_cast<const float*>(beta),          \
+      static_cast<const float*>(g), static_cast<float*>(state),               \
+      static_cast<__nv_bfloat16*>(out), head_k_dim, head_v_dim
+    switch (split) {
+      case 2:
+        gdn_recurrent_split_kernel<2, 128><<<num_v_heads, block, smem, stream>>>(GDN_SPLIT_ARGS);
+        return cudaGetLastError();
+      case 4:
+        gdn_recurrent_split_kernel<4, 128><<<num_v_heads, block, smem, stream>>>(GDN_SPLIT_ARGS);
+        return cudaGetLastError();
+      default:
+        break;
+    }
+#undef GDN_SPLIT_ARGS
+  }
   const size_t smem = static_cast<size_t>(2 * head_k_dim) * sizeof(float);
   gdn_recurrent_kernel<<<num_v_heads, head_v_dim, smem, stream>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),

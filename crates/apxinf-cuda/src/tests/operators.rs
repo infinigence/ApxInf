@@ -804,6 +804,119 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     );
 }
 
+// ── GDN decode recurrence against an fp64 oracle ──────────────────
+//
+// The split kernel regroups the two k-term sums: each thread sums its own
+// contiguous stripe of rows and the stripes are combined in index order,
+// instead of one sequential sum over all of them. Same terms, same fp32
+// arithmetic, different association. This says what that costs, against a
+// double-precision reference of the same recurrence.
+//
+//   cargo test --release -p apxinf-cuda gdn_recurrent_decode -- --nocapture
+//   APXINF_GDN_RECURRENT_SPLIT=1 cargo test ...   (the scalar kernel)
+#[test]
+fn gdn_recurrent_decode_error_against_fp64_oracle() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kdim, vdim) = (32usize, 128usize, 128usize);
+    let draw = |salt: u64, n: usize, scale: f64| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                (((x & 0xFFFF) as f64 / 32768.0 - 1.0) * scale) as f32
+            })
+            .collect()
+    };
+    // A flat draw does not exercise the regrouping: partial sums of equal-scale
+    // terms round the same way whatever order they are added in, and split 1,
+    // 2 and 4 come out bit-identical. Give k a magnitude ramp across the
+    // reduction axis instead, so the stripes carry different scales and the
+    // association actually matters.
+    let q = draw(11, heads * kdim, 1.0);
+    let k: Vec<f32> = draw(22, heads * kdim, 1.0)
+        .iter()
+        .enumerate()
+        .map(|(i, x)| x * (2.0f32).powi(((i % kdim) as i32 - 64) / 8))
+        .collect();
+    let v = draw(33, heads * vdim, 1.0);
+    let beta = draw(44, heads, 0.5);
+    // g is a log-decay: keep it negative so exp(g) is a contraction.
+    let g: Vec<f32> = draw(55, heads, 0.5).iter().map(|x| -x.abs()).collect();
+    let state0 = draw(66, heads * kdim * vdim, 0.3);
+
+    let upload = |data: &[f32]| -> CudaBuffer {
+        let buf = CudaBuffer::alloc(data.len() * 4, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                buf.ptr(),
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len() * 4,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        buf
+    };
+    let (qb, kb, vb, bb, gb) = (upload(&q), upload(&k), upload(&v), upload(&beta), upload(&g));
+    let sb = upload(&state0);
+    let out = CudaBuffer::alloc(heads * vdim * 2, 0).unwrap();
+
+    crate::kernels::linear_attention::gdn_recurrent(
+        &ctx, &qb, &kb, &vb, &bb, &gb, &sb,
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
+        heads, kdim, vdim,
+    )
+    .unwrap();
+    let got = download_bf16_as_fp32(
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
+    )
+    .unwrap();
+
+    // fp64 reference of the same recurrence.
+    let mut sum_abs = 0.0f64;
+    let mut sum_ref = 0.0f64;
+    let mut worst = 0.0f64;
+    let mut state = vec![0.0f64; kdim * vdim];
+    for h in 0..heads {
+        let g_exp = (g[h] as f64).exp();
+        for i in 0..kdim * vdim {
+            state[i] = state0[h * kdim * vdim + i] as f64 * g_exp;
+        }
+        for j in 0..vdim {
+            let mut kv = 0.0f64;
+            for m in 0..kdim {
+                kv += state[m * vdim + j] * k[h * kdim + m] as f64;
+            }
+            let delta = (v[h * vdim + j] as f64 - kv) * beta[h] as f64;
+            let mut acc = 0.0f64;
+            for m in 0..kdim {
+                let updated = state[m * vdim + j] + k[h * kdim + m] as f64 * delta;
+                acc += updated * q[h * kdim + m] as f64;
+            }
+            let actual = got[h * vdim + j] as f64;
+            let delta_abs = (actual - acc).abs();
+            sum_abs += delta_abs;
+            sum_ref += acc.abs();
+            worst = worst.max(delta_abs / acc.abs().max(1e-6));
+        }
+    }
+    let split = std::env::var("APXINF_GDN_RECURRENT_SPLIT").unwrap_or_else(|_| "default".into());
+    println!(
+        "gdn_recurrent_oracle split={split} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
+        heads * vdim,
+        sum_abs / (heads * vdim) as f64,
+        sum_abs / sum_ref,
+        worst
+    );
+    assert!(
+        sum_abs / sum_ref < 0.02,
+        "GDN decode recurrence relative L1 {} against fp64",
+        sum_abs / sum_ref
+    );
+}
+
 // ── KV cache append ───────────────────────────────────────────────
 
 #[test]
