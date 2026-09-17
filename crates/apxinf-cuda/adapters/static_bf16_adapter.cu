@@ -240,6 +240,12 @@ extern "C" cudaError_t apxinf_static_swiglu_bf16(
   const int64_t count = static_cast<int64_t>(rows) * inner;
   if (gate_up == nullptr || output == nullptr || rows <= 0 || inner <= 0)
     return cudaErrorInvalidValue;
+  if (swiglu_vec8_ok(gate_up, output, inner)) {
+    swiglu_bf16_vec8_kernel<<<blocks_for(count / 8), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate_up),
+        static_cast<__nv_bfloat16*>(output), rows, inner);
+    return cudaGetLastError();
+  }
   swiglu_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(gate_up),
       static_cast<__nv_bfloat16*>(output), rows, inner);
@@ -339,6 +345,31 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_bf16_e4m3(
 extern "C" cudaError_t apxinf_static_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, cudaStream_t stream) {
+  // Cache the row in registers when it divides evenly into the block; the
+  // three-pass kernel below covers everything else.
+  if (cols == kThreads * 2 || cols == kThreads * 4 || cols == kThreads * 8) {
+    const int per_thread = cols / kThreads;
+    if (per_thread == 2) {
+      layer_norm_bf16_cached_kernel<2><<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(input),
+          static_cast<const __nv_bfloat16*>(weight),
+          static_cast<const __nv_bfloat16*>(bias),
+          static_cast<__nv_bfloat16*>(output), rows, cols, eps);
+    } else if (per_thread == 4) {
+      layer_norm_bf16_cached_kernel<4><<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(input),
+          static_cast<const __nv_bfloat16*>(weight),
+          static_cast<const __nv_bfloat16*>(bias),
+          static_cast<__nv_bfloat16*>(output), rows, cols, eps);
+    } else {
+      layer_norm_bf16_cached_kernel<8><<<rows, kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(input),
+          static_cast<const __nv_bfloat16*>(weight),
+          static_cast<const __nv_bfloat16*>(bias),
+          static_cast<__nv_bfloat16*>(output), rows, cols, eps);
+    }
+    return cudaGetLastError();
+  }
   layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<const __nv_bfloat16*>(weight),

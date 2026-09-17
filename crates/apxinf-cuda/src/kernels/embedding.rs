@@ -10,6 +10,33 @@ use crate::buffer::{CudaBuffer, CudaDeviceAddress};
 use crate::context::CudaContext;
 use crate::ffi;
 
+/// `[sin(position*scale*exp(-i*step)), cos(...)]` with BF16 output.
+/// Positions are a contiguous FP32 vector; the two halves each have `dim/2` entries.
+pub fn sinusoidal_bf16(
+    ctx: &CudaContext,
+    positions: &Tensor,
+    dim: usize,
+    scale: f32,
+    frequency_step: f32,
+) -> Result<Tensor> {
+    let shape = positions.shape().dims();
+    if shape.len() != 1 || shape[0] == 0 || dim == 0 || dim % 2 != 0
+        || !scale.is_finite() || !frequency_step.is_finite()
+        || positions.dtype() != DType::F32
+        || positions.device() != apxinf_core::Device::Cuda(ctx.device_id()) {
+        return Err(Error::Other("invalid sinusoidal embedding shape, dtype, device or scale".into()));
+    }
+    let rows = i32::try_from(shape[0]).map_err(|_| Error::Other("embedding row count overflow".into()))?;
+    let width = i32::try_from(dim).map_err(|_| Error::Other("embedding width overflow".into()))?;
+    checked_bytes(DType::F32,shape,"sinusoidal positions")?;
+    let output = bf16_output(ctx,shape[0],dim)?;
+    unsafe {
+        check_cuda(ffi::apxinf_sinusoidal_embedding_bf16(gpu_ptr(positions)?,output.ptr(),
+            rows,width,scale,frequency_step,ctx.stream().handle()))?;
+    }
+    Ok(matrix_tensor(ctx,shape[0],dim,output))
+}
+
 pub fn lookup_into(
     ctx: &CudaContext,
     dtype: DType,

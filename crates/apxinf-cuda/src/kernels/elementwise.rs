@@ -782,3 +782,181 @@ pub fn euler_update_f16(
         output,
     ))
 }
+
+/// Concatenate NCHW feature maps along channels using device-to-device copies.
+pub fn concat_channels_bf16(ctx: &CudaContext, inputs: &[&Tensor]) -> Result<Tensor> {
+    let first = inputs
+        .first()
+        .ok_or_else(|| Error::Other("empty channel concatenation".into()))?;
+    let d = first.shape().dims();
+    if d.len() != 4 {
+        return Err(Error::Other("channel concatenation requires NCHW".into()));
+    }
+    let mut channels = 0usize;
+    for t in inputs {
+        let s = t.shape().dims();
+        if s.len() != 4
+            || s[0] != d[0]
+            || s[2..] != d[2..]
+            || t.dtype() != DType::BF16
+            || t.device() != Device::Cuda(ctx.device_id())
+        {
+            return Err(Error::Other(
+                "channel concatenation shape/device mismatch".into(),
+            ));
+        }
+        checked_bytes(DType::BF16, s, "channel concatenation input")?;
+        channels = channels
+            .checked_add(s[1])
+            .ok_or_else(|| Error::Other("channel overflow".into()))?;
+    }
+    let shape = vec![d[0], channels, d[2], d[3]];
+    let bytes = checked_bytes(DType::BF16, &shape, "channel concatenation output")?;
+    let out = output_buffer(ctx, bytes)?;
+    let pitch = bytes / d[0];
+    let mut offset = 0;
+    for t in inputs {
+        let source_pitch = t.size_in_bytes() / d[0];
+        crate::transfers::copy_tensor_2d_to_buffer(
+            ctx,
+            t,
+            &out,
+            offset,
+            pitch,
+            source_pitch,
+            source_pitch,
+            d[0],
+        )?;
+        offset += source_pitch;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(shape),
+        DType::BF16,
+        ctx.device_id(),
+        out,
+    ))
+}
+
+/// Broadcast [N,C,1,1] into a contiguous NCHW feature map.
+pub fn expand_spatial_bf16(
+    ctx: &CudaContext,
+    x: &Tensor,
+    height: usize,
+    width: usize,
+) -> Result<Tensor> {
+    let d = x.shape().dims();
+    if d.len() != 4
+        || d[2..] != [1, 1]
+        || x.dtype() != DType::BF16
+        || x.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(
+            "spatial expansion requires CUDA BF16 [N,C,1,1]".into(),
+        ));
+    }
+    let shape = vec![d[0], d[1], height, width];
+    let bytes = checked_bytes(DType::BF16, &shape, "spatial expansion")?;
+    let spatial = i32::try_from(
+        height
+            .checked_mul(width)
+            .ok_or_else(|| Error::Other("spatial overflow".into()))?,
+    )
+    .map_err(|_| Error::Other("spatial dimension overflow".into()))?;
+    let count =
+        i64::try_from(bytes / 2).map_err(|_| Error::Other("spatial output overflow".into()))?;
+    let out = output_buffer(ctx, bytes)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_expand_spatial_bf16(
+            gpu_ptr(x)?,
+            out.ptr(),
+            spatial,
+            count,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(shape),
+        DType::BF16,
+        ctx.device_id(),
+        out,
+    ))
+}
+
+fn image_layout_bf16(ctx: &CudaContext, x: &Tensor, to_first: bool) -> Result<Tensor> {
+    let d = x.shape().dims();
+    if d.len() != 4
+        || x.dtype() != DType::BF16
+        || x.device() != apxinf_core::Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(
+            "image layout conversion requires a 4D BF16 tensor on the context device".into(),
+        ));
+    }
+    let bytes = checked_bytes(DType::BF16, d, "image layout conversion")?;
+    let (n, c, h, w) = if to_first {
+        (d[0], d[3], d[1], d[2])
+    } else {
+        (d[0], d[1], d[2], d[3])
+    };
+    let dims = [n, c, h, w].map(|v| {
+        i32::try_from(v).map_err(|_| Error::Other("image layout dimension overflow".into()))
+    });
+    let [ni, ci, hi, wi] = dims;
+    let (ni, ci, hi, wi) = (ni?, ci?, hi?, wi?);
+    if !crate::workspace::may_prepare_native_resources() {
+        return Err(Error::Other(
+            "cuDNN image layout conversion needs prepared descriptors for capture".into(),
+        ));
+    }
+    use crate::cudnn::{api, check, Descriptor};
+    let api = api().map_err(Error::Cuda)?;
+    let handle = Descriptor::new(api, api.create, api.destroy).map_err(Error::Cuda)?;
+    let xd = Descriptor::new(api, api.create_tensor, api.destroy_tensor).map_err(Error::Cuda)?;
+    let yd = Descriptor::new(api, api.create_tensor, api.destroy_tensor).map_err(Error::Cuda)?;
+    let out = output_buffer(ctx, bytes)?;
+    unsafe {
+        check(api, (api.set_stream)(handle.raw, ctx.stream().handle())).map_err(Error::Cuda)?;
+        check(
+            api,
+            (api.set_tensor)(xd.raw, if to_first { 1 } else { 0 }, 9, ni, ci, hi, wi),
+        )
+        .map_err(Error::Cuda)?;
+        check(
+            api,
+            (api.set_tensor)(yd.raw, if to_first { 0 } else { 1 }, 9, ni, ci, hi, wi),
+        )
+        .map_err(Error::Cuda)?;
+        let one = 1.0f32;
+        let zero = 0.0f32;
+        check(
+            api,
+            (api.transform)(
+                handle.raw,
+                (&one as *const f32).cast(),
+                xd.raw,
+                gpu_ptr(x)?,
+                (&zero as *const f32).cast(),
+                yd.raw,
+                out.ptr(),
+            ),
+        )
+        .map_err(Error::Cuda)?;
+    }
+    let shape = if to_first {
+        vec![n, c, h, w]
+    } else {
+        vec![n, h, w, c]
+    };
+    Ok(out.into_tensor(Shape::new(shape), DType::BF16))
+}
+
+/// Reorder a contiguous NCHW BF16 tensor to NHWC through cuDNN.
+pub fn nchw_to_nhwc_bf16(ctx: &CudaContext, x: &Tensor) -> Result<Tensor> {
+    image_layout_bf16(ctx, x, false)
+}
+
+/// Reorder a contiguous NHWC BF16 tensor to NCHW through cuDNN.
+pub fn nhwc_to_nchw_bf16(ctx: &CudaContext, x: &Tensor) -> Result<Tensor> {
+    image_layout_bf16(ctx, x, true)
+}

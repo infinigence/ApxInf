@@ -332,6 +332,65 @@ impl CublasHandle {
         }
     }
 
+    /// BF16 operands, FP32 output, FP32 accumulate. Same row-major contract
+    /// as `gemm_ex`.
+    ///
+    /// The composed attention route widened its BF16 operands to fp32 and
+    /// called the fp32 GEMM, so that the scores could stay fp32 for the
+    /// softmax. The widening is not what makes that accurate: every product is
+    /// one BF16 times another and is exact in fp32 either way, and cuBLAS
+    /// accumulates in fp32 in both cases. What the widening does is force the
+    /// multiply onto the CUDA cores -- 5.43 TFLOP/s on Thor against 164-195
+    /// for the tensor cores -- and pay for two casts of the operands. This
+    /// keeps the fp32 output and drops both.
+    ///
+    /// The one real difference is the order of the k-term summation inside the
+    /// dot product, which for the vision tower's head_dim of 64 is 64 terms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_f32_ex(
+        &self,
+        transa: CublasTranspose,
+        transb: CublasTranspose,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &CudaBuffer,
+        lda: i32,
+        b: &CudaBuffer,
+        ldb: i32,
+        beta: f32,
+        c: &CudaBuffer,
+        ldc: i32,
+    ) -> Result<(), String> {
+        let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
+        let transa = transa.raw();
+        let transb = transb.raw();
+        unsafe {
+            ffi::check_cublas(ffi::cublasGemmEx(
+                self.handle,
+                transb,
+                transa,
+                n_i,
+                m_i,
+                k_i,
+                &alpha as *const f32 as *const c_void,
+                b.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                ldb,
+                a.ptr(),
+                ffi::cudaDataType_t::CUDA_R_16BF,
+                lda,
+                &beta as *const f32 as *const c_void,
+                c.ptr() as *mut c_void,
+                ffi::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                ffi::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                -1,
+            ))
+        }
+    }
+
     pub fn raw(&self) -> ffi::cublasHandle_t {
         self.handle
     }
