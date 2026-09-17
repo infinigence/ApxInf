@@ -30,6 +30,7 @@ namespace {
 #include "../kernels/custom/cache.cuh"
 #include "../kernels/custom/linear_attention.cuh"
 #include "../kernels/custom/gdn_chunk_state_wmma.cuh"
+#include "../kernels/custom/gdn_chunk_gemm_wmma.cuh"
 #include "../kernels/custom/pooling.cuh"
 }  // namespace
 
@@ -1054,6 +1055,37 @@ extern "C" cudaError_t apxinf_static_gdn_tri_solve_f32(
 }
 
 
+// Which form of the GDN chunk kernels to run:
+//   1 split BF16 passes (default on the SM100 family), 2 one lossy pass,
+//   0 the scalar kernels. APXINF_GDN_CHUNK_STATE_WMMA selects for both.
+static int device_capability_major();
+
+// The same three forms for the chunk GEMM, selected separately and off unless
+// asked for; see the comment at its dispatch.
+static int wmma_chunk_gemm_mode() {
+  static const int mode = [] {
+    if (const char* v = std::getenv("APXINF_GDN_CHUNK_GEMM_WMMA")) {
+      if (v[0] == 'l') return 2;
+      if (v[0] == '0' || v[0] == 'f') return 0;
+      return 1;
+    }
+    return 0;
+  }();
+  return mode;
+}
+
+static int wmma_chunk_mode() {
+  static const int mode = [] {
+    if (const char* v = std::getenv("APXINF_GDN_CHUNK_STATE_WMMA")) {
+      if (v[0] == 'l') return 2;
+      if (v[0] == '0' || v[0] == 'f') return 0;
+      return 1;
+    }
+    return device_capability_major() >= 10 ? 1 : 0;
+  }();
+  return mode;
+}
+
 // Compute-capability major of the current device, cached. The two GDN tile
 // widths below are not portable constants: each was swept on one board and the
 // optimum is not the same on the next one, so the default has to know which
@@ -1143,6 +1175,46 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
   // the shipped shape rather than 64KB.
   const size_t gemm_smem = static_cast<size_t>(chunk_size) *
                            (head_v_dim + head_k_dim) * sizeof(__nv_bfloat16);
+  // Tensor-core form. Off by default, unlike the chunk-state scan: this
+  // kernel rounds both outputs to BF16, so the scalar form lands within
+  // 1.369621e-7 of an fp64 reference and the split form within 2.959516e-6 --
+  // 21.6x more, though both sit far below the BF16 grid the results are
+  // written on. It is worth 1.9% of the scene and the end-to-end probe moves
+  // with it, so it is the owner's call rather than a default.
+  if (wmma_chunk_gemm_mode() != 0 && head_k_dim == 128 && head_v_dim == 128 &&
+      chunk_size == 64) {
+    const size_t smem = static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 2 +
+                        static_cast<size_t>(64 * 64) * sizeof(__nv_bfloat16) * 2 +
+                        static_cast<size_t>(64 * 128) * sizeof(float);
+    const bool split = wmma_chunk_gemm_mode() == 1;
+    const void* entry =
+        split ? reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<true>)
+              : reinterpret_cast<const void*>(gdn_chunk_gemm_wmma_kernel<false>);
+    static const void* gemm_opted = nullptr;
+    if (gemm_opted != entry) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          entry, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      gemm_opted = entry;
+    }
+#define GDN_GEMM_WMMA_ARGS                                                     \
+  static_cast<const float*>(a), static_cast<const float*>(v),                  \
+      static_cast<const float*>(k), static_cast<const float*>(beta),           \
+      static_cast<const float*>(g_cum), static_cast<float*>(vt_out),           \
+      static_cast<float*>(kcd_out), seq_pad
+    if (split) {
+      gdn_chunk_gemm_wmma_kernel<true>
+          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
+    } else {
+      gdn_chunk_gemm_wmma_kernel<false>
+          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_GEMM_WMMA_ARGS);
+    }
+#undef GDN_GEMM_WMMA_ARGS
+    return cudaGetLastError();
+  }
   switch (chunk_gemm_tile()) {
     case 1: return launch_chunk_gemm<1>(CHUNK_GEMM_ARGS);
     case 2: return launch_chunk_gemm<2>(CHUNK_GEMM_ARGS);
@@ -1278,16 +1350,9 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   //   1 / on / true -> split left operand, two BF16 passes, fp32-class error
   //   lossy         -> one pass, left operand rounded to BF16
   //   unset         -> the scalar kernel
-  static const int wmma_mode = [] {
-    if (const char* v = std::getenv("APXINF_GDN_CHUNK_STATE_WMMA")) {
-      if (v[0] == 'l') return 2;
-      if (v[0] == '0' || v[0] == 'f') return 0;
-      return 1;
-    }
-    // Default on where the tensor cores are worth this much: on Thor the
-    // split form is 1.4623 -> 1.1909 s of fixed cost at the same error.
-    return device_capability_major() >= 10 ? 1 : 0;
-  }();
+  // Default on where the tensor cores are worth this much: on Thor the split
+  // form is 1.4623 -> 1.1909 s of fixed cost at the same error.
+  const int wmma_mode = wmma_chunk_mode();
   if (wmma_mode != 0 && head_k_dim == 128 && head_v_dim == 128 && chunk_size == 64) {
     const size_t wmma_smem =
         static_cast<size_t>(128 * 128) * sizeof(__nv_bfloat16) +  // state

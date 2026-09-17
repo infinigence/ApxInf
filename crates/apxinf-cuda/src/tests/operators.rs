@@ -1083,6 +1083,124 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
     );
 }
 
+// ── GDN chunk GEMM against an fp64 oracle ─────────────────────────
+//
+// Companion to the chunk-state one. Both products here are [C,C] @ [C,V] with
+// the right operand already on the BF16 grid -- vb is bf16(v * beta), kb is
+// bf16(bf16(k * beta) * exp2(g)) -- and both outputs are rounded to BF16 on
+// the way out, so the reference performs those roundings too and what is
+// measured is only what the multiply does.
+//
+//   cargo test --release -p apxinf-cuda gdn_chunk_gemm_error -- --nocapture
+//   APXINF_GDN_CHUNK_STATE_WMMA=0 / lossy for the other two forms
+#[test]
+fn gdn_chunk_gemm_error_against_fp64_oracle() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
+    let seq_pad = chunk * chunks;
+    let draw = |salt: u64, n: usize, scale: f64| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                (((x & 0xFFFF) as f64 / 32768.0 - 1.0) * scale) as f32
+            })
+            .collect()
+    };
+    let a = draw(7, heads * chunks * chunk * chunk, 0.3);
+    let v = draw(8, heads * seq_pad * vdim, 0.6);
+    let k = draw(9, heads * seq_pad * kdim, 0.6);
+    let beta = draw(10, heads * seq_pad, 0.5);
+    let mut g_cum = vec![0.0f32; heads * seq_pad];
+    for h in 0..heads {
+        for c in 0..chunks {
+            let mut acc = 0.0f32;
+            for i in 0..chunk {
+                acc -= 0.02 * ((h + c + i) % 4) as f32;
+                g_cum[h * seq_pad + c * chunk + i] = acc;
+            }
+        }
+    }
+    let upload = |d: &[f32]| -> CudaBuffer {
+        let b = CudaBuffer::alloc(d.len() * 4, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                b.ptr(),
+                d.as_ptr() as *const std::ffi::c_void,
+                d.len() * 4,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        b
+    };
+    let (ab, vb, kb, bb, gb) = (upload(&a), upload(&v), upload(&k), upload(&beta), upload(&g_cum));
+    let n_vt = heads * chunks * chunk * vdim;
+    let n_kcd = heads * chunks * chunk * kdim;
+    let vt = CudaBuffer::alloc(n_vt * 4, 0).unwrap();
+    let kcd = CudaBuffer::alloc(n_kcd * 4, 0).unwrap();
+    crate::kernels::linear_attention::gdn_chunk_gemm(
+        &ctx, &ab, &vb, &kb, &bb, &gb, &vt, &kcd, seq_pad, heads, kdim, vdim, chunk,
+    )
+    .unwrap();
+    let read = |b: &CudaBuffer, n: usize| -> Vec<f32> {
+        crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, n]), DType::F32).unwrap())
+            .unwrap()
+            .to_f32_vec()
+            .unwrap()
+    };
+    let got_vt = read(&vt, n_vt);
+    let got_kcd = read(&kcd, n_kcd);
+
+    let bf = |x: f64| -> f64 {
+        let f = x as f32;
+        let bits = f.to_bits();
+        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        f32::from_bits(r) as f64
+    };
+    let mut sum_abs = 0.0f64;
+    let mut sum_ref = 0.0f64;
+    for h in 0..heads {
+        for c in 0..chunks {
+            let tok = h * seq_pad + c * chunk;
+            let base = ((h * chunks) + c) * chunk;
+            for i in 0..chunk {
+                for j in 0..vdim {
+                    let mut svt = 0.0f64;
+                    let mut skcd = 0.0f64;
+                    for m in 0..chunk {
+                        let am = a[(base + i) * chunk + m] as f64;
+                        let bm = beta[tok + m] as f64;
+                        svt += am * bf(v[(tok + m) * vdim + j] as f64 * bm);
+                        let kb0 = bf(k[(tok + m) * kdim + j] as f64 * bm);
+                        skcd += am * bf(kb0 * (g_cum[tok + m] as f64).exp2());
+                    }
+                    for (expect, actual) in [
+                        (bf(svt), got_vt[(base + i) * vdim + j] as f64),
+                        (bf(skcd), got_kcd[(base + i) * kdim + j] as f64),
+                    ] {
+                        sum_abs += (actual - expect).abs();
+                        sum_ref += expect.abs();
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "gdn_chunk_gemm_oracle mode={} elements={} rel_l1={:.6e}",
+        std::env::var("APXINF_GDN_CHUNK_STATE_WMMA").unwrap_or_else(|_| "default".into()),
+        2 * n_vt,
+        sum_abs / sum_ref
+    );
+    assert!(
+        sum_abs / sum_ref < 0.05,
+        "GDN chunk GEMM relative L1 {} against fp64",
+        sum_abs / sum_ref
+    );
+}
+
 // ── KV cache append ───────────────────────────────────────────────
 
 #[test]
