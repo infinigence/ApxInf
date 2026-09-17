@@ -64,6 +64,7 @@ from .policies import (
     VIEW_SLOTS,
     AutoPolicy,
     ComposablePolicy,
+    Gr00tPolicy,
     Pi05Policy,
     Policy,
     WallossPolicy,
@@ -86,6 +87,8 @@ __all__ = [
     "ComposablePolicy",
     # L2 policies
     "Pi05Policy",
+    "Pi0FastPolicy",
+    "Gr00tPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework

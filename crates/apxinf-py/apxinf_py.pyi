@@ -44,6 +44,7 @@ class Model:
         num_flow_steps: int | None = ...,
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
+        assets: dict[str, str] | None = ...,
     ) -> "Model":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
@@ -59,6 +60,32 @@ class Model:
         ``num_flow_steps`` and ``flow_start_time`` are PI0.5 deployment overrides.
         ``sampling_seed`` seeds the implicit device-side noise stream.
         """
+        ...
+
+    def _infer_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int,
+        noise: npt.NDArray[np.float32],
+    ) -> npt.NDArray[np.float32]:
+        """Private L0 path for processor-produced typed VLA inputs."""
+        ...
+
+    def _calibrate_preprocessed(
+        self,
+        pixel_values: npt.NDArray[np.float32],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32],
+        embodiment_id: int,
+        noise: npt.NDArray[np.float32],
+    ) -> dict[str, float]:
+        """Private activation probe used by the common calibration runner."""
         ...
 
     def _infer_patches(

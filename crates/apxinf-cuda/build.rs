@@ -148,6 +148,14 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
     matches!(arch, "sm_80" | "sm_86" | "sm_87" | "sm_89")
 }
 
+// Architectures that compile the vendored FlashAttention-2 BF16 forward
+// kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
+// the same v2.7.4 instantiations; the -arch flag selects the real target.
+fn is_fa2_bf16_arch(arch: &str) -> bool {
+    is_fa2_sm80_family(arch)
+        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
+}
+
 fn is_cutlass_sm89_family(arch: &str) -> bool {
     matches!(arch, "sm_89")
 }
@@ -433,7 +441,7 @@ fn main() {
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
             let mut fa2_includes = Vec::new();
-            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_sm80_family);
+            let fa2_sm80 = nvcc_arch.as_deref().is_some_and(is_fa2_bf16_arch);
             let fa2_f16_sm100 = nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family);
             let fa2_head_special = fa2_sm80 || fa2_f16_sm100;
             if fa2_sm80 || fa2_f16_sm100 {
@@ -614,33 +622,30 @@ fn main() {
                             cmd.arg("-DAPXINF_FA2_HEAD_SPECIAL=1");
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
-                        // Drop the FlashAttention-2 feature axes this adapter never
-                        // reaches. `fill_params` value-initializes the parameter block
-                        // and then leaves `alibi_slopes_ptr` null and `softcap` zero;
-                        // dropout is pinned to the keep-everything encoding
-                        // (`p_dropout == 1.0`, `rp_dropout == 1.0`); and the window is
-                        // either fully open (-1/-1) or causal (right == 0), so the
-                        // kernels' `Is_local` is never taken. Each macro removes one
-                        // bool template axis, and the instantiations are the product of
-                        // those axes, so the four together cut ptxas work by up to 16x.
+                        // Drop the FlashAttention-2 feature axes the adapter
+                        // never reaches. `fill_params` value-initializes the
+                        // parameter block and then leaves `alibi_slopes_ptr`
+                        // null and `softcap` zero; dropout is pinned to the
+                        // keep-everything encoding (`p_dropout == 1.0`,
+                        // `rp_dropout == 1.0`); and the window is either fully
+                        // open (-1/-1) or causal (right == 0), so `Is_local` is
+                        // never taken. Each macro removes one bool template
+                        // axis and the instantiations are their product, so the
+                        // four together cut ptxas work by up to 16x.
                         //
-                        // This matters on Orin: ptxas needs multiple hours per FA2
-                        // translation unit at sm_87 (measured at over 2.5h on
-                        // flash_fwd_hdim128_bf16_sm80.cu alone, 99.8% CPU, 5.4GB RSS).
+                        // That matters most on Orin, where ptxas needs multiple
+                        // hours per FA2 translation unit at sm_87 -- measured at
+                        // over 2.5h on flash_fwd_hdim128_bf16_sm80.cu alone,
+                        // 99.8% CPU and 5.4 GB RSS.
                         //
-                        // UNEVEN_K is deliberately NOT disabled: seqlen_k is a runtime
-                        // value and is not block-aligned in general.
-                        //
-                        // Opt-in for now, until the trimmed build has cleared the fixed
-                        // accuracy gates on the target device.
-                        if std::env::var_os("APXINF_FA2_TRIM_UNUSED").is_some() {
-                            cmd.args([
-                                "-DFLASHATTENTION_DISABLE_DROPOUT",
-                                "-DFLASHATTENTION_DISABLE_ALIBI",
-                                "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                                "-DFLASHATTENTION_DISABLE_LOCAL",
-                            ]);
-                        }
+                        // UNEVEN_K is deliberately not disabled: seqlen_k is a
+                        // runtime value and is not block-aligned in general.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
+                        ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
@@ -656,6 +661,13 @@ fn main() {
                             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                             "-DFLASH_NAMESPACE=apxinf_fa2_direct_e4m3",
                             "-DAPXINF_FA2_DIRECT_E4M3=1",
+                        ]);
+                        // The direct-E4M3 path uses the same fixed feature set.
+                        cmd.args([
+                            "-DFLASHATTENTION_DISABLE_DROPOUT",
+                            "-DFLASHATTENTION_DISABLE_ALIBI",
+                            "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                            "-DFLASHATTENTION_DISABLE_LOCAL",
                         ]);
                         for include in &fa2_includes {
                             cmd.arg(format!("-I{}", include.display()));

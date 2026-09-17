@@ -66,7 +66,9 @@ pub struct ArchSelection {
 pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     matches!(
         arch,
-        "sm_100" | "sm_100a" | "sm_101" | "sm_101a" | "sm_110" | "sm_110a" | "sm_120" | "sm_120a"
+        "sm_100" | "sm_100a" | "sm_101" | "sm_101a"
+        | "sm_110" | "sm_110a"
+        | "sm_120" | "sm_120a" | "sm_121" | "sm_121a"
     )
 }
 

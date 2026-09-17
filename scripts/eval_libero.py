@@ -21,9 +21,9 @@ resize remains inside the selected policy.
 key is ``(suite, task_id, trial_id)`` so multiple suites share one resumable
 account without ``task_id=0`` colliding across suites.
 
-Adding a new model needs no change here: register a policy in ``apxinf.policies``
-(``@register_policy("<name>")``) and run ``--backend in-process --model-type
-<name> --model-dir <ckpt>`` (or serve it and use ``--backend websocket``).
+Model loading remains registry-driven. Dataset/model-specific state or action
+conventions are explicit adapters in ``scripts/libero_observation.py`` rather
+than being hidden in the shared rollout loop.
 
 This script exists so a kernel change, an FP8 recalibration or a tactic bump can
 be regressed end-to-end against ApxInf's own published LIBERO numbers. The
@@ -34,8 +34,9 @@ observation conversion it uses is mirrored elsewhere; see
     python scripts/eval_libero.py --backend websocket --precision bf16 \
         --suite libero_10 --results-jsonl r.jsonl --summary-json s.json
 
-    # in-process (no server)
+    # in-process GR00T (no server)
     python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+        --backbone /path/to/Cosmos-Reason2-2B \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -50,14 +51,28 @@ import pathlib
 import sys
 import time
 import traceback
-from typing import NamedTuple, Optional, Protocol, Tuple
+from typing import Any, NamedTuple, Optional, Protocol, Tuple
 
 import numpy as np
 
 if __package__:
-    from .libero_observation import libero_images, libero_state, make_env
+    from .libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 else:
-    from libero_observation import libero_images, libero_state, make_env
+    from libero_observation import (
+        libero_gr00t_action,
+        libero_gr00t_state,
+        libero_images,
+        libero_state,
+        load_libero_init_states,
+        make_env,
+    )
 
 # --- rollout protocol constants (OpenPI's public PI0.5 LIBERO configuration) ---
 LIBERO_ACTION_DIM = 7
@@ -129,7 +144,13 @@ def _add_apxinf_to_path() -> None:
 # --- LIBERO harness (inlined; was scripts/libero_harness.py) ------------------
 
 
-def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
+def completed_runs(
+    path: pathlib.Path,
+    precision: str,
+    *,
+    max_steps: Optional[int] = None,
+    replan_steps: Optional[int] = None,
+) -> dict[LedgerKey, dict]:
     """Load the ``status == "completed"`` rows from a resumable ledger.
 
     Keyed by ``(suite, task_id, trial_id)`` so one ledger can hold several suites
@@ -150,6 +171,22 @@ def completed_runs(path: pathlib.Path, precision: str) -> dict[LedgerKey, dict]:
                 f"at line {line_number}"
             )
         if item.get("status") == "completed":
+            # Rows written before rollout-protocol fields were added used the
+            # evaluator's historical OpenPI defaults (520/5). Preserve their
+            # resumability while still rejecting an attempt to reuse them for
+            # an explicitly different protocol such as GR00T's 720/8.
+            item_max_steps = item.get("max_steps", MAX_STEPS)
+            item_replan_steps = item.get("replan_steps", REPLAN_STEPS)
+            if max_steps is not None and item_max_steps != max_steps:
+                raise ValueError(
+                    f"ledger max_steps is {item_max_steps!r}, requested "
+                    f"{max_steps!r} at line {line_number}"
+                )
+            if replan_steps is not None and item_replan_steps != replan_steps:
+                raise ValueError(
+                    f"ledger replan_steps is {item_replan_steps!r}, requested "
+                    f"{replan_steps!r} at line {line_number}"
+                )
             key: LedgerKey = (
                 str(item["suite"]),
                 int(item["task_id"]),
@@ -175,6 +212,9 @@ def write_summary(
     expected_keys: set[LedgerKey],
     precision: str,
     transport: str,
+    *,
+    max_steps: int = MAX_STEPS,
+    replan_steps: int = REPLAN_STEPS,
 ) -> None:
     """Write the aggregate summary, grouped per-suite then per-task."""
     per_suite: dict[str, dict] = {}
@@ -208,6 +248,11 @@ def write_summary(
         "suites": sorted({key[0] for key in expected_keys}),
         "transport": transport,
         "precision": precision,
+        "rollout_protocol": {
+            "max_steps": max_steps,
+            "replan_steps": replan_steps,
+            "wait_steps": WAIT_STEPS,
+        },
         "expected_runs": len(expected_keys),
         "completed_runs": len(rows),
         "missing_runs": [
@@ -284,11 +329,15 @@ class Backend(Protocol):
     #: Static description sent by / read from the underlying policy.
     metadata: dict
 
+    def state_from_observation(self, observation) -> Any:
+        """Return the state representation expected by the selected policy."""
+        ...
+
     def infer(
         self,
         base: np.ndarray,
         wrist: np.ndarray,
-        state: np.ndarray,
+        state: Any,
         prompt: str,
         noise: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
@@ -299,7 +348,31 @@ class Backend(Protocol):
         ...
 
 
-def _observation(base, wrist, state, prompt, keys: WireKeys) -> dict:
+def state_finger_joints(metadata: Mapping) -> int:
+    """How many of LIBERO's mirrored finger joints the checkpoint's state carries.
+
+    LIBERO reports two mirrored finger joints and LeRobot's own env keeps both
+    (8-dim state), while this harness collapsed them into one gripper coordinate
+    (7-dim) for PI0.5. The width is a checkpoint property — it is the width of
+    its normalization statistics — so a policy publishes it as
+    ``metadata["state_dim"]`` and the harness builds exactly that vector instead
+    of guessing. ``None`` (a policy that publishes no width) keeps the
+    historical collapsed vector.
+    """
+    width = metadata.get("state_dim")
+    if width is None:
+        return 1
+    if int(width) == 7:
+        return 1
+    if int(width) == 8:
+        return 2
+    raise ValueError(
+        f"the loaded policy declares state_dim={width}, but this harness can only "
+        "build LIBERO's 7-dim (collapsed gripper) or 8-dim (both finger joints) state"
+    )
+
+
+def _observation(base, wrist, state: Any, prompt, keys: WireKeys) -> dict:
     """The OpenPI LIBERO observation both backends consume, identical on the wire
     and in-process. The keys are resolved once per run, so what the evaluator
     sends and what the policy is built to read cannot drift apart mid-rollout."""
@@ -389,6 +462,11 @@ class WebsocketBackend:
             "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
         }
 
+    def state_from_observation(self, observation) -> np.ndarray:
+        # Preserve the established OpenPI wire contract. A GR00T websocket
+        # server can expose its own adapter without changing this evaluator.
+        return libero_state(observation)
+
     def close(self) -> None:
         connection = getattr(self._client, "_ws", None)
         if connection is not None:
@@ -411,6 +489,7 @@ class InProcessBackend:
 
         self._keys = keys
         options = {
+            "backbone": args.backbone,
             "checkpoint": args.checkpoint,
             "calibration": args.calibration,
             "tactics": args.tactics,
@@ -441,6 +520,12 @@ class InProcessBackend:
             **{name: value for name, value in options.items() if value is not None},
         )
         self.metadata = dict(getattr(self._policy, "metadata", {}))
+        self._is_gr00t = self.metadata.get("model_type") == "gr00t"
+
+    def state_from_observation(self, observation):
+        if self._is_gr00t:
+            return libero_gr00t_state(observation)
+        return libero_state(observation)
 
     def infer(
         self, base, wrist, state, prompt, noise=None
@@ -449,6 +534,8 @@ class InProcessBackend:
             _observation(base, wrist, state, prompt, self._keys), noise=noise
         )
         actions = np.asarray(result["actions"], dtype=np.float32)
+        if self._is_gr00t:
+            actions = libero_gr00t_action(actions)
         normalized = np.asarray(result["normalized_actions"], dtype=np.float32)
         timing = result.get("timing", {}) or {}
         model_ms = float(timing.get("model_ms", 0.0))
@@ -488,6 +575,8 @@ def run_episode(
     warm_start_alpha: float,
     replan_steps: int = REPLAN_STEPS,
     settle_gripper: float = -1.0,
+    finger_joints: int = 1,
+    max_steps: int = MAX_STEPS,
 ) -> dict:
     episode_started = time.perf_counter()
     env.reset()
@@ -519,14 +608,14 @@ def run_episode(
     warm_noise_checksum = None
     rng = np.random.default_rng(seed + 1_000_003 * task_id + 10_007 * trial_id)
 
-    while action_steps < MAX_STEPS:
+    while action_steps < max_steps:
         if not action_plan:
             preprocess_started = time.perf_counter()
             images = libero_images(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
             )
-            state = libero_state(observation)
+            state = libero_state(observation, finger_joints=finger_joints)
             preprocess_seconds += time.perf_counter() - preprocess_started
 
             noise = None
@@ -622,6 +711,8 @@ def run_episode(
         "transport": transport,
         "image_input": "openpi_uint8_hwc",
         "seed": seed,
+        "max_steps": max_steps,
+        "replan_steps": replan_steps,
     }
 
 
@@ -646,6 +737,12 @@ def parse_args() -> argparse.Namespace:
         "--model-seed",
         type=int,
         help="in-process model sampling seed (default: reuse --seed)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"maximum simulator action steps per episode (default: {MAX_STEPS})",
     )
     parser.add_argument(
         "--replan-steps",
@@ -685,6 +782,11 @@ def parse_args() -> argparse.Namespace:
     in_process = parser.add_argument_group("in-process backend")
     in_process.add_argument("--model-dir", type=pathlib.Path)
     in_process.add_argument("--model-type", default=None, help="override config.json model type")
+    in_process.add_argument(
+        "--backbone",
+        type=pathlib.Path,
+        help="named backbone asset required by models such as GR00T N1.7",
+    )
     in_process.add_argument("--checkpoint", type=pathlib.Path)
     in_process.add_argument("--device", default="cuda:0")
     in_process.add_argument("--calibration", type=pathlib.Path)
@@ -792,6 +894,8 @@ def parse_args() -> argparse.Namespace:
             )
     if args.replan_steps <= 0:
         parser.error("--replan-steps must be positive")
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
     if args.trials_per_task <= 0 or args.trials_per_task > 50:
         parser.error("--trials-per-task must be in 1..=50")
     return args
@@ -841,16 +945,30 @@ def main() -> None:
         for task_id in task_ids
         for trial_id in range(args.trials_per_task)
     }
-    ledger = completed_runs(args.results_jsonl, args.precision)
+    ledger = completed_runs(
+        args.results_jsonl,
+        args.precision,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     unexpected = set(ledger) - expected_keys
     if unexpected:
         raise ValueError(
             f"ledger contains runs outside requested scope: {sorted(unexpected)}"
         )
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
 
     backend = build_backend(args)
     print(f"backend={args.backend} metadata={backend.metadata}", flush=True)
+    finger_joints = state_finger_joints(getattr(backend, "metadata", {}) or {})
     try:
         for name, suite in suites.items():
             for task_id in task_ids_by_suite[name]:
@@ -865,7 +983,7 @@ def main() -> None:
                     print(f"{name} task {task_id}: already complete", flush=True)
                     continue
                 print(f"{name} task {task_id}: pending trials {pending}", flush=True)
-                initial_states = suite.get_task_init_states(task_id)
+                initial_states = load_libero_init_states(suite, task_id)
                 env = make_env(task, args.seed)
                 try:
                     for trial_id in pending:
@@ -885,6 +1003,8 @@ def main() -> None:
                                     args.warm_start_alpha,
                                     args.replan_steps,
                                     args.settle_gripper,
+                                    finger_joints,
+                                    args.max_steps,
                                 )
                                 record["attempt"] = attempt
                                 record["precision"] = args.precision
@@ -893,6 +1013,8 @@ def main() -> None:
                                 write_summary(
                                     args.summary_json, ledger, expected_keys,
                                     args.precision, transport,
+                                    max_steps=args.max_steps,
+                                    replan_steps=args.replan_steps,
                                 )
                                 print(
                                     f"{name} task={task_id} trial={trial_id} "
@@ -929,7 +1051,15 @@ def main() -> None:
     finally:
         backend.close()
 
-    write_summary(args.summary_json, ledger, expected_keys, args.precision, transport)
+    write_summary(
+        args.summary_json,
+        ledger,
+        expected_keys,
+        args.precision,
+        transport,
+        max_steps=args.max_steps,
+        replan_steps=args.replan_steps,
+    )
     missing = expected_keys - set(ledger)
     if missing:
         raise RuntimeError(f"evaluation incomplete; missing {sorted(missing)}")

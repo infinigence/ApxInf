@@ -63,12 +63,27 @@ pub enum InitialLatent<'a> {
     Provided(&'a Tensor),
 }
 
+/// Optional typed metadata emitted by preprocessors for VLA families whose
+/// inputs include more than image patches and token IDs.
+///
+/// Keeping these fields on the request preserves the stable observation shape
+/// used by existing PI0.5 and WallOSS callers. A runtime that requires one of
+/// these fields validates it explicitly; other runtimes ignore the empty
+/// default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VlaMetadata<'a> {
+    pub attention_mask: Option<&'a [u8]>,
+    pub image_grid_thw: Option<&'a [[u32; 3]]>,
+    pub embodiment_id: Option<usize>,
+}
+
 /// Complete VLA request: an environment observation plus the model-generation
 /// input that is deliberately not part of the observation itself.
 #[derive(Clone, Copy, Debug)]
 pub struct VlaRequest<'a> {
     pub observation: &'a Observation,
     pub initial_latent: InitialLatent<'a>,
+    pub metadata: VlaMetadata<'a>,
 }
 
 impl<'a> VlaRequest<'a> {
@@ -76,6 +91,11 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Generate { rng },
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+            },
         }
     }
 
@@ -83,6 +103,35 @@ impl<'a> VlaRequest<'a> {
         Self {
             observation,
             initial_latent: InitialLatent::Provided(latent),
+            metadata: VlaMetadata {
+                attention_mask: None,
+                image_grid_thw: None,
+                embodiment_id: None,
+            },
+        }
+    }
+
+    pub const fn generated_with_metadata(
+        observation: &'a Observation,
+        rng: RngKey,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Generate { rng },
+            metadata,
+        }
+    }
+
+    pub const fn provided_with_metadata(
+        observation: &'a Observation,
+        latent: &'a Tensor,
+        metadata: VlaMetadata<'a>,
+    ) -> Self {
+        Self {
+            observation,
+            initial_latent: InitialLatent::Provided(latent),
+            metadata,
         }
     }
 }
@@ -170,6 +219,12 @@ pub trait VlaRuntime {
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 
+    /// Current execution path for diagnostics and benchmarks. Implementations
+    /// should report an eager fallback explicitly after a graph attempt.
+    fn execution_mode(&self) -> &'static str {
+        "runtime-managed"
+    }
+
     /// Run inference and copy the resulting action to host as `f32`.
     ///
     /// [`infer`](Self::infer) returns an [`Action`] whose tensor lives on the
@@ -179,6 +234,37 @@ pub trait VlaRuntime {
     /// This convenience performs the device→host copy inside the runtime, which
     /// already owns the backend.
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>>;
+
+    /// Discrete action-token output shape for autoregressive token VLAs.
+    ///
+    /// A runtime whose deployable output is a token sequence (π0-FAST) returns
+    /// `Some([1, max_action_tokens])`; continuous-action runtimes keep `None`
+    /// and use [`contract`](Self::contract) alone.
+    fn action_token_shape(&self) -> Option<[usize; 2]> {
+        None
+    }
+
+    /// Run inference and return the raw action token ids as `[1, steps]` `f32`.
+    ///
+    /// Integral values are exact in `f32` well beyond any model vocabulary.
+    /// Token detokenization (FAST BPE + DCT) is action postprocessing and stays
+    /// in the Python policy layer.
+    ///
+    /// `stop_token` ends an autoregressive decode early: the runtime emits the
+    /// id, stops, and returns the shorter stream (π0-FAST's FAST stream ends at
+    /// the `|` terminator after ~10% of `max_action_tokens`, and its detokenizer
+    /// truncates there anyway). It rides this token-only entry point rather than
+    /// [`Observation`] so a continuous-action family never carries — or has to
+    /// spell out — a control knob that only token decoding reads.
+    fn infer_action_tokens(
+        &self,
+        _request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<Tensor> {
+        Err(Error::Other(
+            "this VLA runtime does not produce discrete action tokens".into(),
+        ))
+    }
 
     /// Collect named BF16 activation maxima for an FP8 calibration profile.
     fn calibration_amax(&self, _request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {

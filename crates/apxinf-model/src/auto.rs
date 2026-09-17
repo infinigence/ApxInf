@@ -47,6 +47,10 @@ pub struct LoadOptions {
     pub text_weight_dtype: Option<DType>,
     pub calibration_path: Option<PathBuf>,
     pub tuning_path: Option<PathBuf>,
+    /// Additional named model artifacts that are not embedded in the primary
+    /// checkpoint. Model loaders must reject missing or unknown required
+    /// assets instead of discovering them through process-global state.
+    pub assets: BTreeMap<String, PathBuf>,
     /// Enable online GEMM autotuning from real inference requests. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,
@@ -174,6 +178,24 @@ impl LoadedModel {
     /// callers that need host values without holding a backend handle.
     pub fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         self.vla()?.infer_host_f32(request)
+    }
+
+    /// Discrete action-token output shape, for autoregressive token VLAs.
+    ///
+    /// `None` means the loaded runtime emits continuous actions only.
+    pub fn action_token_shape(&self) -> Result<Option<[usize; 2]>> {
+        Ok(self.vla()?.action_token_shape())
+    }
+
+    /// Run VLA inference and return the raw discrete action tokens, for
+    /// autoregressive token VLAs only. `stop_token` ends the decode early (see
+    /// [`VlaRuntime::infer_action_tokens`]).
+    pub fn infer_action_tokens(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+    ) -> Result<Tensor> {
+        self.vla()?.infer_action_tokens(request, stop_token)
     }
 
     pub fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {

@@ -364,6 +364,23 @@ __global__ void bias_residual_bf16_kernel(
   }
 }
 
+// Preserve a two-kernel `bias_bf16` then `add_bf16` contract in one launch:
+// the projection+bias sum is rounded to BF16 before adding the residual.
+__global__ void bias_then_residual_bf16_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* bias,
+    const __nv_bfloat16* residual, __nv_bfloat16* output,
+    int64_t count, int cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    float value = __bfloat162float(projection[index]);
+    if (bias != nullptr) value += __bfloat162float(bias[index % cols]);
+    const __nv_bfloat16 biased = __float2bfloat16(value);
+    output[index] = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[index]));
+  }
+}
+
 __global__ void bias_residual_f16_bf16_kernel(
     const half* projection, const __nv_bfloat16* bias,
     const __nv_bfloat16* residual, __nv_bfloat16* output,

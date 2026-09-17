@@ -195,6 +195,60 @@ pub fn rgb_u8_to_patches_bf16(
         .map_err(Error::Cuda)
     }
 }
+/// Fused static inference image preprocessing into FP32 patch-major layout.
+///
+/// Identical addressing to [`rgb_u8_to_patches_bf16`], but the normalized
+/// value stays in FP32. PaliGemma keeps the SigLIP patch embedding in FP32, so
+/// quantizing the patch tensor to BF16 before the projection changes the
+/// vision features enough to flip action tokens.
+#[allow(clippy::too_many_arguments)]
+pub fn rgb_u8_to_patches_f32(
+    ctx: &CudaContext,
+    images: &CudaBuffer,
+    patches: &Tensor,
+    views: usize,
+    image_size: usize,
+    patch_size: usize,
+    layout: ImageLayout,
+) -> Result<()> {
+    if views == 0 || image_size == 0 || patch_size == 0 || image_size % patch_size != 0 {
+        return Err(Error::Other(
+            "invalid static inference FP32 image preprocessing shape".into(),
+        ));
+    }
+    let expected_bytes = views * 3 * image_size * image_size;
+    let side = image_size / patch_size;
+    let expected_shape = [views * side * side, 3 * patch_size * patch_size];
+    if images.device() != ctx.device_id()
+        || images.len() != expected_bytes
+        || patches.dtype() != DType::F32
+        || patches.shape().dims() != expected_shape
+    {
+        return Err(Error::Other(format!(
+            "static inference FP32 raw image/preprocessed patch mismatch: image bytes {}, patches {} {:?}",
+            images.len(),
+            patches.dtype(),
+            patches.shape().dims()
+        )));
+    }
+    let layout = match layout {
+        ImageLayout::Nhwc => 0,
+        ImageLayout::Nchw => 1,
+    };
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_rgb_u8_to_patches_f32(
+            images.ptr(),
+            gpu_ptr(patches)?,
+            views as i32,
+            image_size as i32,
+            patch_size as i32,
+            layout,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 /// Fused static inference image preprocessing for an already resized RGB image batch.
 ///
 /// The input is `uint8` NHWC or NCHW. The output is patch-major E4M3 with

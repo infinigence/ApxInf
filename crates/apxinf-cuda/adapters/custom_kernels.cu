@@ -607,6 +607,24 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+  const int threads = 256;
+  layer_norm_quant_bf16_e4m3_kernel<<<rows, threads, shared_bytes, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), rows, cols, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_layer_norm_quant_f16_e4m3(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
@@ -628,6 +646,25 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_f16_e4m3(
   bias_gelu_quant_f16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const half*>(input), static_cast<const half*>(bias),
       static_cast<__nv_fp8_e4m3*>(output), count, cols, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+  constexpr int threads = 256;
+  const int64_t quad_count = static_cast<int64_t>(rows) * cols / 4;
+  int blocks = static_cast<int>((quad_count + threads - 1) / threads);
+  blocks = blocks > 1024 ? 1024 : blocks;
+  bias_gelu_quant_bf16_e4m3_packed4_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), quad_count, cols, 1.0f / scale);
   return cudaGetLastError();
 }
 

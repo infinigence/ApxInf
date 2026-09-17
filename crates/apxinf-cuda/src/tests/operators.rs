@@ -5,7 +5,7 @@ use crate::context::CudaContext;
 use crate::kernels::activation::{gelu_tanh, silu};
 use crate::kernels::attention::{causal_mask, softmax, softmax_causal, vision};
 use crate::kernels::cache::append;
-use crate::kernels::elementwise::{add, add_bias, mul, scale};
+use crate::kernels::elementwise::{add, add_bias, concat_columns_bf16, mul, scale};
 use crate::kernels::embedding::lookup;
 use crate::kernels::norm::{layer, rms};
 use crate::kernels::rope::{apply, apply_batched, apply_mrope, apply_vision_2d};
@@ -24,6 +24,61 @@ use crate::test_util::{
 
 fn silu_ref(x: f32) -> f32 {
     x / (1.0f32 + (-x).exp())
+}
+
+#[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+#[test]
+fn sdpa_fa2_prefill_supports_direct_output_projection() {
+    assert!(
+        std::env::var_os("APXINF_PREFILL_SDPA_LEGACY").is_none(),
+        "unset APXINF_PREFILL_SDPA_LEGACY to exercise the FA2 fast path"
+    );
+    let _guard = super::gpu_smem_guard();
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kv_heads, head_dim, max_seq) = (4, 2, 128, 8);
+    let width = heads * head_dim;
+    // Select one channel per head, as a small stand-in for Llama's wo.
+    let mut weights = vec![0.0; width * heads];
+    for head in 0..heads {
+        weights[(head * head_dim) * heads + head] = 1.0;
+    }
+    let wo = upload_fp32_as_bf16(&ctx, &weights, vec![width, heads]).unwrap();
+    for tokens in [1, 5] {
+        let q = upload_fp32_as_bf16(
+            &ctx,
+            &vec![0.0; tokens * width],
+            vec![tokens, heads, head_dim],
+        )
+        .unwrap();
+        let kv_shape = vec![tokens, kv_heads, head_dim];
+        let k = upload_fp32_as_bf16(
+            &ctx,
+            &vec![0.0; tokens * kv_heads * head_dim],
+            kv_shape.clone(),
+        )
+        .unwrap();
+        let values: Vec<f32> = (0..tokens * kv_heads * head_dim)
+            .map(|i| (i / (kv_heads * head_dim) + 1) as f32)
+            .collect();
+        let v = upload_fp32_as_bf16(&ctx, &values, kv_shape).unwrap();
+        let cache = crate::CudaKVCache::new(0, 1, kv_heads, head_dim, max_seq).unwrap();
+        cache.append(&ctx, 0, &k, &v, tokens).unwrap();
+        let out = crate::kernels::attention::sdpa(
+            &ctx, &q, &cache, 0, heads, kv_heads, head_dim, tokens, max_seq, 0,
+        )
+        .unwrap();
+        assert_eq!(out.shape().dims(), &[tokens, width]);
+        // No caller-side reshape: this is the LlamaModel calling convention.
+        let projected = crate::kernels::gemm::matmul(&ctx, &out, &wo).unwrap();
+        assert_eq!(projected.shape().dims(), &[tokens, heads]);
+        // Zero Q/K gives uniform causal attention: mean of values 1..=t+1.
+        let expected: Vec<f32> = (0..tokens * heads)
+            .map(|i| (i / heads + 2) as f32 / 2.0)
+            .collect();
+        let actual = download_bf16_as_fp32(&projected).unwrap();
+        assert!(actual.iter().all(|x| x.is_finite()));
+        assert_bf16_close_reduction(&actual, &expected);
+    }
 }
 
 #[test]
@@ -358,6 +413,35 @@ fn add_bf16_matches_fp32_reference() {
     let tb = upload_fp32_as_bf16(&ctx, &b, vec![n]).unwrap();
     let out = add(&ctx, &ta, &tb).unwrap();
     assert_bf16_close_elementwise(&download_bf16_as_fp32(&out).unwrap(), &expected);
+}
+
+#[test]
+fn concat_columns_bf16_matches_reference_and_can_be_captured() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let left = upload_fp32_as_bf16(&ctx, &[1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+    let right =
+        upload_fp32_as_bf16(&ctx, &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], vec![2, 3]).unwrap();
+    let expected = [1.0, 2.0, 10.0, 20.0, 30.0, 3.0, 4.0, 40.0, 50.0, 60.0];
+    let workspace = crate::workspace::GraphWorkspace::new(4096, 0).unwrap();
+
+    let eager = crate::workspace::prepare_with_workspace(&workspace, || {
+        concat_columns_bf16(&ctx, &[&left, &right])
+    })
+    .unwrap();
+    ctx.synchronize().unwrap();
+    assert_bf16_close_elementwise(&download_bf16_as_fp32(&eager).unwrap(), &expected);
+    drop(eager);
+
+    crate::graph::begin(&ctx, crate::graph::CaptureMode::ThreadLocal).unwrap();
+    let captured = crate::workspace::with_workspace(&workspace, || {
+        concat_columns_bf16(&ctx, &[&left, &right])
+    })
+    .unwrap();
+    let graph = crate::graph::end(&ctx).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+
+    assert_bf16_close_elementwise(&download_bf16_as_fp32(&captured).unwrap(), &expected);
 }
 
 // ── Elementwise: mul ──────────────────────────────────────────────

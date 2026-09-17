@@ -17,6 +17,9 @@ impl Tensor {
     /// Create a tensor from raw bytes. Caller must ensure `data` length
     /// matches `shape.numel() * dtype.size_in_bytes()`.
     pub fn from_raw(shape: Shape, dtype: DType, device: Device, data: Vec<u8>) -> Result<Self> {
+        if device != Device::Cpu {
+            return Err(Error::UnsupportedDevice(device));
+        }
         let expected = shape.numel() * dtype.size_in_bytes();
         if data.len() != expected {
             return Err(Error::DataLengthMismatch {
@@ -32,8 +35,31 @@ impl Tensor {
         })
     }
 
-    /// Create a tensor directly from components (used by apxinf-cuda for GPU tensors).
+    /// Create a tensor directly from components.
+    ///
+    /// This compatibility constructor is retained while the existing CUDA
+    /// backend and `apxinf-cuda-new` coexist. New device backends should call
+    /// [`Tensor::from_raw_parts_unchecked`] so the raw-storage safety boundary
+    /// remains explicit at their call site.
     pub fn from_raw_parts(shape: Shape, dtype: DType, device: Device, storage: Storage) -> Self {
+        // This method intentionally preserves the legacy API. The old backend
+        // owns its allocation through `GpuStorageHandle::_prevent_leak`.
+        unsafe { Self::from_raw_parts_unchecked(shape, dtype, device, storage) }
+    }
+
+    /// Create a tensor directly from backend-owned storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must belong to `device`, remain valid for the returned
+    /// tensor's lifetime, and contain at least `shape.numel() *
+    /// dtype.size_in_bytes()` accessible bytes without arithmetic overflow.
+    pub unsafe fn from_raw_parts_unchecked(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+        storage: Storage,
+    ) -> Self {
         Self {
             shape,
             dtype,
@@ -94,15 +120,45 @@ impl Tensor {
     pub fn from_f16(shape: impl Into<Shape>, data: &[f16]) -> Result<Self> {
         let shape = shape.into();
         if data.len() != shape.numel() {
-            return Err(Error::DataLengthMismatch { expected: shape.numel() * 2, got: data.len() * 2 });
+            return Err(Error::DataLengthMismatch {
+                expected: shape.numel() * 2,
+                got: data.len() * 2,
+            });
         }
         let bytes: Vec<u8> = bytemuck::cast_slice(data).to_vec();
-        Ok(Self { shape, dtype: DType::F16, device: Device::Cpu, storage: Storage::cpu_from_bytes(bytes) })
+        Ok(Self {
+            shape,
+            dtype: DType::F16,
+            device: Device::Cpu,
+            storage: Storage::cpu_from_bytes(bytes),
+        })
     }
 
     /// Create a tensor containing raw CUDA-compatible E4M3 bytes.
     pub fn from_f8_e4m3(shape: impl Into<Shape>, data: &[u8]) -> Result<Self> {
         Self::from_raw(shape.into(), DType::F8E4M3, Device::Cpu, data.to_vec())
+    }
+
+    /// Create a tensor containing signed INT8 values.
+    #[cfg(feature = "quantized-dtypes")]
+    pub fn from_i8(shape: impl Into<Shape>, data: &[i8]) -> Result<Self> {
+        Self::from_raw(
+            shape.into(),
+            DType::I8,
+            Device::Cpu,
+            bytemuck::cast_slice(data).to_vec(),
+        )
+    }
+
+    /// Create a tensor containing signed INT32 values.
+    #[cfg(feature = "quantized-dtypes")]
+    pub fn from_i32(shape: impl Into<Shape>, data: &[i32]) -> Result<Self> {
+        Self::from_raw(
+            shape.into(),
+            DType::I32,
+            Device::Cpu,
+            bytemuck::cast_slice(data).to_vec(),
+        )
     }
 
     // ── Accessors ───────────────────────────────────────────────────
@@ -131,7 +187,7 @@ impl Tensor {
         &self.storage
     }
 
-    pub fn storage_mut(&mut self) -> &mut Storage {
+    pub(crate) fn storage_mut(&mut self) -> &mut Storage {
         &mut self.storage
     }
 
@@ -178,6 +234,20 @@ impl Tensor {
         Ok(self.storage.as_cpu().unwrap())
     }
 
+    #[cfg(feature = "quantized-dtypes")]
+    pub fn as_i8(&self) -> Result<&[i8]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I8)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
+    #[cfg(feature = "quantized-dtypes")]
+    pub fn as_i32(&self) -> Result<&[i32]> {
+        self.ensure_cpu()?;
+        self.ensure_dtype(DType::I32)?;
+        Ok(bytemuck::cast_slice(self.storage.as_cpu().unwrap()))
+    }
+
     /// Convert data to f32 regardless of stored dtype (copies if bf16).
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         self.ensure_cpu()?;
@@ -185,7 +255,15 @@ impl Tensor {
             DType::F32 => Ok(self.as_f32()?.to_vec()),
             DType::F16 => Ok(self.as_f16()?.iter().map(|x| x.to_f32()).collect()),
             DType::BF16 => Ok(self.as_bf16()?.iter().map(|x| x.to_f32()).collect()),
-            DType::F8E4M3 => Err(Error::Other("raw E4M3 conversion requires an explicit quantization scale".into())),
+            DType::F8E4M3 => Err(Error::Other(
+                "raw E4M3 conversion requires an explicit quantization scale".into(),
+            )),
+            #[cfg(feature = "quantized-dtypes")]
+            DType::I8 => Err(Error::Other(
+                "raw INT8 conversion requires an explicit quantization scale".into(),
+            )),
+            #[cfg(feature = "quantized-dtypes")]
+            DType::I32 => Ok(self.as_i32()?.iter().map(|&x| x as f32).collect()),
         }
     }
 
@@ -215,11 +293,7 @@ impl Tensor {
                 device: *device,
                 storage: Storage::Gpu {
                     device: *device,
-                    handle: crate::storage::GpuStorageHandle {
-                        ptr: handle.ptr,
-                        len: handle.len,
-                        _prevent_leak: handle._prevent_leak.clone(),
-                    },
+                    handle: handle.clone(),
                 },
             }),
         }
@@ -288,12 +362,7 @@ impl Tensor {
             let a_off = batch_idx * m * k;
             let b_off = batch_idx * k * n;
             let o_off = batch_idx * m * n;
-            crate::ops::sgemm(
-                m, k, n,
-                &a[a_off..],
-                &b[b_off..],
-                &mut out[o_off..],
-            );
+            crate::ops::sgemm(m, k, n, &a[a_off..], &b[b_off..], &mut out[o_off..]);
         }
 
         Tensor::from_f32(out_shape, &out)
@@ -318,8 +387,14 @@ impl Tensor {
         Ok(())
     }
 
-    /// Replace the internals (used by cuda module to swap storage after transfer).
-    pub fn set_device_and_storage(&mut self, device: Device, storage: Storage) {
+    /// Replace the device and storage metadata without validating their
+    /// relationship.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must belong to `device`, remain alive for this tensor, and
+    /// contain enough accessible bytes for this tensor's shape and dtype.
+    pub unsafe fn set_device_and_storage(&mut self, device: Device, storage: Storage) {
         self.device = device;
         self.storage = storage;
     }
@@ -354,6 +429,15 @@ mod tests {
         let t = Tensor::from_f32(vec![2, 3], &data).unwrap();
         assert_eq!(t.shape(), &Shape::new(vec![2, 3]));
         assert_eq!(t.as_f32().unwrap(), &data);
+    }
+
+    #[test]
+    fn test_from_raw_rejects_gpu_device_for_cpu_bytes() {
+        let result = Tensor::from_raw(Shape::new(vec![1]), DType::F32, Device::Cuda(0), vec![0; 4]);
+        assert!(matches!(
+            result,
+            Err(Error::UnsupportedDevice(Device::Cuda(0)))
+        ));
     }
 
     #[test]
@@ -418,6 +502,9 @@ mod tests {
     #[test]
     fn test_display() {
         let t = Tensor::zeros(vec![2, 3], DType::F32);
-        assert_eq!(format!("{t}"), "Tensor(shape=[2, 3], dtype=f32, device=cpu)");
+        assert_eq!(
+            format!("{t}"),
+            "Tensor(shape=[2, 3], dtype=f32, device=cpu)"
+        );
     }
 }

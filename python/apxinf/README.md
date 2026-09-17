@@ -234,7 +234,9 @@ pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
 
-Native tokenizer differential tests need the Python `sentencepiece` reference
-and a SentencePiece model (`APXINF_TOKENIZER` or
-`APXINF_PI05_MODEL_DIR`); the real-model layering test needs a CUDA `apxinf_py`
-build plus `APXINF_PI05_MODEL_DIR`.
+The `test` extra holds reference implementations, never runtime dependencies: the
+native tokenizer differential tests need the Python `sentencepiece` reference and
+a SentencePiece model (`APXINF_TOKENIZER` or `APXINF_PI05_MODEL_DIR`). Everything
+else is checked against the definition or against itself — the π0-FAST inverse DCT
+is compared with the textbook term-by-term sum, not with scipy. The real-model
+layering test needs a CUDA `apxinf_py` build plus `APXINF_PI05_MODEL_DIR`.

@@ -164,6 +164,85 @@ __global__ void layer_norm_bf16_kernel(
     output[offset + col] = __float2bfloat16(w * (x - mean) * inv_std + b);
 }
 
+// ── Adaptive LayerNorm (bf16) ────────────────────────────────────────────
+//
+// `modulation` is `[scale, shift]`, each half containing `cols` values and
+// shared across all rows:
+//   output = layer_norm(input) * (1 + scale) + shift
+
+// One block owns one row. FP32 reductions match PyTorch LayerNorm semantics;
+// only the final result is rounded to BF16.
+
+__global__ void adaptive_layer_norm_bf16_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* modulation,
+    __nv_bfloat16* output, uint32_t rows, uint32_t cols, float eps)
+{
+    __shared__ float scratch[16];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x)
+        sum += __bfloat162float(input[(uint64_t)row * cols + col]);
+    const float mean = block_sum(sum, scratch) / cols;
+
+    float variance_sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float centered =
+            __bfloat162float(input[(uint64_t)row * cols + col]) - mean;
+        variance_sum += centered * centered;
+    }
+    const float inverse_std = rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const uint64_t index = (uint64_t)row * cols + col;
+        const float normalized = (__bfloat162float(input[index]) - mean) * inverse_std;
+        const float scale = __bfloat162float(modulation[col]);
+        const float shift = __bfloat162float(modulation[cols + col]);
+        output[index] = __float2bfloat16(normalized * (1.0f + scale) + shift);
+    }
+}
+
+// Preserve the two-kernel contract while producing the BF16 activation and
+// its calibrated E4M3 projection input in one pass over the normalized row.
+__global__ void adaptive_layer_norm_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* modulation,
+    __nv_bfloat16* output, __nv_fp8_e4m3* quantized,
+    uint32_t rows, uint32_t cols, float eps, float inverse_scale)
+{
+    __shared__ float scratch[16];
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x)
+        sum += __bfloat162float(input[(uint64_t)row * cols + col]);
+    const float mean = block_sum(sum, scratch) / cols;
+
+    float variance_sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float centered =
+            __bfloat162float(input[(uint64_t)row * cols + col]) - mean;
+        variance_sum += centered * centered;
+    }
+    const float inverse_std =
+        rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const uint64_t index = (uint64_t)row * cols + col;
+        const float normalized =
+            (__bfloat162float(input[index]) - mean) * inverse_std;
+        const float scale = __bfloat162float(modulation[col]);
+        const float shift = __bfloat162float(modulation[cols + col]);
+        const __nv_bfloat16 rounded =
+            __float2bfloat16(normalized * (1.0f + scale) + shift);
+        output[index] = rounded;
+        float value = __bfloat162float(rounded) * inverse_scale;
+        value = fminf(448.0f, fmaxf(-448.0f, value));
+        quantized[index] = static_cast<__nv_fp8_e4m3>(value);
+    }
+}
+
 
 
 
@@ -206,6 +285,43 @@ __global__ void rms_norm_quant_bf16_e4m3_kernel(
                   __bfloat162float(weight[col]) * inverse_scale;
     value = fminf(448.0f, fmaxf(-448.0f, value));
     output[index] = static_cast<__nv_fp8_e4m3>(value);
+  }
+}
+
+__global__ void layer_norm_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_fp8_e4m3* output,
+    int rows, int cols, float eps, float inverse_scale) {
+  extern __shared__ float x_buf[];
+  __shared__ float scratch[16];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int offset = row * cols;
+
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value = __bfloat162float(input[offset + col]);
+    x_buf[col] = value;
+    sum += value;
+  }
+  const float mean = block_sum(sum, scratch) / cols;
+
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered = x_buf[col] - mean;
+    variance_sum += centered * centered;
+  }
+  const float inverse_std =
+      rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float value = (x_buf[col] - mean) * inverse_std;
+    value = value * __bfloat162float(weight[col]) +
+            __bfloat162float(bias[col]);
+    // Match the previous LayerNorm-then-quantize rounding contract.
+    value = __bfloat162float(__float2bfloat16(value));
+    value = fminf(448.0f, fmaxf(-448.0f, value * inverse_scale));
+    output[offset + col] = static_cast<__nv_fp8_e4m3>(value);
   }
 }
 

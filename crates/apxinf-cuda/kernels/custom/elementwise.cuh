@@ -196,6 +196,25 @@ __global__ void gather_rows_bf16_kernel(
   }
 }
 
+__global__ void scatter_rows_bf16_kernel(
+    const __nv_bfloat16* source, const uint32_t* rows,
+    __nv_bfloat16* output, int64_t count, int cols, bool add) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int source_row = static_cast<int>(index / cols);
+    const int column = static_cast<int>(index % cols);
+    const int64_t output_index =
+        static_cast<int64_t>(rows[source_row]) * cols + column;
+    if (add) {
+      output[output_index] = __float2bfloat16(
+          __bfloat162float(output[output_index]) + __bfloat162float(source[index]));
+    } else {
+      output[output_index] = source[index];
+    }
+  }
+}
+
 __global__ void replace_rows_bf16_kernel(
     const __nv_bfloat16* base, const __nv_bfloat16* replacement,
     const uint32_t* row_map, __nv_bfloat16* output, int rows, int cols) {
@@ -220,6 +239,21 @@ __global__ void euler_update_bf16_kernel(
   for (; index < count; index += stride) {
     output[index] = __float2bfloat16(
         __bfloat162float(state[index]) + dt * __bfloat162float(velocity[index]));
+  }
+}
+
+__global__ void bias_position_f32_kernel(
+    const float* projection, const float* bias,
+    const float* position, __nv_bfloat16* output,
+    int64_t count, int cols, int tokens_per_view) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int col = static_cast<int>(index % cols);
+    const int token = static_cast<int>((index / cols) % tokens_per_view);
+    float value = projection[index] + position[token * cols + col];
+    if (bias != nullptr) value += bias[col];
+    output[index] = __float2bfloat16(value);
   }
 }
 

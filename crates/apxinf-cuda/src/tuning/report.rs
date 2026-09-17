@@ -98,6 +98,7 @@ pub(crate) fn key_json(key: &GemmTuningKey) -> Value {
             super::GemmOp::Bf16 => "bf16",
             super::GemmOp::W8A8 => "w8a8",
             super::GemmOp::Fp8F16 => "fp8_f16",
+            super::GemmOp::Fp8Bf16 => "fp8_bf16",
         },
         "device": {
             "sm": key.device.sm,

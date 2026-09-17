@@ -78,8 +78,15 @@ impl GeneralQwen3VL {
         let mut weights = transfer_weights(&weights, &*backend)?;
         let vision_weights = transfer_vision_weights(&vision_weights, &*backend)?;
 
-        // Cache the transposed embedding for the tied lm_head matmul.
-        let lm_head = transpose_tensor_bf16_or_f32(&weights.token_embedding, &*backend)?;
+        // Output projection. Untied checkpoints ship lm_head.weight and it
+        // must be used verbatim; tied ones reuse the transposed embedding.
+        // Deciding this from the checkpoint (rather than the
+        // `tie_word_embeddings` config flag, which several shipped configs
+        // omit) is what makes 8B produce correct logits.
+        let lm_head = match &weights.lm_head {
+            Some(lm) => lm.clone(),
+            None => transpose_tensor_bf16_or_f32(&weights.token_embedding, &*backend)?,
+        };
 
         // Build fused weight matrices (qkv_packed, gate_up_packed) for the
         // fused-GEMM decode path. No-ops on backends without concat_2d.
@@ -534,6 +541,7 @@ fn transfer_weights(w: &Qwen3VLTextWeights, backend: &dyn Backend) -> Result<Qwe
     })).collect::<Result<Vec<_>>>()?;
     Ok(Qwen3VLTextWeights {
         token_embedding: backend.to_device(&w.token_embedding)?,
+        lm_head: w.lm_head.as_ref().map(|t| backend.to_device(t)).transpose()?,
         layers,
         output_norm_weight: backend.to_device(&w.output_norm_weight)?,
     })

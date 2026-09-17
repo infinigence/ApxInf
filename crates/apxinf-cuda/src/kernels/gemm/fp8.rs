@@ -1,5 +1,5 @@
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
-use half::f16;
+use half::{bf16, f16};
 
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
@@ -227,6 +227,32 @@ fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey 
         epilogue: Epilogue::None,
         workspace_limit: usize::MAX,
     }
+}
+
+fn bf16_output_tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey {
+    GemmTuningKey {
+        op: GemmOp::Fp8Bf16,
+        device: DeviceFingerprint::from(ctx.caps()),
+        m,
+        n,
+        k,
+        activation_dtype: TuningDType::F8E4M3,
+        weight_dtype: TuningDType::F8E4M3,
+        output_dtype: TuningDType::Bf16,
+        layout: GemmLayout::RowMajor,
+        scale_mode: ScaleMode::PerTensor,
+        epilogue: Epilogue::None,
+        workspace_limit: usize::MAX,
+    }
+}
+
+fn copy_bf16_output(output: &CudaBuffer, elements: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0u8; elements * DType::BF16.size_in_bytes()];
+    output.copy_to_host(&mut bytes).map_err(Error::Cuda)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|value| bf16::from_bits(u16::from_ne_bytes([value[0], value[1]])).to_f32())
+        .collect())
 }
 
 pub fn exact_fp8_tactic(
@@ -1658,6 +1684,254 @@ pub fn cutlass_fp8_gemm_f16(
 pub fn prepare_cublaslt_fp8_gemm(m: usize, n: usize, k: usize) -> Result<()> {
     let status = unsafe { ffi::apxinf_static_prepare_fp8_gemm_f16(m as i32, n as i32, k as i32) };
     ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+pub fn prepare_cublaslt_fp8_gemm_bf16(m: usize, n: usize, k: usize) -> Result<()> {
+    let status = unsafe { ffi::apxinf_static_prepare_fp8_gemm_bf16(m as i32, n as i32, k as i32) };
+    ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+pub(super) fn set_cublaslt_fp8_bf16_gemm_heuristic(
+    m: usize,
+    n: usize,
+    k: usize,
+    heuristic_rank: i32,
+) -> Result<()> {
+    let status = unsafe {
+        ffi::apxinf_static_set_cublaslt_fp8_gemm_bf16_heuristic(
+            m as i32,
+            n as i32,
+            k as i32,
+            heuristic_rank,
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+fn launch_tactic_fp8_bf16(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    alpha: f32,
+    tactic: TacticId,
+) -> Result<()> {
+    if !matches!(
+        tactic.backend,
+        TacticBackend::Vendor | TacticBackend::CublasLt
+    ) {
+        return Err(Error::Other(format!(
+            "FP8-to-BF16 online autotune cannot execute {tactic:?}"
+        )));
+    }
+    unsafe {
+        ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bf16(
+            activation.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            key.m as i32,
+            key.n as i32,
+            key.k as i32,
+            alpha,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
+fn autotune_request_fp8_bf16(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    alpha: f32,
+    preferred: Option<TacticId>,
+) -> Result<TuningOutcome> {
+    let elements = key
+        .m
+        .checked_mul(key.n)
+        .ok_or_else(|| Error::Other("FP8-to-BF16 autotune output size overflow".into()))?;
+    let bytes = elements
+        .checked_mul(DType::BF16.size_in_bytes())
+        .ok_or_else(|| Error::Other("FP8-to-BF16 autotune output size overflow".into()))?;
+    let reference_output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let default = TacticId {
+        backend: TacticBackend::Vendor,
+        value: 0,
+    };
+    prepare_tactic_fp8(key, default)?;
+    launch_tactic_fp8_bf16(
+        ctx,
+        key,
+        activation,
+        weight,
+        &reference_output,
+        alpha,
+        default,
+    )?;
+    ctx.synchronize().map_err(Error::Cuda)?;
+    let reference = copy_bf16_output(&reference_output, elements)?;
+    drop(reference_output);
+
+    let output = CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+    let events = CudaEventPair::new()?;
+    let mut evictor = ColdL2Evictor::new(ctx)?;
+    let engine = AutoTuneEngine::new(AutoTuneConfig::default())?;
+    let candidates = super::providers::candidates(key, 64).into_iter();
+    engine.tune_with_preferred(key, preferred, candidates, |candidate, config| {
+        prepare_tactic_fp8(key, candidate.tactic)?;
+        launch_tactic_fp8_bf16(
+            ctx,
+            key,
+            activation,
+            weight,
+            &output,
+            alpha,
+            candidate.tactic,
+        )?;
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let actual = copy_bf16_output(&output, elements)?;
+        let correct = crate::tuning::outputs_are_close(&reference, &actual, 0.01, 0.9999);
+        if !correct {
+            return Ok(CandidateMeasurement {
+                tactic: candidate.tactic,
+                milliseconds: None,
+                correct: false,
+            });
+        }
+        for _ in 0..config.warmup_iterations {
+            evictor.evict(ctx)?;
+            launch_tactic_fp8_bf16(
+                ctx,
+                key,
+                activation,
+                weight,
+                &output,
+                alpha,
+                candidate.tactic,
+            )?;
+        }
+        ctx.synchronize().map_err(Error::Cuda)?;
+        let mut milliseconds = 0.0;
+        for _ in 0..config.benchmark_iterations {
+            milliseconds += events.measure(ctx, &mut evictor, || {
+                launch_tactic_fp8_bf16(
+                    ctx,
+                    key,
+                    activation,
+                    weight,
+                    &output,
+                    alpha,
+                    candidate.tactic,
+                )
+            })?;
+        }
+        Ok(CandidateMeasurement {
+            tactic: candidate.tactic,
+            milliseconds: Some(milliseconds / config.benchmark_iterations as f64),
+            correct: true,
+        })
+    })
+}
+
+fn resolve_fp8_bf16_plan(
+    ctx: &CudaContext,
+    key: &GemmTuningKey,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    alpha: f32,
+) -> Result<super::PreparedGemmPlan> {
+    ctx.gemm_plans().resolve_or_tune(
+        ctx,
+        key,
+        TacticId {
+            backend: TacticBackend::Vendor,
+            value: 0,
+        },
+        |preferred| autotune_request_fp8_bf16(ctx, key, activation, weight, alpha, preferred),
+    )
+}
+
+/// Static native E4M3 x E4M3 GEMM with a BF16 output. Callers remain responsible
+/// for activation quantization and for applying any BF16 bias.
+pub fn gemm_fp8_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+) -> Result<Tensor> {
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
+            activation.dtype(),
+            weight.values_e4m3.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: if activation.device() != expected_device {
+                activation.device()
+            } else {
+                weight.values_e4m3.device()
+            },
+        });
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let key = bf16_output_tuning_key(ctx, m, n, k);
+    resolve_fp8_bf16_plan(
+        ctx,
+        &key,
+        &activation,
+        &weight_buffer,
+        activation_scale * weight.scale,
+    )?;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bf16(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            activation_scale * weight.scale,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
 pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<()> {
