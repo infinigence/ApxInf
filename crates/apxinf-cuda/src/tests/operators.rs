@@ -917,6 +917,172 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
     );
 }
 
+// ── GDN chunk-state scan against an fp64 oracle ───────────────────
+//
+// This kernel is the largest single one in a VQA scene -- 452 ms, 38% of
+// prefill -- and it is scalar fp32 on CUDA cores, where Thor is 1.59x Orin
+// while its tensor cores are 11x. Its four inner products are GEMM-shaped and
+// in every one of them the right-hand operand is already on the BF16 grid:
+// the carried state is rounded to BF16 by the kernel itself, and v_new is
+// rounded before both the intra term and the state update. So rounding the
+// left operand to BF16 as well does not open a new order of error, it roughly
+// doubles an error the term already has -- which is a claim to measure, not to
+// assert.
+//
+// This fixes the input and reports the error of whatever the kernel does
+// against a double-precision reference of the scan.
+//
+//   cargo test --release -p apxinf-cuda gdn_chunk_state_scan -- --nocapture
+#[test]
+fn gdn_chunk_state_scan_error_against_fp64_oracle() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
+    let seq_pad = chunk * chunks;
+    let seq = seq_pad;
+
+    let draw = |salt: u64, n: usize, scale: f64| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                (((x & 0xFFFF) as f64 / 32768.0 - 1.0) * scale) as f32
+            })
+            .collect()
+    };
+    let q = draw(1, heads * seq_pad * kdim, 0.5);
+    let k = draw(2, heads * seq_pad * kdim, 0.5);
+    let t = draw(3, heads * chunks * chunk * chunk, 0.25);
+    let vt = draw(4, heads * chunks * chunk * vdim, 0.5);
+    let kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    let state0 = draw(6, heads * kdim * vdim, 0.2);
+    // g_cum is a cumulative log-decay: non-increasing within a chunk.
+    let mut g_cum = vec![0.0f32; heads * seq_pad];
+    for h in 0..heads {
+        for c in 0..chunks {
+            let mut acc = 0.0f32;
+            for i in 0..chunk {
+                acc -= 0.01 * ((h + c + i) % 5) as f32;
+                g_cum[h * seq_pad + c * chunk + i] = acc;
+            }
+        }
+    }
+
+    let upload = |data: &[f32]| -> CudaBuffer {
+        let buf = CudaBuffer::alloc(data.len() * 4, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                buf.ptr(),
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len() * 4,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        buf
+    };
+    let (qb, kb, gb, tb, vtb, kcdb) = (
+        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+    );
+    let sb = upload(&state0);
+    let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
+    let out_t = out
+        .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
+        .unwrap();
+    crate::kernels::linear_attention::gdn_chunk_state(
+        &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
+    )
+    .unwrap();
+    let got = download_bf16_as_fp32(&out_t).unwrap();
+
+    // fp64 reference. The BF16 roundings the kernel performs deliberately are
+    // part of the definition here, not error: the carried state and v_new are
+    // rounded before use, and the reference does the same.
+    let bf = |x: f64| -> f64 {
+        let v = x as f32;
+        let bits = v.to_bits();
+        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        f32::from_bits(r) as f64
+    };
+    let scale = 1.0f64 / (kdim as f64).sqrt();
+    let mut sum_abs = 0.0f64;
+    let mut sum_ref = 0.0f64;
+    let mut worst = 0.0f64;
+    for h in 0..heads {
+        let mut state = vec![0.0f64; kdim * vdim];
+        for i in 0..kdim * vdim {
+            state[i] = state0[h * kdim * vdim + i] as f64;
+        }
+        for c in 0..chunks {
+            let tok = h * seq_pad + c * chunk;
+            let mut v_new = vec![0.0f64; chunk * vdim];
+            let mut inter = vec![0.0f64; chunk * vdim];
+            for i in 0..chunk {
+                let qg = (g_cum[tok + i] as f64).exp2();
+                for j in 0..vdim {
+                    let mut vp = 0.0f64;
+                    let mut ai = 0.0f64;
+                    for m in 0..kdim {
+                        let sv = bf(state[m * vdim + j]);
+                        vp += kcd[((h * chunks + c) * chunk + i) * kdim + m] as f64 * sv;
+                        ai += q[(tok + i) * kdim + m] as f64 * sv;
+                    }
+                    v_new[i * vdim + j] = vt[((h * chunks + c) * chunk + i) * vdim + j] as f64 - vp;
+                    inter[i * vdim + j] = ai * qg;
+                }
+            }
+            for i in 0..chunk {
+                for j in 0..vdim {
+                    let mut intra = 0.0f64;
+                    for m in 0..chunk {
+                        intra += t[((h * chunks + c) * chunk + i) * chunk + m] as f64
+                            * bf(v_new[m * vdim + j]);
+                    }
+                    let acc = inter[i * vdim + j] * scale + intra * scale;
+                    let token = c * chunk + i;
+                    let actual = got[token * heads * vdim + h * vdim + j] as f64;
+                    let delta = (actual - acc).abs();
+                    sum_abs += delta;
+                    sum_ref += acc.abs();
+                    worst = worst.max(delta / acc.abs().max(1e-6));
+                }
+            }
+            let g_last = g_cum[tok + chunk - 1] as f64;
+            let decay = g_last.exp2();
+            let mut vr = vec![0.0f64; chunk * vdim];
+            for i in 0..chunk {
+                let w = (g_last - g_cum[tok + i] as f64).exp2();
+                for j in 0..vdim {
+                    vr[i * vdim + j] = bf(v_new[i * vdim + j] * w);
+                }
+            }
+            for m in 0..kdim {
+                for j in 0..vdim {
+                    let mut acc = 0.0f64;
+                    for i in 0..chunk {
+                        acc += k[(tok + i) * kdim + m] as f64 * vr[i * vdim + j];
+                    }
+                    state[m * vdim + j] = state[m * vdim + j] * decay + acc;
+                }
+            }
+        }
+    }
+    println!(
+        "gdn_chunk_state_oracle tile={} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
+        std::env::var("APXINF_GDN_CHUNK_TILE").unwrap_or_else(|_| "default".into()),
+        seq * heads * vdim,
+        sum_abs / (seq * heads * vdim) as f64,
+        sum_abs / sum_ref,
+        worst
+    );
+    assert!(
+        sum_abs / sum_ref < 0.05,
+        "GDN chunk-state relative L1 {} against fp64",
+        sum_abs / sum_ref
+    );
+}
+
 // ── KV cache append ───────────────────────────────────────────────
 
 #[test]

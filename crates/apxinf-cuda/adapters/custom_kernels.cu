@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cmath>
 #include <cstdint>
@@ -28,6 +29,7 @@ namespace {
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/cache.cuh"
 #include "../kernels/custom/linear_attention.cuh"
+#include "../kernels/custom/gdn_chunk_state_wmma.cuh"
 #include "../kernels/custom/pooling.cuh"
 }  // namespace
 
@@ -1272,6 +1274,59 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // At the shipped shape this lands at 80KB, past the 48KB a kernel receives
   // without asking. Opt in once per instantiation; a device that refuses keeps
   // the error rather than launching with too little shared memory.
+  // Tensor-core form, for the shipped shape only.
+  //   1 / on / true -> split left operand, two BF16 passes, fp32-class error
+  //   lossy         -> one pass, left operand rounded to BF16
+  //   unset         -> the scalar kernel
+  static const int wmma_mode = [] {
+    if (const char* v = std::getenv("APXINF_GDN_CHUNK_STATE_WMMA")) {
+      if (v[0] == 'l') return 2;
+      if (v[0] == '0' || v[0] == 'f') return 0;
+      return 1;
+    }
+    // Default on where the tensor cores are worth this much: on Thor the
+    // split form is 1.4623 -> 1.1909 s of fixed cost at the same error.
+    return device_capability_major() >= 10 ? 1 : 0;
+  }();
+  if (wmma_mode != 0 && head_k_dim == 128 && head_v_dim == 128 && chunk_size == 64) {
+    const size_t wmma_smem =
+        static_cast<size_t>(128 * 128) * sizeof(__nv_bfloat16) +  // state
+        static_cast<size_t>(64) * 1024 +                          // left operands
+        static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) +   // v_round
+        static_cast<size_t>(64 * 128) * sizeof(float) * 2;        // v_new, inter/out
+    const void* entry =
+        wmma_mode == 1
+            ? reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<true>)
+            : reinterpret_cast<const void*>(gdn_chunk_state_wmma_kernel<false>);
+    static const void* opted_in = nullptr;
+    if (opted_in != entry) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          entry, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(wmma_smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      opted_in = entry;
+    }
+    const float chunk_scale =
+        static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim)));
+#define GDN_WMMA_ARGS                                                          \
+  static_cast<const float*>(q), static_cast<const float*>(k),                  \
+      static_cast<const float*>(g_cum), static_cast<const float*>(t_in),       \
+      static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),     \
+      static_cast<float*>(state), static_cast<__nv_bfloat16*>(out), seq,       \
+      seq_pad, total_chunks, out_row_width, chunk_scale
+    if (wmma_mode == 1) {
+      gdn_chunk_state_wmma_kernel<true>
+          <<<num_v_heads, 1024, wmma_smem, stream>>>(GDN_WMMA_ARGS);
+    } else {
+      gdn_chunk_state_wmma_kernel<false>
+          <<<num_v_heads, 1024, wmma_smem, stream>>>(GDN_WMMA_ARGS);
+    }
+#undef GDN_WMMA_ARGS
+    return cudaGetLastError();
+  }
+
   const int tile = chunk_state_tile();
   cudaError_t launched = cudaErrorInvalidValue;
   switch (tile) {
