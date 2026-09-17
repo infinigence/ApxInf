@@ -58,6 +58,31 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+/// Narrowest output width worth packing.
+///
+/// The GEMV over the packed form wins above this and loses badly below it.
+/// Measured per process on real weights at k=2560, packed against BF16:
+///
+///   n      9216   0.371x      n   36864   1.277x
+///   n     18432   0.368x      n   73728   1.610x
+///                             n  248320   1.578x
+///
+/// The cause is load instructions, not bytes: the byte stream alone reads
+/// 22.5 MB in 137.7 us where BF16 reads 45 MB in 184.8, and a ladder that
+/// adds one piece at a time (probes/steps.cu) puts the whole difference on the
+/// three exponent planes -- 282 us with one stream, 608 with four. A layout
+/// that reconstructs from a single stream would not have the crossover at all.
+/// `APXINF_PACKED_DECODE_MIN_N` moves it.
+fn min_packed_width() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("APXINF_PACKED_DECODE_MIN_N")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(36864)
+    })
+}
+
 fn build(ctx: &CudaContext, weight: &Tensor, k: usize, n: usize) -> Result<Option<PackedWeight>> {
     if k % PACK_BLOCK != 0 {
         return Ok(None);
@@ -114,6 +139,9 @@ pub(crate) fn gemv(
     k: usize,
     n: usize,
 ) -> Result<bool> {
+    if n < min_packed_width() {
+        return Ok(false);
+    }
     let ptr = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?.ptr() as usize;
     let mut guard = CACHE.lock().map_err(|_| Error::Other("packed weight cache poisoned".into()))?;
     let map = guard.get_or_insert_with(HashMap::new);
