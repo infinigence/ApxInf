@@ -31,6 +31,7 @@ namespace {
 #include "../kernels/custom/linear_attention.cuh"
 #include "../kernels/custom/gdn_chunk_state_wmma.cuh"
 #include "../kernels/custom/gdn_chunk_gemm_wmma.cuh"
+#include "../kernels/custom/gdn_attn_raw_wmma.cuh"
 #include "../kernels/custom/pooling.cuh"
 }  // namespace
 
@@ -1002,6 +1003,23 @@ extern "C" cudaError_t apxinf_static_gdn_cumsum_f32(
   return cudaGetLastError();
 }
 
+static int device_capability_major();
+
+// Tensor-core form of the raw-attention term, off unless asked for. Neither
+// operand is on the BF16 grid here, so `1` runs the three-term split product
+// and `lossy` the single BF16 pass; see the kernel comment.
+static int wmma_attn_raw_mode() {
+  static const int mode = [] {
+    if (const char* v = std::getenv("APXINF_GDN_ATTN_RAW_WMMA")) {
+      if (v[0] == 'l') return 2;
+      if (v[0] == '0' || v[0] == 'f') return 0;
+      return 1;
+    }
+    return 0;
+  }();
+  return mode;
+}
+
 extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     const void* q, const void* k, const void* beta, const void* g_cum,
     void* a_out, void* t_out, int seq_pad, int num_v_heads, int head_k_dim,
@@ -1013,6 +1031,38 @@ extern "C" cudaError_t apxinf_static_gdn_attn_raw_f32(
     return cudaErrorInvalidValue;
   }
   const int chunks = seq_pad / chunk_size;
+  if (wmma_attn_raw_mode() != 0 && head_k_dim == 128 && chunk_size == 64) {
+    const size_t smem =
+        static_cast<size_t>(64 * 128) * sizeof(__nv_bfloat16) * 4 +
+        static_cast<size_t>(64 * 64) * sizeof(float) * 2;
+    const bool split = wmma_attn_raw_mode() == 1;
+    const void* entry =
+        split ? reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<true>)
+              : reinterpret_cast<const void*>(gdn_attn_raw_wmma_kernel<false>);
+    static const void* attn_wmma_opted = nullptr;
+    if (attn_wmma_opted != entry) {
+      const cudaError_t attr = cudaFuncSetAttribute(
+          entry, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(smem));
+      if (attr != cudaSuccess) {
+        return attr;
+      }
+      attn_wmma_opted = entry;
+    }
+#define GDN_ATTN_WMMA_ARGS                                                     \
+  static_cast<const float*>(q), static_cast<const float*>(k),                  \
+      static_cast<const float*>(beta), static_cast<const float*>(g_cum),       \
+      static_cast<float*>(a_out), static_cast<float*>(t_out), seq_pad
+    if (split) {
+      gdn_attn_raw_wmma_kernel<true>
+          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_ATTN_WMMA_ARGS);
+    } else {
+      gdn_attn_raw_wmma_kernel<false>
+          <<<dim3(chunks, num_v_heads), 256, smem, stream>>>(GDN_ATTN_WMMA_ARGS);
+    }
+#undef GDN_ATTN_WMMA_ARGS
+    return cudaGetLastError();
+  }
   // One K tile and one Q tile for the chunk, rows padded by one float to keep
   // the warp off a single shared-memory bank (see the kernel comment).
   const size_t attn_smem =
