@@ -27,7 +27,12 @@ four-mode correctness gate over the same inputs.
 The Thor column is the one this consolidation re-measured; see
 [RESULTS.md](RESULTS.md) for its decomposition and
 [THOR-ROOFLINE.md](THOR-ROOFLINE.md) for the device limits it is scored
-against. The 4090 numbers come from
+against. [jetson-roofline.md](jetson-roofline.md) is the same measurement for
+sm_87 and sm_101, taken with `scripts/bench_device_roofline.cu`, and its last
+section reconciles the three boards -- including the two measurement traps that
+were hit twice independently: a Jetson's DVFS ramp, which makes a cold sweep
+read as a dependency cliff that is not there, and `cudaDevAttrMemoryClockRate`,
+which does not report the LPDDR rate on Tegra. The 4090 numbers come from
 [qwen-drive-performance.md](qwen-drive-performance.md) and the integration
 record is [kersor-qwen-drive-4090.md](kersor-qwen-drive-4090.md); the Orin
 numbers are #72's.

@@ -1,5 +1,8 @@
 # Measured roofline on Jetson, and what it says about Qwen-Drive
 
+Covers Orin sm_87 and Thor-U sm_101; `THOR-ROOFLINE.md` covers Thor
+sm_110 and the last section here reconciles the three.
+
 Ceilings measured with `scripts/bench_device_roofline.cu` on two boards, and the
 Qwen-Drive-1.0-4B VQA workload placed against them. The point of measuring
 rather than quoting a spec sheet is that on these parts the two disagree by
@@ -114,3 +117,75 @@ known 0.0403/0.0806 pair, perception is the declared BEV gap.
 That is the strongest evidence so far that the divergence from the reference is
 BF16 rounding amplified through the GDN recurrence rather than a defect in one
 kernel or an artifact of one platform.
+
+---
+
+# sm_110, and what the three boards say to each other
+
+`THOR-ROOFLINE.md` is the sm_110 companion to the table above, measured the
+same way on thor-3 (20 SMs @ 1.05 GHz, 32 MB L2, CUDA 13.2). Read together the
+three boards settle two things this document left open and one it warned about.
+
+## The Orin bandwidth number reproduces
+
+Measured here at 152.8 GB/s; measured independently on orin2 with a different
+program at **154.4 GB/s**, 1% apart. Both are far from the 204.8 GB/s pin rate,
+and both put Orin's decode at the roof rather than three quarters of the way to
+it. Thor sm_110 measures 259.7 GB/s against a 273 GB/s spec, the same
+relationship.
+
+The `cudaDevAttrMemoryClockRate` warning above is worth repeating because it
+was hit again: a device probe on Thor computed 273.0 GB/s from that attribute
+and the same probe on Orin computed 83.2, which is not a plausible number for
+any part and is the attribute being wrong rather than the board being slow.
+Measure the stream.
+
+## The GDN scan's mechanism, which was open here
+
+This document says of the scan that "it is bound by neither, which means
+latency, occupancy or instruction mix, and the mechanism is not yet
+established", and warns that an earlier ILP explanation was a DVFS artifact.
+
+The answer is instruction mix, and specifically the unit: all four of the
+scan's inner products are GEMM-shaped and were running as scalar fp32 on the
+CUDA cores, where this family delivers around 5 TFLOPS against 33-135 on the
+tensor cores. Moving `gdn_chunk_state` to tensor cores on sm_110 takes it from
+452.3 ms to 187.8 ms per scene. What made it *safe* to move is that in every
+one of those products the right-hand operand is already on the BF16 grid, so
+only the left one had to be split into two BF16 terms to keep the arithmetic --
+measured at 1.422947e-3 against the scalar form's 1.418808e-3 on an fp64
+reference of the scan, where rounding it instead of splitting it costs 3.5x.
+
+The occupancy half of the guess was not wrong, only secondary: the block width
+and tile width both matter and both differ per board, which is why they now come
+from `kernels/gdn_policy.rs` rather than from a constant.
+
+## The tuning-store trap, and what it is worth after an accuracy filter
+
+The 12.6% recorded here is on Orin, where regenerating the store recovers what
+cuBLAS 13's default heuristic gives up. The same trap appeared on sm_110 --
+all 116 shipped records rejected, recorded under CUDA 13.0 against a board
+running 13.2 -- but the recovery is not the same size, and the difference is
+instructive.
+
+A full autotune pass there is worth 2.5%, and all of it is in the six decode
+records. Those change the batch-1 GEMV tactic, so the BF16 rounding of every
+decode step changes with it: VQA token agreement drops 27% and reasoning
+trajectory RMS rises 14%. The seven prefill records are accuracy-neutral and
+worth 0.05%. Only those seven ship.
+
+So the trap is real on both boards and the warning stands, but "regenerate the
+store" is not unconditionally free: on a board where the decode shapes are the
+ones that move, regenerating and merging without checking accuracy buys 2.5%
+and pays for it somewhere the four-mode gate will not show you. Check with
+`control/precision_probe.py` or an operator oracle, not with the gate.
+
+## The cross-stack reproduction extends
+
+The result above -- same branch, CUDA 12.6 and 13.2, different cuBLAS major,
+different kernels selected, identical gate results -- holds across the third
+board too: sm_110 on CUDA 13.2 lands in the same declared state, VQA first
+differing at index 106 and the two trajectory modes in the same 0.0403/0.0806
+pair. Three stacks, one divergence, which is what a BF16 rounding amplified
+through the GDN recurrence should look like and not what a kernel defect
+should.
