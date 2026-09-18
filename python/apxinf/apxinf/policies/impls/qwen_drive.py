@@ -304,9 +304,9 @@ class QwenDrivePolicy:
         checked by hashing the concatenated output against the serial result,
         not assumed. It is worth doing because this is the largest single item
         in a scene that is not GPU work: on the RTX 4090 the twelve frames of a
-        VQA scene cost 231 ms of PIL bicubic resize and numpy permutation
-        before the first kernel launches, which is 16% of the scene. Eight
-        workers take that to 58 ms. Both PIL's resampling and numpy's copies
+        VQA scene cost 219 ms of PIL bicubic resize and numpy permutation
+        before the first kernel launches, which is 15% of the scene. Twelve
+        workers take that to 50 ms. Both PIL's resampling and numpy's copies
         drop the GIL, which is why threads rather than processes: no image is
         pickled and no array is copied between address spaces.
 
@@ -328,10 +328,12 @@ class QwenDrivePolicy:
                 return max(0, int(override))
             except ValueError:
                 pass
-        # Eight is where the measured scaling stops on a 14-core host: 3.96x at
-        # eight workers, 3.56x at twelve, because the frames are unequal and
-        # the tail is one large frame.
-        return max(1, min(frames, (os.cpu_count() or 1), 8))
+        # One worker per frame, bounded by the cores. Measured on all three
+        # boards and all three want it: at twelve workers against eight, the
+        # RTX 4090 is 4.36x against 3.36x, Orin 4.89x against 3.86x, Thor 4.25x
+        # against 3.28x. Frames are unequal -- the tail is one large one -- so
+        # there is nothing to gain by giving a worker two of them.
+        return max(1, min(frames, os.cpu_count() or 1))
 
     def _preproc_pool(self, workers: int) -> ThreadPoolExecutor:
         pool = getattr(self, "_patch_pool", None)

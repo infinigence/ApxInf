@@ -153,7 +153,42 @@ agreement 0.5813 → 0.5796, unchanged within its own scatter.
 becomes 6.8259 / 6.8002 / 6.8153 / 6.8070. **5.4% slower**, reproducible over
 two alternating rounds with 0.1% spread.
 
-This one is unresolved and should be resolved before merging.
+**This is resolved, and it was not a regression.** The kernel tables say so.
+Profiling one scene on each wheel and differing them:
+
+| kernel | "#72" | this branch | delta |
+|---|---:|---:|---:|
+| `gdn_chunk_state_kernel<8>` | 213.6 ms | 464.3 ms | +250.7 |
+| `gdn_attn_raw_kernel` | 66.0 | 107.7 | +41.8 |
+| `gdn_chunk_gemm_kernel` | 81.1 (tile 8) | 116.3 (tile 32) | +35.2 |
+| `add_rms_norm_plus1` fused vs split | 112.5 | 120.2 | +43.6 net |
+| `gelu_tanh_bf16_vec8` | 39.9 | 27.6 | −12.3 |
+| total | 6047.3 | 6363.2 | **+315.9** |
+
+The launch shapes name the cause: on the baseline side `gdn_chunk_state_kernel`
+runs at block 512 with **64 registers** a thread, on this branch at block 1024
+with **48**. The baseline's source carries `__launch_bounds__(1024)` on that
+kernel and `__launch_bounds__(256, 4)` on the other two; this branch's does
+not, so nvcc chose a narrower allocation and the kernel spills.
+
+Those launch bounds are in no commit. `~/apxinf-orin/ApxInf-qd` is checked out
+at `41066eb` with **789 uncommitted lines across ten files** — launch bounds,
+a fused `add_rms_norm_plus1_bf16_kernel`, row-tiled fast paths in three GDN
+kernels — and the wheel the baseline side installs was built from that working
+tree. #72's actual head, `80b0ecc`, has none of it either: that file is 1194
+lines there, 1285 here, and 1454 in the working tree.
+
+So the comparison was against an unpublished work in progress, not against
+#72, and nothing in the repository is slower than it was. What the number does
+say is that there are 789 lines of measured optimisation sitting on one board
+in no branch, worth about 5% on Orin. It is preserved as
+`~/apxinf-orin/orin-wip-41066eb.patch`; folding it in is real merge work,
+because two of its ten files are the two this branch changed most.
+
+Sweeping the two launch constants on this branch does not recover it — 32/1024
+is already the best of the six combinations tried, at 6.6237-6.6671 against
+6.64-6.72 for the others — which is expected, since the missing speed is in
+kernel source rather than in a constant.
 
 What it is **not**: the policy table. Sweeping its Orin row back to the values
 `41066eb` shipped changes nothing — `chunk_gemm_tile` 16 gives 6.82,
