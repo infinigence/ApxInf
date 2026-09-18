@@ -96,6 +96,20 @@ ULPs 0.0403 and 0.0806, so it flips on changes that move nothing:
 3. `control/verify_perf_orin.py` for speed, always as alternating A/B rounds on
    one machine.
 
+A recorded store belongs to the toolkit that measured it, so it is committed
+at the path that says so:
+
+```
+configs/tuning/nvidia/thor-sm110/tactics.json                       CUDA 13.0, 116 records
+configs/tuning/nvidia/thor-sm110/cuda13.2-cublas13.4/tactics.json   CUDA 13.2,   7 records
+```
+
+Both boards work. The autotuner rewrites rather than merges, so recording on
+13.2 into the unqualified file would have left a Thor on 13.0 with seven
+records for a toolkit it is not running. An autotune report is an artifact,
+not a deliverable -- the engine only ever appends to it -- so it does not
+belong in a commit either.
+
 Measurement evidence for the three boards -- rooflines, kernel tables, the
 per-device sweeps behind the table above -- is kept out of the review diff
 under `devlocal/qwen-drive/reports/` per `AGENTS.md`, along with the probes
