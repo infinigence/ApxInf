@@ -30,11 +30,16 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
   __syncthreads();
   if (warp == 0) {
     value = lane < warps ? scratch[lane] : 0.0f;
-    value = warp_sum(value);
-    if (lane == 0) scratch[0] = value;
+    value = warp_sum_all(value);
+    // Give each warp its own result slot for consecutive scratch reuse.
+    if (lane < warps) scratch[lane] = value;
   }
   __syncthreads();
-  return scratch[0];
+  // Only lane 0 reads its warp's slot, and the same lane writes the next
+  // call's partial sum. Broadcast from a register: shuffle synchronization
+  // alone does not order shared-memory accesses between different lanes.
+  value = lane == 0 ? scratch[warp] : 0.0f;
+  return __shfl_sync(0xffffffff, value, 0);
 }
 
 __device__ __forceinline__ float block_max(float value, float* scratch) {
