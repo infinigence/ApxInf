@@ -6,10 +6,10 @@
 //!
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
-//! * **L1** [`Model::infer_rgb`] — caller supplies resized RGB `uint8` images;
+//! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
 //!   vision→patches runs inside the Rust CUDA graph.
 //!
-//! **L0** [`Model::infer_patches`] (caller supplies pre-computed `patches`,
+//! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
 //! equivalent to a Rust `Observation(Patches)`) is exposed under the private
 //! `_infer_patches` name. It is the model-policy bridge for families such as
 //! WallOSS whose preprocessing stays in Python, and remains outside the public
@@ -169,13 +169,13 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
     }
 }
 
-/// A loaded VLA model handle. Holds the runtime plus the resolved config used
-/// for shape-contract queries and input validation.
+/// Python binding for a loaded VLA runner. Holds the runtime and its contract,
+/// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
 /// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
-pub struct Model {
+pub struct ModelRunner {
     model: LoadedModel,
     contract: VlaContract,
     /// `Some` for autoregressive token VLAs (π0-FAST); `None` for continuous ones.
@@ -193,7 +193,7 @@ struct PreprocessedVlaInput {
     embodiment_id: usize,
 }
 
-impl Model {
+impl ModelRunner {
     fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
         if self.contract.accepts_rgb_u8 {
             Ok(self.contract)
@@ -442,13 +442,14 @@ impl Model {
 }
 
 #[pymethods]
-impl Model {
+impl ModelRunner {
     /// Load a VLA checkpoint through the unified `AutoModel` frontend.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `auto` (default), `fp8`, `bf16`, or `int8`.
+    /// * `compute_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
+    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
@@ -470,7 +471,7 @@ impl Model {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, compute_variant=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -486,6 +487,7 @@ impl Model {
         flow_start_time: Option<f32>,
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
+        compute_variant: Option<String>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -527,6 +529,7 @@ impl Model {
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
+            compute_variant,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
@@ -557,7 +560,7 @@ impl Model {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `bf16` (default), `fp8`, or `int8`.
+    /// * `compute_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
@@ -568,7 +571,7 @@ impl Model {
     #[pyo3(signature = (
         model,
         device="cuda:0",
-        precision="bf16",
+        compute_variant="bf16",
         num_views=2,
         image_size=224,
         action_horizon=10,
@@ -586,7 +589,7 @@ impl Model {
     fn random(
         model: &str,
         device: &str,
-        precision: &str,
+        compute_variant: &str,
         num_views: usize,
         image_size: usize,
         action_horizon: usize,
@@ -628,7 +631,7 @@ impl Model {
 
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
-            precision: parse_precision(precision)?,
+            compute_variant: Some(compute_variant.to_owned()),
             text_weight_dtype: None,
             calibration_path,
             tuning_path: tactics,
@@ -1165,7 +1168,7 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!(
-            "Model(device={}, action=[{}, {}], views={}, image={}, patch={})",
+            "ModelRunner(device={}, action=[{}, {}], views={}, image={}, patch={})",
             self.device(),
             self.action_horizon(),
             self.action_dim(),
@@ -1178,7 +1181,7 @@ impl Model {
 
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Model>()?;
+    module.add_class::<ModelRunner>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

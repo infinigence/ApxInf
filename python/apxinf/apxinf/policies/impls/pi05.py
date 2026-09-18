@@ -1,7 +1,7 @@
 """pi05 L2 policy: raw observation dict + prompt -> unnormalized action chunk.
 
 :class:`Pi05Policy` mirrors openpi's policy shape — ``input_pipeline`` (pre) →
-``model`` → ``output_pipeline`` (post) — where each pipeline is a
+``model_runner`` → ``output_pipeline`` (post) — where each pipeline is a
 :class:`~apxinf.processors.Pipeline` whose flowing value is a **data dict** and
 each step is a ``dict -> dict`` :class:`~apxinf.processors.ProcessorStep` (see
 :mod:`apxinf.processors.transforms`). The model inference itself is *not* a
@@ -68,7 +68,7 @@ from ...checkpoints.descriptor import (
     NormalizationPlan,
     TransformSpec,
 )
-from ..base import CANONICAL_STATE_KEY, VIEW_SLOTS, BareModel
+from ..base import CANONICAL_STATE_KEY, VIEW_SLOTS, ModelRunnerProtocol
 from ...processors import (
     GaussianNoise,
     ImageStack,
@@ -177,7 +177,7 @@ class Pi05Policy:
 
     def __init__(
         self,
-        model: BareModel,
+        model_runner: ModelRunnerProtocol,
         *,
         input_pipeline: Pipeline,
         output_pipeline: Pipeline,
@@ -187,11 +187,11 @@ class Pi05Policy:
         action_dim: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ):
-        self.model = model
+        self.model_runner = model_runner
         self.input_pipeline = input_pipeline
         self.output_pipeline = output_pipeline
         self.image_keys = tuple(
-            image_keys if image_keys is not None else _default_image_keys(model.num_views)
+            image_keys if image_keys is not None else _default_image_keys(model_runner.num_views)
         )
         self.prompt_key = prompt_key
         self.state_key = state_key
@@ -221,13 +221,13 @@ class Pi05Policy:
         # it actually serves.
         self._extra_metadata = dict(metadata) if metadata else {}
         self.metadata = {
-            **self._derived_metadata(model, input_pipeline, output_pipeline, state_normalized),
+            **self._derived_metadata(model_runner, input_pipeline, output_pipeline, state_normalized),
             **self._extra_metadata,
         }
 
     def _derived_metadata(
         self,
-        model: BareModel,
+        model_runner: ModelRunnerProtocol,
         input_pipeline: Pipeline,
         output_pipeline: Pipeline,
         state_normalized: bool,
@@ -235,13 +235,13 @@ class Pi05Policy:
         """Return metadata derived from the policy's active model and pipelines."""
         return {
             "model_type": "pi05",
-            "action_horizon": model.action_horizon,
+            "action_horizon": model_runner.action_horizon,
             "action_dim": self.action_dim_out,
-            "model_action_dim": model.action_dim,
-            "num_flow_steps": getattr(model, "num_flow_steps", None),
-            "flow_start_time": getattr(model, "flow_start_time", None),
-            "num_views": model.num_views,
-            "image_size": [model.image_size, model.image_size],
+            "model_action_dim": model_runner.action_dim,
+            "num_flow_steps": getattr(model_runner, "num_flow_steps", None),
+            "flow_start_time": getattr(model_runner, "flow_start_time", None),
+            "num_views": model_runner.num_views,
+            "image_size": [model_runner.image_size, model_runner.image_size],
             "image_keys": list(self.image_keys),
             "state_key": self.state_key,
             "prompt_key": self.prompt_key,
@@ -256,7 +256,7 @@ class Pi05Policy:
     @classmethod
     def default_pipelines(
         cls,
-        model: BareModel,
+        model_runner: ModelRunnerProtocol,
         *,
         tokenizer: PromptTokenizer,
         unnormalizer: Unnormalizer,
@@ -269,7 +269,7 @@ class Pi05Policy:
         """Assemble the default ``(input_pipeline, output_pipeline)`` from parts.
 
         pi05 runs the exact camera set the model was loaded for
-        (``model.num_views``, parsed from the config's ``input_features``). The
+        (``model_runner.num_views``, parsed from the config's ``input_features``). The
         task's ``image_keys`` must name precisely those cameras — no more, no
         fewer. Absent cameras are never sent, so there is no padding: the model
         runs the real view shape directly.
@@ -290,26 +290,26 @@ class Pi05Policy:
         load time rather than zero-filling them per request.
         """
         image_keys = tuple(
-            image_keys if image_keys is not None else _default_image_keys(model.num_views)
+            image_keys if image_keys is not None else _default_image_keys(model_runner.num_views)
         )
-        if len(image_keys) != model.num_views:
+        if len(image_keys) != model_runner.num_views:
             fix = (
                 f"load with num_views={len(image_keys)} to serve fewer cameras "
                 "than the checkpoint declares"
-                if len(image_keys) < model.num_views
+                if len(image_keys) < model_runner.num_views
                 else "a checkpoint cannot serve more cameras than it was trained on"
             )
             raise ValueError(
-                f"Pi05Policy: model expects {model.num_views} camera views but "
+                f"Pi05Policy: model expects {model_runner.num_views} camera views but "
                 f"{len(image_keys)} image_keys were given: {image_keys}. Supply "
                 f"exactly the loaded model's cameras (real views only, no "
                 f"padding), or {fix}."
             )
         image_pipeline = image_pipeline or Pipeline(
-            [("parse", ParseImage()), ("resize", ResizeWithPad(model.image_size))]
+            [("parse", ParseImage()), ("resize", ResizeWithPad(model_runner.image_size))]
         )
         input_steps = [
-            ("image_stack", ImageStack(image_pipeline, image_keys, model.image_size)),
+            ("image_stack", ImageStack(image_pipeline, image_keys, model_runner.image_size)),
             ("tokenize", Tokenize(tokenizer, state_normalizer, state_key)),
         ]
         # Without an explicit sampler, the binding uses its backend-native RNG.
@@ -329,11 +329,11 @@ class Pi05Policy:
         cls,
         model_dir,
         *,
-        model: Optional[BareModel] = None,
+        model_runner: Optional[ModelRunnerProtocol] = None,
         model_name: str = "pi05",
         checkpoint=None,
         device: str = "cuda:0",
-        precision: str = "auto",
+        compute_variant: str = "auto",
         calibration=None,
         tactics=None,
         autotune: bool = False,
@@ -401,7 +401,7 @@ class Pi05Policy:
         the vision tower has no per-slot parameters) and skips their patch tokens.
 
         Unless ``tactics`` is explicitly supplied, CUDA deployments select the
-        validated tactic database for their compute capability and precision.
+        validated tactic database for their compute capability and compute_variant.
         A checkpoint-local ``tactics.json`` takes precedence over source-tree
         defaults, so normal Python and serving callers share the same routing.
 
@@ -457,23 +457,23 @@ class Pi05Policy:
             for note in layout.notes:
                 _LOGGER.info("checkpoint %s: %s", model_dir, note)
 
-        if model is None:
+        if model_runner is None:
             import apxinf_py  # lazy: processor-only users never import the binding
 
             ckpt = str(checkpoint) if checkpoint is not None else str(model_dir / "model.safetensors")
             tactics = resolve_pi05_tactics(
                 device,
-                precision,
+                compute_variant,
                 model_dir=model_dir,
                 override=Path(tactics) if tactics is not None else None,
                 allow_missing=bool(autotune),
             )
             config_json = layout.config_json_text() if layout is not None else None
-            model = apxinf_py.Model.load(
+            model_runner = apxinf_py.ModelRunner.load(
                 model_name,
                 ckpt,
                 device=device,
-                precision=precision,
+                compute_variant=compute_variant,
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 autotune=bool(autotune),
@@ -487,46 +487,46 @@ class Pi05Policy:
                 **({"flow_start_time": float(flow_start_time)} if flow_start_time is not None else {}),
                 sampling_seed=int(seed),
             )
-        elif action_horizon is not None and int(action_horizon) != int(model.action_horizon):
+        elif action_horizon is not None and int(action_horizon) != int(model_runner.action_horizon):
             # A pre-built model carries its own horizon; silently ignoring the
             # override here would hand back a policy that disagrees with the flag.
             raise ValueError(
                 f"Pi05Policy.from_pretrained: action_horizon={action_horizon} conflicts "
-                f"with the supplied model's horizon {model.action_horizon}; pass the "
+                f"with the supplied model's horizon {model_runner.action_horizon}; pass the "
                 f"override to the model constructor instead"
             )
-        elif num_views is not None and num_views != model.num_views:
+        elif num_views is not None and num_views != model_runner.num_views:
             # An already-loaded handle has its view count baked in; silently
             # ignoring the argument would serve a different shape than requested.
             raise ValueError(
                 f"Pi05Policy.from_pretrained: num_views={num_views} but the model "
-                f"passed in was loaded with {model.num_views}; pass num_views to "
+                f"passed in was loaded with {model_runner.num_views}; pass num_views to "
                 "the load call instead"
             )
         elif (
             num_flow_steps is not None
-            and hasattr(model, "num_flow_steps")
-            and int(num_flow_steps) != int(model.num_flow_steps)
+            and hasattr(model_runner, "num_flow_steps")
+            and int(num_flow_steps) != int(model_runner.num_flow_steps)
         ):
             raise ValueError(
                 f"Pi05Policy.from_pretrained: num_flow_steps={num_flow_steps} but "
-                f"the model passed in was loaded with {model.num_flow_steps}; pass "
+                f"the model passed in was loaded with {model_runner.num_flow_steps}; pass "
                 "num_flow_steps to the load call instead"
             )
         elif (
             flow_start_time is not None
-            and hasattr(model, "flow_start_time")
-            and float(flow_start_time) != float(model.flow_start_time)
+            and hasattr(model_runner, "flow_start_time")
+            and float(flow_start_time) != float(model_runner.flow_start_time)
         ):
             raise ValueError(
                 f"Pi05Policy.from_pretrained: flow_start_time={flow_start_time} but "
-                f"the model passed in was loaded with {model.flow_start_time}; pass "
+                f"the model passed in was loaded with {model_runner.flow_start_time}; pass "
                 "flow_start_time to the load call instead"
             )
 
         tokenizer = PromptTokenizer(
             _resolve_tokenizer(model_dir, tokenizer_path),
-            max_token_len=model.max_token_len if hasattr(model, "max_token_len") else 200,
+            max_token_len=model_runner.max_token_len if hasattr(model_runner, "max_token_len") else 200,
             discrete_state=discrete_state,
         )
         # Declared layouts carry canonical normalization facts. Flat native
@@ -557,7 +557,7 @@ class Pi05Policy:
             width = (
                 unnormalizer.width
                 if unnormalizer is not None
-                else int(action_dim) if action_dim is not None else int(model.action_dim)
+                else int(action_dim) if action_dim is not None else int(model_runner.action_dim)
             )
             plan = NormalizationPlan(
                 state=None,
@@ -596,12 +596,12 @@ class Pi05Policy:
                     "embodiment-level parity.",
                     model_dir,
                 )
-        reset_sampling = getattr(model, "reset_sampling", None)
+        reset_sampling = getattr(model_runner, "reset_sampling", None)
         if callable(reset_sampling):
             reset_sampling(int(seed))
 
         input_pipeline, output_pipeline = cls.default_pipelines(
-            model,
+            model_runner,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
             image_pipeline=image_pipeline,
@@ -615,7 +615,7 @@ class Pi05Policy:
             normalization_metadata["action"] = "custom/injected"
 
         return cls(
-            model,
+            model_runner,
             input_pipeline=input_pipeline,
             output_pipeline=output_pipeline,
             image_keys=image_keys,
@@ -632,7 +632,7 @@ class Pi05Policy:
     @classmethod
     def from_random(
         cls,
-        model: BareModel,
+        model_runner: ModelRunnerProtocol,
         *,
         token_count: Optional[int] = None,
         action_dim: Optional[int] = None,
@@ -649,7 +649,7 @@ class Pi05Policy:
         with no data files on disk: the tokenizer is a fixed-length
         :class:`~apxinf.processors.SyntheticTokenizer` and the unnormalizer is the
         identity map (``q01=-1, q99=1, eps=0``). Pair with
-        ``apxinf_py.Model.random(...)`` for a fully checkpoint-free L2/L3.
+        ``apxinf_py.ModelRunner.random(...)`` for a fully checkpoint-free L2/L3.
 
         The returned actions are **latency-only and numerically meaningless** (the
         weights, tokens, and unnormalization are all synthetic); a warning says so
@@ -663,31 +663,31 @@ class Pi05Policy:
                 "actions are latency-only and numerically meaningless.",
                 stacklevel=2,
             )
-        max_token_len = int(getattr(model, "max_token_len", 200))
+        max_token_len = int(getattr(model_runner, "max_token_len", 200))
         if token_count is None:
             token_count = min(10, max_token_len)
         tokenizer = SyntheticTokenizer(token_count, max_token_len=max_token_len)
 
-        width = int(action_dim) if action_dim is not None else int(model.action_dim)
+        width = int(action_dim) if action_dim is not None else int(model_runner.action_dim)
         # Identity quantile map: with eps=0, unnormalize is (x + 1) * 1 + (-1) == x.
         unnormalizer = Unnormalizer(q01=[-1.0] * width, q99=[1.0] * width, dims=width, eps=0.0)
-        reset_sampling = getattr(model, "reset_sampling", None)
+        reset_sampling = getattr(model_runner, "reset_sampling", None)
         if callable(reset_sampling):
             reset_sampling(int(seed))
 
         if image_keys is None:
             # Resolved here rather than left to the two consumers below, so the
             # published metadata and the ImageStack step cannot drift apart.
-            image_keys = _default_image_keys(model.num_views)
+            image_keys = _default_image_keys(model_runner.num_views)
 
         input_pipeline, output_pipeline = cls.default_pipelines(
-            model,
+            model_runner,
             tokenizer=tokenizer,
             unnormalizer=unnormalizer,
             image_keys=image_keys,
         )
         return cls(
-            model,
+            model_runner,
             input_pipeline=input_pipeline,
             output_pipeline=output_pipeline,
             image_keys=image_keys,
@@ -729,7 +729,7 @@ class Pi05Policy:
         so only one of the two policies should be ``close()``d.
         """
         return type(self)(
-            self.model,
+            self.model_runner,
             input_pipeline=self.input_pipeline.prepend(*before),
             output_pipeline=self.output_pipeline.append(*after),
             image_keys=self.image_keys,
@@ -761,7 +761,7 @@ class Pi05Policy:
             selected_noise = data.get(NOISE)
         if selected_noise is not None:
             selected_noise = np.ascontiguousarray(selected_noise, dtype=np.float32)
-            expected_noise = (self.model.action_horizon, self.model.action_dim)
+            expected_noise = (self.model_runner.action_horizon, self.model_runner.action_dim)
             if selected_noise.shape != expected_noise:
                 raise ValueError(
                     f"noise shape {selected_noise.shape}, expected {expected_noise}"
@@ -782,14 +782,14 @@ class Pi05Policy:
         rgb, token_ids, selected_noise, _ = self._model_inputs(observation, noise)
         if selected_noise is None:
             raise ValueError("calibration requires an explicit deterministic noise tensor")
-        calibrate = getattr(self.model, "_calibrate_rgb", None)
+        calibrate = getattr(self.model_runner, "_calibrate_rgb", None)
         if not callable(calibrate):
             raise RuntimeError("the loaded model does not support PI0.5 calibration")
         return calibrate(rgb, "nhwc", token_ids, selected_noise)
 
     def calibration_plan(self) -> CalibrationPlan:
         """Return the stable sites selected by the native FP8 execution plan."""
-        native_plan = getattr(self.model, "_calibration_plan", None)
+        native_plan = getattr(self.model_runner, "_calibration_plan", None)
         if not callable(native_plan):
             raise RuntimeError("the loaded model does not expose an FP8 calibration plan")
         return CalibrationPlan.runtime_validated_sites(
@@ -807,13 +807,13 @@ class Pi05Policy:
             np.random.SeedSequence([context.seed, context.sample_index])
         )
         noise = np.ascontiguousarray(
-            rng.standard_normal((self.model.action_horizon, self.model.action_dim)),
+            rng.standard_normal((self.model_runner.action_horizon, self.model_runner.action_dim)),
             dtype=np.float32,
         )
         return self.calibrate_observation(observation, noise=noise)
 
     def infer(self, observation: Mapping[str, Any], *, noise: Optional[np.ndarray] = None) -> dict:
-        """Run pre-pipeline -> model -> post-pipeline on one raw observation dict.
+        """Run pre-pipeline -> model_runner -> post-pipeline on one raw observation dict.
 
         Returns ``actions`` (unnormalized ``float32`` ``[horizon, action_dim]``),
         ``normalized_actions`` (the model's raw output), ``token_ids``, the
@@ -830,11 +830,11 @@ class Pi05Policy:
         # model: the policy's own middle step (not a pipeline stage)
         model_started = time.perf_counter()
         normalized = np.asarray(
-            self.model.infer_rgb(rgb, "nhwc", token_ids, selected_noise), dtype=np.float32
+            self.model_runner.infer_rgb(rgb, "nhwc", token_ids, selected_noise), dtype=np.float32
         )
         model_ms = (time.perf_counter() - model_started) * 1000.0
 
-        expected = (self.model.action_horizon, self.model.action_dim)
+        expected = (self.model_runner.action_horizon, self.model_runner.action_dim)
         if normalized.shape != expected:
             raise ValueError(f"model returned action shape {normalized.shape}, expected {expected}")
         if not np.isfinite(normalized).all():
@@ -869,10 +869,10 @@ class Pi05Policy:
     @property
     def action_horizon(self) -> int:
         """Number of actions in one predicted chunk."""
-        return self.model.action_horizon
+        return self.model_runner.action_horizon
 
     def close(self) -> None:
-        close = getattr(self.model, "close", None)
+        close = getattr(self.model_runner, "close", None)
         if callable(close):
             close()
 

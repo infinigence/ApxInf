@@ -626,9 +626,16 @@ the GEMM planner prepares the provider's safe default tactic once before graph
 capture. This fallback may be slower than a tuned hardware database, but it
 must not turn a missing or version-filtered record into an unsafe launch.
 
-## 10. Integrate the Model Runtime and Executor
+## 10. Integrate the Model and ModelRunner
 
-Modify the model configuration, weights, runtime/executor, and registration only after the lower-level operators pass their own correctness tests.
+After lower-level operator tests pass, use the
+[current module ownership table](model-layer-architecture.md#current-module-names-and-responsibilities)
+and [registration procedure](adding-a-new-model.md#registration-and-public-integration).
+In PI0.5, wire safe calls through `backend.rs` into `model/blocks/`; keep forward
+order in `model/mod.rs`, physical weights in `weights/`, requirement reporting
+in the model, and workspace allocation/capture in `model_runner/prepare.rs`.
+WallOSS/GR00T retain their existing runtime/executor symbols. Operator work must
+not introduce a new model wrapper or family-specific dispatch in the backend.
 
 The model layer owns:
 
@@ -752,7 +759,7 @@ confirm target hardware and build architecture
 → add compile-time, hardware, shape, and backend dispatch
 → pass individual-operator correctness tests
 → integrate workspace and validate prepare/capture/replay
-→ integrate the model runtime/executor
+→ integrate the model/Blocks and runner preparation
 → pass layer and complete-model correctness tests
 → profile
 → optimize only measured hotspots

@@ -199,7 +199,7 @@ impl Pi05Config {
     /// The current graph intentionally gives every intermediate a stable
     /// address. A later liveness planner can reuse slots and reduce this
     /// reservation without changing the captured execution contract.
-    pub fn cuda_graph_workspace_bytes(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_fp8_static(&self, token_count: usize) -> Result<usize> {
         if token_count == 0 || token_count > self.max_token_len {
             return Err(Error::Other(format!(
                 "pi05 token count must be in 1..={}, got {token_count}",
@@ -415,7 +415,7 @@ impl Pi05Config {
     /// doubling the validated FP8 bound is therefore safe while keeping the
     /// shape calculation in one place.
     pub fn cuda_graph_workspace_bytes_bf16(&self, token_count: usize) -> Result<usize> {
-        self.cuda_graph_workspace_bytes(token_count)?
+        self.cuda_graph_workspace_bytes_fp8_static(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 BF16 CUDA workspace exceeds address space".into()))
     }
@@ -427,7 +427,7 @@ impl Pi05Config {
     /// unaligned patch projection additionally stores one INT32 accumulator.
     /// Twice the BF16 arena remains a simple conservative upper bound and also
     /// leaves room for the optional dual-backend correctness verifier.
-    pub fn cuda_graph_workspace_bytes_int8(&self, token_count: usize) -> Result<usize> {
+    pub fn cuda_graph_workspace_bytes_int8_dynamic(&self, token_count: usize) -> Result<usize> {
         self.cuda_graph_workspace_bytes_bf16(token_count)?
             .checked_mul(2)
             .ok_or_else(|| Error::Other("pi05 INT8 CUDA workspace exceeds address space".into()))
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn thor_graph_workspace_is_bounded() {
         let bytes = Pi05Config::thor_two_view()
-            .cuda_graph_workspace_bytes(200)
+            .cuda_graph_workspace_bytes_fp8_static(200)
             .unwrap();
         assert!(bytes > 1_800_000_000);
         assert!(bytes < 2_500_000_000);
@@ -629,5 +629,78 @@ mod tests {
         let (max_activation, max_weight) = config.fp8_emulation_scratch_elements(200).unwrap();
         assert_eq!(max_activation, 712 * 16_384);
         assert_eq!(max_weight, weight);
+    }
+}
+
+/// A PI0.5 compute implementation, including its weight and activation formats.
+/// Values are model-local; the loading field `compute_variant` is shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComputeVariant {
+    #[default]
+    Auto,
+    Bf16,
+    Fp8Static,
+    Int8Dynamic,
+}
+impl ComputeVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bf16 => "bf16",
+            Self::Fp8Static => "fp8_static",
+            Self::Int8Dynamic => "int8_dynamic",
+        }
+    }
+    pub fn resolve(self, sm: u32, has_fp8_scales: bool) -> Self {
+        match self {
+            Self::Auto if sm >= 100 && has_fp8_scales => Self::Fp8Static,
+            Self::Auto if (80..100).contains(&sm) => Self::Int8Dynamic,
+            Self::Auto => Self::Bf16,
+            explicit => explicit,
+        }
+    }
+}
+impl std::str::FromStr for ComputeVariant {
+    type Err = apxinf_core::Error;
+    fn from_str(value: &str) -> apxinf_core::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
+            "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 compute_variant {value:?}; expected auto, bf16, fp8_static or int8_dynamic"))),
+        }
+    }
+}
+#[cfg(test)]
+mod compute_variant_tests {
+    use super::ComputeVariant;
+    #[test]
+    fn selection_and_identifiers_are_unambiguous() {
+        for v in [
+            ComputeVariant::Auto,
+            ComputeVariant::Bf16,
+            ComputeVariant::Fp8Static,
+            ComputeVariant::Int8Dynamic,
+        ] {
+            assert_eq!(v.as_str().parse::<ComputeVariant>().unwrap(), v);
+        }
+        for ambiguous in ["fp8", "int8", "w8a8", "unknown"] {
+            assert!(ambiguous.parse::<ComputeVariant>().is_err());
+        }
+        assert_eq!(
+            ComputeVariant::Auto.resolve(110, true),
+            ComputeVariant::Fp8Static
+        );
+        assert_eq!(
+            ComputeVariant::Auto.resolve(110, false),
+            ComputeVariant::Bf16
+        );
+        assert_eq!(
+            ComputeVariant::Auto.resolve(87, false),
+            ComputeVariant::Int8Dynamic
+        );
+        assert_eq!(
+            ComputeVariant::Bf16.resolve(110, true),
+            ComputeVariant::Bf16
+        );
     }
 }

@@ -166,13 +166,13 @@ class CalibratePi05Test(unittest.TestCase):
         # The NPZ directory is the seam between whoever owns the environment
         # and this engine-side calibrator: the observations are an artifact on
         # disk, not a live simulator.
-        class Model:
+        class ModelRunner:
             image_size = 2
             action_horizon = 2
             action_dim = 3
 
         class Policy:
-            model = Model()
+            model_runner = ModelRunner()
             image_keys = ("observation/image", "observation/wrist_image")
             prompt_key = "prompt"
             state_key = "observation/state"
@@ -246,13 +246,13 @@ class CalibratePi05Test(unittest.TestCase):
         # The other half of the pair above: --libero-suite drives the simulator in
         # this process, so ApxInf can recalibrate against its own published LIBERO
         # protocol without a downstream checkout. Both must stay wired up.
-        class Model:
+        class ModelRunner:
             image_size = 2
             action_horizon = 2
             action_dim = 3
 
         class Policy:
-            model = Model()
+            model_runner = ModelRunner()
             image_keys = ("observation/image", "observation/wrist_image")
             prompt_key = "prompt"
             state_key = "observation/state"
@@ -376,7 +376,7 @@ class CalibratePi05Test(unittest.TestCase):
     def test_calibration_job_maps_observation_to_manifest(self):
         import apxinf
 
-        class Model:
+        class ModelRunner:
             image_size = 4
             action_horizon = 2
             action_dim = 3
@@ -386,7 +386,7 @@ class CalibratePi05Test(unittest.TestCase):
                 return ["vision.patch_input"]
 
         class Policy:
-            model = Model()
+            model_runner = ModelRunner()
             image_keys = ("observation/image",)
             prompt_key = "prompt"
             state_key = "observation/state"
@@ -543,12 +543,12 @@ class CalibratePi05Test(unittest.TestCase):
             self.assertNotIn("token_ids", observation)
 
     def test_deterministic_noise_is_stable_per_sample(self):
-        class Model:
+        class ModelRunner:
             action_horizon = 2
             action_dim = 3
 
         class Policy:
-            model = Model()
+            model_runner = ModelRunner()
 
         first = calibrate_pi05.deterministic_noise(Policy(), 17, 2)
         second = calibrate_pi05.deterministic_noise(Policy(), 17, 2)

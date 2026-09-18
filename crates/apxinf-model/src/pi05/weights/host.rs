@@ -8,10 +8,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use half::bf16;
 use apxinf_core::{DType, Error, Result, Tensor};
+use half::bf16;
 
-use super::{GemmaVariantConfig, Pi05Config};
+use crate::pi05::{GemmaVariantConfig, Pi05Config};
 
 const ROOT: &str = "paligemma_with_expert";
 
@@ -31,7 +31,7 @@ pub struct LayerNormWeights {
 #[derive(Debug)]
 pub struct AdaRmsNormWeights {
     /// Conditioning projection `[width, 3 * width]`.
-    pub style: LinearWeights,
+    pub modulation: LinearWeights,
 }
 
 #[derive(Debug)]
@@ -388,7 +388,7 @@ fn synthetic_layer_norm(dim: usize) -> Result<LayerNormWeights> {
 
 fn synthetic_ada_norm(rng: &mut SyntheticRng, width: usize) -> Result<AdaRmsNormWeights> {
     Ok(AdaRmsNormWeights {
-        style: synthetic_linear(rng, width, 3 * width, true)?,
+        modulation: synthetic_linear(rng, width, 3 * width, true)?,
     })
 }
 
@@ -448,7 +448,7 @@ fn take_layer_norm(
 
 fn take_ada_norm(tensors: &mut HashMap<String, Tensor>, prefix: &str) -> Result<AdaRmsNormWeights> {
     Ok(AdaRmsNormWeights {
-        style: take_linear(tensors, &format!("{prefix}.dense"), true)?,
+        modulation: take_linear(tensors, &format!("{prefix}.dense"), true)?,
     })
 }
 

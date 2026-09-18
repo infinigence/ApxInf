@@ -1,19 +1,19 @@
 //! Unified low-level latency benchmark for PI0.5 (BF16 / FP8 / INT8-W8A8).
 //!
 //! This single example replaces the former `pi05_{bf16,thor,int8}_bench.rs`. It
-//! bypasses the unified `AutoModel`/`infer` frontend and drives the dtype-native
-//! `Pi05{Bf16,,Int8}CudaRuntime` directly, because it needs `apxinf_cuda`
+//! bypasses the unified `AutoModel`/`infer` frontend and drives the compute_variant-native
+//! `Pi05{Bf16,,Int8Dynamic}CudaRuntime` directly, because it needs `apxinf_cuda`
 //! profiler hooks, tuning-DB install and raw device inputs that the model
 //! abstraction does not (and should not) expose. For an abstraction-level entry
 //! point see `pi05_auto_smoke`.
 //!
 //! The benchmark runs **checkpoint-free** with deterministic random weights
 //! (`<source>` == `random`), because graph-replay latency depends only on tensor
-//! shape and dtype, not on trained values. Pass a checkpoint path/index instead
+//! shape and compute_variant, not on trained values. Pass a checkpoint path/index instead
 //! to measure a real model and validate against a captured reference.
 //!
 //! ```text
-//! pi05_bench <checkpoint-or-index|random> --dtype {bf16,fp8,int8}
+//! pi05_bench <checkpoint-or-index|random> --compute-variant {bf16,fp8_static,int8_dynamic}
 //!     [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune]
 //!     [--views N] [--image-size N] [--action-horizon N] [--action-dim N]
 //!     [--num-flow-steps N] [--max-token-len N]            (random-only overrides)
@@ -28,6 +28,7 @@
 //! `APXINF_PI05_EAGER_ONLY=1` stops after the eager integrity pass, and
 //! `APXINF_PI05_IMAGE_INPUT` mirrors `--image-input` for scripted runs.
 
+use apxinf_model::pi05::{build_bf16_model, build_fp8_static_model, build_int8_dynamic_model};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,50 +36,51 @@ use std::time::Instant;
 use apxinf_core::{Backend, DType, Tensor};
 use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
-    upload_time_embeddings, upload_time_embeddings_bf16, upload_time_embeddings_int8,
-    Pi05ActivationScales, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime, Pi05CapturedGraph,
-    Pi05Config, Pi05CudaRuntime, Pi05ImageLayout, Pi05Int8CapturedGraph, Pi05Int8CudaRuntime,
-    Pi05Weights, StaticBf16Pi05Weights, StaticFp8Calibration, StaticFp8Pi05Weights,
-    StaticInt8Pi05Weights,
+    upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
+    upload_time_embeddings_int8_dynamic, Bf16Model, Bf16Weights, CapturedGraph,
+    Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticModel, Fp8StaticWeights,
+    Int8DynamicModel, Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dtype {
+enum BenchVariant {
     Bf16,
-    Fp8,
-    Int8,
+    Fp8Static,
+    Int8Dynamic,
 }
 
-impl Dtype {
+impl BenchVariant {
     fn parse(spec: &str) -> Result<Self, String> {
         match spec {
             "bf16" => Ok(Self::Bf16),
-            "fp8" => Ok(Self::Fp8),
-            "int8" | "w8a8" => Ok(Self::Int8),
-            other => Err(format!("--dtype must be bf16, fp8, or int8; got {other}")),
+            "fp8_static" => Ok(Self::Fp8Static),
+            "int8_dynamic" => Ok(Self::Int8Dynamic),
+            other => Err(format!(
+                "--compute-variant must be bf16, fp8_static, or int8_dynamic; got {other}"
+            )),
         }
     }
 
-    /// Device dtype of the patch/noise inputs feeding the graph.
+    /// Device compute_variant of the patch/noise inputs feeding the graph.
     fn io_dtype(self) -> DType {
         match self {
-            Self::Fp8 => DType::F16,
-            Self::Bf16 | Self::Int8 => DType::BF16,
+            Self::Fp8Static => DType::F16,
+            Self::Bf16 | Self::Int8Dynamic => DType::BF16,
         }
     }
 
-    fn precision_label(self) -> &'static str {
+    fn variant_label(self) -> &'static str {
         match self {
             Self::Bf16 => "bf16",
-            Self::Fp8 => "fp8",
-            Self::Int8 => "int8_w8a8",
+            Self::Fp8Static => "fp8_static",
+            Self::Int8Dynamic => "int8_w8a8",
         }
     }
 
     fn patches_label(self) -> &'static str {
         match self {
-            Self::Fp8 => "patches_f16",
-            Self::Bf16 | Self::Int8 => "patches_bf16",
+            Self::Fp8Static => "patches_f16",
+            Self::Bf16 | Self::Int8Dynamic => "patches_bf16",
         }
     }
 
@@ -92,13 +94,13 @@ impl Dtype {
                 reference_max_relative_l2: 0.05,
                 reference_max_abs: None,
             },
-            Self::Fp8 => Thresholds {
+            Self::Fp8Static => Thresholds {
                 eager_graph_max_abs: 1e-3,
                 reference_min_cosine: 0.997,
                 reference_max_relative_l2: 0.10,
                 reference_max_abs: None,
             },
-            Self::Int8 => Thresholds {
+            Self::Int8Dynamic => Thresholds {
                 eager_graph_max_abs: 1e-2,
                 reference_min_cosine: 0.995,
                 reference_max_relative_l2: 0.10,
@@ -108,7 +110,7 @@ impl Dtype {
     }
 }
 
-/// Per-dtype integrity gates (see `Dtype::thresholds`). `eager_graph_min_cosine`
+/// Per-compute_variant integrity gates (see `BenchVariant::thresholds`). `eager_graph_min_cosine`
 /// is a shared `0.999_999`; the reference cosine floor may be overridden.
 #[derive(Clone, Copy, Debug)]
 struct Thresholds {
@@ -120,13 +122,12 @@ struct Thresholds {
 
 const EAGER_GRAPH_MIN_COSINE: f64 = 0.999_999;
 
-/// The dtype-native runtime. The three concrete runtimes expose an identical
-/// `infer`/`capture_infer`/`capture_infer_rgb_u8` surface, so the only per-dtype
-/// fork in the whole benchmark is this construction + delegation.
+/// Benchmark-only dispatch over statically typed Networks. Capture uses the
+/// same prepare implementation and graph owner for every compute variant.
 enum Bench {
-    Bf16(Pi05Bf16CudaRuntime),
-    Fp8(Pi05CudaRuntime),
-    Int8(Pi05Int8CudaRuntime),
+    Bf16(Bf16Model),
+    Fp8Static(Fp8StaticModel),
+    Int8Dynamic(Int8DynamicModel),
 }
 
 impl Bench {
@@ -140,8 +141,12 @@ impl Bench {
     ) -> Result<Tensor, Box<dyn std::error::Error>> {
         Ok(match self {
             Self::Bf16(rt) => rt.infer(patches, token_ids, token_count, noise, time_embeddings)?,
-            Self::Fp8(rt) => rt.infer(patches, token_ids, token_count, noise, time_embeddings)?,
-            Self::Int8(rt) => rt.infer(patches, token_ids, token_count, noise, time_embeddings)?,
+            Self::Fp8Static(rt) => {
+                rt.infer(patches, token_ids, token_count, noise, time_embeddings)?
+            }
+            Self::Int8Dynamic(rt) => {
+                rt.infer(patches, token_ids, token_count, noise, time_embeddings)?
+            }
         })
     }
 
@@ -154,27 +159,30 @@ impl Bench {
         time_embeddings: &[Tensor],
     ) -> Result<Graph, Box<dyn std::error::Error>> {
         Ok(match self {
-            Self::Bf16(rt) => Graph::Bf16(rt.capture_infer(
+            Self::Bf16(rt) => apxinf_model::pi05::capture_patches(
+                &rt,
                 patches,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
-            Self::Fp8(rt) => Graph::Fp8(rt.capture_infer(
+            )?,
+            Self::Fp8Static(rt) => apxinf_model::pi05::capture_patches(
+                &rt,
                 patches,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
-            Self::Int8(rt) => Graph::Int8(rt.capture_infer(
+            )?,
+            Self::Int8Dynamic(rt) => apxinf_model::pi05::capture_patches(
+                &rt,
                 patches,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
+            )?,
         })
     }
 
@@ -187,96 +195,35 @@ impl Bench {
         time_embeddings: &[Tensor],
     ) -> Result<Graph, Box<dyn std::error::Error>> {
         Ok(match self {
-            Self::Bf16(rt) => Graph::Bf16(rt.capture_infer_rgb_u8(
+            Self::Bf16(rt) => apxinf_model::pi05::capture_rgb(
+                &rt,
                 layout,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
-            Self::Fp8(rt) => Graph::Fp8(rt.capture_infer_rgb_u8(
+            )?,
+            Self::Fp8Static(rt) => apxinf_model::pi05::capture_rgb(
+                &rt,
                 layout,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
-            Self::Int8(rt) => Graph::Int8(rt.capture_infer_rgb_u8(
+            )?,
+            Self::Int8Dynamic(rt) => apxinf_model::pi05::capture_rgb(
+                &rt,
                 layout,
                 token_ids,
                 token_count,
                 noise,
                 time_embeddings,
-            )?),
+            )?,
         })
     }
 }
 
-/// The captured CUDA graph. Like `Bench`, the three concrete graph types share
-/// an identical method set, delegated here so the harness stays dtype-agnostic.
-enum Graph {
-    Bf16(Pi05Bf16CapturedGraph),
-    Fp8(Pi05CapturedGraph),
-    Int8(Pi05Int8CapturedGraph),
-}
-
-impl Graph {
-    fn replay(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Bf16(g) => g.replay()?,
-            Self::Fp8(g) => g.replay()?,
-            Self::Int8(g) => g.replay()?,
-        }
-        Ok(())
-    }
-
-    fn replay_and_synchronize(&self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Bf16(g) => g.replay_and_synchronize()?,
-            Self::Fp8(g) => g.replay_and_synchronize()?,
-            Self::Int8(g) => g.replay_and_synchronize()?,
-        }
-        Ok(())
-    }
-
-    fn output(&self) -> &Tensor {
-        match self {
-            Self::Bf16(g) => g.output(),
-            Self::Fp8(g) => g.output(),
-            Self::Int8(g) => g.output(),
-        }
-    }
-
-    fn update_raw_image_inputs(
-        &self,
-        images: &[u8],
-        token_ids: &[u32],
-        noise: &Tensor,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Self::Bf16(g) => g.update_raw_image_inputs(images, token_ids, noise)?,
-            Self::Fp8(g) => g.update_raw_image_inputs(images, token_ids, noise)?,
-            Self::Int8(g) => g.update_raw_image_inputs(images, token_ids, noise)?,
-        }
-        Ok(())
-    }
-
-    fn workspace_bytes(&self) -> usize {
-        match self {
-            Self::Bf16(g) => g.workspace_bytes(),
-            Self::Fp8(g) => g.workspace_bytes(),
-            Self::Int8(g) => g.workspace_bytes(),
-        }
-    }
-
-    fn workspace_used_bytes(&self) -> usize {
-        match self {
-            Self::Bf16(g) => g.workspace_used_bytes(),
-            Self::Fp8(g) => g.workspace_used_bytes(),
-            Self::Int8(g) => g.workspace_used_bytes(),
-        }
-    }
-}
+type Graph = CapturedGraph;
 
 #[derive(Clone, Copy, Debug)]
 enum ImageInput {
@@ -307,9 +254,9 @@ impl ImageInput {
         }
     }
 
-    fn label(self, dtype: Dtype) -> &'static str {
+    fn label(self, compute_variant: BenchVariant) -> &'static str {
         match self {
-            Self::Patches => dtype.patches_label(),
+            Self::Patches => compute_variant.patches_label(),
             Self::Rgb(Pi05ImageLayout::Nhwc) => "rgb_u8_nhwc",
             Self::Rgb(Pi05ImageLayout::Nchw) => "rgb_u8_nchw",
         }
@@ -589,13 +536,13 @@ fn latency_json(mut milliseconds: Vec<f64>) -> serde_json::Value {
 /// the former `pi05_thor_bench`); BF16/INT8 accept a bare `{ "raw_actions": [..] }`.
 fn reference_actions(
     path: &Path,
-    dtype: Dtype,
+    compute_variant: BenchVariant,
     config: &Pi05Config,
     token_count: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     let document: serde_json::Value = serde_json::from_str(&raw)?;
-    if dtype == Dtype::Fp8 {
+    if compute_variant == BenchVariant::Fp8Static {
         let expected_integer = |name: &str, expected: usize| -> Result<(), String> {
             let actual = document
                 .get(name)
@@ -656,7 +603,7 @@ fn reference_actions(
 #[derive(Debug)]
 struct Args {
     source: String,
-    dtype: Dtype,
+    compute_variant: BenchVariant,
     calibration: Option<String>,
     tactics: Option<String>,
     autotune: bool,
@@ -688,7 +635,7 @@ impl Args {
         }
 
         let mut source: Option<String> = None;
-        let mut dtype: Option<Dtype> = None;
+        let mut compute_variant: Option<BenchVariant> = None;
         let mut calibration = None;
         let mut tactics = None;
         let mut autotune = false;
@@ -712,8 +659,12 @@ impl Args {
         while index < raw.len() {
             let argument = raw[index].as_str();
             match argument {
-                "--dtype" => {
-                    dtype = Some(Dtype::parse(&expect_value(raw, &mut index, "--dtype")?)?)
+                "--compute-variant" => {
+                    compute_variant = Some(BenchVariant::parse(&expect_value(
+                        raw,
+                        &mut index,
+                        "--compute-variant",
+                    )?)?)
                 }
                 "--calibration" => {
                     calibration = Some(expect_value(raw, &mut index, "--calibration")?)
@@ -772,7 +723,8 @@ impl Args {
         }
 
         let source = source.ok_or("missing <checkpoint-or-index|random> positional argument")?;
-        let dtype = dtype.ok_or("missing required --dtype {bf16,fp8,int8}")?;
+        let compute_variant = compute_variant
+            .ok_or("missing required --compute-variant {bf16,fp8_static,int8_dynamic}")?;
         validate_explicit_tactics_path(tactics.as_deref(), autotune)?;
         if iterations == 0 {
             return Err("--iterations must be non-zero".into());
@@ -784,7 +736,7 @@ impl Args {
         }
         Ok(Self {
             source,
-            dtype,
+            compute_variant,
             calibration,
             tactics,
             autotune,
@@ -823,7 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::env::args().collect::<Vec<_>>();
     let args = Args::parse(&raw).map_err(|error| {
         format!(
-            "{error}\nusage: {} <checkpoint-or-index|random> --dtype {{bf16,fp8,int8}} \
+            "{error}\nusage: {} <checkpoint-or-index|random> --compute-variant {{bf16,fp8_static,int8_dynamic}} \
              [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune] [--views N] \
              [--image-size N] [--action-horizon N] [--action-dim N] [--num-flow-steps N] \
              [--max-token-len N] [--token-count T] [--iterations N] [--seed N] \
@@ -834,8 +786,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let random = args.source == "random";
-    let dtype = args.dtype;
-    let thresholds = dtype.thresholds();
+    let compute_variant = args.compute_variant;
+    let thresholds = compute_variant.thresholds();
     let token_count = args.token_count;
     let iterations = args.iterations;
     let image_input = ImageInput::resolve(args.image_input.as_deref())?;
@@ -872,12 +824,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // All GEMM precisions share the hardware tactic database; calibration is
     // still specific to FP8 activations.
-    if dtype != Dtype::Fp8 && args.calibration.is_some() {
-        return Err("--calibration only applies to --dtype fp8".into());
+    if compute_variant != BenchVariant::Fp8Static && args.calibration.is_some() {
+        return Err("--calibration only applies to --compute-variant fp8".into());
     }
 
     let config = if random {
-        // Random-benchmark defaults mirror `apxinf_py.Model.random` (2-view / H10)
+        // Random-benchmark defaults mirror `apxinf_py.ModelRunner.random` (2-view / H10)
         // so the Rust and Python entry points measure the same shape by default,
         // rather than `Pi05Config::default()` (3-view / H50). Untouched architecture
         // fields (patch/vision/language/action widths) come from `default()`.
@@ -958,79 +910,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Pi05Weights::from_safetensors(&config, Path::new(&args.source))?
     };
 
-    let bench = match dtype {
-        Dtype::Bf16 => {
+    let bench = match compute_variant {
+        BenchVariant::Bf16 => {
             eprintln!("converting and uploading native BF16 weights...");
-            let device_weights = Arc::new(StaticBf16Pi05Weights::from_host(
+            let device_weights = Arc::new(Bf16Weights::from_host(
                 &host_weights,
                 &*backend,
                 config.language_dual_geglu_shape_possible(),
             )?);
-            Bench::Bf16(Pi05Bf16CudaRuntime::new(
+            Bench::Bf16(build_bf16_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,
             )?)
         }
-        Dtype::Fp8 => {
-            let scales =
-                match args.calibration.as_deref() {
-                    Some(spec) if spec.starts_with("uniform:") => {
-                        eprintln!(
-                            "warning: uniform activation scales are for smoke/latency tests only"
+        BenchVariant::Fp8Static => {
+            let scales = match args.calibration.as_deref() {
+                Some(spec) if spec.starts_with("uniform:") => {
+                    eprintln!(
+                        "warning: uniform activation scales are for smoke/latency tests only"
+                    );
+                    Arc::new(Fp8StaticActivationScales::uniform(
+                        &config,
+                        spec["uniform:".len()..].parse()?,
+                    )?)
+                }
+                Some(path) => {
+                    if random {
+                        return Err(
+                            "random FP8 benchmarks require uniform:SCALE, not a checkpoint profile"
+                                .into(),
                         );
-                        Arc::new(Pi05ActivationScales::uniform(
-                            &config,
-                            spec["uniform:".len()..].parse()?,
-                        )?)
                     }
-                    Some(path) => {
-                        if random {
-                            return Err(
-                                "random FP8 benchmarks require uniform:SCALE, not a checkpoint profile"
-                                    .into(),
-                            );
-                        }
-                        let checkpoint = apxinf_model::pi05::checkpoint_identity(Path::new(
-                            &args.source,
-                        ))?;
-                        let calibration = StaticFp8Calibration::from_json_file(
-                            Path::new(path),
-                            &config,
-                            &checkpoint,
-                        )?;
-                        Arc::new(Pi05ActivationScales::from_calibration(
-                            &config,
-                            &calibration,
-                        )?)
-                    }
-                    None if random => {
-                        eprintln!("warning: no --calibration; using uniform activation scale 1.0");
-                        Arc::new(Pi05ActivationScales::uniform(&config, 1.0)?)
-                    }
-                    None => return Err(
-                        "--dtype fp8 requires --calibration <json|uniform:SCALE> for a checkpoint"
+                    let checkpoint =
+                        apxinf_model::pi05::checkpoint_identity(Path::new(&args.source))?;
+                    let calibration = Fp8StaticCalibration::from_json_file(
+                        Path::new(path),
+                        &config,
+                        &checkpoint,
+                    )?;
+                    Arc::new(Fp8StaticActivationScales::from_calibration(
+                        &config,
+                        &calibration,
+                    )?)
+                }
+                None if random => {
+                    eprintln!("warning: no --calibration; using uniform activation scale 1.0");
+                    Arc::new(Fp8StaticActivationScales::uniform(&config, 1.0)?)
+                }
+                None => {
+                    return Err(
+                        "--compute-variant fp8_static requires --calibration <json|uniform:SCALE> for a checkpoint"
                             .into(),
-                    ),
-                };
+                    )
+                }
+            };
             eprintln!("quantizing and uploading static FP8 weights...");
-            let device_weights = Arc::new(StaticFp8Pi05Weights::from_host(
+            let device_weights = Arc::new(Fp8StaticWeights::from_host(
                 &host_weights,
                 &*backend,
                 config.language_dual_geglu_shape_possible(),
             )?);
-            Bench::Fp8(Pi05CudaRuntime::new(
+            Bench::Fp8Static(build_fp8_static_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,
                 scales,
             )?)
         }
-        Dtype::Int8 => {
+        BenchVariant::Int8Dynamic => {
             eprintln!("quantizing and uploading per-channel INT8 weights...");
-            let device_weights =
-                Arc::new(StaticInt8Pi05Weights::from_host(&host_weights, &backend)?);
-            Bench::Int8(Pi05Int8CudaRuntime::new(
+            let device_weights = Arc::new(Int8DynamicWeights::from_host(&host_weights, &backend)?);
+            Bench::Int8Dynamic(build_int8_dynamic_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,
@@ -1039,7 +990,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(host_weights);
 
-    let io_dtype = dtype.io_dtype();
+    let io_dtype = compute_variant.io_dtype();
     let patch_rows = config.num_views * config.patches_per_view();
     let patch_width = 3 * config.patch_size * config.patch_size;
     let (raw_images, patches_host) = match image_input {
@@ -1063,15 +1014,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     token_ids
         .copy_from_host(&token_bytes)
         .map_err(std::io::Error::other)?;
-    let time_embeddings = match dtype {
-        Dtype::Bf16 => upload_time_embeddings_bf16(&config, &*backend)?,
-        Dtype::Fp8 => upload_time_embeddings(&config, &*backend)?,
-        Dtype::Int8 => upload_time_embeddings_int8(&config, &*backend)?,
+    let time_embeddings = match compute_variant {
+        BenchVariant::Bf16 => upload_time_embeddings_bf16(&config, &*backend)?,
+        BenchVariant::Fp8Static => upload_time_embeddings_fp8_static(&config, &*backend)?,
+        BenchVariant::Int8Dynamic => upload_time_embeddings_int8_dynamic(&config, &*backend)?,
     };
 
     eprintln!(
         "running eager {} integrity pass...",
-        dtype.precision_label()
+        compute_variant.variant_label()
     );
     let eager_output = bench.infer(&patches, &token_ids, token_count, &noise, &time_embeddings)?;
     let eager = backend.to_cpu(&eager_output)?.to_f32_vec()?;
@@ -1082,7 +1033,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "precision": dtype.precision_label(),
+                "compute_variant": compute_variant.variant_label(),
                 "mode": "eager_only",
                 "token_count": token_count,
                 "output_abs_checksum": checksum,
@@ -1093,8 +1044,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "capturing {} graph with {} input...",
-        dtype.precision_label(),
-        image_input.label(dtype)
+        compute_variant.variant_label(),
+        image_input.label(compute_variant)
     );
     let graph = match image_input {
         ImageInput::Patches => {
@@ -1117,7 +1068,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reference_metrics = args
         .reference
         .as_ref()
-        .map(|path| reference_actions(Path::new(path), dtype, &config, token_count))
+        .map(|path| reference_actions(Path::new(path), compute_variant, &config, token_count))
         .transpose()?
         .map(|expected| ErrorMetrics::measure(&captured, &expected))
         .transpose()?;
@@ -1185,10 +1136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "profile": profile,
-            "precision": dtype.precision_label(),
+            "compute_variant": compute_variant.variant_label(),
             "weights": if random { "synthetic" } else { "checkpoint" },
             "image_input": {
-                "kind": image_input.label(dtype),
+                "kind": image_input.label(compute_variant),
                 "graph_includes_cuda_preprocess": matches!(image_input, ImageInput::Rgb(_)),
                 "graph_latency_includes_h2d": false,
                 "input_update_plus_graph_latency_ms": update_plus_graph_latency,
@@ -1244,7 +1195,7 @@ mod tests {
     use super::*;
 
     fn arguments(extra: &[&str]) -> Vec<String> {
-        ["pi05_bench", "random", "--dtype", "fp8"]
+        ["pi05_bench", "random", "--compute-variant", "fp8_static"]
             .into_iter()
             .chain(extra.iter().copied())
             .map(str::to_owned)

@@ -35,7 +35,7 @@ NUM_VIEWS = 2
 
 
 class MockModel:
-    """In-process ``BareModel`` stand-in: normalized action is all-zeros.
+    """In-process ``ModelRunnerProtocol`` stand-in: normalized action is all-zeros.
 
     Replaces the old subprocess ``FakeEngine``; the server now calls the model
     in-process through ``Pi05Policy`` instead of over a stdio pipe.
@@ -92,7 +92,7 @@ def build_policy() -> Pi05Policy:
         input_pipeline=input_pipeline,
         output_pipeline=output_pipeline,
         image_keys=LIBERO_IMAGE_KEYS,
-        metadata={"precision": "int8", "protocol": "openpi.websocket_policy"},
+        metadata={"compute_variant": "int8_dynamic", "protocol": "openpi.websocket_policy"},
     )
 
 
@@ -157,7 +157,7 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         )
         metadata = client.get_server_metadata()
         # Policy metadata (model_type, shapes) merged with the server-injected tags.
-        self.assertEqual(metadata["precision"], "int8")
+        self.assertEqual(metadata["compute_variant"], "int8_dynamic")
         self.assertEqual(metadata["model_type"], "pi05")
         observation = {
             "observation/image": np.full((3, 224, 224), 0.5, dtype=np.float32),
@@ -187,14 +187,14 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         self.assertIn("prev_total_ms", second["server_timing"])
 
         # The in-process model saw two NHWC calls, one row per configured camera.
-        self.assertEqual(len(self.policy.model.images), 2)
-        self.assertEqual(self.policy.model.images[0].shape, (NUM_VIEWS, 224, 224, 3))
-        self.assertEqual(self.policy.model.images[0].dtype, np.dtype("uint8"))
+        self.assertEqual(len(self.policy.model_runner.images), 2)
+        self.assertEqual(self.policy.model_runner.images[0].shape, (NUM_VIEWS, 224, 224, 3))
+        self.assertEqual(self.policy.model_runner.images[0].dtype, np.dtype("uint8"))
         # The float 0.5 base image was parsed to uint8 127.
-        self.assertTrue(np.all(self.policy.model.images[0][0] == 127))
+        self.assertTrue(np.all(self.policy.model_runner.images[0][0] == 127))
         # Seeded noise advances between calls, so the two draws differ.
         self.assertFalse(
-            np.array_equal(self.policy.model.noises[0], self.policy.model.noises[1])
+            np.array_equal(self.policy.model_runner.noises[0], self.policy.model_runner.noises[1])
         )
 
 

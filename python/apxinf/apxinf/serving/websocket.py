@@ -81,7 +81,7 @@ class WebsocketPolicyServer:
                 infer_started = time.monotonic()
                 # Call the policy directly on the event-loop thread rather than
                 # offloading to a worker (``asyncio.to_thread``): the L1 handle
-                # ``apxinf_py.Model`` is *unsendable* — its CUDA context is bound
+                # ``apxinf_py.ModelRunner`` is *unsendable* — its CUDA context is bound
                 # to the thread that created it (the main thread, where the
                 # policy was constructed), and touching it from a thread-pool
                 # thread panics. Inference is one-at-a-time per GPU anyway, so

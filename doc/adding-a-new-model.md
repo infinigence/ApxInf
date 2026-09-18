@@ -64,25 +64,34 @@ generation loop. Their public contract is an observation-to-action inference
 path with model-specific state, image, language, noise, schedule, and action
 semantics.
 
-PI0.5 is the maintained structural reference:
+PI0.5 is the maintained VLA structural reference. Use the
+[module responsibility table](model-layer-architecture.md#current-module-names-and-responsibilities)
+to assign ownership; this is its current layout, not a required number of files:
 
 ```text
 pi05/
-  mod.rs                 module wiring and deliberate exports
-  backend.rs             the model's only CUDA-facing seam
-  config.rs              checkpoint and execution configuration
-  weights.rs             source checkpoint representation
-  *_weights.rs           device/precision-specific weight forms
-  math.rs                model mathematics without device ownership
-  *_executor.rs          one precision's layer composition
-  *_runtime.rs           device state, denoising schedule, workspace and captured execution
-  vla_runtime.rs         VlaRuntime adapter and registered loader
+  mod.rs                 registration and deliberate exports
+  config.rs / load.rs     config validation, variant selection, construction
+  backend.rs             safe CUDA imports and type aliases
+  math.rs                CPU helpers/reference semantics
+  model/
+    mod.rs               Pi05Model<B>: shared forward computation and flow schedule
+    model.rs           ModelVariant: loaded precision-specific dispatch
+    blocks/              layer/backbone implementation and resource requirements
+    calibration.rs       model-specific diagnostic traversal
+  model_runner/
+    runner.rs            Pi05ModelRunner: VlaRuntime, input/RNG binding, plan cache
+    prepare.rs           workspace allocation, warmup, capture and resource lifetime
+  weights/               host mapping, packing, device weights, calibration scales
 ```
 
 Create the new model's own directory and equivalent responsibilities. Do not
 place its state encoder, action decoder, denoising schedule, embodiment logic,
-or workspace inside `pi05/`. A first version may copy PI0.5 runtime or executor
-structure extensively; correctness and isolation are the initial goal.
+or workspace inside `pi05/`. Inspect or copy PI0.5's model/Blocks and runner
+structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
+those roles. Preserve static precision specialization and keep one owner of
+forward order. A family with one implementation needs neither `ModelVariant`
+nor a generic Blocks abstraction merely to resemble PI0.5.
 
 Choose the model input seam explicitly. The policy or application adapter owns
 raw observation-container decoding, robot field and camera mapping, resize when
@@ -97,7 +106,7 @@ declared intermediate representation such as resized RGB `u8`. When
 canonicalization after that seam may belong to the Rust/CUDA runtime. Examples
 include pixel normalization, temporal duplication, patchification, merge
 ordering, layout conversion, and dtype conversion. These operations may be
-prepared and CUDA-graph captured with the model executor. RGB support does not
+prepared and CUDA-graph captured with the model computation. RGB support does not
 make the low-level model responsible for arbitrary image containers, robot
 observation dictionaries, prompt construction, or action unnormalization.
 
@@ -135,7 +144,7 @@ not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
 Do not begin coverage discovery from `dyn Backend` alone. First inspect the
-closest maintained executor at the requested precision and the safe interfaces
+closest maintained model/Blocks implementation at the requested precision and the safe interfaces
 under `apxinf_cuda::kernels`, especially fused normalization/residual,
 QKV/RoPE/cache, attention, activation, and GEMM paths. Complete the execution
 ledger from [Model Execution Wiring](model-execution-wiring.md) before treating
@@ -143,13 +152,14 @@ an operation as missing.
 
 ### Execution and preparation
 
-Separate reusable mathematics from execution state. A runtime may own device
-weights, caches, workspaces, CUDA graphs, and shape-specific preparation. A
+Separate model computation from execution state. A model runner owns or retains
+the model/weights, caches, workspaces, CUDA graphs and prepared profiles. A
 prepared object must bind every shape or condition that changes allocation,
 dispatch, or captured execution.
 
-Preparation runs the real fixed-shape executor once, installs required native
-plans, and proves workspace capacity before capture. Configuration validation
+Preparation queries model/Blocks requirements, allocates stable resources,
+and warms up the real model computation until native plans/tactics are stable
+before capture. Configuration validation
 alone is not preparation. Keep a CPU implementation inside a layer only as a
 named correctness scaffold with an exit criterion. For an accelerator target,
 replace it through an existing safe device path or `adding-new-kernels.md`
@@ -160,17 +170,60 @@ For VLA models, include state shape, image/grid structure, masks, action horizon
 action width, embodiment/category selection, and stochastic input shape where
 they affect execution.
 
+Keep request values distinct from plan compatibility. Current `InferenceSpec`
+contains token count and image layout only; validate additional family invariants
+in the runner or its profile key. Implement `PreparedInference::spec` and `run`;
+declare the actual `status`. Implement `prepare_with_policy`, `prepare_for` and
+`clear_prepared` when adopting the explicit preparation contract. Their defaults
+are unsupported, not successful readiness. Verify mode/fallback reporting,
+incompatible inputs, tuning-store replacement/generation, retained-plan lifetime,
+and output overwrite behavior through native calls. The
+[PI0.5 contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+is the executable reference; new-family support needs its own evidence.
+
 ### Registration and public integration
 
-Register the loader under stable model identifiers. Ensure the normal
-`AutoModel` or `VlaRuntime` entry point can load the checkpoint; a private
-example binary is not a deployment integration.
+Complete these steps in the new family's own code and the existing registries:
 
-Expose Python policy support only after the Rust runtime contract is stable.
-Keep application/robot preprocessing and policy-level normalization, prompt,
-mask, and action postprocessing outside the low-level runtime. Checkpoint-fixed
-canonicalization from a declared model representation to model tensors may
-remain inside the runtime as described above.
+1. Export the family module from `crates/apxinf-model/src/lib.rs`. Implement a
+   `registry::ModelFactory` loader and wire its registration through
+   `builtin::register_builtin_models`, with the correct feature gate and names.
+   `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
+   metadata; test both explicit selection and the supported detection path.
+2. For LLM/VLM, return `LoadedModel::text(Box<dyn LlmTrait>)` and exercise shared
+   generation. For VLA, implement `VlaRuntime` on the family runner and return
+   `LoadedModel::Vla(Box::new(runner))`. Required methods include `contract`,
+   `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
+   deliberately instead of inheriting unsupported defaults unknowingly.
+3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Use `VlaRequest` for observation, provided latent or RNG key, and applicable
+   metadata. Keep family config parsing in the loader. Check the
+   [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)
+   before adopting `compute_variant` or binding config overrides.
+4. Reuse the generic native `ModelRunner` binding. Add a
+   `python/apxinf/apxinf/policies/impls/<family>.py` policy implementing the
+   policy contract, register it with `register_policy`, and import it from
+   `policies/__init__.py`. `AutoPolicy` must discover it by supported metadata
+   or explicit `model_type`. Implement family input/output pipelines and
+   `model_runner` injection; a new Python network or native binding class is
+   unnecessary unless the existing public tensor contract cannot express it.
+5. Test the complete chain below with real inputs. Rebuild the extension
+   together with Python when the binding changes. Ensure checkpoint validation
+   and server/policy selection support the new family; a private benchmark
+   executable alone is not public integration.
+
+```text
+AutoPolicy → <Family>Policy → apxinf.ModelRunner (= apxinf_py.ModelRunner)
+  → Rust AutoModel → registry loader → LoadedModel::Vla(<Family>ModelRunner)
+  → <Family>Model / Blocks → safe backend operations
+```
+
+AutoPolicy and AutoModel are construction entry points, not per-request layers.
+Policy `infer` preprocesses, calls the existing binding and decodes the result.
+Keep robot adaptation, prompt, state/action normalization and output context at
+that boundary. Checkpoint-fixed conversion after the declared RGB/tensor input
+seam remains in the native model computation. See the
+[current ownership table](model-layer-architecture.md#current-module-names-and-responsibilities).
 
 ## Add static-FP8 calibration
 
@@ -180,7 +233,7 @@ aggregates statistics, validates coverage, creates scales, and emits the
 manifest. Do not add a model branch to the runner or copy those operations into
 a model command.
 
-The runtime first publishes its **actual FP8 execution plan** as stable
+The family policy/calibration integration publishes its **actual FP8 execution plan** as stable
 `QuantizedOperator` values. The default plan captures the input of every
 quantized `linear` or `gemm` operator. It deliberately does not scan for every
 module whose class or name happens to contain `Linear`; BF16 operators and
@@ -190,7 +243,7 @@ A conventional model needs only a family name:
 
 ```python
 spec = QuantizationSpec(model_family="new_model")
-plan = spec.plan_for(runtime.fp8_execution_plan())
+plan = spec.plan_for(policy.fp8_execution_plan())
 ```
 
 Keep the model quantization specification thin. Use its overrides only for
@@ -219,7 +272,12 @@ logical model structure (for example `blocks.3.qkv.input`), never object IDs,
 GPU addresses, hook order, or transient module paths. Renaming a stable site is
 a calibration-schema migration.
 
-The policy/model implements the public `collect_calibration(observation,
+`Fp8ExecutionPlan` and `QuantizationSpec` are Python calibration contracts;
+they are not methods supplied by Rust `VlaRuntime`. The current Rust hooks are
+`calibration_plan` and `calibration_amax`, both unsupported by default. Adapt
+native observations into the Python plan in the family policy, as needed.
+
+The policy implements the public `collect_calibration(observation,
 context)` seam. It owns normal preprocessing and model-specific deterministic
 inputs. A dataset adapter may translate an external record with
 `adapt_records`, but it must return only the same public Observation accepted by
@@ -232,7 +290,7 @@ an FP8 consumer. A custom site missing from execution therefore fails closed.
 Dynamic-activation FP8 plans are classified as calibration-free: the runner
 does not iterate the dataset and returns no static profile.
 
-Override the defaults only when the quantized executor proves they are wrong:
+Override the defaults only when the quantized model implementation proves they are wrong:
 fused operators need explicit capture boundaries, excluded BF16 layers consume
 no FP8 scale, tied kernels may share one scale, and algorithms beyond static
 per-tensor FP8 may require different statistics. Tests should exercise the
@@ -302,11 +360,16 @@ complete.
 
 ## Completion criteria
 
-The model has its own directory, uses the correct runtime contract, respects the
+Apply the [accelerator acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
+when completing a new GPU port. The model has its own directory, uses the correct runtime contract, respects the
 model/backend boundary, loads through the maintained registry, passes declared
 numerical tolerances through the public path, has no accelerator hot-path host
-escapes unless a concrete operator blocker is recorded, audits applicable
+escapes, verifies the required
 prepared/static/captured execution, reports functional and optimization status
 separately, reports unsupported cases clearly, and introduces no speculative
 shared abstraction. Explicit performance release gates remain mandatory;
 otherwise optimization is best effort.
+A concrete operator/capture blocker is unfinished port work, not completion.
+Update the family's capability documentation and the shared registry/interface
+documentation in the same change; historical performance or another family's
+prepared-plan tests do not establish support for the new family.

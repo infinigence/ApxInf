@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{standard_normal_f32, DType, Device, RngKey, Tensor};
 use apxinf_model::{
-    AutoModel, LoadOptions, ModelPrecision, Observation, Pi05Config,
-    VisionObservation, VlaRequest,
+    AutoModel, ExecutionMode, ExecutionPolicy, ImageLayout, LoadOptions, Observation, Pi05Config,
+    PreparationStatus, VisionObservation, VlaRequest,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.len() < 2 || arguments.len() > 3 {
+    if arguments.len() < 2 || arguments.len() > 4 {
         return Err(format!(
-            "usage: {} <checkpoint-or-directory> [token-count=21]",
+            "usage: {} <checkpoint-or-directory> [token-count=21] [bf16|fp8_static|int8_dynamic]",
             arguments
                 .first()
                 .map(String::as_str)
@@ -40,7 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = LoadOptions {
         model_name: Some("pi05".to_owned()),
-        precision: ModelPrecision::Bf16,
+        compute_variant: Some(
+            arguments
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("bf16")
+                .parse::<apxinf_model::pi05::ComputeVariant>()?
+                .as_str()
+                .into(),
+        ),
         ..LoadOptions::default()
     };
     let model = AutoModel::load_model(Device::Cuda(0), &checkpoint, &options)?;
@@ -57,8 +65,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let noise = Tensor::zeros(vec![config.action_horizon, config.action_dim], DType::F32);
     let request = VlaRequest::provided(&observation, &noise);
-    let prepared = model.prepare(&observation.inference_spec())?;
+    let spec = observation.inference_spec();
+    let eager = model.prepare_with_policy(&spec, ExecutionPolicy::Eager)?;
+    assert_eq!(
+        eager.status(),
+        PreparationStatus::Ready {
+            mode: ExecutionMode::Eager,
+            fallback_reason: None,
+        }
+    );
+    let eager_values =
+        apxinf_cuda::transfers::to_cpu(eager.run(&request)?.tensor())?.to_f32_vec()?;
+    drop(eager);
+    let prepared = model.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
+    assert_eq!(
+        prepared.status(),
+        PreparationStatus::Ready {
+            mode: ExecutionMode::Graph,
+            fallback_reason: None,
+        }
+    );
+    // Populate the implicit cache so eviction exercises real resource release,
+    // while a separately owned explicit plan remains usable.
+    drop(model.infer(&request)?);
+    assert!(matches!(model.vla()?.execution_mode(), "graph" | "eager"));
+    model.clear_prepared()?;
+    assert_eq!(model.vla()?.execution_mode(), "unprepared");
+    let mut invalid = observation.clone();
+    invalid.token_ids.push(0);
+    assert!(prepared
+        .run(&VlaRequest::provided(&invalid, &noise))
+        .is_err());
     let prepared_action = prepared.run(&request)?;
+    let graph_values = apxinf_cuda::transfers::to_cpu(prepared_action.tensor())?.to_f32_vec()?;
+    let eager_graph_max_abs = eager_values
+        .iter()
+        .zip(&graph_values)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    if eager_values.len() != graph_values.len()
+        || eager_values
+            .iter()
+            .chain(&graph_values)
+            .any(|v| !v.is_finite())
+        || eager_graph_max_abs > 0.01
+    {
+        return Err(format!("explicit eager/graph mismatch: {eager_graph_max_abs}").into());
+    }
     drop(prepared);
     let inferred_action = model.infer(&request)?;
     let cached_action = model.infer(&request)?;
@@ -84,7 +137,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(&provided_rng_action)
         .map(|(left, right)| left * right)
         .sum::<f32>();
-    let left_norm = generated_first.iter().map(|value| value * value).sum::<f32>();
+    let left_norm = generated_first
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>();
     let right_norm = provided_rng_action
         .iter()
         .map(|value| value * value)
@@ -112,9 +168,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if generated_first == different_action {
         return Err("distinct PI0.5 RNG streams produced identical actions".into());
     }
+    // Cover canonical raw RGB -> prepared Session -> device Action as well as
+    // the preprocessed patch route above, without reloading model weights.
+    model.clear_prepared()?;
+    let rgb_observation = Observation {
+        vision: VisionObservation::RgbU8 {
+            bytes: vec![0; config.num_views * config.image_size * config.image_size * 3],
+            layout: ImageLayout::Nhwc,
+        },
+        token_ids: observation.token_ids.clone(),
+        state: None,
+        action_mask: None,
+    };
+    let rgb_request = VlaRequest::provided(&rgb_observation, &noise);
+    let rgb_spec = rgb_observation.inference_spec();
+    let rgb_eager = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::Eager)?;
+    let rgb_eager_values =
+        apxinf_cuda::transfers::to_cpu(rgb_eager.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+    drop(rgb_eager);
+    let rgb_graph = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::RequireGraph)?;
+    let rgb_graph_values =
+        apxinf_cuda::transfers::to_cpu(rgb_graph.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+    let rgb_max_abs = rgb_eager_values
+        .iter()
+        .zip(&rgb_graph_values)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    if rgb_eager_values.len() != rgb_graph_values.len()
+        || rgb_eager_values
+            .iter()
+            .chain(&rgb_graph_values)
+            .any(|v| !v.is_finite())
+        || rgb_max_abs > 0.01
+    {
+        return Err(format!("raw RGB eager/graph mismatch: {rgb_max_abs}").into());
+    }
+    drop(rgb_graph);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "explicit_policy_and_eviction_passed": true,
+            "populated_cache_eviction_passed": true,
+            "raw_rgb_eager_graph_max_abs": rgb_max_abs,
+            "eager_graph_max_abs": eager_graph_max_abs,
             "device": cached_action.tensor().device().to_string(),
             "dtype": cached_action.tensor().dtype().to_string(),
             "prepared_shape": prepared_action.tensor().shape().dims(),
