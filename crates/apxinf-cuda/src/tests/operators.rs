@@ -1167,6 +1167,118 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
     );
 }
 
+// ── GDN chunk-state value split is bit-exact ──────────────────────
+//
+// Splitting a head's scan across several blocks along the value dimension is
+// a claim about the arithmetic, not a measurement: nothing in the kernel
+// crosses that dimension, so each slice sums the same terms in the same order
+// and the result should be identical to the last bit, not merely within an
+// oracle's tolerance. That is a claim a test can settle exactly, so it does --
+// the output words and the carried state are compared as bits.
+//
+//   cargo test --release -p apxinf-cuda gdn_chunk_state_v_split -- --nocapture
+#[test]
+fn gdn_chunk_state_v_split_is_bit_exact() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
+    let seq_pad = chunk * chunks;
+    let seq = seq_pad;
+
+    let draw = |salt: u64, n: usize, scale: f64| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                (((x & 0xFFFF) as f64 / 32768.0 - 1.0) * scale) as f32
+            })
+            .collect()
+    };
+    let q = draw(1, heads * seq_pad * kdim, 0.5);
+    let k = draw(2, heads * seq_pad * kdim, 0.5);
+    let t = draw(3, heads * chunks * chunk * chunk, 0.25);
+    let vt = draw(4, heads * chunks * chunk * vdim, 0.5);
+    let kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    let state0 = draw(6, heads * kdim * vdim, 0.2);
+    let mut g_cum = vec![0.0f32; heads * seq_pad];
+    for h in 0..heads {
+        for c in 0..chunks {
+            let mut acc = 0.0f32;
+            for i in 0..chunk {
+                acc -= 0.01 * ((h + c + i) % 5) as f32;
+                g_cum[h * seq_pad + c * chunk + i] = acc;
+            }
+        }
+    }
+
+    let upload = |data: &[f32]| -> CudaBuffer {
+        let buf = CudaBuffer::alloc(data.len() * 4, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                buf.ptr(),
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len() * 4,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        buf
+    };
+    let (qb, kb, gb, tb, vtb, kcdb) = (
+        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+    );
+
+    // The scan carries its state in the buffer it was given, so each run needs
+    // its own copy of the initial state to start from.
+    let run = |split: &str| -> (Vec<f32>, Vec<f32>) {
+        std::env::set_var("APXINF_GDN_CHUNK_STATE_V_SPLIT", split);
+        let sb = upload(&state0);
+        let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
+        let out_t = out
+            .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
+            .unwrap();
+        crate::kernels::linear_attention::gdn_chunk_state(
+            &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
+        )
+        .unwrap();
+        let produced = download_bf16_as_fp32(&out_t).unwrap();
+        let mut state = vec![0.0f32; heads * kdim * vdim];
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                state.as_mut_ptr() as *mut std::ffi::c_void,
+                sb.ptr(),
+                state.len() * 4,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            ))
+            .unwrap();
+        }
+        (produced, state)
+    };
+
+    let (base_out, base_state) = run("1");
+    for split in ["2", "4"] {
+        let (split_out, split_state) = run(split);
+        let out_diff = base_out
+            .iter()
+            .zip(&split_out)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let state_diff = base_state
+            .iter()
+            .zip(&split_state)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "gdn_chunk_state_v_split split={split} out_words={} out_differing={out_diff} state_differing={state_diff}",
+            base_out.len()
+        );
+        assert_eq!(out_diff, 0, "value split {split} changed the output");
+        assert_eq!(state_diff, 0, "value split {split} changed the carried state");
+    }
+    std::env::remove_var("APXINF_GDN_CHUNK_STATE_V_SPLIT");
+}
+
 // ── GDN chunk GEMM against an fp64 oracle ─────────────────────────
 //
 // Companion to the chunk-state one. Both products here are [C,C] @ [C,V] with

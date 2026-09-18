@@ -28,6 +28,7 @@ struct ApxinfGdnPolicy {
   int32_t chunk_gemm_wmma;
   int32_t attn_raw_wmma;
   int32_t recurrent_split;
+  int32_t chunk_state_v_split;
 };
 
 }  // extern "C"

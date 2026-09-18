@@ -427,20 +427,39 @@ __global__ void gdn_chunk_gemm_kernel(
 // accumulator array is indexed dynamically, nvcc spills it to local memory and
 // the kernel roughly halves in speed -- and the right value is not obvious
 // enough to guess, so the launcher instantiates several and picks one.
-template <int GDN_TILE>
+template <int GDN_TILE, bool V_SPLIT>
 __global__ void gdn_chunk_state_kernel(
     const float* q, const float* k,
     const float* g_cum, const float* t_in, const float* vt_in, const float* kcd_in,
     float* state, __nv_bfloat16* out,
     int seq, int seq_pad, int head_k_dim, int head_v_dim, int chunk_size,
-    int total_chunks, int out_row_width, float scale) {
+    int total_chunks, int out_row_width, float scale, int v_split) {
   const int head = blockIdx.x;
+  // One head's scan can be shared by v_split blocks, each owning a slice of
+  // the value dimension. Nothing here crosses that dimension: the decay scales
+  // rows of the state, every accumulation runs over the key dimension, and an
+  // output column reads only its own column of the state. A slice therefore
+  // computes exactly the values it would have computed inside the whole block,
+  // summed in the same order, so the result is bit-identical and not merely
+  // close. What it buys is blocks: the scan is sequential over chunks and its
+  // only other parallelism is the head count, which is 32 at the shipped shape
+  // and leaves three quarters of a 128-SM device idle.
+  //
+  // V_SPLIT is a template parameter and not just the runtime `v_split`
+  // because a block that is not split must compile to exactly what it
+  // compiled to before this existed. Carrying the offset as a runtime value
+  // cost enough registers to push the 1024-thread width past the per-block
+  // budget: the launch came back with CUDA 701 on a board that had been
+  // running it for weeks. With V_SPLIT false the compiler folds j0 to zero
+  // and every index below collapses to its original form.
+  const int v_cols = V_SPLIT ? head_v_dim / v_split : head_v_dim;
+  const int j0 = V_SPLIT ? static_cast<int>(blockIdx.y) * v_cols : 0;
   extern __shared__ float gdn_chunk_smem[];
   float* v_new = gdn_chunk_smem;
   const int64_t head_token_base = static_cast<int64_t>(head) * seq_pad;
   float* state_head = state + static_cast<int64_t>(head) * head_k_dim * head_v_dim;
-  const int cells = chunk_size * head_v_dim;
-  const int state_cells_total = head_k_dim * head_v_dim;
+  const int cells = chunk_size * v_cols;
+  const int state_cells_total = head_k_dim * v_cols;
   // The inter-chunk term reads the carried state only through a BF16 round
   // trip, so a BF16 copy is bit-identical to re-reading the FP32 state from
   // global memory. Caching it pays here: each thread walks a full head_k_dim
@@ -459,8 +478,16 @@ __global__ void gdn_chunk_state_kernel(
   // on the same values -- the expressions are unchanged, only their count is.
   __nv_bfloat16* v_round = state_cache + state_cells_total;
   for (int c = 0; c < total_chunks; ++c) {
-    for (int cell = threadIdx.x; cell < state_cells_total; cell += blockDim.x) {
-      state_cache[cell] = __float2bfloat16(state_head[cell]);
+    if constexpr (V_SPLIT) {
+      for (int cell = threadIdx.x; cell < state_cells_total; cell += blockDim.x) {
+        const int m = cell / v_cols;
+        state_cache[cell] =
+            __float2bfloat16(state_head[m * head_v_dim + j0 + (cell - m * v_cols)]);
+      }
+    } else {
+      for (int cell = threadIdx.x; cell < state_cells_total; cell += blockDim.x) {
+        state_cache[cell] = __float2bfloat16(state_head[cell]);
+      }
     }
     __syncthreads();
     const int64_t token_base = head_token_base + static_cast<int64_t>(c) * chunk_size;
@@ -476,11 +503,11 @@ __global__ void gdn_chunk_state_kernel(
     // same way the intra and state-update loops below already do. Each cell
     // still sums over m in increasing order, so the values do not change.
     const int inter_span = static_cast<int>(blockDim.x) * GDN_TILE;
-    if (cells % inter_span == 0 && blockDim.x % head_v_dim == 0) {
-      const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
+    if (cells % inter_span == 0 && blockDim.x % v_cols == 0) {
+      const int row_step = static_cast<int>(blockDim.x) / v_cols;
       for (int base = threadIdx.x, it = 0; base < cells; base += inter_span) {
-        const int row0 = base / head_v_dim;
-        const int j = base - row0 * head_v_dim;
+        const int row0 = base / v_cols;
+        const int j = base - row0 * v_cols;
         float vp[GDN_TILE];
         float ai[GDN_TILE];
 #pragma unroll
@@ -489,7 +516,7 @@ __global__ void gdn_chunk_state_kernel(
           ai[t] = 0.0f;
         }
         for (int m = 0; m < head_k_dim; ++m) {
-          const float sv = __bfloat162float(state_cache[m * head_v_dim + j]);
+          const float sv = __bfloat162float(state_cache[m * v_cols + j]);
 #pragma unroll
           for (int t = 0; t < GDN_TILE; ++t) {
             const int i = row0 + t * row_step;
@@ -502,23 +529,24 @@ __global__ void gdn_chunk_state_kernel(
           const int i = row0 + t * row_step;
           const int cell = base + t * static_cast<int>(blockDim.x);
           const float qg = gdn_exp2_approx(g_cum[token_base + i]);
-          v_new[cell] = vt_in[vt_base + cell] - vp[t];
+          v_new[cell] =
+              vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j : cell)] - vp[t];
           attn_inter[it] = ai[t] * qg;
         }
       }
     } else {
       for (int cell = threadIdx.x, it = 0; cell < cells; cell += blockDim.x, ++it) {
-        const int i = cell / head_v_dim;
-        const int j = cell - i * head_v_dim;
+        const int i = cell / v_cols;
+        const int j = cell - i * v_cols;
         float vp = 0.0f;
         float ai = 0.0f;
         const float qg = gdn_exp2_approx(g_cum[token_base + i]);
         for (int m = 0; m < head_k_dim; ++m) {
-          const float s = __bfloat162float(state_cache[m * head_v_dim + j]);
+          const float s = __bfloat162float(state_cache[m * v_cols + j]);
           vp += kcd_in[kcd_base + i * head_k_dim + m] * s;
           ai += q[(token_base + i) * head_k_dim + m] * s;
         }
-        v_new[cell] = vt_in[vt_base + cell] - vp;
+        v_new[cell] = vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j : cell)] - vp;
         attn_inter[it] = ai * qg;
       }
     }
@@ -542,15 +570,15 @@ __global__ void gdn_chunk_state_kernel(
       // (base + s*blockDim)/head_v_dim inside the unrolled body costs an
       // integer divide per element per step, which is worse than the shared
       // read it was meant to save.
-      const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
+      const int row_step = static_cast<int>(blockDim.x) / v_cols;
       for (int base = threadIdx.x, it = 0; base < cells; base += tile_span) {
-        const int row0 = base / head_v_dim;
-        const int j = base - row0 * head_v_dim;
+        const int row0 = base / v_cols;
+        const int j = base - row0 * v_cols;
         float intra[GDN_TILE];
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) intra[s] = 0.0f;
         for (int m = 0; m < chunk_size; ++m) {
-          const float vv = __bfloat162float(v_round[m * head_v_dim + j]);
+          const float vv = __bfloat162float(v_round[m * v_cols + j]);
           #pragma unroll
           for (int s = 0; s < GDN_TILE; ++s) {
             const int i = row0 + s * row_step;
@@ -563,47 +591,47 @@ __global__ void gdn_chunk_state_kernel(
           const float acc = attn_inter[it] * scale + intra[s] * scale;
           const int token = c * chunk_size + i;
           if (token < seq) {
-            out[static_cast<int64_t>(token) * out_row_width + head * head_v_dim + j] =
-                __float2bfloat16(acc);
+            out[static_cast<int64_t>(token) * out_row_width + head * head_v_dim +
+                j0 + j] = __float2bfloat16(acc);
           }
         }
       }
     } else {
       for (int cell = threadIdx.x, it = 0; cell < cells; cell += blockDim.x, ++it) {
-        const int i = cell / head_v_dim;
-        const int j = cell - i * head_v_dim;
+        const int i = cell / v_cols;
+        const int j = cell - i * v_cols;
         float intra = 0.0f;
         for (int m = 0; m < chunk_size; ++m) {
-          intra += t_in[a_base + i * chunk_size + m] * __bfloat162float(v_round[m * head_v_dim + j]);
+          intra += t_in[a_base + i * chunk_size + m] * __bfloat162float(v_round[m * v_cols + j]);
         }
         const float acc = attn_inter[it] * scale + intra * scale;
         const int token = c * chunk_size + i;
         if (token < seq) {
-          out[static_cast<int64_t>(token) * out_row_width + head * head_v_dim + j] =
-              __float2bfloat16(acc);
+          out[static_cast<int64_t>(token) * out_row_width + head * head_v_dim +
+              j0 + j] = __float2bfloat16(acc);
         }
       }
     }
     __syncthreads();
     const float g_last = g_cum[token_base + chunk_size - 1];
     const float decay = gdn_exp2_approx(g_last);
-    const int state_cells = head_k_dim * head_v_dim;
+    const int state_cells = head_k_dim * v_cols;
     for (int cell = threadIdx.x; cell < cells; cell += blockDim.x) {
-      const int i = cell / head_v_dim;
+      const int i = cell / v_cols;
       v_round[cell] = __float2bfloat16(
           v_new[cell] * gdn_exp2_approx(g_last - g_cum[token_base + i]));
     }
     __syncthreads();
     if (state_cells % tile_span == 0) {
-      const int row_step_state = static_cast<int>(blockDim.x) / head_v_dim;
+      const int row_step_state = static_cast<int>(blockDim.x) / v_cols;
       for (int base = threadIdx.x; base < state_cells; base += tile_span) {
-        const int row0 = base / head_v_dim;
-        const int j = base - row0 * head_v_dim;
+        const int row0 = base / v_cols;
+        const int j = base - row0 * v_cols;
         float acc[GDN_TILE];
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) acc[s] = 0.0f;
         for (int i = 0; i < chunk_size; ++i) {
-          const float vv = __bfloat162float(v_round[i * head_v_dim + j]);
+          const float vv = __bfloat162float(v_round[i * v_cols + j]);
           const int64_t krow = static_cast<int64_t>(token_base + i) * head_k_dim;
           #pragma unroll
           for (int s = 0; s < GDN_TILE; ++s) {
@@ -613,20 +641,23 @@ __global__ void gdn_chunk_state_kernel(
         }
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) {
-          const int cell = base + s * static_cast<int>(blockDim.x);
+          const int cell = V_SPLIT
+                               ? (row0 + s * row_step_state) * head_v_dim + j0 + j
+                               : base + s * static_cast<int>(blockDim.x);
           state_head[cell] = state_head[cell] * decay + acc[s];
         }
       }
     } else {
       for (int cell = threadIdx.x; cell < state_cells; cell += blockDim.x) {
-        const int m = cell / head_v_dim;
-        const int j = cell - m * head_v_dim;
+        const int m = cell / v_cols;
+        const int j = cell - m * v_cols;
         float acc = 0.0f;
         for (int i = 0; i < chunk_size; ++i) {
           acc += k[(token_base + i) * head_k_dim + m] *
-                 __bfloat162float(v_round[i * head_v_dim + j]);
+                 __bfloat162float(v_round[i * v_cols + j]);
         }
-        state_head[cell] = state_head[cell] * decay + acc;
+        const int gcell = V_SPLIT ? m * head_v_dim + j0 + j : cell;
+        state_head[gcell] = state_head[gcell] * decay + acc;
       }
     }
     __syncthreads();

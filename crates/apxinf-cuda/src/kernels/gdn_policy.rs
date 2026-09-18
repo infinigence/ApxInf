@@ -53,12 +53,27 @@ pub struct GdnLaunchPolicy {
     pub attn_raw_wmma: i32,
     /// Threads per output column in the decode recurrence.
     pub recurrent_split: i32,
+    /// How many blocks share one head's chunk-state scan, splitting the value
+    /// dimension between them.
+    ///
+    /// The scan is sequential over chunks and its only parallelism is the head
+    /// count, so the launch is one block per head -- 32 at the shipped shape.
+    /// That is a full GPU on a 16-SM Orin and a quarter of one on a 128-SM
+    /// 4090, which ran this kernel at 5.47 ms a layer, 131 ms a scene, on 25%
+    /// of the device. Nothing in the kernel crosses the value dimension: the
+    /// decay multiplies rows of the state, every accumulation sums over the
+    /// key dimension, and each output column reads only its own column of the
+    /// state. Splitting it is therefore the same arithmetic in the same order
+    /// on a subset of the columns, and the result is bit-identical rather than
+    /// merely close.
+    pub chunk_state_v_split: i32,
 }
 
 impl GdnLaunchPolicy {
     /// The measured defaults for `caps`, then any environment overrides.
     pub fn for_device(caps: &CudaDeviceCaps) -> Self {
         let mut policy = Self::defaults_for(caps.arch_family);
+        policy.chunk_state_v_split = chunk_state_v_split_for(caps.multiprocessor_count);
         policy.apply_overrides();
         policy
     }
@@ -89,6 +104,7 @@ impl GdnLaunchPolicy {
                 chunk_gemm_wmma: wmma::OFF,
                 attn_raw_wmma: wmma::OFF,
                 recurrent_split: 4,
+                chunk_state_v_split: 1,
             },
             CudaArchFamily::Sm80 | CudaArchFamily::Other(_) => Self {
                 chunk_state_tile: 8,
@@ -98,6 +114,7 @@ impl GdnLaunchPolicy {
                 chunk_gemm_wmma: wmma::OFF,
                 attn_raw_wmma: wmma::OFF,
                 recurrent_split: 1,
+                chunk_state_v_split: 1,
             },
         }
     }
@@ -118,6 +135,33 @@ impl GdnLaunchPolicy {
         override_wmma("APXINF_GDN_CHUNK_GEMM_WMMA", &mut self.chunk_gemm_wmma);
         override_wmma("APXINF_GDN_ATTN_RAW_WMMA", &mut self.attn_raw_wmma);
         override_from("APXINF_GDN_RECURRENT_SPLIT", &mut self.recurrent_split, &[1, 2, 4]);
+        override_from(
+            "APXINF_GDN_CHUNK_STATE_V_SPLIT",
+            &mut self.chunk_state_v_split,
+            &[1, 2, 4, 8],
+        );
+    }
+}
+
+/// How many blocks to give one head's chunk-state scan, from the width of the
+/// device.
+///
+/// The scan launches one block per head and the shipped model has 32 of them,
+/// so a device with more multiprocessors than that is idle in proportion. The
+/// split is chosen to reach the multiprocessor count and no further: past it
+/// the extra blocks only replicate the key-side reads without adding a wave.
+/// It is capped at 4 because the value dimension is 128 and the block still
+/// wants enough columns to keep its accumulator tiles whole.
+fn chunk_state_v_split_for(multiprocessor_count: u32) -> i32 {
+    // 32 heads is the shipped shape; the adapter clamps the split to whatever
+    // the real head count and value width allow.
+    const HEADS: u32 = 32;
+    if multiprocessor_count >= HEADS * 4 {
+        4
+    } else if multiprocessor_count >= HEADS * 2 {
+        2
+    } else {
+        1
     }
 }
 
@@ -177,5 +221,17 @@ mod tests {
         let mut mode = wmma::OFF;
         override_wmma("APXINF_GDN_TEST_UNSET", &mut mode);
         assert_eq!(mode, wmma::OFF);
+    }
+
+    #[test]
+    fn value_split_follows_the_device_width() {
+        // 16 SMs (Orin) and 20 (Thor) are narrower than the 32 heads the scan
+        // already launches, so they keep one block per head.
+        assert_eq!(chunk_state_v_split_for(16), 1);
+        assert_eq!(chunk_state_v_split_for(20), 1);
+        // 128 SMs (RTX 4090) fit four blocks per head.
+        assert_eq!(chunk_state_v_split_for(128), 4);
+        assert_eq!(chunk_state_v_split_for(64), 2);
+        assert_eq!(chunk_state_v_split_for(63), 1);
     }
 }

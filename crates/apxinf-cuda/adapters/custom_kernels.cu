@@ -1238,22 +1238,24 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_f32(
 
 
 #define CHUNK_STATE_ARGS                                                      \
-  num_v_heads, block_threads, smem, stream, q, k, g_cum, t_in, vt_in, kcd_in, \
-      state, out, seq, seq_pad, head_k_dim, head_v_dim, chunk_size,           \
-      total_chunks, out_row_width
+  num_v_heads, v_split, block_threads, smem, stream, q, k, g_cum, t_in,       \
+      vt_in, kcd_in, state, out, seq, seq_pad, head_k_dim, head_v_dim,        \
+      chunk_size, total_chunks, out_row_width
 
-template <int TILE>
+template <int TILE, bool V_SPLIT>
 static cudaError_t launch_chunk_state(
-    int num_v_heads, int block_threads, size_t smem, cudaStream_t stream,
+    int num_v_heads, int v_split, int block_threads, size_t smem,
+    cudaStream_t stream,
     const void* q, const void* k, const void* g_cum, const void* t_in,
     const void* vt_in, const void* kcd_in, void* state, void* out,
     int seq, int seq_pad, int head_k_dim, int head_v_dim, int chunk_size,
     int total_chunks, int out_row_width) {
   if (smem > 48u * 1024u) {
+    // Per instantiation, and each instantiation is its own function.
     static bool opted_in = false;
     if (!opted_in) {
       const cudaError_t attr = cudaFuncSetAttribute(
-          reinterpret_cast<const void*>(gdn_chunk_state_kernel<TILE>),
+          reinterpret_cast<const void*>(gdn_chunk_state_kernel<TILE, V_SPLIT>),
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(smem));
       if (attr != cudaSuccess) {
@@ -1262,14 +1264,16 @@ static cudaError_t launch_chunk_state(
       opted_in = true;
     }
   }
-  gdn_chunk_state_kernel<TILE><<<num_v_heads, block_threads, smem, stream>>>(
-      static_cast<const float*>(q), static_cast<const float*>(k),
-      static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
-      static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
-      static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
-      seq, seq_pad, head_k_dim, head_v_dim, chunk_size, total_chunks,
-      out_row_width,
-      static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim))));
+  gdn_chunk_state_kernel<TILE, V_SPLIT>
+      <<<dim3(num_v_heads, v_split), block_threads, smem, stream>>>(
+          static_cast<const float*>(q), static_cast<const float*>(k),
+          static_cast<const float*>(g_cum), static_cast<const float*>(t_in),
+          static_cast<const float*>(vt_in), static_cast<const float*>(kcd_in),
+          static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
+          seq, seq_pad, head_k_dim, head_v_dim, chunk_size, total_chunks,
+          out_row_width,
+          static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_k_dim))),
+          v_split);
   return cudaGetLastError();
 }
 
@@ -1296,11 +1300,27 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // keeps its own accumulation order. Must stay a multiple of head_v_dim so a
   // thread's column index remains fixed (see the kernel comment), and no
   // larger than the per-thread attn_inter budget allows.
-  const int cells_per_chunk = chunk_size * head_v_dim;
+  //
+  // A head's scan may also be split across v_split blocks along the value
+  // dimension, which changes no arithmetic (see the kernel) but multiplies the
+  // grid. The policy asks for a width from the device's multiprocessor count;
+  // the shape decides what it can have, and a slice that would leave partial
+  // warps of columns falls back towards one block per head.
+  int v_split = policy->chunk_state_v_split > 0 ? policy->chunk_state_v_split : 1;
+  while (v_split > 1 &&
+         (head_v_dim % v_split != 0 || (head_v_dim / v_split) % 32 != 0)) {
+    v_split /= 2;
+  }
+  const int v_cols = head_v_dim / v_split;
+  const int cells_per_chunk = chunk_size * v_cols;
   auto block_ok = [&](int threads) {
     return threads >= 32 && threads <= 1024 && threads % 32 == 0 &&
-           head_v_dim % 32 == 0 && threads % head_v_dim == 0 &&
-           cells_per_chunk % threads == 0 && cells_per_chunk / threads <= 32;
+           v_cols % 32 == 0 && threads % v_cols == 0 &&
+           cells_per_chunk % threads == 0 && cells_per_chunk / threads <= 32 &&
+           // Keep the tiled path reachable: with a trip count the accumulator
+           // array is indexed dynamically and nvcc spills it, which costs more
+           // than the wider block wins.
+           cells_per_chunk % (threads * policy->chunk_state_tile) == 0;
   };
   // 1024. That is not what an earlier sweep found -- on the CUDA 12.6 board,
   // before this kernel was tiled, 512 won at 33.27ms per layer against 36.35ms
@@ -1315,16 +1335,23 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // and will again. The width comes from the policy table, and anything the
   // shape cannot take falls back rather than launching something invalid --
   // 1024 exceeds the register budget for this kernel on some boards.
-  int block_threads = block_ok(policy->chunk_state_threads)
-                          ? policy->chunk_state_threads
-                          : (block_ok(512) ? 512 : 256);
+  int block_threads = policy->chunk_state_threads;
+  if (!block_ok(block_threads)) {
+    block_threads = 256;
+    for (const int candidate : {1024, 512, 256, 128, 64, 32}) {
+      if (block_ok(candidate)) {
+        block_threads = candidate;
+        break;
+      }
+    }
+  }
   // v_new, a BF16 copy of the carried state, and a BF16 tile holding v_new's
   // round trip for the chunk (see the kernel comment). 32KB + 32KB + 16KB at
   // the shipped shape, so two blocks still fit in an SM's 164KB.
   const size_t smem =
-      static_cast<size_t>(chunk_size) * head_v_dim * sizeof(float) +
-      static_cast<size_t>(head_k_dim) * head_v_dim * sizeof(__nv_bfloat16) +
-      static_cast<size_t>(chunk_size) * head_v_dim * sizeof(__nv_bfloat16);
+      static_cast<size_t>(chunk_size) * v_cols * sizeof(float) +
+      static_cast<size_t>(head_k_dim) * v_cols * sizeof(__nv_bfloat16) +
+      static_cast<size_t>(chunk_size) * v_cols * sizeof(__nv_bfloat16);
   // At the shipped shape this lands at 80KB, past the 48KB a kernel receives
   // without asking. Opt in once per instantiation; a device that refuses keeps
   // the error rather than launching with too little shared memory.
@@ -1377,12 +1404,24 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
 
   const int tile = policy->chunk_state_tile;
   cudaError_t launched = cudaErrorInvalidValue;
-  switch (tile) {
-    case 1: launched = launch_chunk_state<1>(CHUNK_STATE_ARGS); break;
-    case 2: launched = launch_chunk_state<2>(CHUNK_STATE_ARGS); break;
-    case 4: launched = launch_chunk_state<4>(CHUNK_STATE_ARGS); break;
-    case 8: launched = launch_chunk_state<8>(CHUNK_STATE_ARGS); break;
-    default: launched = launch_chunk_state<16>(CHUNK_STATE_ARGS); break;
+  // One block per head compiles to the kernel as it was before the split
+  // existed; see the V_SPLIT comment in the kernel for why that matters.
+  if (v_split == 1) {
+    switch (tile) {
+      case 1: launched = launch_chunk_state<1, false>(CHUNK_STATE_ARGS); break;
+      case 2: launched = launch_chunk_state<2, false>(CHUNK_STATE_ARGS); break;
+      case 4: launched = launch_chunk_state<4, false>(CHUNK_STATE_ARGS); break;
+      case 8: launched = launch_chunk_state<8, false>(CHUNK_STATE_ARGS); break;
+      default: launched = launch_chunk_state<16, false>(CHUNK_STATE_ARGS); break;
+    }
+  } else {
+    switch (tile) {
+      case 1: launched = launch_chunk_state<1, true>(CHUNK_STATE_ARGS); break;
+      case 2: launched = launch_chunk_state<2, true>(CHUNK_STATE_ARGS); break;
+      case 4: launched = launch_chunk_state<4, true>(CHUNK_STATE_ARGS); break;
+      case 8: launched = launch_chunk_state<8, true>(CHUNK_STATE_ARGS); break;
+      default: launched = launch_chunk_state<16, true>(CHUNK_STATE_ARGS); break;
+    }
   }
   return launched;
 }

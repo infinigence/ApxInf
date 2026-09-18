@@ -167,3 +167,138 @@ branch, `main` has moved twelve, and this branch adds its own. The third data
 point that separates them is #72's current head `80b0ecc` built on the same
 board; that build was in progress when both Jetsons went off the network, and
 it is the next thing to run.
+
+# Where the 4090's scene actually goes
+
+`ncu` is refused on this box too (`ERR_NVGPUCTRPERM`), but `nsys` is not, and
+between a kernel trace, an NVTX range around `policy.infer`, and the same scene
+run at one token and at 64, the whole 1.45 s is accounted for.
+
+## The device's own roofline
+
+| | measured | spec |
+|---|---:|---:|
+| DRAM read, 2 GB | **954.5 GB/s** | 1008 GB/s |
+| copy (r+w) | 886.0 GB/s | |
+| FP32 FMA, 32 chains | 80.2 TFLOP/s | |
+| BF16 GEMM, 8192³ | 168.8 TFLOP/s | |
+
+FP32 on CUDA cores is **80.2 TFLOP/s against Thor's 5.43 and Orin's 3.42**,
+which is why the fp32 GDN kernels that dominate a Jetson's prefill are a much
+smaller share here, and why the tensor-core forms that pay on Thor are not
+obviously worth their extra passes on this board.
+
+## The split, and the same 76% on two very different boards
+
+| | fixed cost | decode |
+|---|---:|---:|
+| per scene, four scenes | 0.7142 s | 11.572 ms/token |
+
+The byte budget is 8.41 GB per decode token, so the floor at 954.5 GB/s is
+8.81 ms and the measured decode is **76.1% of it**. Thor measured 76.3% against
+its own floor. Two boards a factor of 3.7 apart in bandwidth and 15 apart in
+fp32 throughput sit at the same fraction of their own roofs, which says the
+remaining decode gap is a property of the decode path and not of either device.
+
+## A fifth of the scene is not GPU work at all
+
+An NVTX range around `policy.infer` against the kernel trace:
+
+| | |
+|---|---:|
+| `infer` call | 727.3 ms |
+| host before the first kernel launches | **283.0 ms** |
+| GPU span | 435.6 ms |
+| host after the last kernel | 8.7 ms |
+
+At 64 tokens the GPU span grows to 1167.9 ms and the host prologue does not
+move, so it is 283 ms of a 1471 ms scene — **19%**, larger than any kernel, and
+entirely invisible to a GPU profiler. Inside the GPU span the device is busy
+94.5% of the time in prefill and 96.4% in decode, over 494 launches per decode
+token; the gaps are 0.42 ms/token, so there is no launch-overhead story here.
+
+Timing the policy's `_patchify` stage by stage over the twelve frames of a
+scene found it:
+
+| stage | ms, twelve frames |
+|---|---:|
+| PIL bicubic resize to `target_size` | 125.6 |
+| PIL bicubic resize onto the patch grid | 52.8 |
+| block-ordered permutation and copy | 19.9 |
+| `Image.fromarray` | 10.3 |
+| normalisation | 9.5 |
+| `asarray` to float32 | 4.8 |
+| **total** | **222.9** |
+
+Four fifths of it is two bicubic resizes. Collapsing them into one would change
+pixel values and the reference performs both, so that is not available. What is
+available is that the twelve frames are independent, and both PIL's resampling
+and numpy's copies release the GIL. Eight worker threads take 231 ms to 58.4 ms
+— 3.96x — and the concatenated patch tensors hash identically to the serial
+ones.
+
+Measured end to end, three alternating rounds:
+
+| | scene 0 | scene 1 | scene 2 | scene 3 |
+|---|---:|---:|---:|---:|
+| serial | 1.4553 | 1.4534 | 1.4556 | 1.4554 |
+| eight threads | 1.2903 | 1.2934 | 1.2826 | 1.2837 |
+
+**Geomean 1.1300x**, 167 ms a scene, for a change that hands the model the same
+bytes. `APXINF_QWEN_PREPROC_THREADS` sets the worker count; 1 restores the loop.
+
+## The chunk-state scan runs on a quarter of the device
+
+`gdn_chunk_state_kernel<8>` is 131.2 ms of the 410 ms prefill, 24 launches of
+5.47 ms, and the trace gives its shape: **grid 32, block 1024, 80 KB of shared
+memory**. Thirty-two blocks is one per value head, and this board has 128
+multiprocessors, so three quarters of it are idle for the duration. On a 16-SM
+Orin the same launch is two full waves, which is why nothing about it looked
+wrong until now.
+
+The scan is sequential over chunks, so chunks cannot be spread. The value
+dimension can: the decay scales rows of the state, every accumulation runs over
+the key dimension, and an output column reads only its own column of the state,
+so nothing in the kernel crosses it. Splitting a head across four blocks of 32
+columns is the same arithmetic in the same order on a quarter of the columns
+each, and `gdn_chunk_state_v_split_is_bit_exact` checks that as bits rather
+than against a tolerance: 98304 output words and the whole carried state, zero
+differing at both two-way and four-way. The width comes from the device's
+multiprocessor count, so Orin and Thor keep one block per head.
+
+Three alternating rounds, on top of the parallel preprocessing:
+
+| blocks per head | scene 0 | scene 1 | scene 2 | scene 3 | geomean |
+|---|---:|---:|---:|---:|---:|
+| 1 | 1.2921 | 1.2873 | 1.2925 | 1.2861 | — |
+| 2 | 1.2564 | 1.2565 | 1.2477 | 1.2553 | 1.0283x |
+| 4 | 1.2453 | 1.2475 | 1.2371 | 1.2389 | **1.0381x** |
+
+47 ms a scene. Four is the most this shape allows — the value dimension is 128
+and a slice below 32 columns stops being a whole warp of them — and the curve
+is already flattening, so the kernel has stopped being short of blocks and
+started being short of something else. Together with the preprocessing that is
+**1.173x** on the 4090 over the consolidated branch, both halves bit-exact.
+
+One thing this uncovered: carrying the column offset as a runtime value cost
+enough registers to push the 1024-thread width past the per-block budget, and
+the unsplit launch came back `CUDA 701` on a board that had been running it
+for weeks. The split is therefore a template parameter, and one block per head
+compiles to what it compiled to before.
+
+## What the parallel preprocessing is worth on the other board
+
+Orin measures the same preprocessing at 241.7 ms serial and 49.4 ms on twelve
+workers — 4.89x, against the 4090's 3.96x on eight — and the concatenated
+patch tensors hash to the same digest on both boards. End to end, three
+alternating rounds on a machine that was not idle (an nvcc from an earlier
+build held one of the twelve cores throughout, which is what alternating is
+for):
+
+| | scene 0 | scene 1 | scene 2 | scene 3 |
+|---|---:|---:|---:|---:|
+| serial | 6.8672 | 6.8686 | 6.8636 | 6.8572 |
+| eight threads | 6.6622 | 6.6688 | 6.6710 | 6.6758 |
+
+**1.0292x**, 195 ms a scene. The win is a fixed number of milliseconds, so it is
+worth 13% on the fastest board and 3% on the slowest.
