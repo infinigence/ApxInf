@@ -87,8 +87,73 @@ On Thor: builds, the four-mode gate in its declared state, `perf-thor.sh` at
 and all four fp64 operator oracles returning the same numbers as before the
 merge.
 
-**Not re-verified on Orin or the 4090.** Both keep the sm80-family row of the
-policy table, which holds the constants those two lines measured, and no
-tensor-core path is enabled for them — so the intent is no behaviour change on
-either. That intent is untested. Run the gate and `verify_perf` on both before
-merging.
+Both Orin and the 4090 have since been run; the section at the end of this
+document has their numbers. The 4090 came out 1.78x faster and Orin 5.4%
+slower, and the Orin result is not yet explained.
+
+---
+
+# What the three boards measured, on this branch
+
+Run after the consolidation, same four scenes, same script, same two
+environment flags (`APXINF_CUDA_ALLOC_CACHE=1`,
+`APXINF_CUDA_SKIP_OUTPUT_ZERO=1`) on every board, so the numbers are
+comparable to each other and not to any earlier record taken without them.
+
+## Correctness: the gate reproduces, and two boards agree bit for bit
+
+| | VQA first difference | direct |
+|---|---|---|
+| Orin sm_87 | scene 0, index 121, token 357 | 0.08056783676147461 |
+| RTX 4090 sm_89 | scenes 0 and 1 pass; scene 2 at index 487 | 0.08056783676147461 |
+| Thor sm_110 | scene 0, index 106, token 5459 | 0.08056640625 |
+
+Orin's row is what #72 and #74 recorded, digit for digit, which is the
+evidence that the consolidation did not disturb that line.
+
+The 4090 and Orin produce the *same seventeen digits* for the direct
+trajectory error. They are different silicon on different toolkits, and they
+take the same code path -- both are sm80-family, so both get the scalar GDN
+kernels and the FA2 head-256 dispatch. Thor differs in the last digits, and it
+is the one board whose policy row puts the chunk-state scan on tensor cores.
+That is the shape the divergence should have if it is BF16 rounding amplified
+through the GDN recurrence, as `jetson-roofline.md` argues, and not a defect in
+one kernel.
+
+## Performance, measured on each board against its own previous branch
+
+Alternating rounds on one machine, so a slow patch cannot land on one side only.
+
+**RTX 4090, against #73** — 2.5831 / 2.6048 / 2.5942 / 2.5676 s per scene
+becomes 1.4513 / 1.4536 / 1.4531 / 1.4536 and 1.4467 / 1.4536 / 1.4537 /
+1.4542. **1.78x.**
+
+That is not "no behaviour change", which is what was expected before measuring.
+#73 is the 4090's own older line: it has neither #72's Orin work nor the twelve
+commits `main` has taken since. Consolidating hands the 4090 both at once. The
+policy table's sm80 row is unchanged for it; the speed comes from the rest of
+the branch.
+
+Accuracy over the same probe, #73 → this branch: direct trajectory
+mean/rms/p99 0.012886/0.043744/0.322266 → 0.011401/0.037494/0.161133, the p99
+halving; reasoning rms 0.030624 → 0.029038 with its mean 6.7% worse; VQA token
+agreement 0.5813 → 0.5796, unchanged within its own scatter.
+
+**Orin, against #72 at `41066eb`** — 6.4726 / 6.4634 / 6.4721 / 6.4616 s
+becomes 6.8259 / 6.8002 / 6.8153 / 6.8070. **5.4% slower**, reproducible over
+two alternating rounds with 0.1% spread.
+
+This one is unresolved and should be resolved before merging.
+
+What it is **not**: the policy table. Sweeping its Orin row back to the values
+`41066eb` shipped changes nothing — `chunk_gemm_tile` 16 gives 6.82,
+`chunk_state_threads` 512 gives 6.83, both together 6.83, `chunk_state_tile` 4
+the same, against 6.81 for the defaults. Nor is it accuracy-related: the gate
+reproduces exactly.
+
+What it could be: the span from `41066eb` to this branch carries three sets of
+commits, and only one of them is this work. Upstream added eleven to #72's own
+branch, `main` has moved twelve, and this branch adds its own. The third data
+point that separates them is #72's current head `80b0ecc` built on the same
+board; that build was in progress when both Jetsons went off the network, and
+it is the next thing to run.
