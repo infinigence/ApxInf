@@ -68,9 +68,7 @@ Recipe tune(
     const apxinf_gemm_bindings_t& execution_bindings, int device,
     std::string& report, const Recipe* preferred) {
   const size_t count = static_cast<size_t>(
-      spec.m * (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
-                    ? spec.n / 2
-                    : spec.n));
+      spec.m * (is_gated_semantic(spec) ? spec.n / 2 : spec.n));
   Allocation output(count * dtype_bytes(spec.output_dtype));
   auto bindings = execution_bindings;
   bindings.output = output.pointer;

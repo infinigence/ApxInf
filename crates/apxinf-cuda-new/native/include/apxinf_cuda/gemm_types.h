@@ -32,6 +32,10 @@ typedef enum {
   APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU = 1,
   APXINF_GEMM_SEMANTIC_GEMM_GEGLU = 2,
   APXINF_GEMM_SEMANTIC_GEMM_BIAS = 3,
+  APXINF_GEMM_SEMANTIC_GEMM_BIAS_RELU = 4,
+  APXINF_GEMM_SEMANTIC_GEMM_BIAS_SILU = 5,
+  APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL = 6,
+  APXINF_GEMM_SEMANTIC_GEMM_SWIGLU = 7,
 } apxinf_gemm_semantic_t;
 
 typedef struct {
@@ -48,6 +52,7 @@ typedef struct {
   uint32_t a_alignment;
   uint32_t b_alignment;
   uint32_t bias_alignment;
+  uint32_t residual_alignment;
   uint32_t a_scales_alignment;
   uint32_t b_scales_alignment;
   uint32_t output_alignment;
@@ -79,6 +84,7 @@ typedef struct {
   uint64_t b_version;
   uint32_t b_is_immutable;
   const void* bias;
+  const void* residual;
   const float* a_scales;
   const float* b_scales;
   void* output;

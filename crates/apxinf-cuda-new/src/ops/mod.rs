@@ -11,8 +11,10 @@ pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use gemm::{
-    gemm, gemm_bias, gemm_bias_gelu, gemm_geglu, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
-    GemmGegluArgs, GemmPolicy, GemmQuantization, WeightVersion,
+    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_relu, gemm_bias_residual, gemm_bias_silu,
+    gemm_geglu, gemm_swiglu, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs, GemmBiasReluArgs,
+    GemmBiasResidualArgs, GemmBiasSiluArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
+    GemmSwigluArgs, WeightVersion,
 };
 
 /// Run a fixed-shape forward pass that may tune and create native executions.

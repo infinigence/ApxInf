@@ -34,21 +34,28 @@ static __global__ void pack_gate_up(const void* src,void* dst,int type,int64_t r
  }
 }
 __device__ inline float gelu(float x) {return 0.5f*x*(1.f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x)));}
+__device__ inline float silu(float x) { return x / (1.0f + expf(-x)); }
 static __global__ void finish(const void* projection,int projection_type,void* output,int out_type,
- const void* bias,int bias_type,const float* as,const float* bs,
+ const void* bias,int bias_type,const void* residual,const float* as,const float* bs,
  int64_t m,int64_t n,int semantic,int scale_mode,float alpha,float output_scale) {
- int64_t width=semantic==2?n/2:n;
+ int64_t width=(semantic==APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+                semantic==APXINF_GEMM_SEMANTIC_GEMM_SWIGLU)?n/2:n;
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<m*width;i+=int64_t(gridDim.x)*blockDim.x) {
   int64_t r=i/width,c=i%width;
   float factor=scale_mode==1?as[r]*bs[c]:1.f;
   float x=load(projection,projection_type,r*n+c)*factor*alpha;
-  if(semantic==2) {
+  if(semantic==APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+     semantic==APXINF_GEMM_SEMANTIC_GEMM_SWIGLU) {
    float up=load(projection,projection_type,r*n+c+width)*alpha;
    if(scale_mode==1) up*=as[r]*bs[c+width];
-   x=gelu(x)*up;
+   x=(semantic==APXINF_GEMM_SEMANTIC_GEMM_GEGLU?gelu(x):silu(x))*up;
   } else {
    if(bias) x+=load(bias,bias_type,c);
-   if(semantic==1) x=gelu(x);
+   if(semantic==APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU) x=gelu(x);
+   else if(semantic==APXINF_GEMM_SEMANTIC_GEMM_BIAS_RELU) x=fmaxf(x,0.f);
+   else if(semantic==APXINF_GEMM_SEMANTIC_GEMM_BIAS_SILU) x=silu(x);
+   else if(semantic==APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL)
+    x+=load(residual,out_type,i);
   }
   save(output,out_type,i,x/output_scale);
  }

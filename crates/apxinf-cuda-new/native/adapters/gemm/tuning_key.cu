@@ -41,7 +41,7 @@ std::string common_key(const Spec& spec,
                        int driver_version,
                        const cudaDeviceProp& properties) {
   std::ostringstream key;
-  key << "gemm-recipe-v6|" << APXINF_GEMM_BUILD_ID << '|'
+  key << "gemm-recipe-v7|" << APXINF_GEMM_BUILD_ID << '|'
       << properties.major * 10 + properties.minor << '|' << runtime_version << '|'
       << driver_version
       << '|' << cublasLtGetVersion() << '|'
@@ -52,7 +52,8 @@ std::string common_key(const Spec& spec,
       << spec.output_dtype << '|' << spec.quantization << '|'
       << spec.b_is_immutable << '|'
       << spec.a_alignment << '|' << spec.b_alignment << '|'
-      << spec.bias_alignment << '|' << spec.a_scales_alignment << '|'
+      << spec.bias_alignment << '|' << spec.residual_alignment << '|'
+      << spec.a_scales_alignment << '|'
       << spec.b_scales_alignment << '|' << spec.output_alignment;
 
   // Only the unit/non-unit predicates matter for selection. The scale values

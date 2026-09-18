@@ -151,9 +151,7 @@ void validate_candidates(const Spec& spec,
                          int device, const float* expected,
                          size_t expected_len) {
   const size_t count = static_cast<size_t>(
-      spec.m * (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
-                    ? spec.n / 2
-                    : spec.n));
+      spec.m * (is_gated_semantic(spec) ? spec.n / 2 : spec.n));
   if (expected == nullptr || expected_len != count) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid candidate validation output");

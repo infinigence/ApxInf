@@ -9,9 +9,16 @@ mod cuda_arch;
 mod gemm_fingerprint;
 
 use cuda_arch::{
-    gencode_args, is_cutlass_sm100_family, select_cuda_arch, target_features, ArchSelection,
-    ArchSource,
+    gencode_args, is_cutlass_sm100_family, is_cutlass_sm80_family, select_cuda_arch,
+    target_features, ArchSelection, ArchSource,
 };
+
+#[derive(Clone, Copy)]
+enum NativeSourceKind {
+    Generic,
+    CutlassSm80,
+    CutlassSm100,
+}
 
 fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
     let path = out.join("apxinf_cuda_arches.h");
@@ -19,6 +26,7 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
         "#pragma once\n#include <cstddef>\n#include <cstdint>\nnamespace apxinf::gemm {\n\
          constexpr uint64_t kDeviceFeatureNativeFp8 = UINT64_C(1) << 0;\n\
          constexpr uint64_t kDeviceFeatureCutlassSm100 = UINT64_C(1) << 1;\n\
+         constexpr uint64_t kDeviceFeatureCutlassSm80W8a8 = UINT64_C(1) << 2;\n\
          struct CompiledTarget { int sm; uint64_t features; };\n\
          constexpr CompiledTarget kCompiledTargets[] = {\n",
     );
@@ -174,14 +182,22 @@ fn main() {
     .map(|source| adapters.join(source))
     .to_vec();
     let cutlass_root = native.join("kernels/cutlass");
-    let mut cutlass_sources = Vec::new();
+    let operators = cutlass_root.join("ops/gemm");
+    let mut cutlass_sm80_sources = Vec::new();
+    if selection
+        .targets
+        .iter()
+        .any(|target| is_cutlass_sm80_family(&target.cutlass_arch))
+    {
+        cutlass_sm80_sources.push(operators.join("gemm_i8_bf16_sm80.cu"));
+    }
+    let mut cutlass_sm100_sources = Vec::new();
     if selection
         .targets
         .iter()
         .any(|target| is_cutlass_sm100_family(&target.cutlass_arch))
     {
-        let operators = cutlass_root.join("ops/gemm");
-        cutlass_sources.extend(
+        cutlass_sm100_sources.extend(
             [
                 "gemm_e4m3_f16_sm100.cu",
                 "gemm_e4m3_geglu_interleaved_sm100.cu",
@@ -194,7 +210,8 @@ fn main() {
     assert!(
         generic_sources
             .iter()
-            .chain(&cutlass_sources)
+            .chain(&cutlass_sm80_sources)
+            .chain(&cutlass_sm100_sources)
             .all(|path| path.is_file()),
         "GEMM build source is missing"
     );
@@ -210,14 +227,22 @@ fn main() {
         cutlass_root.join("include"),
         cutlass_root.join("tools/util/include"),
     ];
-    let has_cutlass = !cutlass_sources.is_empty();
+    let has_cutlass_sm80 = !cutlass_sm80_sources.is_empty();
+    let has_cutlass_sm100 = !cutlass_sm100_sources.is_empty();
     let generic_codegen = gencode_args(
         selection
             .targets
             .iter()
             .map(|target| target.nvcc_arch.clone()),
     );
-    let cutlass_codegen = gencode_args(
+    let cutlass_sm80_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| is_cutlass_sm80_family(&target.cutlass_arch))
+            .map(|target| target.cutlass_arch.clone()),
+    );
+    let cutlass_sm100_codegen = gencode_args(
         selection
             .targets
             .iter()
@@ -227,11 +252,21 @@ fn main() {
     let mut objects = Vec::new();
     for (index, source) in generic_sources
         .drain(..)
-        .map(|source| (source, false))
-        .chain(cutlass_sources.into_iter().map(|source| (source, true)))
+        .map(|source| (source, NativeSourceKind::Generic))
+        .chain(
+            cutlass_sm80_sources
+                .into_iter()
+                .map(|source| (source, NativeSourceKind::CutlassSm80)),
+        )
+        .chain(
+            cutlass_sm100_sources
+                .into_iter()
+                .map(|source| (source, NativeSourceKind::CutlassSm100)),
+        )
         .enumerate()
     {
-        let (source, is_cutlass) = source;
+        let (source, source_kind) = source;
+        let is_cutlass = !matches!(source_kind, NativeSourceKind::Generic);
         let object = out.join(format!(
             "gemm-{index}-{}.o",
             source.file_stem().unwrap().to_string_lossy()
@@ -246,16 +281,19 @@ fn main() {
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()))
             .arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""));
-        command.args(if is_cutlass {
-            &cutlass_codegen
-        } else {
-            &generic_codegen
+        command.args(match source_kind {
+            NativeSourceKind::Generic => &generic_codegen,
+            NativeSourceKind::CutlassSm80 => &cutlass_sm80_codegen,
+            NativeSourceKind::CutlassSm100 => &cutlass_sm100_codegen,
         });
         for include in cuda_includes.iter().filter(|path| path.is_dir()) {
             command.arg(format!("-I{}", include.display()));
         }
-        if has_cutlass {
+        if has_cutlass_sm100 {
             command.arg("-DAPXINF_GEMM_CUTLASS=1");
+        }
+        if has_cutlass_sm80 {
+            command.arg("-DAPXINF_GEMM_CUTLASS_SM80_W8A8=1");
         }
         if is_cutlass {
             command.args(["--expt-relaxed-constexpr", "--expt-extended-lambda"]);

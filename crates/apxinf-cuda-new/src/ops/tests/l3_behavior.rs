@@ -101,3 +101,83 @@ fn gemm_bias_has_its_own_semantic_api() {
         assert!((*actual - expected).abs() < 0.01);
     }
 }
+
+#[test]
+fn gemm_bias_relu_has_its_own_semantic_api() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![1, 2], &[1.0, 1.0]);
+    let b = tensor(0, vec![2, 3], &[1.0; 6]);
+    let bias = tensor(0, vec![3], &[-3.0, -2.0, 1.0]);
+    let mut out = tensor(0, vec![1, 3], &[0.0; 3]);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.policy.online_tune = false;
+    gemm_bias_relu(
+        &ctx,
+        GemmBiasReluArgs {
+            gemm: args,
+            bias: &bias,
+        },
+    )
+    .unwrap();
+    assert_eq!(values(&out), vec![0.0, 0.0, 3.0]);
+}
+
+#[test]
+fn gemm_bias_silu_has_its_own_semantic_api() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![1, 2], &[1.0, 1.0]);
+    let b = tensor(0, vec![2, 2], &[1.0; 4]);
+    let bias = tensor(0, vec![2], &[-1.0, 0.0]);
+    let mut out = tensor(0, vec![1, 2], &[0.0; 2]);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.policy.online_tune = false;
+    gemm_bias_silu(
+        &ctx,
+        GemmBiasSiluArgs {
+            gemm: args,
+            bias: &bias,
+        },
+    )
+    .unwrap();
+    for (actual, input) in values(&out).iter().zip([1.0_f32, 2.0]) {
+        let expected = input / (1.0 + (-input).exp());
+        assert!((*actual - expected).abs() < 0.02);
+    }
+}
+
+#[test]
+fn gemm_bias_residual_has_its_own_semantic_api() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![1, 2], &[1.0, 1.0]);
+    let b = tensor(0, vec![2, 2], &[1.0; 4]);
+    let bias = tensor(0, vec![2], &[0.5, -0.5]);
+    let residual = tensor(0, vec![1, 2], &[10.0, 20.0]);
+    let mut out = tensor(0, vec![1, 2], &[0.0; 2]);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.policy.online_tune = false;
+    gemm_bias_residual(
+        &ctx,
+        GemmBiasResidualArgs {
+            gemm: args,
+            bias: &bias,
+            residual: &residual,
+        },
+    )
+    .unwrap();
+    assert_eq!(values(&out), vec![12.5, 21.5]);
+}
+
+#[test]
+fn gemm_swiglu_has_its_own_semantic_api() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![1, 1], &[1.0]);
+    let b = tensor(0, vec![1, 4], &[1.0, 2.0, 3.0, 4.0]);
+    let mut out = tensor(0, vec![1, 2], &[0.0; 2]);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.policy.online_tune = false;
+    gemm_swiglu(&ctx, GemmSwigluArgs { gemm: args }).unwrap();
+    for ((actual, gate), up) in values(&out).iter().zip([1.0_f32, 2.0]).zip([3.0, 4.0]) {
+        let expected = gate / (1.0 + (-gate).exp()) * up;
+        assert!((*actual - expected).abs() < 0.02);
+    }
+}

@@ -97,8 +97,7 @@ cudaError_t launch_postprocess(const Spec& spec,
   if (resources.projection == nullptr) {
     return cudaSuccess;
   }
-  const int64_t output_width =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ? spec.n / 2 : spec.n;
+  const int64_t output_width = is_gated_semantic(spec) ? spec.n / 2 : spec.n;
   const int64_t count = spec.m * output_width;
   const int blocks = static_cast<int>(
       std::min<int64_t>((count + 255) / 256, 4096));
@@ -110,6 +109,7 @@ cudaError_t launch_postprocess(const Spec& spec,
       has_row_channel_scales(spec)
           ? spec.output_dtype
           : resources.projection_dtype,
+      bindings.residual,
       bindings.a_scales, bindings.b_scales, spec.m, spec.n,
       static_cast<int>(spec.semantic),
       has_row_channel_scales(spec) ? 1 : 0,
