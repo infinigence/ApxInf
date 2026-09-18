@@ -1,4 +1,4 @@
-//! π0.5 FP8 CUDA transformer-layer execution.
+//! π0.5 FP8 CUDA transformer-layer computation.
 
 use crate::pi05::backend::{kernels, Context};
 use apxinf_core::{Error, Result, Tensor};
@@ -205,9 +205,9 @@ pub fn action_layer_fp8_static(
     scales: Fp8StaticTransformerLayerScales,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
-    attention_style: &Tensor,
-    mlp_style: &Tensor,
-    next_norm_style: &Tensor,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
     next_norm_scale: f32,
     prefix_k: &Tensor,
     prefix_v: &Tensor,
@@ -220,7 +220,7 @@ pub fn action_layer_fp8_static(
         None => norm::adaptive_rms_quant_f16_e4m3(
             ctx,
             input,
-            attention_style,
+            attention_modulation,
             rms_eps,
             scales.attention_norm,
         )?,
@@ -260,8 +260,8 @@ pub fn action_layer_fp8_static(
         ctx,
         &projected,
         input,
-        attention_style,
-        mlp_style,
+        attention_modulation,
+        mlp_modulation,
         rms_eps,
         scales.mlp_norm,
     )?;
@@ -284,8 +284,8 @@ pub fn action_layer_fp8_static(
         ctx,
         &projected,
         &hidden,
-        mlp_style,
-        next_norm_style,
+        mlp_modulation,
+        next_norm_modulation,
         rms_eps,
         next_norm_scale,
     )?;
@@ -582,9 +582,9 @@ mod tests {
 }
 
 // Precision-specific backbone operations share this file with their layers.
-pub(in crate::pi05::network) mod backbone {
-    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+pub(in crate::pi05::model) mod backbone {
     use super::*;
+    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
     use crate::pi05::weights::*;
     use crate::pi05::Pi05Config;
     use apxinf_core::{Error, Result, Tensor};
@@ -596,16 +596,16 @@ pub(in crate::pi05::network) mod backbone {
         pub tokens: usize,
     }
 
-    pub struct Fp8StaticStepStyles {
+    pub struct Fp8StaticStepModulation {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
     pub struct Fp8StaticBlocks {
-        pub(in crate::pi05::network) backend: Arc<RuntimeBackend>,
-        pub(in crate::pi05::network) config: Arc<Pi05Config>,
-        pub(in crate::pi05::network) weights: Arc<Fp8StaticWeights>,
-        pub(in crate::pi05::network) scales: Arc<Fp8StaticActivationScales>,
+        pub(in crate::pi05::model) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05::model) config: Arc<Pi05Config>,
+        pub(in crate::pi05::model) weights: Arc<Fp8StaticWeights>,
+        pub(in crate::pi05::model) scales: Arc<Fp8StaticActivationScales>,
         packed_vision_qkv: bool,
     }
     impl Fp8StaticBlocks {
@@ -736,7 +736,7 @@ pub(in crate::pi05::network) mod backbone {
             activation::bias_silu_f16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
         }
 
-        fn style(
+        fn modulation(
             &self,
             conditioning: &Tensor,
             weights: &crate::pi05::Fp8StaticLinearWeights,
@@ -747,11 +747,14 @@ pub(in crate::pi05::network) mod backbone {
                 self.scales.conditioning,
                 weights.as_kernel_view(),
             )?;
-            let style = elementwise::bias_f16(self.ctx(), &projected, weights.bias.as_ref())?;
-            style.reshape(vec![style.numel()])
+            let modulation = elementwise::bias_f16(self.ctx(), &projected, weights.bias.as_ref())?;
+            modulation.reshape(vec![modulation.numel()])
         }
 
-        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Fp8StaticStepStyles> {
+        fn prepare_step_modulation(
+            &self,
+            time_embedding: &Tensor,
+        ) -> Result<Fp8StaticStepModulation> {
             let conditioning = self.conditioning(time_embedding)?;
             let conditioning = quantization::quantize_f16_e4m3(
                 self.ctx(),
@@ -761,21 +764,22 @@ pub(in crate::pi05::network) mod backbone {
             let mut attention = Vec::with_capacity(self.config.action_expert.depth);
             let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
             for layer in &self.weights.action_layers {
-                attention.push(self.style(&conditioning, &layer.input_style)?);
-                mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
+                attention.push(self.modulation(&conditioning, &layer.input_modulation)?);
+                mlp.push(self.modulation(&conditioning, &layer.post_attention_modulation)?);
             }
-            let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
-            Ok(Fp8StaticStepStyles {
+            let final_norm =
+                self.modulation(&conditioning, &self.weights.action_final_modulation)?;
+            Ok(Fp8StaticStepModulation {
                 attention,
                 mlp,
                 final_norm,
             })
         }
 
-        fn prepare_all_styles(
+        fn prepare_all_modulation(
             &self,
             time_embeddings: &[Tensor],
-        ) -> Result<Vec<Fp8StaticStepStyles>> {
+        ) -> Result<Vec<Fp8StaticStepModulation>> {
             if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
@@ -785,23 +789,25 @@ pub(in crate::pi05::network) mod backbone {
             }
             time_embeddings
                 .iter()
-                .map(|embedding| self.prepare_step_styles(embedding))
+                .map(|embedding| self.prepare_step_modulation(embedding))
                 .collect()
         }
 
-        fn denoise_step_with_styles(
+        fn denoise_step_with_modulation(
             &self,
             state: &Tensor,
-            styles: &Fp8StaticStepStyles,
+            modulation: &Fp8StaticStepModulation,
             prefix: &Fp8StaticPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
                 || prefix.values.len() != self.config.action_expert.depth
-                || styles.attention.len() != self.config.action_expert.depth
-                || styles.mlp.len() != self.config.action_expert.depth
+                || modulation.attention.len() != self.config.action_expert.depth
+                || modulation.mlp.len() != self.config.action_expert.depth
             {
-                return Err(Error::Other("π0.5 prefix KV/style depth mismatch".into()));
+                return Err(Error::Other(
+                    "π0.5 prefix KV/modulation depth mismatch".into(),
+                ));
             }
             let state_fp8 =
                 quantization::quantize_f16_e4m3(self.ctx(), state, self.scales.action_input)?;
@@ -817,14 +823,14 @@ pub(in crate::pi05::network) mod backbone {
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
-                let (next_norm_style, next_norm_scale) =
+                let (next_norm_modulation, next_norm_scale) =
                     if index + 1 < self.config.action_expert.depth {
                         (
-                            &styles.attention[index + 1],
+                            &modulation.attention[index + 1],
                             self.scales.action_layers[index + 1].attention_norm,
                         )
                     } else {
-                        (&styles.final_norm, self.scales.action_final_norm)
+                        (&modulation.final_norm, self.scales.action_final_norm)
                     };
                 let output = action_layer_fp8_static(
                     self.ctx(),
@@ -833,9 +839,9 @@ pub(in crate::pi05::network) mod backbone {
                     self.scales.action_layers[index],
                     &hidden,
                     attention_normalized.as_ref(),
-                    &styles.attention[index],
-                    &styles.mlp[index],
-                    next_norm_style,
+                    &modulation.attention[index],
+                    &modulation.mlp[index],
+                    next_norm_modulation,
                     next_norm_scale,
                     &prefix.keys[index],
                     &prefix.values[index],
@@ -870,8 +876,8 @@ pub(in crate::pi05::network) mod backbone {
             prefix: &Fp8StaticPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
-            let styles = self.prepare_step_styles(time_embedding)?;
-            self.denoise_step_with_styles(state, &styles, prefix, dt)
+            let modulation = self.prepare_step_modulation(time_embedding)?;
+            self.denoise_step_with_modulation(state, &modulation, prefix, dt)
         }
 
         fn encode_vision_fp8_patches(&self, patches: &Tensor) -> Result<Tensor> {
@@ -925,7 +931,7 @@ pub(in crate::pi05::network) mod backbone {
 
     impl super::super::Blocks for Fp8StaticBlocks {
         type Prefix = Fp8StaticPrefixKvCache;
-        type Styles = Fp8StaticStepStyles;
+        type StepModulation = Fp8StaticStepModulation;
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -942,10 +948,13 @@ pub(in crate::pi05::network) mod backbone {
         fn prefix(&self, input: &Tensor) -> Result<Self::Prefix> {
             self.prefix_forward(input)
         }
-        fn prepare_styles(&self, embeddings: &[Tensor]) -> Result<Vec<Self::Styles>> {
-            self.prepare_all_styles(embeddings)
+        fn prepare_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>> {
+            self.prepare_all_modulation(embeddings)
         }
-        fn eager_styles(&self, _embeddings: &[Tensor]) -> Result<Option<Vec<Self::Styles>>> {
+        fn eager_modulation(
+            &self,
+            _embeddings: &[Tensor],
+        ) -> Result<Option<Vec<Self::StepModulation>>> {
             Ok(None)
         }
         fn step(
@@ -957,27 +966,27 @@ pub(in crate::pi05::network) mod backbone {
         ) -> Result<Tensor> {
             self.denoise_step(state, embedding, prefix, dt)
         }
-        fn step_with_styles(
+        fn step_with_modulation(
             &self,
             state: &Tensor,
-            styles: &Self::Styles,
+            modulation: &Self::StepModulation,
             prefix: &Self::Prefix,
             dt: f32,
         ) -> Result<Tensor> {
-            self.denoise_step_with_styles(state, styles, prefix, dt)
+            self.denoise_step_with_modulation(state, modulation, prefix, dt)
         }
     }
 }
 
-impl crate::pi05::network::PrepareBlocks for backbone::Fp8StaticBlocks {
+impl crate::pi05::model::PrepareBlocks for backbone::Fp8StaticBlocks {
     fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
         &self.backend
     }
     fn workspace_requirements(
         &self,
         tokens: usize,
-    ) -> apxinf_core::Result<crate::pi05::network::WorkspaceRequirements> {
-        Ok(crate::pi05::network::WorkspaceRequirements {
+    ) -> apxinf_core::Result<crate::pi05::model::WorkspaceRequirements> {
+        Ok(crate::pi05::model::WorkspaceRequirements {
             bytes: self.config.cuda_graph_workspace_bytes_fp8_static(tokens)?,
             fp8_scratch: Some(self.config.fp8_emulation_scratch_elements(tokens)?),
         })

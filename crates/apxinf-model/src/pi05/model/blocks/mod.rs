@@ -17,19 +17,21 @@ use crate::pi05::{backend::DeviceBuffer, Pi05Config};
 use apxinf_core::{Result, Tensor};
 
 /// Internal, statically dispatched seam. The associated state types retain
-/// each Block's physical representation without exposing dtype tests to Network.
+/// each Block's physical representation without exposing dtype tests to Model.
 pub trait Blocks {
     type Prefix;
-    type Styles;
+    /// Per-timestep, per-layer adaptive RMSNorm and residual modulation tensors,
+    /// derived from the time conditioning rather than the request observation.
+    type StepModulation;
     fn config(&self) -> &Pi05Config;
     /// `native` denotes the Block's already materialized input representation.
     fn vision(&self, patches: &Tensor, native: bool) -> Result<Tensor>;
     fn embed_prefix(&self, vision: &Tensor, ids: &DeviceBuffer, count: usize) -> Result<Tensor>;
     fn prefix(&self, input: &Tensor) -> Result<Self::Prefix>;
-    fn prepare_styles(&self, embeddings: &[Tensor]) -> Result<Vec<Self::Styles>>;
-    /// Preserve execution ordering: BF16/dynamic INT8 precompute eager styles; FP8
+    fn prepare_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>>;
+    /// Preserve execution ordering: BF16/dynamic INT8 precompute eager modulation; FP8
     /// computes them per step after prefix processing. Capture precomputes all.
-    fn eager_styles(&self, embeddings: &[Tensor]) -> Result<Option<Vec<Self::Styles>>>;
+    fn eager_modulation(&self, embeddings: &[Tensor]) -> Result<Option<Vec<Self::StepModulation>>>;
     fn step(
         &self,
         state: &Tensor,
@@ -37,10 +39,10 @@ pub trait Blocks {
         prefix: &Self::Prefix,
         dt: f32,
     ) -> Result<Tensor>;
-    fn step_with_styles(
+    fn step_with_modulation(
         &self,
         state: &Tensor,
-        styles: &Self::Styles,
+        modulation: &Self::StepModulation,
         prefix: &Self::Prefix,
         dt: f32,
     ) -> Result<Tensor>;

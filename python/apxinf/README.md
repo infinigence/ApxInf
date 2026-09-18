@@ -3,7 +3,7 @@
 Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
-`apxinf.Model` so you never import `apxinf_py` directly.
+`apxinf.ModelRunner` so you never import `apxinf_py` directly.
 
 ## Layout
 
@@ -11,7 +11,7 @@ the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 apxinf/
 ├── processors/   pure-numpy pre/post steps + Pipeline (offline, no GPU/Rust)
 ├── policies/     the L2 layer — stable machinery + volatile per-model impls
-│   ├── base.py       Policy + BareModel contracts (structural Protocols)
+│   ├── base.py       Policy + ModelRunnerProtocol contracts (structural Protocols)
 │   ├── registry.py   model_type -> policy-class registry
 │   ├── auto.py       AutoPolicy: checkpoint -> concrete policy by config type
 │   └── impls/        concrete per-model policies (the part that grows)
@@ -20,7 +20,7 @@ apxinf/
 ├── checkpoints/  read a checkpoint's layout, norm stats and metadata; the
 │                 `.pth` sidecar reader here is tensor-only (no Torch import)
 ├── serving/      the L3 layer — the OpenPI-compatible websocket server
-└── __init__.py   facade: Model (lazy), concrete policies, AutoPolicy, Policy, steps
+└── __init__.py   facade: ModelRunner (lazy), concrete policies, AutoPolicy, Policy, steps
 ```
 
 **Adding a model:** drop `apxinf/policies/impls/<name>.py` following `pi05.py`
@@ -148,11 +148,11 @@ result["actions"]   # unnormalized float32 [horizon, action_dim]
 result["timing"]    # {"model_ms": ..., "total_ms": ...}
 ```
 
-For bare-model (L1) use, the binding is reachable as `apxinf.Model`:
+For bare-model (L1) use, the binding is reachable as `apxinf.ModelRunner`:
 
 ```python
-from apxinf import Model
-model = Model.load("pi05", "model.safetensors", compute_variant="bf16")
+from apxinf import ModelRunner
+model = ModelRunner.load("pi05", "model.safetensors", compute_variant="bf16")
 model.infer_rgb(rgb_u8, "nhwc", token_ids)          # internal device sampling
 model.infer_rgb(rgb_u8, "nhwc", token_ids, noise)   # exact external noise
 ```

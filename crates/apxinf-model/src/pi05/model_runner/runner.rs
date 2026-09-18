@@ -1,4 +1,4 @@
-//! PI0.5 session: preparation, bounded plan cache, and per-call input binding.
+//! PI0.5 runner: preparation, bounded plan cache, and per-call input binding.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use super::prepare::CapturedGraph;
 use crate::pi05::backend::{
     transfers, tuning, DeviceBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
-use crate::pi05::network::LoadedCompute;
+use crate::pi05::model::ModelVariant;
 use crate::pi05::Pi05Config;
 
 impl CapturedGraph {
@@ -82,13 +82,13 @@ enum ExecStrategy {
 
 /// Owning prepared PI0.5 inference plan. Runs neither capture nor autotune.
 /// Graph actions alias reusable device output: copy to host/device storage before
-/// the next run if a stable result is needed. Runs are serialized on this session.
+/// the next run if a stable result is needed. Runs are serialized on this runner.
 /// Each call fully binds input and RNG key; there is no implicit episode counter.
 pub struct Pi05PreparedInference {
     spec: InferenceSpec,
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi05Config>,
-    compute: LoadedCompute,
+    model: ModelVariant,
     strategy: ExecStrategy,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
     tuning_generation: u64,
@@ -122,7 +122,7 @@ impl Pi05PreparedInference {
                         )));
                     }
                     raw.copy_from_host(bytes).map_err(Error::Cuda)?;
-                    self.compute.preprocess_rgb(
+                    self.model.preprocess_rgb(
                         raw,
                         &inputs.patches,
                         kernel_image_layout(*layout),
@@ -130,7 +130,7 @@ impl Pi05PreparedInference {
                     None
                 }
             },
-            self.compute.input_dtype(),
+            self.model.input_dtype(),
             patch_shape(&self.config),
             "patches",
         )?;
@@ -141,7 +141,7 @@ impl Pi05PreparedInference {
             InitialLatent::Provided(latent) => {
                 let noise = normalize_tensor(
                     Some(latent),
-                    self.compute.input_dtype(),
+                    self.model.input_dtype(),
                     noise_shape(&self.config),
                     "initial latent",
                 )?
@@ -159,7 +159,7 @@ impl Pi05PreparedInference {
     fn run_eager(&self, inputs: &EagerInputs, request: &VlaRequest<'_>) -> Result<Action> {
         let observation = request.observation;
         self.update_eager_inputs(inputs, request)?;
-        Ok(Action::new(self.compute.infer(
+        Ok(Action::new(self.model.infer(
             &inputs.patches,
             &inputs.token_ids,
             self.spec.token_count,
@@ -174,7 +174,7 @@ impl Pi05PreparedInference {
         request: &VlaRequest<'_>,
     ) -> Result<BTreeMap<String, f32>> {
         self.update_eager_inputs(inputs, request)?;
-        self.compute.calibrate(
+        self.model.calibrate(
             &inputs.patches,
             &inputs.token_ids,
             self.spec.token_count,
@@ -225,7 +225,7 @@ impl Pi05PreparedInference {
         let patches = match &observation.vision {
             VisionObservation::Patches(tensor) => normalize_tensor(
                 Some(tensor),
-                self.compute.input_dtype(),
+                self.model.input_dtype(),
                 patch_shape(&self.config),
                 "patches",
             )?,
@@ -240,7 +240,7 @@ impl Pi05PreparedInference {
                     InitialLatent::Provided(latent) => {
                         let noise = normalize_tensor(
                             Some(latent),
-                            self.compute.input_dtype(),
+                            self.model.input_dtype(),
                             noise_shape(&self.config),
                             "initial latent",
                         )?
@@ -259,15 +259,15 @@ impl Pi05PreparedInference {
     }
 }
 
-/// PI0.5 network whose cached prepared plan owns all graph-visible resources.
+/// PI0.5 model whose cached prepared plan owns all graph-visible resources.
 ///
 /// A graph workspace can reserve multiple GiB, so the implicit `infer` path
 /// retains only the most recently used shape. Callers that need more than one
 /// simultaneously prepared shape can own those plans explicitly via `prepare`.
-pub struct Pi05Session {
+pub struct Pi05ModelRunner {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi05Config>,
-    compute: LoadedCompute,
+    model: ModelVariant,
     prepared: RefCell<Option<(InferenceSpec, Rc<Pi05PreparedInference>)>>,
 }
 
@@ -308,16 +308,16 @@ where
     Ok(value)
 }
 
-impl Pi05Session {
+impl Pi05ModelRunner {
     pub(in crate::pi05) fn new(
         backend: Arc<RuntimeBackend>,
         config: Arc<Pi05Config>,
-        compute: LoadedCompute,
+        model: ModelVariant,
     ) -> Self {
         Self {
             backend,
             config,
-            compute,
+            model,
             prepared: RefCell::new(None),
         }
     }
@@ -331,11 +331,11 @@ impl Pi05Session {
             )));
         }
         let cuda = &*self.backend;
-        let dtype = self.compute.input_dtype();
+        let dtype = self.model.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
         let patches = self.backend.to_device(&Tensor::zeros(
             patch_shape(&self.config),
-            self.compute.captured_patch_dtype(raw_rgb),
+            self.model.captured_patch_dtype(raw_rgb),
         ))?;
         let noise = self
             .backend
@@ -369,7 +369,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            compute: self.compute.clone(),
+            model: self.model.clone(),
             strategy: ExecStrategy::Eager(EagerInputs {
                 patches,
                 raw_images,
@@ -389,7 +389,7 @@ impl Pi05Session {
         policy: ExecutionPolicy,
     ) -> Result<Pi05PreparedInference> {
         self.build_prepared_using(spec, policy, |patches, tokens, noise| {
-            super::prepare::capture_loaded(&self.compute, spec, patches, tokens, noise)
+            super::prepare::capture_loaded(&self.model, spec, patches, tokens, noise)
         })
     }
 
@@ -440,7 +440,7 @@ impl Pi05Session {
             spec: *spec,
             backend: Arc::clone(&self.backend),
             config: Arc::clone(&self.config),
-            compute: self.compute.clone(),
+            model: self.model.clone(),
             strategy,
             fallback_reason,
             normal_generator: RefCell::new(normal_generator),
@@ -460,7 +460,7 @@ impl Pi05Session {
     }
 }
 
-impl VlaRuntime for Pi05Session {
+impl VlaRuntime for Pi05ModelRunner {
     fn contract(&self) -> crate::VlaContract {
         crate::VlaContract {
             action_shape: [self.config.action_horizon, self.config.action_dim],
@@ -662,7 +662,7 @@ fn normalize_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pi05::load::load_session;
+    use crate::pi05::load::load_model_runner;
     use crate::LoadOptions;
     use std::path::Path;
 
@@ -672,7 +672,7 @@ mod tests {
         let path =
             std::env::var("APXINF_PI05_TEST_CHECKPOINT").expect("fixed real checkpoint required");
         let backend = Arc::new(RuntimeBackend::new(0).unwrap());
-        let session = load_session(
+        let runner = load_model_runner(
             Path::new(&path),
             backend.clone(),
             &LoadOptions {
@@ -683,24 +683,24 @@ mod tests {
         .unwrap();
         let observation = Observation {
             vision: VisionObservation::Patches(Tensor::zeros(
-                patch_shape(&session.config),
+                patch_shape(&runner.config),
                 DType::BF16,
             )),
             token_ids: vec![0; 10],
             state: None,
             action_mask: None,
         };
-        let noise = Tensor::zeros(noise_shape(&session.config), DType::BF16);
+        let noise = Tensor::zeros(noise_shape(&runner.config), DType::BF16);
         let request = VlaRequest::provided(&observation, &noise);
         let spec = observation.inference_spec();
         let failing_capture = |_: &Tensor, _: &DeviceBuffer, _: &Tensor| -> Result<CapturedGraph> {
             backend.capture_graph(|| backend.synchronize())?;
             panic!("CUDA must reject synchronization during stream capture");
         };
-        assert!(session
+        assert!(runner
             .build_prepared_using(&spec, ExecutionPolicy::RequireGraph, failing_capture)
             .is_err());
-        let fallback = session
+        let fallback = runner
             .build_prepared_using(&spec, ExecutionPolicy::PreferGraph, failing_capture)
             .unwrap();
         assert!(matches!(
@@ -718,7 +718,7 @@ mod tests {
         drop(fallback);
         // Same numeric generation, different tactic store: old plans must fail.
         for policy in [ExecutionPolicy::Eager, ExecutionPolicy::RequireGraph] {
-            let plan = session.prepare_with_policy(&spec, policy).unwrap();
+            let plan = runner.prepare_with_policy(&spec, policy).unwrap();
             backend
                 .context()
                 .install_tuning(tuning::TuningSession::inference(
@@ -739,7 +739,7 @@ mod tests {
             ))
             .unwrap();
         let generation = backend.context().tuning().generation();
-        let eager = session
+        let eager = runner
             .prepare_with_policy(&spec, ExecutionPolicy::Eager)
             .unwrap();
         for _ in 0..2 {
@@ -748,10 +748,10 @@ mod tests {
         backend.synchronize().unwrap();
         assert_eq!(backend.context().tuning().generation(), generation);
         drop(eager);
-        let recovered = session
+        let recovered = runner
             .prepare_with_policy(&spec, ExecutionPolicy::RequireGraph)
             .unwrap();
-        drop(session);
+        drop(runner);
         drop(backend);
         let actual = transfers::to_cpu(recovered.run(&request).unwrap().tensor())
             .unwrap()

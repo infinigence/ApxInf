@@ -1,6 +1,6 @@
 """Pi05Policy composition tests.
 
-Most run offline against a ``MockModel`` implementing the ``BareModel`` protocol
+Most run offline against a ``MockModel`` implementing the ``ModelRunnerProtocol`` protocol
 (no CUDA, no apxinf_py). One gated test cross-checks the real ``apxinf_py`` model
 when ``APXINF_PI05_MODEL_DIR`` + a CUDA build are available.
 
@@ -155,7 +155,7 @@ def test_explicit_noise_is_forwarded_exactly():
     result = policy.infer(make_obs(), noise=noise)
     np.testing.assert_array_equal(result["noise"], noise)
     np.testing.assert_array_equal(result["normalized_actions"], noise)
-    np.testing.assert_array_equal(policy.model.last_noise, noise)
+    np.testing.assert_array_equal(policy.model_runner.last_noise, noise)
 
 
 def test_calibration_and_inference_share_observation_preprocessing():
@@ -164,14 +164,14 @@ def test_calibration_and_inference_share_observation_preprocessing():
     noise = np.arange(HORIZON * MODEL_DIM, dtype=np.float32).reshape(HORIZON, MODEL_DIM)
 
     policy.infer(observation, noise=noise)
-    expected_rgb = policy.model.last_rgb.copy()
-    expected_tokens = policy.model.last_tokens.copy()
+    expected_rgb = policy.model_runner.last_rgb.copy()
+    expected_tokens = policy.model_runner.last_tokens.copy()
     records = policy.calibrate_observation(observation, noise=noise)
 
     assert records == {"vision.patch_input": float(np.max(expected_rgb))}
-    np.testing.assert_array_equal(policy.model.last_rgb, expected_rgb)
-    np.testing.assert_array_equal(policy.model.last_tokens, expected_tokens)
-    np.testing.assert_array_equal(policy.model.last_noise, noise)
+    np.testing.assert_array_equal(policy.model_runner.last_rgb, expected_rgb)
+    np.testing.assert_array_equal(policy.model_runner.last_tokens, expected_tokens)
+    np.testing.assert_array_equal(policy.model_runner.last_noise, noise)
 
 
 def test_explicit_noise_does_not_advance_internal_stream():
@@ -381,7 +381,7 @@ def test_real_model_layering(model_dir):
     # The real checkpoint's horizon and width come from the weights, not from
     # MockModel's constants — pi05_libero_base runs H=50, not HORIZON.
     noise = np.random.default_rng(0).standard_normal(
-        (policy.model.action_horizon, policy.model.action_dim), dtype=np.float32
+        (policy.model_runner.action_horizon, policy.model_runner.action_dim), dtype=np.float32
     )
     result = policy.infer(obs, noise=noise)
     normalized = result["normalized_actions"]
@@ -392,7 +392,7 @@ def test_real_model_layering(model_dir):
     image_stack = policy.input_pipeline["image_stack"]
     views = [image_stack.image_pipeline(obs[key]) for key in image_stack.image_keys]
     rgb = np.ascontiguousarray(np.stack(views), dtype=np.uint8)
-    l1 = policy.model.infer_rgb(rgb, "nhwc", result["token_ids"], result["noise"])
+    l1 = policy.model_runner.infer_rgb(rgb, "nhwc", result["token_ids"], result["noise"])
     np.testing.assert_allclose(normalized, l1, rtol=0.0, atol=2e-3)
 
     # L2 minus unnormalize reproduces L1's first action_dim columns.
@@ -403,5 +403,5 @@ def test_real_model_layering(model_dir):
     # The real Observation seam reaches the native BF16 collector and must
     # cover exactly the stable sites declared by the FP8 execution plan.
     records = policy.calibrate_observation(obs, noise=noise)
-    assert set(records) == set(policy.model._calibration_plan())
+    assert set(records) == set(policy.model_runner._calibration_plan())
     assert all(np.isfinite(value) and value >= 0.0 for value in records.values())

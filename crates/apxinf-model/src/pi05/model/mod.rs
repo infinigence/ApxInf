@@ -1,6 +1,6 @@
 //! One PI0.5 dataflow: vision -> prefix/KV -> fixed-step action generation.
 //! Precision, fused topology and physical weight representations live in Blocks.
-//! Session and prepare own execution policy, capture, workspaces and input binding.
+//! ModelRunner and prepare own execution policy, capture, workspaces and input binding.
 
 use super::backend::DeviceBuffer as CudaBuffer;
 use apxinf_core::{Error, Result, Tensor};
@@ -8,20 +8,20 @@ use blocks::Blocks;
 
 mod blocks;
 mod calibration;
-mod compute;
+mod variant;
 pub use calibration::Pi05CalibrationObserver;
-pub use compute::{
-    build_bf16_network, build_fp8_static_network, build_int8_dynamic_network,
+pub use variant::{
+    build_bf16_model, build_fp8_static_model, build_int8_dynamic_model,
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic,
 };
-pub(super) use compute::{LoadedCompute, NetworkOperation};
+pub(super) use variant::{ModelOperation, ModelVariant};
 
 use crate::pi05::backend::{DeviceBuffer, RuntimeBackend};
 use crate::pi05::Pi05ImageLayout;
 use apxinf_core::DType;
 use std::sync::Arc;
-/// Resource requirements supplied by a compute implementation. Execution owns
+/// Resource requirements supplied by a model implementation. Execution owns
 /// allocation, warmup, capture and lifetime; this description allocates nothing.
 pub struct WorkspaceRequirements {
     pub bytes: usize,
@@ -39,7 +39,7 @@ pub trait PrepareBlocks: Blocks + 'static {
     ) -> Result<()>;
 }
 
-impl<B: PrepareBlocks> Pi05Network<B> {
+impl<B: PrepareBlocks> Pi05Model<B> {
     pub(in crate::pi05) fn backend(&self) -> &Arc<RuntimeBackend> {
         self.blocks.backend()
     }
@@ -68,11 +68,11 @@ pub use blocks::int8_dynamic::{
     vision_patch_embed_int8_dynamic, Int8DynamicActionLayerOutput, Int8DynamicLanguageLayerOutput,
 };
 pub use blocks::{Bf16PrefixKvCache, Fp8StaticPrefixKvCache, Int8DynamicPrefixKvCache};
-pub type Bf16Network = std::sync::Arc<Pi05Network<blocks::Bf16Blocks>>;
-pub type Fp8StaticNetwork = std::sync::Arc<Pi05Network<blocks::Fp8StaticBlocks>>;
-pub type Int8DynamicNetwork = std::sync::Arc<Pi05Network<blocks::Int8DynamicBlocks>>;
+pub type Bf16Model = std::sync::Arc<Pi05Model<blocks::Bf16Blocks>>;
+pub type Fp8StaticModel = std::sync::Arc<Pi05Model<blocks::Fp8StaticBlocks>>;
+pub type Int8DynamicModel = std::sync::Arc<Pi05Model<blocks::Int8DynamicBlocks>>;
 
-impl<B: PrepareBlocks> Pi05Network<B> {
+impl<B: PrepareBlocks> Pi05Model<B> {
     pub(in crate::pi05) fn preprocess(
         &self,
         images: &DeviceBuffer,
@@ -86,11 +86,11 @@ impl<B: PrepareBlocks> Pi05Network<B> {
     }
 }
 
-pub struct Pi05Network<B: Blocks> {
+pub struct Pi05Model<B: Blocks> {
     blocks: B,
 }
 
-impl<B: Blocks> Pi05Network<B> {
+impl<B: Blocks> Pi05Model<B> {
     pub fn from_blocks(blocks: B) -> Self {
         Self { blocks }
     }
@@ -105,8 +105,8 @@ impl<B: Blocks> Pi05Network<B> {
     pub fn prefix_forward(&self, prefix: &Tensor) -> Result<B::Prefix> {
         self.blocks.prefix(prefix)
     }
-    pub fn prepare_all_styles(&self, embeddings: &[Tensor]) -> Result<Vec<B::Styles>> {
-        self.blocks.prepare_styles(embeddings)
+    pub fn prepare_all_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<B::StepModulation>> {
+        self.blocks.prepare_modulation(embeddings)
     }
     pub fn denoise_step(
         &self,
@@ -118,24 +118,26 @@ impl<B: Blocks> Pi05Network<B> {
         self.blocks.step(state, embedding, prefix, dt)
     }
 
-    pub fn denoise_all_steps_with_styles(
+    pub fn denoise_all_steps_with_modulation(
         &self,
         noise: &Tensor,
-        styles: &[B::Styles],
+        modulation: &[B::StepModulation],
         prefix: &B::Prefix,
     ) -> Result<Tensor> {
         let config = self.blocks.config();
-        if styles.len() != config.num_flow_steps {
+        if modulation.len() != config.num_flow_steps {
             return Err(Error::Other(format!(
-                "π0.5 expected {} precomputed style sets, got {}",
+                "π0.5 expected {} precomputed modulation sets, got {}",
                 config.num_flow_steps,
-                styles.len()
+                modulation.len()
             )));
         }
         let mut state = noise.clone();
         let dt = -config.flow_start_time / config.num_flow_steps as f32;
-        for styles in styles {
-            state = self.blocks.step_with_styles(&state, styles, prefix, dt)?;
+        for modulation in modulation {
+            state = self
+                .blocks
+                .step_with_modulation(&state, modulation, prefix, dt)?;
         }
         Ok(state)
     }
@@ -145,8 +147,8 @@ impl<B: Blocks> Pi05Network<B> {
         embeddings: &[Tensor],
         prefix: &B::Prefix,
     ) -> Result<Tensor> {
-        if let Some(styles) = self.blocks.eager_styles(embeddings)? {
-            return self.denoise_all_steps_with_styles(noise, &styles, prefix);
+        if let Some(modulation) = self.blocks.eager_modulation(embeddings)? {
+            return self.denoise_all_steps_with_modulation(noise, &modulation, prefix);
         }
         self.denoise_embeddings(noise, embeddings, prefix)
     }
@@ -181,12 +183,12 @@ impl<B: Blocks> Pi05Network<B> {
         embeddings: &[Tensor],
         native: bool,
     ) -> Result<Tensor> {
-        let styles = self.blocks.eager_styles(embeddings)?;
+        let modulation = self.blocks.eager_modulation(embeddings)?;
         let vision = self.blocks.vision(patches, native)?;
         let prefix = self.blocks.embed_prefix(&vision, ids, count)?;
         let prefix = self.blocks.prefix(&prefix)?;
-        match styles {
-            Some(styles) => self.denoise_all_steps_with_styles(noise, &styles, &prefix),
+        match modulation {
+            Some(modulation) => self.denoise_all_steps_with_modulation(noise, &modulation, &prefix),
             None => self.denoise_embeddings(noise, embeddings, &prefix),
         }
     }
@@ -210,39 +212,39 @@ impl<B: Blocks> Pi05Network<B> {
     ) -> Result<Tensor> {
         self.infer_impl(patches, ids, count, noise, embeddings, true)
     }
-    fn infer_styles_impl(
+    fn infer_modulation_impl(
         &self,
         patches: &Tensor,
         ids: &CudaBuffer,
         count: usize,
         noise: &Tensor,
-        styles: &[B::Styles],
+        modulation: &[B::StepModulation],
         native: bool,
     ) -> Result<Tensor> {
         let vision = self.blocks.vision(patches, native)?;
         let prefix = self.blocks.embed_prefix(&vision, ids, count)?;
         let prefix = self.blocks.prefix(&prefix)?;
-        self.denoise_all_steps_with_styles(noise, styles, &prefix)
+        self.denoise_all_steps_with_modulation(noise, modulation, &prefix)
     }
-    pub fn infer_with_styles(
+    pub fn infer_with_modulation(
         &self,
         patches: &Tensor,
         ids: &CudaBuffer,
         count: usize,
         noise: &Tensor,
-        styles: &[B::Styles],
+        modulation: &[B::StepModulation],
     ) -> Result<Tensor> {
-        self.infer_styles_impl(patches, ids, count, noise, styles, false)
+        self.infer_modulation_impl(patches, ids, count, noise, modulation, false)
     }
-    pub fn infer_with_native_styles(
+    pub fn infer_with_native_modulation(
         &self,
         patches: &Tensor,
         ids: &CudaBuffer,
         count: usize,
         noise: &Tensor,
-        styles: &[B::Styles],
+        modulation: &[B::StepModulation],
     ) -> Result<Tensor> {
-        self.infer_styles_impl(patches, ids, count, noise, styles, true)
+        self.infer_modulation_impl(patches, ids, count, noise, modulation, true)
     }
 }
 
@@ -267,7 +269,7 @@ mod tests {
     }
     impl<const P: bool> Blocks for Probe<P> {
         type Prefix = ();
-        type Styles = ();
+        type StepModulation = ();
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -283,13 +285,13 @@ mod tests {
             self.record("prefix");
             Ok(())
         }
-        fn prepare_styles(&self, _: &[Tensor]) -> Result<Vec<()>> {
-            self.record("styles");
+        fn prepare_modulation(&self, _: &[Tensor]) -> Result<Vec<()>> {
+            self.record("modulation");
             Ok(vec![(); 2])
         }
-        fn eager_styles(&self, e: &[Tensor]) -> Result<Option<Vec<()>>> {
+        fn eager_modulation(&self, e: &[Tensor]) -> Result<Option<Vec<()>>> {
             if P {
-                self.prepare_styles(e).map(Some)
+                self.prepare_modulation(e).map(Some)
             } else {
                 Ok(None)
             }
@@ -299,7 +301,7 @@ mod tests {
             self.record("inline step");
             Ok(tensor())
         }
-        fn step_with_styles(&self, _: &Tensor, _: &(), _: &(), dt: f32) -> Result<Tensor> {
+        fn step_with_modulation(&self, _: &Tensor, _: &(), _: &(), dt: f32) -> Result<Tensor> {
             assert_eq!(dt, -0.5);
             self.record("prepared step");
             Ok(tensor())
@@ -311,18 +313,18 @@ mod tests {
         let mut config = Pi05Config::default();
         config.num_flow_steps = 2;
         config.flow_start_time = 1.0;
-        let network = Pi05Network::from_blocks(Probe::<PRECOMPUTE> {
+        let model = Pi05Model::from_blocks(Probe::<PRECOMPUTE> {
             config,
             events: events.clone(),
         });
         let ids = CudaBuffer::alloc_zeros(4, 0).unwrap();
         let embeddings = [tensor(), tensor()];
-        network
+        model
             .infer(&tensor(), &ids, 1, &tensor(), &embeddings)
             .unwrap();
         let expected = if PRECOMPUTE {
             vec![
-                "styles",
+                "modulation",
                 "vision",
                 "embed",
                 "prefix",
@@ -334,8 +336,8 @@ mod tests {
         };
         assert_eq!(*events.borrow(), expected);
         events.borrow_mut().clear();
-        network
-            .infer_with_native_styles(&tensor(), &ids, 1, &tensor(), &[(), ()])
+        model
+            .infer_with_native_modulation(&tensor(), &ids, 1, &tensor(), &[(), ()])
             .unwrap();
         assert_eq!(
             *events.borrow(),
@@ -347,16 +349,16 @@ mod tests {
                 "prepared step"
             ]
         );
-        assert!(network
-            .denoise_all_steps_with_styles(&tensor(), &[()], &())
+        assert!(model
+            .denoise_all_steps_with_modulation(&tensor(), &[()], &())
             .is_err());
     }
     #[test]
-    fn shared_network_preserves_precomputed_eager_order() {
+    fn shared_model_preserves_precomputed_eager_order() {
         check_order::<true>();
     }
     #[test]
-    fn shared_network_preserves_inline_eager_order() {
+    fn shared_model_preserves_inline_eager_order() {
         check_order::<false>();
     }
 }

@@ -1,4 +1,4 @@
-//! Dynamic-activation INT8 π0.5 transformer-layer execution.
+//! Dynamic-activation INT8 π0.5 transformer-layer computation.
 
 use crate::pi05::backend::{kernels, Context};
 use apxinf_core::{Result, Tensor};
@@ -81,9 +81,9 @@ pub fn action_layer_int8_dynamic(
     weights: &Int8DynamicDeviceActionLayer,
     input: &Tensor,
     attention_normalized: Option<&Tensor>,
-    attention_style: &Tensor,
-    mlp_style: &Tensor,
-    next_norm_style: &Tensor,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
     prefix_k: &Tensor,
     prefix_v: &Tensor,
     position_offset: usize,
@@ -92,7 +92,7 @@ pub fn action_layer_int8_dynamic(
 ) -> Result<Int8DynamicActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
-        None => norm::adaptive_rms_bf16(ctx, input, attention_style, rms_eps)?,
+        None => norm::adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps)?,
     };
     let qkv = weights.qkv.gemm(ctx, &normalized)?;
     let q = rope::apply_q_write_kv_bf16(
@@ -124,8 +124,8 @@ pub fn action_layer_int8_dynamic(
         ctx,
         &projected,
         input,
-        attention_style,
-        mlp_style,
+        attention_modulation,
+        mlp_modulation,
         rms_eps,
     )?;
     let gate_up = weights.gate_up.gemm(ctx, &fused.normalized)?;
@@ -135,8 +135,8 @@ pub fn action_layer_int8_dynamic(
         ctx,
         &projected,
         &fused.hidden,
-        mlp_style,
-        next_norm_style,
+        mlp_modulation,
+        next_norm_modulation,
         rms_eps,
     )?;
     Ok(Int8DynamicActionLayerOutput {
@@ -216,9 +216,9 @@ impl QkvViews for rope::QkvTensors {
 }
 
 // Precision-specific backbone operations share this file with their layers.
-pub(in crate::pi05::network) mod backbone {
-    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+pub(in crate::pi05::model) mod backbone {
     use super::*;
+    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
     use crate::pi05::weights::*;
     use crate::pi05::Pi05Config;
     use apxinf_core::{DType, Error, Result, Tensor};
@@ -230,15 +230,15 @@ pub(in crate::pi05::network) mod backbone {
         pub tokens: usize,
     }
 
-    pub struct Int8DynamicStepStyles {
+    pub struct Int8DynamicStepModulation {
         attention: Vec<Tensor>,
         mlp: Vec<Tensor>,
         final_norm: Tensor,
     }
     pub struct Int8DynamicBlocks {
-        pub(in crate::pi05::network) backend: Arc<RuntimeBackend>,
-        pub(in crate::pi05::network) config: Arc<Pi05Config>,
-        pub(in crate::pi05::network) weights: Arc<Int8DynamicWeights>,
+        pub(in crate::pi05::model) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05::model) config: Arc<Pi05Config>,
+        pub(in crate::pi05::model) weights: Arc<Int8DynamicWeights>,
     }
     impl Int8DynamicBlocks {
         pub fn new(
@@ -376,36 +376,40 @@ pub(in crate::pi05::network) mod backbone {
             activation::bias_silu_bf16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
         }
 
-        fn style(
+        fn modulation(
             &self,
             conditioning: &Tensor,
             weights: &Int8DynamicLinearWeights,
         ) -> Result<Tensor> {
             let projected = weights.gemm(self.ctx(), conditioning)?;
-            let style = elementwise::bias_bf16(self.ctx(), &projected, weights.bias.as_ref())?;
-            style.reshape(vec![style.numel()])
+            let modulation = elementwise::bias_bf16(self.ctx(), &projected, weights.bias.as_ref())?;
+            modulation.reshape(vec![modulation.numel()])
         }
 
-        fn prepare_step_styles(&self, time_embedding: &Tensor) -> Result<Int8DynamicStepStyles> {
+        fn prepare_step_modulation(
+            &self,
+            time_embedding: &Tensor,
+        ) -> Result<Int8DynamicStepModulation> {
             let conditioning = self.conditioning(time_embedding)?;
             let mut attention = Vec::with_capacity(self.config.action_expert.depth);
             let mut mlp = Vec::with_capacity(self.config.action_expert.depth);
             for layer in &self.weights.action_layers {
-                attention.push(self.style(&conditioning, &layer.input_style)?);
-                mlp.push(self.style(&conditioning, &layer.post_attention_style)?);
+                attention.push(self.modulation(&conditioning, &layer.input_modulation)?);
+                mlp.push(self.modulation(&conditioning, &layer.post_attention_modulation)?);
             }
-            let final_norm = self.style(&conditioning, &self.weights.action_final_style)?;
-            Ok(Int8DynamicStepStyles {
+            let final_norm =
+                self.modulation(&conditioning, &self.weights.action_final_modulation)?;
+            Ok(Int8DynamicStepModulation {
                 attention,
                 mlp,
                 final_norm,
             })
         }
 
-        fn prepare_all_styles(
+        fn prepare_all_modulation(
             &self,
             time_embeddings: &[Tensor],
-        ) -> Result<Vec<Int8DynamicStepStyles>> {
+        ) -> Result<Vec<Int8DynamicStepModulation>> {
             if time_embeddings.len() != self.config.num_flow_steps {
                 return Err(Error::Other(format!(
                     "π0.5 expected {} timestep embeddings, got {}",
@@ -415,23 +419,25 @@ pub(in crate::pi05::network) mod backbone {
             }
             time_embeddings
                 .iter()
-                .map(|embedding| self.prepare_step_styles(embedding))
+                .map(|embedding| self.prepare_step_modulation(embedding))
                 .collect()
         }
 
-        fn denoise_step_with_styles(
+        fn denoise_step_with_modulation(
             &self,
             state: &Tensor,
-            styles: &Int8DynamicStepStyles,
+            modulation: &Int8DynamicStepModulation,
             prefix: &Int8DynamicPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
             if prefix.keys.len() != self.config.action_expert.depth
                 || prefix.values.len() != self.config.action_expert.depth
-                || styles.attention.len() != self.config.action_expert.depth
-                || styles.mlp.len() != self.config.action_expert.depth
+                || modulation.attention.len() != self.config.action_expert.depth
+                || modulation.mlp.len() != self.config.action_expert.depth
             {
-                return Err(Error::Other("π0.5 INT8 prefix/style depth mismatch".into()));
+                return Err(Error::Other(
+                    "π0.5 INT8 prefix/modulation depth mismatch".into(),
+                ));
             }
             let hidden = self.weights.action_in.gemm(self.ctx(), state)?;
             let mut hidden =
@@ -439,10 +445,10 @@ pub(in crate::pi05::network) mod backbone {
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
-                let next_norm_style = if index + 1 < self.config.action_expert.depth {
-                    &styles.attention[index + 1]
+                let next_norm_modulation = if index + 1 < self.config.action_expert.depth {
+                    &modulation.attention[index + 1]
                 } else {
-                    &styles.final_norm
+                    &modulation.final_norm
                 };
                 let output = action_layer_int8_dynamic(
                     self.ctx(),
@@ -450,9 +456,9 @@ pub(in crate::pi05::network) mod backbone {
                     layer,
                     &hidden,
                     attention_normalized.as_ref(),
-                    &styles.attention[index],
-                    &styles.mlp[index],
-                    next_norm_style,
+                    &modulation.attention[index],
+                    &modulation.mlp[index],
+                    next_norm_modulation,
                     &prefix.keys[index],
                     &prefix.values[index],
                     prefix.tokens,
@@ -481,14 +487,14 @@ pub(in crate::pi05::network) mod backbone {
             prefix: &Int8DynamicPrefixKvCache,
             dt: f32,
         ) -> Result<Tensor> {
-            let styles = self.prepare_step_styles(time_embedding)?;
-            self.denoise_step_with_styles(state, &styles, prefix, dt)
+            let modulation = self.prepare_step_modulation(time_embedding)?;
+            self.denoise_step_with_modulation(state, &modulation, prefix, dt)
         }
     }
 
     impl super::super::Blocks for Int8DynamicBlocks {
         type Prefix = Int8DynamicPrefixKvCache;
-        type Styles = Int8DynamicStepStyles;
+        type StepModulation = Int8DynamicStepModulation;
         fn config(&self) -> &Pi05Config {
             &self.config
         }
@@ -502,11 +508,14 @@ pub(in crate::pi05::network) mod backbone {
         fn prefix(&self, input: &Tensor) -> Result<Self::Prefix> {
             self.prefix_forward(input)
         }
-        fn prepare_styles(&self, embeddings: &[Tensor]) -> Result<Vec<Self::Styles>> {
-            self.prepare_all_styles(embeddings)
+        fn prepare_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>> {
+            self.prepare_all_modulation(embeddings)
         }
-        fn eager_styles(&self, embeddings: &[Tensor]) -> Result<Option<Vec<Self::Styles>>> {
-            self.prepare_all_styles(embeddings).map(Some)
+        fn eager_modulation(
+            &self,
+            embeddings: &[Tensor],
+        ) -> Result<Option<Vec<Self::StepModulation>>> {
+            self.prepare_all_modulation(embeddings).map(Some)
         }
         fn step(
             &self,
@@ -517,27 +526,27 @@ pub(in crate::pi05::network) mod backbone {
         ) -> Result<Tensor> {
             self.denoise_step(state, embedding, prefix, dt)
         }
-        fn step_with_styles(
+        fn step_with_modulation(
             &self,
             state: &Tensor,
-            styles: &Self::Styles,
+            modulation: &Self::StepModulation,
             prefix: &Self::Prefix,
             dt: f32,
         ) -> Result<Tensor> {
-            self.denoise_step_with_styles(state, styles, prefix, dt)
+            self.denoise_step_with_modulation(state, modulation, prefix, dt)
         }
     }
 }
 
-impl crate::pi05::network::PrepareBlocks for backbone::Int8DynamicBlocks {
+impl crate::pi05::model::PrepareBlocks for backbone::Int8DynamicBlocks {
     fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
         &self.backend
     }
     fn workspace_requirements(
         &self,
         tokens: usize,
-    ) -> apxinf_core::Result<crate::pi05::network::WorkspaceRequirements> {
-        Ok(crate::pi05::network::WorkspaceRequirements {
+    ) -> apxinf_core::Result<crate::pi05::model::WorkspaceRequirements> {
+        Ok(crate::pi05::model::WorkspaceRequirements {
             bytes: self
                 .config
                 .cuda_graph_workspace_bytes_int8_dynamic(tokens)?,

@@ -408,10 +408,10 @@ pub struct Fp8StaticDeviceLanguageLayer {
 
 #[derive(Debug)]
 pub struct Fp8StaticDeviceActionLayer {
-    pub input_style: Fp8StaticLinearWeights,
+    pub input_modulation: Fp8StaticLinearWeights,
     pub qkv: Fp8StaticLinearWeights,
     pub output: Fp8StaticLinearWeights,
-    pub post_attention_style: Fp8StaticLinearWeights,
+    pub post_attention_modulation: Fp8StaticLinearWeights,
     pub gate_up: Fp8StaticLinearWeights,
     pub down: Fp8StaticLinearWeights,
 }
@@ -427,7 +427,7 @@ pub struct Fp8StaticWeights {
     pub language_layers: Vec<Fp8StaticDeviceLanguageLayer>,
     pub language_final_norm_scale: Tensor,
     pub action_layers: Vec<Fp8StaticDeviceActionLayer>,
-    pub action_final_style: Fp8StaticLinearWeights,
+    pub action_final_modulation: Fp8StaticLinearWeights,
     pub action_in: Fp8StaticLinearWeights,
     pub action_out: Fp8StaticLinearWeights,
     pub time_mlp_in: Fp8StaticLinearWeights,
@@ -477,7 +477,7 @@ impl Fp8StaticWeights {
             language_layers,
             language_final_norm_scale: fp16_to_device(&weights.language_final_norm_scale, backend)?,
             action_layers,
-            action_final_style: style_to_device(&weights.action_final_norm, backend)?,
+            action_final_modulation: modulation_to_device(&weights.action_final_norm, backend)?,
             action_in: Fp8StaticLinearWeights::from_host(&weights.action_in, backend)?,
             action_out: Fp8StaticLinearWeights::from_host(&weights.action_out, backend)?,
             time_mlp_in: Fp8StaticLinearWeights::from_host(&weights.time_mlp_in, backend)?,
@@ -542,7 +542,7 @@ impl Fp8StaticDeviceLanguageLayer {
 impl Fp8StaticDeviceActionLayer {
     fn from_host(weights: &ActionLayerWeights, backend: &dyn Backend) -> Result<Self> {
         Ok(Self {
-            input_style: style_to_device(&weights.input_norm, backend)?,
+            input_modulation: modulation_to_device(&weights.input_norm, backend)?,
             qkv: Fp8StaticLinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -552,7 +552,7 @@ impl Fp8StaticDeviceActionLayer {
                 backend,
             )?,
             output: Fp8StaticLinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_style: style_to_device(&weights.post_attention_norm, backend)?,
+            post_attention_modulation: modulation_to_device(&weights.post_attention_norm, backend)?,
             gate_up: Fp8StaticLinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
@@ -562,9 +562,9 @@ impl Fp8StaticDeviceActionLayer {
     }
 }
 
-fn style_to_device(
+fn modulation_to_device(
     weights: &AdaRmsNormWeights,
     backend: &dyn Backend,
 ) -> Result<Fp8StaticLinearWeights> {
-    Fp8StaticLinearWeights::from_host(&weights.style, backend)
+    Fp8StaticLinearWeights::from_host(&weights.modulation, backend)
 }

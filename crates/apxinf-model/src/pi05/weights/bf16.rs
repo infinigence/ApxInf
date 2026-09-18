@@ -350,10 +350,10 @@ pub struct Bf16DeviceLanguageLayer {
 
 #[derive(Debug)]
 pub struct Bf16DeviceActionLayer {
-    pub input_style: Bf16LinearWeights,
+    pub input_modulation: Bf16LinearWeights,
     pub qkv: Bf16LinearWeights,
     pub output: Bf16LinearWeights,
-    pub post_attention_style: Bf16LinearWeights,
+    pub post_attention_modulation: Bf16LinearWeights,
     pub gate_up: Bf16LinearWeights,
     pub down: Bf16LinearWeights,
 }
@@ -369,7 +369,7 @@ pub struct Bf16Weights {
     pub language_layers: Vec<Bf16DeviceLanguageLayer>,
     pub language_final_norm_scale: Tensor,
     pub action_layers: Vec<Bf16DeviceActionLayer>,
-    pub action_final_style: Bf16LinearWeights,
+    pub action_final_modulation: Bf16LinearWeights,
     pub action_in: Bf16LinearWeights,
     pub action_out: Bf16LinearWeights,
     pub time_mlp_in: Bf16LinearWeights,
@@ -416,7 +416,7 @@ impl Bf16Weights {
                 .iter()
                 .map(|layer| Bf16DeviceActionLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            action_final_style: style_to_device(&weights.action_final_norm, backend)?,
+            action_final_modulation: modulation_to_device(&weights.action_final_norm, backend)?,
             action_in: Bf16LinearWeights::from_host(&weights.action_in, backend)?,
             action_out: Bf16LinearWeights::from_host(&weights.action_out, backend)?,
             time_mlp_in: Bf16LinearWeights::from_host(&weights.time_mlp_in, backend)?,
@@ -481,7 +481,7 @@ impl Bf16DeviceLanguageLayer {
 impl Bf16DeviceActionLayer {
     fn from_host(weights: &ActionLayerWeights, backend: &dyn Backend) -> Result<Self> {
         Ok(Self {
-            input_style: style_to_device(&weights.input_norm, backend)?,
+            input_modulation: modulation_to_device(&weights.input_norm, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -491,7 +491,7 @@ impl Bf16DeviceActionLayer {
                 backend,
             )?,
             output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_style: style_to_device(&weights.post_attention_norm, backend)?,
+            post_attention_modulation: modulation_to_device(&weights.post_attention_norm, backend)?,
             gate_up: Bf16LinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
@@ -501,9 +501,9 @@ impl Bf16DeviceActionLayer {
     }
 }
 
-fn style_to_device(
+fn modulation_to_device(
     weights: &AdaRmsNormWeights,
     backend: &dyn Backend,
 ) -> Result<Bf16LinearWeights> {
-    Bf16LinearWeights::from_host(&weights.style, backend)
+    Bf16LinearWeights::from_host(&weights.modulation, backend)
 }

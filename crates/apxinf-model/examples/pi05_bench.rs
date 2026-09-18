@@ -28,9 +28,7 @@
 //! `APXINF_PI05_EAGER_ONLY=1` stops after the eager integrity pass, and
 //! `APXINF_PI05_IMAGE_INPUT` mirrors `--image-input` for scripted runs.
 
-use apxinf_model::pi05::{
-    build_bf16_network, build_fp8_static_network, build_int8_dynamic_network,
-};
+use apxinf_model::pi05::{build_bf16_model, build_fp8_static_model, build_int8_dynamic_model};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,9 +37,9 @@ use apxinf_core::{Backend, DType, Tensor};
 use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
-    upload_time_embeddings_int8_dynamic, Bf16Network, Bf16Weights, CapturedGraph,
-    Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticNetwork, Fp8StaticWeights,
-    Int8DynamicNetwork, Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights,
+    upload_time_embeddings_int8_dynamic, Bf16Model, Bf16Weights, CapturedGraph,
+    Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticModel, Fp8StaticWeights,
+    Int8DynamicModel, Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,9 +125,9 @@ const EAGER_GRAPH_MIN_COSINE: f64 = 0.999_999;
 /// Benchmark-only dispatch over statically typed Networks. Capture uses the
 /// same prepare implementation and graph owner for every compute variant.
 enum Bench {
-    Bf16(Bf16Network),
-    Fp8Static(Fp8StaticNetwork),
-    Int8Dynamic(Int8DynamicNetwork),
+    Bf16(Bf16Model),
+    Fp8Static(Fp8StaticModel),
+    Int8Dynamic(Int8DynamicModel),
 }
 
 impl Bench {
@@ -831,7 +829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = if random {
-        // Random-benchmark defaults mirror `apxinf_py.Model.random` (2-view / H10)
+        // Random-benchmark defaults mirror `apxinf_py.ModelRunner.random` (2-view / H10)
         // so the Rust and Python entry points measure the same shape by default,
         // rather than `Pi05Config::default()` (3-view / H50). Untouched architecture
         // fields (patch/vision/language/action widths) come from `default()`.
@@ -920,7 +918,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &*backend,
                 config.language_dual_geglu_shape_possible(),
             )?);
-            Bench::Bf16(build_bf16_network(
+            Bench::Bf16(build_bf16_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,
@@ -973,7 +971,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &*backend,
                 config.language_dual_geglu_shape_possible(),
             )?);
-            Bench::Fp8Static(build_fp8_static_network(
+            Bench::Fp8Static(build_fp8_static_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,
@@ -983,7 +981,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BenchVariant::Int8Dynamic => {
             eprintln!("quantizing and uploading per-channel INT8 weights...");
             let device_weights = Arc::new(Int8DynamicWeights::from_host(&host_weights, &backend)?);
-            Bench::Int8Dynamic(build_int8_dynamic_network(
+            Bench::Int8Dynamic(build_int8_dynamic_model(
                 backend.clone(),
                 config.clone(),
                 device_weights,

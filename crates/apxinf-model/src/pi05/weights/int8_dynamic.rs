@@ -199,10 +199,10 @@ pub struct Int8DynamicDeviceLanguageLayer {
 }
 
 pub struct Int8DynamicDeviceActionLayer {
-    pub input_style: Int8DynamicLinearWeights,
+    pub input_modulation: Int8DynamicLinearWeights,
     pub qkv: Int8DynamicLinearWeights,
     pub output: Int8DynamicLinearWeights,
-    pub post_attention_style: Int8DynamicLinearWeights,
+    pub post_attention_modulation: Int8DynamicLinearWeights,
     pub gate_up: Int8DynamicLinearWeights,
     pub down: Int8DynamicLinearWeights,
 }
@@ -217,7 +217,7 @@ pub struct Int8DynamicWeights {
     pub language_layers: Vec<Int8DynamicDeviceLanguageLayer>,
     pub language_final_norm_scale: Tensor,
     pub action_layers: Vec<Int8DynamicDeviceActionLayer>,
-    pub action_final_style: Int8DynamicLinearWeights,
+    pub action_final_modulation: Int8DynamicLinearWeights,
     pub action_in: Int8DynamicLinearWeights,
     pub action_out: Int8DynamicLinearWeights,
     pub time_mlp_in: Int8DynamicLinearWeights,
@@ -258,7 +258,7 @@ impl Int8DynamicWeights {
                 .iter()
                 .map(|layer| Int8DynamicDeviceActionLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            action_final_style: style_to_device(&weights.action_final_norm, backend)?,
+            action_final_modulation: modulation_to_device(&weights.action_final_norm, backend)?,
             action_in: Int8DynamicLinearWeights::from_host(&weights.action_in, backend)?,
             action_out: Int8DynamicLinearWeights::from_host(&weights.action_out, backend)?,
             time_mlp_in: Int8DynamicLinearWeights::from_host(&weights.time_mlp_in, backend)?,
@@ -318,7 +318,7 @@ impl Int8DynamicDeviceLanguageLayer {
 impl Int8DynamicDeviceActionLayer {
     fn from_host(weights: &ActionLayerWeights, backend: &RuntimeBackend) -> Result<Self> {
         Ok(Self {
-            input_style: style_to_device(&weights.input_norm, backend)?,
+            input_modulation: modulation_to_device(&weights.input_norm, backend)?,
             qkv: Int8DynamicLinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -328,7 +328,7 @@ impl Int8DynamicDeviceActionLayer {
                 backend,
             )?,
             output: Int8DynamicLinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_style: style_to_device(&weights.post_attention_norm, backend)?,
+            post_attention_modulation: modulation_to_device(&weights.post_attention_norm, backend)?,
             gate_up: Int8DynamicLinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
@@ -338,9 +338,9 @@ impl Int8DynamicDeviceActionLayer {
     }
 }
 
-fn style_to_device(
+fn modulation_to_device(
     weights: &AdaRmsNormWeights,
     backend: &RuntimeBackend,
 ) -> Result<Int8DynamicLinearWeights> {
-    Int8DynamicLinearWeights::from_host(&weights.style, backend)
+    Int8DynamicLinearWeights::from_host(&weights.modulation, backend)
 }

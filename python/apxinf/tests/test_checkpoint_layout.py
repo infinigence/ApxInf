@@ -880,7 +880,7 @@ def _load_with_fake_binding(monkeypatch, model_dir, **kwargs):
         captured["pipeline_kwargs"] = pipeline_kwargs
         return FakePipeline(), FakePipeline()
 
-    monkeypatch.setitem(sys.modules, "apxinf_py", types.SimpleNamespace(Model=FakeBindingModel))
+    monkeypatch.setitem(sys.modules, "apxinf_py", types.SimpleNamespace(ModelRunner=FakeBindingModel))
     monkeypatch.setattr(pi05, "resolve_pi05_tactics", lambda *a, **k: None)
     monkeypatch.setattr(pi05, "PromptTokenizer", lambda *a, **k: object())
     monkeypatch.setattr(

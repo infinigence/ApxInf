@@ -1,4 +1,4 @@
-//! Checkpoint structure, compute-specific device representations and fixed calibration assets.
+//! Checkpoint structure, model-specific device representations and fixed calibration assets.
 mod bf16;
 mod fp8_static;
 mod fp8_static_calibration;

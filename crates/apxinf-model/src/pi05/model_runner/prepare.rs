@@ -2,8 +2,8 @@
 use crate::pi05::backend::{
     kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend,
 };
-use crate::pi05::network::Pi05Network;
-use crate::pi05::network::{LoadedCompute, NetworkOperation, PrepareBlocks, WorkspaceRequirements};
+use crate::pi05::model::Pi05Model;
+use crate::pi05::model::{ModelOperation, ModelVariant, PrepareBlocks, WorkspaceRequirements};
 use crate::pi05::{Pi05Config, Pi05ImageLayout};
 use apxinf_core::{Backend, Error, Graph, Result, Tensor};
 use std::sync::Arc;
@@ -128,7 +128,7 @@ impl CapturedGraph {
 }
 
 struct CaptureBuilder<'a, B: PrepareBlocks> {
-    network: &'a Arc<Pi05Network<B>>,
+    model: &'a Arc<Pi05Model<B>>,
     backend: &'a Arc<RuntimeBackend>,
     config: &'a Pi05Config,
 }
@@ -145,21 +145,21 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         token_ids: &CudaBuffer,
         token_count: usize,
         noise: &Tensor,
-        styles: &[B::Styles],
+        modulation: &[B::StepModulation],
     ) -> Result<Tensor> {
         match (raw_images, raw_image_layout) {
             (None, None) => {
-                self.network
-                    .infer_with_styles(patches, token_ids, token_count, noise, styles)
+                self.model
+                    .infer_with_modulation(patches, token_ids, token_count, noise, modulation)
             }
             (Some(images), Some(layout)) => {
-                self.network.preprocess(images, patches, layout)?;
-                self.network.infer_with_native_styles(
+                self.model.preprocess(images, patches, layout)?;
+                self.model.infer_with_native_modulation(
                     patches,
                     token_ids,
                     token_count,
                     noise,
-                    styles,
+                    modulation,
                 )
             }
             _ => Err(Error::Other(
@@ -185,10 +185,10 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                 "π0.5 raw image capture state is inconsistent".into(),
             ));
         }
-        let styles = self.network.prepare_all_styles(time_embeddings)?;
+        let modulation = self.model.prepare_all_modulation(time_embeddings)?;
         backend.synchronize()?;
         let workspace = allocate_workspace(
-            &self.network.workspace_requirements(token_count)?,
+            &self.model.workspace_requirements(token_count)?,
             self.ctx().device_id(),
         )?;
         let mut stable = false;
@@ -202,7 +202,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                     token_ids,
                     token_count,
                     noise,
-                    &styles,
+                    &modulation,
                 )
             })?;
             backend.synchronize()?;
@@ -227,7 +227,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                     token_ids,
                     token_count,
                     noise,
-                    &styles,
+                    &modulation,
                 )
             })
         })?;
@@ -241,7 +241,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             token_ids: token_ids.clone(),
             token_count,
             backend: Arc::clone(&self.backend),
-            _fixed: Box::new((Arc::clone(&self.network), styles)),
+            _fixed: Box::new((Arc::clone(&self.model), modulation)),
             workspace,
         })
     }
@@ -287,7 +287,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
         let patches = backend.to_device(&Tensor::zeros(
             vec![patch_rows, patch_width],
-            self.network.raw_patch_dtype(),
+            self.model.raw_patch_dtype(),
         ))?;
         self.capture_infer_impl(
             patches,
@@ -306,7 +306,7 @@ pub(super) enum CaptureInput<'a> {
     Rgb(Pi05ImageLayout),
 }
 pub(super) fn capture<B: PrepareBlocks>(
-    network: &Arc<Pi05Network<B>>,
+    model: &Arc<Pi05Model<B>>,
     input: CaptureInput<'_>,
     tokens: &CudaBuffer,
     count: usize,
@@ -314,9 +314,9 @@ pub(super) fn capture<B: PrepareBlocks>(
     embeddings: &[Tensor],
 ) -> Result<CapturedGraph> {
     let builder = CaptureBuilder {
-        network,
-        backend: network.backend(),
-        config: network.config(),
+        model,
+        backend: model.backend(),
+        config: model.config(),
     };
     match input {
         CaptureInput::Rgb(layout) => {
@@ -330,7 +330,7 @@ pub(super) fn capture<B: PrepareBlocks>(
 /// Prepare a low-level graph with caller-owned stable patch/token/noise tensors.
 /// Their storage is retained; sizes and addresses cannot change between replays.
 pub fn capture_patches<B: PrepareBlocks>(
-    network: &Arc<Pi05Network<B>>,
+    model: &Arc<Pi05Model<B>>,
     patches: &Tensor,
     tokens: &CudaBuffer,
     count: usize,
@@ -338,7 +338,7 @@ pub fn capture_patches<B: PrepareBlocks>(
     embeddings: &[Tensor],
 ) -> Result<CapturedGraph> {
     capture(
-        network,
+        model,
         CaptureInput::Patches(patches),
         tokens,
         count,
@@ -348,7 +348,7 @@ pub fn capture_patches<B: PrepareBlocks>(
 }
 /// Prepare a graph that owns RGB input storage and device preprocessing.
 pub fn capture_rgb<B: PrepareBlocks>(
-    network: &Arc<Pi05Network<B>>,
+    model: &Arc<Pi05Model<B>>,
     layout: Pi05ImageLayout,
     tokens: &CudaBuffer,
     count: usize,
@@ -356,7 +356,7 @@ pub fn capture_rgb<B: PrepareBlocks>(
     embeddings: &[Tensor],
 ) -> Result<CapturedGraph> {
     capture(
-        network,
+        model,
         CaptureInput::Rgb(layout),
         tokens,
         count,
@@ -366,7 +366,7 @@ pub fn capture_rgb<B: PrepareBlocks>(
 }
 
 pub(super) fn capture_loaded(
-    compute: &LoadedCompute,
+    model: &ModelVariant,
     spec: &crate::vla::InferenceSpec,
     patches: &Tensor,
     tokens: &CudaBuffer,
@@ -378,15 +378,15 @@ pub(super) fn capture_loaded(
         count: usize,
         noise: &'a Tensor,
     }
-    impl NetworkOperation for CaptureOperation<'_> {
+    impl ModelOperation for CaptureOperation<'_> {
         type Output = CapturedGraph;
         fn run<B: PrepareBlocks>(
             self,
-            network: &Arc<Pi05Network<B>>,
+            model: &Arc<Pi05Model<B>>,
             embeddings: &[Tensor],
         ) -> Result<Self::Output> {
             capture(
-                network,
+                model,
                 self.input,
                 self.tokens,
                 self.count,
@@ -396,10 +396,10 @@ pub(super) fn capture_loaded(
         }
     }
     let input = match spec.image_layout {
-        Some(layout) => CaptureInput::Rgb(super::session::kernel_image_layout(layout)),
+        Some(layout) => CaptureInput::Rgb(super::runner::kernel_image_layout(layout)),
         None => CaptureInput::Patches(patches),
     };
-    compute.with_network(CaptureOperation {
+    model.with_model(CaptureOperation {
         input,
         tokens,
         count: spec.token_count,

@@ -58,7 +58,7 @@ Runtime partial-flow support:
 - `crates/apxinf-model/src/pi05/int8_runtime.rs`
   - same schedule support for INT8 path
 - `crates/apxinf-py/src/lib.rs`
-  - `apxinf_py.Model.load(..., num_flow_steps=..., flow_start_time=...)`
+  - `apxinf_py.ModelRunner.load(..., num_flow_steps=..., flow_start_time=...)`
   - Python getters expose `num_flow_steps` and `flow_start_time`
 - `python/apxinf/apxinf/policies/impls/pi05.py`
   - forwards `num_flow_steps` and `flow_start_time`

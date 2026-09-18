@@ -6,9 +6,9 @@ that folds the former ``bench_pi05_layers.py`` (L0/L1/L2 in-process) and
 ``bench_pi05_openpi_latency.py`` (L3 websocket). The serving call peels into four
 concentric shells, each the cost of the layer around the one inside it:
 
-* **L0 model** — ``Model._infer_patches``: pure engine forward, inputs already
+* **L0 model** — ``ModelRunner._infer_patches``: pure engine forward, inputs already
   patch-embedded (vision→patches skipped). The floor.
-* **L1 rust** — ``Model.infer_rgb``: the ``apxinf_py`` binding from resized RGB;
+* **L1 rust** — ``ModelRunner.infer_rgb``: the ``apxinf_py`` binding from resized RGB;
   adds Rust-side vision→patches (in the CUDA graph) + PyO3 marshalling over L0.
 * **L2 python api** — ``Pi05Policy.infer``: adds the numpy pre chain
   (parse/resize/tokenize) + post chain (trim/unnormalize) around L1. Its default
@@ -321,7 +321,7 @@ def main() -> None:
 
     if in_process:
         if random:
-            from apxinf import Model
+            from apxinf import ModelRunner
 
             # Random engines bypass Pi05Policy.from_pretrained, so this synthetic
             # benchmark is the sole caller that must resolve the package default.
@@ -341,7 +341,7 @@ def main() -> None:
                 # Synthetic FP8 has no calibration file; a uniform scale keeps the
                 # FP8 path on (the kernel falls back to a default tactic).
                 calibration = "uniform:1.0"
-            handle = Model.random(
+            handle = ModelRunner.random(
                 model=args.model,
                 device=args.device,
                 compute_variant=args.compute_variant,
@@ -415,7 +415,7 @@ def main() -> None:
                 compute_variant=args.compute_variant,
                 **{name: value for name, value in options.items() if value is not None},
             )
-            handle = policy.model
+            handle = policy.model_runner
             rng = np.random.default_rng(0)
             model_type = str(policy.metadata.get("model_type", "pi05"))
             image_keys = tuple(

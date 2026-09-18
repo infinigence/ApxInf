@@ -197,6 +197,34 @@ CUDA-feature typechecking and dependency guards passed. Details are tracked
 separately in baseline.md. Session G additionally completes final-source Thor performance qualification
 and closes the earlier contention blocker; historical samples remain recorded.
 
+### PI0.5 naming follow-up
+
+The naming-only follow-up uses `model_runner/Pi05ModelRunner` for lifecycle and
+execution ownership, `model/Pi05Model<B>` for forward computation, and
+`model/variant.rs::ModelVariant` for precision dispatch. The Python binding is
+`apxinf.ModelRunner` (the re-export of `apxinf_py.ModelRunner`); policy injection
+and access use `model_runner`. Per-timestep modulation data is `StepModulation`.
+The existing Rust `AutoModel` factory and `LoadedModel` result keep their names.
+No wrapper, resource ownership or computation is added. See the
+[canonical mapping and call relationships](architecture.md#canonical-names-and-pythonrust-relationship).
+Rebuild the native extension and update Python callers together.
+
+The candidate records above and GPU qualification below retain their historical
+source names and revisions. Local verification of the rename includes 108 Rust
+CPU tests, 242 Python tests, CUDA-feature typechecks and actual binding import.
+
+The naming snapshot `a5f7e84ded89` (uncommitted changes on `830d188`) additionally
+passes native Thor release builds, 8 model/runner/lifecycle/backend tests, all
+three precision public smokes, and 7 fixed-input full-output comparisons.
+All compared outputs match the preserved pre-rename outputs exactly (max_abs=0),
+including eager/graph agreement. The rebuilt Python binding passes 7 real
+policy/tokenizer/calibration tests and 7 GPU binding/L0-L1 tests with zero skips;
+the official OpenPI websocket round-trip/health test also passes. The 23 cached
+CUDA objects and kernel archive retain their audited hashes. No dedicated
+performance qualification is claimed for this naming follow-up.
+Evidence is under `devlocal/pi05-module-naming/thor-20260917/`; the implementation
+report remains under `devlocal/pi05-module-naming/reports/`.
+
 ### Stage 2 exit checklist (final PI0.5 candidate)
 
 | Requirement | Current result |
@@ -360,7 +388,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Complete: execution/network/weights encapsulation, no runtime adapters, shared preparation and compute_variant | Final module functionality qualified on both hosts; Thor final-source performance qualified in G; Orin performance retains D evidence | Current tree, breaking interfaces and contracts recorded |
+| PI0.5 | Complete: model_runner/model/weights encapsulation, no runtime adapters, shared preparation and compute_variant | Final module functionality qualified on both hosts; Thor final-source performance qualified in G; Orin performance retains D evidence | Current tree, breaking interfaces and contracts recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |

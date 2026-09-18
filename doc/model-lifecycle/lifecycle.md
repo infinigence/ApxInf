@@ -4,7 +4,7 @@ Status: target specification plus explicitly marked implemented slices. Current-
 module responsibilities are in [architecture.md](architecture.md).
 Implementation order and tracking are in [migration.md](migration.md).
 
-当前 PI0.5 的[完整 Session 时序与 prepare 参数](#implemented-pi05-preparation-contract)
+当前 PI0.5 的[完整 ModelRunner 时序与 prepare 参数](#implemented-pi05-preparation-contract)
 在 implemented 章节；前面的跨模型生命周期仍是历史对比和目标规范。
 
 ## Current lifecycle differences at upstream/main 7baa69b
@@ -249,22 +249,22 @@ policy methods; their default status is RuntimeManaged, never a fabricated Ready
 Python processing and action decoding are unchanged; PI0.5 loading uses the new
 compute_variant field. See the architecture document for breaking entry changes.
 
-### Session 生命周期：准备、执行、失效与释放
+### ModelRunner 生命周期：准备、执行、失效与释放
 
-Session 是长期对象；`execution/prepare.rs` 是被调用的模块，没有一个长期运行的 Prepare
-对象。Session 决定执行策略并分配请求输入/noise buffer；prepare 模块负责 graph
-workspace、固定 styles、预热、录制和 CapturedGraph 封装。PreparedInference
+ModelRunner 是长期对象；`model_runner/prepare.rs` 是被调用的模块，没有一个长期运行的 Prepare
+对象。ModelRunner 决定执行策略并分配请求输入/noise buffer；prepare 模块负责 graph
+workspace、固定 modulation、预热、录制和 CapturedGraph 封装。PreparedInference
 是准备结果，既可以使用 Eager，也可以使用 Graph。
 时序图从上向下阅读：实线箭头是调用/操作，虚线箭头是返回；
 alt 是互斥分支，opt 是满足条件才执行。它们与类图的持有箭头含义不同。
 
 ```mermaid
 sequenceDiagram
-    participant U as Rust 调用方或 native Model
-    participant S as Pi05Session
-    participant C as network/LoadedCompute
-    participant P as execution/prepare.rs
-    participant N as Network
+    participant U as Rust 调用方或 native ModelRunner
+    participant S as Pi05ModelRunner
+    participant C as model/ModelVariant
+    participant P as model_runner/prepare.rs
+    participant N as Model
     participant R as PreparedInference
     participant G as CapturedGraph
 
@@ -299,15 +299,15 @@ sequenceDiagram
         alt mode 为 Eager
             S->>R: 创建 Eager 计划并保留输入资源
         else mode 为 PreferGraph 或 RequireGraph
-            S->>P: capture_loaded(compute, spec, buffers)
-            P->>C: with_network(CaptureOperation)
-            C->>P: operation.run(network, embeddings)
-            Note over C,P: 静态泛型回调；network 不导入 execution
-            P->>N: 读取 Blocks 资源需求，准备 styles
+            S->>P: capture_loaded(model, spec, buffers)
+            P->>C: with_model(CaptureOperation)
+            C->>P: operation.run(model, embeddings)
+            Note over C,P: 静态泛型回调；model 不导入 model_runner
+            P->>N: 读取 Blocks 资源需求，准备 modulation
             P->>P: 分配 workspace 和录制所需资源
             P->>N: 预热并录制（禁止 autotune）
             alt 录制成功
-                P->>G: 保留 graph、buffer、workspace、Network/styles
+                P->>G: 保留 graph、buffer、workspace、Model/modulation
                 P-->>S: CapturedGraph（内部静态派发完成后）
                 S->>R: 创建 Graph 计划
             else 录制失败且 PreferGraph
@@ -339,11 +339,11 @@ sequenceDiagram
             C->>N: infer(inputs)
             N-->>R: 设备输出
         end
-        Note over U,R: 成功时返回 Action；便利调用经 Session 返回
+        Note over U,R: 成功时返回 Action；便利调用经 ModelRunner 返回
     end
-    U->>S: clear_prepared() 或释放 Session
+    U->>S: clear_prepared() 或释放 ModelRunner
     S->>S: 释放隐式缓存引用
-    Note over U,G: 显式计划仍可持有资源；没有计划到 Session 的反向引用
+    Note over U,G: 显式计划仍可持有资源；没有计划到 ModelRunner 的反向引用
     U->>R: 释放最后一个计划引用
     Note over R,G: 释放拥有的资源；仍持有的输出 Tensor 可能继续保留 arena
 ```
@@ -360,11 +360,11 @@ sequenceDiagram
 | prepare(spec) | 等价于 prepare_with_policy(spec, PreferGraph)；已知规格，使用默认策略 |
 | prepare_with_policy(spec, mode) | 不做样本调优；已有 tactics 或使用默认选择，需要明确控制执行方式 |
 | prepare_for(sample, mode) | 从样本提取 spec；仅后端加载时开启 autotune 才先进行允许调优的样本执行 |
-| Session.infer(request) | 维护最近一个隐式计划；缓存有效则跳过准备，否则按需样本调优再以 PreferGraph 建计划 |
-| LoadedCompute.infer(inputs) | 只转发到对应 Network，不检查计划缓存，也不自动 prepare |
+| ModelRunner.infer(request) | 维护最近一个隐式计划；缓存有效则跳过准备，否则按需样本调优再以 PreferGraph 建计划 |
+| ModelVariant.infer(inputs) | 只转发到对应 Model，不检查计划缓存，也不自动 prepare |
 
 三个显式 prepare 均返回 `Result<Box<dyn PreparedInference>>`，创建独立计划，
-不查询或填入 Session.infer 的隐式缓存。`autotune=true` 在加载时选择后端 AutoTune
+不查询或填入 ModelRunner.infer 的隐式缓存。`autotune=true` 在加载时选择后端 AutoTune
 模式；调优选择算子 tactics，不训练、不改权重，已有条目可以复用。它与 Eager/Graph
 是独立选项。prepare_with_policy 的预热/录制以及计划 run 均禁止 autotune。
 
@@ -377,15 +377,15 @@ sequenceDiagram
 `strategy` 是 `Eager(EagerInputs)` 或 `Graph(CapturedGraph)`；Graph 分支就是 enum
 变体，不是额外阶段。`status()` 返回 Ready(Eager/Graph) 或 Invalidated，不是准备
 进度条。tactics store 身份或 generation 变化会使计划失效；显式 run 报错，由调用方
-重新准备，便利 Session.infer 则自动替换失效缓存。
+重新准备，便利 ModelRunner.infer 则自动替换失效缓存。
 
 所谓 RNG buffer 更准确地说是**初始噪声 buffer**：prepare 分配固定地址并绑定生成器，
 每次 run 根据 seed/sequence/draw 生成噪声，或复制用户提供的噪声。复用地址不代表
 复用噪声值。样本调优使用的图像与 token 也不会固定到后续计划中。
 
-`execution/prepare.rs` 的内部 capture 共用一条录制机制；公开 capture_patches/capture_rgb
+`model_runner/prepare.rs` 的内部 capture 共用一条录制机制；公开 capture_patches/capture_rgb
 仅按输入形式提供两个低层入口，不是三个录制阶段。普通 Python Pi05Policy.infer
-经过 Model.infer_rgb 调用 Session.infer，默认 PreferGraph；当前 Python Policy
+经过绑定 ModelRunner.infer_rgb 调用 Pi05ModelRunner.infer，默认 PreferGraph；当前 Python Policy
 没有直接暴露上述显式 prepare / ExecutionPolicy 选项。
 
 ```rust
@@ -418,8 +418,8 @@ match plan.status() {
 | Ready | Fixed spec and current tuning store identity/generation; not readiness for all shapes or models |
 | Tactic store replacement or generation changes | Graph and eager plans report Invalidated; run rejects them |
 | Invalid input | Run returns an error without automatic plan eviction or recapture |
-| execution_mode on Session | Reports the implicit cache only; use plan.status() for explicitly owned plans |
-| clear_prepared | Synchronizes and evicts the session's implicit cache; caller-owned plans and output allocation views remain alive |
+| execution_mode on ModelRunner | Reports the implicit cache only; use plan.status() for explicitly owned plans |
+| clear_prepared | Synchronizes and evicts the runner's implicit cache; caller-owned plans and output allocation views remain alive |
 | Request reset | PI0.5 binds every input and full RNG key per call; no implicit episode counter to reset |
 | Output | Device tensor; captured result aliases reusable output storage until next run; Tensor clone is not a value snapshot |
 | Concurrency | Fixed-buffer plans run serially; thread-local tuning suppression does not add thread safety |
@@ -432,20 +432,20 @@ lifecycle guarantees above remain targets until separately implemented and teste
 
 ### Stage 2 resource preparation and invalidation details
 
-The complete sequence above replaces the previous diagram that merged Network
+The complete sequence above replaces the previous diagram that merged Model
 and prepare into one participant. CUDA backend capture uses a scoped cleanup
 mechanism: errors/unwind end and discard capture, and known capture errors are
-cleared before later execution. Session calls execution/prepare, which uses the internal NetworkOperation seam
-to run the selected Network. Network does not depend on execution or a
+cleared before later execution. ModelRunner calls model_runner/prepare, which uses the internal ModelOperation seam
+to run the selected Model. Model does not depend on model_runner or a
 long-lived preparation object.
 
 
 Graph handles are in-process objects, not serialized cache files. The captured
-resource owner retains Network and therefore every referenced fixed weight,
-plus workspace, style tensors, input buffers and reusable output. Request data
-is rebound before replay. Dropping the Session does not invalidate a separately
+resource owner retains Model and therefore every referenced fixed weight,
+plus workspace, modulation tensors, input buffers and reusable output. Request data
+is rebound before replay. Dropping the ModelRunner does not invalidate a separately
 owned prepared plan. Retained plans may therefore keep considerable GPU memory
-alive; explicit cache eviction releases only the Session's implicit plan.
+alive; explicit cache eviction releases only the ModelRunner's implicit plan.
 A captured output Tensor also owns a view of the arena allocation. Keeping that
 Tensor can retain the entire arena after the plan is dropped. Consume/copy the
 value and release old output handles as well as plans when measuring memory

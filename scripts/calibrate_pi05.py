@@ -207,7 +207,7 @@ def resolve_observations(args, policy):
     """Resolve one CLI source into replayable public Observations plus identity."""
     if args.zero_fixture:
         observation = {
-            key: np.zeros((policy.model.image_size, policy.model.image_size, 3), np.uint8)
+            key: np.zeros((policy.model_runner.image_size, policy.model_runner.image_size, 3), np.uint8)
             for key in policy.image_keys
         }
         observation[policy.prompt_key] = "synthetic calibration fixture"
@@ -255,7 +255,7 @@ def load_observations(args, policy) -> Iterable[Mapping[str, object]]:
 def deterministic_noise(policy, seed: int, sample_index: int) -> np.ndarray:
     rng = np.random.default_rng(np.random.SeedSequence([seed, sample_index]))
     return np.ascontiguousarray(
-        rng.standard_normal((policy.model.action_horizon, policy.model.action_dim)),
+        rng.standard_normal((policy.model_runner.action_horizon, policy.model_runner.action_dim)),
         dtype=np.float32,
     )
 

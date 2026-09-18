@@ -71,14 +71,14 @@ impl Pi05CalibrationObserver {
         insert(&weights.time_mlp_in.weight, "time.input".into())?;
         insert(&weights.time_mlp_out.weight, "time.hidden".into())?;
         for layer in &weights.action_layers {
-            insert(&layer.input_style.weight, "action.conditioning".into())?;
+            insert(&layer.input_modulation.weight, "action.conditioning".into())?;
             insert(
-                &layer.post_attention_style.weight,
+                &layer.post_attention_modulation.weight,
                 "action.conditioning".into(),
             )?;
         }
         insert(
-            &weights.action_final_style.weight,
+            &weights.action_final_modulation.weight,
             "action.conditioning".into(),
         )?;
         for (layer, names) in weights.action_layers.iter().zip(plan.action_layers()) {
@@ -170,10 +170,10 @@ mod tests {
 }
 
 use super::blocks::Bf16Blocks;
-use super::Pi05Network;
+use super::Pi05Model;
 use crate::pi05::backend::DeviceBuffer as CudaBuffer;
-impl Pi05Network<Bf16Blocks> {
-    /// Explicit diagnostic traversal of the same Network; no second model body.
+impl Pi05Model<Bf16Blocks> {
+    /// Explicit diagnostic traversal of the same Model; no second model body.
     pub fn calibrate(
         &self,
         patches: &Tensor,

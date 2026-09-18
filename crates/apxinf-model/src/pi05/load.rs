@@ -1,5 +1,5 @@
-//! Load PI0.5 assets and assemble the computation and execution modules.
-use super::network::LoadedCompute;
+//! Load PI0.5 assets and assemble the computation and model_runner modules.
+use super::model::ModelVariant;
 use super::*;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Result};
@@ -12,16 +12,16 @@ pub(super) fn load_registered(
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    Ok(LoadedModel::Vla(Box::new(load_session(
+    Ok(LoadedModel::Vla(Box::new(load_model_runner(
         path, backend, options,
     )?)))
 }
 
-pub(super) fn load_session(
+pub(super) fn load_model_runner(
     path: &Path,
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
-) -> Result<Pi05Session> {
+) -> Result<Pi05ModelRunner> {
     let backend = crate::accelerator::cuda::downcast_arc(backend)
         .ok_or_else(|| Error::Other("PI0.5 is only registered for CUDA".into()))?;
     let cuda = &*backend;
@@ -65,7 +65,7 @@ pub(super) fn load_session(
         compute_variant.as_str()
     );
 
-    let compute = match compute_variant {
+    let model = match compute_variant {
         ComputeVariant::Fp8Static => {
             let scales = if let Some(scale) = options.uniform_fp8_scale {
                 Arc::new(Fp8StaticActivationScales::uniform(&config, scale)?)
@@ -90,8 +90,8 @@ pub(super) fn load_session(
                 config.language_dual_geglu_shape_possible(),
             )?);
             let time_embeddings = Arc::new(upload_time_embeddings_fp8_static(&config, &*backend)?);
-            LoadedCompute::Fp8Static {
-                network: build_fp8_static_network(
+            ModelVariant::Fp8Static {
+                model: build_fp8_static_model(
                     Arc::clone(&backend),
                     Arc::clone(&config),
                     weights,
@@ -107,8 +107,8 @@ pub(super) fn load_session(
                 config.language_dual_geglu_shape_possible(),
             )?);
             let time_embeddings = Arc::new(upload_time_embeddings_bf16(&config, &*backend)?);
-            LoadedCompute::Bf16 {
-                network: build_bf16_network(Arc::clone(&backend), Arc::clone(&config), weights)?,
+            ModelVariant::Bf16 {
+                model: build_bf16_model(Arc::clone(&backend), Arc::clone(&config), weights)?,
                 time_embeddings,
             }
         }
@@ -116,8 +116,8 @@ pub(super) fn load_session(
             let weights = Arc::new(Int8DynamicWeights::from_host(&host_weights, cuda)?);
             let time_embeddings =
                 Arc::new(upload_time_embeddings_int8_dynamic(&config, &*backend)?);
-            LoadedCompute::Int8Dynamic {
-                network: build_int8_dynamic_network(
+            ModelVariant::Int8Dynamic {
+                model: build_int8_dynamic_model(
                     Arc::clone(&backend),
                     Arc::clone(&config),
                     weights,
@@ -128,7 +128,7 @@ pub(super) fn load_session(
         ComputeVariant::Auto => unreachable!("automatic precision was resolved"),
     };
 
-    Ok(Pi05Session::new(backend, config, compute))
+    Ok(Pi05ModelRunner::new(backend, config, model))
 }
 
 fn artifact_root(path: &Path) -> &Path {

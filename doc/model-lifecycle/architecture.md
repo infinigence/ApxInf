@@ -165,9 +165,9 @@ a global enum of every model's variants or a registration framework.
 and BF16 otherwise. Explicit choices retain existing kernel fallback behavior;
 this selection rule is not a declaration that all hardware/profile combinations
 are qualified. The resolved ID is logged. The loader creates matching Blocks and
-injects them into `Pi05Network::from_blocks`. Selection and typed dispatch are
-split by lifetime: `load.rs` selects during loading, while `network/compute.rs`
-owns typed execution dispatch. Session and the model dataflow do not match variants.
+injects them into `Pi05Model::from_blocks`. Selection and typed dispatch are
+split by lifetime: `load.rs` selects during loading, while `model/variant.rs`
+owns typed execution dispatch. Pi05ModelRunner and the model dataflow do not match variants.
 
 Each value selects a complete compute implementation, including numerical
 formats and preparation requirements. `fp8_static` means fixed calibration-based
@@ -265,6 +265,66 @@ compatibility types. This view describes the refactor branch, not unmigrated
 families. The implemented CPU/CUDA checks and native qualification status are
 tracked separately in [baseline.md](baseline.md).
 
+### Canonical names and Python/Rust relationship
+
+The current names distinguish the model's forward computation from the runner
+that prepares and executes it. This naming migration preserves the existing
+objects, resource ownership and call order; it introduces no additional wrapper.
+
+| Previous name | Current name | Responsibility |
+| --- | --- | --- |
+| `apxinf.Model` / `apxinf_py.Model` / PyO3 `Model` | `ModelRunner` | One native Python type, re-exported by `apxinf`; input/output conversion and calls into Rust |
+| `Pi05Session` / `execution/` | `Pi05ModelRunner` / `model_runner/` | PI0.5 preparation, execution resources, implicit cache and inference |
+| `Pi05Network<B>` / `network/` | `Pi05Model<B>` / `model/` | Shared model forward computation |
+| `LoadedCompute` / `network/compute.rs` | `ModelVariant` / `model/variant.rs` | Runtime choice of a loaded precision-specific model and fixed time embeddings |
+| `BareModel` | `ModelRunnerProtocol` | Python policy's structural runner contract |
+| `policy.model`, injected `model=` | `policy.model_runner`, injected `model_runner=` | Policy's reference to the native runner |
+| `Styles` / `*StepStyles` | `StepModulation` / `*StepModulation` | Per-timestep scale/shift/gate tensors for adaptive RMSNorm and gated residuals |
+
+`AutoPolicy` selects a Python policy; there is no Python `AutoModel` class.
+The binding's `ModelRunner.load` calls the separate Rust `AutoModel::load_model`
+factory. That factory selects a registered model loader and returns the existing
+`LoadedModel::{Text, Vla}` enum. For PI0.5, its VLA value contains a
+`Pi05ModelRunner` through `Box<dyn VlaRuntime>`. `LoadedModel` is a
+heterogeneous loading result, not another execution layer or a Worker.
+
+Python provides `Pi05Policy`, not a Python `Pi05Model` network implementation.
+The policy chooses model-specific preprocessing and action decoding; Rust chooses
+the network and precision implementation. The binding `ModelRunner` and concrete
+`Pi05ModelRunner` are distinct owning objects, not duplicate copies of weights.
+`AutoPolicy` and `AutoModel` are construction entry points and are absent from
+the per-inference call chain.
+
+`StepModulation` is derived from fixed weights and a timestep's conditioning
+vector. Each action layer has attention and MLP modulation, plus the final norm
+modulation. It is computed data, distinct from the learned projection weights;
+it can be precomputed because it does not depend on the observation or noise.
+OpenPI calls the projected vector `modulation`, split into `scale`, `shift` and
+`gate`; PI0.5 uses adaptive RMSNorm rather than LayerNorm.
+
+The native binding must be rebuilt together with the Python package for these
+public renames. Model-family load arguments such as `model="pi05"`, checkpoint
+keys, calibration formats and `compute_variant` values retain their meaning.
+
+### CPU helpers in `pi05/math.rs`
+
+[`math.rs`](../../crates/apxinf-model/src/pi05/math.rs) is directly under `pi05/`,
+alongside `model/`, `model_runner/` and `weights/`. It is compiled without the
+`cuda` feature and its four functions are re-exported by `pi05/mod.rs`:
+
+| Function | Purpose and current caller |
+| --- | --- |
+| `sinusoidal_time_embedding` | Generates the fixed flow timestep embeddings used by `model/variant.rs` during loading; uses float64 intermediate arithmetic to match OpenPI |
+| `discretize_state` | CPU utility matching NumPy state binning, including boundary behavior; exercised by CPU tests |
+| `pi05_prompt` | CPU reference for task normalization and optional state-to-prompt formatting; calls `discretize_state` |
+| `euler_flow_step` | CPU reference for `x -= velocity / num_steps`; tests the reverse-time sign |
+
+The current Python input pipeline uses `processors/tokenize.py`, not bindings to
+the Rust state/prompt utilities. Production GPU action updates live in the Block
+implementations and kernels, not this CPU Euler helper. This file is neither an
+execution layer nor a second model implementation. Its five unit tests can run
+with `cargo test -p apxinf-model --no-default-features pi05::math::tests --lib`.
+
 ### 对象关系：谁持有谁
 
 本图只表达持有关系，不表达加载顺序或调用顺序。`*--` 实心菱形表示
@@ -279,7 +339,7 @@ classDiagram
         output_pipeline
         infer(observation)
     }
-    class Model {
+    class ModelRunner {
         LoadedModel model
     }
     class LoadedModel {
@@ -287,8 +347,8 @@ classDiagram
         Text
         Vla
     }
-    class Pi05Session {
-        LoadedCompute compute
+    class Pi05ModelRunner {
+        ModelVariant model
         optional prepared_cache
         infer(request)
         prepare_with_policy(spec, execution_policy)
@@ -296,20 +356,20 @@ classDiagram
     }
     class Pi05PreparedInference {
         InferenceSpec spec
-        LoadedCompute compute
+        ModelVariant model
         ExecStrategy strategy
         status()
         run(request)
     }
-    class LoadedCompute {
+    class ModelVariant {
         <<enum>>
         Bf16
         Fp8Static
         Int8Dynamic
         infer(inputs)
-        with_network(operation)
+        with_model(operation)
     }
-    class Pi05Network {
+    class Pi05Model {
         B blocks
         infer(inputs)
     }
@@ -332,37 +392,37 @@ classDiagram
         graph
         workspace
         stable_inputs_outputs
-        retained_network_and_styles
+        retained_model_and_modulation
         replay()
     }
-    Pi05Policy *-- Model : native 模型句柄
-    Model *-- LoadedModel
-    LoadedModel *-- Pi05Session : Vla 中的具体对象
-    Pi05Session *-- LoadedCompute
-    Pi05Session o-- Pi05PreparedInference : Rc 最近一个隐式计划
-    Pi05PreparedInference *-- LoadedCompute
+    Pi05Policy *-- ModelRunner : native 模型句柄
+    ModelRunner *-- LoadedModel
+    LoadedModel *-- Pi05ModelRunner : Vla 中的具体对象
+    Pi05ModelRunner *-- ModelVariant
+    Pi05ModelRunner o-- Pi05PreparedInference : Rc 最近一个隐式计划
+    Pi05PreparedInference *-- ModelVariant
     Pi05PreparedInference *-- ExecStrategy
-    LoadedCompute o-- Pi05Network : Arc 三选一
-    Pi05Network *-- BlocksImplementation : 泛型 B
+    ModelVariant o-- Pi05Model : Arc 三选一
+    Pi05Model *-- BlocksImplementation : 泛型 B
     BlocksImplementation o-- DeviceWeights : Arc 对应实现
     ExecStrategy *-- CapturedGraph : 仅 Graph 变体
-    CapturedGraph o-- Pi05Network : 保持固定资产存活
+    CapturedGraph o-- Pi05Model : 保持固定资产存活
 ```
 
-`Pi05Policy` 在 Python 层，`Model` 是 native binding 对象，其余是 Rust 类型。
+`Pi05Policy` 在 Python 层，`ModelRunner` 是 native binding 对象，其余是 Rust 类型。
 `BlocksImplementation` 和 `DeviceWeights` 仅为图中的分组，不是实际基类；
-三种 Blocks 分别实现 `Blocks` 与 `PrepareBlocks` trait。`Pi05Network<B>`
-共享一份源码，由 Rust 静态特化。`LoadedCompute` 是带数据的 enum，其方法集中
-转发到对应 Network，不重复实现模型数学计算，也不管理计划缓存。
+三种 Blocks 分别实现 `Blocks` 与 `PrepareBlocks` trait。`Pi05Model<B>`
+共享一份源码，由 Rust 静态特化。`ModelVariant` 是带数据的 enum，其方法集中
+转发到对应 Model，不重复实现模型数学计算，也不管理计划缓存。
 
-- **Policy = Model + 输入/输出 pipelines**。Model 不包含 tokenizer 或动作反归一化。
-- **Model 间接持有 Session**，是包含执行状态的用户侧句柄。`LoadedModel::Vla`
+- **Policy = ModelRunner + 输入/输出 pipelines**。ModelRunner 不包含 tokenizer 或动作反归一化。
+- **绑定 ModelRunner 间接持有 Pi05ModelRunner**，是包含执行状态的用户侧句柄。`LoadedModel::Vla`
   是统一容器的一个变体，不是另一个名叫 LoadedVla 的执行对象。
-- **LoadedCompute 是 PI0.5 内部的已加载计算实现**，含 Network 和时间嵌入。
-  `LoadedModel` 区分 Text/VLA 接口；`LoadedCompute` 区分 PI0.5 的计算实现。
-- **Session 和计划没有互相持有**。计划不引用 Session；两者共享 Network。
-  清除隐式缓存或释放 Session，不会销毁调用方仍持有的显式计划。
-- **CapturedGraph 拥有 graph 和工作区，并保留 Network 引用**。CUDA Graph 使用
+- **ModelVariant 是 PI0.5 内部的已加载计算实现**，含 Model 和时间嵌入。
+  `LoadedModel` 区分 Text/VLA 接口；`ModelVariant` 区分 PI0.5 的计算实现。
+- **Pi05ModelRunner 和计划没有互相持有**。计划不引用 Pi05ModelRunner；两者共享 Pi05Model。
+  清除隐式缓存或释放 ModelRunner，不会销毁调用方仍持有的显式计划。
+- **CapturedGraph 拥有 graph 和工作区，并保留 Model 引用**。CUDA Graph 使用
   设备地址，不会自动替 Rust 持有权重；这条引用链防止 graph 活着而权重先释放。
   共享引用不复制权重。graph 先于其引用的内存释放。
 
@@ -370,14 +430,15 @@ classDiagram
 
 AutoPolicy 选择 Policy 类；AutoModel 是统一 native 加载入口，也接受明确的
 模型名称。它们不是必须成对使用的对象。直接调用 Pi05Policy 只跳过 AutoPolicy；
-当前没有独立的 Python Pi05Model 类。所有分派发生在加载时，不是每次推理时。
+当前没有独立的 Python Pi05Model 类。模型家族和精度实现在加载时选定；
+推理时仍通过 LoadedModel/VlaRuntime 和 ModelVariant 转发到已选定的实现。
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
     participant AP as AutoPolicy
     participant P as Pi05Policy
-    participant M as Model.load
+    participant M as ModelRunner.load
     participant A as AutoModel
     participant L as pi05/load.rs
     alt 自动选择 Policy
@@ -387,32 +448,33 @@ sequenceDiagram
         U->>P: from_pretrained(model_dir)
     end
     P->>P: 解析模型与处理器元数据
-    opt 未注入现成的 Model
+    opt 未注入现成的 ModelRunner
         P->>M: load(pi05, checkpoint, options)
         M->>A: load_model(device, path, options)
         A->>L: 按明确模型名称分派
         L->>L: 读取 config、checkpoint、calibration
-        L->>L: 创建设备权重、Blocks、Network、时间嵌入
-        L->>L: 包装 LoadedCompute，创建 Pi05Session
-        L-->>A: LoadedModel::Vla(Session)
+        L->>L: 创建设备权重、Blocks、Model、时间嵌入
+        L->>L: 包装 ModelVariant，创建 Pi05ModelRunner
+        L-->>A: LoadedModel::Vla(Pi05ModelRunner)
         A-->>M: LoadedModel
-        M-->>P: Model 句柄
+        M-->>P: ModelRunner 句柄
     end
     P->>P: 完成 pipelines 并组装 Policy
     P-->>U: Policy（经 AutoPolicy 或直接返回）
 ```
 
-`Model.load()` 返回 Model，不返回 LoadedCompute。普通 Python 调用为
+`ModelRunner.load()` 返回 ModelRunner，不返回 ModelVariant。普通 Python 调用为
 `policy = Pi05Policy.from_pretrained(path, compute_variant="bf16")`，随后
-`policy.infer(observation)`。它执行 input_pipeline → Model.infer_rgb →
-Session.infer → output_pipeline。处理后的 observation 还会传给输出 pipeline，
+`policy.infer(observation)`。它执行 input_pipeline → 绑定 ModelRunner.infer_rgb →
+LoadedModel.infer_host_f32 → Pi05ModelRunner.infer_host_f32 →
+Pi05ModelRunner.infer → output_pipeline。处理后的 observation 还会传给输出 pipeline，
 供状态相关的机器人适配使用。encode/decode 是概念描述，不是同名 Rust 接口。
 
 ### 权重结构与归属
 
 `weights/host.rs` 的 `Pi05Weights` 是共同的 PI0.5 checkpoint 逻辑树：vision、
 language_layers、action_layers、norm、action_in/out 和 time_mlp_in/out。
-加载时转换为三种并列的设备结构，由对应 Blocks 持有，Network 不访问具体布局。
+加载时转换为三种并列的设备结构，由对应 Blocks 持有，Model 不访问具体布局。
 
 | 文件 | 内容 |
 | --- | --- |
@@ -425,7 +487,7 @@ language_layers、action_layers、norm、action_in/out 和 time_mlp_in/out。
 
 静态 FP8 的激活 scales 来自校准；动态 INT8 的激活 scales 在运行时按行生成，
 权重 scales 仍固定。每种设备文件内部包含 linear 子模块和模型聚合结构，
-没有另建三套 Network，也没有把通用打包操作放在某个 dtype 的文件下。
+没有另建三套 Model，也没有把通用打包操作放在某个 dtype 的文件下。
 
 ```text
 pi05/
@@ -435,14 +497,14 @@ pi05/
   backend.rs                   model-wide accelerator seam
   math.rs                      CPU-capable model math helpers
 
-  execution/
-    mod.rs                     Session / plan / low-level capture exports
-    session.rs                 private state, input binding, cache and validity
+  model_runner/
+    mod.rs                     ModelRunner / plan / low-level capture exports
+    runner.rs                  private state, input binding, cache and validity
     prepare.rs                 allocation, warmup, capture and graph ownership
 
-  network/
+  model/
     mod.rs                     model dataflow and computation/resource interface
-    compute.rs                 construction, LoadedCompute and static dispatch
+    variant.rs                 construction, ModelVariant and static dispatch
     calibration.rs             private BF16 observer and diagnostic traversal
     blocks/
       mod.rs                   semantic Blocks contract
@@ -462,7 +524,7 @@ pi05/
 ```
 
 The tree has 22 Rust files (20 before this module encapsulation); the model
-root has five files. The extra files are execution/mod.rs and network/compute.rs,
+root has five files. The extra files are model_runner/mod.rs and model/variant.rs,
 which provide module ownership and loaded-computation dispatch rather than new
 per-layer abstractions. Each device-weight file groups its linear storage in
 an internal module and its aggregate model tree in the same file. Backbone/layer
@@ -470,41 +532,41 @@ code also remains grouped per variant instead of expanding into many one-functio
 files. Cross-model matrix/view reuse remains a later evidence-driven extraction;
 PI0.5's own weight organization is complete in this stage.
 
-Network owns the full model order and flow step count/dt. Blocks own backbone
-layer loops, fusion, physical layout and fixed weights. The model dataflow methods depend on the Blocks contract; the network module
-exports and compute adapter select concrete implementations. BF16-only calibration
-traversal lives privately in network/calibration.rs.
-Rust statically specializes the Network for each implementation. `network/compute.rs` wraps
-these types for the public Session; no per-layer virtual calls are introduced.
+Model owns the full model order and flow step count/dt. Blocks own backbone
+layer loops, fusion, physical layout and fixed weights. The model dataflow methods depend on the Blocks contract; the model module
+exports and ModelVariant dispatch select concrete implementations. BF16-only calibration
+traversal lives privately in model/calibration.rs.
+Rust statically specializes the Model for each implementation. `model/variant.rs` wraps
+these types for the public ModelRunner; no per-layer virtual calls are introduced.
 
 Blocks report workspace requirements and perform their native input conversion.
-Session allocates request/noise buffers; `execution/prepare.rs` allocates graph workspace
-and capture-specific resources, prepares fixed styles, warms up until tactics
+ModelRunner allocates request/noise buffers; `model_runner/prepare.rs` allocates graph workspace
+and capture-specific resources, prepares fixed modulation, warms up until tactics
 stabilize, captures with the shared CUDA scope, and returns a single CapturedGraph
-for every variant. Its erased fixed-resource owner retains the concrete Network
-and style tensors; this erases ownership storage only, not computation dispatch.
+for every variant. Its erased fixed-resource owner retains the concrete Model
+and modulation tensors; this erases ownership storage only, not computation dispatch.
 The executable graph is dropped before the memory it references.
 
-Session owns the preparation policy, request validation, RNG rebinding, tactic
+ModelRunner owns the preparation policy, request validation, RNG rebinding, tactic
 invalidation and implicit cache. It does not choose FP8/INT8 implementations or
 manage separate precision graph types. There is no replacement runtime facade.
-Low-level diagnostic callers construct a Network with `build_*_network`, call
+Low-level diagnostic callers construct a Model with `build_*_model`, call
 its computation methods, and explicitly use `capture_patches` or `capture_rgb`.
 Ordinary callers use AutoModel and prepare/run.
 
 ### 与周边 crate 的 Interface / seam
 
-PI0.5 位于 `apxinf-model` crate；execution、network、weights 是它内部的三个 Rust
+PI0.5 位于 `apxinf-model` crate；model_runner、model、weights 是它内部的三个 Rust
 module，不是三个 crate。模型层定义模型语义与执行生命周期，CUDA crate 提供设备
 资源和算子。当前实际连接的是 **apxinf-cuda**，不是 apxinf-cuda-new。
 
 ```mermaid
 flowchart TD
-    U[Python Policy / native Model] -->|已处理的请求与结果| M[apxinf-model：PI0.5]
+    U[Python Policy / native ModelRunner] -->|已处理的请求与结果| M[apxinf-model：PI0.5]
     C[apxinf-core：Tensor、Backend、Graph 等契约] -.-> M
     L[apxinf-loader：checkpoint 读取] -->|CPU Tensor| W[pi05/weights]
-    M --> E[execution：执行资源]
-    M --> N[network：计算流程]
+    M --> E[model_runner：执行资源]
+    M --> N[model：计算流程]
     M --> W
     E --> B[pi05/backend.rs：模型级导入 seam]
     N --> B
@@ -516,7 +578,7 @@ flowchart TD
 
 | 对接方 | Interface 与职责 |
 | --- | --- |
-| Python Policy / apxinf-py | processors 留在 Policy；native Model 持有 LoadedModel::Vla，向 Session 传模型请求，接收动作输出 |
+| Python Policy / apxinf-py | processors 留在 Policy；native ModelRunner 持有 LoadedModel::Vla，向 Pi05ModelRunner 传模型请求，接收动作输出 |
 | apxinf-core | 提供 Tensor、Device、Backend、Graph、RNG 等基础类型和契约；加载入口使用 Arc&lt;dyn Backend&gt; |
 | apxinf-loader | 读取 SafeTensors 等资产；PI0.5 weights 解释 checkpoint 键名、形状和模型专属转换 |
 | apxinf-cuda | 实现 CUDA buffer/传输、graph scope、workspace、tactics 和算子；不决定 PI0.5 的 vision/prefix/flow 顺序 |
@@ -526,10 +588,10 @@ flowchart TD
 `DeviceBuffer` 对应 `CudaBuffer`。Blocks 通过 `kernels` 直接调用 CUDA 专属算子，
 不要求把融合算子都塞进通用 Backend trait，也不增加逐层动态派发。
 
-具体使用分工：weights 转换/打包并上传固定资产；network/Blocks 调用计算算子；
-execution 管理输入、RNG、workspace、预热、capture 和 replay。底层分配、传输及
-capture 清理由 CUDA crate 实现。backend.rs 只集中导入/别名，不持有 Session 状态，
-因此留在根目录供三者共同使用；放进 execution 会引入反向依赖。这个 seam 不是承诺
+具体使用分工：weights 转换/打包并上传固定资产；model/Blocks 调用计算算子；
+model_runner 管理输入、RNG、workspace、预热、capture 和 replay。底层分配、传输及
+capture 清理由 CUDA crate 实现。backend.rs 只集中导入/别名，不持有 ModelRunner 状态，
+因此留在根目录供三者共同使用；放进 model_runner 会引入反向依赖。这个 seam 不是承诺
 替换一个文件就能支持其他设备：新后端仍需实现实际使用的算子和资源契约。
 
 `math.rs` 则不依赖 CUDA，保留无 CUDA 构建可用的纯函数与语义测试。例如：
@@ -542,7 +604,7 @@ assert_eq!(pi05_prompt("pick_up", &[], false), "pick up\n");
 
 这不表示 PI0.5 有完整 CPU 推理实现，也不表示 Python processor 正在调用上述
 Rust prompt 函数。当前无 CUDA 构建直接覆盖这些函数的单元测试；CUDA 加载路径还
-使用 sinusoidal_time_embedding 在 CPU 生成时间嵌入，再转换并上传。network module
+使用 sinusoidal_time_embedding 在 CPU 生成时间嵌入，再转换并上传。model module
 目前整体以 CUDA feature 编译，根目录 math 保留了独立测试与调用能力。
 
 
@@ -552,7 +614,7 @@ Rust prompt 函数。当前无 CUDA 构建直接覆盖这些函数的单元测�
 下面是当前实现的节选；省略外围函数、校验与错误清理，不是独立可运行程序。
 
 ```rust
-// network/blocks/bf16.rs：使用设备权重调用 CUDA 算子。
+// model/blocks/bf16.rs：使用设备权重调用 CUDA 算子。
 use crate::pi05::backend::{kernels, Context};
 use kernels::{gemm, norm};
 
@@ -576,7 +638,7 @@ backend.to_device(&Tensor::from_bf16(
 导入 CUDA crate；具体 CUDA 类型、buffer 和专属布局仍通过模型的 backend seam 使用。
 
 ```rust
-// execution/prepare.rs：CUDA workspace 分配与 capture 由执行层发起。
+// model_runner/prepare.rs：CUDA workspace 分配与 capture 由执行层发起。
 fn allocate_workspace(
     requirements: &WorkspaceRequirements,
     device: usize,
@@ -588,7 +650,7 @@ fn allocate_workspace(
 }
 ```
 
-同一文件还调用 `backend.capture_graph(...)`，把 network 的计算调用放进 capture
+同一文件还调用 `backend.capture_graph(...)`，把 model 的计算调用放进 capture
 闭包，并把 graph、workspace、输入 buffer 和计算对象保存在 `CapturedGraph` 中。
 因此不能把全部 CUDA 对接挪进 Blocks：那会让 Blocks 同时负责权重加载和请求生命周期。
 
@@ -596,28 +658,29 @@ fn allocate_workspace(
 
 ```mermaid
 flowchart TD
-    L[load：读取资产并组装] --> E[execution：Session 与执行计划]
-    L --> N[network：已加载计算实现]
+    L[load：读取资产并组装] --> E[model_runner：ModelRunner 与执行计划]
+    L --> N[model：已加载计算实现]
     L --> W[weights：固定资产]
     E -->|计算与资源契约| N
     N -->|使用对应资产| W
 ```
 
-- `execution` 拥有策略、缓存、有效性、输入/noise buffer 和 graph 资源。
-  Session 字段私有；load 调用 `Pi05Session::new`，不能初始化或修改缓存字段。
-- `network` 拥有 LoadedCompute、时间嵌入、具体实现分派和 Blocks。计算顺序仍是
-  一份 `Pi05Network<B>`。Blocks 成员和实现模块私有，执行层不能直接访问。
-- `weights` 保留模型逻辑权重树和设备表示，不依赖 network 或 execution。
+- `model_runner` 拥有策略、缓存、有效性、输入/noise buffer 和 graph 资源。
+  ModelRunner 字段私有；load 调用 `Pi05ModelRunner::new`，不能初始化或修改缓存字段。
+- `model` 拥有 ModelVariant、时间嵌入、具体实现分派和 Blocks。计算顺序仍是
+  一份 `Pi05Model<B>`。Blocks 成员和实现模块私有，执行层不能直接访问。
+- `weights` 保留模型逻辑权重树和设备表示，不依赖 model 或 model_runner。
   本轮不提取跨模型权重、不修改 packing、量化或设备内存算法。
-- `PrepareBlocks` 和 `WorkspaceRequirements` 归 network，描述所需资源，不执行分配。
-  execution 通过 Network 方法查询需求并分配，network 不认识执行策略或 CapturedGraph。
-- 录图分派由 execution 的 `CaptureOperation` 发起：调用
-  `LoadedCompute::with_network(operation)`，后者按具体实现调用泛型 `operation.run`。
-  `NetworkOperation` 只是 PI0.5 内部的静态分派 Interface，network 不导入 execution；
-  execution 不 match 具体 variant，也没有逐层动态派发。
-- `backend.rs` 留在根目录，因为 weights、network、execution 都使用它。
-  `math.rs` 保持 CPU 可用，不被 CUDA 专属 network 模块的 feature gate 隐藏。
-  BF16 校准遍历归 network 内部，以便不向 execution 暴露 Blocks/权重字段。
+- `PrepareBlocks` 和 `WorkspaceRequirements` 归 model；`workspace_requirements()` 查询不分配资源。
+  `PrepareBlocks` 还提供 CUDA backend、输入 dtype 和图像预处理能力。
+  model_runner 通过 Model 方法查询需求并分配，model 不认识执行策略或 CapturedGraph。
+- 录图分派由 model_runner 的 `CaptureOperation` 发起：调用
+  `ModelVariant::with_model(operation)`，后者按具体实现调用泛型 `operation.run`。
+  `ModelOperation` 只是 PI0.5 内部的静态分派 Interface，model 不导入 model_runner；
+  model_runner 不 match 具体 variant，也没有逐层动态派发。
+- `backend.rs` 留在根目录，因为 weights、model、model_runner 都使用它。
+  `math.rs` 保持 CPU 可用，不被 CUDA 专属 model 模块的 feature gate 隐藏。
+  BF16 校准遍历归 model 内部，以便不向 model_runner 暴露 Blocks/权重字段。
 
 
 #### 模块间的接口：先交需求，再执行计算
@@ -625,13 +688,13 @@ flowchart TD
 下面同样按当前源码摘录或简化，`...` 表示省略参数/字段，不是可直接编译的代码。
 
 ```rust
-// network/mod.rs：给执行层的数据契约，查询本身不分配显存。
+// model/mod.rs：给执行层的数据契约，查询本身不分配显存。
 pub struct WorkspaceRequirements {
     pub bytes: usize,
     pub fp8_scratch: Option<(usize, usize)>,
 }
 
-impl<B: PrepareBlocks> Pi05Network<B> {
+impl<B: PrepareBlocks> Pi05Model<B> {
     pub(in crate::pi05) fn workspace_requirements(
         &self, tokens: usize,
     ) -> Result<WorkspaceRequirements> {
@@ -639,8 +702,8 @@ impl<B: PrepareBlocks> Pi05Network<B> {
     }
 }
 
-// execution/prepare.rs：查询需求 → 分配 → 预热/调优稳定 → capture。
-let requirements = self.network.workspace_requirements(token_count)?;
+// model_runner/prepare.rs：查询需求 → 分配 → 预热/调优稳定 → capture。
+let requirements = self.model.workspace_requirements(token_count)?;
 let workspace = allocate_workspace(&requirements, self.ctx().device_id())?;
 // 此处先执行现有的预热与 tactic 稳定性检查。
 let (graph, output) = backend.capture_graph(|| {
@@ -648,69 +711,69 @@ let (graph, output) = backend.capture_graph(|| {
 })?;
 ```
 
-**network 说“计算需要多少资源”，execution 决定何时申请、是否录图、保留多久。**
-`PrepareBlocks` 是计算能力/资源需求契约，不是另一个 Session prepare 生命周期入口。
+**model 说“计算需要多少资源”，model_runner 决定何时申请、是否录图、保留多久。**
+`PrepareBlocks` 是计算能力/资源需求契约，不是另一个 ModelRunner prepare 生命周期入口。
 
 ```rust
-// network/compute.rs：由 network 定义，避免 network 反向依赖 execution。
-pub(in crate::pi05) trait NetworkOperation {
+// model/variant.rs：由 model 定义，避免 model 反向依赖 model_runner。
+pub(in crate::pi05) trait ModelOperation {
     type Output;
     fn run<B: PrepareBlocks>(
         self,
-        network: &Arc<Pi05Network<B>>,
+        model: &Arc<Pi05Model<B>>,
         embeddings: &[Tensor],
     ) -> Result<Self::Output>;
 }
 
-// execution/prepare.rs：执行层提供 capture 操作，返回类型也由执行层决定。
-impl NetworkOperation for CaptureOperation<'_> {
+// model_runner/prepare.rs：执行层提供 capture 操作，返回类型也由执行层决定。
+impl ModelOperation for CaptureOperation<'_> {
     type Output = CapturedGraph;
     fn run<B: PrepareBlocks>(
         self,
-        network: &Arc<Pi05Network<B>>,
+        model: &Arc<Pi05Model<B>>,
         embeddings: &[Tensor],
     ) -> Result<Self::Output> {
-        capture(network, self.input, self.tokens, self.count, self.noise, embeddings)
+        capture(model, self.input, self.tokens, self.count, self.noise, embeddings)
     }
 }
-// execution 调用；network 内部 match 一次具体 variant，再调用 operation.run。
-compute.with_network(CaptureOperation { ... })
+// model_runner 调用；model 内部 match 一次具体 variant，再调用 operation.run。
+model.with_model(CaptureOperation { ... })
 ```
 
 这里是**执行层调用计算层提供的类型分派接口**，由计算层回调执行层传入的操作。
-network 不导入 `CapturedGraph` 或 Session，execution 不匹配 BF16/FP8/INT8。
+model 不导入 `CapturedGraph` 或 ModelRunner，model_runner 不匹配 BF16/FP8/INT8。
 这不是逐层动态派发，也不是面向外部用户的插件注册接口。
 
 ```rust
-// load.rs 的组装流程（简化）：weights → network → execution。
-// 固定资产通过 Arc 交给 Blocks；weights 不认识 Network 或 Session。
-let network = build_bf16_network(backend, config, weights)?;
+// load.rs 的组装流程（简化）：weights → model → model_runner。
+// 固定资产通过 Arc 交给 Blocks；weights 不认识 Model 或 ModelRunner。
+let model = build_bf16_model(backend, config, weights)?;
 
-// network/mod.rs：顶层流程通过语义接口调用 Blocks，不取出权重字段。
+// model/mod.rs：顶层流程通过语义接口调用 Blocks，不取出权重字段。
 pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
     self.blocks.vision(patches, false)
 }
 ```
 
 模块间交接的是设备权重类型、计算对象、资源需求和操作契约。
-Blocks 再读取例如 `weights.qkv.weight` 的具体表示并调用算子；Session 不越过
-network 去操作这些字段。新增量化/融合实现主要改 Blocks 与相应 weights，
-执行策略变化主要改 execution。
+Blocks 再读取例如 `weights.qkv.weight` 的具体表示并调用算子；ModelRunner 不越过
+model 去操作这些字段。新增量化/融合实现主要改 Blocks 与相应 weights，
+执行策略变化主要改 model_runner。
 
-普通用户仍通过 Policy/Model 使用 Session；已有低层构造、计算和 capture 导出
+普通 Python 用户通过 Policy/绑定 ModelRunner 使用 Pi05ModelRunner；已有低层构造、计算和 capture 导出
 供仓库诊断/benchmark 使用，不新增转发对象。目录层级服务职责封装，不要求每个文件
 都有独立公共类型。未使用全面 `pub(crate)` 放开字段来迁就移动。
 
 `scripts/check_model_family_boundaries.sh` 同时执行
-`check_pi05_module_boundaries.py`：检查 network 不依赖 execution/Session/执行策略，
-weights 不依赖 network/execution，execution 不依赖具体 Blocks 或 match
-LoadedCompute 变体，load 不直接构造 Session 字段。Rust 隐私检查进一步限制访问。
+`check_pi05_module_boundaries.py`：检查 model 不依赖 model_runner/ModelRunner/执行策略，
+weights 不依赖 model/model_runner，model_runner 不依赖具体 Blocks 或 match
+ModelVariant 变体，load 不直接构造 ModelRunner 字段。Rust 隐私检查进一步限制访问。
 该脚本检查显式依赖，不代替编译器或完整 Rust AST 分析。
 
 | 修改任务 | 所属 module | 验证入口 |
 | --- | --- | --- |
-| 缓存、策略、失效和计划寿命 | execution | Session/lifecycle tests |
-| 模型流程或某种 Blocks | network | 固定输入 eager/graph 数值对照 |
+| 缓存、策略、失效和计划寿命 | model_runner | ModelRunner/lifecycle tests |
+| 模型流程或某种 Blocks | model | 固定输入 eager/graph 数值对照 |
 | checkpoint 映射和设备布局 | weights | 权重测试与实际 checkpoint 集成 |
 | 模型加载组装 | load | 加载与 public smoke |
 
@@ -719,17 +782,17 @@ LoadedCompute 变体，load 不直接构造 Session 字段。Rust 隐私检查�
 | Previous PI0.5 entry | Current entry |
 | --- | --- |
 | precision=fp8 / bf16 / int8 or w8a8 | compute_variant=fp8_static / bf16 / int8_dynamic |
-| Pi05CudaRuntime::new | build_fp8_static_network |
-| Pi05Bf16CudaRuntime::new | build_bf16_network |
-| Pi05Int8CudaRuntime::new | build_int8_dynamic_network |
-| runtime.capture_infer / capture_infer_rgb_u8 | capture_patches(&network, ...) / capture_rgb(&network, ...) |
+| Pi05CudaRuntime::new | build_fp8_static_model |
+| Pi05Bf16CudaRuntime::new | build_bf16_model |
+| Pi05Int8CudaRuntime::new | build_int8_dynamic_model |
+| runtime.capture_infer / capture_infer_rgb_u8 | capture_patches(&model, ...) / capture_rgb(&model, ...) |
 | Three precision CapturedGraph types | CapturedGraph |
 | StaticFp8Pi05Weights / StaticBf16Pi05Weights / StaticInt8Pi05Weights | Fp8StaticWeights / Bf16Weights / Int8DynamicWeights |
 | Pi05ActivationScales / StaticFp8Calibration | Fp8StaticActivationScales / Fp8StaticCalibration |
 | Unprefixed FP8 layer functions/types | Explicit fp8_static / Fp8Static names |
-| Pi05VlaRuntime alias | Pi05Session |
+| Pi05VlaRuntime alias | Pi05ModelRunner |
 | pi05_bench --dtype fp8; JSON precision key | --compute-variant fp8_static; JSON compute_variant key |
-| Python Model.random(precision=...) | Model.random(compute_variant=...) |
+| Python ModelRunner.random(precision=...) | ModelRunner.random(compute_variant=...) |
 
 Repository callers are migrated. External low-level Rust callers, Python keyword
 callers and benchmark parsers must update. Existing checkpoint/calibration/tactic
@@ -744,25 +807,25 @@ are not rewritten. Its websocket boundary recognizes the new server metadata.
 ### Internal interfaces and change ownership
 
 ```rust
-// Abbreviated signatures; the callable implementation lives in network/blocks/mod.rs.
+// Abbreviated signatures; the callable implementation lives in model/blocks/mod.rs.
 trait Blocks {
     type Prefix;   // precision-specific KV representation
-    type Styles;   // fixed per-step modulation tensors
+    type StepModulation;   // fixed per-step modulation tensors
     fn vision(patches, native_representation) -> Tensor;
     fn embed_prefix(vision, token_ids, token_count) -> Tensor;
     fn prefix(embeddings) -> Self::Prefix;
-    fn prepare_styles(time_embeddings) -> Vec<Self::Styles>;
-    fn eager_styles(time_embeddings) -> Option<Vec<Self::Styles>>;
+    fn prepare_modulation(time_embeddings) -> Vec<Self::StepModulation>;
+    fn eager_modulation(time_embeddings) -> Option<Vec<Self::StepModulation>>;
     fn step(state, time_embedding, prefix, dt) -> Tensor;
-    fn step_with_styles(state, styles, prefix, dt) -> Tensor;
+    fn step_with_modulation(state, modulation, prefix, dt) -> Tensor;
 }
-fn network_infer(input, noise, time_embeddings) {
-    styles = blocks.eager_styles(time_embeddings);
+fn model_infer(input, noise, time_embeddings) {
+    modulation = blocks.eager_modulation(time_embeddings);
     vision = blocks.vision(input.patches, input.is_native);
     prefix = blocks.prefix(blocks.embed_prefix(vision, input.ids, input.count));
     for index in 0..config.num_flow_steps {
-        noise = match styles {
-            Some(styles) => blocks.step_with_styles(noise, styles[index], prefix, dt),
+        noise = match modulation {
+            Some(modulation) => blocks.step_with_modulation(noise, modulation[index], prefix, dt),
             None => blocks.step(noise, time_embeddings[index], prefix, dt),
         };
     }
@@ -770,11 +833,11 @@ fn network_infer(input, noise, time_embeddings) {
 }
 ```
 
-`Prefix` and `Styles` keep physical representations behind the Block boundary.
+`Prefix` and `StepModulation` keep physical representations behind the Block boundary.
 The native-input flag is an internal materialization contract: callers already
 validate and construct the expected representation. It does not select dtype.
-BF16/dynamic INT8 eager styles remain precomputed before vision; static FP8 eager styles remain
-computed per flow step after prefix. Capture prepares fixed styles beforehand.
+BF16/dynamic INT8 eager modulation remain precomputed before vision; static FP8 eager modulation remain
+computed per flow step after prefix. Capture prepares fixed modulation beforehand.
 Preserving this order avoids mixing algorithm/rounding changes into migration.
 A fusion or backbone implementation change stays in its Block; changing how
-vision conditions language/action or the flow schedule belongs in Network.
+vision conditions language/action or the flow schedule belongs in Model.

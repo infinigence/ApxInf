@@ -103,7 +103,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
 
         fake_unnormalizer = types.SimpleNamespace(width=7)
         with tempfile.TemporaryDirectory() as model_dir, mock.patch.dict(
-            sys.modules, {"apxinf_py": types.SimpleNamespace(Model=FakeBindingModel)}
+            sys.modules, {"apxinf_py": types.SimpleNamespace(ModelRunner=FakeBindingModel)}
         ), mock.patch.object(
             pi05, "resolve_pi05_tactics", return_value=selected
         ) as resolve, mock.patch.object(

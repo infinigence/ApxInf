@@ -25,13 +25,13 @@ Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf)
 Benchmarking PI-0.5 with randomly generated weights.
 
 ```bash
-python scripts/bench_pi05.py --random-weights --precision bf16 --layer l1 \
+python scripts/bench_pi05.py --random-weights --compute-variant bf16 --layer l1 \
   --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 \
   --warmup 10 --samples 100 --autotune
 ```
 
 ```bash
-python scripts/bench_pi05.py --random-weights --precision fp8 --layer l1 \
+python scripts/bench_pi05.py --random-weights --compute-variant fp8_static --layer l1 \
   --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 --autotune
 ```
 
@@ -44,7 +44,7 @@ Reported latency is P50 over 30 samples after 10 warm-up iterations
 import numpy as np
 from apxinf import AutoPolicy
 
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
+policy = AutoPolicy.from_pretrained("<path-to-model>", compute_variant="bf16")
 
 observation = {
     key: np.zeros((256, 256, 3), np.uint8)
@@ -70,7 +70,7 @@ Resize, tokenization, normalization, and the flow sampler all run inside `infer`
 
 ```bash
 python python/apxinf/examples/openpi_server.py \
-  --model-dir <path-to-model> --precision bf16 --port 8000 \
+  --model-dir <path-to-model> --compute-variant bf16 --port 8000 \
   --image-keys observation/image,observation/wrist_image \
   --state-key observation/state
 ```
@@ -169,7 +169,7 @@ Confirm the binding imports and reaches the GPU:
 
 ```bash
 python -c 'import apxinf_py; print(apxinf_py.__version__)'
-python scripts/bench_pi05.py --random-weights --precision bf16 --layer l1 --samples 5
+python scripts/bench_pi05.py --random-weights --compute-variant bf16 --layer l1 --samples 5
 ```
 
 Needs a Linux host with an NVIDIA driver and a CUDA toolkit plus a stable Rust
@@ -190,9 +190,9 @@ You own resize, tokenization, noise, and unnormalization; the model takes
 already-resized frames and returns a **normalized-domain** chunk.
 
 ```python
-from apxinf import Model
+from apxinf import ModelRunner
 
-model = Model.load("pi05", "<path-to-model>/model.safetensors", precision="bf16")
+model = ModelRunner.load("pi05", "<path-to-model>/model.safetensors", compute_variant="bf16")
 
 # rgb: uint8 [views, H, W, 3] at model.image_size; tokens: uint32; noise: float32
 actions = model.infer_rgb(rgb, "nhwc", token_ids, noise)   # (H, action_dim)
@@ -209,7 +209,7 @@ it exposes the serving contract, the pipelines, and the layer boundary:
 ```python
 policy = AutoPolicy.from_pretrained(
     "<path-to-model>",
-    precision="bf16",
+    compute_variant="bf16",
     action_dim=None,        # default: infer the model's full vector from checkpoint weights
 )
 
@@ -241,7 +241,7 @@ from apxinf.serving import WebsocketPolicyServer
 
 policy = AutoPolicy.from_pretrained(
     "<path-to-model>",
-    precision="bf16",
+    compute_variant="bf16",
     image_keys=("observation/image", "observation/wrist_image"),
     state_key="observation/state",
 )
@@ -262,25 +262,25 @@ so the client can assert it rather than guess.
 
 ## Precisions
 
-`--precision` selects the numeric path; the serving command is otherwise
+`--compute-variant` selects the PI0.5 implementation; the serving command is otherwise
 unchanged.
 
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --precision bf16 --port 8000 \
+  --model-dir <path-to-model> --compute-variant bf16 --port 8000 \
   --image-keys observation/image,observation/wrist_image \
   --state-key observation/state
 ```
 
 ```python
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
+policy = AutoPolicy.from_pretrained("<path-to-model>", compute_variant="bf16")
 ```
 
 | Precision | Where | Needs |
 |---|---|---|
 | `bf16` | every supported device; the default | the checkpoint alone |
-| `fp8` | Thor only, where it is the fastest path — Orin has no FP8 Tensor Cores | per-tensor activation scales |
-| `int8` | W8A8, optimized for Orin (SM87) and Ada (SM89) | the checkpoint alone |
+| `fp8_static` | Thor only, where it is the fastest path — Orin has no FP8 Tensor Cores | per-tensor activation scales |
+| `int8_dynamic` | W8A8, optimized for Orin (SM87) and Ada (SM89) | the checkpoint alone |
 
 ### FP8 calibration
 
@@ -289,7 +289,7 @@ ApxInf falls back to `<path-to-model>/calibration.json`:
 
 ```bash
 python scripts/pi05_openpi_websocket_server.py \
-  --model-dir <path-to-model> --precision fp8 \
+  --model-dir <path-to-model> --compute-variant fp8_static \
   --image-keys observation/image,observation/wrist_image \
   --state-key observation/state \
   --calibration <path-to-calibration.json> \
@@ -299,7 +299,7 @@ python scripts/pi05_openpi_websocket_server.py \
 ```python
 policy = AutoPolicy.from_pretrained(
     "<path-to-model>",
-    precision="fp8",
+    compute_variant="fp8_static",
     calibration="<path-to-calibration.json>",
 )
 ```
@@ -405,7 +405,7 @@ That is the published protocol: all 10 LIBERO-10 tasks x 50 episodes at seed 7
 be attributed to the engine, the processors, or the transport.
 
 ```bash
-python scripts/bench_pi05.py --model-dir <path-to-model> --precision bf16 --layer l1,l2
+python scripts/bench_pi05.py --model-dir <path-to-model> --compute-variant bf16 --layer l1,l2
 ```
 
 - `--layer` selects any subset of `l1` (bare model), `l2` (full policy), `l3`

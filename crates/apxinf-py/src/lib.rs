@@ -6,10 +6,10 @@
 //!
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
-//! * **L1** [`Model::infer_rgb`] — caller supplies resized RGB `uint8` images;
+//! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
 //!   vision→patches runs inside the Rust CUDA graph.
 //!
-//! **L0** [`Model::infer_patches`] (caller supplies pre-computed `patches`,
+//! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
 //! equivalent to a Rust `Observation(Patches)`) is exposed under the private
 //! `_infer_patches` name. It is the model-policy bridge for families such as
 //! WallOSS whose preprocessing stays in Python, and remains outside the public
@@ -169,13 +169,13 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
     }
 }
 
-/// A loaded VLA model handle. Holds the runtime plus the resolved config used
-/// for shape-contract queries and input validation.
+/// Python binding for a loaded VLA runner. Holds the runtime and its contract,
+/// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
 /// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
-pub struct Model {
+pub struct ModelRunner {
     model: LoadedModel,
     contract: VlaContract,
     device: Device,
@@ -191,7 +191,7 @@ struct PreprocessedVlaInput {
     embodiment_id: usize,
 }
 
-impl Model {
+impl ModelRunner {
     fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
         if self.contract.accepts_rgb_u8 {
             Ok(self.contract)
@@ -440,7 +440,7 @@ impl Model {
 }
 
 #[pymethods]
-impl Model {
+impl ModelRunner {
     /// Load a VLA checkpoint through the unified `AutoModel` frontend.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
@@ -1072,7 +1072,7 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!(
-            "Model(device={}, action=[{}, {}], views={}, image={}, patch={})",
+            "ModelRunner(device={}, action=[{}, {}], views={}, image={}, patch={})",
             self.device(),
             self.action_horizon(),
             self.action_dim(),
@@ -1085,7 +1085,7 @@ impl Model {
 
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Model>()?;
+    module.add_class::<ModelRunner>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

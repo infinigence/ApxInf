@@ -1,11 +1,11 @@
-"""The contracts shared across the frontend: :class:`Policy` and :class:`BareModel`.
+"""The contracts shared across the frontend: :class:`Policy` and :class:`ModelRunnerProtocol`.
 
 Both are structural :class:`typing.Protocol` types — nothing has to inherit
 them; any object of the right shape satisfies them. They are the stable anchor
 points other layers code against:
 
-* :class:`BareModel` — the model-side contract (L1 bare inference) a policy
-  consumes, i.e. the subset of a ``apxinf_py.Model`` handle it relies on.
+* :class:`ModelRunnerProtocol` — the model-side contract (L1 bare inference) a policy
+  consumes, i.e. the subset of a ``apxinf_py.ModelRunner`` handle it relies on.
 * :class:`Policy` — the L2 contract (``obs dict -> result dict``) every
   model-specific policy satisfies. Downstream consumers (the websocket server, the
   :class:`~apxinf.policies.auto.AutoPolicy` registry, a lerobot adaptor) code
@@ -36,7 +36,7 @@ import numpy as np
 
 __all__ = [
     "Policy",
-    "BareModel",
+    "ModelRunnerProtocol",
     "ComposablePolicy",
     "VIEW_SLOTS",
     "CANONICAL_IMAGE_KEYS",
@@ -83,8 +83,8 @@ CANONICAL_PROMPT_KEY = "prompt"
 
 
 @runtime_checkable
-class BareModel(Protocol):
-    """The subset of a ``apxinf_py.Model`` handle an L2 policy relies on (L1).
+class ModelRunnerProtocol(Protocol):
+    """The subset of a ``apxinf_py.ModelRunner`` handle an L2 policy relies on (L1).
 
     Only L1 ``infer_rgb`` is part of the contract. The L0 patches path exists on
     the binding but is internal (exposed privately as ``_infer_patches``) and is

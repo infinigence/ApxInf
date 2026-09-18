@@ -1,11 +1,11 @@
 //! Low-level numerical integrity probe for PI0.5.
 //!
 //! This example intentionally bypasses the unified `AutoModel`/`infer` frontend
-//! to reach `Fp8StaticNetwork` internals and `apxinf_cuda` tuning/kernel
+//! to reach `Fp8StaticModel` internals and `apxinf_cuda` tuning/kernel
 //! signatures directly, which the model abstraction does not (and should not)
 //! expose. See `pi05_auto_smoke` for the abstraction-level entry point.
 
-use apxinf_model::pi05::build_fp8_static_network;
+use apxinf_model::pi05::build_fp8_static_model;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_ids = CudaBuffer::alloc_zeros(token_count * 4, backend.device_id())
         .map_err(std::io::Error::other)?;
     let time_embeddings = upload_time_embeddings_fp8_static(&config, &*backend)?;
-    let runtime = build_fp8_static_network(
+    let runtime = build_fp8_static_model(
         backend.clone(),
         config.clone(),
         device_weights.clone(),

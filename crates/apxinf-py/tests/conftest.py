@@ -32,10 +32,10 @@ def precision() -> str:
 
 
 @pytest.fixture(scope="session")
-def model(precision: str) -> "apxinf_py.Model":
+def model(precision: str) -> "apxinf_py.ModelRunner":
     kwargs = {
         "device": os.environ.get("APXINF_PI05_DEVICE", "cuda:0"),
-        "precision": precision,
+        "compute_variant": {"fp8": "fp8_static", "int8": "int8_dynamic"}.get(precision, precision),
     }
     calibration = os.environ.get("APXINF_PI05_CALIBRATION")
     tactics = os.environ.get("APXINF_PI05_TACTICS")
@@ -44,17 +44,17 @@ def model(precision: str) -> "apxinf_py.Model":
     if tactics:
         kwargs["tactics"] = tactics
     try:
-        return apxinf_py.Model.load("pi05", _checkpoint(), **kwargs)
+        return apxinf_py.ModelRunner.load("pi05", _checkpoint(), **kwargs)
     except Exception as error:  # noqa: BLE001 - surface load failures as skips
         pytest.skip(f"pi05 load failed (needs CUDA build + checkpoint): {error}")
 
 
-def make_tokens(model: "apxinf_py.Model", count: int = 16) -> np.ndarray:
+def make_tokens(model: "apxinf_py.ModelRunner", count: int = 16) -> np.ndarray:
     count = min(count, model.max_token_len)
     return np.zeros(count, dtype=np.uint32)
 
 
-def make_noise(model: "apxinf_py.Model", seed: int = 0) -> np.ndarray:
+def make_noise(model: "apxinf_py.ModelRunner", seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.standard_normal(
         (model.action_horizon, model.action_dim), dtype=np.float32

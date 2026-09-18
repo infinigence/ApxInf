@@ -187,7 +187,7 @@ def parse_args() -> argparse.Namespace:
         "there when --image-keys is not given.",
     )
     # Synthetic-shape knobs, used only with --random-weights (a checkpoint runs its
-    # native config). They mirror apxinf_py.Model.random.
+    # native config). They mirror apxinf_py.ModelRunner.random.
     parser.add_argument("--image-size", type=int, default=224, help="random: image edge")
     parser.add_argument("--num-flow-steps", type=int, default=10, help="random: flow steps")
     parser.add_argument("--max-token-len", type=int, default=200, help="random: max prompt tokens")
@@ -297,7 +297,7 @@ def main() -> None:
             action_horizon,
             args.token_count,
         )
-        handle = apxinf_py.Model.random(
+        handle = apxinf_py.ModelRunner.random(
             model=(args.model_type or "pi05"),
             device=args.device,
             compute_variant=args.compute_variant,

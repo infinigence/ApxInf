@@ -35,7 +35,7 @@ NUM_VIEWS = 2
 
 
 class MockModel:
-    """In-process ``BareModel`` stand-in: normalized action is all-zeros.
+    """In-process ``ModelRunnerProtocol`` stand-in: normalized action is all-zeros.
 
     Replaces the old subprocess ``FakeEngine``; the server now calls the model
     in-process through ``Pi05Policy`` instead of over a stdio pipe.
@@ -187,14 +187,14 @@ class WebsocketServerCompatibilityTest(unittest.TestCase):
         self.assertIn("prev_total_ms", second["server_timing"])
 
         # The in-process model saw two NHWC calls, one row per configured camera.
-        self.assertEqual(len(self.policy.model.images), 2)
-        self.assertEqual(self.policy.model.images[0].shape, (NUM_VIEWS, 224, 224, 3))
-        self.assertEqual(self.policy.model.images[0].dtype, np.dtype("uint8"))
+        self.assertEqual(len(self.policy.model_runner.images), 2)
+        self.assertEqual(self.policy.model_runner.images[0].shape, (NUM_VIEWS, 224, 224, 3))
+        self.assertEqual(self.policy.model_runner.images[0].dtype, np.dtype("uint8"))
         # The float 0.5 base image was parsed to uint8 127.
-        self.assertTrue(np.all(self.policy.model.images[0][0] == 127))
+        self.assertTrue(np.all(self.policy.model_runner.images[0][0] == 127))
         # Seeded noise advances between calls, so the two draws differ.
         self.assertFalse(
-            np.array_equal(self.policy.model.noises[0], self.policy.model.noises[1])
+            np.array_equal(self.policy.model_runner.noises[0], self.policy.model_runner.noises[1])
         )
 
 
