@@ -221,9 +221,35 @@ including eager/graph agreement. The rebuilt Python binding passes 7 real
 policy/tokenizer/calibration tests and 7 GPU binding/L0-L1 tests with zero skips;
 the official OpenPI websocket round-trip/health test also passes. The 23 cached
 CUDA objects and kernel archive retain their audited hashes. No dedicated
-performance qualification is claimed for this naming follow-up.
+performance qualification was performed in that snapshot; the separate run below
+qualifies the committed naming change.
 Evidence is under `devlocal/pi05-module-naming/thor-20260917/`; the implementation
 report remains under `devlocal/pi05-module-naming/reports/`.
+
+### Committed naming regression on Thor (2026-09-18)
+
+2026-09-18 在 Thor 上重新构建命名提交 `f5fb3cd`（源码快照 `76cf08add247`），与保留的命名前 `0f23048` binary 做逐配置、交替顺序的对照。`0f23048..830d188` 仅有文档修改，因此该 binary 对应命名前 PR 的 runtime。复用相同 checkpoint、tactics、校准和固定 RGB/token/noise 输入；2/3 views × 10/21 tokens × BF16/FP8/INT8，共 12 组 H10，10 flow steps、10 次 graph warmup，每种延迟各采样 30 次。三视图沿用已有 fixture 的 wrist 图像复制规则，两侧输入相同。
+
+12 组完整 eager/captured 输出与基线按位一致，workspace 的 capacity/used bytes 逐配置相同；另补 BF16/FP8 × T10/T21 的 4 组 H50，对照已保存的命名前完整输出，也全部按位一致。共 16 组 `max_abs=0`，每组 eager/graph 一致。Graph P50 变化 −0.38%～+0.48%，P95 −0.82%～+1.66%；包含输入更新的 graph P50 变化 −0.39%～+0.31%。本次样本未观察到明显性能退化。
+
+每个进程运行前采样的 GPU utilization 均为 0%；1,622 个运行期遥测样本中，GPU 上仅有已知常驻服务和本次 benchmark，未发现新增并行 GPU 工作进程。保留全部 28 次进程执行的结果，没有剔除或替换样本。此处测量稳态 graph 与输入更新加 graph 延迟，不包含模型加载、capture、Python policy 开销，也不代表机器人闭环成功率。P95 来自 30 次采样，记录观察值，不将其当成部署 SLO。
+
+| 精度 | Views / tokens | Graph P50 原 → 新 (ms) | P50 变化 | P95 变化 | 输入更新 + graph P50 变化 |
+| --- | --- | --- | --- | --- | --- |
+| bf16 | 2 / 21 | 78.858 → 78.995 | +0.17% | +0.39% | +0.31% |
+| bf16 | 2 / 10 | 71.956 → 72.043 | +0.12% | -0.05% | -0.12% |
+| bf16 | 3 / 21 | 92.938 → 93.068 | +0.14% | -0.31% | +0.13% |
+| bf16 | 3 / 10 | 89.121 → 89.000 | -0.14% | +0.40% | -0.03% |
+| fp8_static | 2 / 21 | 41.963 → 42.041 | +0.19% | +0.26% | -0.08% |
+| fp8_static | 2 / 10 | 41.348 → 41.193 | -0.38% | -0.82% | -0.39% |
+| fp8_static | 3 / 21 | 54.170 → 54.431 | +0.48% | +1.66% | +0.02% |
+| fp8_static | 3 / 10 | 53.325 → 53.528 | +0.38% | +1.47% | +0.04% |
+| int8_dynamic | 2 / 21 | 116.826 → 116.540 | -0.25% | -0.44% | -0.12% |
+| int8_dynamic | 2 / 10 | 112.544 → 112.532 | -0.01% | -0.22% | +0.06% |
+| int8_dynamic | 3 / 21 | 140.679 → 140.671 | -0.01% | +0.09% | -0.03% |
+| int8_dynamic | 3 / 10 | 136.522 → 136.669 | +0.11% | +0.32% | +0.01% |
+
+Evidence: `devlocal/pi05-module-naming/thor-20260918/` contains the frozen source manifest, build log, binary and asset SHA-256, all commands, full outputs, telemetry and the final audit. The native build uses the same 23 audited CUDA objects; no operator source or binary changes.
 
 ### Stage 2 exit checklist (final PI0.5 candidate)
 
