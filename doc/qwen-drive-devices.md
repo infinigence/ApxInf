@@ -335,5 +335,26 @@ for):
 | serial | 6.8672 | 6.8686 | 6.8636 | 6.8572 |
 | eight threads | 6.6622 | 6.6688 | 6.6710 | 6.6758 |
 
-**1.0292x**, 195 ms a scene. The win is a fixed number of milliseconds, so it is
-worth 13% on the fastest board and 3% on the slowest.
+**1.0292x**, 195 ms a scene. Thor measures 143.1 ms serial and 33.7 ms on
+twelve workers, 4.25x, and 1.0394x end to end — 134 ms a scene. The win is a
+fixed number of milliseconds on every board, so it is worth 13% on the fastest
+one and 3% on the slowest.
+
+One worker per frame, bounded by the cores, is what all three want: twelve
+workers against eight is 4.36x against 3.36x on the 4090, 4.89x against 3.86x
+on Orin, 4.25x against 3.28x on Thor. An earlier eight-worker cap came from a
+single three-repeat measurement on the 4090 that did not reproduce.
+
+## Where the branch stands on the 4090
+
+Both changes together, three alternating rounds against the branch as
+consolidated:
+
+| | scene 0 | scene 1 | scene 2 | scene 3 |
+|---|---:|---:|---:|---:|
+| as consolidated | 1.4502 | 1.4515 | 1.4569 | 1.4549 |
+| now | 1.2378 | 1.2336 | 1.2330 | 1.2318 |
+
+**1.1777x**, 219 ms a scene, and both halves produce identical bytes -- the
+preprocessing by hash and end-to-end probe, the scan by bit comparison of its
+output and carried state.
