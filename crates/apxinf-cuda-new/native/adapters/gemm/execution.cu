@@ -236,13 +236,11 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     apxinf::gemm::check_cuda(cudaSetDevice(runtime->device));
     const auto keys =
         apxinf::gemm::tuning_keys(normalized_spec, *policy, runtime->device);
-    const std::string& key = keys.performance;
+    const std::string& key = keys.key;
     std::lock_guard<std::mutex> lock(runtime->gemm_mutex);
 
     Recipe recipe{};
     bool recipe_found = false;
-    Recipe compatible_hint{};
-    bool compatible_hint_found = false;
     std::string source = "recipe";
     if (const auto cached = runtime->gemm_recipes.find(key);
         cached != runtime->gemm_recipes.end()) {
@@ -253,29 +251,13 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
       const std::string serialized = apxinf::gemm::read_recipe(
           policy->cache_dir != nullptr ? policy->cache_dir : "", key);
       std::istringstream input(serialized);
-      recipe_found = static_cast<bool>(
-          input >> recipe.provider_id >> recipe.implementation_id >>
-          recipe.implementation_version >> recipe.configuration);
+    recipe_found = static_cast<bool>(
+        input >> recipe.provider_id >> recipe.implementation_id >>
+        recipe.implementation_version >> recipe.configuration);
+    if (recipe_found) {
+      input >> std::ws;
+      recipe_found = input.eof();
     }
-
-    // A compatibility hint may come from a device with a different
-    // performance profile. It is never restored as a fully tuned recipe: it is
-    // only moved to the front of the next complete tuning pass.
-    if (!recipe_found) {
-      const std::string serialized = apxinf::gemm::read_recipe(
-          policy->cache_dir != nullptr ? policy->cache_dir : "",
-          keys.compatible_hint);
-      std::istringstream input(serialized);
-      compatible_hint_found = static_cast<bool>(
-          input >> compatible_hint.provider_id >>
-          compatible_hint.implementation_id >>
-          compatible_hint.implementation_version >>
-          compatible_hint.configuration);
-      if (compatible_hint_found &&
-          find_implementation(compatible_hint, normalized_spec,
-                              runtime->device) == nullptr) {
-        compatible_hint_found = false;
-      }
     }
 
     std::unique_ptr<Execution> execution;
@@ -294,10 +276,6 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
           runtime->gemm_recipes[key] = recipe;
         }
       }
-      if (execution == nullptr) {
-        compatible_hint = recipe;
-        compatible_hint_found = true;
-      }
     }
 
     bool persist_recipe = false;
@@ -305,7 +283,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
       if (policy->online_tune) {
         const Recipe tuned_recipe = apxinf::gemm::tune(
             normalized_spec, *policy, *bindings, runtime->device,
-            source, compatible_hint_found ? &compatible_hint : nullptr);
+            source);
         const auto* implementation =
             find_implementation(tuned_recipe, normalized_spec, runtime->device);
         if (implementation == nullptr) {
@@ -352,9 +330,6 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
         apxinf::gemm::write_recipe(
             policy->cache_dir != nullptr ? policy->cache_dir : "", key,
             serialized.str());
-        apxinf::gemm::write_recipe(
-            policy->cache_dir != nullptr ? policy->cache_dir : "",
-            keys.compatible_hint, serialized.str());
       }
     }
 
@@ -451,7 +426,7 @@ extern "C" apxinf_status_t apxinf_gemm_test_seed_recipe(
     std::ostringstream serialized;
     serialized << provider_id << ' ' << implementation_id << ' '
                << implementation_version << ' ' << configuration;
-    apxinf::gemm::write_recipe(policy->cache_dir, keys.performance,
+    apxinf::gemm::write_recipe(policy->cache_dir, keys.key,
                                serialized.str());
   });
 }

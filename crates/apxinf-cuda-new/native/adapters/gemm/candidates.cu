@@ -145,8 +145,8 @@ bool supports_device(const Implementation& implementation,
   return true;
 }
 
-const std::vector<Implementation>& registry(uint32_t semantic) {
-  static const std::vector<Implementation> vendor_entries = {
+const ImplementationRegistry& registry(uint32_t semantic) {
+  static const ImplementationRegistry vendor_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
@@ -157,7 +157,7 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
   };
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
-  static const std::vector<Implementation> gemm_bias_entries = {
+  static const ImplementationRegistry gemm_bias_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
@@ -166,7 +166,7 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
   };
-  static const std::vector<Implementation> gemm_entries = {
+  static const ImplementationRegistry gemm_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
@@ -186,7 +186,7 @@ const std::vector<Implementation>& registry(uint32_t semantic) {
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
 #endif
   };
-  static const std::vector<Implementation> gemm_geglu_entries = {
+  static const ImplementationRegistry gemm_geglu_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},

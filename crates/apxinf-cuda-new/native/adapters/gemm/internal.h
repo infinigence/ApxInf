@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../../include/apxinf_cuda/gemm.h"
+#include "../../framework/registry.h"
+#include "../../framework/runtime_internal.h"
 
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -21,46 +23,10 @@ namespace apxinf::gemm {
 
 struct Spec : apxinf_gemm_spec_t {};
 
-struct Failure : std::runtime_error {
-  apxinf_status_t status;
-
-  Failure(apxinf_status_t status, const std::string& message)
-      : std::runtime_error(message), status(status) {}
-};
-
-void set_last_error(const std::string& message);
-void clear_last_error();
-
-template <class Function>
-apxinf_status_t abi_boundary(Function&& function) {
-  try {
-    function();
-    clear_last_error();
-    return APXINF_STATUS_OK;
-  } catch (const Failure& failure) {
-    set_last_error(failure.what());
-    return failure.status;
-  } catch (const std::exception& exception) {
-    set_last_error(exception.what());
-    return APXINF_STATUS_INTERNAL_ERROR;
-  } catch (...) {
-    set_last_error("unknown native exception");
-    return APXINF_STATUS_INTERNAL_ERROR;
-  }
-}
-
-inline void check_cuda(cudaError_t status) {
-  if (status != cudaSuccess) {
-    throw Failure(APXINF_STATUS_CUDA_ERROR, cudaGetErrorString(status));
-  }
-}
-
-inline void check_cublas(cublasStatus_t status) {
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    throw Failure(APXINF_STATUS_PROVIDER_ERROR,
-                  "cuBLAS status " + std::to_string(status));
-  }
-}
+using apxinf::framework::Failure;
+using apxinf::framework::abi_boundary;
+using apxinf::framework::check_cublas;
+using apxinf::framework::check_cuda;
 
 inline size_t dtype_bytes(uint32_t dtype) {
   if (dtype == APXINF_DTYPE_F32 || dtype == APXINF_DTYPE_I32) {
@@ -132,20 +98,11 @@ inline bool supports_alignment(const Implementation& implementation,
          spec.output_alignment >= required.output;
 }
 
-struct Recipe {
-  uint32_t provider_id;
-  uint32_t implementation_id;
-  uint32_t implementation_version;
-  int32_t configuration;
-};
+using Recipe = apxinf::framework::Recipe;
 
 struct TuningKeys {
-  // A recipe under this key is fully tuned for an equivalent performance
-  // profile and may be restored directly.
-  std::string performance;
-  // A recipe under this key only proves execution compatibility. It may be
-  // tried first, but all candidates must still be tuned on this device.
-  std::string compatible_hint;
+  // A recipe under this key is fully tuned for one exact equivalence class.
+  std::string key;
 };
 
 struct AccuracyMetrics {
@@ -176,7 +133,8 @@ struct Execution {
   ~Execution();
 };
 
-const std::vector<Implementation>& registry(uint32_t semantic);
+using ImplementationRegistry = apxinf::framework::Registry<Implementation>;
+const ImplementationRegistry& registry(uint32_t semantic);
 void prepare_cublas(Execution& execution);
 size_t cublas_resource_requirements(const Spec& spec);
 void destroy_cublas(Execution& execution) noexcept;
@@ -200,10 +158,8 @@ uint64_t cutlass_weight_prepack_count(const Execution& execution);
 TuningKeys tuning_keys(const Spec& spec,
                        const apxinf_gemm_policy_t& policy,
                        int device);
-std::string read_recipe(const std::string& directory, const std::string& key);
-void write_recipe(const std::string& directory,
-                  const std::string& key,
-                  const std::string& recipe);
+using apxinf::framework::read_recipe;
+using apxinf::framework::write_recipe;
 std::unique_ptr<Execution> prepare(const Implementation& implementation,
                                    int configuration, const Spec& spec,
                                    const apxinf_gemm_policy_t& policy,
@@ -212,7 +168,7 @@ std::unique_ptr<Execution> prepare(const Implementation& implementation,
 Recipe tune(
     const Spec& spec, const apxinf_gemm_policy_t& policy,
     const apxinf_gemm_bindings_t& bindings, int device,
-    std::string& report, const Recipe* preferred = nullptr);
+    std::string& report);
 AccuracyMetrics compare_reference(const std::vector<float>& expected,
                                   const std::vector<float>& actual);
 std::string format_accuracy(const AccuracyMetrics& metrics);
@@ -222,9 +178,3 @@ void validate_candidates(const Spec& spec,
                          const float* expected, size_t expected_len);
 
 }  // namespace apxinf::gemm
-
-struct apxinf_runtime {
-  int device = 0;
-  std::mutex gemm_mutex;
-  std::map<std::string, apxinf::gemm::Recipe> gemm_recipes;
-};
