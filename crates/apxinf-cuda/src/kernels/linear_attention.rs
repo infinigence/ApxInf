@@ -631,6 +631,53 @@ pub fn gated_rms_silu(
 }
 
 /// RMSNorm with zero-init (1 + weight) semantics, fp32 compute, BF16 storage.
+/// `sum = a + b` and `rms_norm_plus1(sum)` in one launch, returning both.
+///
+/// The pair it replaces is the tail of every text block: the residual add,
+/// then the norm at the head of what follows. Returns the sum as well as the
+/// normed rows because the sum is the next block's residual.
+pub fn add_rms_norm_plus1(
+    ctx: &CudaContext,
+    a: &Tensor,
+    b: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let (rows, cols) = matrix_shape(a, "add rms norm plus1")?;
+    if rows == 0
+        || cols == 0
+        || b.shape().dims() != a.shape().dims()
+        || weight.shape().dims() != [cols]
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        return Err(Error::Other("add rms norm plus1 shape mismatch".into()));
+    }
+    expect_bf16(a, "add rms norm plus1")?;
+    expect_bf16(b, "add rms norm plus1")?;
+    expect_bf16(weight, "add rms norm plus1")?;
+    let sum = bf16_output(ctx, rows, cols)?;
+    let output = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        check_cuda(ffi::apxinf_static_add_rms_norm_plus1_bf16(
+            gpu_ptr(a)?,
+            gpu_ptr(b)?,
+            gpu_ptr(weight)?,
+            sum.ptr(),
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            eps,
+            ctx.stream().handle(),
+        ))
+    }?;
+    let shape = || Shape::new(vec![rows, cols]);
+    Ok((
+        make_gpu_tensor(shape(), DType::BF16, ctx.device_id(), sum),
+        make_gpu_tensor(shape(), DType::BF16, ctx.device_id(), output),
+    ))
+}
+
 pub fn rms_norm_plus1(
     ctx: &CudaContext,
     input: &Tensor,

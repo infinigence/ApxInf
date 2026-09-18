@@ -80,9 +80,17 @@ impl GdnLaunchPolicy {
 
     /// Defaults by architecture family, each swept on a board of that family.
     ///
-    /// sm80 family (Orin sm_87, RTX 4090 sm_89): the values #72 measured, with
-    /// the tensor-core forms off -- those kernels need an SM100-family tensor
-    /// core to be worth their extra passes.
+    /// sm80 family (Orin sm_87, RTX 4090 sm_89): re-swept after the GDN
+    /// kernels went to column tiles under a register cap, which moved both of
+    /// them. The chunk-gemm width moved furthest, because fusing its two
+    /// products doubled the accumulators and 32 of them no longer fit the cap:
+    /// tile 4 is 5.785 s/scene, 8 is 5.764, 16 is 5.774 and 32 is 6.328 -- not
+    /// a mild regression but a 10% one. The chunk-state block went the other
+    /// way, from 1024 back to 512 (5.7645 against 5.7787 over four interleaved
+    /// pairs), because the column tile needs fewer registers per thread and the
+    /// cap already bought back the residency the wider block was there to
+    /// provide. The tensor-core forms stay off: those kernels need an
+    /// SM100-family tensor core to be worth their extra passes.
     ///
     /// sm100 family (Thor sm_110): chunk-state tile 4 rather than 8 and
     /// chunk-gemm tile 4 rather than 32, both re-swept here; the chunk-state
@@ -108,9 +116,9 @@ impl GdnLaunchPolicy {
             },
             CudaArchFamily::Sm80 | CudaArchFamily::Other(_) => Self {
                 chunk_state_tile: 8,
-                chunk_state_threads: 1024,
+                chunk_state_threads: 512,
                 chunk_state_wmma: wmma::OFF,
-                chunk_gemm_tile: 32,
+                chunk_gemm_tile: 8,
                 chunk_gemm_wmma: wmma::OFF,
                 attn_raw_wmma: wmma::OFF,
                 recurrent_split: 1,
@@ -198,7 +206,8 @@ mod tests {
         let thor = GdnLaunchPolicy::defaults_for(CudaArchFamily::Sm100);
         let orin = GdnLaunchPolicy::defaults_for(CudaArchFamily::Sm80);
         assert_eq!((thor.chunk_state_tile, thor.chunk_gemm_tile), (4, 4));
-        assert_eq!((orin.chunk_state_tile, orin.chunk_gemm_tile), (8, 32));
+        assert_eq!((orin.chunk_state_tile, orin.chunk_gemm_tile), (8, 8));
+        assert_eq!((thor.chunk_state_threads, orin.chunk_state_threads), (1024, 512));
         assert_eq!(thor.recurrent_split, 4);
         assert_eq!(orin.recurrent_split, 1);
         assert_eq!(thor.chunk_state_wmma, wmma::SPLIT2);

@@ -814,10 +814,17 @@ impl QwenDriveModel {
             k_tag, kind, cells[2], cells[1], cells[0], l2s[2], l2s[1], l2s[0]))
     }
 
-    fn forward_mlp(&self, x: Tensor, post_norm: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, trace: bool) -> Result<Tensor> {
+    /// The block tail: the residual add, then the MLP, then the next residual
+    /// add. The first add is folded into the norm that consumes it, because at
+    /// decode both are one 2560-element row and the pair costs two launches for
+    /// a few microseconds of work.
+    fn forward_mlp(&self, x: &Tensor, delta: &Tensor, post_norm: &Tensor, gate_up_w: &Tensor, down_w: &Tensor, trace: bool) -> Result<Tensor> {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
-        let normed = la::rms_norm_plus1(ctx, &x, post_norm, eps)?;
+        let (x, normed) = la::add_rms_norm_plus1(ctx, x, delta, post_norm, eps)?;
+        if trace {
+            trace_rows("text0_residual", &x)?;
+        }
         let gu = gemm::bf16(ctx, &normed, gate_up_w)?;
         let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
         let down = linear_checkpoint(ctx, &act, down_w)?;
@@ -897,8 +904,7 @@ impl QwenDriveModel {
             trace_rows("text3_gated_attention", &attn)?;
             trace_rows("text3_out_proj", &proj)?;
         }
-        let hidden = elementwise::add(ctx, &x, &proj)?;
-        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, false)
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, false)
     }
 
     /// Run one GDN decode layer, from a captured graph when one is available.
@@ -1300,13 +1306,11 @@ impl QwenDriveModel {
         )?;
         let gated = gated.reshape(vec![seq, value_dim])?;
         let proj = linear_checkpoint(ctx, &gated, &w.out_w)?;
-        let hidden = elementwise::add(ctx, &x, &proj)?;
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_gated_norm", &gated)?;
             trace_rows("text0_out_proj", &proj)?;
-            trace_rows("text0_residual", &hidden)?;
         }
-        self.forward_mlp(hidden, &w.post_norm, &w.gate_up_w, &w.down_w, layer_idx == 0 && seq > 1)
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, layer_idx == 0 && seq > 1)
     }
 
     /// Run the text transformer over one token span, appending to the hybrid

@@ -185,6 +185,18 @@ extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_static_add_rms_norm_plus1_bf16(
+        a: *const c_void,
+        b: *const c_void,
+        weight: *const c_void,
+        sum_out: *mut c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_rms_norm_plus1_bf16(
         input: *const c_void,
         weight: *const c_void,

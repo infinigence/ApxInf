@@ -1315,11 +1315,13 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   const int cells_per_chunk = chunk_size * v_cols;
   auto block_ok = [&](int threads) {
     return threads >= 32 && threads <= 1024 && threads % 32 == 0 &&
-           v_cols % 32 == 0 && threads % v_cols == 0 &&
+           v_cols % 32 == 0 &&
            cells_per_chunk % threads == 0 && cells_per_chunk / threads <= 32 &&
            // Keep the tiled path reachable: with a trip count the accumulator
            // array is indexed dynamically and nvcc spills it, which costs more
-           // than the wider block wins.
+           // than the wider block wins. The tiles run along the columns, so
+           // the slice has to hold a whole number of them.
+           v_cols % policy->chunk_state_tile == 0 &&
            cells_per_chunk % (threads * policy->chunk_state_tile) == 0;
   };
   // 1024. That is not what an earlier sweep found -- on the CUDA 12.6 board,
@@ -1516,6 +1518,23 @@ extern "C" cudaError_t apxinf_static_rms_norm_plus1_bf16(
   rms_norm_plus1_bf16_kernel<<<rows, 256, smem, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(output), cols, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_add_rms_norm_plus1_bf16(
+    const void* a, const void* b, const void* weight, void* sum_out,
+    void* output, int rows, int cols, float eps, cudaStream_t stream) {
+  if (a == nullptr || b == nullptr || weight == nullptr || sum_out == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t smem = static_cast<size_t>(cols) * sizeof(float);
+  add_rms_norm_plus1_bf16_kernel<<<rows, 256, smem, stream>>>(
+      static_cast<const __nv_bfloat16*>(a),
+      static_cast<const __nv_bfloat16*>(b),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<__nv_bfloat16*>(sum_out),
       static_cast<__nv_bfloat16*>(output), cols, eps);
   return cudaGetLastError();
 }

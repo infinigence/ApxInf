@@ -217,7 +217,7 @@ __global__ void gdn_cumsum_kernel(
 // A1[i,j] = -beta_i * (k_i . k_j) * exp2(g_i-g_j), strictly lower triangular.
 // T[i,j] = bf16((q_i . k_j) * exp2(g_i-g_j)), including the diagonal.
 // Q remains unscaled until the final attention output. One block per chunk/head.
-__global__ void gdn_attn_raw_kernel(
+__global__ __launch_bounds__(256, 4) void gdn_attn_raw_kernel(
     const float* q, const float* k, const float* beta, const float* g_cum,
     float* a_out, float* t_out,
     int seq_pad, int head_k_dim, int chunk_size) {
@@ -248,22 +248,89 @@ __global__ void gdn_attn_raw_kernel(
     q_tile[t * tile_stride + d] = q[src];
   }
   __syncthreads();
-  for (int cell = threadIdx.x; cell < chunk_size * chunk_size; cell += blockDim.x) {
-    const int i = cell / chunk_size;
-    const int j = cell - i * chunk_size;
-    const int row_i = i * tile_stride;
-    const int row_j = j * tile_stride;
-    float a1 = 0.0f;
-    float a2 = 0.0f;
-    const float beta_i = beta[token_base + i];
-    for (int d = 0; d < head_k_dim; ++d) {
-      const float k_j = k_tile[row_j + d];
-      a1 += k_tile[row_i + d] * k_j;
-      a2 += q_tile[row_i + d] * k_j;
+  // One cell per thread issues three shared reads for two FMAs: k_tile[i][d],
+  // q_tile[i][d] and k_tile[j][d]. A rectangular register tile of cells shares
+  // all three across the block it covers -- 2*ATI+ATJ reads for 2*ATI*ATJ
+  // FMAs, four times fewer per FMA at 4x4 -- which is the read side of the
+  // same argument that moved the chunk-state loops. At the shipped shape a
+  // block's 4096 cells over 256 threads is exactly one 4x4 tile per thread, so
+  // the tile costs no extra trips. Each cell still sums over d in increasing
+  // order against the same operands, so the values do not change.
+  constexpr int ATI = 4;
+  constexpr int ATJ = 4;
+  if (chunk_size % ATI == 0 && chunk_size % ATJ == 0) {
+    const int tiles_j = chunk_size / ATJ;
+    const int total_tiles = (chunk_size / ATI) * tiles_j;
+    for (int t = threadIdx.x; t < total_tiles; t += blockDim.x) {
+      const int i0 = (t / tiles_j) * ATI;
+      const int j0 = (t - (t / tiles_j) * tiles_j) * ATJ;
+      float a1[ATI][ATJ];
+      float a2[ATI][ATJ];
+#pragma unroll
+      for (int ii = 0; ii < ATI; ++ii) {
+#pragma unroll
+        for (int jj = 0; jj < ATJ; ++jj) {
+          a1[ii][jj] = 0.0f;
+          a2[ii][jj] = 0.0f;
+        }
+      }
+      for (int d = 0; d < head_k_dim; ++d) {
+        float kv[ATI];
+        float qv[ATI];
+        float kj[ATJ];
+#pragma unroll
+        for (int ii = 0; ii < ATI; ++ii) {
+          kv[ii] = k_tile[(i0 + ii) * tile_stride + d];
+          qv[ii] = q_tile[(i0 + ii) * tile_stride + d];
+        }
+#pragma unroll
+        for (int jj = 0; jj < ATJ; ++jj) {
+          kj[jj] = k_tile[(j0 + jj) * tile_stride + d];
+        }
+#pragma unroll
+        for (int ii = 0; ii < ATI; ++ii) {
+#pragma unroll
+          for (int jj = 0; jj < ATJ; ++jj) {
+            a1[ii][jj] += kv[ii] * kj[jj];
+            a2[ii][jj] += qv[ii] * kj[jj];
+          }
+        }
+      }
+#pragma unroll
+      for (int ii = 0; ii < ATI; ++ii) {
+        const int i = i0 + ii;
+        const float beta_i = beta[token_base + i];
+        const float g_i = g_cum[token_base + i];
+#pragma unroll
+        for (int jj = 0; jj < ATJ; ++jj) {
+          const int j = j0 + jj;
+          const int cell = i * chunk_size + j;
+          const float decay = gdn_exp2_approx(g_i - g_cum[token_base + j]);
+          a_out[matrix_base + cell] =
+              (j < i) ? -__fmul_rn(__fmul_rn(a1[ii][jj], decay), beta_i) : 0.0f;
+          t_out[matrix_base + cell] =
+              (j <= i) ? __bfloat162float(__float2bfloat16(a2[ii][jj] * decay)) : 0.0f;
+        }
+      }
     }
-    const float decay = gdn_exp2_approx(g_cum[token_base + i] - g_cum[token_base + j]);
-    a_out[matrix_base + cell] = (j < i) ? -__fmul_rn(__fmul_rn(a1, decay), beta_i) : 0.0f;
-    t_out[matrix_base + cell] = (j <= i) ? __bfloat162float(__float2bfloat16(a2 * decay)) : 0.0f;
+  } else {
+    for (int cell = threadIdx.x; cell < chunk_size * chunk_size; cell += blockDim.x) {
+      const int i = cell / chunk_size;
+      const int j = cell - i * chunk_size;
+      const int row_i = i * tile_stride;
+      const int row_j = j * tile_stride;
+      float a1 = 0.0f;
+      float a2 = 0.0f;
+      const float beta_i = beta[token_base + i];
+      for (int d = 0; d < head_k_dim; ++d) {
+        const float k_j = k_tile[row_j + d];
+        a1 += k_tile[row_i + d] * k_j;
+        a2 += q_tile[row_i + d] * k_j;
+      }
+      const float decay = gdn_exp2_approx(g_cum[token_base + i] - g_cum[token_base + j]);
+      a_out[matrix_base + cell] = (j < i) ? -__fmul_rn(__fmul_rn(a1, decay), beta_i) : 0.0f;
+      t_out[matrix_base + cell] = (j <= i) ? __bfloat162float(__float2bfloat16(a2 * decay)) : 0.0f;
+    }
   }
 }
 
@@ -303,7 +370,7 @@ __global__ void gdn_tri_solve_kernel(float* a, int chunk_size) {
 // lets it move out. See chunk_state_tile() for why the width is measured
 // rather than chosen.
 template <int GEMM_TILE>
-__global__ void gdn_chunk_gemm_kernel(
+__global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
     const float* a, const float* v, const float* k, const float* beta,
     const float* g_cum, float* vt_out, float* kcd_out,
     int seq_pad, int head_k_dim, int head_v_dim, int chunk_size) {
@@ -343,7 +410,51 @@ __global__ void gdn_chunk_gemm_kernel(
   const int k_cells = chunk_size * head_k_dim;
   const int v_span = static_cast<int>(blockDim.x) * GEMM_TILE;
   const int k_span = v_span;
-  if (v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
+  // The two products share a: vt_out = a @ vb_tile and kcd_out = a @ kb_tile
+  // walk the same a[i][m] over the same i and m. Run as two loops each cell
+  // fetches its row of a twice, which at the shipped shape is 4096 global
+  // loads per thread where 2048 carry all the data. Fusing them halves that
+  // and costs one more accumulator per tile element, so the tile width has to
+  // come down far enough that the pair still fits in registers under the
+  // block's launch bounds -- see chunk_state_tile() for how the width is
+  // chosen. The two output cells at a given (i, j) are independent, and each
+  // still accumulates over m in increasing order, so the values are unchanged.
+  //
+  // Requires the two tiles to have the same row length; they do at every
+  // shipped shape, and the pair of loops below covers the case where they do
+  // not.
+  if (head_v_dim == head_k_dim && v_cells == k_cells &&
+      v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
+    const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
+    for (int base = threadIdx.x; base < v_cells; base += v_span) {
+      const int row0 = base / head_v_dim;
+      const int j = base - row0 * head_v_dim;
+      float vt[GEMM_TILE];
+      float kcd[GEMM_TILE];
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) {
+        vt[s] = 0.0f;
+        kcd[s] = 0.0f;
+      }
+      for (int m = 0; m < chunk_size; ++m) {
+        const float vv = __bfloat162float(vb_tile[m * head_v_dim + j]);
+        const float kv = __bfloat162float(kb_tile[m * head_k_dim + j]);
+        #pragma unroll
+        for (int s = 0; s < GEMM_TILE; ++s) {
+          const int i = row0 + s * row_step;
+          const float av = a[a_base + i * chunk_size + m];
+          vt[s] += av * vv;
+          kcd[s] += av * kv;
+        }
+      }
+      #pragma unroll
+      for (int s = 0; s < GEMM_TILE; ++s) {
+        const int off = base + s * static_cast<int>(blockDim.x);
+        vt_out[vt_base + off] = __bfloat162float(__float2bfloat16(vt[s]));
+        kcd_out[kcd_base + off] = __bfloat162float(__float2bfloat16(kcd[s]));
+      }
+    }
+  } else if (v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
     const int row_step = static_cast<int>(blockDim.x) / head_v_dim;
     for (int base = threadIdx.x; base < v_cells; base += v_span) {
       const int row0 = base / head_v_dim;
@@ -377,7 +488,10 @@ __global__ void gdn_chunk_gemm_kernel(
       vt_out[vt_base + cell] = __bfloat162float(__float2bfloat16(vt));
     }
   }
-  if (k_cells % k_span == 0 && blockDim.x % head_k_dim == 0) {
+  if (head_v_dim == head_k_dim && v_cells == k_cells &&
+      v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
+    // kcd_out was produced by the fused loop above.
+  } else if (k_cells % k_span == 0 && blockDim.x % head_k_dim == 0) {
     const int row_step = static_cast<int>(blockDim.x) / head_k_dim;
     for (int base = threadIdx.x; base < k_cells; base += k_span) {
       const int row0 = base / head_k_dim;
@@ -427,8 +541,35 @@ __global__ void gdn_chunk_gemm_kernel(
 // accumulator array is indexed dynamically, nvcc spills it to local memory and
 // the kernel roughly halves in speed -- and the right value is not obvious
 // enough to guess, so the launcher instantiates several and picks one.
+// Load a tile of contiguous bf16 out of shared memory.
+//
+// A column tile reads GDN_TILE adjacent bf16, which at every shipped width is
+// sixteen bytes on a sixteen-byte boundary: both shared buffers start on one
+// (the extern block does, and both offsets are whole numbers of kilobytes),
+// a row is v_cols bf16 and v_cols is a multiple of eight, and the tile's
+// column index is a multiple of the tile width. That is enough for one wide load instead of eight narrow ones,
+// but it takes the reinterpret to say so -- left to itself nvcc emits the
+// eight, which is the whole cost the column tile was meant to move. The
+// values are the same either way.
+template <int N>
+__device__ __forceinline__ void gdn_load_bf16_tile(const __nv_bfloat16* src,
+                                                   float* dst) {
+  if constexpr (N % 8 == 0) {
+#pragma unroll
+    for (int b = 0; b < N / 8; ++b) {
+      const float4 packed = *reinterpret_cast<const float4*>(src + b * 8);
+      const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&packed);
+#pragma unroll
+      for (int t = 0; t < 8; ++t) dst[b * 8 + t] = __bfloat162float(e[t]);
+    }
+  } else {
+#pragma unroll
+    for (int t = 0; t < N; ++t) dst[t] = __bfloat162float(src[t]);
+  }
+}
+
 template <int GDN_TILE, bool V_SPLIT>
-__global__ void gdn_chunk_state_kernel(
+__global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
     const float* q, const float* k,
     const float* g_cum, const float* t_in, const float* vt_in, const float* kcd_in,
     float* state, __nv_bfloat16* out,
@@ -495,19 +636,28 @@ __global__ void gdn_chunk_state_kernel(
     const int64_t kcd_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * head_k_dim;
     const int64_t a_base = (static_cast<int64_t>(head) * total_chunks + c) * chunk_size * chunk_size;
     float attn_inter[32];
-    // The inter term was the one loop here still reading the state cache once
-    // per cell. A thread's column j is fixed, so state_cache[m][j] is the same
-    // value for every cell it owns -- sixteen of them at the shipped shape --
-    // and ncu puts this kernel at 56% of the L1 pipeline with the cache reads
-    // dominating. Carrying a tile of accumulators moves the read outside, the
-    // same way the intra and state-update loops below already do. Each cell
-    // still sums over m in increasing order, so the values do not change.
+    // All three accumulation loops in this kernel tile over a thread's *columns*
+    // rather than its rows. The distinction is what the tile amortises. A row
+    // tile fixes j and walks i, so the one shared read per step is reused and
+    // the GDN_TILE global reads are not: the inter term then issues eight
+    // kcd_in loads and eight q loads for sixteen FMAs, and ncu charges 51.5% of
+    // this kernel's stalls to long_scoreboard, which is the global path. A
+    // column tile fixes i and walks j, so the global reads are the ones reused
+    // -- one kcd_in and one q per sixteen FMAs -- and the shared reads become
+    // GDN_TILE contiguous bf16, sixteen bytes, on a pipeline ncu puts under 1%.
+    // Occupancy is not the lever here: raising it to 100% by dropping the state
+    // cache was measured slower because it added global traffic, which is the
+    // same finding read from the other side.
+    //
+    // Each cell still sums over m in increasing order against the same
+    // operands; only which thread owns it changes. The values are unchanged.
     const int inter_span = static_cast<int>(blockDim.x) * GDN_TILE;
-    if (cells % inter_span == 0 && blockDim.x % v_cols == 0) {
-      const int row_step = static_cast<int>(blockDim.x) / v_cols;
-      for (int base = threadIdx.x, it = 0; base < cells; base += inter_span) {
-        const int row0 = base / v_cols;
-        const int j = base - row0 * v_cols;
+    if (cells % inter_span == 0 && v_cols % GDN_TILE == 0 &&
+        head_k_dim % 4 == 0) {
+      for (int base = static_cast<int>(threadIdx.x) * GDN_TILE, it = 0;
+           base < cells; base += inter_span) {
+        const int i = base / v_cols;
+        const int j = base - i * v_cols;
         float vp[GDN_TILE];
         float ai[GDN_TILE];
 #pragma unroll
@@ -515,22 +665,36 @@ __global__ void gdn_chunk_state_kernel(
           vp[t] = 0.0f;
           ai[t] = 0.0f;
         }
-        for (int m = 0; m < head_k_dim; ++m) {
-          const float sv = __bfloat162float(state_cache[m * v_cols + j]);
+        const int64_t krow = kcd_base + static_cast<int64_t>(i) * head_k_dim;
+        const int64_t qrow = static_cast<int64_t>(token_base + i) * head_k_dim;
+        // kcd_in and q are walked along m, which is their contiguous axis, and
+        // a row of either starts on a sixteen-byte boundary (head_k_dim is a
+        // multiple of four floats and the chunk bases are whole rows). Four
+        // floats per instruction instead of one: with the shared side already
+        // one wide load per m, this is what is left of the inner loop's
+        // instruction count. Same values, same order over m.
+        for (int m = 0; m < head_k_dim; m += 4) {
+          const float4 kv4 = *reinterpret_cast<const float4*>(kcd_in + krow + m);
+          const float4 qv4 = *reinterpret_cast<const float4*>(q + qrow + m);
+          const float kv[4] = {kv4.x, kv4.y, kv4.z, kv4.w};
+          const float qv[4] = {qv4.x, qv4.y, qv4.z, qv4.w};
 #pragma unroll
-          for (int t = 0; t < GDN_TILE; ++t) {
-            const int i = row0 + t * row_step;
-            vp[t] += kcd_in[kcd_base + i * head_k_dim + m] * sv;
-            ai[t] += q[(token_base + i) * head_k_dim + m] * sv;
+          for (int u = 0; u < 4; ++u) {
+            float sv[GDN_TILE];
+            gdn_load_bf16_tile<GDN_TILE>(state_cache + (m + u) * v_cols + j, sv);
+#pragma unroll
+            for (int t = 0; t < GDN_TILE; ++t) {
+              vp[t] += kv[u] * sv[t];
+              ai[t] += qv[u] * sv[t];
+            }
           }
         }
+        const float qg = gdn_exp2_approx(g_cum[token_base + i]);
 #pragma unroll
         for (int t = 0; t < GDN_TILE; ++t, ++it) {
-          const int i = row0 + t * row_step;
-          const int cell = base + t * static_cast<int>(blockDim.x);
-          const float qg = gdn_exp2_approx(g_cum[token_base + i]);
+          const int cell = base + t;
           v_new[cell] =
-              vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j : cell)] - vp[t];
+              vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j + t : cell)] - vp[t];
           attn_inter[it] = ai[t] * qg;
         }
       }
@@ -555,44 +719,44 @@ __global__ void gdn_chunk_state_kernel(
       v_round[cell] = __float2bfloat16(v_new[cell]);
     }
     __syncthreads();
-    // blockDim is a multiple of head_v_dim, so a thread's column j is the same
-    // for every cell it owns, and v_round[m][j] does not depend on which cell
-    // is being accumulated -- the plain loop re-reads and re-converts it once
-    // per cell. Accumulating a tile of cells at once lets that read move out.
+    // Column-tiled for the reason given above the inter term: t_in[i][m] is
+    // loaded once and multiplied against GDN_TILE contiguous v_round entries,
+    // instead of one v_round read against GDN_TILE t_in loads.
     // The tile count must be a compile-time constant: with a runtime trip count
     // the accumulators are indexed dynamically, nvcc puts them in local memory
     // instead of registers, and the kernel gets about twice as slow. Hence the
     // divisibility guard and the plain path beside it.
     const int tile_span = static_cast<int>(blockDim.x) * GDN_TILE;
-    if (cells % tile_span == 0) {
-      // blockDim is a multiple of head_v_dim, so the tile's rows are an
-      // arithmetic sequence and the row index needs no division: recomputing
-      // (base + s*blockDim)/head_v_dim inside the unrolled body costs an
-      // integer divide per element per step, which is worse than the shared
-      // read it was meant to save.
-      const int row_step = static_cast<int>(blockDim.x) / v_cols;
-      for (int base = threadIdx.x, it = 0; base < cells; base += tile_span) {
-        const int row0 = base / v_cols;
-        const int j = base - row0 * v_cols;
+    if (cells % tile_span == 0 && v_cols % GDN_TILE == 0 &&
+        chunk_size % 4 == 0) {
+      for (int base = static_cast<int>(threadIdx.x) * GDN_TILE, it = 0;
+           base < cells; base += tile_span) {
+        const int i = base / v_cols;
+        const int j = base - i * v_cols;
         float intra[GDN_TILE];
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) intra[s] = 0.0f;
-        for (int m = 0; m < chunk_size; ++m) {
-          const float vv = __bfloat162float(v_round[m * v_cols + j]);
+        const int64_t arow = a_base + static_cast<int64_t>(i) * chunk_size;
+        for (int m = 0; m < chunk_size; m += 4) {
+          const float4 tv4 = *reinterpret_cast<const float4*>(t_in + arow + m);
+          const float tv[4] = {tv4.x, tv4.y, tv4.z, tv4.w};
           #pragma unroll
-          for (int s = 0; s < GDN_TILE; ++s) {
-            const int i = row0 + s * row_step;
-            intra[s] += t_in[a_base + i * chunk_size + m] * vv;
+          for (int u = 0; u < 4; ++u) {
+            float vv[GDN_TILE];
+            gdn_load_bf16_tile<GDN_TILE>(v_round + (m + u) * v_cols + j, vv);
+            #pragma unroll
+            for (int s = 0; s < GDN_TILE; ++s) {
+              intra[s] += tv[u] * vv[s];
+            }
           }
         }
+        const int token = c * chunk_size + i;
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s, ++it) {
-          const int i = row0 + s * row_step;
           const float acc = attn_inter[it] * scale + intra[s] * scale;
-          const int token = c * chunk_size + i;
           if (token < seq) {
             out[static_cast<int64_t>(token) * out_row_width + head * head_v_dim +
-                j0 + j] = __float2bfloat16(acc);
+                j0 + j + s] = __float2bfloat16(acc);
           }
         }
       }
@@ -622,28 +786,26 @@ __global__ void gdn_chunk_state_kernel(
           v_new[cell] * gdn_exp2_approx(g_last - g_cum[token_base + i]));
     }
     __syncthreads();
-    if (state_cells % tile_span == 0) {
-      const int row_step_state = static_cast<int>(blockDim.x) / v_cols;
-      for (int base = threadIdx.x; base < state_cells; base += tile_span) {
-        const int row0 = base / v_cols;
-        const int j = base - row0 * v_cols;
+    if (state_cells % tile_span == 0 && v_cols % GDN_TILE == 0) {
+      for (int base = static_cast<int>(threadIdx.x) * GDN_TILE;
+           base < state_cells; base += tile_span) {
+        const int m = base / v_cols;
+        const int j = base - m * v_cols;
         float acc[GDN_TILE];
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) acc[s] = 0.0f;
         for (int i = 0; i < chunk_size; ++i) {
-          const float vv = __bfloat162float(v_round[i * v_cols + j]);
-          const int64_t krow = static_cast<int64_t>(token_base + i) * head_k_dim;
+          const float kv = k[static_cast<int64_t>(token_base + i) * head_k_dim + m];
+          float vv[GDN_TILE];
+          gdn_load_bf16_tile<GDN_TILE>(v_round + i * v_cols + j, vv);
           #pragma unroll
           for (int s = 0; s < GDN_TILE; ++s) {
-            const int m = row0 + s * row_step_state;
-            acc[s] += k[krow + m] * vv;
+            acc[s] += kv * vv[s];
           }
         }
         #pragma unroll
         for (int s = 0; s < GDN_TILE; ++s) {
-          const int cell = V_SPLIT
-                               ? (row0 + s * row_step_state) * head_v_dim + j0 + j
-                               : base + s * static_cast<int>(blockDim.x);
+          const int cell = V_SPLIT ? m * head_v_dim + j0 + j + s : base + s;
           state_head[cell] = state_head[cell] * decay + acc[s];
         }
       }
@@ -935,6 +1097,102 @@ __global__ void rms_norm_plus1_bf16_kernel(
   for (int i = threadIdx.x; i < cols; i += blockDim.x) {
     output[base + i] = __float2bfloat16(
         __fmul_rn(__fmul_rn(la_plus1[i], rms), __fadd_rn(1.0f, __bfloat162float(weight[i]))));
+  }
+}
+
+// The residual add fused into the norm that always follows it.
+//
+// x = a + b; out = rms_norm_plus1(x). Both halves of every text block end this
+// way -- sixty-four pairs per decoded token -- and at decode each is one
+// 2560-element row, a couple of microseconds of work behind a kernel's fixed
+// cost. Fusing removes one launch and one round trip through the sum per pair.
+//
+// The sum still goes to memory in BF16 and the reduction still reads it back
+// from there. That is not an oversight: the separate pair rounds, and carrying
+// the fp32 sum into the reduction instead would be a different model. Nothing
+// below the first __syncthreads differs from rms_norm_plus1_bf16_kernel, the
+// gridDim.x switch to the vectorised mean included, so the two keep agreeing
+// on prefill and decode shapes alike.
+__global__ void add_rms_norm_plus1_bf16_kernel(
+    const __nv_bfloat16* a, const __nv_bfloat16* b,
+    const __nv_bfloat16* weight, __nv_bfloat16* sum_out, __nv_bfloat16* output,
+    int cols, float eps) {
+  const int row = blockIdx.x;
+  extern __shared__ float la_fused_plus1[];
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  // The add it replaces was a vec8 kernel spread over the whole tensor; this
+  // one has a block per row, so a scalar add here is a step backwards and was
+  // measured as one -- 17.8us per pair against the 15.9us of the two separate
+  // kernels. Eight bf16 per instruction restores it.
+  //
+  // The rounded sum goes into shared on the way past, so the reduction below
+  // never reads it back from global. la_fused_plus1[i] holds exactly what the
+  // separate norm would have loaded, and the reduction still walks i in the
+  // same strided order, so the sum of squares is unchanged.
+  const bool wide =
+      cols % 8 == 0 &&
+      ((reinterpret_cast<uintptr_t>(a + base) |
+        reinterpret_cast<uintptr_t>(b + base) |
+        reinterpret_cast<uintptr_t>(sum_out + base)) &
+       15) == 0;
+  if (wide) {
+    const float4* a4 = reinterpret_cast<const float4*>(a + base);
+    const float4* b4 = reinterpret_cast<const float4*>(b + base);
+    float4* s4 = reinterpret_cast<float4*>(sum_out + base);
+    const int vec_count = cols / 8;
+    for (int v = threadIdx.x; v < vec_count; v += blockDim.x) {
+      float4 pa = a4[v];
+      float4 pb = b4[v];
+      float4 po;
+      const __nv_bfloat16* av = reinterpret_cast<const __nv_bfloat16*>(&pa);
+      const __nv_bfloat16* bv = reinterpret_cast<const __nv_bfloat16*>(&pb);
+      __nv_bfloat16* ov = reinterpret_cast<__nv_bfloat16*>(&po);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const __nv_bfloat16 t = __float2bfloat16(
+            __bfloat162float(av[j]) + __bfloat162float(bv[j]));
+        ov[j] = t;
+        la_fused_plus1[v * 8 + j] = __bfloat162float(t);
+      }
+      s4[v] = po;
+    }
+  } else {
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+      const __nv_bfloat16 t = __float2bfloat16(
+          __bfloat162float(a[base + i]) + __bfloat162float(b[base + i]));
+      sum_out[base + i] = t;
+      la_fused_plus1[i] = __bfloat162float(t);
+    }
+  }
+  __syncthreads();
+  float partial = 0.0f;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float v = la_fused_plus1[i];
+    partial += v * v;
+  }
+  __shared__ float fused_warp_sums[32];
+  for (int offset = 16; offset > 0; offset >>= 1)
+    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) fused_warp_sums[warp] = partial;
+  __syncthreads();
+  if (warp == 0) {
+    float v = (lane < (blockDim.x + 31) / 32) ? fused_warp_sums[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+      v += __shfl_xor_sync(0xffffffff, v, offset);
+    if (lane == 0) fused_warp_sums[0] = v;
+  }
+  __syncthreads();
+  float mean =
+      __fmul_rn(fused_warp_sums[0], __fdiv_rn(1.0f, static_cast<float>(cols)));
+  if (gridDim.x >= 16 && cols > 128 && cols % 4 == 0)
+    mean = rms_vector_square_mean_bf16(sum_out + base, cols);
+  const float rms = rsqrtf(__fadd_rn(mean, eps));
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    output[base + i] = __float2bfloat16(__fmul_rn(
+        __fmul_rn(la_fused_plus1[i], rms),
+        __fadd_rn(1.0f, __bfloat162float(weight[i]))));
   }
 }
 
