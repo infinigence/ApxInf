@@ -1,6 +1,5 @@
 mod bf16;
 mod fp8;
-mod packed;
 mod plan;
 mod providers;
 mod w8a8;

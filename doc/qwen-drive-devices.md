@@ -1,8 +1,9 @@
-# Qwen-Drive across three devices
+# Qwen-Drive on more than one device
 
-One model implementation, three boards. This is the map: what each board gets,
-where its constants live, and what has and has not been re-measured since the
-three lines were brought together.
+One model implementation, three boards -- Jetson AGX Orin (sm_87), Jetson AGX
+Thor (sm_110) and the RTX 4090 (sm_89). This is what to know before changing
+anything that behaves differently on one of them: where each kind of
+per-device decision belongs, and what the constants currently are.
 
 ## The fixed workload
 
@@ -15,27 +16,6 @@ state: stationary, just-braked, 2.67 m/s, 6.99 m/s.
 
 `control/verify_perf_orin.py` runs it; `control/verify_gpu_orin.py` is the
 four-mode correctness gate over the same inputs.
-
-## Where each board stands
-
-| | sm | per scene | against its own baseline |
-|---|---|---:|---|
-| RTX 4090 | sm_89 | 3.580 s | 1.02x over the pre-pilot snapshot |
-| Jetson AGX Orin | sm_87 | 6.014 s | 1.09x, from 6.609 s |
-| Jetson AGX Thor | sm_110 | **3.505 s** | **1.47x**, from 5.196 s |
-
-The Thor column is the one this consolidation re-measured; see
-[RESULTS.md](RESULTS.md) for its decomposition and
-[THOR-ROOFLINE.md](THOR-ROOFLINE.md) for the device limits it is scored
-against. [jetson-roofline.md](jetson-roofline.md) is the same measurement for
-sm_87 and sm_101, taken with `scripts/bench_device_roofline.cu`, and its last
-section reconciles the three boards -- including the two measurement traps that
-were hit twice independently: a Jetson's DVFS ramp, which makes a cold sweep
-read as a dependency cliff that is not there, and `cudaDevAttrMemoryClockRate`,
-which does not report the LPDDR rate on Tegra. The 4090 numbers come from
-[qwen-drive-performance.md](qwen-drive-performance.md) and the integration
-record is [kersor-qwen-drive-4090.md](kersor-qwen-drive-4090.md); the Orin
-numbers are #72's.
 
 ## Where the per-device decisions live
 
@@ -77,331 +57,53 @@ Orin, 0.05% on Thor after the accuracy filter, nothing at all on the 4090.
 
 ## What the constants actually are
 
-`GdnLaunchPolicy::defaults_for` is the whole table. The point of collecting it
-is that none of these transfers:
+`GdnLaunchPolicy::defaults_for` is the whole table, and the point of collecting
+it in one place is that not one of these values transfers between the two
+families:
 
 | | sm80 family | sm100 family |
 |---|---:|---:|
 | chunk-state tile | 8 | 4 |
-| chunk-gemm tile | 32 | 4 |
+| chunk-state block | 512 | 1024 |
+| chunk-gemm tile | 8 | 4 |
 | recurrence split | 1 | 4 |
 | chunk-state scan | scalar fp32 | two BF16 terms on tensor cores |
-
-The chunk-state curve does not merely shift between the two: a tile of 16 is
-8% off the optimum on Orin and 26% off on Thor.
-
-## What has been verified since the consolidation
-
-On Thor: builds, the four-mode gate in its declared state, `perf-thor.sh` at
-1.4708x geomean, `precision_probe.py` unchanged on all three runnable modes,
-and all four fp64 operator oracles returning the same numbers as before the
-merge.
-
-Both Orin and the 4090 have since been run; the section at the end of this
-document has their numbers. The 4090 came out 1.78x faster and Orin 5.4%
-slower, and the Orin result is not yet explained.
-
----
-
-# What the three boards measured, on this branch
-
-Run after the consolidation, same four scenes, same script, same two
-environment flags (`APXINF_CUDA_ALLOC_CACHE=1`,
-`APXINF_CUDA_SKIP_OUTPUT_ZERO=1`) on every board, so the numbers are
-comparable to each other and not to any earlier record taken without them.
-
-## Correctness: the gate reproduces, and two boards agree bit for bit
-
-| | VQA first difference | direct |
-|---|---|---|
-| Orin sm_87 | scene 0, index 121, token 357 | 0.08056783676147461 |
-| RTX 4090 sm_89 | scenes 0 and 1 pass; scene 2 at index 487 | 0.08056783676147461 |
-| Thor sm_110 | scene 0, index 106, token 5459 | 0.08056640625 |
-
-Orin's row is what #72 and #74 recorded, digit for digit, which is the
-evidence that the consolidation did not disturb that line.
-
-The 4090 and Orin produce the *same seventeen digits* for the direct
-trajectory error. They are different silicon on different toolkits, and they
-take the same code path -- both are sm80-family, so both get the scalar GDN
-kernels and the FA2 head-256 dispatch. Thor differs in the last digits, and it
-is the one board whose policy row puts the chunk-state scan on tensor cores.
-That is the shape the divergence should have if it is BF16 rounding amplified
-through the GDN recurrence, as `jetson-roofline.md` argues, and not a defect in
-one kernel.
-
-## Performance, measured on each board against its own previous branch
-
-Alternating rounds on one machine, so a slow patch cannot land on one side only.
-
-**RTX 4090, against #73** — 2.5831 / 2.6048 / 2.5942 / 2.5676 s per scene
-becomes 1.4513 / 1.4536 / 1.4531 / 1.4536 and 1.4467 / 1.4536 / 1.4537 /
-1.4542. **1.78x.**
-
-That is not "no behaviour change", which is what was expected before measuring.
-#73 is the 4090's own older line: it has neither #72's Orin work nor the twelve
-commits `main` has taken since. Consolidating hands the 4090 both at once. The
-policy table's sm80 row is unchanged for it; the speed comes from the rest of
-the branch.
-
-Accuracy over the same probe, #73 → this branch: direct trajectory
-mean/rms/p99 0.012886/0.043744/0.322266 → 0.011401/0.037494/0.161133, the p99
-halving; reasoning rms 0.030624 → 0.029038 with its mean 6.7% worse; VQA token
-agreement 0.5813 → 0.5796, unchanged within its own scatter.
-
-**Orin, against #72 at `41066eb`** — 6.4726 / 6.4634 / 6.4721 / 6.4616 s
-becomes 6.8259 / 6.8002 / 6.8153 / 6.8070. **5.4% slower**, reproducible over
-two alternating rounds with 0.1% spread.
-
-**This is resolved, and it was not a regression.** The kernel tables say so.
-Profiling one scene on each wheel and differing them:
-
-| kernel | "#72" | this branch | delta |
-|---|---:|---:|---:|
-| `gdn_chunk_state_kernel<8>` | 213.6 ms | 464.3 ms | +250.7 |
-| `gdn_attn_raw_kernel` | 66.0 | 107.7 | +41.8 |
-| `gdn_chunk_gemm_kernel` | 81.1 (tile 8) | 116.3 (tile 32) | +35.2 |
-| `add_rms_norm_plus1` fused vs split | 112.5 | 120.2 | +43.6 net |
-| `gelu_tanh_bf16_vec8` | 39.9 | 27.6 | −12.3 |
-| total | 6047.3 | 6363.2 | **+315.9** |
-
-The launch shapes name the cause: on the baseline side `gdn_chunk_state_kernel`
-runs at block 512 with **64 registers** a thread, on this branch at block 1024
-with **48**. The baseline's source carries `__launch_bounds__(1024)` on that
-kernel and `__launch_bounds__(256, 4)` on the other two; this branch's does
-not, so nvcc chose a narrower allocation and the kernel spills.
-
-Those launch bounds are in no commit. `~/apxinf-orin/ApxInf-qd` is checked out
-at `41066eb` with **789 uncommitted lines across ten files** — launch bounds,
-a fused `add_rms_norm_plus1_bf16_kernel`, row-tiled fast paths in three GDN
-kernels — and the wheel the baseline side installs was built from that working
-tree. #72's actual head, `80b0ecc`, has none of it either: that file is 1194
-lines there, 1285 here, and 1454 in the working tree.
-
-So the comparison was against an unpublished work in progress, not against
-#72, and nothing in the repository is slower than it was. What the number does
-say is that there are 789 lines of measured optimisation sitting on one board
-in no branch, worth about 5% on Orin. It is preserved as
-`~/apxinf-orin/orin-wip-41066eb.patch`; folding it in is real merge work,
-because two of its ten files are the two this branch changed most.
-
-Sweeping the two launch constants on this branch does not recover it — 32/1024
-is already the best of the six combinations tried, at 6.6237-6.6671 against
-6.64-6.72 for the others — which is expected, since the missing speed is in
-kernel source rather than in a constant.
-
-### Folding it in
-
-Done, and it is now in the branch. The kernel table said what to take and the
-launch shapes said why, so the fold is four separable pieces rather than one
-patch applied blind:
-
-| | what it is | orin2 kernel table |
-|---|---|---:|
-| column tiles | the three chunk loops fix the row and walk the columns, so the *global* reads are the ones amortised and the shared reads become one wide BF16 load | 250.7 ms on chunk-state, 35.2 on chunk-gemm |
-| launch bounds | a register cap, not a width: without it nvcc gave chunk-state 48 registers at a 1024-thread block and spilled | (included above) |
-| a 4×4 register tile in `gdn_attn_raw` | three shared reads for two FMAs becomes 2·4+4 for 2·4·4 | 41.8 ms |
-| the residual add folded into the norm | at decode both are one 2560-element row, two launches for a few microseconds | 43.6 ms net |
-
-Two constants in the sm80 row moved with the kernels. Chunk-gemm's width moved
-furthest, because fusing its two products doubled the accumulators and 32 no
-longer fit the cap — 4 is 5.785 s/scene, 8 is 5.764, 16 is 5.774, **32 is
-6.328**, so the old default was a 10% regression rather than a mild one. The
-chunk-state block went the other way, 1024 back to 512, because the column tile
-needs fewer registers and the cap already bought back the residency the wider
-block provided. Thor's row was re-swept too and did not move: 4 is 3.3405
-against 3.3521 at 2, 3.3483 at 16 and 3.3615 at 8.
-
-Nothing about the numbers changed. On orin2 the three operator oracles land
-digit for digit where they were — chunk-state 1.418808e-3 against fp64,
-chunk-gemm 1.369621e-7, the decode recurrence 1.403177e-3 — the value-split
-test still reports zero differing words, and the whole probe is byte-identical
-to the tree this recovers, first differing VQA index `[121, 88, 445, 32]`
-included.
-
-Three alternating rounds on orin2, against that tree:
-
-| | scene 0 | scene 1 | scene 2 | scene 3 |
-|---|---:|---:|---:|---:|
-| the uncommitted tree, serial | 6.4881 | 6.4778 | 6.4854 | 6.4836 |
-| this branch, serial | 6.5033 | 6.4949 | 6.5044 | 6.5038 |
-| this branch, its own defaults | 6.2926 | 6.2897 | 6.2916 | 6.2773 |
-
-Kernels alone land within **0.27%** of the tree; with this branch's own
-preprocessing it is **3.12% ahead** of it and **6.07% ahead** of where the
-branch stood before the fold.
-
-Thor gains less, and for a reason the policy table predicts: its row puts the
-chunk-state scan on tensor cores, so the largest of the four pieces never runs
-there. What is left is the attention term, the chunk GEMM and the add fusion —
-3.3643/3.3673/3.3697/3.3681 becomes 3.3397/3.3403/3.3316/3.3319, **1.0094x**,
-31 ms a scene.
-
-What it is **not**: the policy table. Sweeping its Orin row back to the values
-`41066eb` shipped changes nothing — `chunk_gemm_tile` 16 gives 6.82,
-`chunk_state_threads` 512 gives 6.83, both together 6.83, `chunk_state_tile` 4
-the same, against 6.81 for the defaults. Nor is it accuracy-related: the gate
-reproduces exactly.
-
-What it could be: the span from `41066eb` to this branch carries three sets of
-commits, and only one of them is this work. Upstream added eleven to #72's own
-branch, `main` has moved twelve, and this branch adds its own. The third data
-point that separates them is #72's current head `80b0ecc` built on the same
-board; that build was in progress when both Jetsons went off the network, and
-it is the next thing to run.
-
-# Where the 4090's scene actually goes
-
-`ncu` is refused on this box too (`ERR_NVGPUCTRPERM`), but `nsys` is not, and
-between a kernel trace, an NVTX range around `policy.infer`, and the same scene
-run at one token and at 64, the whole 1.45 s is accounted for.
-
-## The device's own roofline
-
-| | measured | spec |
-|---|---:|---:|
-| DRAM read, 2 GB | **954.5 GB/s** | 1008 GB/s |
-| copy (r+w) | 886.0 GB/s | |
-| FP32 FMA, 32 chains | 80.2 TFLOP/s | |
-| BF16 GEMM, 8192³ | 168.8 TFLOP/s | |
-
-FP32 on CUDA cores is **80.2 TFLOP/s against Thor's 5.43 and Orin's 3.42**,
-which is why the fp32 GDN kernels that dominate a Jetson's prefill are a much
-smaller share here, and why the tensor-core forms that pay on Thor are not
-obviously worth their extra passes on this board.
-
-## The split, and the same 76% on two very different boards
-
-| | fixed cost | decode |
-|---|---:|---:|
-| per scene, four scenes | 0.7142 s | 11.572 ms/token |
-
-The byte budget is 8.41 GB per decode token, so the floor at 954.5 GB/s is
-8.81 ms and the measured decode is **76.1% of it**. Thor measured 76.3% against
-its own floor. Two boards a factor of 3.7 apart in bandwidth and 15 apart in
-fp32 throughput sit at the same fraction of their own roofs, which says the
-remaining decode gap is a property of the decode path and not of either device.
-
-## A fifth of the scene is not GPU work at all
-
-An NVTX range around `policy.infer` against the kernel trace:
-
-| | |
-|---|---:|
-| `infer` call | 727.3 ms |
-| host before the first kernel launches | **283.0 ms** |
-| GPU span | 435.6 ms |
-| host after the last kernel | 8.7 ms |
-
-At 64 tokens the GPU span grows to 1167.9 ms and the host prologue does not
-move, so it is 283 ms of a 1471 ms scene — **19%**, larger than any kernel, and
-entirely invisible to a GPU profiler. Inside the GPU span the device is busy
-94.5% of the time in prefill and 96.4% in decode, over 494 launches per decode
-token; the gaps are 0.42 ms/token, so there is no launch-overhead story here.
-
-Timing the policy's `_patchify` stage by stage over the twelve frames of a
-scene found it:
-
-| stage | ms, twelve frames |
-|---|---:|
-| PIL bicubic resize to `target_size` | 125.6 |
-| PIL bicubic resize onto the patch grid | 52.8 |
-| block-ordered permutation and copy | 19.9 |
-| `Image.fromarray` | 10.3 |
-| normalisation | 9.5 |
-| `asarray` to float32 | 4.8 |
-| **total** | **222.9** |
-
-Four fifths of it is two bicubic resizes. Collapsing them into one would change
-pixel values and the reference performs both, so that is not available. What is
-available is that the twelve frames are independent, and both PIL's resampling
-and numpy's copies release the GIL. Eight worker threads take 231 ms to 58.4 ms
-— 3.96x — and the concatenated patch tensors hash identically to the serial
-ones.
-
-Measured end to end, three alternating rounds:
-
-| | scene 0 | scene 1 | scene 2 | scene 3 |
-|---|---:|---:|---:|---:|
-| serial | 1.4553 | 1.4534 | 1.4556 | 1.4554 |
-| eight threads | 1.2903 | 1.2934 | 1.2826 | 1.2837 |
-
-**Geomean 1.1300x**, 167 ms a scene, for a change that hands the model the same
-bytes. `APXINF_QWEN_PREPROC_THREADS` sets the worker count; 1 restores the loop.
-
-## The chunk-state scan runs on a quarter of the device
-
-`gdn_chunk_state_kernel<8>` is 131.2 ms of the 410 ms prefill, 24 launches of
-5.47 ms, and the trace gives its shape: **grid 32, block 1024, 80 KB of shared
-memory**. Thirty-two blocks is one per value head, and this board has 128
-multiprocessors, so three quarters of it are idle for the duration. On a 16-SM
-Orin the same launch is two full waves, which is why nothing about it looked
-wrong until now.
-
-The scan is sequential over chunks, so chunks cannot be spread. The value
-dimension can: the decay scales rows of the state, every accumulation runs over
-the key dimension, and an output column reads only its own column of the state,
-so nothing in the kernel crosses it. Splitting a head across four blocks of 32
-columns is the same arithmetic in the same order on a quarter of the columns
-each, and `gdn_chunk_state_v_split_is_bit_exact` checks that as bits rather
-than against a tolerance: 98304 output words and the whole carried state, zero
-differing at both two-way and four-way. The width comes from the device's
-multiprocessor count, so Orin and Thor keep one block per head.
-
-Three alternating rounds, on top of the parallel preprocessing:
-
-| blocks per head | scene 0 | scene 1 | scene 2 | scene 3 | geomean |
-|---|---:|---:|---:|---:|---:|
-| 1 | 1.2921 | 1.2873 | 1.2925 | 1.2861 | — |
-| 2 | 1.2564 | 1.2565 | 1.2477 | 1.2553 | 1.0283x |
-| 4 | 1.2453 | 1.2475 | 1.2371 | 1.2389 | **1.0381x** |
-
-47 ms a scene. Four is the most this shape allows — the value dimension is 128
-and a slice below 32 columns stops being a whole warp of them — and the curve
-is already flattening, so the kernel has stopped being short of blocks and
-started being short of something else. Together with the preprocessing that is
-**1.173x** on the 4090 over the consolidated branch, both halves bit-exact.
-
-One thing this uncovered: carrying the column offset as a runtime value cost
-enough registers to push the 1024-thread width past the per-block budget, and
-the unsplit launch came back `CUDA 701` on a board that had been running it
-for weeks. The split is therefore a template parameter, and one block per head
-compiles to what it compiled to before.
-
-## What the parallel preprocessing is worth on the other board
-
-Orin measures the same preprocessing at 241.7 ms serial and 49.4 ms on twelve
-workers — 4.89x, against the 4090's 3.96x on eight — and the concatenated
-patch tensors hash to the same digest on both boards. End to end, three
-alternating rounds on a machine that was not idle (an nvcc from an earlier
-build held one of the twelve cores throughout, which is what alternating is
-for):
-
-| | scene 0 | scene 1 | scene 2 | scene 3 |
-|---|---:|---:|---:|---:|
-| serial | 6.8672 | 6.8686 | 6.8636 | 6.8572 |
-| eight threads | 6.6622 | 6.6688 | 6.6710 | 6.6758 |
-
-**1.0292x**, 195 ms a scene. Thor measures 143.1 ms serial and 33.7 ms on
-twelve workers, 4.25x, and 1.0394x end to end — 134 ms a scene. The win is a
-fixed number of milliseconds on every board, so it is worth 13% on the fastest
-one and 3% on the slowest.
-
-One worker per frame, bounded by the cores, is what all three want: twelve
-workers against eight is 4.36x against 3.36x on the 4090, 4.89x against 3.86x
-on Orin, 4.25x against 3.28x on Thor. An earlier eight-worker cap came from a
-single three-repeat measurement on the 4090 that did not reproduce.
-
-## Where the branch stands on the 4090
-
-Both changes together, three alternating rounds against the branch as
-consolidated:
-
-| | scene 0 | scene 1 | scene 2 | scene 3 |
-|---|---:|---:|---:|---:|
-| as consolidated | 1.4502 | 1.4515 | 1.4569 | 1.4549 |
-| now | 1.2378 | 1.2336 | 1.2330 | 1.2318 |
-
-**1.1777x**, 219 ms a scene, and both halves produce identical bytes -- the
-preprocessing by hash and end-to-end probe, the scan by bit comparison of its
-output and carried state.
+| blocks per head in the scan | from the multiprocessor count | from the multiprocessor count |
+
+The curves are not merely shifted, either: a chunk-state tile of 16 is 8% off
+the optimum on Orin and 26% off on Thor, and a chunk-gemm tile of 32 -- which
+was the sm80 default until the kernel's two products were fused -- is a 10%
+regression rather than a mild one.
+
+Every field has an environment override (`APXINF_GDN_*`, named in
+`gdn_policy.rs`) so a new board can be re-swept without a rebuild. Re-sweep
+after changing any of these kernels: the chunk-state block width has moved
+twice already, and the chunk-gemm width once.
+
+## When a measurement is needed
+
+Three things decide correctness questions on this model, in this order, and the
+four-mode gate is not one of them -- it reports scene 0's maximum trajectory
+error, which on this checkpoint only ever takes the two adjacent BF16 output
+ULPs 0.0403 and 0.0806, so it flips on changes that move nothing:
+
+1. `cargo test -p apxinf-cuda gdn_ -- --nocapture` runs the fp64 operator
+   oracles for the GDN kernels and the bit-exactness test for the value split.
+   A kernel change that claims to preserve the arithmetic has to say so here.
+2. `control/precision_probe.py` reports token agreement and error
+   distributions over every scene of every runnable mode, which move
+   continuously where the gate does not.
+3. `control/verify_perf_orin.py` for speed, always as alternating A/B rounds on
+   one machine.
+
+Measurement evidence for the three boards -- rooflines, kernel tables, the
+per-device sweeps behind the table above -- is kept out of the review diff
+under `devlocal/qwen-drive/reports/` per `AGENTS.md`, along with the probes
+that produced it and the two subsystems this revision does not reach: the
+packed-weight GEMV and the perception scaffold.
+
+One measurement note that costs hours if it is learned the hard way: on a
+Jetson the same build measures several percent apart over an afternoon, and
+6.29 s/scene at 14:20 became 6.75 s at 17:40 with nothing changed. Any
+comparison has to be alternating rounds of both sides on one machine within
+one run. Two numbers an hour apart are not a comparison.

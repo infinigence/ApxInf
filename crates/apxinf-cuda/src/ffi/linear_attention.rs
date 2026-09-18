@@ -207,18 +207,6 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
-    pub fn apxinf_static_partial_rope_table_bf16(
-        x: *const c_void,
-        cos: *const c_void,
-        sin: *const c_void,
-        out: *mut c_void,
-        rows: i32,
-        heads: i32,
-        head_dim: i32,
-        rotary_dim: i32,
-        stream: cudaStream_t,
-    ) -> cudaError_t;
-    #[allow(clippy::too_many_arguments)]
     pub fn apxinf_static_full_attn_prepare_bf16(
         fused: *const c_void,
         q_norm_w: *const c_void,
@@ -337,14 +325,6 @@ extern "C" {
         input: *const c_void,
         output: *mut c_void,
         count: i64,
-        stream: cudaStream_t,
-    ) -> cudaError_t;
-    pub fn apxinf_static_merge_rows_bf16(
-        input: *const c_void,
-        output: *mut c_void,
-        out_count: i64,
-        cols: i32,
-        factor: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
 }

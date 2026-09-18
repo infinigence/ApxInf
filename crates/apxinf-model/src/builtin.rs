@@ -18,7 +18,6 @@ pub fn register_builtin_models() {
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
     registry::register("qwen_drive", load_qwen_drive);
-    registry::register("qwen_drive-cuda", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
     crate::pi05::register_builtin();

@@ -495,7 +495,7 @@ impl QwenDriveDeviceWeights {
         }
         // FIX (implement_r3 / synthesis_r3): load-time confirmation line for the A_log
         // bf16-grid rounding (lands in the captured load section; expected max_delta>0).
-        eprintln!(
+        qdiag!(
             "[qwen_drive] a_log_bf16_round max_delta={:.6} layer0_first4={:?}",
             a_log_max_delta, a_log_layer0_first4
         );

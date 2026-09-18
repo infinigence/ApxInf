@@ -17,10 +17,27 @@
 //! * `planner` is the retained CPU f32 correctness scaffold from the saved K3
 //!   base; it is the replay oracle for the device executor, not a deployment
 //!   path.
-//! * `perception_fpn` and `perception_depth` are native feature-pyramid and
-//!   depth-network components. The public perception path remains pending
-//!   until camera projection, voxel pooling, BEV processing and output heads
-//!   are connected and verified together.
+
+/// Every development diagnostic in this model goes through here.
+///
+/// They were `eprintln!` calls, and on a normal request they ran: the vision
+/// tower printed once per block, `generate` printed its entry, the tail of the
+/// prompt, prefill completion and a decode heartbeat. That floods stderr for
+/// anyone running inference, and several of the lines carry prompt and
+/// generated token ids, which is request content and should not leave the
+/// process because a developer left a probe in. Routing them through one macro
+/// makes the switch the only way to reach any of them, and makes a new one
+/// impossible to add without it.
+macro_rules! qdiag {
+    ($($arg:tt)*) => {{
+        if $crate::qwen_drive::general::diagnostics_enabled() {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+// Declared above the modules on purpose: `macro_rules!` is in scope for
+// everything that follows it in this file, which is how the submodules below
+// reach it. Keep new modules below this line.
 
 pub mod config;
 pub mod planner;
@@ -34,12 +51,6 @@ pub mod device_weights;
 pub mod expert;
 #[cfg(feature = "cuda")]
 pub mod general;
-#[cfg(feature = "cuda")]
-pub mod perception_depth;
-#[cfg(feature = "cuda")]
-pub mod perception_fpn;
-#[cfg(feature = "cuda")]
-pub mod perception_view;
 #[cfg(feature = "cuda")]
 pub mod vision;
 

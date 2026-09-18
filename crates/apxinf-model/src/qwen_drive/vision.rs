@@ -93,7 +93,7 @@ pub fn forward(
         )));
     }
     // TEMP-DIAG (implement_r3): vision-entry geometry; revert in the acceptance-bound revision.
-    eprintln!("[qwen_drive] vision_entry total_patches={} segments={} offsets_len={} offsets_max={} max_tokens={} heads={} head_dim={} n={} grids={:?}", total_patches, grid_thw.len(), offsets.len(), offsets.last().copied().unwrap_or(0), max_tokens, heads, head_dim, weights.blocks.len(), grid_thw);
+    qdiag!("[qwen_drive] vision_entry total_patches={} segments={} offsets_len={} offsets_max={} max_tokens={} heads={} head_dim={} n={} grids={:?}", total_patches, grid_thw.len(), offsets.len(), offsets.last().copied().unwrap_or(0), max_tokens, heads, head_dim, weights.blocks.len(), grid_thw);
     // TEMP-DIAG (implement_r4): per-op elapsed-ms reference; revert in the acceptance-bound revision.
     let vis_t0 = std::time::Instant::now();
     let offsets_dev = upload_u32(ctx, &offsets)?;
@@ -113,7 +113,7 @@ pub fn forward(
 
     for (block_idx, block) in weights.blocks.iter().enumerate() {
         // TEMP-DIAG (implement_r2, ungated in implement_r3): vision-block heartbeat every block; revert in the acceptance-bound revision.
-        eprintln!(
+        qdiag!(
             "[qwen_drive] vision_block k={} n={} ms={}",
             block_idx,
             weights.blocks.len(),
@@ -173,7 +173,22 @@ pub fn forward(
 
     // Merger: LayerNorm(1024) -> merge 4 rows -> fc1 -> exact erf GELU -> fc2.
     let normed = norm::layer_bf16(ctx, &x, &weights.merger_norm_w, &weights.merger_norm_b, eps)?;
-    let merged = la::merge_rows(ctx, &normed, merge * merge)?;
+    // Merging rows is a reshape and nothing else: the merger takes `merge*merge`
+    // consecutive rows as one row of `cols * merge * merge`, which is the same
+    // contiguous elements in the same order. On a GPU tensor `reshape` only
+    // rewrites the metadata, so this replaces a kernel launch and a full copy
+    // of the tower's output with no work at all.
+    let (rows, cols) = {
+        let dims = normed.shape().dims();
+        (dims[0], dims[1])
+    };
+    let factor = merge * merge;
+    if rows % factor != 0 {
+        return Err(Error::Other(format!(
+            "qwen_drive vision merger: {rows} rows do not divide by {factor}"
+        )));
+    }
+    let merged = normed.reshape(vec![rows / factor, cols * factor])?;
     let h = gemm::bf16_bias(ctx, &merged, &weights.merger_fc1_w, &weights.merger_fc1_b)?;
     let h = la::gelu_exact(ctx, &h)?;
     let primary = gemm::bf16_bias(ctx, &h, &weights.merger_fc2_w, &weights.merger_fc2_b)?;
@@ -212,7 +227,7 @@ fn compute_pos_embeds(
             if let Some((_, tensor)) = cache.iter().find(|(key, _)| key.as_slice() == grid_thw) {
                 let hit = tensor.clone();
                 if timed {
-                    eprintln!(
+                    qdiag!(
                         "[qwen_drive] pos_embed cache hit {:.2}ms",
                         started.elapsed().as_secs_f64() * 1e3
                     );
@@ -367,7 +382,7 @@ fn compute_pos_embeds(
         }
     }
     if timed {
-        eprintln!(
+        qdiag!(
             "[qwen_drive] pos_embed total={:.1}ms readback={:.1}ms interp={:.1}ms round+upload={:.1}ms tokens={} hidden={}",
             started.elapsed().as_secs_f64() * 1e3,
             after_readback.as_secs_f64() * 1e3,

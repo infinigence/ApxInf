@@ -65,7 +65,7 @@ fn gdn_stage_mark(
     since: &mut std::time::Instant,
 ) -> Result<()> {
     ctx.synchronize().map_err(Error::Cuda)?;
-    eprintln!(
+    qdiag!(
         "[qwen_drive] gdn_stage layer={} {} ms={:.2}",
         layer_idx,
         name,
@@ -450,7 +450,7 @@ fn configure_gemm_tuning(cuda: &RuntimeBackend) -> Result<()> {
     } else {
         tuning::TuningMode::Inference
     };
-    eprintln!(
+    qdiag!(
         "[qwen_drive] gemm tuning: mode={:?} store={} loaded={}",
         mode,
         paths.tactics.display(),
@@ -485,12 +485,12 @@ impl QwenDriveModel {
         })?;
         configure_gemm_tuning(&cuda)?;
         let config = QwenDriveConfig::from_json_file(&model_dir.join("config.json"))?;
-        eprintln!("[qwen_drive] loading VLM weights from {}", model_dir.display());
+        qdiag!("[qwen_drive] loading VLM weights from {}", model_dir.display());
         let (tensors, _meta) = apxinf_loader::safetensors::load_native_path(model_dir)
             .map_err(|e| Error::Other(format!("qwen_drive: load VLM weights: {e}")))?;
-        eprintln!("[qwen_drive] VLM safetensors loaded: {} tensors", tensors.len());
+        qdiag!("[qwen_drive] VLM safetensors loaded: {} tensors", tensors.len());
         let vlm = QwenDriveVlmWeights::from_map(tensors)?;
-        eprintln!(
+        qdiag!(
             "[qwen_drive] VLM weights classified: {} language tensors, {} visual tensors",
             vlm.language_tensor_count(),
             vlm.visual_tensor_count()
@@ -503,7 +503,7 @@ impl QwenDriveModel {
             })
             .transpose()?;
         let weights = QwenDriveDeviceWeights::from_maps(&config, vlm, expert, &*backend)?;
-        eprintln!(
+        qdiag!(
             "[qwen_drive] device weights resident (planner={}); allocating caches",
             weights.expert.is_some()
         );
@@ -1347,7 +1347,7 @@ impl QwenDriveModel {
             // decode forwards flooded the head-limited receipt (~2048 lines) and truncated
             // gen_entry/vision_entry/mha signature/prefill_done/decode_step in r10.
             if seq > 1 && diagnostics_enabled() {
-                eprintln!("[qwen_drive] prefill_layer k={} kind={} ms_since_prev={:.1}", layer_idx, if is_full { "full" } else { "gdn" }, layer_t0.elapsed().as_secs_f64() * 1000.0);
+                qdiag!("[qwen_drive] prefill_layer k={} kind={} ms_since_prev={:.1}", layer_idx, if is_full { "full" } else { "gdn" }, layer_t0.elapsed().as_secs_f64() * 1000.0);
             }
             layer_t0 = std::time::Instant::now();
             // TEMP-DIAG (implement_r3 / synthesis_r3, folded A2): mixer-delta probe -- hidden
@@ -1387,7 +1387,7 @@ impl QwenDriveModel {
                     .map_err(|e| Error::Other(format!("qwen_drive hidden_norm: {e}")))?;
                 let l2: f64 = vals.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
                 let mean: f64 = vals.iter().map(|&v| v as f64).sum::<f64>() / vals.len().max(1) as f64;
-                eprintln!("[qwen_drive] hidden_norm k={} kind={} l2={:.4} mean={:.6} first2={:?}",
+                qdiag!("[qwen_drive] hidden_norm k={} kind={} l2={:.4} mean={:.6} first2={:?}",
                     layer_idx, if is_full { "full" } else { "gdn" }, l2, mean, &vals[..vals.len().min(2)]);
                 // TEMP-DIAG (implement_r13): capture k=0 and the final layer for the digest
                 // re-emission inside the capture window (same format as the live marker).
@@ -1480,7 +1480,7 @@ impl QwenDriveModel {
             let pixels = self.upload_pixels(pixels)?;
             let vis = vision::forward(&self.config, &self.weights.vision, self.ctx(), &pixels, grid_thw)?;
             // TEMP-DIAG (implement_r2): vision-tower completion marker; revert in the acceptance-bound revision.
-            eprintln!("[qwen_drive] vision_done vision_rows={}", vis.primary.shape().dims()[0]);
+            qdiag!("[qwen_drive] vision_done vision_rows={}", vis.primary.shape().dims()[0]);
             trace_rows("model_visual", &vis.primary)?;
             let vis_primary = &vis.primary;
             let image_tok = self.config.image_token_id;
@@ -1582,7 +1582,7 @@ impl QwenDriveModel {
                 }
             }
             // TEMP-DIAG (implement_r2): image-embedding scatter completion marker; revert in the acceptance-bound revision.
-            eprintln!("[qwen_drive] embed_scatter_done");
+            qdiag!("[qwen_drive] embed_scatter_done");
             grid_thw
         } else {
             empty_grids
@@ -1706,10 +1706,10 @@ impl QwenDriveModel {
         eos_token_ids: &[u32],
     ) -> Result<Vec<u32>> {
         // TEMP-DIAG (implement_r2): generate() entry marker (channel vs pre-entry stall disambiguator); revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] gen_entry prompt_tokens={} has_pixels={} max_new_tokens={}", token_ids.len(), pixel_values.is_some(), max_new_tokens);
+        qdiag!("[qwen_drive] gen_entry prompt_tokens={} has_pixels={} max_new_tokens={}", token_ids.len(), pixel_values.is_some(), max_new_tokens);
         // TEMP-DIAG (implement_r12): last-16 prompt ids close the prompt-divergence candidate;
         // revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
+        qdiag!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
         self.reset_state()?;
         // TEMP-DIAG (implement_r1): generation-entry clock for prefill/decode timing; revert in the acceptance-bound revision.
         let diag_start = std::time::Instant::now();
@@ -1724,7 +1724,7 @@ impl QwenDriveModel {
         })?;
         let mut logits = self.prefill_impl(token_ids, pixel_values)?;
         // TEMP-DIAG (implement_r1): prefill completion marker + decode heartbeat clock; revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] prefill_done prompt_tokens={} elapsed_ms={:.1}", token_ids.len(), diag_start.elapsed().as_secs_f64() * 1000.0);
+        qdiag!("[qwen_drive] prefill_done prompt_tokens={} elapsed_ms={:.1}", token_ids.len(), diag_start.elapsed().as_secs_f64() * 1000.0);
         // TEMP-DIAG (implement_r3 / synthesis_r3): drain the composed-causal attention
         // P-invariant probe lines (emitted during prefill at layer 3) into the digest so
         // they land inside the receipt window; revert in the acceptance-bound revision.
@@ -1852,7 +1852,7 @@ impl QwenDriveModel {
                         top8.truncate(8);
                     }
                 }
-                eprintln!("[qwen_drive] logits_top8 step={} rows={} max={:.4} min={:.4} top8={:?}", step, rows, row_max, row_min, top8);
+                qdiag!("[qwen_drive] logits_top8 step={} rows={} max={:.4} min={:.4} top8={:?}", step, rows, row_max, row_min, top8);
                 // TEMP-DIAG (implement_r14): logits-row argmax sweep over rows N-1/N-2/N-3
                 // (reuses the r11 row-readback idiom; two extra ~0.5MB readbacks at step 0
                 // only; successor implement_r2: step-1 decode logits hold a single row, so the
@@ -1875,7 +1875,7 @@ impl QwenDriveModel {
                     }
                     tail.push(top3);
                 }
-                eprintln!("[qwen_drive] logits_tail3 step={} rows={} n1={:?} n2_top3={:?} n3_top3={:?}", step, rows, top8[0], tail[0], tail[1]);
+                qdiag!("[qwen_drive] logits_tail3 step={} rows={} n1={:?} n2_top3={:?} n3_top3={:?}", step, rows, top8[0], tail[0], tail[1]);
                 }
                 // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 1): row_health 64-row
                 // step-0 teacher-forced sweep, digest-routed as 4 lines (pre/mid/tail/aggregate).
@@ -1977,7 +1977,7 @@ impl QwenDriveModel {
             }
             // TEMP-DIAG (implement_r1): heartbeat at step 0 and every 25 steps; revert in the acceptance-bound revision.
             if step % 25 == 0 {
-                eprintln!("[qwen_drive] decode_step k={} token_id={} ms_since_last={:.1}", step, sample.token_id, diag_last_step.elapsed().as_secs_f64() * 1000.0);
+                qdiag!("[qwen_drive] decode_step k={} token_id={} ms_since_last={:.1}", step, sample.token_id, diag_last_step.elapsed().as_secs_f64() * 1000.0);
                 diag_last_step = std::time::Instant::now();
             }
             if eos_token_ids.contains(&sample.token_id) || step + 1 == max_new_tokens {
@@ -1989,13 +1989,13 @@ impl QwenDriveModel {
         // TEMP-DIAG (implement_r13): evidence-accessibility digest -- re-emit the r12 vis_fp,
         // prompt_tail and hidden_norm k=0/k=31 values as short lines here so they land inside the
         // receipt's trailing capture window; revert in the repair revision.
-        eprintln!("[qwen_drive] diag_digest zero_vision={} captured={}", DIAG_ZERO_VISION as u8, self.diag_digest.len());
-        eprintln!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
+        qdiag!("[qwen_drive] diag_digest zero_vision={} captured={}", DIAG_ZERO_VISION as u8, self.diag_digest.len());
+        qdiag!("[qwen_drive] prompt_tail ids={:?}", &token_ids[token_ids.len().saturating_sub(16)..]);
         for line in self.diag_digest.drain(..) {
-            eprintln!("{line}");
+            qdiag!("{line}");
         }
         // TEMP-DIAG (implement_r1): exit summary with the first 8 generated ids; revert in the acceptance-bound revision.
-        eprintln!("[qwen_drive] decode_exit steps={} eos={} first_ids={:?}", generated.len(), diag_eos, &generated[..generated.len().min(8)]);
+        qdiag!("[qwen_drive] decode_exit steps={} eos={} first_ids={:?}", generated.len(), diag_eos, &generated[..generated.len().min(8)]);
         Ok(generated)
     }
 

@@ -281,13 +281,17 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
         if workspace.is_null() {
+            // On the context's stream, so these are the blocks the reuse
+            // cache may hand back: an operator output is written by a kernel
+            // on that stream and read by the next one on the same stream, so
+            // a recycled block is ordered behind whatever last used it. This
+            // is the path the cache was measured on -- 43,811 malloc/free
+            // pairs and 13.6 s of host time in one VQA inference.
             match output_fill() {
-                OutputFill::Zero => {
-                    CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)
-                }
-                OutputFill::Dirty => CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda),
+                OutputFill::Zero => CudaBuffer::alloc_zeros_on(ctx, bytes).map_err(Error::Cuda),
+                OutputFill::Dirty => CudaBuffer::alloc_on(ctx, bytes).map_err(Error::Cuda),
                 OutputFill::Poison => {
-                    CudaBuffer::alloc_filled(bytes, ctx.device_id(), 0xFF).map_err(Error::Cuda)
+                    CudaBuffer::alloc_filled_on(ctx, bytes, 0xFF).map_err(Error::Cuda)
                 }
             }
         } else {

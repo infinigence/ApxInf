@@ -710,56 +710,6 @@ pub fn rms_norm_plus1(
     ))
 }
 
-/// Partial rotary from precomputed BF16 cos/sin tables `[rows, rotary_dim]`.
-/// `x` is `[rows, heads, head_dim]`; leading `rotary_dim` channels rotate,
-/// the rest pass through.
-pub fn partial_rope_table(
-    ctx: &CudaContext,
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-) -> Result<Tensor> {
-    let dims = x.shape().dims();
-    if dims.len() != 3
-        || dims[1] != heads
-        || dims[2] != head_dim
-        || rotary_dim == 0
-        || rotary_dim % 2 != 0
-        || rotary_dim > head_dim
-        || cos.shape().dims() != [dims[0], rotary_dim]
-        || sin.shape().dims() != [dims[0], rotary_dim]
-    {
-        return Err(Error::Other("partial rope table shape mismatch".into()));
-    }
-    for tensor in [x, cos, sin] {
-        expect_bf16(tensor, "partial rope table")?;
-    }
-    let rows = dims[0];
-    let output = output_buffer(ctx, x.size_in_bytes())?;
-    unsafe {
-        check_cuda(ffi::apxinf_static_partial_rope_table_bf16(
-            gpu_ptr(x)?,
-            gpu_ptr(cos)?,
-            gpu_ptr(sin)?,
-            output.ptr(),
-            rows as i32,
-            heads as i32,
-            head_dim as i32,
-            rotary_dim as i32,
-            ctx.stream().handle(),
-        ))
-    }?;
-    Ok(make_gpu_tensor(
-        x.shape().clone(),
-        DType::BF16,
-        ctx.device_id(),
-        output,
-    ))
-}
-
 /// Full-attention (q|gate) input preparation: per-head (1 + w) RMSNorm on q/k,
 /// partial rotary from tables, K/V append into caller-owned caches at
 /// `cache_offset`. `fused` is the fused qkv projection `[seq, width]`; q_out is
@@ -1187,34 +1137,6 @@ pub fn gelu_exact(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     }?;
     Ok(make_gpu_tensor(
         input.shape().clone(),
-        DType::BF16,
-        ctx.device_id(),
-        output,
-    ))
-}
-
-/// Merge `factor` consecutive rows into one row:
-/// `[rows, cols] -> [rows / factor, cols * factor]`.
-pub fn merge_rows(ctx: &CudaContext, input: &Tensor, factor: usize) -> Result<Tensor> {
-    let (rows, cols) = matrix_shape(input, "merge rows")?;
-    if rows == 0 || factor == 0 || rows % factor != 0 {
-        return Err(Error::Other("merge rows shape mismatch".into()));
-    }
-    expect_bf16(input, "merge rows")?;
-    let out_rows = rows / factor;
-    let output = bf16_output(ctx, out_rows, cols * factor)?;
-    unsafe {
-        check_cuda(ffi::apxinf_static_merge_rows_bf16(
-            gpu_ptr(input)?,
-            output.ptr(),
-            (out_rows * cols * factor) as i64,
-            cols as i32,
-            factor as i32,
-            ctx.stream().handle(),
-        ))
-    }?;
-    Ok(make_gpu_tensor(
-        Shape::new(vec![out_rows, cols * factor]),
         DType::BF16,
         ctx.device_id(),
         output,

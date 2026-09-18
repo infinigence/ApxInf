@@ -2,7 +2,6 @@ pub mod backend;
 pub mod buffer;
 pub mod context;
 pub mod cublas;
-mod cudnn;
 pub mod device_caps;
 /// CUDA runtime and kernel support for apxinf.
 ///

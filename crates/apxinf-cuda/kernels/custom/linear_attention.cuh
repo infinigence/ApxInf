@@ -1196,35 +1196,6 @@ __global__ void add_rms_norm_plus1_bf16_kernel(
   }
 }
 
-// Partial rotary from precomputed bf16 cos/sin tables [rows, rotary_dim]:
-// rotate the leading rotary_dim channels (pairs (p, p + rotary/2)) with the
-// torch elementwise rounding chain (mul -> round, mul -> round, add -> round),
-// pass the remaining channels through. Works in place (out may alias x).
-__global__ void partial_rope_table_bf16_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* cos, const __nv_bfloat16* sin,
-    __nv_bfloat16* out, int heads, int head_dim, int rotary_dim) {
-  const int row = blockIdx.x;
-  const int head = blockIdx.y;
-  const int half = rotary_dim / 2;
-  const int64_t table_base = static_cast<int64_t>(row) * rotary_dim;
-  const int64_t base = (static_cast<int64_t>(row) * heads + head) * head_dim;
-  for (int p = threadIdx.x; p < half; p += blockDim.x) {
-    const float a = __bfloat162float(x[base + p]);
-    const float b = __bfloat162float(x[base + half + p]);
-    const float c = __bfloat162float(cos[table_base + p]);
-    const float s = __bfloat162float(sin[table_base + p]);
-    const float t1 = __bfloat162float(__float2bfloat16(a * c));
-    const float t2 = __bfloat162float(__float2bfloat16(-b * s));
-    const float t3 = __bfloat162float(__float2bfloat16(b * c));
-    const float t4 = __bfloat162float(__float2bfloat16(a * s));
-    out[base + p] = __float2bfloat16(t1 + t2);
-    out[base + half + p] = __float2bfloat16(t3 + t4);
-  }
-  for (int d = rotary_dim + threadIdx.x; d < head_dim; d += blockDim.x) {
-    out[base + d] = x[base + d];
-  }
-}
-
 // Fused full-attention input preparation for the (q|gate)-per-head layout:
 // per (token, head): per-head RMSNorm (1 + w semantics) on q/k, partial rotary
 // from tables, K/V cache append. The gate half of each q head stays in the
@@ -1556,19 +1527,5 @@ __global__ void gelu_exact_bf16_kernel(
   for (; index < count; index += stride) {
     const float x = __bfloat162float(input[index]);
     output[index] = __float2bfloat16(x * 0.5f * (1.0f + erff(x * 0.70710678f)));
-  }
-}
-
-// Merge `factor` consecutive rows into one: out[r, s*cols + c] = in[r*factor+s, c].
-__global__ void merge_rows_bf16_kernel(
-    const __nv_bfloat16* input, __nv_bfloat16* output, int64_t out_count, int cols, int factor) {
-  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  for (; index < out_count; index += stride) {
-    const int64_t r = index / (static_cast<int64_t>(factor) * cols);
-    const int64_t rem = index - r * factor * cols;
-    const int64_t s = rem / cols;
-    const int64_t c = rem - s * cols;
-    output[index] = input[(r * factor + s) * cols + c];
   }
 }

@@ -23,7 +23,6 @@ namespace {
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/attention.cuh"
 #include "../kernels/custom/normalization.cuh"
-#include "../kernels/custom/group_normalization.cuh"
 #include "../kernels/custom/activation.cuh"
 #include "../kernels/custom/embedding.cuh"
 #include "../kernels/custom/elementwise.cuh"
@@ -33,7 +32,6 @@ namespace {
 #include "../kernels/custom/gdn_chunk_state_wmma.cuh"
 #include "../kernels/custom/gdn_chunk_gemm_wmma.cuh"
 #include "../kernels/custom/gdn_attn_raw_wmma.cuh"
-#include "../kernels/custom/pooling.cuh"
 }  // namespace
 
 extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,void* output,
@@ -45,40 +43,9 @@ extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,vo
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t apxinf_batch_norm_relu_bf16(const void* x,const void* mean,
-    const void* invstd,const void* weight,const void* bias,void* out,
-    int channels,int spatial,int64_t count,cudaStream_t stream) {
-  if(!x||!mean||!invstd||!weight||!bias||!out||channels<=0||spatial<=0||count<=0)
-    return cudaErrorInvalidValue;
-  batch_norm_relu_bf16_kernel<<<256,256,0,stream>>>((const __nv_bfloat16*)x,
-      (const __nv_bfloat16*)mean,(const float*)invstd,(const __nv_bfloat16*)weight,
-      (const __nv_bfloat16*)bias,(__nv_bfloat16*)out,channels,spatial,count);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_group_norm_bf16_rounded(const void* x,const void* w,const void* b,void* y,
-    int n,int c,int spatial,int groups,float eps,cudaStream_t stream) {
-  if(!x||!w||!b||!y||n<=0||c<=0||spatial<=0||groups<=0||c%groups) return cudaErrorInvalidValue;
-  group_norm_bf16_rounded_kernel<<<n*groups,256,0,stream>>>(
-      (const __nv_bfloat16*)x,(const __nv_bfloat16*)w,(const __nv_bfloat16*)b,(__nv_bfloat16*)y,c,spatial,groups,eps);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_global_mean_bf16(const void* x,void* y,int rows,int spatial,cudaStream_t stream) {
-  if(!x||!y||rows<=0||spatial<=0) return cudaErrorInvalidValue;
-  global_mean_bf16_kernel<<<rows,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)y,spatial);
-  return cudaGetLastError();
-}
-
 extern "C" cudaError_t apxinf_relu_bf16(const void* x,void* y,int64_t count,cudaStream_t stream) {
   if(!x||!y||count<=0) return cudaErrorInvalidValue;
   relu_bf16_kernel<<<256,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)y,count);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_expand_spatial_bf16(const void* x,void* y,int spatial,int64_t count,cudaStream_t stream) {
-  if(!x||!y||spatial<=0||count<=0)return cudaErrorInvalidValue;
-  expand_spatial_bf16_kernel<<<256,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)y,spatial,count);
   return cudaGetLastError();
 }
 
@@ -108,13 +75,6 @@ extern "C" cudaError_t apxinf_channel_layer_norm_bf16_rounded(const void* x,
       ||static_cast<int64_t>(batches)*spatial>2147483647) return cudaErrorInvalidValue;
   channel_layer_norm_bf16_rounded_kernel<<<batches*spatial,256,0,stream>>>(
       (const __nv_bfloat16*)x,(const __nv_bfloat16*)weight,(const __nv_bfloat16*)bias,(__nv_bfloat16*)out,channels,spatial,eps);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_max_pool2x2_bf16(const void* x,void* out,int height,int width,int64_t count,cudaStream_t stream) {
-  if(!x||!out||height<2||width<2||count<=0) return cudaErrorInvalidValue;
-  int blocks=static_cast<int>((count+255)/256>65535?65535:(count+255)/256);
-  max_pool2x2_bf16_kernel<<<blocks,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)out,height,width,count);
   return cudaGetLastError();
 }
 
@@ -1539,22 +1499,6 @@ extern "C" cudaError_t apxinf_static_add_rms_norm_plus1_bf16(
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t apxinf_static_partial_rope_table_bf16(
-    const void* x, const void* cos, const void* sin, void* out,
-    int rows, int heads, int head_dim, int rotary_dim, cudaStream_t stream) {
-  if (x == nullptr || cos == nullptr || sin == nullptr || out == nullptr ||
-      rows <= 0 || heads <= 0 || head_dim <= 0 || rotary_dim <= 0 ||
-      (rotary_dim & 1) != 0 || rotary_dim > head_dim) {
-    return cudaErrorInvalidValue;
-  }
-  partial_rope_table_bf16_kernel<<<dim3(rows, heads), 32, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(x),
-      static_cast<const __nv_bfloat16*>(cos),
-      static_cast<const __nv_bfloat16*>(sin),
-      static_cast<__nv_bfloat16*>(out), heads, head_dim, rotary_dim);
-  return cudaGetLastError();
-}
-
 extern "C" cudaError_t apxinf_static_full_attn_prepare_bf16(
     const void* fused, const void* q_norm_w, const void* k_norm_w,
     const void* cos, const void* sin, void* q_out, void* k_cache, void* v_cache,
@@ -1746,20 +1690,5 @@ extern "C" cudaError_t apxinf_static_gelu_exact_bf16(
   gelu_exact_bf16_kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(input),
       static_cast<__nv_bfloat16*>(output), count);
-  return cudaGetLastError();
-}
-
-extern "C" cudaError_t apxinf_static_merge_rows_bf16(
-    const void* input, void* output, int64_t out_count, int cols, int factor,
-    cudaStream_t stream) {
-  if (input == nullptr || output == nullptr || out_count <= 0 ||
-      cols <= 0 || factor <= 0) {
-    return cudaErrorInvalidValue;
-  }
-  int blocks = static_cast<int>((out_count + 255) / 256);
-  blocks = blocks > 1024 ? 1024 : blocks;
-  merge_rows_bf16_kernel<<<blocks, 256, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(input),
-      static_cast<__nv_bfloat16*>(output), out_count, cols, factor);
   return cudaGetLastError();
 }
