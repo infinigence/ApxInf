@@ -58,12 +58,22 @@ has an environment override so a new board can be re-swept without a rebuild.
 
 **Data — which tactic each shape uses.**
 `configs/tuning/<vendor>/<family>-sm<N>/tactics.json`, resolved by
-`TuningPaths::for_cuda`. Four stores ship: `rtx4090-sm89`, `orin-sm87`,
+`TuningPaths::resolve_for_cuda`. Four stores ship: `rtx4090-sm89`, `orin-sm87`,
 `thor-sm101`, `thor-sm110`. Recording one is a run of the autotuner, not a code
-change — but read the note in RESULTS.md first: on Thor all 116 shipped records
-were rejected at load because they were recorded under CUDA 13.0 and the board
-runs 13.2, and the autotuner's rewrite replaces rather than merges across
-toolkit versions.
+change.
+
+A tactic is only valid for the libraries that measured it, and all three boards
+were running a different toolkit from the one their store was recorded on, so
+every record was rejected at load and the GEMMs quietly fell back to the
+untuned heuristic. The resolver therefore prefers
+`<family>-sm<N>/cuda<major>.<minor>-cublas<major>.<minor>/tactics.json` and uses
+the unqualified file only when its header matches the running libraries — the
+subdirectory is named by the same truncation the loader compares, so a store
+found under it is one this toolkit can use in full. Nothing relocates: a board
+running the toolkit its store was recorded on resolves to exactly the file it
+resolved to before. A second toolkit now writes beside the first rather than
+over it. See `doc/jetson-roofline.md` for what regenerating is worth — 12.6% on
+Orin, 0.05% on Thor after the accuracy filter, nothing at all on the 4090.
 
 ## What the constants actually are
 

@@ -180,6 +180,62 @@ ones that move, regenerating and merging without checking accuracy buys 2.5%
 and pays for it somewhere the four-mode gate will not show you. Check with
 `control/precision_probe.py` or an operator oracle, not with the gate.
 
+### The third board, and why the store is now toolkit-qualified
+
+The RTX 4090 completes the set, and makes the trap look less like a Jetson
+accident. `configs/tuning/nvidia/rtx4090-sm89/tactics.json` was recorded under
+CUDA 12.8 / cuBLAS 12.8.4; the box runs 12.3 / 12.3.02, so the engine prints
+`ignored 52 incompatible CUDA tuning record(s)` and routes every GEMM through
+the untuned heuristic. Worse than on the Jetsons: those 52 records are another
+model's shapes entirely -- m=512/768/968 against n=32768/16384/2048 -- and
+would not have matched Qwen-Drive's (n=18432/8192/2560/1024, k=2560/9216)
+even on a matching toolkit. Three boards, three versions of the same silent
+fallback: Orin 12.6 against 13.2, Thor 13.0 against 13.2, the 4090 12.8
+against 12.3.
+
+An autotune pass into a scratch directory produced 13 records under 12.3 --
+the same 13 shapes Thor produced, which is the first cross-board confirmation
+that the shape set is a property of the model and not of the board. Against
+the rejected-store baseline, in two alternating rounds:
+
+| | scene 0 | scene 1 | scene 2 | scene 3 |
+|---|---|---|---|---|
+| shipped store, all 52 rejected | 1.4474 | 1.4528 | 1.4554 | 1.4568 |
+| tuned for 12.3, 13 records | 1.4515 | 1.4533 | 1.4537 | 1.4543 |
+
+Geomean 0.9999 -- the two are the same run. So on sm_89 the store is worth
+nothing measurable: cuBLAS 12.3's default heuristic already picks what the
+search finds. That is a
+useful negative -- it says the 12.6% on Orin is about cuBLAS 13's heuristic
+on that hardware, not about tuning in general -- and it is why no 12.3 store
+is committed here.
+
+The fix that does ship is the path. `TuningPaths::resolve_for_cuda` looks for
+`<hardware>/cuda<major>.<minor>-cublas<major>.<minor>/tactics.json` first and
+falls back to the unqualified `<hardware>/tactics.json` only when that file's
+header matches the running libraries. The subdirectory name is built from the
+same major.minor truncation the record loader uses to accept or reject, so a
+store found under it is one the toolkit can use in full. Nothing moves: every
+existing checkout resolves to the same file it resolved to before, on the
+board it was recorded for. What changes is that a second toolkit now writes
+beside the first instead of on top of it, and that a board whose store was
+rejected gets a place to put its own.
+
+Measured on the board, same command either side of the commit:
+
+```
+before  [apxinf] warning: ignored 52 incompatible CUDA tuning record(s) for
+                 NVIDIA GeForce RTX 4090 (CUDA/cuBLAS version mismatch: 52)
+        [qwen_drive] gemm tuning: mode=Inference store=.../rtx4090-sm89/
+                 tactics.json loaded=true
+after   (nothing)
+```
+
+`loaded=true` followed by every record being dropped is the shape of the bug:
+the engine reported a store it was not using. After the change it resolves to
+`rtx4090-sm89/cuda12.3-cublas12.3/tactics.json`, finds no file, and says so by
+saying nothing. The 12.8 store is untouched and still loads on a 12.8 box.
+
 ## The cross-stack reproduction extends
 
 The result above -- same branch, CUDA 12.6 and 13.2, different cuBLAS major,

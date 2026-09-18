@@ -426,7 +426,11 @@ fn configure_gemm_tuning(cuda: &RuntimeBackend) -> Result<()> {
     let root = std::env::var_os("APXINF_QWEN_TUNING_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("configs/tuning"));
-    let paths = tuning::TuningPaths::for_cuda(&root, cuda.context().caps());
+    let paths = tuning::TuningPaths::resolve_for_cuda(
+        &root,
+        cuda.context().caps(),
+        cuda.context().library_versions(),
+    );
     let database = paths
         .tactics
         .is_file()

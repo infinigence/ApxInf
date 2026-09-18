@@ -9,6 +9,7 @@ use apxinf_core::{Error, Result};
 use crate::context::CudaLibraryVersions;
 use crate::device_caps::CudaDeviceCaps;
 
+use super::db::{major_minor, versions_compatible};
 use super::{GemmTuningKey, GemmTuningRecord, TacticId, TacticStore, TuningDb, TuningOutcome};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,6 +47,69 @@ impl TuningPaths {
             report: directory.join("tuning_report.json"),
             directory,
         }
+    }
+
+    /// The store belonging to one CUDA/cuBLAS pair, under the hardware
+    /// directory. The subdirectory name is built from the same major.minor
+    /// truncation the loader uses to accept or reject a record, so a store
+    /// found here is a store this toolkit can use in full.
+    pub fn for_cuda_toolkit(
+        root: impl AsRef<Path>,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+    ) -> Self {
+        let directory = root
+            .as_ref()
+            .join("nvidia")
+            .join(hardware_directory_name(caps))
+            .join(toolkit_directory_name(versions));
+        Self {
+            tactics: directory.join("tactics.json"),
+            report: directory.join("tuning_report.json"),
+            directory,
+        }
+    }
+
+    /// Pick the store this toolkit can actually use, preferring a
+    /// toolkit-qualified one and otherwise keeping the unqualified store that
+    /// shipped before this existed.
+    ///
+    /// Tactics are only valid for the library that measured them: the loader
+    /// drops every record whose recorded CUDA/cuBLAS major.minor differs from
+    /// the running one, so a store recorded under another toolkit is loaded,
+    /// rejected record by record, and silently replaced by the untuned
+    /// heuristics. All three Qwen-Drive boards hit exactly that -- Orin
+    /// 12.6 against 13.2, Thor 13.0 against 13.2, the RTX 4090 12.8 against
+    /// 12.3 -- and the last of those additionally held another model's
+    /// shapes. Routing each toolkit to its own subdirectory lets the stores
+    /// coexist instead of overwriting one another.
+    ///
+    /// Resolution order:
+    /// 1. `<hardware>/<toolkit>/tactics.json`, if it exists;
+    /// 2. `<hardware>/tactics.json`, if it exists and its header matches the
+    ///    running libraries -- the path every existing checkout uses;
+    /// 3. `<hardware>/<toolkit>/tactics.json` otherwise, which is where an
+    ///    autotune pass then writes without disturbing a store recorded for
+    ///    another toolkit.
+    ///
+    /// An unreadable unqualified store is returned rather than stepped over,
+    /// so the caller still reports the parse error instead of quietly
+    /// starting from nothing.
+    pub fn resolve_for_cuda(
+        root: impl AsRef<Path>,
+        caps: &CudaDeviceCaps,
+        versions: &CudaLibraryVersions,
+    ) -> Self {
+        let root = root.as_ref();
+        let toolkit = Self::for_cuda_toolkit(root, caps, versions);
+        if toolkit.tactics.is_file() {
+            return toolkit;
+        }
+        let unqualified = Self::for_cuda(root, caps);
+        if unqualified.tactics.is_file() && tactics_usable_by(&unqualified.tactics, versions) {
+            return unqualified;
+        }
+        toolkit
     }
 
     pub fn from_tactics(path: impl Into<PathBuf>) -> Self {
@@ -257,6 +321,30 @@ fn hardware_directory_name(caps: &CudaDeviceCaps) -> String {
     format!("{family}-sm{}", caps.sm)
 }
 
+/// `cuda<major>.<minor>-cublas<major>.<minor>`, the exact pair the record
+/// loader compares. Both are named because a toolkit can ship a cuBLAS
+/// update without moving the CUDA runtime version.
+fn toolkit_directory_name(versions: &CudaLibraryVersions) -> String {
+    format!(
+        "cuda{}-cublas{}",
+        major_minor(&versions.cuda),
+        major_minor(&versions.cublas)
+    )
+}
+
+/// Whether every record in an existing store would survive the loader's
+/// version check. A store that cannot be parsed counts as usable so the
+/// caller reports the parse failure rather than this function hiding it.
+fn tactics_usable_by(path: &Path, versions: &CudaLibraryVersions) -> bool {
+    match TuningDb::from_json_file(path) {
+        Ok(database) => {
+            versions_compatible(database.header.cuda_version.as_deref(), &versions.cuda)
+                && versions_compatible(database.header.cublas_version.as_deref(), &versions.cublas)
+        }
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +415,94 @@ mod tests {
             TuningPaths::for_cuda("configs/tuning", &caps("NVIDIA GeForce RTX 4090", 89)).tactics,
             Path::new("configs/tuning/nvidia/rtx4090-sm89/tactics.json")
         );
+    }
+
+    fn versions(cuda: &str, cublas: &str) -> CudaLibraryVersions {
+        CudaLibraryVersions {
+            cuda: cuda.into(),
+            cublas: cublas.into(),
+        }
+    }
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "apxinf-tuning-paths-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_store(path: &Path, cuda: &str, cublas: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"cuda_version":"{cuda}","cublas_version":"{cublas}","device_name":"NVIDIA GeForce RTX 4090","sm":89,"records":[]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn toolkit_directory_names_both_libraries() {
+        let paths =
+            TuningPaths::for_cuda_toolkit("configs/tuning", &caps("NVIDIA Thor", 110), &versions("13.2", "13.2.1"));
+        assert_eq!(
+            paths.tactics,
+            Path::new("configs/tuning/nvidia/thor-sm110/cuda13.2-cublas13.2/tactics.json")
+        );
+    }
+
+    #[test]
+    fn resolution_keeps_a_matching_unqualified_store() {
+        let root = scratch_root("match");
+        let device = caps("NVIDIA GeForce RTX 4090", 89);
+        write_store(
+            &root.join("nvidia/rtx4090-sm89/tactics.json"),
+            "12.3",
+            "12.3.02",
+        );
+        assert_eq!(
+            TuningPaths::resolve_for_cuda(&root, &device, &versions("12.3", "12.3.02")).tactics,
+            root.join("nvidia/rtx4090-sm89/tactics.json")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolution_steps_over_a_store_recorded_for_another_toolkit() {
+        // The RTX 4090 case: a store recorded under 12.8 on a box running
+        // 12.3, whose records the loader would reject one by one.
+        let root = scratch_root("mismatch");
+        let device = caps("NVIDIA GeForce RTX 4090", 89);
+        let unqualified = root.join("nvidia/rtx4090-sm89/tactics.json");
+        write_store(&unqualified, "12.8", "12.8.4");
+
+        let running = versions("12.3", "12.3.02");
+        let resolved = TuningPaths::resolve_for_cuda(&root, &device, &running);
+        assert_eq!(
+            resolved.tactics,
+            root.join("nvidia/rtx4090-sm89/cuda12.3-cublas12.3/tactics.json")
+        );
+        assert!(!resolved.tactics.is_file());
+
+        // Once that toolkit has a store of its own it wins outright, and the
+        // 12.8 store is still there for the box it was recorded on.
+        write_store(&resolved.tactics, "12.3", "12.3.02");
+        assert_eq!(
+            TuningPaths::resolve_for_cuda(&root, &device, &running).tactics,
+            resolved.tactics
+        );
+        assert_eq!(
+            TuningPaths::resolve_for_cuda(&root, &device, &versions("12.8", "12.8.4")).tactics,
+            unqualified
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

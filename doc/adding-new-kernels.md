@@ -597,9 +597,15 @@ the corresponding GEMM execution module
 
 Verify `GemmOp`, epilogue, layout, legal backend/tactic ranges, lookup semantics,
 and the database header. Hardware databases live at
-`configs/tuning/<vendor>/<hardware>/tactics.json`. The schema and SM are hard
-compatibility boundaries. CUDA/cuBLAS versions selectively invalidate records
-that depend on those libraries. `kernel_build_id` is provenance only; a changed
+`configs/tuning/<vendor>/<hardware>/tactics.json`, or
+`configs/tuning/<vendor>/<hardware>/cuda<major>.<minor>-cublas<major>.<minor>/tactics.json`
+when the running toolkit has a store of its own; `TuningPaths::resolve_for_cuda`
+prefers the qualified one and falls back to the unqualified one only when its
+header matches. The schema and SM are hard compatibility boundaries.
+CUDA/cuBLAS versions selectively invalidate records that depend on those
+libraries, which is why the toolkit pair is in the path: a store recorded
+elsewhere is otherwise loaded, rejected record by record, and silently replaced
+by the untuned heuristic. `kernel_build_id` is provenance only; a changed
 provider contract is invalidated through that provider's
 `implementation_version`. Each runtime owns its own `TuningSession`.
 
