@@ -1,9 +1,40 @@
 # Model Execution Wiring
 
-Use this guide after model semantics are known and before writing the executor.
+Use this guide after model semantics are known and before composing the model
+and its runner. Use the [module ownership table](model-layer-architecture.md#current-module-names-and-responsibilities)
+for names and placement; this guide defines device execution and acceptance.
 It bridges the model equation and ApxInf's safe CUDA interfaces. The purpose is
 to design the maintained hot path, not merely to find an implementation that
 produces the right answer.
+
+## Accelerator port acceptance
+
+A completed new accelerator port uses ApxInf model code and safe model-neutral
+operators as its inference path. Vendor math/kernel libraries belong behind
+those APIs. External inference engines (TensorRT, ONNX Runtime, Torch execution,
+OpenVINO or equivalents) may run as private references; model graphs, layers or
+generated external plans are not a maintained ApxInf implementation.
+
+After public inputs are uploaded, tensor computation stays on the target GPU
+until the explicit public output transfer. The host may load/transform weights,
+prepare static metadata, submit fixed control flow and receive results. CPU
+intermediate computation and D2H/H2D round trips remain private correctness
+scaffolds and must be replaced before port completion.
+
+Fixed profiles must support CUDA Graph acceleration. Prefer one graph from
+canonical device inputs to outputs. For a VLA where concrete blockers prevent
+one graph, the accepted fallback partition covers Vision, Language and Action
+with captured graphs, stable device buffers and device-only handoff. Capture
+the entire fixed-step action/denoising loop in the Action graph. Intermediate
+readback, dynamic allocation and synchronization between segments are not a
+completed port. An eager path remains useful for parity and explicit fallback;
+it does not satisfy this capture gate by itself.
+
+These are new-port acceptance requirements, not a statement that every existing
+family has migrated. Record a missing device/capture path as a blocker. Once
+these correctness, residency and capture gates pass, latency optimization is
+best effort unless the task specifies a performance release gate. See
+[current family coverage](model-layer-architecture.md#current-coverage-and-port-decisions).
 
 ## Start from an execution ledger
 
@@ -20,9 +51,12 @@ implementation differs from the plan.
 
 Search for an implementation in this order:
 
-1. the closest maintained optimized executor at the requested precision and
-   hardware, especially `crates/apxinf-model/src/pi05/*_executor.rs` and
-   `*_runtime.rs` for VLA execution;
+1. the closest maintained model and layer implementation at the requested
+   precision and hardware: for PI0.5, inspect `pi05/model/mod.rs` for forward
+   order, `pi05/model/blocks/` for fusion, `pi05/model/variant.rs` for precision
+   dispatch, and `pi05/model_runner/` for preparation/resource ownership under
+   `crates/apxinf-model/src/`. WallOSS/GR00T retain their actual runtime/executor
+   filenames; locate them before copying patterns;
 2. safe model-neutral interfaces under `crates/apxinf-cuda/src/kernels/`, with
    particular attention to `fused.rs`, `attention.rs`, `rope.rs`, `norm.rs`,
    `activation.rs`, `gemm/`, `cache.rs`, and `elementwise.rs`;
@@ -75,29 +109,32 @@ explicit calibration, and final output transfer. If a runtime declares resized
 RGB as an accepted representation, checkpoint-fixed pixel normalization,
 patchification, merge ordering, and dtype conversion are part of the maintained
 device path rather than host preprocessing. Prepare and capture them with the
-fixed-shape executor when their operators support CUDA Graph capture.
+fixed-shape model computation when their operators support CUDA Graph capture.
 A CPU implementation inside a layer may be used briefly to establish numerical
 evidence, but it is a **correctness scaffold**. Mark the affected ledger row,
 profile its cost, and use it to validate the replacement boundary. Once the
 semantics are established, resolve the row through an existing safe device
 composition or the complete [Adding New Kernels](adding-new-kernels.md) path.
-For an accelerator target, a steady-state host scaffold is not deliverable
-optimization debt: it remains unfinished implementation unless a concrete
-operator blocker makes a correct device path impossible. Long CUDA build times,
-adapter rebuild scope, or the availability of a numerically correct host path
-do not satisfy that blocker. Ordinary optimization debt may cover an unfused
-device composition, untuned tactic, or documented capture gap after the hot
-computation itself remains on the device.
+For an accelerator target, a steady-state host scaffold remains unfinished
+implementation. If a correct device path is unavailable, record the concrete
+operator blocker. Long CUDA build times, adapter rebuild scope, or the availability
+of a numerically correct host path do not satisfy that blocker.
+Ordinary optimization debt may cover an unfused
+device composition or untuned tactic after the required device/capture contract
+passes.
 
 ## Plan tensor lifetime and reuse
 
 Classify each value by when it changes:
 
-- checkpoint lifetime: transformed weights, constant position tables;
-- prepared-profile lifetime: masks, index maps, shape metadata, graph workspace;
+- checkpoint/loaded-model lifetime: transformed weights, constant position
+  tables and fixed timestep embeddings when the schedule is load-time constant;
+- prepared-profile lifetime: masks, index maps, shape metadata, graph workspace
+  and precomputed `StepModulation` where the model permits it;
 - request lifetime: encoded images and language prefix, reusable cross-attention
   keys and values;
-- solver-step lifetime: timestep embedding, noisy action state, step output;
+- solver-step lifetime: noisy action state, step output and any conditioning
+  that actually changes with the step's inputs;
 - layer lifetime: transient projections and normalization scratch.
 
 Compute or upload a value at the widest correct lifetime. In particular, audit
@@ -107,16 +144,19 @@ is not proof that the model uses the right cache lifetime.
 
 ## Prepare and capture fixed-shape execution
 
-For a fixed target profile, allocate outputs and scratch at stable addresses.
-Use `GraphWorkspace`, run the same inference body once through
-`prepare_with_workspace` to validate shapes and prepare native plans, then run
-it through `with_workspace` during CUDA Graph capture. Update captured input
-contents in place and replay the graph through the maintained runtime.
+For a fixed target profile, query model/Blocks workspace requirements and let
+the runner's preparation code allocate stable inputs, outputs and scratch.
+Use `GraphWorkspace` and `prepare_with_workspace` for warmup, then `with_workspace`
+during capture through the shared CUDA capture scope. PI0.5's
+[`model_runner/prepare.rs`](../crates/apxinf-model/src/pi05/model_runner/prepare.rs)
+repeats warmup until tuning generation stabilizes; one invocation is not a
+universal readiness guarantee. Capture and eager call the same model semantics.
+Update captured input contents in place and replay through the prepared object.
 
-Preparation must exercise the real executor. A method that only validates a
+Preparation must exercise the real model computation. A method that only validates a
 configuration object is not execution preparation. If graph capture is
 unsupported for a required operation, record the exact operation and failure;
-an eager fallback is a known performance gap, not silent success. Compare eager
+an eager fallback is observable but does not satisfy a required capture gate. Compare eager
 and replayed outputs before relying on replay latency.
 
 ## Wiring review
@@ -130,8 +170,8 @@ Before reporting the port, provide evidence for all of the following:
   public input/output boundaries;
 - stable buffers and reusable KV/state are owned by the runtime at the correct
   lifetime;
-- the fixed-shape path completes prepare, capture, input update, and replay, or
-  records the concrete capture gap as performance debt/blocker;
+- the fixed-shape path completes prepare, capture, input update and replay;
+  unresolved required capture paths are reported as blockers;
 - operator/layer replay, eager end-to-end, captured end-to-end, and public API
   checks pass their declared tolerances;
 - wall-clock and graph-replay latency are reported separately, with any gap to
@@ -140,10 +180,11 @@ Before reporting the port, provide evidence for all of the following:
 Report two independent outcomes:
 
 - **functional acceptance** requires the reference tolerance, maintained public
-  path, and clear unsupported-case behavior;
+  path, native device/capture gates and clear unsupported-case behavior;
 - **optimization status** is `target met`, `best effort with performance debt`,
   or `blocked`, with remaining host escapes, unfused hot sequences, missing
-  reusable state, capture gaps, and measured impact listed explicitly.
+  reusable state and measured impact listed explicitly. Device-residency or
+  required capture gaps remain blocked rather than best-effort completion.
 
 Optimization is best effort unless the task explicitly defines it as a release
 gate. The agent must investigate and attempt the applicable existing paths, but

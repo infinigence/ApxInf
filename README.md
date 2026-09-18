@@ -119,6 +119,12 @@ is 92.4%.
 ## Port a new model with an agent
 
 `skills/model-port-workflow` drives the whole sequence.
+Start with the [documentation index](doc/README.md) and
+[current module responsibilities](doc/model-layer-architecture.md#current-module-names-and-responsibilities).
+New VLA code separates Model forward computation, ModelRunner execution ownership,
+and weights; reuse the existing native binding and policy registries. The
+[integration guide](doc/adding-a-new-model.md#registration-and-public-integration)
+identifies current contracts and family-specific option limits.
 
 Install it once, from the repository root:
 
@@ -184,7 +190,7 @@ toolchain. If `nvcc --version` or `cargo --version` fails, set them up first:
 Three public layers, each wrapping the one before. Pick the outermost one that
 still leaves you the control you need.
 
-### L1 — bare model
+### L1 — native ModelRunner
 
 You own resize, tokenization, noise, and unnormalization; the model takes
 already-resized frames and returns a **normalized-domain** chunk.
@@ -192,11 +198,11 @@ already-resized frames and returns a **normalized-domain** chunk.
 ```python
 from apxinf import ModelRunner
 
-model = ModelRunner.load("pi05", "<path-to-model>/model.safetensors", compute_variant="bf16")
+model_runner = ModelRunner.load("pi05", "<path-to-model>/model.safetensors", compute_variant="bf16")
 
-# rgb: uint8 [views, H, W, 3] at model.image_size; tokens: uint32; noise: float32
-actions = model.infer_rgb(rgb, "nhwc", token_ids, noise)   # (H, action_dim)
-model.action_horizon, model.num_views, model.image_size    # what it was loaded for
+# rgb: uint8 [views, H, W, 3] at model_runner.image_size; tokens: uint32; noise: float32
+actions = model_runner.infer_rgb(rgb, "nhwc", token_ids, noise)   # (H, action_dim)
+model_runner.action_horizon, model_runner.num_views, model_runner.image_size
 ```
 
 ### L2 — policy
@@ -474,4 +480,3 @@ Scan the QR Code to join our Wechat Group
 <div align="left">
   <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/wechat.jpg" alt="wechat-group" width="256"/>
 </div>
-

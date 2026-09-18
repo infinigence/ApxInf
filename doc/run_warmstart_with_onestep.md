@@ -48,15 +48,14 @@ Runtime partial-flow support:
   - added `flow_start_time`, default `1.0`
   - accepts `flow_start_time` from config/override
   - validates it is in `(0, 1]`
-- `crates/apxinf-model/src/pi05/bf16_runtime.rs`
-  - timestep embedding uses
-    `flow_start_time * (1 - step / num_flow_steps)`
-  - Euler step uses
-    `dt = -flow_start_time / num_flow_steps`
-- `crates/apxinf-model/src/pi05/runtime.rs`
-  - same schedule support for FP8 path
-- `crates/apxinf-model/src/pi05/int8_runtime.rs`
-  - same schedule support for INT8 path
+- `crates/apxinf-model/src/pi05/model/variant.rs`
+  - prepares fixed timestep embeddings during loading for BF16/FP8/INT8
+  - uses `flow_start_time * (1 - step / num_flow_steps)`
+- `crates/apxinf-model/src/pi05/model/mod.rs`
+  - owns the shared flow schedule and `dt = -flow_start_time / num_flow_steps`
+  - calls precision-specific Blocks for each step
+- `crates/apxinf-model/src/pi05/model_runner/prepare.rs`
+  - captures that same model computation; it does not define a second schedule
 - `crates/apxinf-py/src/lib.rs`
   - `apxinf_py.ModelRunner.load(..., num_flow_steps=..., flow_start_time=...)`
   - Python getters expose `num_flow_steps` and `flow_start_time`

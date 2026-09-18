@@ -33,10 +33,23 @@ Start at the public loader and forward entry point. Follow the concrete model
 runtime through the Rust operation, backend/provider selection, C ABI adapter,
 and device implementation. Record the condition selecting each branch.
 
-For ApxInf, useful starting locations relative to the selected checkout are:
+For ApxInf, first read the selected checkout's
+`doc/model-layer-architecture.md#current-module-names-and-responsibilities`.
+Trace construction separately from repeated inference: Python `AutoPolicy`
+selects a policy; the native `ModelRunner` calls Rust `AutoModel`; the latter
+returns `LoadedModel::{Text,Vla}`. PI0.5 inference goes through
+`Pi05ModelRunner` to `Pi05Model<B>`/Blocks or an existing captured graph.
+`ModelVariant` selects loaded precision implementations, not graph policy.
+`StepModulation` is computed conditioning data, not learned weights.
+WallOSS/GR00T still have runtime/executor files; do not relabel their types or
+claim PI0.5 preparation guarantees without inspecting the family.
+
+Useful starting locations relative to the selected checkout are:
 
 - `crates/apxinf-model/src/<model>/`: configuration, weights, public integration,
-  and runtime scheduling.
+  and execution scheduling. In PI0.5, `model/` owns forward order and Blocks,
+  `model_runner/` owns preparation/cache/input binding, and `weights/` owns
+  fixed representations. `backend.rs` is an import/type-alias seam.
 - `crates/apxinf-cuda/src/kernels/`: typed operation contracts and dispatch.
 - `crates/apxinf-cuda/src/ffi/`, `src/cublas.rs`, `src/graph.rs`, and
   `src/backend.rs` within that crate: ABI, vendor calls, and graph lifecycle.
@@ -137,7 +150,8 @@ generation quality, and benchmark milestones. State which fixtures/configuration
 were validated and which remain unresolved. Do not infer long-context numerical
 acceptance from short fixtures or matching greedy tokens.
 
-Follow the project root [AGENTS.md](../../AGENTS.md#development-artifacts)
+Follow `AGENTS.md` from the checkout being analyzed (not the global skill
+installation directory)
 for all generated artifacts. Save task-specific reports under
 `<project-root>/devlocal/<feat-name>/reports/` and link the result in the response.
 Promote a report to maintained documentation only when that is part of the task. Keep machine paths,

@@ -19,7 +19,7 @@ function. It owns:
 It does not own raw device kernels, arbitrary application observations, robot
 adapter semantics, or policy-level prompt, normalization, and action contracts.
 It may own checkpoint-fixed conversion from a declared model input
-representation to the tensors consumed by the network.
+representation to the tensors consumed by the model.
 
 ```text
 Policy / application adapter
@@ -50,6 +50,94 @@ do not fit token sampling.
 The contracts may share model-neutral tensor or RNG facilities. They should not
 be unified merely because both accept language or images.
 
+## Current module names and responsibilities
+
+Use this table when assigning new model code. The source links show the PI0.5
+implementation; they are examples to inspect, not cross-family imports. A small
+family may combine files while preserving these owners. Add a trait, enum or
+wrapper only when the implementation needs it; matching PI0.5's file count is
+not a port requirement.
+
+| Owner / name | Inputs and output; responsibility | PI0.5 or shared source |
+| --- | --- | --- |
+| Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
+| Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text` or `Vla`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
+| `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
+| `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
+| `model/` (`<Family>Model<B>`) | Canonical tensors → model-domain result; shared forward order, modality connections and fixed flow schedule | [model/mod.rs](../crates/apxinf-model/src/pi05/model/mod.rs) |
+| `model/variant.rs` (`ModelVariant`) | Private dispatch among constructed precision-specific models and fixed time embeddings; does not own graph/cache policy | [variant.rs](../crates/apxinf-model/src/pi05/model/variant.rs) |
+| `model/blocks/` (`Blocks`, `PrepareBlocks`) | Backbone/layer composition, physical intermediate representations and precision-specific fusion; reports workspace needs without allocating the graph workspace | [blocks/mod.rs](../crates/apxinf-model/src/pi05/model/blocks/mod.rs) |
+| `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
+| `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
+| `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
+
+`ComputeVariant` is a configuration choice; `ModelVariant` is a loaded private
+enum; `LoadedModel` is the cross-family loading result. They have different
+lifetimes and are not three names for a model. A single-implementation family
+does not need a precision-dispatch enum. `StepModulation` is computed per-step
+scale/shift/gate data, distinct from learned modulation weights. Keep model
+semantics such as `prefix` and `denoise`; flow steps are not token decode steps.
+
+The native binding and the family runner are existing language-boundary and
+execution owners. `apxinf.ModelRunner` re-exports `apxinf_py.ModelRunner`; there
+is no separate Python `Pi05Model` or Python `AutoModel`. Python `AutoPolicy`
+selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
+Reuse these entry points for a new family instead of adding a factory/runner
+wrapper merely to reproduce the names in this table.
+
+### Dependency direction within a family
+
+```text
+load → weights + model construction + model_runner constructor
+model_runner → model interface / ModelVariant → Blocks → weights
+model_runner, Blocks, weights → safe backend resources / operations
+```
+
+The model does not depend on `VlaRequest`, `InferenceSpec`, graph policy or
+runner types. Weights do not depend on model/runner types. The runner invokes
+the model interface and typed dispatch; precision-specific matches and concrete
+Blocks construction stay in the model construction/variant module. It allocates
+from model-reported requirements rather than encoding a second workspace-size
+formula. Config and resource descriptions are leaf data. PI0.5 enforces these
+directions with [check_pi05_module_boundaries.py](../scripts/check_pi05_module_boundaries.py).
+That guard checks PI0.5 only; a new family must enforce its own declared boundaries.
+
+### Current coverage and port decisions
+
+| Family / contract | Current organization and limits |
+| --- | --- |
+| PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `compute_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
+| GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
+| Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
+
+New VLA code should use `Model` for forward computation and `ModelRunner` for
+execution ownership. Existing family symbols remain their actual names until
+separately migrated; do not rename or import them as part of an unrelated port.
+`VlaRuntime` default preparation-policy methods return unsupported, and default
+`PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
+does not prove graph readiness or PI0.5-equivalent guarantees.
+
+The common loader currently accepts `compute_variant` only for PI0.5 registry
+names. Supporting it for a new family requires updating that admission check
+and implementing family-local parsing/validation; registration alone is not
+enough. `LoadOptions.config`, Python `config_json`/shape overrides and
+`ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
+in that family and its loader; use existing named assets where applicable and
+extend a shared option only for a demonstrated contract, not by copying
+`Pi05Config` or adding unrelated fields to it.
+
+See [Adding a New Model](adding-a-new-model.md#registration-and-public-integration)
+for the exact integration sequence and
+[PI0.5 preparation](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+for implemented signatures and output-lifetime rules. Capture acceptance for a
+new accelerator port is defined in
+[Model Execution Wiring](model-execution-wiring.md#accelerator-port-acceptance);
+it is not a claim that every existing family has already passed those gates.
+
 ## VLA input seam and preprocessing ownership
 
 Separate application and policy preprocessing from model tensor
@@ -75,7 +163,7 @@ the input is already decoded and resized to the declared profile. The runtime
 may then own checkpoint-fixed pixel normalization, temporal duplication,
 patchification, spatial merge or ordering, layout conversion, and dtype
 conversion. Keeping those operations on the device allows them to share fixed
-buffers and CUDA Graph lifecycle with the network.
+buffers and CUDA Graph lifecycle with the model.
 
 This ownership does not turn `VlaRuntime` into a high-level policy. In
 particular, image normalization that converts declared RGB into model patches
@@ -96,9 +184,9 @@ to understand a directory rather than requiring a fixed file recipe:
    implementation and capability declaration.
 2. **Weight pipeline** — checkpoint keys, transformations, device upload,
    precision-specific representations and tied storage.
-3. **Network composition** — model mathematics, layer ordering, residuals,
+3. **Model composition** — model mathematics, layer ordering, residuals,
    attention, conditioning and schedules.
-4. **Execution carrier** — caches, workspaces, prepared shapes, graph capture
+4. **Model runner** — caches, workspaces, prepared shapes, graph capture
    and repeated invocation.
 5. **Specification and budget** — derived dimensions, static limits, workspace
    sizing and dispatch invariants.
@@ -124,11 +212,11 @@ library. During an initial port, dependencies follow this matrix:
 | `<new_model>` → another model-family directory | no |
 | another model-family directory changed to accommodate `<new_model>` | no by default; requires a separate shared-seam design and review |
 
-Use another maintained executor as evidence for layer ordering, fusion choices,
+Use another maintained model implementation as evidence for layer ordering, fusion choices,
 workspace lifetimes, and safe CUDA calls. Copy the architecture-specific code
 needed by the new model and rename its concepts locally. Reusing an optimized
 runtime means reusing those proven patterns and model-neutral interfaces; it
-does not mean importing the other family's config, weights, model, executor,
+does not mean importing the other family's config, weights, model, runner,
 backend seam, cache, or graph modules.
 
 Extract a shared architecture module only after both model implementations are
@@ -136,8 +224,10 @@ maintained, independently tested, and demonstrate the same stable semantics and
 lifecycle. Make that extraction a separately reviewable design change. A new
 port alone is not evidence for moving code out of either family.
 
-The directory's `backend.rs` is the only CUDA-facing seam when concrete device
-facilities are required. Other files import through that seam. This keeps
+When a family already has `backend.rs`, import its concrete CUDA resources
+and safe operations through that file. PI0.5 uses it as a re-export/type-alias
+module, not an abstract backend provider. A new family need not add a wrapper
+with forwarding methods to satisfy this convention. This keeps
 accelerator changes from rewriting the directory topology.
 
 ## Model/backend boundary
@@ -173,12 +263,12 @@ model type.
 
 ## Dependency rules
 
-- Registration may assemble configuration, weights, network, and runtime.
+- Registration may assemble configuration, weights, model, and runtime.
 - Weight code may depend on configuration and model-neutral transfer or
-  quantization facilities; it does not depend on the executor.
-- Network composition reads weights and dimensions; it does not depend on a
-  captured-runtime implementation.
-- Execution carriers invoke a narrow network interface or model-owned function;
+  quantization facilities; it does not depend on model/runner types.
+- Model composition reads weights and dimensions; it does not depend on a
+  runner or capture implementation.
+- Model runners invoke a narrow model interface or model-owned function;
   they do not recreate model mathematics.
 - Shape and budget definitions remain leaf concepts.
 - Debugging and profiling may cross these responsibilities without owning
@@ -204,7 +294,7 @@ behavior, the commonality is not stable enough.
 - No backend crate imports model types or model-family concepts.
 - Model code reaches CUDA through its declared seam.
 - Weight transformations occur at load time where possible.
-- Network mathematics has one owner.
+- Model mathematics has one owner.
 - Prepared execution binds every allocation/dispatch-relevant shape.
 - Shared code is backed by repeated maintained use, not a forecast.
 

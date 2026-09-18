@@ -10,6 +10,20 @@ test, such as `gemm_bias_all_candidates_match_torch`. Keep operator semantics
 as the primary organization; cover supported dtypes and quantization variants
 inside that test instead of organizing tests by dtype.
 
+## Scope and ownership
+
+Resolve source and docs in the checkout being modified. This skill applies to
+`crates/apxinf-cuda-new/` L3 semantics and candidate tests. The current PI0.5
+`model`/Blocks and `model_runner` path uses `apxinf-cuda`; passing an L3 candidate
+test does not prove that a model calls it. For model integration, follow
+`doc/model-execution-wiring.md` and trace the actual safe call and backend.
+
+Model forward order belongs in Model/Blocks, preparation and graph resources in
+ModelRunner, and checkpoint/device representations in weights. Keep L3 Args,
+reference fixtures and candidate dispatch model-neutral. Operator numerical
+thresholds below are L3 gates, not automatically model-level output tolerances;
+model acceptance also needs fixed-input eager/graph and public-path evidence.
+
 ## Oracle contract
 
 - Generate deterministic fixtures with PyTorch and a fixed seed. Check the

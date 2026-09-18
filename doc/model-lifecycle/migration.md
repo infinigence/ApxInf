@@ -1,5 +1,12 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
+Current integration rules: [module ownership and family support](../model-layer-architecture.md#current-module-names-and-responsibilities),
+[registration procedure](../adding-a-new-model.md#registration-and-public-integration),
+and [implemented PI0.5 preparation](lifecycle.md#implemented-pi05-preparation-contract).
+Stage descriptions below retain the terminology of their recorded revisions;
+use the naming follow-up and current guides for new code, not the earlier
+Session/Network or runtime/executor layouts.
+
 Status: PI0.5 Stage 2 is complete for the agreed refactor scope: runtime removal,
 fixed-asset organization, compute_variant naming and module encapsulation.
 Session G qualifies final-source Thor performance after the earlier contention
@@ -251,7 +258,7 @@ report remains under `devlocal/pi05-module-naming/reports/`.
 
 Evidence: `devlocal/pi05-module-naming/thor-20260918/` contains the frozen source manifest, build log, binary and asset SHA-256, all commands, full outputs, telemetry and the final audit. The native build uses the same 23 audited CUDA objects; no operator source or binary changes.
 
-### Stage 2 exit checklist (final PI0.5 candidate)
+### Stage 2 exit checklist (pre-naming qualification record)
 
 | Requirement | Current result |
 | --- | --- |
