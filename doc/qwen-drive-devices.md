@@ -190,6 +190,53 @@ is already the best of the six combinations tried, at 6.6237-6.6671 against
 6.64-6.72 for the others — which is expected, since the missing speed is in
 kernel source rather than in a constant.
 
+### Folding it in
+
+Done, and it is now in the branch. The kernel table said what to take and the
+launch shapes said why, so the fold is four separable pieces rather than one
+patch applied blind:
+
+| | what it is | orin2 kernel table |
+|---|---|---:|
+| column tiles | the three chunk loops fix the row and walk the columns, so the *global* reads are the ones amortised and the shared reads become one wide BF16 load | 250.7 ms on chunk-state, 35.2 on chunk-gemm |
+| launch bounds | a register cap, not a width: without it nvcc gave chunk-state 48 registers at a 1024-thread block and spilled | (included above) |
+| a 4×4 register tile in `gdn_attn_raw` | three shared reads for two FMAs becomes 2·4+4 for 2·4·4 | 41.8 ms |
+| the residual add folded into the norm | at decode both are one 2560-element row, two launches for a few microseconds | 43.6 ms net |
+
+Two constants in the sm80 row moved with the kernels. Chunk-gemm's width moved
+furthest, because fusing its two products doubled the accumulators and 32 no
+longer fit the cap — 4 is 5.785 s/scene, 8 is 5.764, 16 is 5.774, **32 is
+6.328**, so the old default was a 10% regression rather than a mild one. The
+chunk-state block went the other way, 1024 back to 512, because the column tile
+needs fewer registers and the cap already bought back the residency the wider
+block provided. Thor's row was re-swept too and did not move: 4 is 3.3405
+against 3.3521 at 2, 3.3483 at 16 and 3.3615 at 8.
+
+Nothing about the numbers changed. On orin2 the three operator oracles land
+digit for digit where they were — chunk-state 1.418808e-3 against fp64,
+chunk-gemm 1.369621e-7, the decode recurrence 1.403177e-3 — the value-split
+test still reports zero differing words, and the whole probe is byte-identical
+to the tree this recovers, first differing VQA index `[121, 88, 445, 32]`
+included.
+
+Three alternating rounds on orin2, against that tree:
+
+| | scene 0 | scene 1 | scene 2 | scene 3 |
+|---|---:|---:|---:|---:|
+| the uncommitted tree, serial | 6.4881 | 6.4778 | 6.4854 | 6.4836 |
+| this branch, serial | 6.5033 | 6.4949 | 6.5044 | 6.5038 |
+| this branch, its own defaults | 6.2926 | 6.2897 | 6.2916 | 6.2773 |
+
+Kernels alone land within **0.27%** of the tree; with this branch's own
+preprocessing it is **3.12% ahead** of it and **6.07% ahead** of where the
+branch stood before the fold.
+
+Thor gains less, and for a reason the policy table predicts: its row puts the
+chunk-state scan on tensor cores, so the largest of the four pieces never runs
+there. What is left is the attention term, the chunk GEMM and the add fusion —
+3.3643/3.3673/3.3697/3.3681 becomes 3.3397/3.3403/3.3316/3.3319, **1.0094x**,
+31 ms a scene.
+
 What it is **not**: the policy table. Sweeping its Orin row back to the values
 `41066eb` shipped changes nothing — `chunk_gemm_tile` 16 gives 6.82,
 `chunk_state_threads` 512 gives 6.83, both together 6.83, `chunk_state_tile` 4
