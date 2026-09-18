@@ -76,7 +76,7 @@ pi05/
   math.rs                CPU helpers/reference semantics
   model/
     mod.rs               Pi05Model<B>: shared forward computation and flow schedule
-    variant.rs           ModelVariant: loaded precision-specific dispatch
+    model.rs           ModelVariant: loaded precision-specific dispatch
     blocks/              layer/backbone implementation and resource requirements
     calibration.rs       model-specific diagnostic traversal
   model_runner/

@@ -53,7 +53,7 @@ Search for an implementation in this order:
 
 1. the closest maintained model and layer implementation at the requested
    precision and hardware: for PI0.5, inspect `pi05/model/mod.rs` for forward
-   order, `pi05/model/blocks/` for fusion, `pi05/model/variant.rs` for precision
+   order, `pi05/model/blocks/` for fusion, `pi05/model/model.rs` for precision
    dispatch, and `pi05/model_runner/` for preparation/resource ownership under
    `crates/apxinf-model/src/`. WallOSS/GR00T retain their actual runtime/executor
    filenames; locate them before copying patterns;

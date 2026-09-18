@@ -208,7 +208,7 @@ and closes the earlier contention blocker; historical samples remain recorded.
 
 The naming-only follow-up uses `model_runner/Pi05ModelRunner` for lifecycle and
 execution ownership, `model/Pi05Model<B>` for forward computation, and
-`model/variant.rs::ModelVariant` for precision dispatch. The Python binding is
+`model/model.rs::ModelVariant` for precision dispatch. The Python binding is
 `apxinf.ModelRunner` (the re-export of `apxinf_py.ModelRunner`); policy injection
 and access use `model_runner`. Per-timestep modulation data is `StepModulation`.
 The existing Rust `AutoModel` factory and `LoadedModel` result keep their names.

@@ -30,7 +30,7 @@ objects, resource ownership and call order; it introduces no additional wrapper.
 | `apxinf.Model` / `apxinf_py.Model` / PyO3 `Model` | `ModelRunner` | One native Python type, re-exported by `apxinf`; input/output conversion and calls into Rust |
 | `Pi05Session` / `execution/` | `Pi05ModelRunner` / `model_runner/` | PI0.5 preparation, execution resources, implicit cache and inference |
 | `Pi05Network<B>` / `network/` | `Pi05Model<B>` / `model/` | Shared model forward computation |
-| `LoadedCompute` / `network/compute.rs` | `ModelVariant` / `model/variant.rs` | Runtime choice of a loaded precision-specific model and fixed time embeddings |
+| `LoadedCompute` / `network/compute.rs` | `ModelVariant` / `model/model.rs` | Runtime choice of a loaded precision-specific model and fixed time embeddings |
 | `BareModel` | `ModelRunnerProtocol` | Python policy's structural runner contract |
 | `policy.model`, injected `model=` | `policy.model_runner`, injected `model_runner=` | Policy's reference to the native runner |
 | `Styles` / `*StepStyles` | `StepModulation` / `*StepModulation` | Per-timestep scale/shift/gate tensors for adaptive RMSNorm and gated residuals |
@@ -68,7 +68,7 @@ alongside `model/`, `model_runner/` and `weights/`. It is compiled without the
 
 | Function | Purpose and current caller |
 | --- | --- |
-| `sinusoidal_time_embedding` | Generates the fixed flow timestep embeddings used by `model/variant.rs` during loading; uses float64 intermediate arithmetic to match OpenPI |
+| `sinusoidal_time_embedding` | Generates the fixed flow timestep embeddings used by `model/model.rs` during loading; uses float64 intermediate arithmetic to match OpenPI |
 | `discretize_state` | CPU utility matching NumPy state binning, including boundary behavior; exercised by CPU tests |
 | `pi05_prompt` | CPU reference for task normalization and optional state-to-prompt formatting; calls `discretize_state` |
 | `euler_flow_step` | CPU reference for `x -= velocity / num_steps`; tests the reverse-time sign |
@@ -258,7 +258,7 @@ pi05/
 
   model/
     mod.rs                     model dataflow and computation/resource interface
-    variant.rs                 construction, ModelVariant and static dispatch
+    model.rs                 construction, ModelVariant and static dispatch
     calibration.rs             private BF16 observer and diagnostic traversal
     blocks/
       mod.rs                   semantic Blocks contract
@@ -278,7 +278,7 @@ pi05/
 ```
 
 The tree has 22 Rust files (20 before this module encapsulation); the model
-root has five files. The extra files are model_runner/mod.rs and model/variant.rs,
+root has five files. The extra files are model_runner/mod.rs and model/model.rs,
 which provide module ownership and loaded-computation dispatch rather than new
 per-layer abstractions. Each device-weight file groups its linear storage in
 an internal module and its aggregate model tree in the same file. Backbone/layer
@@ -290,7 +290,7 @@ Model owns the full model order and flow step count/dt. Blocks own backbone
 layer loops, fusion, physical layout and fixed weights. The model dataflow methods depend on the Blocks contract; the model module
 exports and ModelVariant dispatch select concrete implementations. BF16-only calibration
 traversal lives privately in model/calibration.rs.
-Rust statically specializes the Model for each implementation. `model/variant.rs` wraps
+Rust statically specializes the Model for each implementation. `model/model.rs` wraps
 these types for the public ModelRunner; no per-layer virtual calls are introduced.
 
 Blocks report workspace requirements and perform their native input conversion.
@@ -469,7 +469,7 @@ let (graph, output) = backend.capture_graph(|| {
 `PrepareBlocks` 是计算能力/资源需求契约，不是另一个 ModelRunner prepare 生命周期入口。
 
 ```rust
-// model/variant.rs：由 model 定义，避免 model 反向依赖 model_runner。
+// model/model.rs：由 model 定义，避免 model 反向依赖 model_runner。
 pub(in crate::pi05) trait ModelOperation {
     type Output;
     fn run<B: PrepareBlocks>(
@@ -757,7 +757,7 @@ and BF16 otherwise. Explicit choices retain existing kernel fallback behavior;
 this selection rule is not a declaration that all hardware/profile combinations
 are qualified. The resolved ID is logged. The loader creates matching Blocks and
 injects them into `Pi05Model::from_blocks`. Selection and typed dispatch are
-split by lifetime: `load.rs` selects during loading, while `model/variant.rs`
+split by lifetime: `load.rs` selects during loading, while `model/model.rs`
 owns typed execution dispatch. Pi05ModelRunner and the model dataflow do not match variants.
 
 Each value selects a complete compute implementation, including numerical

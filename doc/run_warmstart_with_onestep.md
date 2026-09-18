@@ -48,7 +48,7 @@ Runtime partial-flow support:
   - added `flow_start_time`, default `1.0`
   - accepts `flow_start_time` from config/override
   - validates it is in `(0, 1]`
-- `crates/apxinf-model/src/pi05/model/variant.rs`
+- `crates/apxinf-model/src/pi05/model/model.rs`
   - prepares fixed timestep embeddings during loading for BF16/FP8/INT8
   - uses `flow_start_time * (1 - step / num_flow_steps)`
 - `crates/apxinf-model/src/pi05/model/mod.rs`

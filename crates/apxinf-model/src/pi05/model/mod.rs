@@ -8,14 +8,14 @@ use blocks::Blocks;
 
 mod blocks;
 mod calibration;
-mod variant;
+mod model;
 pub use calibration::Pi05CalibrationObserver;
-pub use variant::{
+pub use model::{
     build_bf16_model, build_fp8_static_model, build_int8_dynamic_model,
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic,
 };
-pub(super) use variant::{ModelOperation, ModelVariant};
+pub(super) use model::{ModelOperation, ModelVariant};
 
 use crate::pi05::backend::{DeviceBuffer, RuntimeBackend};
 use crate::pi05::Pi05ImageLayout;
