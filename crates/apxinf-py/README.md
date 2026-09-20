@@ -67,7 +67,7 @@ environment variables (they skip cleanly without CUDA / a checkpoint):
 
 ```sh
 pip install pytest numpy
-APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_PRECISION=bf16 \
+APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_MODEL_VARIANT=bf16 \
   pytest crates/apxinf-py/tests
 ```
 
