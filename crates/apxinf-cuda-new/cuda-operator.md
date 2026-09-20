@@ -56,7 +56,7 @@ Use when bias addition is part of the required L3 semantic.
 
 | Rust API | Semantics | Output | Supported quantization | Important restrictions | Reference test |
 |---|---|---|---|---|---|
-| `ops::gemm_bias_gelu` | `Y = GELU(alpha * (A @ B) + bias) / output_scale` | `[M,N]` | None, FP8 unit-scale, FP8 row/channel | `bias=[N]`; W8A8 is not supported | `gemm_bias_gelu_all_candidates_match_torch` |
+| `ops::gemm_bias_gelu` | `Y = GELU(alpha * (A @ B) + bias) / output_scale` | `[M,N]` | None, FP8 unit-scale, FP8 row/channel, W8A8 row/channel | `bias=[N]`; W8A8 output is BF16 | `gemm_bias_gelu_all_candidates_match_torch` |
 
 The activation is the tanh-approximation GELU used by the checked Torch
 reference. Use only when the model requires this fused ordering.
@@ -72,6 +72,47 @@ Use for the complete GeGLU projection. Do not pre-pack or interleave the public
 weight: candidate-specific packing is internal. When a weight allocation is
 immutable, attach a `WeightVersion` so a prepared execution may safely cache a
 transformed copy.
+
+<!-- l3-operator:gemm_bias_relu -->
+### `gemm_bias_relu`
+
+Computes `Y = ReLU(alpha * (A @ B) + bias) / output_scale` with output
+`[M,N]` and bias `[N]`. Supports all shared GEMM quantization modes;
+W8A8 output is BF16. Reference: `gr00t_bias_activation_candidates_match_torch`
+and `gr00t_w8a8_bias_family_candidates_match_torch`.
+
+<!-- l3-operator:gemm_bias_silu -->
+### `gemm_bias_silu`
+
+Computes `Y = SiLU(alpha * (A @ B) + bias) / output_scale` with output
+`[M,N]` and bias `[N]`. Supports all shared GEMM quantization modes;
+W8A8 output is BF16. Reference: `gr00t_bias_activation_candidates_match_torch`
+and `gr00t_w8a8_bias_family_candidates_match_torch`.
+
+<!-- l3-operator:gemm_bias_residual -->
+### `gemm_bias_residual`
+
+Computes `Y = (alpha * (A @ B) + bias + residual) / output_scale`.
+Output and residual have shape `[M,N]` and the same dtype; bias has shape
+`[N]`. Supports all shared GEMM quantization modes; W8A8 output is BF16.
+Reference: `gr00t_bias_residual_candidates_match_torch` and
+`gr00t_w8a8_bias_family_candidates_match_torch`.
+
+<!-- l3-operator:gemm_swiglu -->
+### `gemm_swiglu`
+
+Computes `Y = SiLU(alpha * (A @ B_gate)) * (alpha * (A @ B_up)) / output_scale`.
+Public weight is `[K,2N]`, with gate columns first and up columns second;
+output is `[M,N]`. Supports all shared GEMM quantization modes; channel scales
+have length `2N`, covering both gate and up columns, and W8A8 output is BF16. Reference:
+`gr00t_swiglu_candidates_match_torch` and
+`gr00t_w8a8_swiglu_candidates_match_torch`.
+
+The cuBLAS W8A8 fallback converts unscaled INT8 operands exactly to BF16,
+accumulates and stores the projection in FP32, then applies row/channel
+scales and the fused epilogue before the final BF16 output conversion.
+This avoids rounding scaled operands or gate/up projections to BF16 before
+SwiGLU.
 
 ## Operator families not yet exposed by `cuda-new`
 

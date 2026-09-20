@@ -174,6 +174,10 @@ pub(crate) enum Semantic {
     GemmBiasGelu = 1,
     GemmGeglu = 2,
     GemmBias = 3,
+    GemmBiasRelu = 4,
+    GemmBiasSilu = 5,
+    GemmBiasResidual = 6,
+    GemmSwiglu = 7,
 }
 
 #[cfg(test)]
@@ -185,6 +189,10 @@ impl Semantic {
         Self::GemmBias,
         Self::GemmBiasGelu,
         Self::GemmGeglu,
+        Self::GemmBiasRelu,
+        Self::GemmBiasSilu,
+        Self::GemmBiasResidual,
+        Self::GemmSwiglu,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -196,6 +204,10 @@ impl Semantic {
             Self::GemmBias => "gemm_bias",
             Self::GemmBiasGelu => "gemm_bias_gelu",
             Self::GemmGeglu => "gemm_geglu",
+            Self::GemmBiasRelu => "gemm_bias_relu",
+            Self::GemmBiasSilu => "gemm_bias_silu",
+            Self::GemmBiasResidual => "gemm_bias_residual",
+            Self::GemmSwiglu => "gemm_swiglu",
         }
     }
 }
@@ -306,6 +318,26 @@ pub(crate) fn normalize<'a>(
     semantic: Semantic,
     bias: Option<&Tensor>,
 ) -> Result<Normalized> {
+    normalize_operands(ctx, args, semantic, bias, None)
+}
+
+pub(crate) fn normalize_with_residual<'a>(
+    ctx: &CudaContext,
+    args: GemmArgs<'a>,
+    semantic: Semantic,
+    bias: Option<&Tensor>,
+    residual: &'a Tensor,
+) -> Result<Normalized> {
+    normalize_operands(ctx, args, semantic, bias, Some(residual))
+}
+
+fn normalize_operands<'a>(
+    ctx: &CudaContext,
+    args: GemmArgs<'a>,
+    semantic: Semantic,
+    bias: Option<&Tensor>,
+    residual: Option<&Tensor>,
+) -> Result<Normalized> {
     let a_shape = args.a.shape().dims();
     let b_shape = args.b.shape().dims();
     if a_shape.len() != 2 || b_shape.len() != 2 {
@@ -325,15 +357,29 @@ pub(crate) fn normalize<'a>(
     {
         return Err(invalid("invalid GEMM dimensions"));
     }
-    if semantic == Semantic::GemmGeglu && n % 2 != 0 {
-        return Err(invalid("GEMM+GeGLU requires an even projection width"));
+    let is_gated = matches!(semantic, Semantic::GemmGeglu | Semantic::GemmSwiglu);
+    if is_gated && n % 2 != 0 {
+        return Err(invalid("gated GEMM requires an even projection width"));
     }
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
-    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu);
+    let needs_bias = matches!(
+        semantic,
+        Semantic::GemmBias
+            | Semantic::GemmBiasGelu
+            | Semantic::GemmBiasRelu
+            | Semantic::GemmBiasSilu
+            | Semantic::GemmBiasResidual
+    );
     if bias.is_some() != needs_bias {
         return Err(invalid("fused operands do not match the semantic operator"));
+    }
+    let needs_residual = semantic == Semantic::GemmBiasResidual;
+    if residual.is_some() != needs_residual {
+        return Err(invalid(
+            "residual operand does not match the semantic operator",
+        ));
     }
     let (quantization, row_scales, channel_scales) = match args.quantization {
         GemmQuantization::None => {
@@ -368,7 +414,16 @@ pub(crate) fn normalize<'a>(
             if args.a.dtype() != DType::I8
                 || args.b.dtype() != DType::I8
                 || args.out.dtype() != DType::BF16
-                || !matches!(semantic, Semantic::Gemm | Semantic::GemmBias)
+                || !matches!(
+                    semantic,
+                    Semantic::Gemm
+                        | Semantic::GemmBias
+                        | Semantic::GemmBiasGelu
+                        | Semantic::GemmBiasRelu
+                        | Semantic::GemmBiasSilu
+                        | Semantic::GemmBiasResidual
+                        | Semantic::GemmSwiglu
+                )
                 || k > 131071
             {
                 return Err(invalid("invalid W8A8 GEMM contract"));
@@ -385,11 +440,7 @@ pub(crate) fn normalize<'a>(
         tensor_storage(ctx, args.a, args.a.dtype(), a_shape)?,
         tensor_storage(ctx, args.b, args.b.dtype(), b_shape)?,
     ];
-    let output_width = if semantic == Semantic::GemmGeglu {
-        n / 2
-    } else {
-        n
-    };
+    let output_width = if is_gated { n / 2 } else { n };
     let output_buffer = tensor_storage(ctx, args.out, args.out.dtype(), &[m, output_width])?;
     let output_bytes = required_bytes(args.out.dtype(), &[m, output_width])?;
     reject_output_overlap(
@@ -412,6 +463,7 @@ pub(crate) fn normalize<'a>(
         b_version: args.weight_version.map_or(0, WeightVersion::get),
         b_is_immutable: u32::from(args.weight_version.is_some()),
         bias: std::ptr::null(),
+        residual: std::ptr::null(),
         a_scales: std::ptr::null(),
         b_scales: std::ptr::null(),
         output: output_buffer.ptr(),
@@ -436,6 +488,13 @@ pub(crate) fn normalize<'a>(
     };
     for (tensor, expected_dtype, expected_shape, slot, name) in [
         (bias, projection_dtype, vec![n], 0, "bias"),
+        (
+            residual,
+            args.out.dtype(),
+            vec![m, output_width],
+            1,
+            "residual",
+        ),
         (row_scales, DType::F32, vec![m], 2, "row scale"),
         (channel_scales, DType::F32, vec![n], 3, "channel scale"),
     ] {
@@ -450,6 +509,7 @@ pub(crate) fn normalize<'a>(
             )?;
             match slot {
                 0 => bindings.bias = buffer.ptr(),
+                1 => bindings.residual = buffer.ptr(),
                 2 => bindings.a_scales = buffer.ptr().cast(),
                 _ => bindings.b_scales = buffer.ptr().cast(),
             }
@@ -460,7 +520,7 @@ pub(crate) fn normalize<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 4,
+            version: 5,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -471,6 +531,7 @@ pub(crate) fn normalize<'a>(
             a_alignment: alignment_class(bindings.a),
             b_alignment: alignment_class(bindings.b),
             bias_alignment: alignment_class(bindings.bias),
+            residual_alignment: alignment_class(bindings.residual),
             a_scales_alignment: alignment_class(bindings.a_scales.cast::<std::ffi::c_void>()),
             b_scales_alignment: alignment_class(bindings.b_scales.cast::<std::ffi::c_void>()),
             output_alignment: alignment_class(bindings.output.cast_const()),

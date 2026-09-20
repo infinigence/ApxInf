@@ -24,7 +24,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 4 || spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+  if (spec.version != 5 || spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_SWIGLU ||
       spec.a_dtype > APXINF_DTYPE_I8 || spec.b_dtype > APXINF_DTYPE_I8 ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
       spec.output_dtype > APXINF_DTYPE_E4M3 ||
@@ -37,6 +37,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   }
   for (uint32_t alignment : {
            spec.a_alignment, spec.b_alignment, spec.bias_alignment,
+           spec.residual_alignment,
            spec.a_scales_alignment, spec.b_scales_alignment,
            spec.output_alignment}) {
     if (!valid_alignment_class(alignment)) {
@@ -57,8 +58,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
        spec.accumulation_dtype != APXINF_DTYPE_I32 ||
        spec.quantization != APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL ||
        spec.output_dtype != APXINF_DTYPE_BF16 || spec.k > 131071 ||
-       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM &&
-        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS))) {
+       (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU))) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid INT8 GEMM contract");
   }
   if (spec.a_dtype != APXINF_DTYPE_I8 &&
@@ -80,7 +80,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "plain GEMM requires matching non-quantized inputs");
   }
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU && spec.n % 2 != 0) {
+  if (apxinf::gemm::is_gated_semantic(spec) && spec.n % 2 != 0) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "GEMM+GeGLU requires an even projection width");
   }
@@ -107,21 +107,24 @@ void validate_policy(const apxinf_gemm_policy_t& policy) {
 void validate_bindings(const apxinf::gemm::Spec& spec,
                        const apxinf_gemm_bindings_t& bindings,
                        bool require_output) {
-  const bool needs_bias =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
+  const bool requires_bias = apxinf::gemm::needs_bias(spec);
+  const bool requires_residual = apxinf::gemm::needs_residual(spec);
   const bool needs_scales =
       apxinf::gemm::has_row_channel_scales(spec);
   if (bindings.a == nullptr || bindings.b == nullptr ||
       (require_output && bindings.output == nullptr) ||
-      (needs_bias && bindings.bias == nullptr) ||
+      (requires_bias && bindings.bias == nullptr) ||
+      (requires_residual && bindings.residual == nullptr) ||
       (needs_scales &&
        (bindings.a_scales == nullptr || bindings.b_scales == nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "missing required GEMM bindings");
   }
-  if (!needs_bias && bindings.bias != nullptr) {
+  if (!requires_bias && bindings.bias != nullptr) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "unexpected GEMM bias");
+  }
+  if (!requires_residual && bindings.residual != nullptr) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "unexpected GEMM residual");
   }
   if (!std::isfinite(bindings.alpha) ||
       !std::isfinite(bindings.output_scale) ||
@@ -146,6 +149,8 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
   validate_recorded_alignment(bindings.b, spec.b_alignment, "GEMM B binding");
   validate_recorded_alignment(bindings.bias, spec.bias_alignment,
                               "GEMM bias binding");
+  validate_recorded_alignment(bindings.residual, spec.residual_alignment,
+                              "GEMM residual binding");
   validate_recorded_alignment(bindings.a_scales, spec.a_scales_alignment,
                               "GEMM A scales binding");
   validate_recorded_alignment(bindings.b_scales, spec.b_scales_alignment,

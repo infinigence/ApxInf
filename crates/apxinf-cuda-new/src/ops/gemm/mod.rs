@@ -4,9 +4,17 @@ mod gemm_bias;
 pub(crate) mod gemm_execution;
 mod gemm_geglu;
 mod gemm_gelu;
+mod gemm_relu;
+mod gemm_residual;
+mod gemm_silu;
+mod gemm_swiglu;
 
 pub use contracts::{GemmArgs, GemmPolicy, GemmQuantization, WeightVersion};
 pub use gemm::gemm;
 pub use gemm_bias::{gemm_bias, GemmBiasArgs};
 pub use gemm_geglu::{gemm_geglu, GemmGegluArgs};
 pub use gemm_gelu::{gemm_bias_gelu, GemmBiasGeluArgs};
+pub use gemm_relu::{gemm_bias_relu, GemmBiasReluArgs};
+pub use gemm_residual::{gemm_bias_residual, GemmBiasResidualArgs};
+pub use gemm_silu::{gemm_bias_silu, GemmBiasSiluArgs};
+pub use gemm_swiglu::{gemm_swiglu, GemmSwigluArgs};

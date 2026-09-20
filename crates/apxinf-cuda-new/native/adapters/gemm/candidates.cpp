@@ -57,6 +57,17 @@ AlignmentRequirements cutlass_geglu_alignment(const Spec& spec) {
 }
 #endif
 
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+AlignmentRequirements cutlass_w8a8_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  requirements.a = 16;
+  requirements.a_scales = alignof(float);
+  requirements.b_scales = alignof(float);
+  requirements.output = 16;
+  return requirements;
+}
+#endif
+
 void one_configuration(const Spec&, std::vector<int>& configs) {
   configs.push_back(0);
 }
@@ -77,6 +88,16 @@ bool supports_cutlass_fp8(const Spec& spec) {
          spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
          spec.n % 16 == 0 &&
          spec.k % 16 == 0 && spec.output_scale_is_unit != 0;
+}
+
+bool supports_cutlass_fp8_bf16(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.a_dtype == APXINF_DTYPE_E4M3 &&
+         spec.b_dtype == APXINF_DTYPE_E4M3 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+         spec.n % 16 == 0 && spec.k % 16 == 0 &&
+         spec.output_scale_is_unit != 0;
 }
 
 bool supports_cutlass_fp8_geglu(const Spec& spec) {
@@ -108,6 +129,21 @@ void cutlass_configurations(const Spec&,
   for (int configuration = 0; configuration < 4; ++configuration) {
     configs.push_back(configuration);
   }
+}
+#endif
+
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+bool supports_cutlass_w8a8(const Spec& spec) {
+  // This candidate writes the scaled GEMM result directly to the public
+  // output. It has no bias, activation, residual, or gated epilogue.
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.a_dtype == APXINF_DTYPE_I8 &&
+         spec.b_dtype == APXINF_DTYPE_I8 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_I32 &&
+         spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
+         spec.k % 16 == 0 && spec.alpha_is_unit != 0 &&
+         spec.output_scale_is_unit != 0;
 }
 #endif
 
@@ -176,6 +212,13 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+      {kProviderCutlass, 5, 1, "cutlass-w8a8-sm80",
+       kDeviceFeatureCutlassSm80W8a8, true, true, false, supports_cutlass_w8a8,
+       cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
+       one_configuration, prepare_cutlass_w8a8, launch_cutlass_w8a8,
+       destroy_cutlass_w8a8},
+#endif
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue",
        kDeviceFeatureNativeFp8, true, false, false, supports_native_fp8,
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
@@ -187,6 +230,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
+      {kProviderCutlass, 4, 1, "cutlass-fp8-bf16", kDeviceFeatureCutlassSm100,
+       true, true, false, supports_cutlass_fp8_bf16, cutlass_fp8_alignment,
+       cutlass_fp8_resource_requirements, cutlass_configurations,
+       prepare_cutlass_fp8_gemm, launch_cutlass_fp8_bf16_gemm, destroy_cutlass},
 #endif
   };
   static const ImplementationRegistry gemm_geglu_entries = {
@@ -223,6 +270,12 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS:
       selected = &gemm_bias_entries;
+      break;
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RELU:
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_SILU:
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL:
+    case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU:
+      selected = &vendor_entries;
       break;
     default:
       throw Failure(APXINF_STATUS_INTERNAL_ERROR,
@@ -350,4 +403,27 @@ extern "C" int apxinf_gemm_test_resource_prefilter(int device) {
     return failure.status == APXINF_STATUS_UNSUPPORTED && !test_create_called;
   }
   return 0;
+}
+
+// Private regression hook: the SM80-family W8A8 implementation has no fused
+// epilogue and must never appear in a non-plain semantic registry.
+extern "C" int apxinf_gemm_test_w8a8_registry_is_plain_only() {
+  using namespace apxinf::gemm;
+  bool found_plain_w8a8 = false;
+  for (uint32_t semantic = APXINF_GEMM_SEMANTIC_GEMM;
+       semantic <= APXINF_GEMM_SEMANTIC_GEMM_SWIGLU; ++semantic) {
+    for (const auto& implementation : registry(semantic)) {
+      if (implementation.provider_id != 3 ||
+          implementation.implementation_id != 5) {
+        continue;
+      }
+      if (semantic != APXINF_GEMM_SEMANTIC_GEMM) return 0;
+      found_plain_w8a8 = true;
+    }
+  }
+#ifdef APXINF_GEMM_CUTLASS_SM80_W8A8
+  return found_plain_w8a8;
+#else
+  return !found_plain_w8a8;
+#endif
 }

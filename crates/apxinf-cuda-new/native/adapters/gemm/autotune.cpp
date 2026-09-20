@@ -25,7 +25,7 @@ class GemmTuningProblem {
         device_(device),
         output_(static_cast<size_t>(
                     spec.m *
-                    (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
+                    (is_gated_semantic(spec)
                          ? spec.n / 2
                          : spec.n)) *
                 dtype_bytes(spec.output_dtype)),

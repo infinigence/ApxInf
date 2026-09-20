@@ -20,6 +20,7 @@ struct ExecutionKey {
     b_version: u64,
     b_is_immutable: u32,
     bias: usize,
+    residual: usize,
     a_scales: usize,
     b_scales: usize,
     output: usize,
@@ -46,6 +47,7 @@ impl ExecutionKey {
             b_version: bindings.b_version,
             b_is_immutable: bindings.b_is_immutable,
             bias: bindings.bias as usize,
+            residual: bindings.residual as usize,
             a_scales: bindings.a_scales as usize,
             b_scales: bindings.b_scales as usize,
             output: bindings.output as usize,
@@ -253,7 +255,11 @@ pub(crate) fn validate_candidates(
     normalized: &Normalized,
     expected: &[f32],
 ) -> Result<()> {
-    let output_width = if normalized.spec.semantic == super::contracts::Semantic::GemmGeglu as u32 {
+    let output_width = if matches!(
+        normalized.spec.semantic,
+        value if value == super::contracts::Semantic::GemmGeglu as u32
+            || value == super::contracts::Semantic::GemmSwiglu as u32
+    ) {
         normalized.spec.n as usize / 2
     } else {
         normalized.spec.n as usize

@@ -25,6 +25,7 @@ unsafe extern "C" {
         capacity: usize,
     ) -> usize;
     fn apxinf_gemm_test_resource_prefilter(device: c_int) -> c_int;
+    fn apxinf_gemm_test_w8a8_registry_is_plain_only() -> c_int;
     fn apxinf_framework_test_registry_contract(error: *mut c_char, capacity: usize) -> c_int;
     fn apxinf_framework_test_recipe_db_contract(
         directory: *const c_char,
@@ -126,6 +127,37 @@ fn hardware_fingerprint(
         .to_owned()
 }
 
+fn device_sm(device: usize) -> i32 {
+    let mut major = 0;
+    let mut minor = 0;
+    unsafe {
+        crate::ffi::check_cuda(crate::ffi::cudaDeviceGetAttribute(
+            &mut major,
+            crate::ffi::CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MAJOR,
+            device as i32,
+        ))
+        .unwrap();
+        crate::ffi::check_cuda(crate::ffi::cudaDeviceGetAttribute(
+            &mut minor,
+            crate::ffi::CUDA_DEV_ATTR_COMPUTE_CAPABILITY_MINOR,
+            device as i32,
+        ))
+        .unwrap();
+    }
+    major * 10 + minor
+}
+
+fn has_native_fp8(sm: i32) -> bool {
+    matches!(sm, 89 | 90 | 100 | 101 | 110 | 120)
+}
+
+fn has_cutlass_sm100_family(sm: i32) -> bool {
+    matches!(sm, 100 | 101 | 110 | 120)
+}
+
+fn has_cutlass_sm80_w8a8(sm: i32) -> bool {
+    matches!(sm, 80 | 86 | 87 | 89)
+}
 #[test]
 fn uuid_does_not_partition_persistent_tuning_cache() {
     let first = [0x11; 16];
@@ -144,6 +176,11 @@ fn uuid_does_not_partition_persistent_tuning_cache() {
 #[test]
 fn workspace_budget_rejects_before_provider_create() {
     assert_eq!(unsafe { apxinf_gemm_test_resource_prefilter(0) }, 1);
+}
+
+#[test]
+fn cutlass_w8a8_candidate_is_registered_for_plain_gemm_only() {
+    assert_eq!(unsafe { apxinf_gemm_test_w8a8_registry_is_plain_only() }, 1);
 }
 
 pub(super) fn tensor(device: usize, shape: Vec<usize>, values: &[f32]) -> Tensor {
@@ -276,6 +313,7 @@ fn gemm_rejects_storage_misaligned_for_its_dtype() {
 #[test]
 fn gpu_e2e_candidate_alignment_is_selected_and_keyed_from_actual_bindings() {
     let ctx = CudaContext::new(0).unwrap();
+    let sm = device_sm(ctx.device_id());
     let (m, k, n) = (64, 64, 64);
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &vec![0x38; m * k]);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &vec![0x38; k * n]);
@@ -315,15 +353,24 @@ fn gpu_e2e_candidate_alignment_is_selected_and_keyed_from_actual_bindings() {
     let execution = super::execution::prepare(&ctx, misaligned).unwrap();
     let summary = execution.summary().to_owned();
     eprintln!("GPU_ALIGNMENT_MISALIGNED {summary}");
-    assert!(summary.contains("cutlass-fp8=skip(alignment)"), "{summary}");
+    if has_cutlass_sm100_family(sm) {
+        assert!(summary.contains("cutlass-fp8=skip(alignment)"), "{summary}");
+    } else {
+        assert!(
+            !summary.contains("cutlass-fp8") || summary.contains("cutlass-fp8=skip(device)"),
+            "{summary}"
+        );
+    }
     assert!(
         summary.contains("cublasLt+custom-epilogue=skip(alignment)"),
         "{summary}"
     );
-    assert!(
-        summary.contains("cublasLt-native-fp8+custom-epilogue=skip(alignment)"),
-        "{summary}"
-    );
+    let native_fp8_skip = if has_native_fp8(sm) {
+        "cublasLt-native-fp8+custom-epilogue=skip(alignment)"
+    } else {
+        "cublasLt-native-fp8+custom-epilogue=skip(device)"
+    };
+    assert!(summary.contains(native_fp8_skip), "{summary}");
     assert!(
         !summary.contains("source=memory"),
         "alignment key aliased: {summary}"
@@ -390,6 +437,7 @@ fn fp8_unit_scale_f32_output_does_not_round_through_f16() {
 #[test]
 fn fp8_unit_scale_bf16_output_does_not_round_through_f16() {
     let ctx = CudaContext::new(0).unwrap();
+    let sm = device_sm(ctx.device_id());
     let (m, k, n) = (1, 16, 16);
     // BF16 can represent this dot product exactly, while F16 overflows it.
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &vec![0x7e; m * k]);
@@ -406,6 +454,14 @@ fn fp8_unit_scale_bf16_output_does_not_round_through_f16() {
     assert_eq!(expected, 3_211_264.0);
     super::execution::validate_candidates(&ctx, &normalized, &vec![expected; m * n]).unwrap();
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    let summary = execution.summary().to_owned();
+    if matches!(sm, 100 | 101 | 110 | 120) {
+        assert!(
+            (0..4).any(|configuration| summary
+                .contains(&format!("cutlass-fp8-bf16#{configuration}=timed"))),
+            "the BF16 CUTLASS candidate was not exercised: {summary}"
+        );
+    }
 
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
@@ -445,6 +501,75 @@ fn gpu_e2e_autotune_times_candidates_and_checks_winner_capture() {
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
     assert!(f16_values(&out).iter().all(|&value| value == k as f32));
+}
+
+#[test]
+fn gpu_e2e_cutlass_w8a8_uses_canonical_kn_weight_and_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let sm = device_sm(ctx.device_id());
+    if !has_cutlass_sm80_w8a8(sm) {
+        eprintln!("skipping CUTLASS W8A8 test on unsupported SM {sm}");
+        return;
+    }
+    let (m, k, n) = (8, 16, 16);
+    let a_values: Vec<i8> = (0..m * k).map(|index| (index % 5) as i8 - 2).collect();
+    let b_values: Vec<i8> = (0..k * n)
+        .map(|index| {
+            let row = index / n;
+            let column = index % n;
+            ((row * 3 + column * 5) % 7) as i8 - 3
+        })
+        .collect();
+    let row_scales: Vec<f32> = (0..m)
+        .map(|row| if row % 2 == 0 { 0.5 } else { 1.0 })
+        .collect();
+    let channel_scales: Vec<f32> = (0..n)
+        .map(|column| if column % 3 == 0 { 0.25 } else { 0.5 })
+        .collect();
+    let expected: Vec<f32> = (0..m)
+        .flat_map(|row| {
+            let a_values = &a_values;
+            let b_values = &b_values;
+            let row_scales = &row_scales;
+            let channel_scales = &channel_scales;
+            (0..n).map(move |column| {
+                let dot: i32 = (0..k)
+                    .map(|inner| {
+                        i32::from(a_values[row * k + inner])
+                            * i32::from(b_values[inner * n + column])
+                    })
+                    .sum();
+                dot as f32 * row_scales[row] * channel_scales[column]
+            })
+        })
+        .collect();
+
+    let a_bytes: Vec<u8> = a_values.into_iter().map(|value| value as u8).collect();
+    let b_bytes: Vec<u8> = b_values.into_iter().map(|value| value as u8).collect();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &a_bytes);
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &b_bytes);
+    let row_scales = scales(0, &row_scales);
+    let channel_scales = scales(0, &channel_scales);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out)
+        .with_immutable_weight(WeightVersion::new(1));
+    args.policy.allow_fallback = false;
+    args.policy.graph_safe = true;
+    args.policy.deterministic = true;
+
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    let summary = execution.summary().to_owned();
+    assert!(
+        summary.contains("cutlass-w8a8-sm80#0=timed("),
+        "CUTLASS W8A8 candidate was not exercised: {summary}"
+    );
+
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&out), expected);
 }
 
 #[test]
@@ -854,13 +979,7 @@ fn w8a8_orin_shape_uses_cublas_dequantization_fallback() {
     let row_scales = scales(0, &vec![0.5; m]);
     let channel_scales = scales(0, &vec![2.0; n]);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
-    let mut args = GemmArgs::w8a8(
-        &a,
-        &row_scales,
-        &b,
-        &channel_scales,
-        &mut out,
-    );
+    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out);
     args.policy.online_tune = false;
     args.policy.allow_fallback = true;
 
@@ -1014,6 +1133,11 @@ fn tuning_isolated_from_user_buffers_and_replay_results() {
 #[test]
 fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     let ctx = CudaContext::new(0).unwrap();
+    let sm = device_sm(ctx.device_id());
+    if !has_cutlass_sm100_family(sm) {
+        eprintln!("skipping CUTLASS GeGLU prepack test on unsupported SM {sm}");
+        return;
+    }
     let (m, k, n) = (522, 2048, 32768);
     let a = zeros_tensor(0, vec![m, k], DType::F8E4M3);
     let b = zeros_tensor(0, vec![k, n], DType::F8E4M3);

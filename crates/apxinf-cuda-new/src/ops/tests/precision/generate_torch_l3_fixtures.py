@@ -18,6 +18,7 @@ import torch
 M, K, N = 8, 16, 16
 BF16_ALPHA, BF16_OUTPUT_SCALE = 0.75, 1.25
 FP8_UNIT_ALPHA, FP8_UNIT_OUTPUT_SCALE = 1.0, 1.0
+FP8_BF16_ALPHA = 0.03125
 FP8_SCALED_ALPHA, FP8_SCALED_OUTPUT_SCALE = 0.75, 1.25
 W8A8_ALPHA, W8A8_OUTPUT_SCALE = 0.5, 1.25
 
@@ -49,13 +50,20 @@ def rust_array(name: str, ty: str, values: list[int], width: int) -> str:
 
 
 def finish(projection: torch.Tensor, semantic: str, bias: torch.Tensor | None,
-           alpha: float, output_scale: float) -> torch.Tensor:
+           residual: torch.Tensor | None, alpha: float,
+           output_scale: float) -> torch.Tensor:
     if semantic == "gemm":
         result = alpha * projection
     elif semantic == "gemm_bias":
         result = alpha * projection + bias
     elif semantic == "gemm_bias_gelu":
         result = torch.nn.functional.gelu(alpha * projection + bias, approximate="tanh")
+    elif semantic == "gemm_bias_relu":
+        result = torch.relu(alpha * projection + bias)
+    elif semantic == "gemm_bias_silu":
+        result = torch.nn.functional.silu(alpha * projection + bias)
+    elif semantic == "gemm_bias_residual":
+        result = alpha * projection + bias + residual
     else:
         raise ValueError(f"unsupported L3 semantic: {semantic}")
     return (result / output_scale).to(torch.float32)
@@ -71,6 +79,23 @@ def geglu(a: torch.Tensor, b: torch.Tensor, alpha: float,
             output_scale).to(torch.float32)
 
 
+def swiglu(a: torch.Tensor, b: torch.Tensor, alpha: float,
+           output_scale: float) -> torch.Tensor:
+    """Evaluate the public B=[B_gate, B_up] contract as two GEMMs."""
+    width = b.shape[1] // 2
+    gate = alpha * (a @ b[:, :width])
+    up = alpha * (a @ b[:, width:])
+    return (torch.nn.functional.silu(gate) * up / output_scale).to(torch.float32)
+
+
+def swiglu_projection(projection: torch.Tensor, alpha: float,
+                      output_scale: float) -> torch.Tensor:
+    width = projection.shape[1] // 2
+    gate = alpha * projection[:, :width]
+    up = alpha * projection[:, width:]
+    return (torch.nn.functional.silu(gate) * up / output_scale).to(torch.float32)
+
+
 def main() -> None:
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
@@ -81,11 +106,15 @@ def main() -> None:
     raw_bias = torch.randn((N,), generator=generator) * 0.25
     w8a8_a = torch.randint(-16, 16, (M, K), generator=generator, dtype=torch.int8)
     w8a8_b = torch.randint(-16, 16, (K, N), generator=generator, dtype=torch.int8)
+    w8a8_swiglu_b = torch.randint(-16, 16, (K, 2 * N), generator=generator,
+                                  dtype=torch.int8)
+    raw_residual = torch.randn((M, N), generator=generator) * 0.25
 
     bf16_a = raw_a.to(torch.bfloat16)
     bf16_b = raw_b.to(torch.bfloat16)
     bf16_geglu_b = raw_geglu_b.to(torch.bfloat16)
     bf16_bias = raw_bias.to(torch.bfloat16)
+    bf16_residual = raw_residual.to(torch.bfloat16)
 
     fp8_a = raw_a.to(torch.float8_e4m3fn)
     fp8_b = raw_b.to(torch.float8_e4m3fn)
@@ -93,6 +122,7 @@ def main() -> None:
     fp8_bias = raw_bias.to(torch.float32)
     row_scales = torch.linspace(0.25, 1.125, M, dtype=torch.float32)
     channel_scales = torch.linspace(0.50, 1.4375, N, dtype=torch.float32)
+    swiglu_channel_scales = torch.linspace(0.50, 1.4375, 2 * N, dtype=torch.float32)
 
     bf16_projection = bf16_a.float() @ bf16_b.float()
     fp8_projection = fp8_a.float() @ fp8_b.float()
@@ -104,31 +134,44 @@ def main() -> None:
     w8a8_projection = (
         w8a8_a.float() @ w8a8_b.float()
     ) * row_scales[:, None] * channel_scales[None, :]
+    w8a8_swiglu_projection = (
+        w8a8_a.float() @ w8a8_swiglu_b.float()
+    ) * row_scales[:, None] * swiglu_channel_scales[None, :]
 
     arrays: list[str] = []
     arrays.append(rust_array("BF16_A", "u16", words(bf16_a), K))
     arrays.append(rust_array("BF16_B", "u16", words(bf16_b), N))
     arrays.append(rust_array("BF16_GEGLU_B", "u16", words(bf16_geglu_b), 2 * N))
     arrays.append(rust_array("BF16_BIAS", "u16", words(bf16_bias), N))
+    arrays.append(rust_array("BF16_RESIDUAL", "u16", words(bf16_residual), N))
     arrays.append(rust_array("FP8_A", "u8", bytes_(fp8_a), K))
     arrays.append(rust_array("FP8_B", "u8", bytes_(fp8_b), N))
     arrays.append(rust_array("FP8_GEGLU_B", "u8", bytes_(fp8_geglu_b), 2 * N))
     arrays.append(rust_array("W8A8_A", "u8", bytes_(w8a8_a), K))
     arrays.append(rust_array("W8A8_B", "u8", bytes_(w8a8_b), N))
+    arrays.append(rust_array("W8A8_SWIGLU_B", "u8", bytes_(w8a8_swiglu_b), 2 * N))
     arrays.append(rust_array("FP8_BIAS", "f32", f32_bits(fp8_bias), 4))
     arrays.append(rust_array("ROW_SCALES", "f32", f32_bits(row_scales), 4))
     arrays.append(rust_array("CHANNEL_SCALES", "f32", f32_bits(channel_scales), 4))
+    arrays.append(rust_array("SWIGLU_CHANNEL_SCALES", "f32",
+                             f32_bits(swiglu_channel_scales), 4))
+
+    fp8_bf16 = (FP8_BF16_ALPHA * fp8_projection).to(torch.bfloat16)
+    arrays.append(rust_array("FP8_BF16_GEMM_BITS", "u16", words(fp8_bf16), N))
 
     for prefix, projection, bias, alpha, output_scale, semantics in [
         ("BF16", bf16_projection, bf16_bias.float(), BF16_ALPHA, BF16_OUTPUT_SCALE,
-         ["gemm", "gemm_bias", "gemm_bias_gelu"]),
+         ["gemm", "gemm_bias", "gemm_bias_gelu", "gemm_bias_relu",
+          "gemm_bias_silu", "gemm_bias_residual"]),
         ("FP8_UNIT", fp8_projection, fp8_bias, FP8_UNIT_ALPHA, FP8_UNIT_OUTPUT_SCALE,
          ["gemm"]),
         ("FP8_SCALED", scaled_projection, fp8_bias, FP8_SCALED_ALPHA,
-         FP8_SCALED_OUTPUT_SCALE, ["gemm", "gemm_bias", "gemm_bias_gelu"]),
+         FP8_SCALED_OUTPUT_SCALE, ["gemm", "gemm_bias", "gemm_bias_gelu",
+                                   "gemm_bias_relu", "gemm_bias_silu"]),
     ]:
         for semantic in semantics:
-            expected = finish(projection, semantic, bias, alpha, output_scale)
+            residual = bf16_residual.float() if semantic == "gemm_bias_residual" else None
+            expected = finish(projection, semantic, bias, residual, alpha, output_scale)
             arrays.append(rust_array(f"{prefix}_{semantic.upper()}", "f32", f32_bits(expected), 4))
 
     for prefix, a, b, alpha, output_scale in [
@@ -139,12 +182,22 @@ def main() -> None:
         expected = geglu(a, b, alpha, output_scale)
         arrays.append(rust_array(f"{prefix}_GEMM_GEGLU", "f32", f32_bits(expected), 4))
 
-    for semantic in ["gemm", "gemm_bias"]:
+    expected = swiglu(bf16_a.float(), bf16_geglu_b.float(),
+                      BF16_ALPHA, BF16_OUTPUT_SCALE)
+    arrays.append(rust_array("BF16_GEMM_SWIGLU", "f32", f32_bits(expected), 4))
+
+    for semantic in ["gemm", "gemm_bias", "gemm_bias_gelu",
+                     "gemm_bias_relu", "gemm_bias_silu", "gemm_bias_residual"]:
+        residual = bf16_residual.float() if semantic == "gemm_bias_residual" else None
         expected = finish(
-            w8a8_projection, semantic, bf16_bias.float(),
+            w8a8_projection, semantic, bf16_bias.float(), residual,
             W8A8_ALPHA, W8A8_OUTPUT_SCALE,
         )
         arrays.append(rust_array(f"W8A8_{semantic.upper()}", "f32", f32_bits(expected), 4))
+
+    expected = swiglu_projection(w8a8_swiglu_projection, W8A8_ALPHA,
+                                 W8A8_OUTPUT_SCALE)
+    arrays.append(rust_array("W8A8_GEMM_SWIGLU", "f32", f32_bits(expected), 4))
 
     destination = Path(__file__).with_name("torch_l3_fixtures.rs")
     destination.write_text(
@@ -159,6 +212,7 @@ def main() -> None:
         f"pub(crate) const BF16_OUTPUT_SCALE: f32 = {BF16_OUTPUT_SCALE};\n"
         f"pub(crate) const FP8_UNIT_ALPHA: f32 = {FP8_UNIT_ALPHA};\n"
         f"pub(crate) const FP8_UNIT_OUTPUT_SCALE: f32 = {FP8_UNIT_OUTPUT_SCALE};\n"
+        f"pub(crate) const FP8_BF16_ALPHA: f32 = {FP8_BF16_ALPHA};\n"
         f"pub(crate) const FP8_SCALED_ALPHA: f32 = {FP8_SCALED_ALPHA};\n"
         f"pub(crate) const FP8_SCALED_OUTPUT_SCALE: f32 = {FP8_SCALED_OUTPUT_SCALE};\n\n"
         f"pub(crate) const W8A8_ALPHA: f32 = {W8A8_ALPHA};\n"

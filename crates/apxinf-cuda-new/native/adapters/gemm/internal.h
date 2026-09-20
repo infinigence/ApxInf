@@ -43,6 +43,23 @@ inline bool has_row_channel_scales(const Spec& spec) {
          spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL;
 }
 
+inline bool is_gated_semantic(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU;
+}
+
+inline bool needs_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU ||
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RELU ||
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SILU ||
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL;
+}
+
+inline bool needs_residual(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL;
+}
+
 struct Execution;
 using PrepareExecutionFn = void (*)(Execution&);
 using EnqueueFn = cudaError_t (*)(Execution&);
@@ -52,6 +69,7 @@ struct AlignmentRequirements {
   uint32_t a = 1;
   uint32_t b = 1;
   uint32_t bias = 1;
+  uint32_t residual = 1;
   uint32_t a_scales = 1;
   uint32_t b_scales = 1;
   uint32_t output = 1;
@@ -88,10 +106,9 @@ inline bool supports_alignment(const Implementation& implementation,
   return spec.a_alignment >= required.a &&
          spec.b_alignment >= required.b &&
          spec.bias_alignment >=
-             (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-                      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU
-                                     ? required.bias
-                                     : 0) &&
+             (needs_bias(spec) ? required.bias : 0) &&
+         spec.residual_alignment >=
+             (needs_residual(spec) ? required.residual : 0) &&
          spec.a_scales_alignment >=
              (has_row_channel_scales(spec) ? required.a_scales : 0) &&
          spec.b_scales_alignment >=
@@ -148,12 +165,17 @@ void destroy_cublaslt(Execution& execution) noexcept;
 cudaError_t launch_cublaslt(Execution& execution);
 void prepare_cutlass_fp8_gemm(Execution& execution);
 void prepare_cutlass_geglu(Execution& execution);
+void prepare_cutlass_w8a8(Execution& execution);
 size_t cutlass_fp8_resource_requirements(const Spec& spec);
 size_t cutlass_geglu_resource_requirements(const Spec& spec);
+size_t cutlass_w8a8_resource_requirements(const Spec& spec);
 void destroy_cutlass(Execution& execution) noexcept;
+void destroy_cutlass_w8a8(Execution& execution) noexcept;
 cudaError_t launch_cutlass_fp8_gemm(Execution& execution);
+cudaError_t launch_cutlass_fp8_bf16_gemm(Execution& execution);
 cudaError_t launch_cutlass_fp8_geglu(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu(Execution& execution);
+cudaError_t launch_cutlass_w8a8(Execution& execution);
 uint64_t cutlass_weight_prepack_count(const Execution& execution);
 
 TuningKeys tuning_keys(const Spec& spec,

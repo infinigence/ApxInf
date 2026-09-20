@@ -116,10 +116,11 @@ struct FusionCallbacksTraits<apxinf_cuda_cutlass_detail::GeGluEVT> {
 }  // namespace cutlass::epilogue::fusion
 
 namespace apxinf::cuda::cutlass_ops {
-template <typename TileShape, typename ClusterShape>
+template <typename TileShape, typename ClusterShape,
+          typename Output = cutlass::half_t>
 struct Fp8Gemm {
   using ElementInput = cutlass::float_e4m3_t;
-  using ElementOutput = cutlass::half_t;
+  using ElementOutput = Output;
   using ElementAccumulator = float;
   using LayoutA = cutlass::layout::RowMajor;
   // ApxInf stores linear weights physically as contiguous [K, N]. The original
@@ -483,6 +484,31 @@ int fp8_gemm_f16(
       // cluster while avoiding the explicit two-SM epilogue that wedges the
       // current Thor-U driver during graph replay.
       return launch<Fp8Gemm<Shape<_256, _128, _128>, Shape<_2, _1, _1>>>(
+          activation, weight, output, m, n, k, alpha, stream);
+    default:
+      return -5;
+  }
+}
+
+int fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream) {
+  switch (tactic) {
+    case 0:
+      return launch<Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _4, _1>,
+                            cutlass::bfloat16_t>>(
+          activation, weight, output, m, n, k, alpha, stream);
+    case 1:
+      return launch<Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _1, _1>,
+                            cutlass::bfloat16_t>>(
+          activation, weight, output, m, n, k, alpha, stream);
+    case 2:
+      return launch<Fp8Gemm<Shape<_128, _128, _128>, Shape<_2, _1, _1>,
+                            cutlass::bfloat16_t>>(
+          activation, weight, output, m, n, k, alpha, stream);
+    case 3:
+      return launch<Fp8Gemm<Shape<_256, _128, _64>, Shape<_2, _2, _1>,
+                            cutlass::bfloat16_t>>(
           activation, weight, output, m, n, k, alpha, stream);
     default:
       return -5;
