@@ -1,5 +1,9 @@
 // Head-64 noncausal BF16 specialization of the existing licensed FA2 provider.
 // PyTorch's reference build uses separate multiply/add in the softmax exponent.
+// Do not share CUDA entrypoint symbols with generic fast-math FA2 kernels.
+#define flash_fwd_kernel apxinf_reference_fwd_kernel
+#define flash_fwd_splitkv_kernel apxinf_reference_splitkv_kernel
+#define flash_fwd_splitkv_combine_kernel apxinf_reference_splitkv_combine_kernel
 #define UNFUSE_FMA
 #include "flash_attn/namespace_config.h"
 #include "flash_attn/flash_fwd_launch_template.h"

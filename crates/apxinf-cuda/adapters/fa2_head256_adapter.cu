@@ -1,4 +1,10 @@
 // BF16 head256 specialization for causal prefill and noncausal split-KV.
+// These templates use different math from the generic FA2 translation units.
+// Keep their CUDA entrypoints distinct: identical weak host stubs otherwise
+// register multiple device implementations under the same kernel symbol.
+#define flash_fwd_kernel apxinf_reference_fwd_kernel
+#define flash_fwd_splitkv_kernel apxinf_reference_splitkv_kernel
+#define flash_fwd_splitkv_combine_kernel apxinf_reference_splitkv_combine_kernel
 #define UNFUSE_FMA
 #include "flash_attn/namespace_config.h"
 #include "flash_attn/flash_fwd_launch_template.h"
