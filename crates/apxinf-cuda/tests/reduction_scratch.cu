@@ -9,13 +9,16 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/attention.cuh"
+#include "../kernels/custom/normalization.cuh"
 
 #define CHECK(call) do { auto e = (call); if (e != cudaSuccess) { \
   std::fprintf(stderr, "%s: %s\n", #call, cudaGetErrorString(e)); \
@@ -160,9 +163,53 @@ static void test_sdpa() {
   }
 }
 
+// Qwen-Drive's vision path uses the cached row kernel, which has its own
+// mean -> variance scratch-reuse boundary. Poison every output before replay.
+template<int PerThread> static void test_cached_layer_norm() {
+  constexpr int rows = 17, cols = 256 * PerThread;
+  std::vector<__nv_bfloat16> input(rows * cols), weight(cols), bias(cols), result(input.size());
+  std::vector<__nv_bfloat16> first;
+  std::vector<double> expected(input.size());
+  for (size_t i = 0; i < input.size(); ++i)
+    input[i] = __float2bfloat16(std::sin(i * 0.013f) * 3.f + std::sin((i / cols) * .41f));
+  for (int c = 0; c < cols; ++c) {
+    weight[c] = __float2bfloat16(1.f);
+    bias[c] = __float2bfloat16(0.f);
+  }
+  for (int r = 0; r < rows; ++r) {
+    double mean = 0, variance = 0;
+    for (int c = 0; c < cols; ++c) mean += __bfloat162float(input[r * cols + c]);
+    mean /= cols;
+    for (int c = 0; c < cols; ++c) {
+      double value = __bfloat162float(input[r * cols + c]) - mean;
+      variance += value * value;
+    }
+    for (int c = 0; c < cols; ++c)
+      expected[r * cols + c] = (__bfloat162float(input[r * cols + c]) - mean) / std::sqrt(variance / cols + 1e-6);
+  }
+  auto x = upload(input), w = upload(weight), b = upload(bias), y = upload(result);
+  for (int fill : {0x00, 0x5a, 0xff}) {
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      CHECK(cudaMemset(y, fill, result.size() * sizeof(__nv_bfloat16)));
+      layer_norm_bf16_cached_kernel<PerThread><<<rows, 256>>>(x, w, b, y, rows, cols, 1e-6f);
+      CHECK(cudaGetLastError());
+      download(result, y);
+      if (first.empty()) first = result;
+      for (size_t i = 0; i < result.size(); ++i) {
+        check_close(__bfloat162float(result[i]), expected[i], 0.016);
+        check_close(__bfloat162float(result[i]), __bfloat162float(first[i]), 0);
+      }
+    }
+  }
+  CHECK(cudaFree(x)); CHECK(cudaFree(w)); CHECK(cudaFree(b)); CHECK(cudaFree(y));
+}
+
 int main() {
   test_reuse();
   test_softmax();
   test_sdpa();
-  std::puts("PASS: scratch reuse, softmax, and SDPA CPU references");
+  test_cached_layer_norm<2>();
+  test_cached_layer_norm<4>();
+  test_cached_layer_norm<8>();
+  std::puts("PASS: scratch reuse, softmax, SDPA, and cached LayerNorm CPU references");
 }
