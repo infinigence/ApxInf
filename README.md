@@ -95,7 +95,7 @@ steady-state CUDA Graph replay P50.
 | Jetson AGX Thor | FP8 | **41.16 ms** | **24.3 Hz** |
 | Jetson AGX Orin | BF16 | 165.67 ms | 6.0 Hz |
 | RTX 4090 | BF16 | 31.38 ms | 31.9 Hz |
-| RTX 4090 | INT8 | 25.99 ms | 38.5 Hz |
+| RTX 4090 | INT8 | 21.92 ms | 45.6 Hz |
 
 With onestep action generation pruning.
 
