@@ -1725,6 +1725,7 @@ fn launch_tactic_fp8_bf16(
             "FP8-to-BF16 online autotune cannot execute {tactic:?}"
         )));
     }
+    let scratch = fp8_weight_scratch(ctx, key.n, key.k)?;
     unsafe {
         ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bf16(
             activation.ptr(),
@@ -1734,6 +1735,7 @@ fn launch_tactic_fp8_bf16(
             key.n as i32,
             key.k as i32,
             alpha,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)
@@ -1918,6 +1920,7 @@ pub fn gemm_fp8_bf16(
         activation_scale * weight.scale,
     )?;
     let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
     let status = unsafe {
         ffi::apxinf_static_fp8_gemm_bf16(
             activation.ptr(),
@@ -1927,6 +1930,7 @@ pub fn gemm_fp8_bf16(
             n as i32,
             k as i32,
             activation_scale * weight.scale,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         )
     };
@@ -1940,6 +1944,17 @@ pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<(
     ffi::check_cublas(status).map_err(Error::Cuda)
 }
 
+/// TN staging belongs to the calling stream/workspace, not to a shared
+/// shape plan: two contexts must never overwrite each other's FP8 weights.
+fn fp8_weight_scratch(ctx: &CudaContext, n: usize, k: usize) -> Result<Option<CudaBuffer>> {
+    if ctx.caps().arch_family == crate::CudaArchFamily::Sm100 {
+        return Ok(None);
+    }
+    let bytes = n.checked_mul(k)
+        .ok_or_else(|| Error::Other("FP8 weight staging size overflow".into()))?;
+    crate::workspace::output_buffer(ctx, bytes).map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cublaslt_fp8_gemm_f16(
     ctx: &CudaContext,
@@ -1951,6 +1966,7 @@ pub fn cublaslt_fp8_gemm_f16(
     k: usize,
     alpha: f32,
 ) -> Result<()> {
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
     let status = unsafe {
         ffi::apxinf_static_fp8_gemm_f16(
             activation.ptr(),
@@ -1960,6 +1976,7 @@ pub fn cublaslt_fp8_gemm_f16(
             n as i32,
             k as i32,
             alpha,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         )
     };

@@ -140,6 +140,7 @@ extern "C" {
         n: i32,
         k: i32,
         alpha: f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_fp8_gemm_bf16(
@@ -150,6 +151,7 @@ extern "C" {
         n: i32,
         k: i32,
         alpha: f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_fp8_gemm_split_f16(
@@ -265,6 +267,7 @@ extern "C" {
         benchmark_iterations: i32,
         returned_algorithms: *mut i32,
         milliseconds: *mut f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_autotune_cublaslt_fp8_gemm_bf16(
@@ -282,6 +285,7 @@ extern "C" {
         benchmark_iterations: i32,
         returned_algorithms: *mut i32,
         milliseconds: *mut f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
 }

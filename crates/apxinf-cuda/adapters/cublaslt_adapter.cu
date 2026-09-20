@@ -1,5 +1,5 @@
 // Copyright 2026 apxinf contributors.
-// Static E4M3 helpers for the static inference Thor inference path.
+// Static E4M3 helpers for native CUDA inference.
 
 #include <cublasLt.h>
 #include <cuda_fp16.h>
@@ -78,6 +78,7 @@ struct GemmPlan {
   cublasLtMatrixLayout_t output = nullptr;
   cublasLtMatmulAlgo_t algorithm{};
   bool has_algorithm = false;
+  bool transpose_weight = false;
 };
 
 struct Bf16GemmPlan {
@@ -364,24 +365,63 @@ cublasStatus_t configure_custom_algorithm(
 #endif
 }
 
+__global__ void transpose_fp8_kn_to_nk(
+    const uint8_t* input, uint8_t* output, size_t count, int n, int k) {
+  const size_t index = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  if (index < count) output[index] = input[(index % k) * n + index / k];
+}
+
+cublasStatus_t prepare_fp8_weight_layout(
+    const ShapeKey& key, GemmPlan* plan, cublasOperation_t* operation) {
+#if defined(APXINF_FP8_NN_LAYOUT)
+  // The build's existing architecture predicate owns this decision.
+  *operation = CUBLAS_OP_N;
+  return CUBLAS_STATUS_SUCCESS;
+#else
+  *operation = CUBLAS_OP_T;
+  plan->transpose_weight = true;
+  return CUBLAS_STATUS_SUCCESS;
+#endif
+}
+
+cublasStatus_t stage_fp8_weight(
+    const ShapeKey& key, const GemmPlan& plan, const void*& weight,
+    void* weight_scratch, cudaStream_t stream) {
+  if (!plan.transpose_weight) return CUBLAS_STATUS_SUCCESS;
+  if (weight_scratch == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+  const size_t count = static_cast<size_t>(key.n) * key.k;
+  transpose_fp8_kn_to_nk<<<(count + 255) / 256, 256, 0, stream>>>(
+      static_cast<const uint8_t*>(weight), static_cast<uint8_t*>(weight_scratch),
+      count, key.n, key.k);
+  if (cudaGetLastError() != cudaSuccess) return CUBLAS_STATUS_EXECUTION_FAILED;
+  weight = weight_scratch;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
 cublasStatus_t make_plan(const ShapeKey& key, GemmPlan* plan) {
   // Row-major D=A@B is computed through the column-major identity
-  // D^T=B^T@A^T. Memory is already in the required column-major layout:
-  // weight [K,N] -> [N,K], activation [M,K] -> [K,M].
+  // D^T=B^T@A^T. Blackwell consumes KN weights directly; older targets
+  // transpose them to NK for the required physical TN contract.
   cublasStatus_t status = cublasLtMatmulDescCreate(
       &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
   cublasOperation_t op = CUBLAS_OP_N;
+  status = prepare_fp8_weight_layout(key, plan, &op);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSA, &op, sizeof(op));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
+  op = CUBLAS_OP_N;
   status = cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSB, &op, sizeof(op));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
   status = cublasLtMatrixLayoutCreate(
-      &plan->weight, CUDA_R_8F_E4M3, key.n, key.k, key.n);
+      &plan->weight, CUDA_R_8F_E4M3,
+      plan->transpose_weight ? key.k : key.n,
+      plan->transpose_weight ? key.n : key.k,
+      plan->transpose_weight ? key.k : key.n);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatrixLayoutCreate(
       &plan->activation, CUDA_R_8F_E4M3, key.k, key.m, key.k);
@@ -440,15 +480,21 @@ cublasStatus_t make_fp8_bf16_plan(const ShapeKey& key, GemmPlan* plan) {
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
   cublasOperation_t op = CUBLAS_OP_N;
+  status = prepare_fp8_weight_layout(key, plan, &op);
+  if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSA, &op, sizeof(op));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
+  op = CUBLAS_OP_N;
   status = cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSB, &op, sizeof(op));
   if (status != CUBLAS_STATUS_SUCCESS) return status;
 
   status = cublasLtMatrixLayoutCreate(
-      &plan->weight, CUDA_R_8F_E4M3, key.n, key.k, key.n);
+      &plan->weight, CUDA_R_8F_E4M3,
+      plan->transpose_weight ? key.k : key.n,
+      plan->transpose_weight ? key.n : key.k,
+      plan->transpose_weight ? key.k : key.n);
   if (status != CUBLAS_STATUS_SUCCESS) return status;
   status = cublasLtMatrixLayoutCreate(
       &plan->activation, CUDA_R_8F_E4M3, key.k, key.m, key.k);
@@ -1323,7 +1369,7 @@ extern "C" int apxinf_static_prepare_fp8_gemm_bias_f16(
 
 extern "C" int apxinf_static_fp8_gemm_f16(
     const void* activation, const void* weight, void* output,
-    int m, int n, int k, float alpha, cudaStream_t stream) {
+    int m, int n, int k, float alpha, void* weight_scratch, cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || output == nullptr ||
       m <= 0 || n <= 0 || k <= 0)
     return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
@@ -1334,7 +1380,9 @@ extern "C" int apxinf_static_fp8_gemm_f16(
 
   const float beta = 0.0f;
   GemmPlan& plan = it->second;
-  cublasStatus_t status = cublasLtMatmul(
+  cublasStatus_t status = stage_fp8_weight(key, plan, weight, weight_scratch, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
+  status = cublasLtMatmul(
       g_lt, plan.operation, &alpha,
       weight, plan.weight, activation, plan.activation,
       &beta, output, plan.output, output, plan.output,
@@ -1345,7 +1393,7 @@ extern "C" int apxinf_static_fp8_gemm_f16(
 
 extern "C" int apxinf_static_fp8_gemm_bf16(
     const void* activation, const void* weight, void* output,
-    int m, int n, int k, float alpha, cudaStream_t stream) {
+    int m, int n, int k, float alpha, void* weight_scratch, cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || output == nullptr ||
       m <= 0 || n <= 0 || k <= 0)
     return static_cast<int>(CUBLAS_STATUS_INVALID_VALUE);
@@ -1356,6 +1404,8 @@ extern "C" int apxinf_static_fp8_gemm_bf16(
 
   const float beta = 0.0f;
   GemmPlan& plan = it->second;
+  cublasStatus_t status = stage_fp8_weight(key, plan, weight, weight_scratch, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
   return static_cast<int>(cublasLtMatmul(
       g_lt, plan.operation, &alpha,
       weight, plan.weight, activation, plan.activation,
@@ -1621,7 +1671,7 @@ extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_f16(
     void* l2_eviction_buffer, size_t l2_eviction_bytes,
     int m, int n, int k, float alpha, int max_algorithms,
     int warmup_iterations, int benchmark_iterations,
-    int* returned_algorithms, float* milliseconds, cudaStream_t stream) {
+    int* returned_algorithms, float* milliseconds, void* weight_scratch, cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || output == nullptr ||
       l2_eviction_buffer == nullptr || l2_eviction_bytes == 0 ||
       returned_algorithms == nullptr || milliseconds == nullptr ||
@@ -1645,6 +1695,8 @@ extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_f16(
     it = g_plans.emplace(key, plan).first;
   }
   GemmPlan& plan = it->second;
+  status = stage_fp8_weight(key, plan, weight, weight_scratch, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
 
   cublasLtMatmulPreference_t preference = nullptr;
   status = cublasLtMatmulPreferenceCreate(&preference);
@@ -1751,7 +1803,7 @@ extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_bf16(
     void* l2_eviction_buffer, size_t l2_eviction_bytes,
     int m, int n, int k, float alpha, int max_algorithms,
     int warmup_iterations, int benchmark_iterations,
-    int* returned_algorithms, float* milliseconds, cudaStream_t stream) {
+    int* returned_algorithms, float* milliseconds, void* weight_scratch, cudaStream_t stream) {
   if (activation == nullptr || weight == nullptr || output == nullptr ||
       l2_eviction_buffer == nullptr || l2_eviction_bytes == 0 ||
       returned_algorithms == nullptr || milliseconds == nullptr ||
@@ -1775,6 +1827,8 @@ extern "C" int apxinf_static_autotune_cublaslt_fp8_gemm_bf16(
     it = g_fp8_bf16_plans.emplace(key, plan).first;
   }
   GemmPlan& plan = it->second;
+  status = stage_fp8_weight(key, plan, weight, weight_scratch, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
 
   cublasLtMatmulPreference_t preference = nullptr;
   status = cublasLtMatmulPreferenceCreate(&preference);

@@ -924,6 +924,33 @@ fn fp8_identity_gemm_runs_on_device() {
     for (actual, expected) in output.iter().zip(&activation) {
         assert!((actual - expected).abs() < 0.04, "{actual} != {expected}");
     }
+
+    // Exercise the repaired legacy TN output variant; Blackwell keeps its
+    // existing NN implementation and shape qualifications.
+    #[cfg(not(apxinf_cutlass_gemm))]
+    {
+        let bf16_output = crate::kernels::gemm::fp8_bf16(
+            backend.context(),
+            &activation_fp8,
+            activation_scale,
+            crate::kernels::gemm::Fp8WeightView {
+                values_e4m3: &weight_fp8,
+                scale: weight_scale,
+                dual_geglu_interleaved: false,
+                dual_geglu_auto_interleaved: None,
+            },
+        );
+        if crate::kernels::gemm::native_fp8_supported(backend.context()).unwrap() {
+            let output = backend
+                .to_cpu(&bf16_output.unwrap()).unwrap().to_f32_vec().unwrap();
+            for (actual, expected) in output.iter().zip(&activation) {
+                assert!((actual - expected).abs() < 0.04, "BF16 {actual} != {expected}");
+            }
+        } else {
+            assert!(bf16_output.unwrap_err().to_string()
+                .contains("requires native E4M3 Tensor Core support"));
+        }
+    }
 }
 
 #[test]
@@ -978,7 +1005,7 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
     let activation_fp8 =
         quantize_rows_bf16_e4m3_padded(backend.context(), &activation_gpu, K_PADDED).unwrap();
     let weight_fp8 = quantize_rows_bf16_e4m3(backend.context(), &weight_gpu).unwrap();
-    let output_padded = gemm_fp8_dynamic_bf16(
+    let output_result = gemm_fp8_dynamic_bf16(
         backend.context(),
         &activation_fp8.values,
         &activation_fp8.scales,
@@ -987,8 +1014,17 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
             channel_scales: &weight_fp8.scales,
         },
         Some(&bias_gpu),
-    )
-    .unwrap();
+    );
+    if !cfg!(apxinf_cutlass_gemm) {
+        let error = output_result.unwrap_err().to_string();
+        assert!(
+            error.contains("dynamic rowwise FP8 GEMM requires native FP8 Tensor Cores")
+                || error.contains("dynamic rowwise FP8 GEMM requires an SM100-family native backend"),
+            "unsupported architecture must fail explicitly, got: {error}"
+        );
+        return;
+    }
+    let output_padded = output_result.unwrap();
     let output = slice_columns_bf16(backend.context(), &output_padded, N).unwrap();
     backend.synchronize().unwrap();
 
@@ -1413,6 +1449,26 @@ fn fp8_large_k_gemm_matches_quantized_cpu_reference() {
             );
         }
     }
+
+    // The same shape may be reused by a different layer. Any TN staging
+    // buffer in its cached plan must consume the current weight on each call.
+    let zeros = upload(vec![K, N], &vec![0.0; K * N]);
+    let zero_weight = quantize_f16_e4m3(backend.context(), &zeros, weight_scale).unwrap();
+    let zero_output = fp8_gemm_f16(
+        backend.context(),
+        &activation_fp8,
+        &zero_weight,
+        activation_scale,
+        weight_scale,
+    )
+    .unwrap();
+    assert!(backend
+        .to_cpu(&zero_output)
+        .unwrap()
+        .to_f32_vec()
+        .unwrap()
+        .iter()
+        .all(|value| *value == 0.0));
 }
 
 #[test]

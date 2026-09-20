@@ -560,6 +560,13 @@ fn main() {
                     if let Some(selected_arch) = selected_arch {
                         cmd.args([format!("-arch={selected_arch}")]);
                     }
+                    if entry.ends_with("cublaslt_adapter.cu")
+                        && nvcc_arch.as_deref().is_some_and(is_cutlass_sm100_family)
+                    {
+                        // Keep the measured Blackwell FP8 NN layout. Other
+                        // targets stage KN weights into cuBLASLt's TN layout.
+                        cmd.arg("-DAPXINF_FP8_NN_LAYOUT=1");
+                    }
                     for include in &target_include_dirs {
                         if std::path::Path::new(include).exists() {
                             cmd.arg(format!("-I{include}"));
