@@ -28,7 +28,7 @@ Self-check the engine loads (`num_views` / `action` shape must match the
 checkpoint):
 
 ```bash
-python -c "import apxinf_py; print(apxinf_py.Model.load('pi05','<ckpt>/model.safetensors',device='cuda:0',precision='bf16'))"
+python -c "import apxinf_py; print(apxinf_py.ModelRunner.load('pi05','<ckpt>/model.safetensors',device='cuda:0',precision='bf16'))"
 # Model(device=cuda:0, action=[50, 32], views=3, image=224, patch=14)
 ```
 

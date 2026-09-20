@@ -1,0 +1,79 @@
+--- flash_attn/flash_fwd_kernel.h
++++ flash_attn/flash_fwd_kernel.h
+@@ -445,7 +445,68 @@
+     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+ 
+     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+ 
++#if defined(APXINF_FA2_DIRECT_E4M3) && APXINF_FA2_DIRECT_E4M3
++    using ElementOutput = cutlass::float_e4m3_t;
++    using GmemTiledCopyOQuant = decltype(make_tiled_copy(
++        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<64>, ElementOutput>{},
++        typename Kernel_traits::GmemLayoutAtom{},
++        Layout<Shape<_1, _8>>{}));
++    GmemTiledCopyOQuant gmem_tiled_copy_O_quant;
++    auto gmem_thr_copy_O_quant = gmem_tiled_copy_O_quant.get_thread_slice(tidx);
++
++    Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<ElementOutput*>(params.o_ptr)
++                                          + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
++                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
++                            make_stride(params.o_row_stride, params.o_head_stride, _1{}));
++    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
++                           make_coord(m_block, 0));
++    Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
++
++    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
++    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
++    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
++    Tensor tOgO = gmem_thr_copy_O_quant.partition_D(gO);
++
++    __syncthreads();
++
++    Tensor tOrO = make_tensor<Element>(shape(tOgO));
++    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
++
++    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
++    Tensor taccOcO = thr_mma.partition_C(caccO);
++    static_assert(decltype(size<0>(taccOcO))::value == 4);
++    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
++    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));
++    if (get<1>(taccOcO_row(0)) == 0) {
++        #pragma unroll
++        for (int mi = 0; mi < size(lse); ++mi) {
++            const int row = get<0>(taccOcO_row(mi));
++            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
++        }
++    }
++
++    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
++    Tensor tOcO = gmem_thr_copy_O_quant.partition_D(cO);
++    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
++    if (!Is_even_K) {
++        #pragma unroll
++        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
++    }
++
++    Tensor tOrQ = make_tensor<ElementOutput>(shape(tOgO));
++    #pragma unroll
++    for (int i = 0; i < size(tOrQ); ++i) {
++        // Preserve production's observable FP32 -> FP16 round before scale.
++        float value = static_cast<float>(tOrO(i)) * params.softcap;
++        value = fminf(448.0f, fmaxf(-448.0f, value));
++        tOrQ(i) = ElementOutput(value);
++    }
++    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
++        gmem_tiled_copy_O_quant, tOrQ, tOgO, tOcO, tOpO,
++        binfo.actual_seqlen_q - m_block * kBlockM
++    );
++#else
+     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
+                                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
+@@ -491,6 +553,7 @@
+     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+     );
++#endif
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////

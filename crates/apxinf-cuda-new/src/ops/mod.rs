@@ -1,15 +1,25 @@
-//! GEMM-only pilot: semantic APIs with selection and native state behind L1.
+//! Semantic CUDA APIs with selection and native state behind L1.
 
+mod attention;
 mod gemm;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
+#[cfg(test)]
+pub(crate) use attention::{
+    contracts as attention_contracts, execution as attention_execution,
+    normalize_kv_cache_attention, normalize_segmented_attention,
+};
 #[cfg(test)]
 pub(crate) use gemm::contracts;
 #[cfg(test)]
 pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
+pub use attention::{
+    attention, kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask,
+    AttentionPolicy, KvCacheAttentionArgs, SegmentedAttentionArgs,
+};
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_geglu, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
     GemmGegluArgs, GemmPolicy, GemmQuantization, WeightVersion,

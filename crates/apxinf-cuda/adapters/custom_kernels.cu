@@ -352,12 +352,14 @@ __global__ void row_softmax_f32_bf16_kernel(
   for (uint32_t i = threadIdx.x; i < cols; i += blockDim.x) {
     local = fmaxf(local, x[i]);
   }
-  const float max_val = block_max(local, scratch);
+  const float max_val = block_max_parallel_unsafe(local, scratch);
   float partial = 0.0f;
   for (uint32_t i = threadIdx.x; i < cols; i += blockDim.x) {
     partial += expf(x[i] - max_val);
   }
-  const float sum = block_sum(partial, scratch);
+  // Finish all maximum reads before the sum overwrites shared scratch.
+  __syncthreads();
+  const float sum = block_sum_parallel_unsafe(partial, scratch);
   __nv_bfloat16* y = output + static_cast<size_t>(row) * cols;
   for (uint32_t i = threadIdx.x; i < cols; i += blockDim.x) {
     y[i] = __float2bfloat16(expf(x[i] - max_val) / sum);
@@ -399,12 +401,14 @@ __global__ void row_softmax_causal_f32_kernel(
   for (uint32_t i = threadIdx.x; i < valid; i += blockDim.x) {
     local = fmaxf(local, x[i]);
   }
-  const float max_val = block_max(local, scratch);
+  const float max_val = block_max_parallel_unsafe(local, scratch);
   float partial = 0.0f;
   for (uint32_t i = threadIdx.x; i < valid; i += blockDim.x) {
     partial += expf(x[i] - max_val);
   }
-  const float sum = block_sum(partial, scratch);
+  // Finish all maximum reads before the sum overwrites shared scratch.
+  __syncthreads();
+  const float sum = block_sum_parallel_unsafe(partial, scratch);
   for (uint32_t i = threadIdx.x; i < cols; i += blockDim.x) {
     y[i] = (i < valid) ? (expf(x[i] - max_val) / sum) : 0.0f;
   }

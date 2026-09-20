@@ -110,7 +110,7 @@ class CheckpointLayout:
     tokenizer: Optional[TokenizerSpec] = None
 
     def config_json_text(self) -> Optional[str]:
-        """The ``config_json=`` string to hand ``apxinf_py.Model.load``.
+        """The ``config_json=`` string to hand ``apxinf_py.ModelRunner.load``.
 
         ``None`` lets the Rust loader read ``config.json``.
         """

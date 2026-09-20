@@ -4,7 +4,7 @@ This package owns everything policy-related, mirroring how :mod:`apxinf.processo
 owns its own steps and :class:`~apxinf.processors.base.ProcessorStep`. It is split
 into a **stable** outer layer and a **volatile** inner one:
 
-* :mod:`~apxinf.policies.base` — the :class:`Policy` / :class:`BareModel` contracts,
+* :mod:`~apxinf.policies.base` — the :class:`Policy` / :class:`ModelRunnerProtocol` contracts,
   plus :class:`ComposablePolicy` (the opt-in seam an outer adaptation layer wraps),
   :data:`VIEW_SLOTS` (the camera slot names the weights consume, in order), and the
   ``CANONICAL_*`` keys a policy falls back to when the caller names none.
@@ -32,7 +32,7 @@ from .base import (
     CANONICAL_PROMPT_KEY,
     CANONICAL_STATE_KEY,
     VIEW_SLOTS,
-    BareModel,
+    ModelRunnerProtocol,
     ComposablePolicy,
     Policy,
 )
@@ -43,7 +43,7 @@ from .impls import Pi05Policy, Pi0FastPolicy, Gr00tPolicy, QwenDrivePolicy, Wall
 
 __all__ = [
     "Policy",
-    "BareModel",
+    "ModelRunnerProtocol",
     "ComposablePolicy",
     "VIEW_SLOTS",
     "CANONICAL_IMAGE_KEYS",

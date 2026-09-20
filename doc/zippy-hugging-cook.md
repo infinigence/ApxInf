@@ -1,5 +1,12 @@
 # Plan: Metal GPU Attention and Batched RoPE Kernels
 
+Status: historical planning note, not the current source layout or a supported
+model-port recipe. The `apxinf-metal` crate paths and single-file `llama.rs`
+listed below are absent from this checkout. They are retained as the original
+proposal, not instructions to recreate those modules. Use
+[Model Organization](model-organization.md) for current source locations and
+[Adding a New Model](adding-a-new-model.md) for integration.
+
 ## Context
 
 During Metal inference, the attention computation in `llama.rs` falls back to CPU with GPU→CPU→GPU round-trips per layer. The batched RoPE (`rope_batched`) also runs CPU-only. This kills performance — every layer copies Q/K/V to CPU, runs scalar attention loops, then copies the result back to Metal. The fix requires Metal-native kernels for RoPE, KV cache management, and attention (both decode and prefill).

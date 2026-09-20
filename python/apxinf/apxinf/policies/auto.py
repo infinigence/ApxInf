@@ -2,7 +2,7 @@
 
 The model type comes from ``config.json`` or supported layout metadata:
 
-    policy = AutoPolicy.from_pretrained("pi05_libero_base", precision="bf16")
+    policy = AutoPolicy.from_pretrained("pi05_libero_base", model_variant="bf16")
 
 Use this when you don't want to hard-code which model you're serving (generic
 code — the websocket server, batch eval). Use the concrete class (e.g.

@@ -458,7 +458,7 @@ class WallossPolicy:
 
     def __init__(
         self,
-        model,
+        model_runner,
         processor,
         *,
         action_min,
@@ -467,7 +467,7 @@ class WallossPolicy:
         native_rgb: bool = False,
         metadata: Mapping[str, Any] | None = None,
     ):
-        self.model = model
+        self.model_runner = model_runner
         self.processor = processor
         self._action_min = np.asarray(action_min, np.float32)[:action_dim]
         self._action_delta = np.asarray(action_delta, np.float32)[:action_dim]
@@ -475,10 +475,10 @@ class WallossPolicy:
         self._native_rgb = bool(native_rgb)
         self.metadata = {
             "model_type": "walloss",
-            "action_horizon": model.action_horizon,
+            "action_horizon": model_runner.action_horizon,
             "action_dim": self._action_dim,
-            "model_action_dim": model.action_dim,
-            "num_views": model.num_views,
+            "model_action_dim": model_runner.action_dim,
+            "num_views": model_runner.num_views,
             "image_keys": list(getattr(processor, "image_keys", ())),
             "state_key": getattr(processor, "state_key", None),
             "prompt_key": getattr(processor, "prompt_key", None),
@@ -498,7 +498,7 @@ class WallossPolicy:
         cls,
         model_dir,
         *,
-        model=None,
+        model_runner=None,
         checkpoint=None,
         device="cuda:0",
         precision="auto",
@@ -533,7 +533,7 @@ class WallossPolicy:
             resolved_state_bins = _checkpoint_state_bins(model_dir)
         if resolved_state_bins < 2:
             raise ValueError(f"state_bins must be >= 2, got {resolved_state_bins}")
-        if model is None:
+        if model_runner is None:
             import apxinf_py
 
             ckpt = (
@@ -541,7 +541,7 @@ class WallossPolicy:
                 if checkpoint is not None
                 else str(model_dir / "model.safetensors")
             )
-            model = apxinf_py.Model.load(
+            model_runner = apxinf_py.ModelRunner.load(
                 "walloss",
                 ckpt,
                 device=device,
@@ -549,10 +549,10 @@ class WallossPolicy:
                 **({"tactics": str(tactics)} if tactics else {}),
                 sampling_seed=int(seed),
             )
-        width = int(action_dim) if action_dim is not None else int(model.action_dim)
-        if width < 1 or width > int(model.action_dim):
+        width = int(action_dim) if action_dim is not None else int(model_runner.action_dim)
+        if width < 1 or width > int(model_runner.action_dim):
             raise ValueError(
-                f"action_dim must be in 1..={model.action_dim}, got {width}"
+                f"action_dim must be in 1..={model_runner.action_dim}, got {width}"
             )
         action_min, action_delta = _load_normalizer(
             model_dir / "normalizer_action.pth", norm_key
@@ -567,15 +567,15 @@ class WallossPolicy:
                 raise ValueError(
                     "WallOSS runtime currently requires exactly two camera views"
                 )
-            native_rgb = bool(getattr(model, "accepts_rgb_u8", False))
+            native_rgb = bool(getattr(model_runner, "accepts_rgb_u8", False))
             processor = _WallossProcessor(
                 model_dir,
                 image_keys=image_keys,
                 camera_names=camera_names,
                 state_key=state_key,
                 prompt_key=prompt_key,
-                action_horizon=model.action_horizon,
-                action_dim=model.action_dim,
+                action_horizon=model_runner.action_horizon,
+                action_dim=model_runner.action_dim,
                 norm_key=norm_key,
                 state_bins=resolved_state_bins,
                 native_rgb=native_rgb,
@@ -590,11 +590,11 @@ class WallossPolicy:
         }
         if metadata:
             processor_metadata.update(metadata)
-        reset = getattr(model, "reset_sampling", None)
+        reset = getattr(model_runner, "reset_sampling", None)
         if callable(reset):
             reset(int(seed))
         return cls(
-            model,
+            model_runner,
             processor,
             action_min=action_min,
             action_delta=action_delta,
@@ -616,11 +616,11 @@ class WallossPolicy:
             "action_mask": action_mask,
         }
         if self._native_rgb:
-            normalized = self.model.infer_rgb(
+            normalized = self.model_runner.infer_rgb(
                 vision, "nhwc", token_ids, **inference_kwargs
             )
         else:
-            normalized = self.model._infer_patches(
+            normalized = self.model_runner._infer_patches(
                 vision, token_ids, **inference_kwargs
             )
         normalized = np.asarray(normalized, dtype=np.float32)
@@ -646,9 +646,9 @@ class WallossPolicy:
 
     @property
     def action_horizon(self):
-        return int(self.model.action_horizon)
+        return int(self.model_runner.action_horizon)
 
     def close(self):
-        close = getattr(self.model, "close", None)
+        close = getattr(self.model_runner, "close", None)
         if callable(close):
             close()

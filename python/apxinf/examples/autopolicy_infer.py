@@ -26,7 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--tokenizer", type=pathlib.Path)
-    parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default="bf16")
+    parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default=None)
+    parser.add_argument("--model-variant", choices=("auto", "bf16", "fp8_static", "int8_dynamic"), default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--action-dim",
@@ -77,6 +78,7 @@ def main() -> None:
         args.policy_options,
         device=args.device,
         precision=args.precision,
+        model_variant=getattr(args, "model_variant", None),
         action_dim=args.action_dim,
     )
     if getattr(args, "tokenizer", None) is not None:

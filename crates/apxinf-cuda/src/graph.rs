@@ -45,7 +45,11 @@ pub(crate) fn end(ctx: &CudaContext) -> Result<CapturedGraph, String> {
     let stream = ctx.stream().handle();
     let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
     unsafe {
-        ffi::check_cuda(ffi::cudaStreamEndCapture(stream, &mut graph))?;
+        let status = ffi::cudaStreamEndCapture(stream, &mut graph);
+        if status != ffi::CUDA_SUCCESS {
+            clear_capture_error();
+            ffi::check_cuda(status)?;
+        }
     }
     let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
     let status = unsafe {
@@ -68,6 +72,30 @@ pub(crate) fn end(ctx: &CudaContext) -> Result<CapturedGraph, String> {
         graph,
         stream,
     })
+}
+
+/// Discard a failed or unwinding capture without instantiating its graph.
+/// EndCapture releases the stream, but leaves CUDA's thread-local last error
+/// populated. Native kernel launch checks must not inherit that capture error.
+pub(crate) fn abort(ctx: &CudaContext) {
+    let mut graph = std::ptr::null_mut();
+    unsafe {
+        let _ = ffi::cudaStreamEndCapture(ctx.stream().handle(), &mut graph);
+        if !graph.is_null() {
+            let _ = ffi::cudaGraphDestroy(graph);
+        }
+    }
+    clear_capture_error();
+}
+
+fn clear_capture_error() {
+    // Only consume Unsupported/Invalidated from the capture we just ended.
+    // Leave unrelated asynchronous/device failures visible to the next check.
+    unsafe {
+        if matches!(ffi::cudaPeekAtLastError(), 900 | 901) {
+            let _ = ffi::cudaGetLastError();
+        }
+    }
 }
 
 #[cfg(test)]

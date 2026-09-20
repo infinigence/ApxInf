@@ -33,6 +33,18 @@ static __global__ void pack_gate_up(const void* src,void* dst,int type,int64_t r
   save(dst,type,j,load(src,type,i));
  }
 }
+static __global__ void dequantize_i8_bf16(const int8_t* src,
+                                          __nv_bfloat16* dst,
+                                          const float* scales,
+                                          int64_t rows,
+                                          int64_t cols,
+                                          bool rowwise) {
+ for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<rows*cols;i+=int64_t(gridDim.x)*blockDim.x) {
+  int64_t r=i/cols,c=i%cols;
+  float scale=rowwise?scales[r]:scales[c];
+  dst[i]=__float2bfloat16_rn(float(src[i])*scale);
+ }
+}
 __device__ inline float gelu(float x) {return 0.5f*x*(1.f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x)));}
 static __global__ void finish(const void* projection,int projection_type,void* output,int out_type,
  const void* bias,int bias_type,const float* as,const float* bs,
@@ -55,5 +67,13 @@ static __global__ void finish(const void* projection,int projection_type,void* o
 }
 inline cudaError_t unpack_gemm(const void* src,void* dst,int out_type,int type,int64_t r,int64_t c,int layout,cudaStream_t stream) {
  unpack<<<int(std::min<int64_t>((r*c+255)/256,4096)),256,0,stream>>>(src,dst,out_type,type,r,c,layout); return cudaGetLastError();
+}
+inline cudaError_t dequantize_i8_gemm(const void* src,void* dst,
+                                     const float* scales,int64_t r,int64_t c,
+                                     bool rowwise,cudaStream_t stream) {
+ dequantize_i8_bf16<<<int(std::min<int64_t>((r*c+255)/256,4096)),256,0,stream>>>(
+     static_cast<const int8_t*>(src),static_cast<__nv_bfloat16*>(dst),
+     scales,r,c,rowwise);
+ return cudaGetLastError();
 }
 } // namespace

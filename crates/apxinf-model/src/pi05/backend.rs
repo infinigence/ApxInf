@@ -1,6 +1,6 @@
-//! Compile-time backend seam for PI0.5 executors.
+//! Compile-time backend seam for PI0.5 Blocks.
 //!
-//! Executor code depends on this model-local alias and the model-neutral
+//! Block code depends on this model-local alias and the model-neutral
 //! kernel contract. Adding another accelerator backend changes this seam,
 //! not the layer topology.
 

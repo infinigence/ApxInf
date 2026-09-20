@@ -36,6 +36,7 @@ pub use qwen_drive::QwenDriveConfig;
 pub use qwen_drive::QwenDriveModel;
 pub use registry::{get, list, register};
 pub use vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    VlaRuntime,
 };

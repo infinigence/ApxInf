@@ -12,6 +12,28 @@ use crate::device_caps::CudaDeviceCaps;
 use super::db::{major_minor, versions_compatible};
 use super::{GemmTuningKey, GemmTuningRecord, TacticId, TacticStore, TuningDb, TuningOutcome};
 
+thread_local! {
+    static AUTOTUNE_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Execute with existing/default tactics without benchmarking new choices.
+/// Scoped to this host thread, nestable, and restored on errors or unwinding.
+/// Native resource allocation remains allowed for eager execution.
+pub fn without_autotune<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AUTOTUNE_SUPPRESSED.with(|state| state.set(self.0));
+        }
+    }
+    let _restore = Restore(AUTOTUNE_SUPPRESSED.with(|state| state.replace(true)));
+    operation()
+}
+
+pub(crate) fn autotune_suppressed() -> bool {
+    AUTOTUNE_SUPPRESSED.with(std::cell::Cell::get)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TuningMode {
     #[default]
@@ -394,6 +416,20 @@ mod tests {
             implementation_version: Some(TacticBackend::Cutlass.implementation_version()),
             milliseconds: Some(0.1),
         }
+    }
+
+    #[test]
+    fn autotune_suppression_is_nested_thread_local_and_unwind_safe() {
+        assert!(!autotune_suppressed());
+        without_autotune(|| {
+            assert!(autotune_suppressed());
+            without_autotune(|| assert!(autotune_suppressed()));
+            assert!(autotune_suppressed());
+            assert!(!std::thread::spawn(autotune_suppressed).join().unwrap());
+        });
+        assert!(!autotune_suppressed());
+        let _ = std::panic::catch_unwind(|| without_autotune(|| panic!("test unwind")));
+        assert!(!autotune_suppressed());
     }
 
     #[test]

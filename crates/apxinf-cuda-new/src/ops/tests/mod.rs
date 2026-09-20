@@ -8,6 +8,7 @@
 
 use super::*;
 
+#[path = "backend_framework.rs"]
 mod framework;
 mod l3_behavior;
 mod operator_doc;
