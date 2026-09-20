@@ -282,3 +282,47 @@ fn temporal_merged_rescale_matches_float64_reference_at_bf16_boundary() {
         expected
     );
 }
+
+#[test]
+fn bf16_autotune_after_suppressed_run_publishes_and_reuses_exact_plan() {
+    const M: usize = 8;
+    const K: usize = 64;
+    const N: usize = 64;
+    let backend = CudaBackend::new(0).unwrap();
+    crate::kernels::gemm::configure_tuning(
+        backend.context(),
+        crate::tuning::TuningMode::AutoTune,
+        &[],
+        None,
+    )
+    .unwrap();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, K], &vec![bf16::from_f32(0.5); M * K]).unwrap())
+        .unwrap();
+    let weight = backend
+        .to_device(&Tensor::from_bf16(vec![K, N], &vec![bf16::from_f32(0.25); K * N]).unwrap())
+        .unwrap();
+    let run = || crate::kernels::gemm::bf16(backend.context(), &activation, &weight).unwrap();
+    let expected = crate::tuning::without_autotune(run);
+    backend.synchronize().unwrap();
+    assert_eq!(backend.context().tuning().generation(), 0);
+    let actual = run();
+    backend.synchronize().unwrap();
+    let generation = backend.context().tuning().generation();
+    assert_eq!(
+        generation, 1,
+        "a default cached during suppression must still be tuned on real input"
+    );
+    assert_eq!(
+        backend.to_cpu(&actual).unwrap().to_f32_vec().unwrap(),
+        backend.to_cpu(&expected).unwrap().to_f32_vec().unwrap()
+    );
+    run();
+    crate::tuning::without_autotune(run);
+    backend.synchronize().unwrap();
+    assert_eq!(
+        backend.context().tuning().generation(),
+        generation,
+        "an exact plan must not tune again"
+    );
+}

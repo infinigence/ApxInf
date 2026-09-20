@@ -219,7 +219,7 @@ def _run_precision(
 
     options: dict[str, Any] = {
         "device": device,
-        "precision": precision,
+        "model_variant": {"bf16": "bf16", "fp8": "fp8_static"}[precision],
         "seed": seed,
         "image_keys": tuple(image_keys),
         "num_views": len(image_keys),
@@ -241,7 +241,7 @@ def _run_precision(
     policy = Pi05Policy.from_pretrained(model_dir, **options)
     load_seconds = time.perf_counter() - load_started
     try:
-        shape = (int(policy.model.action_horizon), int(policy.model.action_dim))
+        shape = (int(policy.model_runner.action_horizon), int(policy.model_runner.action_dim))
         noises = [_noise(seed, index, shape) for index in range(len(observations))]
         raw_outputs = [
             policy.infer(observation, noise=noise)

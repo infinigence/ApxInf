@@ -1,5 +1,6 @@
 use std::ffi::{c_char, c_void};
 
+pub(crate) use super::types::Policy;
 use super::types::{CudaStream, Runtime};
 
 #[repr(C)]
@@ -25,16 +26,6 @@ pub(crate) struct Spec {
     /// Structural predicates only: the scale values live in [`Bindings`].
     pub alpha_is_unit: u32,
     pub output_scale_is_unit: u32,
-}
-
-#[repr(C)]
-pub(crate) struct Policy {
-    pub workspace_limit: u64,
-    pub online_tune: u32,
-    pub allow_fallback: u32,
-    pub graph_safe: u32,
-    pub deterministic: u32,
-    pub cache_dir: *const c_char,
 }
 
 #[repr(C)]

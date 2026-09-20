@@ -161,7 +161,7 @@ def test_int8_precision_name_is_accepted(tmp_path, monkeypatch):
     monkeypatch.setitem(
         __import__("sys").modules,
         "apxinf_py",
-        SimpleNamespace(Model=Native),
+        SimpleNamespace(ModelRunner=Native),
     )
     policy = Gr00tPolicy.from_pretrained(
         tmp_path, backbone=tmp_path, precision="int8", action_dim=3

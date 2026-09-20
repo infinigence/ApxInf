@@ -21,7 +21,7 @@ Public modules:
   layout detection, metadata, norm stats, and
   :func:`~apxinf.checkpoints.inspect_checkpoint`, which reports whether a
   directory is self-consistent and servable.
-* **bindings** — :class:`Model` re-exports the ``apxinf_py`` PyO3 handle (L1
+* **bindings** — :class:`ModelRunner` re-exports the ``apxinf_py`` PyO3 handle (L1
   bare-model inference; an internal L0 patches path exists but is private). It is
   the single public surface; you never import ``apxinf_py`` directly.
 * :mod:`apxinf.serving` — the websocket policy server (a thin, model-agnostic
@@ -39,7 +39,7 @@ body steps through :meth:`~apxinf.policies.base.ComposablePolicy.with_adapter`.
 address it without restating string literals. A robot/dataset/simulator
 adaptation layer builds on top of these seams; none of it lives here.
 
-``import apxinf`` never touches CUDA: only ``apxinf.Model`` (accessed lazily) and a
+``import apxinf`` never touches CUDA: only ``apxinf.ModelRunner`` (accessed lazily) and a
 policy's ``from_pretrained`` pull in the ``apxinf_py`` binding.
 """
 
@@ -82,7 +82,7 @@ from .processors import (
 
 __all__ = [
     "processors",
-    # policy contract (outward); BareModel (inward) lives in apxinf.policies
+    # policy contract (outward); ModelRunnerProtocol (inward) lives in apxinf.policies
     "Policy",
     "ComposablePolicy",
     # L2 policies
@@ -107,7 +107,7 @@ __all__ = [
     "CANONICAL_STATE_KEY",
     "CANONICAL_PROMPT_KEY",
     # bindings (lazy)
-    "Model",
+    "ModelRunner",
     # processor steps
     "ProcessorStep",
     "Pipeline",
@@ -123,11 +123,11 @@ __version__ = "0.1.0"
 
 
 def __getattr__(name: str):
-    # Re-export the compiled binding's Model under the single ``apxinf`` facade,
+    # Re-export the compiled binding's ModelRunner under the single ``apxinf`` facade,
     # lazily — so ``import apxinf`` (processor / offline use) never imports
-    # ``apxinf_py`` / touches CUDA. Only ``apxinf.Model`` access pulls it in.
-    if name == "Model":
-        from apxinf_py import Model
+    # ``apxinf_py`` / touches CUDA. Only ``apxinf.ModelRunner`` access pulls it in.
+    if name == "ModelRunner":
+        from apxinf_py import ModelRunner
 
-        return Model
+        return ModelRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

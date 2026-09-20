@@ -60,6 +60,33 @@ impl CudaBackend {
         self.ctx.device_id()
     }
 
+    /// Capture one operation, ending capture on success, error, or unwinding.
+    /// The caller retains every buffer referenced by the returned graph.
+    pub fn capture_graph<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<(Box<dyn Graph>, T)> {
+        struct CaptureScope<'a> {
+            backend: &'a CudaBackend,
+            active: bool,
+        }
+        impl Drop for CaptureScope<'_> {
+            fn drop(&mut self) {
+                if self.active {
+                    crate::graph::abort(self.backend.context());
+                }
+            }
+        }
+        self.begin_capture()?;
+        let mut scope = CaptureScope {
+            backend: self,
+            active: true,
+        };
+        let output = operation()?;
+        scope.active = false;
+        Ok((self.end_capture()?, output))
+    }
+
     /// Begin a relaxed stream capture for decode graphs which call vendor
     /// libraries with internal thread-local state.
     pub fn begin_capture_relaxed(&self) -> Result<()> {
@@ -381,5 +408,36 @@ mod graph_tests {
         let mut output = vec![0u8; 64];
         buffer.copy_to_host(&mut output).unwrap();
         assert!(output.iter().all(|value| *value == 0x5a));
+    }
+}
+
+#[cfg(test)]
+mod capture_scope_tests {
+    use super::*;
+
+    #[test]
+    fn capture_scope_recovers_after_cuda_error_and_unwind() {
+        let backend = CudaBackend::new(0).unwrap();
+        let bytes = CudaBuffer::alloc_zeros(16, 0).unwrap();
+        // Synchronizing a capturing stream is forbidden by CUDA. Exercise a
+        // native invalidated capture without illegal device memory accesses.
+        assert!(backend.capture_graph(|| backend.synchronize()).is_err());
+        assert_eq!(unsafe { crate::ffi::cudaPeekAtLastError() }, 0);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(Box<dyn Graph>, ())> =
+                backend.capture_graph(|| panic!("capture unwind probe"));
+        }));
+        assert!(panic.is_err());
+        assert_eq!(unsafe { crate::ffi::cudaPeekAtLastError() }, 0);
+        let (graph, ()) = backend
+            .capture_graph(|| {
+                crate::graph::captured_memset(backend.context(), &bytes, 7).map_err(Error::Cuda)
+            })
+            .unwrap();
+        graph.replay().unwrap();
+        backend.synchronize().unwrap();
+        let mut result = [0; 16];
+        bytes.copy_to_host(&mut result).unwrap();
+        assert_eq!(result, [7; 16]);
     }
 }

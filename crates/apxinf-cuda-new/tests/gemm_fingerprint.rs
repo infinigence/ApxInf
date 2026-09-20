@@ -44,11 +44,11 @@ impl Drop for Fixture {
 
 fn populated_fixture() -> Fixture {
     let fixture = Fixture::new();
-    fixture.write("adapters/gemm/registry.cu", "candidate-v1");
+    fixture.write("adapters/gemm/candidates.cpp", "candidate-v1");
     fixture.write("include/apxinf_cuda/gemm.h", "gemm-abi-v1");
     fixture.write("kernels/custom/gemm.cuh", "custom-kernel-v1");
     fixture.write("kernels/cutlass/include/cutlass/cutlass.h", "cutlass-v1");
-    fixture.write("adapters/runtime.cu", "unrelated-runtime-v1");
+    fixture.write("adapters/runtime.cpp", "unrelated-runtime-v1");
     fixture.write("adapters/attention/kernel.cu", "unrelated-adapter-v1");
     fixture
 }
@@ -58,14 +58,14 @@ fn only_gemm_native_inputs_change_the_build_id() {
     let fixture = populated_fixture();
     let original = fixture.fingerprint("x86_64-unknown-linux-gnu", "sm_100", "sm_100a");
 
-    fixture.write("adapters/runtime.cu", "unrelated-runtime-v2");
+    fixture.write("adapters/runtime.cpp", "unrelated-runtime-v2");
     fixture.write("adapters/attention/kernel.cu", "unrelated-adapter-v2");
     assert_eq!(
         original,
         fixture.fingerprint("x86_64-unknown-linux-gnu", "sm_100", "sm_100a")
     );
 
-    fixture.write("adapters/gemm/registry.cu", "candidate-v2");
+    fixture.write("adapters/gemm/candidates.cpp", "candidate-v2");
     assert_ne!(
         original,
         fixture.fingerprint("x86_64-unknown-linux-gnu", "sm_100", "sm_100a")

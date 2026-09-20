@@ -1,6 +1,6 @@
 """GR00T N1.7 policy: raw camera/state observations to deployable actions.
 
-The model loads through the same ``apxinf_py.Model`` / ``AutoModel`` path as
+The model loads through the same ``apxinf_py.ModelRunner`` / ``AutoModel`` path as
 every other VLA family. NVIDIA's checkpoint processor builds the exact
 multimodal tensors, ApxInf executes the model core, and the same processor
 decodes normalized actions back to the robot domain.
@@ -60,7 +60,7 @@ class Gr00tPolicy:
 
     def __init__(
         self,
-        model: Any,
+        model_runner: Any,
         *,
         processor: _ProcessorAdapter,
         seed: int = 0,
@@ -71,16 +71,16 @@ class Gr00tPolicy:
     ) -> None:
         if noise_mode not in ("fixed", "stream"):
             raise ValueError("Gr00tPolicy: noise_mode must be 'fixed' or 'stream'")
-        self.model = model
+        self.model_runner = model_runner
         self.processor = processor
         self.image_keys = tuple(processor.image_keys)
         self.state_key = processor.state_key
         self.prompt_key = processor.prompt_key
         self.noise_mode = noise_mode
         self.action_horizon_out = (
-            int(action_horizon) if action_horizon is not None else int(model.action_horizon)
+            int(action_horizon) if action_horizon is not None else int(model_runner.action_horizon)
         )
-        self.action_dim_out = int(action_dim) if action_dim is not None else int(model.action_dim)
+        self.action_dim_out = int(action_dim) if action_dim is not None else int(model_runner.action_dim)
         self._rng = np.random.default_rng(seed)
         self._fixed_noise = self._sample_noise()
         # Constructing the fixed control tensor must not consume the first draw
@@ -89,8 +89,8 @@ class Gr00tPolicy:
         self.metadata = {
             "model_type": "gr00t",
             "action_horizon": self.action_horizon_out,
-            "model_action_horizon": int(model.action_horizon),
-            "model_action_dim": int(model.action_dim),
+            "model_action_horizon": int(model_runner.action_horizon),
+            "model_action_dim": int(model_runner.action_dim),
             "action_dim": self.action_dim_out,
             "num_views": len(self.image_keys),
             "image_keys": list(self.image_keys),
@@ -108,7 +108,7 @@ class Gr00tPolicy:
         model_dir,
         *,
         backbone=None,
-        model: Optional[Any] = None,
+        model_runner: Optional[Any] = None,
         device: str = "cuda:0",
         precision: str = "auto",
         calibration=None,
@@ -157,10 +157,10 @@ class Gr00tPolicy:
         resolved_action_horizon = (
             action_horizon if action_horizon is not None else adapter.action_horizon
         )
-        if model is None:
+        if model_runner is None:
             import apxinf_py  # lazy optional native dependency
 
-            model = apxinf_py.Model.load(
+            model_runner = apxinf_py.ModelRunner.load(
                 "gr00t",
                 str(model_dir),
                 device=device,
@@ -170,7 +170,7 @@ class Gr00tPolicy:
                 assets={"backbone": str(backbone)},
             )
         return cls(
-            model,
+            model_runner,
             processor=adapter,
             seed=seed,
             noise_mode=noise_mode,
@@ -195,7 +195,7 @@ class Gr00tPolicy:
 
     def fp8_execution_plan(self) -> Fp8ExecutionPlan:
         """Return the quantized operators selected by the native runtime."""
-        native_plan = getattr(self.model, "_calibration_plan", None)
+        native_plan = getattr(self.model_runner, "_calibration_plan", None)
         if not callable(native_plan):
             raise RuntimeError("the loaded model does not expose an FP8 calibration plan")
         sites = tuple(native_plan())
@@ -226,7 +226,7 @@ class Gr00tPolicy:
         """Collect one deterministic BF16 activation sample for the common runner."""
         if not isinstance(observation, Mapping):
             raise TypeError(f"observation must be a mapping, got {type(observation)!r}")
-        calibrate = getattr(self.model, "_calibrate_preprocessed", None)
+        calibrate = getattr(self.model_runner, "_calibrate_preprocessed", None)
         if not callable(calibrate):
             raise RuntimeError("the loaded model does not support GR00T calibration")
         encoded = self.processor.encode(observation)
@@ -234,7 +234,7 @@ class Gr00tPolicy:
             np.random.SeedSequence([context.seed, context.sample_index])
         )
         noise = rng.standard_normal(
-            (1, int(self.model.action_horizon), int(self.model.action_dim)),
+            (1, int(self.model_runner.action_horizon), int(self.model_runner.action_dim)),
             dtype=np.float32,
         )
         noise = _round_to_bf16(noise)
@@ -264,8 +264,8 @@ class Gr00tPolicy:
         else:
             noise = np.ascontiguousarray(noise, dtype=np.float32)
             expected_unbatched = (
-                int(self.model.action_horizon),
-                int(self.model.action_dim),
+                int(self.model_runner.action_horizon),
+                int(self.model_runner.action_dim),
             )
             expected_noise = (
                 1,
@@ -287,7 +287,7 @@ class Gr00tPolicy:
 
         model_started = time.perf_counter()
         normalized = np.asarray(
-            self.model._infer_preprocessed(
+            self.model_runner._infer_preprocessed(
                 encoded["pixel_values"],
                 encoded["image_grid_thw"],
                 encoded["token_ids"],
@@ -299,7 +299,7 @@ class Gr00tPolicy:
             dtype=np.float32,
         )
         model_ms = (time.perf_counter() - model_started) * 1000.0
-        expected = (int(self.model.action_horizon), int(self.model.action_dim))
+        expected = (int(self.model_runner.action_horizon), int(self.model_runner.action_dim))
         if normalized.shape != expected:
             raise ValueError(f"model returned action shape {normalized.shape}, expected {expected}")
         if not np.isfinite(normalized).all():
@@ -338,7 +338,7 @@ class Gr00tPolicy:
         return self.action_horizon_out
 
     def close(self) -> None:
-        close = getattr(self.model, "close", None)
+        close = getattr(self.model_runner, "close", None)
         if callable(close):
             close()
 
@@ -346,7 +346,7 @@ class Gr00tPolicy:
         # Match NVIDIA/ApxInf validation: sample f32, round through BF16, then
         # hand contiguous f32 values to the native binding.
         values = self._rng.standard_normal(
-            (1, int(self.model.action_horizon), int(self.model.action_dim)), dtype=np.float32
+            (1, int(self.model_runner.action_horizon), int(self.model_runner.action_dim)), dtype=np.float32
         )
         return _round_to_bf16(values)
 

@@ -104,4 +104,4 @@ def test_model_reexport_matches_binding():
     apxinf_py = pytest.importorskip("apxinf_py")
     import apxinf
 
-    assert apxinf.Model is apxinf_py.Model
+    assert apxinf.ModelRunner is apxinf_py.ModelRunner

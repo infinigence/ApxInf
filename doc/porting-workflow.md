@@ -40,7 +40,8 @@ capabilities, and CUDA toolchain. Do not infer a source revision, checkpoint
 variant, target precision, or hardware target from a similarly named branch or
 an unrelated previous experiment.
 
-At the first user-facing preflight, ask the user to choose an execution mode:
+Reuse an execution mode already chosen in the task. Otherwise, an implementation
+request defaults to hands-off; offer hands-on when the user wants checkpoints:
 
 - **hands-off (recommended):** continue through every workflow stage and stop
   only at completion, a concrete blocker, or a required approval;
@@ -53,10 +54,10 @@ complete the port, use hands-off. Record the selected mode in the private port
 notes. A progress summary is an update, not a stopping condition in hands-off
 mode. In hands-on mode, a checkpoint pause must ask a concrete question and
 state the default action; a bare progress report is not a checkpoint. Continue
-safe read-only discovery while waiting for the mode choice.
+independent discovery while waiting for any required missing input.
 
 If required facts remain unknown or ambiguous after inspection, combine them
-with the mode choice in one concise question. Explicitly request the missing
+in one concise question. Explicitly request only the missing
 parts of:
 
 - reference source location and immutable revision;
@@ -184,12 +185,21 @@ the gap.
 
 ## 5. Design the target execution path
 
-Before implementing the executor, build the execution ledger required by
+Before implementing the model and its runner, assign family-local owners using
+the [current responsibility table](model-layer-architecture.md#current-module-names-and-responsibilities).
+Record forward order, precision composition, fixed weight transformations,
+request state, workspace/capture, policy transforms and public registration.
+Check the current family's supported options; a proposal or a different
+family's readiness does not establish the new port's contract.
+
+Then build the execution ledger required by
 [Model Execution Wiring](model-execution-wiring.md). Resolve repeated semantic
-sequences against maintained optimized executors and the safe CUDA kernel
+sequences against maintained model/Blocks implementations and the safe CUDA kernel
 facade before consulting only the portable backend trait.
 
-The design must identify fusion choices, tensor lifetimes, reusable KV/state,
+Apply the [accelerator acceptance contract](model-execution-wiring.md#accelerator-port-acceptance):
+native GPU computation and required fixed-profile capture are completion gates;
+latency remains best effort unless explicitly gated. The design must identify fusion choices, tensor lifetimes, reusable KV/state,
 workspace ownership, host transfers, and CUDA Graph eligibility. Any CPU
 implementation inside the steady-state model graph is a temporary correctness
 scaffold. Give it a device replacement and exit criterion in the ledger.
@@ -210,8 +220,8 @@ Layout adaptations and device fallbacks require operator-level replay against
 captured reference tensors. A declared fallback without replay evidence is a
 kernel gap, not a passed capability. A host fallback in the hot path may satisfy
 an intermediate functional checkpoint, but the accelerator port remains
-unfinished until the fallback is replaced or a concrete operator blocker is
-established.
+unfinished until the fallback is replaced. An unresolved operator blocker is
+reported as blocked, not as a completed port with performance debt.
 
 When a genuine gap is found, follow
 [`adding-new-kernels.md`](adding-new-kernels.md). Hand off the operation's full
@@ -235,10 +245,16 @@ call raw CUDA, vendor libraries, or FFI directly.
 
 Prefer this order:
 
-1. reuse the execution structure of a maintained optimized runtime;
+1. inspect/copy the appropriate model/Blocks and runner structure without
+   importing another model family;
 2. reuse matching fused safe interfaces;
 3. compose existing device primitives when fusion semantics do not match;
 4. add a model-neutral operator when semantics are genuinely missing.
+
+Complete [Rust registration and Python policy integration](adding-a-new-model.md#registration-and-public-integration)
+through existing factories/bindings. Keep LLM/VLM on `LlmTrait`; use a family
+`ModelRunner` implementing `VlaRuntime` for VLA. Do not add a factory or execution
+wrapper merely to make the call chain symmetrical.
 
 If implementation reveals that an earlier preflight assumption was wrong,
 return to semantic inventory or kernel coverage. Finding more work is progress,
@@ -260,13 +276,16 @@ Verify in increasing scope:
 5. requested target/precision tuples;
 6. eager-versus-captured output parity;
 7. host-transfer and synchronization audit of the steady-state path;
-8. wall-clock and graph-replay latency plus memory against stated goals.
+8. explicit preparation status/fallback, stale-plan rejection, input/RNG updates,
+   output lifetime and failure cleanup for the contracts being adopted;
+9. wall-clock and graph-replay latency plus memory against stated goals.
 
 Correctness gates are mandatory. Optimization is best effort unless the request
 explicitly declares a performance release gate. Report functional acceptance
-separately from optimization status. Unmet latency, host escapes, or capture
-gaps must include attempted reuse, measured impact where available, and the
-next concrete optimization; they must not be hidden behind a generic fallback.
+separately from optimization status. Unmet latency must include attempted reuse,
+measured impact and the next optimization. Host escapes or missing required
+capture remain blockers under the accelerator contract; they must not be hidden
+behind a generic fallback.
 
 ## 9. Prepare the review
 
@@ -276,6 +295,12 @@ The reviewable change should contain only maintained product material:
 - model runtime and public integration code;
 - focused tests for maintained runtime or kernel behavior;
 - concise documentation needed by future maintainers.
+
+Document actual module owners, registered names, input/output representations,
+supported precision/preparation modes and unsupported cases in the same PR.
+Update the relevant guide/skill if the common integration procedure changes.
+Check source links and runnable examples. Preserve old measurements with their
+original revisions rather than relabelling them as validation of new code.
 
 Do not commit:
 
@@ -302,7 +327,7 @@ A port is complete only when:
 
 - reference inputs and semantics are understood;
 - canonical rewrites have numerical evidence;
-- every required computation has validated coverage or a clear blocker;
+- every required computation has validated coverage;
 - the maintained runtime loads the intended checkpoint;
 - end-to-end output passes the declared tolerance;
 - the public deployment path has been exercised;
@@ -314,8 +339,7 @@ A port is complete only when:
 - applicable existing optimized paths have been attempted and remaining
   performance debt is itemized;
 - every accelerator hot-path correctness scaffold has been replaced by a
-  device implementation, or a concrete operator blocker names the missing
-  semantics, attempted safe interfaces, and required resolution;
+  device implementation and the required capture path passes;
 - performance is measured with the declared metric and reported independently
   from functional acceptance;
 - the repository diff contains no private or one-off experiment artifacts.

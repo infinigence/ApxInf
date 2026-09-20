@@ -4,7 +4,7 @@ L1 runs vision→patches inside the CUDA graph; L0 takes pre-computed patches.
 Feeding the same image both ways must agree within tolerance. This is only
 exact for the BF16 path, whose kernel is a plain ``(u8/255)*2 - 1`` normalize
 (``static_bf16.cu``); the FP8 path additionally quantizes with a vision scale,
-so this test skips unless precision is bf16.
+so this test skips unless the loaded model_variant is bf16.
 """
 
 import os
@@ -31,8 +31,8 @@ def patchify_bf16(rgb_nhwc: np.ndarray, patch_size: int) -> np.ndarray:
     return grid.reshape(views * per_side * per_side, channels * patch_size * patch_size)
 
 
-def test_l0_l1_consistency(model, precision):
-    if precision != "bf16":
+def test_l0_l1_consistency(model):
+    if model.model_variant != "bf16":
         pytest.skip("L0/L1 exact consistency reference is defined for bf16 only")
 
     rng = np.random.default_rng(1234)

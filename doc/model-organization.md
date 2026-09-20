@@ -1,103 +1,61 @@
 # apxinf-model Organization
 
-Date: 2026-07-04
-Status: Design doc for the per-model folder structure.
+Status: current source map. Use [Model Layer Architecture](model-layer-architecture.md#current-module-names-and-responsibilities)
+for authoritative responsibility/dependency rules and
+[Adding a New Model](adding-a-new-model.md) for the integration procedure.
 
-## The principle
+## Shared contracts and construction
 
-**Each model's structure code lives in its own folder. Shared infrastructure
-stays at the top level.**
+Under `crates/apxinf-model/src/`:
 
-```
-apxinf-model/src/
-  ── Shared infrastructure (model-agnostic) ──
-  lib.rs              module wiring + re-exports
-  llm_trait.rs        LlmTrait (prefill → decode → backend sampling → stream)
-  auto.rs             AutoModel (unified frontend, picks best impl)
-  registry.rs         model factory registry
-  builtin.rs          register_builtin_models()
-  profiling.rs        GenerationProfile (TTFT/TPOT tracking)
-  debug.rs            DebugCapture / DebugConfig (activation capture)
-  nvtx.rs             NVTX no-op stub / re-export
+| Location | Responsibility |
+| --- | --- |
+| `lib.rs`, `builtin.rs`, `registry.rs` | Exports, built-in registrations and loader lookup |
+| `auto.rs` | `AutoModel` factory, `LoadOptions`, `LoadedModel::{Text,Vla}` result |
+| `llm_trait.rs`, `generation_config.rs` | Autoregressive LLM/VLM input, generation, sampling options and output contracts |
+| `vla/mod.rs` | `VlaRuntime`, observation/request/action, prepared inference, execution policy/status |
+| `accelerator.rs` | Backend creation for shared loading |
+| `profiling.rs`, `debug.rs`, `nvtx.rs` | Timing and diagnostic mechanisms |
 
-  ── Per-model folders ──
-  llama/              Llama model structure
-    mod.rs            re-exports
-    weights.rs        LlamaWeights, TransformerLayer
-    model.rs          LlamaModel (legacy CPU/CUDA impl + its KVCache)
-    general.rs        GeneralLlama (dyn Backend impl, decode workspace)
-    decode_graph.rs   DecodeGraph, DecodeWorkspace (allocation-free decode)
+`AutoModel` selects a loader; `LoadedModel` holds the resulting family interface.
+Neither is a worker or another model-forward implementation. Python `AutoPolicy`
+selects a policy; the existing PyO3 `ModelRunner` invokes Rust loading/inference.
+There is no Python `AutoModel` binding or Python PI0.5 network class.
 
-  qwen3vl/            Qwen3-VL model structure
-    mod.rs
-    config.rs         Qwen3VLConfig
-    weights.rs        Qwen3VLTextWeights
-    vision_weights.rs Qwen3VLVisionWeights
-    vision.rs         vision tower forward
-    general.rs        GeneralQwen3VL (unified text/image prefill + decode)
-```
+## Family implementations
 
-## What's shared vs model-specific
+| Directory | Current organization |
+| --- | --- |
+| `pi05/` | `load.rs` and `config.rs` construct `Pi05ModelRunner`; `model/` holds `Pi05Model<B>`, Blocks and `ModelVariant`; `model_runner/` owns preparation/cache/resources; `weights/` owns host mapping and device representations |
+| `walloss/` | Existing BF16 runtime/executor, `fp8.rs`, schedule/geometry and weight files |
+| `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
+| `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |
+| `qwen3vl/` | `GeneralQwen3VL` in `general.rs`, text/vision weights, vision computation and family-specific multimodal/decode state |
 
-### Shared (top-level)
+New VLA code names forward computation `Model` and execution ownership
+`ModelRunner`. These are roles inside the family, not new shared base classes.
+Use one implementation directly when no variant dispatch is needed. LLM/VLM
+continue to implement `LlmTrait`; sharing the word "model" does not turn their
+autoregressive generation into VLA action inference.
 
-- **`LlmTrait`** — the shared autoregressive LLM/VLM process. Models
-  implement token-level `forward`; request-level `prefill(LlmInput)` accepts
-  optional image processor output, and `backend()` binds logits to the matching
-  sampler. `generate_streaming_with_options` is shared (validate → prefill →
-  penalties/filtering/selection → token-only decode loop → stream). The older
-  `generate_streaming` is a greedy compatibility wrapper around that pipeline.
-- **`AutoModel`** — unified frontend with one `load_model` entry point. It
-  detects `config.json:model_type` by default, accepts an optional registry
-  name override in `LoadOptions`, and picks the best device implementation.
-- **`registry`** — factory registry for model constructors.
-- **`GenerationProfile`** — timing instrumentation (TTFT, TPOT, tok/s).
-- **`DebugCapture`** — activation capture for debugging.
-- **`nvtx`** — profiling markers (no-op on non-CUDA).
+Each family is self-contained. Inspect/copy a close implementation when useful,
+then rename concepts and validate independently. Shared infrastructure stays
+above family directories; no family imports another family's private model,
+weights, runner, graph or backbone. Existing `*_runtime.rs`/`*_executor.rs`
+filenames in WallOSS/GR00T are current code, not a reason to recreate PI0.5's
+removed files or claim all families have migrated.
 
-### Model-specific (per-folder)
+## How to navigate a change
 
-Each model folder contains:
-- **`weights.rs`** — weight struct + `from_map` loader (HF key → tensor).
-- **`model.rs`** — the model struct implementing `LlmTrait`. VLMs override
-  request-level `prefill`; they do not need a separate generation method.
-- **`decode_graph.rs`** (if the model has a fast decode path) — the
-  allocation-free workspace + CUDA Graph capture, specific to that
-  model's layer structure.
-- Additional files as needed (vision tower, config, etc.).
+- Forward order, modality connections, flow schedule: model computation.
+- Layer fusion and intermediate physical layout: Blocks and its weight representation.
+- Checkpoint keys, packing or calibration scales: weights and loading.
+- Input/RNG binding, workspace allocation, capture, plan cache or invalidation: runner/preparation.
+- Prompt, state/action normalization, tokenizer and output context: Python policy/processors.
+- Model-neutral device operation: safe backend API and its provider implementation.
 
-## Why per-model folders
-
-1. **Adding a new model is self-contained.** A new `mamba/` folder
-   doesn't touch `llama/` or `qwen3vl/`. The shared infrastructure
-   doesn't change.
-
-2. **Model-specific fusion choices stay in the model.** The decode
-   graph (packed QKV, flash attention, fused RMSNorm) is Llama-specific
-   today — it lives in `llama/decode_graph.rs`. If Qwen3-VL gets its own
-   decode graph, it's `qwen3vl/decode_graph.rs`.
-
-3. **Clear boundary between "pipeline" and "architecture".** The shared
-   `LlmTrait::generate_streaming_with_options` is the pipeline (prefill →
-   decode → backend sampling → stream). The model folder is the architecture
-   (how one forward pass works).
-
-## VLM and VLA boundaries
-
-VLM generation uses `LlmTrait` directly. `LlmInput` carries borrowed,
-optional processor output to `prefill`; Qwen3-VL keeps mRoPE, deepstack, and
-embedding scatter model-specific. See [adding a new model](adding-a-new-model.md)
-for the current interface contract.
-
-VLA models remain under the separate `VlaRuntime` interface because their
-observation/action contract and generation process are not autoregressive text.
-They share `RngKey` and the backend's standard-normal generator with the
-sampling infrastructure, but continuous action latents do not pass through the
-categorical token sampler.
-
-## KVCache
-
-The `KvCache` trait is shared (`apxinf-core`). `CudaKVCache` is shared
-(`apxinf-cuda`). The legacy `KVCache` struct in `llama/model.rs` is a CPU
-implementation used only by the legacy `LlamaModel` — it stays as an
-implementation detail of that model, not a shared type.
+For PI0.5's exact paths and callable interfaces, see the
+[current component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
+and [preparation contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract).
+The [current coverage table](model-layer-architecture.md#current-coverage-and-port-decisions)
+records which capabilities are still family-specific.

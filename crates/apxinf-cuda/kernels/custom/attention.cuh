@@ -296,6 +296,8 @@ __global__ void vision_sdpa_bf16_kernel(
     if (tid == 0) scores[seq_len] = max_val;
     __syncthreads();
     max_val = scores[seq_len];
+    // Protect the maximum reads before reusing the max/sum scratch slot.
+    __syncwarp();
 
     float sum = 0.0f;
     for (uint32_t ki = tid; ki < seq_len; ki += 32u) {
@@ -392,6 +394,8 @@ __global__ void noncausal_sdpa_bf16_kernel(
     if (tid == 0) scores[key_value_len] = max_val;
     __syncthreads();
     max_val = scores[key_value_len];
+    // Protect the maximum reads before reusing the max/sum scratch slot.
+    __syncwarp();
 
     float sum = 0.0f;
     for (uint32_t ki = tid; ki < key_value_len; ki += 32u) {
@@ -843,6 +847,8 @@ __global__ void mqa_softmax_f16_block_kernel(half* data, int rows, int cols) {
   for (int col = thread; col < cols; col += blockDim.x) {
     sum += __expf(__half2float(source[col]) - maximum);
   }
+  // All threads must read the maximum before its slot is overwritten.
+  __syncthreads();
   reduction[thread] = sum;
   __syncthreads();
   for (int stride = kMqaSoftmaxThreads / 2; stride > 0; stride >>= 1) {

@@ -28,8 +28,9 @@ An integration has several overlapping lifetimes:
 | Session or sequence | autoregressive KV state, sampling position, robot episode state where supported | explicit reset, sequence end, or replacement of the model instance |
 | Request | instruction/messages, images, state, masks, noise, request-local buffers and outputs | completion or failure after outstanding device work is handled |
 
-Prepared profiles belong to the instance but can contain mutable buffers used
-by requests. Sharing an instance therefore does not by itself imply concurrent
+Prepared profiles are retained by the instance cache and/or explicit prepared
+handles and can contain mutable buffers used by requests. PI0.5 explicit plans
+retain dependencies and can outlive cache eviction or the original runner. Sharing an instance therefore does not by itself imply concurrent
 request safety. Each runtime must state whether calls are serialized or require
 independent sessions/profiles. Session reset must not be confused with unloading
 weights, and request completion must not imply destruction of reusable graphs.
@@ -60,8 +61,8 @@ Requests repeat stages 3-6 while the instance remains loaded.
 | 1. Resolve and validate assets | asset locations and explicit overrides -> compatible asset identities, configuration and selected execution policy | loader mechanisms plus family-specific interpretation | load/reload |
 | 2. Load and initialize | validated assets -> usable runtime, device weights and declared capabilities | model runtime; higher-level policy/generation layer loads its own text and output transforms | instance creation |
 | 3. Canonicalize request | application input -> family-specific canonical model inputs and routing metadata | application adapter followed by policy/generation input logic | request or prefill |
-| 4. Select / prepare execution | runtime plus execution-relevant metadata -> compatible plans, caches, workspace and optionally a captured graph | runtime/execution carrier | profile miss or invalidation; otherwise reuse |
-| 5. Execute | prepared state plus current canonical inputs/session state -> model-domain result and state transition | family network and runtime using safe backend operations | request, decode step or solver iteration |
+| 4. Select / prepare execution | runtime plus execution-relevant metadata -> compatible plans, caches, workspace and optionally a captured graph | model runner | profile miss or invalidation; otherwise reuse |
+| 5. Execute | prepared state plus current canonical inputs/session state -> model-domain result and state transition | family model and runner using safe backend operations | request, decode step or solver iteration |
 | 6. Interpret output | model-domain result -> public result, stream item or continuation decision | family policy/generation output logic, then application adapter | result or generated step |
 | 7. Reset / release | active state plus reset/close intent -> cleared session or retired resources | owning session/runtime; adapters close only what they own | session end, cancellation recovery or unload |
 
@@ -141,9 +142,9 @@ works. Document capture failures and any supported eager fallback.
 
 ### 5. Execute
 
-The family network owns layer order, attention semantics, conditioning,
-scheduling and the model's mathematical state transition. The execution carrier
-owns allocation reuse, cache/graph lifetime and dispatch; it calls the network
+The family model owns layer order, attention semantics, conditioning,
+scheduling and the model's mathematical state transition. The model runner
+owns allocation reuse, cache/graph lifetime and dispatch; it calls the model
 rather than duplicating its mathematics. Backend operations remain model-neutral
 and are accessed through safe interfaces.
 
@@ -221,8 +222,8 @@ crates/
     llm_trait.rs, vla/        established execution-family contracts
     <model>/
       config / weights        family asset interpretation and weight preparation
-      network / executor      network mathematics and composition
-      runtime / cache / graph execution preparation, state and resource lifetime
+      model / blocks          model forward order and layer implementation
+      model_runner / prepare  execution preparation, state and resource lifetime
       backend.rs              family CUDA-facing seam when required
   apxinf-cuda/                 safe device operations and kernel implementation
   apxinf-py/                   thin native language adapter
@@ -234,6 +235,13 @@ python/apxinf/apxinf/
   serving/                   transport and request handling
 ```
 
+PI0.5 uses `model/`, `model_runner/` and `weights/`; WallOSS/GR00T retain their
+runtime/executor filenames, and LLM/VLM use their existing `LlmTrait` paths.
+The [current module table](model-layer-architecture.md#current-module-names-and-responsibilities)
+is authoritative for names and owners. `AutoModel` returns `LoadedModel`;
+`ModelRunner` is the native VLA binding, and a concrete family runner implements
+`VlaRuntime`. None of the seven stages requires another wrapper or shared trait.
+
 The role names inside `<model>/` are illustrative; use the existing filenames
 that express those responsibilities. A small module may combine stages. Split
 when a responsibility changes independently, not to obtain seven files. Keep
@@ -242,7 +250,7 @@ existing processors. Do not introduce shared family switches or a new generic
 policy crate solely to make the directory tree symmetric.
 
 Follow the existing [dependency matrix](model-layer-architecture.md#per-model-isolation).
-Network code must not depend on a concrete captured-runtime implementation;
+Model computation must not depend on runner/capture types;
 shape/budget definitions should remain leaf concepts. A family implementation
 is not another family's reuse library.
 

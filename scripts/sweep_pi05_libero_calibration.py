@@ -10,7 +10,7 @@ are identical (the binding feeds f32 patches/noise that the runtime normalizes t
 the same FP16 the stdio path used).
 
 Internal-tooling note: L0 is exposed to Python only as the private
-``Model._infer_patches`` (fixtures store pre-computed patches, so L1 ``infer_rgb``
+``ModelRunner._infer_patches`` (fixtures store pre-computed patches, so L1 ``infer_rgb``
 cannot be used here). This is a first-party ``scripts/`` workflow that ships and
 evolves with the binding, so depending on that private name is intentional — if
 the L0 signature changes, this script changes with it.
@@ -24,8 +24,6 @@ import pathlib
 import time
 
 import numpy as np
-
-import apxinf_py
 
 
 def metrics(actual: np.ndarray, expected: np.ndarray) -> dict[str, float | None]:
@@ -81,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    import apxinf_py  # Native binding is needed only for execution, not --help.
     fixture_paths = list(args.fixture)
     if args.fixture_dir is not None:
         fixture_paths.extend(sorted(args.fixture_dir.glob("*.npz")))
@@ -112,18 +111,18 @@ def main() -> None:
         started = time.perf_counter()
         # Feed f32 patches/noise: the runtime normalizes them to the same FP16 the
         # old stdio server received, so scores match the legacy sweep.
-        model = apxinf_py.Model.load(
+        model = apxinf_py.ModelRunner.load(
             "pi05",
             str(args.checkpoint),
             device=args.device,
-            precision="fp8",
+            model_variant="fp8_static",
             calibration=str(calibration),
             tactics=str(args.tactics),
         )
         comparisons = []
         try:
             for path, patches, tokens, noise, reference in fixtures:
-                # L0 is intentionally private (Model._infer_patches); see the
+                # L0 is intentionally private (ModelRunner._infer_patches); see the
                 # module docstring for why this internal script depends on it.
                 actual = np.asarray(
                     model._infer_patches(

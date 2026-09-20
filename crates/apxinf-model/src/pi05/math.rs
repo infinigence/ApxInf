@@ -1,3 +1,10 @@
+//! CUDA-independent PI0.5 helpers and reference semantics.
+//!
+//! Model loading uses [`sinusoidal_time_embedding`] to prepare fixed timestep
+//! embeddings. The state/prompt helpers are CPU utilities, not the implementation
+//! called by Python preprocessing. [`euler_flow_step`] documents and tests the
+//! reverse-time update; inference performs that update in device kernels.
+
 use std::f64::consts::TAU;
 
 /// OpenPI's float64-generated sinusoidal flow timestep embedding.
