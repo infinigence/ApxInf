@@ -17,7 +17,7 @@ mod model;
 mod model_runner;
 mod weights;
 
-pub use config::{ComputeVariant, GemmaVariantConfig, Pi05Config, Pi05PerformanceProfile};
+pub use config::{GemmaVariantConfig, ModelVariantChoice, Pi05Config, Pi05PerformanceProfile};
 pub use math::{discretize_state, euler_flow_step, pi05_prompt, sinusoidal_time_embedding};
 #[cfg(feature = "cuda")]
 pub use model::Pi05CalibrationObserver;

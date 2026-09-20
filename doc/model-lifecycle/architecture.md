@@ -58,7 +58,7 @@ OpenPI calls the projected vector `modulation`, split into `scale`, `shift` and
 
 The native binding must be rebuilt together with the Python package for these
 public renames. Model-family load arguments such as `model="pi05"`, checkpoint
-keys, calibration formats and `compute_variant` values retain their meaning.
+keys, calibration formats and `model_variant` values retain their meaning.
 
 ### CPU helpers in `pi05/math.rs`
 
@@ -218,7 +218,7 @@ sequenceDiagram
 ```
 
 `ModelRunner.load()` 返回 ModelRunner，不返回 ModelVariant。普通 Python 调用为
-`policy = Pi05Policy.from_pretrained(path, compute_variant="bf16")`，随后
+`policy = Pi05Policy.from_pretrained(path, model_variant="bf16")`，随后
 `policy.infer(observation)`。它执行 input_pipeline → 绑定 ModelRunner.infer_rgb →
 LoadedModel.infer_host_f32 → Pi05ModelRunner.infer_host_f32 →
 Pi05ModelRunner.infer → output_pipeline。处理后的 observation 还会传给输出 pipeline，
@@ -246,7 +246,7 @@ language_layers、action_layers、norm、action_in/out 和 time_mlp_in/out。
 ```text
 pi05/
   mod.rs                       public exports and registration
-  config.rs                    fixed model configuration and compute_variant
+  config.rs                    fixed model configuration and model_variant
   load.rs                      checkpoint loading and module assembly
   backend.rs                   model-wide accelerator seam
   math.rs                      CPU-capable model math helpers
@@ -535,7 +535,7 @@ ModelVariant 变体，load 不直接构造 ModelRunner 字段。Rust 隐私检�
 
 | Previous PI0.5 entry | Current entry |
 | --- | --- |
-| precision=fp8 / bf16 / int8 or w8a8 | compute_variant=fp8_static / bf16 / int8_dynamic |
+| precision=fp8 / bf16 / int8 or w8a8 | model_variant=fp8_static / bf16 / int8_dynamic |
 | Pi05CudaRuntime::new | build_fp8_static_model |
 | Pi05Bf16CudaRuntime::new | build_bf16_model |
 | Pi05Int8CudaRuntime::new | build_int8_dynamic_model |
@@ -545,15 +545,15 @@ ModelVariant 变体，load 不直接构造 ModelRunner 字段。Rust 隐私检�
 | Pi05ActivationScales / StaticFp8Calibration | Fp8StaticActivationScales / Fp8StaticCalibration |
 | Unprefixed FP8 layer functions/types | Explicit fp8_static / Fp8Static names |
 | Pi05VlaRuntime alias | Pi05ModelRunner |
-| pi05_bench --dtype fp8; JSON precision key | --compute-variant fp8_static; JSON compute_variant key |
-| Python ModelRunner.random(precision=...) | ModelRunner.random(compute_variant=...) |
+| pi05_bench --dtype fp8; JSON precision key | --model-variant fp8_static; JSON model_variant key |
+| Python ModelRunner.random(precision=...) | ModelRunner.random(model_variant=...) |
 
 Repository callers are migrated. External low-level Rust callers, Python keyword
 callers and benchmark parsers must update. Existing checkpoint/calibration/tactic
 asset schemas are preserved; operator names such as W8A8 are not renamed globally.
 GR00T/WallOSS numerical implementations are unchanged. The shared LoadOptions
 still contains legacy precision for those families, not a second PI0.5 selector.
-Dedicated PI0.5 benchmark/server tools use compute_variant. The multi-model LIBERO
+Dedicated PI0.5 benchmark/server tools use model_variant. The multi-model LIBERO
 campaign tool retains its numerical precision ledger category, translating that
 category to PI0.5's implementation ID at loading; historical campaign ledgers
 are not rewritten. Its websocket boundary recognizes the new server metadata.
@@ -723,7 +723,7 @@ specialization in hot paths.
 
 ### Compute implementation selection (agreed target)
 
-Use `compute_variant` for the single user-facing choice of a model's compute
+Use `model_variant` for the single user-facing choice of a model's compute
 implementation. It selects a compatible bundle of Blocks, physical weight
 representations and preparation requirements; it is not merely a dtype or a
 checkpoint/model-size variant. Do not add independently combinable quantization
@@ -731,23 +731,23 @@ and implementation fields until a real use case requires them.
 
 The field name and selection contract are shared across models. Supported values
 belong to each model: do not create one global enum containing every model's
-implementations. Within a model module, use `ComputeVariant`; if a flattened
-public export is needed, an alias such as `Pi05ComputeVariant` disambiguates it.
+implementations. Within a model module, use `ModelVariantChoice`; if a flattened
+public export is needed, an alias such as `Pi05ModelVariantChoice` disambiguates it.
 The prefix identifies ownership, not a different lifecycle contract.
 
 ```rust
 // Implemented PI0.5 selection. Shared LoadOptions carries a model-local ID.
 let options = LoadOptions {
-    compute_variant: Some(pi05::ComputeVariant::Fp8Static.as_str().into()),
+    model_variant: Some(pi05::ModelVariantChoice::Fp8Static.as_str().into()),
     ..LoadOptions::default()
 };
-// pi05::ComputeVariant::{Auto, Bf16, Fp8Static, Int8Dynamic}
+// pi05::ModelVariantChoice::{Auto, Bf16, Fp8Static, Int8Dynamic}
 ```
 
-Rust and Python use `compute_variant`; canonical values are `auto`, `bf16`,
+Rust and Python use `model_variant`; canonical values are `auto`, `bf16`,
 `fp8_static`, `int8_dynamic`. PI0.5 rejects explicit legacy `precision` and
 ambiguous IDs such as `fp8` or `w8a8`. Other models retain their existing precision
-interfaces until migrated and reject compute_variant through the current common
+interfaces until migrated and reject model_variant through the current common
 loader. Stage 3 extends this support when WallOSS migrates; it does not introduce
 a global enum of every model's variants or a registration framework.
 

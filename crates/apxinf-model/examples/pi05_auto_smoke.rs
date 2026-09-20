@@ -40,12 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = LoadOptions {
         model_name: Some("pi05".to_owned()),
-        compute_variant: Some(
+        model_variant: Some(
             arguments
                 .get(3)
                 .map(String::as_str)
                 .unwrap_or("bf16")
-                .parse::<apxinf_model::pi05::ComputeVariant>()?
+                .parse::<apxinf_model::pi05::ModelVariantChoice>()?
                 .as_str()
                 .into(),
         ),

@@ -461,6 +461,10 @@ impl Pi05ModelRunner {
 }
 
 impl VlaRuntime for Pi05ModelRunner {
+    fn model_variant(&self) -> Option<&'static str> {
+        Some(self.model.name())
+    }
+
     fn contract(&self) -> crate::VlaContract {
         crate::VlaContract {
             action_shape: [self.config.action_horizon, self.config.action_dim],
@@ -676,7 +680,7 @@ mod tests {
             Path::new(&path),
             backend.clone(),
             &LoadOptions {
-                compute_variant: Some("bf16".into()),
+                model_variant: Some("bf16".into()),
                 ..LoadOptions::default()
             },
         )
@@ -758,6 +762,77 @@ mod tests {
             .to_f32_vec()
             .unwrap();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and APXINF_PI05_TEST_CHECKPOINT"]
+    fn native_prepare_for_tunes_after_suppressed_preparation() {
+        let path =
+            std::env::var("APXINF_PI05_TEST_CHECKPOINT").expect("fixed real checkpoint required");
+        let backend = Arc::new(RuntimeBackend::new(0).unwrap());
+        let runner = load_model_runner(
+            Path::new(&path),
+            backend.clone(),
+            &LoadOptions {
+                model_variant: Some("bf16".into()),
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runner.model_variant(), Some("bf16"));
+        let observation = Observation {
+            vision: VisionObservation::Patches(Tensor::zeros(
+                patch_shape(&runner.config),
+                DType::BF16,
+            )),
+            token_ids: vec![0; 10],
+            state: None,
+            action_mask: None,
+        };
+        let noise = Tensor::zeros(noise_shape(&runner.config), DType::BF16);
+        let request = VlaRequest::provided(&observation, &noise);
+        for policy in [ExecutionPolicy::Eager, ExecutionPolicy::RequireGraph] {
+            backend
+                .context()
+                .install_tuning(tuning::TuningSession::new(
+                    tuning::TuningMode::AutoTune,
+                    tuning::TacticStore::default(),
+                    None,
+                ))
+                .unwrap();
+            let initial = runner
+                .prepare_with_policy(&observation.inference_spec(), policy)
+                .unwrap();
+            initial.run(&request).unwrap();
+            backend.synchronize().unwrap();
+            assert_eq!(
+                backend.context().tuning().generation(),
+                0,
+                "preparation and prepared run must suppress tuning"
+            );
+            let tuned = runner.prepare_for(&request, policy).unwrap();
+            let generation = backend.context().tuning().generation();
+            assert!(
+                generation > 0,
+                "sample preparation must tune the previously deferred keys"
+            );
+            assert_eq!(initial.status(), PreparationStatus::Invalidated);
+            assert!(initial.run(&request).is_err());
+            drop(initial);
+            let action = backend
+                .to_cpu(tuned.run(&request).unwrap().tensor())
+                .unwrap();
+            assert!(action.to_f32_vec().unwrap().iter().all(|x| x.is_finite()));
+            drop(tuned);
+            let repeated = runner.prepare_for(&request, policy).unwrap();
+            repeated.run(&request).unwrap();
+            backend.synchronize().unwrap();
+            assert_eq!(
+                backend.context().tuning().generation(),
+                generation,
+                "already tuned keys must be reused by subsequent sample preparation"
+            );
+        }
     }
 
     #[test]

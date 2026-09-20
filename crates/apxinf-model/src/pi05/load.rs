@@ -48,25 +48,22 @@ pub(super) fn load_model_runner(
     });
     if options.precision != ModelPrecision::Auto {
         return Err(Error::Other(
-            "PI0.5 uses compute_variant instead of precision".into(),
+            "PI0.5 uses model_variant instead of precision".into(),
         ));
     }
-    let compute_variant = options
-        .compute_variant
+    let model_variant = options
+        .model_variant
         .as_deref()
         .unwrap_or("auto")
-        .parse::<ComputeVariant>()?
+        .parse::<ModelVariantChoice>()?
         .resolve(
             cuda.context().caps().sm,
             calibration_path.is_some() || options.uniform_fp8_scale.is_some(),
         );
-    eprintln!(
-        "[apxinf] PI0.5 compute_variant={}",
-        compute_variant.as_str()
-    );
+    eprintln!("[apxinf] PI0.5 model_variant={}", model_variant.as_str());
 
-    let model = match compute_variant {
-        ComputeVariant::Fp8Static => {
+    let model = match model_variant {
+        ModelVariantChoice::Fp8Static => {
             let scales = if let Some(scale) = options.uniform_fp8_scale {
                 Arc::new(Fp8StaticActivationScales::uniform(&config, scale)?)
             } else {
@@ -100,7 +97,7 @@ pub(super) fn load_model_runner(
                 time_embeddings,
             }
         }
-        ComputeVariant::Bf16 => {
+        ModelVariantChoice::Bf16 => {
             let weights = Arc::new(Bf16Weights::from_host(
                 &host_weights,
                 &*backend,
@@ -112,7 +109,7 @@ pub(super) fn load_model_runner(
                 time_embeddings,
             }
         }
-        ComputeVariant::Int8Dynamic => {
+        ModelVariantChoice::Int8Dynamic => {
             let weights = Arc::new(Int8DynamicWeights::from_host(&host_weights, cuda)?);
             let time_embeddings =
                 Arc::new(upload_time_embeddings_int8_dynamic(&config, &*backend)?);
@@ -125,7 +122,7 @@ pub(super) fn load_model_runner(
                 time_embeddings,
             }
         }
-        ComputeVariant::Auto => unreachable!("automatic precision was resolved"),
+        ModelVariantChoice::Auto => unreachable!("automatic precision was resolved"),
     };
 
     Ok(Pi05ModelRunner::new(backend, config, model))

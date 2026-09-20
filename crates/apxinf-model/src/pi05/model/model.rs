@@ -103,6 +103,14 @@ pub(in crate::pi05) enum ModelVariant {
 }
 
 impl ModelVariant {
+    pub(in crate::pi05) fn name(&self) -> &'static str {
+        match self {
+            Self::Bf16 { .. } => "bf16",
+            Self::Fp8Static { .. } => "fp8_static",
+            Self::Int8Dynamic { .. } => "int8_dynamic",
+        }
+    }
+
     pub(in crate::pi05) fn input_dtype(&self) -> DType {
         match self {
             Self::Fp8Static { .. } => DType::F16,
@@ -194,7 +202,7 @@ impl ModelVariant {
                 time_embeddings,
             } => model.calibrate(patches, tokens, count, noise, time_embeddings),
             _ => Err(Error::Other(
-                "PI0.5 calibration requires compute_variant=bf16".into(),
+                "PI0.5 calibration requires model_variant=bf16".into(),
             )),
         }
     }

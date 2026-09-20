@@ -8,7 +8,7 @@ use the naming follow-up and current guides for new code, not the earlier
 Session/Network or runtime/executor layouts.
 
 Status: PI0.5 Stage 2 is complete for the agreed refactor scope: runtime removal,
-fixed-asset organization, compute_variant naming and module encapsulation.
+fixed-asset organization, model_variant naming and module encapsulation.
 Session G qualifies final-source Thor performance after the earlier contention
 window; Orin performance and final native checks retain their separately recorded
 sources. Later model stages remain open.
@@ -176,7 +176,7 @@ family boundaries, formatting, and 182 Python tests (6 skips, 5 subtests).
 The user extended this stage and explicitly allowed breaking low-level interfaces.
 Candidate `883e55c` removes all runtime files, shares preparation and graph
 ownership, moves construction/typed dispatch to load.rs, organizes fixed assets
-under weights/, and exposes compute_variant with bf16/fp8_static/int8_dynamic.
+under weights/, and exposes model_variant with bf16/fp8_static/int8_dynamic.
 Network no longer imports any concrete Block variant. Repository Rust/Python
 callers and diagnostic examples use the new interfaces. The architecture document
 contains the full directory tree and migration table.
@@ -282,7 +282,7 @@ recorded rather than stopped. Final evidence belongs in [baseline.md](baseline.m
 
 Deliverables:
 
-- Adopt the shared `compute_variant` selection contract with model-owned values;
+- Adopt the shared `model_variant` selection contract with model-owned values;
   validate naming and construction with PI0.5 and WallOSS before generalizing the
   common loader representation. See [compute selection](architecture.md#compute-implementation-selection-agreed-target).
 
@@ -421,7 +421,7 @@ solely because the documentation or a CPU build passes.
 | --- | --- | --- | --- |
 | Baseline matrix | Source merge and inventory complete | PI0.5 Thor/Orin matrix passed; other families and deployment budgets remain open | baseline.md added |
 | GR00T | Deferred: concurrent development | Pending | Target specified; re-audit before migration |
-| PI0.5 | Complete: model_runner/model/weights encapsulation, no runtime adapters, shared preparation and compute_variant | Final module functionality qualified on both hosts; Thor final-source performance qualified in G; Orin performance retains D evidence | Current tree, breaking interfaces and contracts recorded |
+| PI0.5 | Complete: model_runner/model/weights encapsulation, no runtime adapters, shared preparation and model_variant | Final module functionality qualified on both hosts; Thor final-source performance qualified in G; Orin performance retains D evidence | Current tree, breaking interfaces and contracts recorded |
 | WallOSS | Pending | Pending | Target specified |
 | Llama | Pending | Pending | Target specified |
 | Qwen3-VL | Pending | Pending | Target specified |

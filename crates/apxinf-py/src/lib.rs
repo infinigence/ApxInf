@@ -446,7 +446,7 @@ impl ModelRunner {
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `compute_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
+    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
     /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
@@ -469,7 +469,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, compute_variant=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -485,7 +485,7 @@ impl ModelRunner {
         flow_start_time: Option<f32>,
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
-        compute_variant: Option<String>,
+        model_variant: Option<String>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -527,7 +527,7 @@ impl ModelRunner {
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
-            compute_variant,
+            model_variant,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
@@ -555,7 +555,7 @@ impl ModelRunner {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `compute_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
+    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
@@ -566,7 +566,7 @@ impl ModelRunner {
     #[pyo3(signature = (
         model,
         device="cuda:0",
-        compute_variant="bf16",
+        model_variant="bf16",
         num_views=2,
         image_size=224,
         action_horizon=10,
@@ -584,7 +584,7 @@ impl ModelRunner {
     fn random(
         model: &str,
         device: &str,
-        compute_variant: &str,
+        model_variant: &str,
         num_views: usize,
         image_size: usize,
         action_horizon: usize,
@@ -626,7 +626,7 @@ impl ModelRunner {
 
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
-            compute_variant: Some(compute_variant.to_owned()),
+            model_variant: Some(model_variant.to_owned()),
             text_weight_dtype: None,
             calibration_path,
             tuning_path: tactics,
@@ -1028,6 +1028,12 @@ impl ModelRunner {
             Device::Cuda(index) => format!("cuda:{index}"),
             Device::Cpu => "cpu".to_string(),
         }
+    }
+
+    /// Actual loaded implementation; `auto` is resolved during loading.
+    #[getter]
+    fn model_variant(&self) -> PyResult<Option<&'static str>> {
+        Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 
     #[getter]

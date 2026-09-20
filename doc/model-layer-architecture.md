@@ -74,7 +74,8 @@ not a port requirement.
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
 | `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
 
-`ComputeVariant` is a configuration choice; `ModelVariant` is a loaded private
+`model_variant` is the shared loading field and CLI option `--model-variant`.
+`ModelVariantChoice` is a configuration choice; `ModelVariant` is a loaded private
 enum; `LoadedModel` is the cross-family loading result. They have different
 lifetimes and are not three names for a model. A single-implementation family
 does not need a precision-dispatch enum. `StepModulation` is computed per-step
@@ -109,7 +110,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 
 | Family / contract | Current organization and limits |
 | --- | --- |
-| PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `compute_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
@@ -121,7 +122,7 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader currently accepts `compute_variant` only for PI0.5 registry
+The common loader currently accepts `model_variant` only for PI0.5 registry
 names. Supporting it for a new family requires updating that admission check
 and implementing family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
@@ -307,7 +308,7 @@ suite.
 ## PI0.5 migration pilot
 
 PI0.5 uses one statically dispatched `Pi05Model` with bf16/fp8_static/int8_dynamic
-Blocks. `load.rs` selects compute_variant and materializes fixed assets;
+Blocks. `load.rs` selects model_variant and materializes fixed assets;
 `model_runner/runner.rs` owns private request state and plan validity;
 `model_runner/prepare.rs` owns the shared
 warmup/capture path and graph resources. `weights/` groups checkpoint mapping,

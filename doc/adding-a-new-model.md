@@ -199,7 +199,7 @@ Complete these steps in the new family's own code and the existing registries:
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
    [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)
-   before adopting `compute_variant` or binding config overrides.
+   before adopting `model_variant` or binding config overrides.
 4. Reuse the generic native `ModelRunner` binding. Add a
    `python/apxinf/apxinf/policies/impls/<family>.py` policy implementing the
    policy contract, register it with `register_policy`, and import it from

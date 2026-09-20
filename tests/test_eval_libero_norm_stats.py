@@ -54,7 +54,7 @@ def test_omitted_norm_stats_preserves_checkpoint_defaults(monkeypatch, tmp_path)
     args = parse(monkeypatch, tmp_path)
     eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
     assert "norm_stats" not in options
-    assert options["compute_variant"] == "bf16"
+    assert options["model_variant"] == "bf16"
     assert "precision" not in options
 
 

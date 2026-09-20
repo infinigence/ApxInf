@@ -49,7 +49,7 @@ cargo check -p apxinf-py
 import numpy as np
 import apxinf_py
 
-model = apxinf_py.ModelRunner.load("pi05", "/path/to/checkpoint", device="cuda:0", compute_variant="bf16")
+model = apxinf_py.ModelRunner.load("pi05", "/path/to/checkpoint", device="cuda:0", model_variant="bf16")
 
 rgb = np.zeros((model.num_views, model.image_size, model.image_size, 3), np.uint8)
 tokens = np.zeros(16, np.uint32)

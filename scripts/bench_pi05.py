@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified layered latency benchmark for the pi05 serving stack — L0 / L1 / L2 / L3.
 
-One entry point, driven by ``--layer × --compute-variant × weights-source × input``,
+One entry point, driven by ``--layer × --model-variant × weights-source × input``,
 that folds the former ``bench_pi05_layers.py`` (L0/L1/L2 in-process) and
 ``bench_pi05_openpi_latency.py`` (L3 websocket). The serving call peels into four
 concentric shells, each the cost of the layer around the one inside it:
@@ -31,18 +31,18 @@ server (``--host/--port``) and needs no local weights — serve with
 ``--random-weights`` for a fully checkpoint-free L3.
 
     # checkpoint-free engine floor — the zero-config default (no download)
-    python scripts/bench_pi05.py --compute-variant bf16 --views 2 --token-count 10
+    python scripts/bench_pi05.py --model-variant bf16 --views 2 --token-count 10
 
     # full in-process breakdown against a checkpoint
     python scripts/bench_pi05.py --model-dir /path/to/pi05 --layer l0,l1,l2 \
-        --compute-variant bf16 --prompt "put both moka pots on the stove"
+        --model-variant bf16 --prompt "put both moka pots on the stove"
 
     # same checkpoint, forced to a 10-step chunk instead of its native H=50
     python scripts/bench_pi05.py --model-dir /path/to/pi05 --layer l0,l1,l2 \
-        --compute-variant bf16 --action-horizon 10
+        --model-variant bf16 --action-horizon 10
 
     # L3 against a running websocket server
-    python scripts/bench_pi05.py --layer l3 --compute-variant bf16 \
+    python scripts/bench_pi05.py --layer l3 --model-variant bf16 \
         --host 127.0.0.1 --port 8000 --prompt "put both moka pots on the stove"
 """
 
@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="comma list of l0,l1,l2,l3 or `all` (default: all with --model-dir, else l0,l1)",
     )
-    p.add_argument("--compute-variant", choices=("bf16", "fp8_static", "int8_dynamic"), default="bf16")
+    p.add_argument("--model-variant", choices=("bf16", "fp8_static", "int8_dynamic"), default="bf16")
     p.add_argument("--model", default="pi05", help="model name for the random-weights engine")
     p.add_argument(
         "--model-type",
@@ -159,10 +159,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Calibration is public for synthetic FP8 latency runs. Tactics are routed
-    # internally by CUDA SM + compute_variant below.
+    # internally by CUDA SM + model_variant below.
     p.add_argument("--calibration", help="FP8 calibration json or `uniform:SCALE` (random mode)")
     # Internal escape hatch for tactic generation/debugging. Normal benchmark
-    # runs select the repository's validated JSON from CUDA SM + compute_variant.
+    # runs select the repository's validated JSON from CUDA SM + model_variant.
     p.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
     p.add_argument(
         "--autotune",
@@ -216,7 +216,7 @@ def _run_in_process(handle, policy, layers, observation, rgb, token_ids, noise, 
     return raw
 
 
-def _run_l3(host, port, compute_variant, prompt, warmup, samples):
+def _run_l3(host, port, model_variant, prompt, warmup, samples):
     """Attach to a running websocket server and time one round trip per call."""
     from openpi_client import websocket_client_policy
 
@@ -228,9 +228,9 @@ def _run_l3(host, port, compute_variant, prompt, warmup, samples):
 
     client = websocket_client_policy.WebsocketClientPolicy(host, port)
     metadata = client.get_server_metadata()
-    actual_compute_variant = metadata.get("compute_variant")
-    if actual_compute_variant != compute_variant:
-        raise RuntimeError(f"server compute_variant is {actual_compute_variant!r}, expected {compute_variant!r}")
+    actual_model_variant = metadata.get("model_variant")
+    if actual_model_variant != model_variant:
+        raise RuntimeError(f"server model_variant is {actual_model_variant!r}, expected {model_variant!r}")
     action_horizon = int(metadata.get("action_horizon", 10))
 
     rng = np.random.default_rng(0)
@@ -306,14 +306,14 @@ def main() -> None:
                 "native config apart from --action-horizon)"
             )
     # Calibration remains a synthetic FP8 knob here. Tactics are selected below
-    # from CUDA SM + compute_variant for both synthetic and checkpoint benchmarks.
+    # from CUDA SM + model_variant for both synthetic and checkpoint benchmarks.
     if checkpoint and args.calibration is not None:
         raise SystemExit(
             "--calibration only applies to synthetic weights (drop --model-dir); "
             "a checkpoint loads calibration.json from its model directory"
         )
-    if args.calibration is not None and args.compute_variant != "fp8_static":
-        raise SystemExit("--calibration only applies to --compute-variant fp8_static")
+    if args.calibration is not None and args.model_variant != "fp8_static":
+        raise SystemExit("--calibration only applies to --model-variant fp8_static")
     handle = None
     policy = None
     tactics = args.tactics
@@ -327,24 +327,24 @@ def main() -> None:
             # benchmark is the sole caller that must resolve the package default.
             tactics = resolve_pi05_tactics(
                 args.device,
-                args.compute_variant,
+                args.model_variant,
                 override=args.tactics,
                 allow_missing=args.autotune,
             )
             if tactics is not None:
                 print(
-                    f"using {args.compute_variant} tactics for {args.device}: {tactics}",
+                    f"using {args.model_variant} tactics for {args.device}: {tactics}",
                     file=sys.stderr,
                 )
             calibration = args.calibration
-            if args.compute_variant == "fp8_static" and calibration is None:
+            if args.model_variant == "fp8_static" and calibration is None:
                 # Synthetic FP8 has no calibration file; a uniform scale keeps the
                 # FP8 path on (the kernel falls back to a default tactic).
                 calibration = "uniform:1.0"
             handle = ModelRunner.random(
                 model=args.model,
                 device=args.device,
-                compute_variant=args.compute_variant,
+                model_variant=args.model_variant,
                 num_views=args.views if args.views is not None else 2,
                 image_size=args.image_size if args.image_size is not None else 224,
                 action_horizon=args.action_horizon if args.action_horizon is not None else 10,
@@ -412,7 +412,7 @@ def main() -> None:
                 args.model_dir,
                 model_type=args.model_type,
                 device=args.device,
-                compute_variant=args.compute_variant,
+                model_variant=args.model_variant,
                 **{name: value for name, value in options.items() if value is not None},
             )
             handle = policy.model_runner
@@ -473,7 +473,7 @@ def main() -> None:
     l3_segments = None
     if "l3" in layers:
         l3_metadata, l3_segments = _run_l3(
-            args.host, args.port, args.compute_variant, args.prompt, args.warmup, args.samples
+            args.host, args.port, args.model_variant, args.prompt, args.warmup, args.samples
         )
 
     # Assemble report.
@@ -482,7 +482,7 @@ def main() -> None:
     result = {
         "schema": "apxinf.pi05.latency.v2",
         "git_commit": _git_commit(),
-        "compute_variant": args.compute_variant,
+        "model_variant": args.model_variant,
         "device": args.device,
         "weights": "synthetic" if random else "checkpoint",
         "layers": layers,
@@ -515,7 +515,7 @@ def main() -> None:
     # Console table.
     if in_process_report:
         hdr = (
-            f"in-process latency  |  {args.compute_variant}  "
+            f"in-process latency  |  {args.model_variant}  "
             f"{'synthetic' if random else 'checkpoint'}  "
             f"H={handle.action_horizon} Dmodel={handle.action_dim} "
             f"views={handle.num_views} T={token_count}"
@@ -540,7 +540,7 @@ def main() -> None:
     if l3_segments is not None:
         stats = result["l3_segments_ms"]
         print(
-            f"\nL3 websocket  views={l3_metadata.get('num_views')} compute_variant={args.compute_variant} "
+            f"\nL3 websocket  views={l3_metadata.get('num_views')} model_variant={args.model_variant} "
             f"prompt={args.prompt!r} ({args.warmup} warmup + {args.samples} samples)"
         )
         header = f"{'segment':<18}{'p50':>9}{'p95':>9}{'min':>9}{'max':>9}{'mean':>9}{'std':>8}"

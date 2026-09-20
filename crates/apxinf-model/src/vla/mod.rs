@@ -241,6 +241,11 @@ pub struct VlaContract {
 /// The boxed return keeps this trait object-safe so `LoadedModel::Vla` can
 /// directly hold heterogeneous model runtimes.
 pub trait VlaRuntime {
+    /// Resolved model-local implementation ID, when supported by the family.
+    fn model_variant(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Fixed input/output capabilities of this loaded checkpoint.
     fn contract(&self) -> VlaContract;
 

@@ -380,8 +380,8 @@ class WebsocketBackend:
         self.metadata = self._client.get_server_metadata()
         self._keys = keys
         actual_precision = self.metadata.get("precision")
-        if "compute_variant" in self.metadata:
-            actual_precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}.get(self.metadata["compute_variant"])
+        if "model_variant" in self.metadata:
+            actual_precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}.get(self.metadata["model_variant"])
 
         if actual_precision != expected_precision:
             self.close()
@@ -487,7 +487,7 @@ class InProcessBackend:
         # Campaign precision is a numerical comparison category in the ledger.
         # PI0.5 loading uses a model-local implementation ID instead.
         selector = (
-            {"compute_variant": {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]}
+            {"model_variant": {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]}
             if model_type == "pi05" else {"precision": args.precision}
         )
         self._policy = AutoPolicy.from_pretrained(

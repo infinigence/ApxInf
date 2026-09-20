@@ -219,7 +219,7 @@ def _run_precision(
 
     options: dict[str, Any] = {
         "device": device,
-        "compute_variant": {"bf16": "bf16", "fp8": "fp8_static"}[precision],
+        "model_variant": {"bf16": "bf16", "fp8": "fp8_static"}[precision],
         "seed": seed,
         "image_keys": tuple(image_keys),
         "num_views": len(image_keys),

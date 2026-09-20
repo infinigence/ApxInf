@@ -40,7 +40,7 @@ def policy_kwargs(
     *,
     device: str,
     precision: Optional[str] = None,
-    compute_variant: Optional[str] = None,
+    model_variant: Optional[str] = None,
     action_dim: int = 0,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -55,14 +55,14 @@ def policy_kwargs(
         if not isinstance(caller_metadata, dict):
             raise ValueError("policy-options metadata must be a JSON object")
         kwargs["metadata"] = {**caller_metadata, **metadata}
-    if precision is not None and compute_variant is not None:
-        raise ValueError("choose compute_variant for PI0.5 or precision for other models")
+    if precision is not None and model_variant is not None:
+        raise ValueError("choose model_variant for PI0.5 or precision for other models")
     kwargs["device"] = device
-    if compute_variant is not None:
+    if model_variant is not None:
         kwargs.pop("precision", None)
-        kwargs["compute_variant"] = compute_variant
+        kwargs["model_variant"] = model_variant
     elif precision is not None:
-        kwargs.pop("compute_variant", None)
+        kwargs.pop("model_variant", None)
         kwargs["precision"] = precision
     if action_dim:
         kwargs["action_dim"] = action_dim

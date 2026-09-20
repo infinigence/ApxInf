@@ -18,8 +18,8 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             (110, "bf16", "thor-sm110"),
             (110, "fp8_static", "thor-sm110"),
         ]
-        for sm, compute_variant, directory in cases:
-            with self.subTest(sm=sm, compute_variant=compute_variant), tempfile.TemporaryDirectory() as root:
+        for sm, model_variant, directory in cases:
+            with self.subTest(sm=sm, model_variant=model_variant), tempfile.TemporaryDirectory() as root:
                 root = pathlib.Path(root)
                 path = root / "configs" / "tuning" / "nvidia" / directory / "tactics.json"
                 path.parent.mkdir(parents=True)
@@ -27,7 +27,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
                 with mock.patch.object(_tactics, "_SOURCE_ROOT", root), mock.patch.object(
                     _tactics, "cuda_sm", return_value=sm
                 ):
-                    selected = _tactics.resolve_pi05_tactics("cuda:0", compute_variant)
+                    selected = _tactics.resolve_pi05_tactics("cuda:0", model_variant)
                 self.assertEqual(selected, path)
 
     def test_checkpoint_tactics_precede_source_default(self):
@@ -123,7 +123,7 @@ class Pi05TacticSelectionTest(unittest.TestCase):
             pi05.Pi05Policy.from_pretrained(
                 model_dir,
                 device="cuda:0",
-                compute_variant="bf16",
+                model_variant="bf16",
                 autotune=True,
                 tokenizer_path=str(tokenizer_path),
             )

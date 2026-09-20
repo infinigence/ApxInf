@@ -140,12 +140,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
-        "--compute-variant", choices=("auto", "fp8_static", "bf16", "int8_dynamic"), default="bf16"
+        "--model-variant", choices=("auto", "fp8_static", "bf16", "int8_dynamic"), default="bf16"
     )
     parser.add_argument(
         "--calibration",
         type=pathlib.Path,
-        help="FP8 activation calibration JSON; required only for --compute-variant fp8_static",
+        help="FP8 activation calibration JSON; required only for --model-variant fp8_static",
     )
     parser.add_argument(
         "--tactics",
@@ -243,7 +243,7 @@ def main() -> None:
 
     metadata = {
         "protocol": "openpi.websocket_policy",
-        "compute_variant": args.compute_variant,
+        "model_variant": args.model_variant,
         "policy": "pi05",
         "autotune": args.autotune,
     }
@@ -254,16 +254,16 @@ def main() -> None:
         # server is the sole caller that must resolve the package default.
         tactics = resolve_pi05_tactics(
             args.device,
-            args.compute_variant,
+            args.model_variant,
             override=args.tactics,
             allow_missing=args.autotune,
         )
         if tactics is not None:
-            logging.info("using %s tactics for %s: %s", args.compute_variant, args.device, tactics)
+            logging.info("using %s tactics for %s: %s", args.model_variant, args.device, tactics)
         # Synthetic FP8 has no calibration file; a uniform activation scale keeps the
         # FP8 path on. bf16/int8 need neither calibration nor tactics.
         calibration = None
-        if args.compute_variant == "fp8_static":
+        if args.model_variant == "fp8_static":
             calibration = str(args.calibration) if args.calibration is not None else "uniform:1.0"
         action_horizon = args.action_horizon if args.action_horizon is not None else 50
         # There is no checkpoint to read a camera count off, so it has to be said:
@@ -292,7 +292,7 @@ def main() -> None:
         logging.info(
             "serving checkpoint-free %s random-weights engine (views=%d, H=%d, T=%d) "
             "— actions are latency-only",
-            args.compute_variant,
+            args.model_variant,
             num_views,
             action_horizon,
             args.token_count,
@@ -300,7 +300,7 @@ def main() -> None:
         handle = apxinf_py.ModelRunner.random(
             model=(args.model_type or "pi05"),
             device=args.device,
-            compute_variant=args.compute_variant,
+            model_variant=args.model_variant,
             num_views=num_views,
             image_size=args.image_size,
             action_horizon=action_horizon,
@@ -346,12 +346,12 @@ def main() -> None:
             )
             logging.log(level, "preflight %s", finding)
 
-        logging.info("loading %s policy in-process from %s", args.compute_variant, args.model_dir)
+        logging.info("loading %s policy in-process from %s", args.model_variant, args.model_dir)
         options = {
             "model_type": args.model_type,
             "checkpoint": args.checkpoint,
             "device": args.device,
-            "compute_variant": args.compute_variant,
+            "model_variant": args.model_variant,
             "calibration": args.calibration,
             "tactics": args.tactics,
             "autotune": args.autotune,

@@ -26,6 +26,8 @@ pub struct PreparedGemmPlan {
     pub tactic: TacticId,
     pub source: PlanSource,
     generation: u64,
+    // This plan was prepared before real-input tuning was allowed.
+    autotune_pending: bool,
 }
 
 #[derive(Debug, Default)]
@@ -55,7 +57,14 @@ impl GemmPlanCache {
         }
 
         let resolved = session.lookup_gemm(key);
-        self.prepare_and_cache(key, default, resolved, generation)
+        self.prepare_and_cache(
+            key,
+            default,
+            resolved,
+            generation,
+            session.mode() == TuningMode::AutoTune
+                && !matches!(resolved, Some(value) if value.source == TacticMatch::Exact),
+        )
     }
 
     /// Resolve an exact plan from the request's real operands. The tuning
@@ -69,12 +78,18 @@ impl GemmPlanCache {
     ) -> Result<PreparedGemmPlan> {
         let session = ctx.tuning();
         let generation = session.generation();
+        let can_autotune = session.mode() == TuningMode::AutoTune
+            && !crate::tuning::autotune_suppressed()
+            && crate::workspace::may_prepare_native_resources()
+            && !crate::workspace::is_preparing_workspace();
         if let Some(plan) = self
             .plans
             .lock()
             .map_err(|_| Error::Other("CUDA GEMM plan cache lock is poisoned".into()))?
             .get(key)
-            .filter(|plan| plan.generation == generation)
+            .filter(|plan| {
+                plan.generation == generation && !(can_autotune && plan.autotune_pending)
+            })
             .cloned()
         {
             return Ok(plan);
@@ -82,12 +97,7 @@ impl GemmPlanCache {
 
         let mut resolved = session.lookup_gemm(key);
         let needs_exact = !matches!(resolved, Some(value) if value.source == TacticMatch::Exact);
-        if needs_exact
-            && session.mode() == TuningMode::AutoTune
-            && !crate::tuning::autotune_suppressed()
-            && crate::workspace::may_prepare_native_resources()
-            && !crate::workspace::is_preparing_workspace()
-        {
+        if needs_exact && can_autotune {
             match session.tune_gemm(ctx.caps(), ctx.library_versions(), key, tune) {
                 Ok(tuned) => resolved = Some(tuned),
                 Err(error) => {
@@ -96,7 +106,17 @@ impl GemmPlanCache {
                 }
             }
         }
-        self.prepare_and_cache(key, default, resolved, session.generation())
+        // A failed attempt keeps its fallback cached until the tuning generation
+        // changes. Only deferred work should reopen the cache on the next call.
+        let autotune_pending =
+            needs_exact && session.mode() == TuningMode::AutoTune && !can_autotune;
+        self.prepare_and_cache(
+            key,
+            default,
+            resolved,
+            session.generation(),
+            autotune_pending,
+        )
     }
 
     fn prepare_and_cache(
@@ -105,12 +125,14 @@ impl GemmPlanCache {
         default: TacticId,
         resolved: Option<crate::tuning::ResolvedTactic>,
         generation: u64,
+        autotune_pending: bool,
     ) -> Result<PreparedGemmPlan> {
         self.prepare_and_cache_with(
             key,
             default,
             resolved,
             generation,
+            autotune_pending,
             crate::workspace::may_prepare_native_resources(),
             providers::prepare,
         )
@@ -122,6 +144,7 @@ impl GemmPlanCache {
         default: TacticId,
         resolved: Option<crate::tuning::ResolvedTactic>,
         generation: u64,
+        autotune_pending: bool,
         may_prepare_native_resources: bool,
         mut prepare: impl FnMut(&GemmTuningKey, TacticId) -> Result<()>,
     ) -> Result<PreparedGemmPlan> {
@@ -153,6 +176,7 @@ impl GemmPlanCache {
             tactic,
             source,
             generation,
+            autotune_pending,
         };
         self.plans
             .lock()
@@ -187,6 +211,12 @@ impl GemmPlanCache {
             tactic,
             source: PlanSource::Default,
             generation: ctx.tuning().generation(),
+            autotune_pending: self
+                .plans
+                .lock()
+                .map_err(|_| Error::Other("CUDA GEMM plan cache lock is poisoned".into()))?
+                .get(key)
+                .is_some_and(|plan| plan.autotune_pending),
         };
         self.plans
             .lock()
@@ -275,14 +305,82 @@ mod tests {
         let cache = GemmPlanCache::default();
         let mut prepare_called = false;
         let error = cache
-            .prepare_and_cache_with(&key(), default_bf16_tactic(), None, 0, false, |_, _| {
-                prepare_called = true;
-                Ok(())
-            })
+            .prepare_and_cache_with(
+                &key(),
+                default_bf16_tactic(),
+                None,
+                0,
+                false,
+                false,
+                |_, _| {
+                    prepare_called = true;
+                    Ok(())
+                },
+            )
             .unwrap_err();
 
         assert!(!prepare_called);
         assert!(error.to_string().contains("plan cache miss"));
         assert!(error.to_string().contains("before capture"));
+    }
+    #[test]
+    fn deferred_bucket_tuning_and_failed_attempts_are_not_confused() {
+        use crate::tuning::{GemmTuningRecord, TacticStore, TuningSession};
+        let backend = crate::CudaBackend::new(0).unwrap();
+        let ctx = backend.context();
+        let mut key = key();
+        key.device = DeviceFingerprint::from(ctx.caps());
+        key.m = 8;
+        key.n = 64;
+        key.k = 64;
+        let tactic = default_bf16_tactic();
+        for fail in [false, true] {
+            let mut bucket_key = key.clone();
+            bucket_key.m = 7;
+            let record = |key| GemmTuningRecord {
+                key,
+                tactic,
+                implementation_version: None,
+                milliseconds: Some(1.0),
+            };
+            let store = TacticStore::from_gemm_records([record(bucket_key)]).unwrap();
+            ctx.install_tuning(TuningSession::new(TuningMode::AutoTune, store, None))
+                .unwrap();
+            let cache = GemmPlanCache::default();
+            let before = crate::tuning::without_autotune(|| {
+                cache.resolve_or_tune(ctx, &key, tactic, |_| panic!("suppressed tuning"))
+            })
+            .unwrap();
+            assert_eq!(before.source, PlanSource::Bucket);
+            let calls = std::cell::Cell::new(0);
+            let after = cache
+                .resolve_or_tune(ctx, &key, tactic, |_| {
+                    calls.set(calls.get() + 1);
+                    if fail {
+                        Err(Error::Other("test: no valid candidate".into()))
+                    } else {
+                        Ok(TuningOutcome {
+                            winner: record(key.clone()),
+                            candidates: vec![],
+                        })
+                    }
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert_eq!(
+                after.source,
+                if fail {
+                    PlanSource::Bucket
+                } else {
+                    PlanSource::Exact
+                }
+            );
+            let repeated = cache
+                .resolve_or_tune(ctx, &key, tactic, |_| {
+                    panic!("completed tuning attempts must not repeat")
+                })
+                .unwrap();
+            assert_eq!(after, repeated);
+        }
     }
 }

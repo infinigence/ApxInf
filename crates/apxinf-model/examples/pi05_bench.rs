@@ -1,7 +1,7 @@
 //! Unified low-level latency benchmark for PI0.5 (BF16 / FP8 / INT8-W8A8).
 //!
 //! This single example replaces the former `pi05_{bf16,thor,int8}_bench.rs`. It
-//! bypasses the unified `AutoModel`/`infer` frontend and drives the compute_variant-native
+//! bypasses the unified `AutoModel`/`infer` frontend and drives the variant-specific
 //! `Pi05{Bf16,,Int8Dynamic}CudaRuntime` directly, because it needs `apxinf_cuda`
 //! profiler hooks, tuning-DB install and raw device inputs that the model
 //! abstraction does not (and should not) expose. For an abstraction-level entry
@@ -9,11 +9,11 @@
 //!
 //! The benchmark runs **checkpoint-free** with deterministic random weights
 //! (`<source>` == `random`), because graph-replay latency depends only on tensor
-//! shape and compute_variant, not on trained values. Pass a checkpoint path/index instead
+//! shape and model_variant, not on trained values. Pass a checkpoint path/index instead
 //! to measure a real model and validate against a captured reference.
 //!
 //! ```text
-//! pi05_bench <checkpoint-or-index|random> --compute-variant {bf16,fp8_static,int8_dynamic}
+//! pi05_bench <checkpoint-or-index|random> --model-variant {bf16,fp8_static,int8_dynamic}
 //!     [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune]
 //!     [--views N] [--image-size N] [--action-horizon N] [--action-dim N]
 //!     [--num-flow-steps N] [--max-token-len N]            (random-only overrides)
@@ -56,12 +56,12 @@ impl BenchVariant {
             "fp8_static" => Ok(Self::Fp8Static),
             "int8_dynamic" => Ok(Self::Int8Dynamic),
             other => Err(format!(
-                "--compute-variant must be bf16, fp8_static, or int8_dynamic; got {other}"
+                "--model-variant must be bf16, fp8_static, or int8_dynamic; got {other}"
             )),
         }
     }
 
-    /// Device compute_variant of the patch/noise inputs feeding the graph.
+    /// Device dtype of the patch/noise inputs feeding the graph.
     fn io_dtype(self) -> DType {
         match self {
             Self::Fp8Static => DType::F16,
@@ -110,7 +110,7 @@ impl BenchVariant {
     }
 }
 
-/// Per-compute_variant integrity gates (see `BenchVariant::thresholds`). `eager_graph_min_cosine`
+/// Per-variant integrity gates (see `BenchVariant::thresholds`). `eager_graph_min_cosine`
 /// is a shared `0.999_999`; the reference cosine floor may be overridden.
 #[derive(Clone, Copy, Debug)]
 struct Thresholds {
@@ -254,9 +254,9 @@ impl ImageInput {
         }
     }
 
-    fn label(self, compute_variant: BenchVariant) -> &'static str {
+    fn label(self, model_variant: BenchVariant) -> &'static str {
         match self {
-            Self::Patches => compute_variant.patches_label(),
+            Self::Patches => model_variant.patches_label(),
             Self::Rgb(Pi05ImageLayout::Nhwc) => "rgb_u8_nhwc",
             Self::Rgb(Pi05ImageLayout::Nchw) => "rgb_u8_nchw",
         }
@@ -536,13 +536,13 @@ fn latency_json(mut milliseconds: Vec<f64>) -> serde_json::Value {
 /// the former `pi05_thor_bench`); BF16/INT8 accept a bare `{ "raw_actions": [..] }`.
 fn reference_actions(
     path: &Path,
-    compute_variant: BenchVariant,
+    model_variant: BenchVariant,
     config: &Pi05Config,
     token_count: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(path)?;
     let document: serde_json::Value = serde_json::from_str(&raw)?;
-    if compute_variant == BenchVariant::Fp8Static {
+    if model_variant == BenchVariant::Fp8Static {
         let expected_integer = |name: &str, expected: usize| -> Result<(), String> {
             let actual = document
                 .get(name)
@@ -603,7 +603,7 @@ fn reference_actions(
 #[derive(Debug)]
 struct Args {
     source: String,
-    compute_variant: BenchVariant,
+    model_variant: BenchVariant,
     calibration: Option<String>,
     tactics: Option<String>,
     autotune: bool,
@@ -635,7 +635,7 @@ impl Args {
         }
 
         let mut source: Option<String> = None;
-        let mut compute_variant: Option<BenchVariant> = None;
+        let mut model_variant: Option<BenchVariant> = None;
         let mut calibration = None;
         let mut tactics = None;
         let mut autotune = false;
@@ -659,11 +659,11 @@ impl Args {
         while index < raw.len() {
             let argument = raw[index].as_str();
             match argument {
-                "--compute-variant" => {
-                    compute_variant = Some(BenchVariant::parse(&expect_value(
+                "--model-variant" => {
+                    model_variant = Some(BenchVariant::parse(&expect_value(
                         raw,
                         &mut index,
-                        "--compute-variant",
+                        "--model-variant",
                     )?)?)
                 }
                 "--calibration" => {
@@ -723,8 +723,8 @@ impl Args {
         }
 
         let source = source.ok_or("missing <checkpoint-or-index|random> positional argument")?;
-        let compute_variant = compute_variant
-            .ok_or("missing required --compute-variant {bf16,fp8_static,int8_dynamic}")?;
+        let model_variant = model_variant
+            .ok_or("missing required --model-variant {bf16,fp8_static,int8_dynamic}")?;
         validate_explicit_tactics_path(tactics.as_deref(), autotune)?;
         if iterations == 0 {
             return Err("--iterations must be non-zero".into());
@@ -736,7 +736,7 @@ impl Args {
         }
         Ok(Self {
             source,
-            compute_variant,
+            model_variant,
             calibration,
             tactics,
             autotune,
@@ -775,7 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::env::args().collect::<Vec<_>>();
     let args = Args::parse(&raw).map_err(|error| {
         format!(
-            "{error}\nusage: {} <checkpoint-or-index|random> --compute-variant {{bf16,fp8_static,int8_dynamic}} \
+            "{error}\nusage: {} <checkpoint-or-index|random> --model-variant {{bf16,fp8_static,int8_dynamic}} \
              [--calibration <json|uniform:SCALE>] [--tactics <json>] [--autotune] [--views N] \
              [--image-size N] [--action-horizon N] [--action-dim N] [--num-flow-steps N] \
              [--max-token-len N] [--token-count T] [--iterations N] [--seed N] \
@@ -786,8 +786,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let random = args.source == "random";
-    let compute_variant = args.compute_variant;
-    let thresholds = compute_variant.thresholds();
+    let model_variant = args.model_variant;
+    let thresholds = model_variant.thresholds();
     let token_count = args.token_count;
     let iterations = args.iterations;
     let image_input = ImageInput::resolve(args.image_input.as_deref())?;
@@ -824,8 +824,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // All GEMM precisions share the hardware tactic database; calibration is
     // still specific to FP8 activations.
-    if compute_variant != BenchVariant::Fp8Static && args.calibration.is_some() {
-        return Err("--calibration only applies to --compute-variant fp8".into());
+    if model_variant != BenchVariant::Fp8Static && args.calibration.is_some() {
+        return Err("--calibration only applies to --model-variant fp8".into());
     }
 
     let config = if random {
@@ -910,7 +910,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Pi05Weights::from_safetensors(&config, Path::new(&args.source))?
     };
 
-    let bench = match compute_variant {
+    let bench = match model_variant {
         BenchVariant::Bf16 => {
             eprintln!("converting and uploading native BF16 weights...");
             let device_weights = Arc::new(Bf16Weights::from_host(
@@ -960,7 +960,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => {
                     return Err(
-                        "--compute-variant fp8_static requires --calibration <json|uniform:SCALE> for a checkpoint"
+                        "--model-variant fp8_static requires --calibration <json|uniform:SCALE> for a checkpoint"
                             .into(),
                     )
                 }
@@ -990,7 +990,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(host_weights);
 
-    let io_dtype = compute_variant.io_dtype();
+    let io_dtype = model_variant.io_dtype();
     let patch_rows = config.num_views * config.patches_per_view();
     let patch_width = 3 * config.patch_size * config.patch_size;
     let (raw_images, patches_host) = match image_input {
@@ -1014,7 +1014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     token_ids
         .copy_from_host(&token_bytes)
         .map_err(std::io::Error::other)?;
-    let time_embeddings = match compute_variant {
+    let time_embeddings = match model_variant {
         BenchVariant::Bf16 => upload_time_embeddings_bf16(&config, &*backend)?,
         BenchVariant::Fp8Static => upload_time_embeddings_fp8_static(&config, &*backend)?,
         BenchVariant::Int8Dynamic => upload_time_embeddings_int8_dynamic(&config, &*backend)?,
@@ -1022,7 +1022,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "running eager {} integrity pass...",
-        compute_variant.variant_label()
+        model_variant.variant_label()
     );
     let eager_output = bench.infer(&patches, &token_ids, token_count, &noise, &time_embeddings)?;
     let eager = backend.to_cpu(&eager_output)?.to_f32_vec()?;
@@ -1033,7 +1033,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "compute_variant": compute_variant.variant_label(),
+                "model_variant": model_variant.variant_label(),
                 "mode": "eager_only",
                 "token_count": token_count,
                 "output_abs_checksum": checksum,
@@ -1044,8 +1044,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "capturing {} graph with {} input...",
-        compute_variant.variant_label(),
-        image_input.label(compute_variant)
+        model_variant.variant_label(),
+        image_input.label(model_variant)
     );
     let graph = match image_input {
         ImageInput::Patches => {
@@ -1068,7 +1068,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reference_metrics = args
         .reference
         .as_ref()
-        .map(|path| reference_actions(Path::new(path), compute_variant, &config, token_count))
+        .map(|path| reference_actions(Path::new(path), model_variant, &config, token_count))
         .transpose()?
         .map(|expected| ErrorMetrics::measure(&captured, &expected))
         .transpose()?;
@@ -1136,10 +1136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "profile": profile,
-            "compute_variant": compute_variant.variant_label(),
+            "model_variant": model_variant.variant_label(),
             "weights": if random { "synthetic" } else { "checkpoint" },
             "image_input": {
-                "kind": image_input.label(compute_variant),
+                "kind": image_input.label(model_variant),
                 "graph_includes_cuda_preprocess": matches!(image_input, ImageInput::Rgb(_)),
                 "graph_latency_includes_h2d": false,
                 "input_update_plus_graph_latency_ms": update_plus_graph_latency,
@@ -1195,7 +1195,7 @@ mod tests {
     use super::*;
 
     fn arguments(extra: &[&str]) -> Vec<String> {
-        ["pi05_bench", "random", "--compute-variant", "fp8_static"]
+        ["pi05_bench", "random", "--model-variant", "fp8_static"]
             .into_iter()
             .chain(extra.iter().copied())
             .map(str::to_owned)

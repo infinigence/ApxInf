@@ -38,13 +38,13 @@ model-specific example only when it demonstrates a genuinely distinct workflow.
 
 ## Quick start
 
-Use `--compute-variant bf16|fp8_static|int8_dynamic|auto` for PI0.5.
+Use `--model-variant bf16|fp8_static|int8_dynamic|auto` for PI0.5.
 The generic examples retain `--precision` for other model families; choose one
 selector. Without either flag, the selected policy applies its default.
 
 ```sh
 # Terminal 1 — serve a checkpoint
-python examples/openpi_server.py --model-dir /path/to/checkpoint --compute-variant bf16
+python examples/openpi_server.py --model-dir /path/to/checkpoint --model-variant bf16
 
 # Terminal 2 — one round trip against it
 python examples/openpi_client.py --host 127.0.0.1 --port 8000

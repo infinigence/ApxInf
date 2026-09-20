@@ -103,7 +103,7 @@ and historical GPU evidence do not prove a new family's acceptance.
    family runner and `LoadedModel::Vla` for VLA. Wire Rust registration; for
    VLA, also wire Python policy discovery and reuse `apxinf.ModelRunner` / `apxinf_py.ModelRunner`
    and `model_runner` injection. Check the common loader's current
-   `compute_variant` admission and PI0.5-only config overrides before extending
+   `model_variant` admission and PI0.5-only config overrides before extending
    options. When adopting explicit preparation, read the implemented PI0.5
    section of `doc/model-lifecycle/lifecycle.md`. Test mode/fallback, stale-plan
    rejection, tuning-store replacement/generation, compatible run without

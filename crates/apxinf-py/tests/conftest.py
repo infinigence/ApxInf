@@ -6,9 +6,9 @@ extension is not built with ``--features cuda`` or no checkpoint is provided:
 
   APXINF_PI05_CHECKPOINT   checkpoint dir (with config.json) or index file  [required]
   APXINF_PI05_DEVICE       device string, default "cuda:0"
-  APXINF_PI05_PRECISION    auto|fp8|bf16|int8, default "bf16"
-  APXINF_PI05_CALIBRATION  FP8 calibration.json (only for precision=fp8)
-  APXINF_PI05_TACTICS      FP8 tactics.json    (only for precision=fp8)
+  APXINF_PI05_MODEL_VARIANT auto|bf16|fp8_static|int8_dynamic, default "bf16"
+  APXINF_PI05_CALIBRATION  FP8 calibration.json (only for model_variant=fp8_static)
+  APXINF_PI05_TACTICS      FP8 tactics.json    (only for model_variant=fp8_static)
 """
 
 import os
@@ -27,15 +27,15 @@ def _checkpoint() -> str:
 
 
 @pytest.fixture(scope="session")
-def precision() -> str:
-    return os.environ.get("APXINF_PI05_PRECISION", "bf16")
+def model_variant() -> str:
+    return os.environ.get("APXINF_PI05_MODEL_VARIANT", "bf16")
 
 
 @pytest.fixture(scope="session")
-def model(precision: str) -> "apxinf_py.ModelRunner":
+def model(model_variant: str) -> "apxinf_py.ModelRunner":
     kwargs = {
         "device": os.environ.get("APXINF_PI05_DEVICE", "cuda:0"),
-        "compute_variant": {"fp8": "fp8_static", "int8": "int8_dynamic"}.get(precision, precision),
+        "model_variant": model_variant,
     }
     calibration = os.environ.get("APXINF_PI05_CALIBRATION")
     tactics = os.environ.get("APXINF_PI05_TACTICS")

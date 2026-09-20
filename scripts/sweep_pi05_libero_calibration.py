@@ -115,7 +115,7 @@ def main() -> None:
             "pi05",
             str(args.checkpoint),
             device=args.device,
-            compute_variant="fp8_static",
+            model_variant="fp8_static",
             calibration=str(calibration),
             tactics=str(args.tactics),
         )

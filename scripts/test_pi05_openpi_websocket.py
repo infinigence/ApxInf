@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--expected-compute-variant", choices=("fp8_static", "bf16", "int8_dynamic"))
+    parser.add_argument("--expected-model-variant", choices=("fp8_static", "bf16", "int8_dynamic"))
     # The action shape is a property of whatever the server is serving — a
     # checkpoint runs its native horizon (pi05_libero_base = 50) while a
     # --random-weights server runs whatever shape it was started with. Default to
@@ -110,11 +110,11 @@ def main() -> None:
 
     client = websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
     metadata = client.get_server_metadata()
-    if args.expected_compute_variant is not None:
-        actual_compute_variant = metadata.get("compute_variant")
-        if actual_compute_variant != args.expected_compute_variant:
+    if args.expected_model_variant is not None:
+        actual_model_variant = metadata.get("model_variant")
+        if actual_model_variant != args.expected_model_variant:
             raise RuntimeError(
-                f"server compute_variant is {actual_compute_variant!r}, expected {args.expected_compute_variant!r}"
+                f"server model_variant is {actual_model_variant!r}, expected {args.expected_model_variant!r}"
             )
     action_shape = expected_action_shape(args, metadata)
 

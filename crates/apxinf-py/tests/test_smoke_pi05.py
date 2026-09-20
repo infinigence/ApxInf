@@ -75,3 +75,10 @@ def test_bad_rgb_bytes_raise(model):
     noise = make_noise(model)
     with pytest.raises(ValueError, match="rgb_u8 expected"):
         model.infer_rgb(rgb, "nhwc", tokens, noise)
+
+
+def test_loaded_model_variant_is_resolved(model, model_variant):
+    expected = model_variant
+    assert model.model_variant in {"bf16", "fp8_static", "int8_dynamic"}
+    if expected != "auto":
+        assert model.model_variant == expected

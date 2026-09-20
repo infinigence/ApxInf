@@ -213,3 +213,41 @@ def test_websocket_example_leaves_unnamed_keys_to_the_policy(monkeypatch, tmp_pa
     assert "state_key" not in captured["kwargs"]
     assert captured["served"] is True
     assert captured["closed"] is True
+
+
+@pytest.mark.parametrize("variant,precision", [("bf16", "bf16"), ("fp8_static", "fp8"), ("int8_dynamic", "int8")])
+def test_websocket_model_variant_cli_reaches_evaluator(monkeypatch, tmp_path, variant, precision):
+    from types import SimpleNamespace
+    from scripts import eval_libero
+    example = _load_example("openpi_server")
+    captured = {}
+    monkeypatch.setattr(sys, "argv", ["openpi_server", "--model-dir", str(tmp_path),
+                                    "--model-variant", variant])
+
+    class Policy:
+        def close(self): pass
+
+    def load(*args, **kwargs):
+        captured.update(kwargs)
+        return Policy()
+
+    class Server:
+        def __init__(self, *args): pass
+        def serve_forever(self): pass
+
+    monkeypatch.setattr(example.AutoPolicy, "from_pretrained", load)
+    monkeypatch.setattr(example, "WebsocketPolicyServer", Server)
+    example.main()
+    assert captured["model_variant"] == variant
+    assert captured["metadata"]["model_variant"] == variant
+    assert "precision" not in captured["metadata"]
+
+    class Client:
+        def __init__(self, *args): pass
+        def get_server_metadata(self): return captured["metadata"]
+        def close(self): pass
+
+    monkeypatch.setitem(sys.modules, "openpi_client", SimpleNamespace(
+        websocket_client_policy=SimpleNamespace(WebsocketClientPolicy=Client)))
+    backend = eval_libero.WebsocketBackend("localhost", 8000, precision, None)
+    backend.close()

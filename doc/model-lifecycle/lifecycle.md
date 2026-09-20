@@ -10,11 +10,11 @@ are retained at the end; they are not additional APIs to implement by name.
 
 These Rust interfaces are implemented on the refactor branch. Hardware evidence
 and model coverage are recorded in the [migration tracker](migration.md).
-PI0.5 supports them for all three ComputeVariant choices. Other VLA families
+PI0.5 supports them for all three ModelVariantChoice choices. Other VLA families
 retain their existing prepare path and return an unsupported error for the new
 policy methods; their default status is RuntimeManaged, never a fabricated Ready.
 Python processing and action decoding are unchanged; PI0.5 loading uses the new
-compute_variant field. See the architecture document for breaking entry changes.
+model_variant field. See the architecture document for breaking entry changes.
 
 ### ModelRunner 生命周期：准备、执行、失效与释放
 
@@ -470,3 +470,18 @@ graph parity, state reset, graph reuse/invalidation, fallback/cleanup, cancellat
 and output lifetime as applicable. Measure cold preparation, steady-state latency,
 LLM TTFT/TPOT, and device memory separately. A documentation or CPU check does not
 qualify native GPU execution; unsupported or untested matrix cells remain explicit.
+
+
+### Deferred GEMM autotuning
+
+Preparation and prepared runs suppress autotuning, but may cache default or
+bucket GEMM choices. Those plans retain an `autotune_pending` flag. A later
+real-input `prepare_for` with an AutoTune backend resolves the deferred work
+before reusing the plan. Exact choices and already attempted tuning failures
+remain cached within the same tuning generation. Publishing new exact choices
+invalidates previously prepared inference plans through the existing generation
+check; callers must use the newly returned plan.
+
+The native regression `native_prepare_for_tunes_after_suppressed_preparation`
+checks both Eager and RequireGraph with a real checkpoint. It verifies deferred
+tuning, stale-plan rejection and reuse without repeated tuning.
