@@ -5,6 +5,12 @@ Thor (sm_110) and the RTX 4090 (sm_89). This is what to know before changing
 anything that behaves differently on one of them: where each kind of
 per-device decision belongs, and what the constants currently are.
 
+The Rust text registry loads only the VLM. An adjacent `planner-sft` directory
+does not enable planning through `LlmTrait`; the planning-capable model/Python
+policy must explicitly request its planner checkpoint. Projection layout is
+selected once during model construction and retained with the device weights,
+so weight packing and execution use the same physical representation.
+
 ## The fixed workload
 
 Four public VQA scenes from WOD_E2E, batch 1, BF16, exactly 64 generated

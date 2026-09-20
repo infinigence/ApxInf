@@ -164,6 +164,11 @@ impl PlanningExpertConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.layers_per_kv == 0 {
+            return Err(Error::Other(
+                "qwen_drive expert config: layers_per_kv must be greater than zero".into(),
+            ));
+        }
         if self.n_layers % self.layers_per_kv != 0 {
             return Err(Error::Other(format!(
                 "qwen_drive expert config: {} layers not divisible by layers_per_kv {}",
@@ -397,6 +402,7 @@ impl QwenDriveConfig {
     /// post-rotary K/V directly, so their attention geometry must match and
     /// the number of exported caches must equal the expert's KV sources.
     pub fn validate(&self) -> Result<()> {
+        self.expert.validate()?;
         let full = self.text.full_attention_layers();
         if full.len() != self.expert.num_kv_sources() {
             return Err(Error::Other(format!(
@@ -549,5 +555,21 @@ mod tests {
         assert!(err.is_err());
         let message = format!("{}", err.err().unwrap());
         assert!(message.contains("full-attention"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn rejects_zero_layers_per_kv_when_loading_json() {
+        let broken = CHECKPOINT_CONFIG.replace("\"layers_per_kv\": 4", "\"layers_per_kv\": 0");
+        let error = QwenDriveConfig::from_json_str(&broken).unwrap_err();
+        assert!(error.to_string().contains("layers_per_kv must be greater than zero"));
+    }
+
+    #[test]
+    fn validates_expert_before_counting_scene_caches() {
+        let mut config = QwenDriveConfig::from_json_str(CHECKPOINT_CONFIG).unwrap();
+        config.expert.layers_per_kv = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("layers_per_kv"));
+        config.expert.layers_per_kv = 3;
+        assert!(config.validate().unwrap_err().to_string().contains("not divisible"));
     }
 }

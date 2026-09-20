@@ -71,11 +71,9 @@ fn load_qwen3vl(
     Ok(LoadedModel::text(Box::new(model)))
 }
 
-/// Load the Qwen-Drive VLM through the maintained registry surface. When the
-/// checkpoint ships the SFT planner head beside the VLM it is attached so the
-/// direct-planning flow works out of the box; the Python policy passes an
-/// explicit planner path for the RL head. CUDA-only: other devices fail
-/// clearly here.
+/// Load only the Qwen-Drive VLM through the text registry. Planning weights
+/// require an explicit planner path through the planning-capable model/policy
+/// entry point; an adjacent directory does not add capabilities to LlmTrait.
 fn load_qwen_drive(
     path: &Path,
     device: Device,
@@ -89,14 +87,8 @@ fn load_qwen_drive(
         } else {
             path.parent().unwrap_or_else(|| Path::new("."))
         };
-        let planner_dir = model_dir.join("planner-sft");
-        let planner = if planner_dir.is_dir() {
-            Some(planner_dir.as_path())
-        } else {
-            None
-        };
         let model = crate::qwen_drive::QwenDriveModel::load_with_backend(
-            model_dir, planner, backend,
+            model_dir, None, backend,
         )?;
         Ok(LoadedModel::text(Box::new(model)))
     }

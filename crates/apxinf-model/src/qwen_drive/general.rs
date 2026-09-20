@@ -253,20 +253,17 @@ fn alloc_scan_scratch(ctx: &Context, bytes: usize, padded: bool) -> Result<Devic
 /// token 357, and both trajectory modes report the same error to every digit.
 /// `APXINF_QWEN_LINEAR_TUNED=0` restores the raw path for anyone who needs the
 /// old arithmetic exactly.
-pub(super) fn tuned_projection() -> bool {
-    static TUNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TUNED.get_or_init(|| {
-        !matches!(
-            std::env::var("APXINF_QWEN_LINEAR_TUNED").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
+fn tuned_projection() -> bool {
+    !matches!(
+        std::env::var("APXINF_QWEN_LINEAR_TUNED").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
 }
 
-fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<Tensor> {
+fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor, in_out: bool) -> Result<Tensor> {
     // Under the gate the loader has already stored this weight as [in, out],
     // so the raw path's [out, in] check does not apply to it.
-    if tuned_projection() {
+    if in_out {
         return gemm::bf16(ctx, input, weight);
     }
     let x = input.shape().dims();
@@ -306,11 +303,11 @@ fn linear_checkpoint(ctx: &Context, input: &Tensor, weight: &Tensor) -> Result<T
     Ok(output)
 }
 
-fn project_and_pack(ctx: &Context, input: &Tensor, weights: &[&Tensor]) -> Result<Tensor> {
+fn project_and_pack(ctx: &Context, input: &Tensor, weights: &[&Tensor], in_out: bool) -> Result<Tensor> {
     let rows = input.shape().dims()[0];
     let mut outputs = Vec::with_capacity(weights.len());
     for weight in weights {
-        let value = linear_checkpoint(ctx, input, weight)?;
+        let value = linear_checkpoint(ctx, input, weight, in_out)?;
         outputs.push(value.reshape(vec![rows, value.shape().dims()[1], 1, 1])?);
     }
     let packed = elementwise::concat_channels_bf16(ctx, &outputs.iter().collect::<Vec<_>>())?;
@@ -502,7 +499,10 @@ impl QwenDriveModel {
                 QwenDriveExpertWeights::from_map(&config, &tensors)
             })
             .transpose()?;
-        let weights = QwenDriveDeviceWeights::from_maps(&config, vlm, expert, &*backend)?;
+        let projection_in_out = tuned_projection();
+        let weights = QwenDriveDeviceWeights::from_maps(
+            &config, vlm, expert, &*backend, projection_in_out,
+        )?;
         qdiag!(
             "[qwen_drive] device weights resident (planner={}); allocating caches",
             weights.expert.is_some()
@@ -827,7 +827,7 @@ impl QwenDriveModel {
         }
         let gu = gemm::bf16(ctx, &normed, gate_up_w)?;
         let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
-        let down = linear_checkpoint(ctx, &act, down_w)?;
+        let down = linear_checkpoint(ctx, &act, down_w, self.weights.projection_in_out)?;
         if trace {
             trace_rows("text0_post_norm", &normed)?;
             trace_rows("text0_gate_up", &gu)?;
@@ -858,7 +858,7 @@ impl QwenDriveModel {
         let head_dim = text.head_dim;
         let rotary = text.rotary_dim();
         let normed = la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?;
-        let fused = project_and_pack(ctx, &normed, &[&w.q_w, &w.k_w, &w.v_w])?;
+        let fused = project_and_pack(ctx, &normed, &[&w.q_w, &w.k_w, &w.v_w], self.weights.projection_in_out)?;
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_input_norm", &normed)?;
             trace_rows("text3_fused_qkv", &fused)?;
@@ -899,7 +899,7 @@ impl QwenDriveModel {
         }
         let attn = attn.reshape(vec![seq, heads * head_dim])?;
         la::sigmoid_gate_mul(ctx, &attn, &fused, heads, head_dim)?;
-        let proj = linear_checkpoint(ctx, &attn, &w.o_w)?;
+        let proj = linear_checkpoint(ctx, &attn, &w.o_w, self.weights.projection_in_out)?;
         if layer_idx == 3 && seq > 1 {
             trace_rows("text3_gated_attention", &attn)?;
             trace_rows("text3_out_proj", &proj)?;
@@ -1132,7 +1132,7 @@ impl QwenDriveModel {
         // weight bytes, but two were only [32, hidden] and dragged the group to
         // about 70GB/s where the MLP projections reach 172GB/s; the packed
         // weight also arrives in the layout the on-device pack used to build.
-        let zba = linear_checkpoint(ctx, &normed, &w.zba_w)?
+        let zba = linear_checkpoint(ctx, &normed, &w.zba_w, self.weights.projection_in_out)?
             .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
         if gdn_timed {
             gdn_stage_mark(ctx, layer_idx, "project", &mut gdn_since)?;
@@ -1305,7 +1305,7 @@ impl QwenDriveModel {
             1e-6,
         )?;
         let gated = gated.reshape(vec![seq, value_dim])?;
-        let proj = linear_checkpoint(ctx, &gated, &w.out_w)?;
+        let proj = linear_checkpoint(ctx, &gated, &w.out_w, self.weights.projection_in_out)?;
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_gated_norm", &gated)?;
             trace_rows("text0_out_proj", &proj)?;

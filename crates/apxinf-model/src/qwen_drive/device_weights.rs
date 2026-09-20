@@ -106,8 +106,8 @@ fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
 /// `[m,k] @ [k,n]` and needs `[in, out]`. Transposing once here keeps the
 /// per-call cost at zero; doing it the other way -- leaving the layout alone
 /// and transposing at each call -- would cost more than the tuning saves.
-fn projection(tensor: &Tensor) -> Result<Tensor> {
-    if super::general::tuned_projection() {
+fn projection(tensor: &Tensor, in_out: bool) -> Result<Tensor> {
+    if in_out {
         transpose_2d(tensor)
     } else {
         Ok(tensor.clone())
@@ -329,6 +329,19 @@ mod frequency_tests {
     use super::fourier_freq_table;
 
     #[test]
+    fn projection_packing_obeys_the_explicit_layout() {
+        let values: Vec<_> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter().map(half::bf16::from_f32).collect();
+        let weight = apxinf_core::Tensor::from_bf16(vec![2, 3], &values).unwrap();
+        let checkpoint = super::projection(&weight, false).unwrap();
+        assert_eq!(checkpoint.shape().dims(), &[2, 3]);
+        assert_eq!(checkpoint.as_bf16().unwrap(), values);
+        let in_out = super::projection(&weight, true).unwrap();
+        assert_eq!(in_out.shape().dims(), &[3, 2]);
+        assert_eq!(in_out.to_f32_vec().unwrap(), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
     fn bf16_logspace_matches_frozen_cuda_reference() {
         let expected = [
             1.0, 1.203125, 1.4453125, 1.7421875, 2.09375, 2.515625, 3.015625, 3.65625, 4.375,
@@ -348,6 +361,9 @@ mod frequency_tests {
 }
 
 pub struct QwenDriveDeviceWeights {
+    /// Fixed physical projection layout, selected once during construction.
+    /// true: `[in, out]` for tuned NN GEMM; false: checkpoint `[out, in]`.
+    pub projection_in_out: bool,
     /// `[vocab, hidden]`; doubles as the tied lm_head via a transposed GEMM.
     pub embed_tokens: Tensor,
     pub layers: Vec<MixerWeights>,
@@ -362,6 +378,7 @@ impl QwenDriveDeviceWeights {
         vlm: QwenDriveVlmWeights,
         expert: Option<QwenDriveExpertWeights>,
         backend: &dyn Backend,
+        projection_in_out: bool,
     ) -> Result<Self> {
         let mut language = vlm.language;
         let mut visual = vlm.visual;
@@ -394,7 +411,7 @@ impl QwenDriveDeviceWeights {
             let gate_up_w = up(backend, &concat_columns(&[&gate, &up_w])?)?;
             let down_w = up(
                 backend,
-                &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?)?,
+                &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?, projection_in_out)?,
             )?;
             if text.is_full_attention(index) {
                 let q = take(&mut language, &format!("{p}.self_attn.q_proj.weight"))?;
@@ -410,9 +427,9 @@ impl QwenDriveDeviceWeights {
                 }
                 layers.push(MixerWeights::FullAttention(FullAttentionLayerWeights {
                     input_norm,
-                    q_w: up(backend, &projection(&q)?)?,
-                    k_w: up(backend, &projection(&k)?)?,
-                    v_w: up(backend, &projection(&v)?)?,
+                    q_w: up(backend, &projection(&q, projection_in_out)?)?,
+                    k_w: up(backend, &projection(&k, projection_in_out)?)?,
+                    v_w: up(backend, &projection(&v, projection_in_out)?)?,
                     q_norm: up(
                         backend,
                         &take(&mut language, &format!("{p}.self_attn.q_norm.weight"))?,
@@ -426,7 +443,7 @@ impl QwenDriveDeviceWeights {
                         &projection(&take(
                             &mut language,
                             &format!("{p}.self_attn.o_proj.weight"),
-                        )?)?,
+                        )?, projection_in_out)?,
                     )?,
                     post_norm,
                     gate_up_w,
@@ -465,7 +482,7 @@ impl QwenDriveDeviceWeights {
                     input_norm,
                     zba_w: up(
                         backend,
-                        &projection(&concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?)?,
+                        &projection(&concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?, projection_in_out)?,
                     )?,
                     conv_w: up(backend, &conv.reshape(vec![conv_dim, kernel])?)?,
                     dt_bias: up(
@@ -485,7 +502,7 @@ impl QwenDriveDeviceWeights {
                         &projection(&take(
                             &mut language,
                             &format!("{p}.linear_attn.out_proj.weight"),
-                        )?)?,
+                        )?, projection_in_out)?,
                     )?,
                     post_norm,
                     gate_up_w,
@@ -630,6 +647,7 @@ impl QwenDriveDeviceWeights {
             .map(|expert| Self::upload_expert(config, expert, backend))
             .transpose()?;
         Ok(Self {
+            projection_in_out,
             embed_tokens,
             layers,
             final_norm,
