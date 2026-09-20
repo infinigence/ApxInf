@@ -649,7 +649,7 @@ class QwenDrivePolicy:
                 terminators,
                 self.im_end_id,
                 self.newline_ids,
-                None,
+                self.num_steps,
             )
             content = list(generated)
             for position, token in enumerate(generated):
@@ -672,7 +672,7 @@ class QwenDrivePolicy:
                 ego,
                 nav_command,
                 noise_array,
-                None,
+                self.num_steps,
             )
         model_ms = (time.perf_counter() - model_started) * 1000.0
         actions = _wrap_heading(

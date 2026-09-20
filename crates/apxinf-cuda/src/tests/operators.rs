@@ -690,8 +690,14 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
             }
         }
     }
-    let route = if std::env::var_os("APXINF_VISION_FA2").is_some() {
+    #[cfg(apxinf_fa2_head_special)]
+    let specialized = crate::kernels::attention::vision_fa2_enabled();
+    #[cfg(not(apxinf_fa2_head_special))]
+    let specialized = false;
+    let route = if specialized {
         "fa2-head64"
+    } else if cfg!(apxinf_fa2_sm80) {
+        "fa2-generic"
     } else {
         "composed"
     };

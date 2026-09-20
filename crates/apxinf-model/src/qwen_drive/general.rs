@@ -1510,7 +1510,7 @@ impl QwenDriveModel {
             // TEMP-DIAG (implement_r15): scatter-mapping tail for the receipt (host data, zero
             // GPU cost); expected at the measured prompt: image_rows=10416,
             // last_image_prompt_row=10441, last_src_row=10415; revert in the acceptance-bound revision.
-            {
+            if diagnostics_enabled() {
                 let mapped = row_map.iter().filter(|&&m| m != u32::MAX).count();
                 let (last_pr, last_src) = row_map.iter().enumerate().rev()
                     .find(|(_, &m)| m != u32::MAX).map(|(i, &m)| (i, m)).unwrap_or((usize::MAX, u32::MAX));
@@ -1524,7 +1524,7 @@ impl QwenDriveModel {
             // readback -- row 0 (text control) and the first image row; under true vision
             // rimg_first4 must equal the vis_fp row0 fingerprint; digest-routed; revert in
             // the acceptance-bound revision.
-            {
+            if diagnostics_enabled() {
                 let dims = x.shape().dims().to_vec();
                 let width = *dims.last().unwrap_or(&1);
                 let row_bytes = width * DType::BF16.size_in_bytes();
@@ -1549,7 +1549,7 @@ impl QwenDriveModel {
             // localization leg -- one ~7.1MB readback of the vis.pre_merger frame-0 slice;
             // degenerate pre_merger => tower, diverse => merger chain; digest-routed; revert in
             // the acceptance-bound revision.
-            {
+            if diagnostics_enabled() {
                 let pdims = vis.pre_merger.shape().dims().to_vec();
                 let pwidth = *pdims.last().unwrap_or(&1);
                 let pframe = grid_thw
@@ -1594,7 +1594,7 @@ impl QwenDriveModel {
         // are bit-identical while a one-position shift makes them differ. Digest-routed (a
         // live print here would sit above the 80-line capture window); revert in the
         // acceptance-bound revision.
-        if token_ids.len() >= 16 {
+        if diagnostics_enabled() && token_ids.len() >= 16 {
             let n = token_ids.len();
             let dims = x.shape().dims().to_vec();
             let width = *dims.last().unwrap_or(&1);
@@ -1624,14 +1624,16 @@ impl QwenDriveModel {
         // TEMP-DIAG (implement_r14): position-id tail captured into the digest sink (a live
         // eprintln here would sit above the 80-line capture window); revert in the
         // acceptance-bound revision.
-        self.diag_digest.push(format!("[qwen_drive] pos_tail last4={:?} max_pos={} rope_delta={}", &positions[positions.len().saturating_sub(4)..], max_pos, self.rope_delta));
+        if diagnostics_enabled() {
+            self.diag_digest.push(format!("[qwen_drive] pos_tail last4={:?} max_pos={} rope_delta={}", &positions[positions.len().saturating_sub(4)..], max_pos, self.rope_delta));
+        }
         if self.cache_len + token_ids.len() > self.max_seq_len {
             return Err(Error::Other("qwen_drive: prompt exceeds the cache capacity".into()));
         }
         // TEMP-DIAG (implement_r19): last-3 prompt ids for the echo-margin lens own-token
         // logits (token N-1/N-2/N-3 at the measured prompt); revert in the acceptance-bound
         // revision.
-        let probe_tail3 = if token_ids.len() >= 3 {
+        let probe_tail3 = if diagnostics_enabled() && token_ids.len() >= 3 {
             Some([token_ids[token_ids.len() - 3], token_ids[token_ids.len() - 2], token_ids[token_ids.len() - 1]])
         } else {
             None
@@ -1639,7 +1641,7 @@ impl QwenDriveModel {
         // TEMP-DIAG (implement_r5, successor synthesis_r4 bundle 2 support): publish the
         // per-row segment map (1=prefix-text, 2=image, 3=vision-marker, 4=tail-text) for the
         // attn_mix probe's token-id-driven segment masses; revert in the acceptance-bound revision.
-        {
+        if diagnostics_enabled() {
             let img_tok = self.config.image_token_id;
             let vs_tok = self.config.vision_start_token_id;
             let ve_tok = self.config.vision_end_token_id;

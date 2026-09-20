@@ -2368,10 +2368,11 @@ pub fn mha_bf16(
 ///   FA2 head-64                           rel L1 2.305103e-3
 ///
 /// The three agree to within 0.5% of each other and FA2 is the most accurate
-/// of them. `APXINF_VISION_FA2=0` selects the composed route, and
-/// `APXINF_VISION_SCORES_FP32` then puts its scores back on the CUDA cores.
+/// of them. `APXINF_VISION_FA2=0` disables this specialization: SM80-family
+/// builds use generic FA2, while the other compiled targets use the composed
+/// route. `APXINF_VISION_SCORES_FP32` affects only that composed route.
 #[cfg(apxinf_fa2_head_special)]
-fn vision_fa2_enabled() -> bool {
+pub(crate) fn vision_fa2_enabled() -> bool {
     !matches!(
         std::env::var("APXINF_VISION_FA2").as_deref(),
         Ok("0") | Ok("false")
