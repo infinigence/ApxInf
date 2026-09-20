@@ -813,86 +813,53 @@ __global__ void flash_attn_decode_bf16_splitk_kernel(
 
 
 
-// One warp per row, matching FlashRT's Apache-2.0 FP16 softmax. The even
-// path packs two values per lane; the scalar path keeps arbitrary prompt
-// lengths correct without relying on half2 alignment between odd rows.
+// In-place row softmax used by the cuBLAS MQA fallback. A full thread block
+// cooperates on each row and re-reads logits after the reductions, avoiding
+// a fixed per-thread register array and packed/alignment-specific paths.
 constexpr int kSoftmaxMaxCols = 1024;
-constexpr int kSoftmaxIterations = kSoftmaxMaxCols / 32;
+constexpr int kMqaSoftmaxThreads = 128;
 
-__global__ void softmax_even_f16_kernel(half* data, int rows, int cols) {
-  int lane = threadIdx.x;
+__global__ void mqa_softmax_f16_block_kernel(half* data, int rows, int cols) {
+  __shared__ float reduction[kMqaSoftmaxThreads];
+  int thread = threadIdx.x;
   int row = blockIdx.x;
   if (row >= rows) return;
   half* source = data + static_cast<int64_t>(row) * cols;
-  half2* source2 = reinterpret_cast<half2*>(source);
-  int cols2 = cols / 2;
-  float values[kSoftmaxIterations];
   float maximum = -1.0e30f;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations / 2; ++iteration) {
-    int col2 = iteration * 32 + lane;
-    if (col2 < cols2) {
-      half2 packed = source2[col2];
-      values[2 * iteration] = __half2float(packed.x);
-      values[2 * iteration + 1] = __half2float(packed.y);
-      maximum = fmaxf(maximum, fmaxf(values[2 * iteration],
-                                     values[2 * iteration + 1]));
-    } else {
-      values[2 * iteration] = -1.0e30f;
-      values[2 * iteration + 1] = -1.0e30f;
+  for (int col = thread; col < cols; col += blockDim.x) {
+    maximum = fmaxf(maximum, __half2float(source[col]));
+  }
+  reduction[thread] = maximum;
+  __syncthreads();
+  for (int stride = kMqaSoftmaxThreads / 2; stride > 0; stride >>= 1) {
+    if (thread < stride) {
+      reduction[thread] = fmaxf(reduction[thread], reduction[thread + stride]);
     }
+    __syncthreads();
   }
-  maximum = warp_max(maximum);
-  float sum = 0.0f;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
-    values[iteration] = __expf(values[iteration] - maximum);
-    sum += values[iteration];
-  }
-  sum = warp_sum_all(sum);
-  float inverse = 1.0f / sum;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations / 2; ++iteration) {
-    int col2 = iteration * 32 + lane;
-    if (col2 < cols2) {
-      source2[col2] = __floats2half2_rn(values[2 * iteration] * inverse,
-                                        values[2 * iteration + 1] * inverse);
-    }
-  }
-}
+  maximum = reduction[0];
 
-__global__ void softmax_scalar_f16_kernel(half* data, int rows, int cols) {
-  int lane = threadIdx.x;
-  int row = blockIdx.x;
-  if (row >= rows) return;
-  half* source = data + static_cast<int64_t>(row) * cols;
-  float values[kSoftmaxIterations];
-  float maximum = -1.0e30f;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
-    int col = iteration * 32 + lane;
-    float value = col < cols ? __half2float(source[col]) : -1.0e30f;
-    values[iteration] = value;
-    maximum = fmaxf(maximum, value);
-  }
-  maximum = warp_max(maximum);
   float sum = 0.0f;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
-    values[iteration] = __expf(values[iteration] - maximum);
-    sum += values[iteration];
+  for (int col = thread; col < cols; col += blockDim.x) {
+    sum += __expf(__half2float(source[col]) - maximum);
   }
-  sum = warp_sum_all(sum);
-  float inverse = 1.0f / sum;
-#pragma unroll
-  for (int iteration = 0; iteration < kSoftmaxIterations; ++iteration) {
-    int col = iteration * 32 + lane;
-    if (col < cols) source[col] = __float2half(values[iteration] * inverse);
+  reduction[thread] = sum;
+  __syncthreads();
+  for (int stride = kMqaSoftmaxThreads / 2; stride > 0; stride >>= 1) {
+    if (thread < stride) {
+      reduction[thread] += reduction[thread + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse = 1.0f / reduction[0];
+  for (int col = thread; col < cols; col += blockDim.x) {
+    source[col] = __float2half(__expf(__half2float(source[col]) - maximum) * inverse);
   }
 }
 
 // BF16 counterpart used by the Thor static-inference MQA path. One warp owns
 // a row, so each score is loaded once and all reductions stay warp-local.
+constexpr int kSoftmaxIterations = kSoftmaxMaxCols / 32;
 __global__ void softmax_scalar_bf16_kernel(
     __nv_bfloat16* data, int rows, int cols) {
   int lane = threadIdx.x;
@@ -1225,8 +1192,6 @@ __global__ void segmented_mha_bf16_kernel(
         __float2bfloat16(accumulator);
   }
 }
-
-
 
 // Gather a KV cache prefix from per-layer [n_kv_heads, max_seq_len, hd]
 // into contiguous [tokens, n_kv_heads, hd] for the FlashAttention-2

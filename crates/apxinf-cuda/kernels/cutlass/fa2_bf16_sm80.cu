@@ -4,8 +4,6 @@
 #include <cuda_runtime.h>
 #include <cutlass/numeric_types.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <type_traits>
 
@@ -25,10 +23,23 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params,
 
 }  // namespace FLASH_NAMESPACE
 
+namespace apxinf::cuda::cutlass_ops {
+
+void run_mha_fwd_hdim64_bf16_apx(
+    FLASH_NAMESPACE::Flash_fwd_params& params, cudaStream_t stream);
+bool use_mha_fwd_hdim64_bf16_apx(
+    const FLASH_NAMESPACE::Flash_fwd_params& params);
+
+}  // namespace apxinf::cuda::cutlass_ops
+
 namespace {
 
 constexpr float kLog2E = 1.4426950408889634074f;
 
+// Minimal contiguous inference adapter for the public Flash_fwd_params
+// contract. The field mapping follows official FlashAttention 2.7.4.post1's
+// set_params_fprop (BSD-3-Clause); ApxInf supplies raw pointers and owns the
+// host-side split policy.
 void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
                  const void* q, const void* k, const void* v, void* output,
                  void* softmax_lse, int batch, int query_tokens,
@@ -82,63 +93,6 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
   params.num_splits = 1;
 }
 
-#if defined(APXINF_FA2_SPLITKV)
-int num_splits_heuristic(int batch_nheads_mblocks, int num_sms,
-                         int num_n_blocks, int max_splits) {
-  if (batch_nheads_mblocks >= 0.8f * num_sms) {
-    return 1;
-  }
-  max_splits = std::min({max_splits, num_sms, num_n_blocks});
-  float max_efficiency = 0.0f;
-  float efficiency[129];
-  efficiency[0] = 0.0f;
-  auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-  auto split_eligible = [&](int splits) {
-    return splits == 1 ||
-           ceildiv(num_n_blocks, splits) != ceildiv(num_n_blocks, splits - 1);
-  };
-  for (int splits = 1; splits <= max_splits; ++splits) {
-    if (!split_eligible(splits)) {
-      efficiency[splits] = 0.0f;
-      continue;
-    }
-    float waves = static_cast<float>(batch_nheads_mblocks * splits) / num_sms;
-    float value = waves / std::ceil(waves);
-    max_efficiency = std::max(max_efficiency, value);
-    efficiency[splits] = value;
-  }
-  for (int splits = 1; splits <= max_splits; ++splits) {
-    if (split_eligible(splits) && efficiency[splits] >= 0.85f * max_efficiency) {
-      return splits;
-    }
-  }
-  return 1;
-}
-
-int setup_splitkv(FLASH_NAMESPACE::Flash_fwd_params& params,
-                  void* softmax_lse_accum, void* o_accum, int num_sms,
-                  int query_tokens, int key_tokens, int head_dim, int batch,
-                  int query_heads) {
-  int num_splits = 1;
-  if (softmax_lse_accum != nullptr && o_accum != nullptr && num_sms > 0) {
-    const int block_n = head_dim <= 64 ? 256 : (head_dim <= 128 ? 128 : 64);
-    const int num_n_blocks = (key_tokens + block_n - 1) / block_n;
-    const int num_m_blocks = (query_tokens + 63) / 64;
-    num_splits = num_splits_heuristic(
-        batch * query_heads * num_m_blocks, num_sms * 2, num_n_blocks, 128);
-  }
-  params.num_splits = num_splits;
-  if (num_splits > 1) {
-    params.softmax_lseaccum_ptr = softmax_lse_accum;
-    params.oaccum_ptr = o_accum;
-  } else {
-    params.softmax_lseaccum_ptr = nullptr;
-    params.oaccum_ptr = nullptr;
-  }
-  return num_splits;
-}
-#endif
-
 }  // namespace
 
 namespace apxinf::cuda::cutlass_ops {
@@ -161,6 +115,13 @@ int fa2(
               q, k, v, output, softmax_lse, batch, query_tokens,
               key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
   params.is_causal = false;
+  if constexpr (std::is_same<Element, cutlass::bfloat16_t>::value) {
+    if (head_dim == 64 &&
+        apxinf::cuda::cutlass_ops::use_mha_fwd_hdim64_bf16_apx(params)) {
+      apxinf::cuda::cutlass_ops::run_mha_fwd_hdim64_bf16_apx(params, stream);
+      return static_cast<int>(cudaSuccess);
+    }
+  }
   if (head_dim <= 96) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
   } else if (head_dim <= 128) {
@@ -222,6 +183,13 @@ int fa2_strided_qkv(
   params.q_row_stride = row_stride;
   params.k_row_stride = row_stride;
   params.v_row_stride = row_stride;
+  if constexpr (std::is_same<Element, cutlass::bfloat16_t>::value) {
+    if (head_dim == 64 &&
+        apxinf::cuda::cutlass_ops::use_mha_fwd_hdim64_bf16_apx(params)) {
+      apxinf::cuda::cutlass_ops::run_mha_fwd_hdim64_bf16_apx(params, stream);
+      return static_cast<int>(cudaSuccess);
+    }
+  }
   if (head_dim <= 96) {
     FLASH_NAMESPACE::run_mha_fwd_<Element, 96, false>(params, stream);
   } else {
@@ -236,12 +204,13 @@ int fa2_splitkv(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
-    int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+    int head_dim, float softmax_scale, int num_splits, cudaStream_t stream) {
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       softmax_lse == nullptr || softmax_lse_accum == nullptr ||
       o_accum == nullptr || batch <= 0 || query_tokens <= 0 ||
       key_tokens <= 0 || query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      head_dim > 256 || query_heads % kv_heads != 0 || num_sms <= 0) {
+      head_dim > 256 || query_heads % kv_heads != 0 || num_splits <= 0 ||
+      num_splits > 128) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
 
@@ -253,9 +222,9 @@ int fa2_splitkv(
   if constexpr (IsCausal) {
     params.window_size_right = 0;
   }
-  const int num_splits =
-      setup_splitkv(params, softmax_lse_accum, o_accum, num_sms, query_tokens,
-                    key_tokens, head_dim, batch, query_heads);
+  params.num_splits = num_splits;
+  params.softmax_lseaccum_ptr = num_splits > 1 ? softmax_lse_accum : nullptr;
+  params.oaccum_ptr = num_splits > 1 ? o_accum : nullptr;
   if (num_splits <= 1) {
     if (head_dim <= 96) {
       FLASH_NAMESPACE::run_mha_fwd_<Element, 96, IsCausal>(params, stream);
@@ -311,22 +280,22 @@ int fa2_bf16_splitkv(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
-    int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+    int head_dim, float softmax_scale, int num_splits, cudaStream_t stream) {
   return fa2_splitkv<cutlass::bfloat16_t, false>(
       q, k, v, output, softmax_lse, softmax_lse_accum, o_accum, batch,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
-      num_sms, stream);
+      num_splits, stream);
 }
 
 int fa2_bf16_causal_splitkv(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
-    int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+    int head_dim, float softmax_scale, int num_splits, cudaStream_t stream) {
   return fa2_splitkv<cutlass::bfloat16_t, true>(
       q, k, v, output, softmax_lse, softmax_lse_accum, o_accum, batch,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
-      num_sms, stream);
+      num_splits, stream);
 }
 #endif
 
@@ -338,6 +307,15 @@ int fa2_f16(
   return fa2<cutlass::half_t>(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+int fa2_f16_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  return fa2_strided_qkv<cutlass::half_t>(
+      qkv, output, softmax_lse, batch, tokens, heads, head_dim,
+      softmax_scale, stream);
 }
 
 }  // namespace apxinf::cuda::cutlass_ops

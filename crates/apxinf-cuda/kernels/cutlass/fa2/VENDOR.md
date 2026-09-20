@@ -1,11 +1,20 @@
 # Vendored: Flash-Attention 2 forward kernels
 
 ApxInf compiles the BF16 head-dimension 96 and 256 non-causal forward
-instantiations for SM80/SM86/SM87/SM89. On SM100-family builds it also compiles
-the FP16 head-dimension 96 and 256 instantiations; the Thor PI0.5 FP8 path uses
-FP16 Gemma MQA (`head_dim=256`). Both paths use the repository-local raw-pointer
-wrapper in `../fa2_bf16_sm80.cu`. Split-KV and other head-dimension
-instantiations are intentionally omitted.
+instantiations for SM80/SM86/SM87/SM89. The ApxInf-owned sibling translation
+unit `../fa2_hdim64_bf16.cu` additionally instantiates exact head-dimension 64
+tiles for an SM87-only dispatch; it does not modify this vendored tree. On
+SM100-family builds ApxInf also compiles the FP16 head-dimension 96 and 256
+instantiations; the Thor PI0.5 FP8 path uses FP16 Gemma MQA (`head_dim=256`).
+These paths use the repository-local raw-pointer wrapper in
+`../fa2_bf16_sm80.cu`. Only the listed forward instantiations and the required
+head-dimension 256 split-KV instantiation are compiled.
+
+The split-KV count is selected outside the vendored tree by ApxInf's Rust
+attention layer. Its occupancy policy is an independent Rust implementation of
+the BSD-3-Clause `num_splits_heuristic` in upstream FA2's `flash_api.cpp`; the
+raw-pointer CUDA wrapper receives the resulting count and only marshals kernel
+parameters.
 
 ## Sources
 
@@ -34,23 +43,23 @@ We keep a dedicated CUTLASS 3.x tree here separate from
 because CUTLASS 4.x has breaking CuTe layout-algebra changes that FA2
 2.7.x does not support.
 
-## Local patches
+## PyTorch-free build boundary
 
-Three inherited PyTorch-decoupling patches in `flash_attn/` allow FA2 to build
-without a Torch installation:
+`flash.h`, `philox_unpack.cuh`, and `flash_fwd_launch_template.h` are kept at
+their upstream `v2.7.4.post1` contents. ApxInf does not depend on libtorch, so
+the narrow ATen/C10 surface referenced by those files is implemented under
+the sibling `../fa2_compat/` include root. Keeping the compatibility code out
+of this directory makes the upstream provenance auditable with a byte-for-byte
+comparison.
 
-1. `flash_fwd_launch_template.h`: replaced `#include <c10/cuda/CUDAException.h>`
-   with inline CUDA-runtime stubs for `C10_CUDA_CHECK` and
-   `C10_CUDA_KERNEL_LAUNCH_CHECK`.
+The compatibility layer is inference-only: FA2 is compiled with dropout,
+ALiBi, soft-cap, and local attention disabled. It supplies a Philox state
+carrier for template completeness and native CUDA error handling for launch
+code. It is not intended to emulate PyTorch outside this build boundary.
 
-2. `flash.h`: replaced `#include <ATen/cuda/CUDAGeneratorImpl.h>` with a
-   minimal POD `at::PhiloxCudaState` struct (dropout RNG state is
-   carried through but never read in inference because `p_dropout=0`).
-
-3. `philox_unpack.cuh`: replaced `#include <ATen/cuda/detail/UnpackRaw.cuh>`
-   with a ~10-line inline stub for `at::cuda::philox::unpack()`.
-
-Total inherited patch footprint: approximately 30 lines.
+The direct-E4M3 output path remains an ApxInf extension in
+`flash_fwd_kernel.h`; it is unrelated to the PyTorch-free compatibility layer
+and is selected only by `APXINF_FA2_DIRECT_E4M3`.
 
 ## Backporting upstream bugfixes
 

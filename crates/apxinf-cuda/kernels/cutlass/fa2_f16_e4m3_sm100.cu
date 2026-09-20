@@ -65,9 +65,11 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params,
   params.is_causal = false;
   params.window_size_left = -1;
   params.window_size_right = -1;
+  // Soft-capping is disabled for this translation unit, so the upstream field
+  // can carry the output quantization scale without changing the vendor ABI.
+  params.softcap = output_inverse_scale;
   params.is_seqlens_k_cumulative = true;
   params.num_splits = 1;
-  params.output_inverse_scale = output_inverse_scale;
 }
 }  // namespace
 

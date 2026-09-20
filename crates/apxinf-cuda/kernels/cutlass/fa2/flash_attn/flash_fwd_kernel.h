@@ -498,7 +498,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     #pragma unroll
     for (int i = 0; i < size(tOrQ); ++i) {
         // Preserve production's observable FP32 -> FP16 round before scale.
-        float value = static_cast<float>(tOrO(i)) * params.output_inverse_scale;
+        float value = static_cast<float>(tOrO(i)) * params.softcap;
         value = fminf(448.0f, fmaxf(-448.0f, value));
         tOrQ(i) = ElementOutput(value);
     }

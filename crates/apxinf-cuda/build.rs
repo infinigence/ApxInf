@@ -435,7 +435,9 @@ fn main() {
             }
 
             let fa2_root = cutlass_root.join("fa2");
+            let fa2_compat = cutlass_root.join("fa2_compat");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
+            let fa2_hdim64_apx = cutlass_root.join("fa2_hdim64_bf16.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
@@ -452,6 +454,7 @@ fn main() {
                 let fa2_cutlass = fa2_root.join("cutlass/include");
                 assert!(
                     fa2_operator.is_file()
+                        && fa2_hdim64_apx.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
                         && fa2_hdim128.is_file()
@@ -464,6 +467,7 @@ fn main() {
                 );
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
+                    fa2_hdim64_apx,
                     fa2_hdim96,
                     fa2_hdim128,
                     fa2_hdim256,
@@ -505,7 +509,7 @@ fn main() {
                     kernel_files.extend(fa2_direct_e4m3_sources.iter().cloned());
                     println!("cargo:rustc-cfg=apxinf_fa2_direct_e4m3_sm100");
                 }
-                fa2_includes.extend([fa2_root.clone(), fa2_cutlass]);
+                fa2_includes.extend([fa2_compat.clone(), fa2_root.clone(), fa2_cutlass]);
                 kernel_files.extend(fa2_sources.iter().cloned());
                 if fa2_sm80 {
                     println!("cargo:rustc-cfg=apxinf_fa2_sm80");
@@ -514,6 +518,7 @@ fn main() {
                     println!("cargo:rustc-cfg=apxinf_fa2_head_special");
                 }
                 emit_rerun_if_changed_tree(&fa2_root);
+                emit_rerun_if_changed_tree(&fa2_compat);
             }
 
             if !kernel_files.is_empty() {

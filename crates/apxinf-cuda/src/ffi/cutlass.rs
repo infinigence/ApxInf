@@ -6,54 +6,6 @@ use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
     #[cfg(apxinf_cutlass_fmha)]
-    pub fn apxinf_static_prepare_cutlass_mha_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        output: *mut c_void,
-        batches: i32,
-        query_tokens: i32,
-        key_tokens: i32,
-        query_heads: i32,
-        kv_heads: i32,
-        head_dim: i32,
-        stream: cudaStream_t,
-    ) -> i32;
-    #[cfg(apxinf_cutlass_fmha)]
-    pub fn apxinf_static_cutlass_mha_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        output: *mut c_void,
-        batches: i32,
-        query_tokens: i32,
-        key_tokens: i32,
-        query_heads: i32,
-        kv_heads: i32,
-        head_dim: i32,
-        stream: cudaStream_t,
-    ) -> i32;
-    #[cfg(apxinf_cutlass_fmha)]
-    pub fn apxinf_static_prepare_cutlass_mha_packed_qkv_f16(
-        qkv: *const c_void,
-        output: *mut c_void,
-        batches: i32,
-        tokens: i32,
-        heads: i32,
-        head_dim: i32,
-        stream: cudaStream_t,
-    ) -> i32;
-    #[cfg(apxinf_cutlass_fmha)]
-    pub fn apxinf_static_cutlass_mha_packed_qkv_f16(
-        qkv: *const c_void,
-        output: *mut c_void,
-        batches: i32,
-        tokens: i32,
-        heads: i32,
-        head_dim: i32,
-        stream: cudaStream_t,
-    ) -> i32;
-    #[cfg(apxinf_cutlass_fmha)]
     pub fn apxinf_static_prepare_cutlass_mha_bf16(
         q: *const c_void,
         k: *const c_void,

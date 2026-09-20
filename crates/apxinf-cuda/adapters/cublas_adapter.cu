@@ -64,13 +64,8 @@ extern "C" int apxinf_static_cublas_mqa_f16(
       &zero, g_mqa_logits, CUDA_R_16F, key_tokens,
       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
   if (status != CUBLAS_STATUS_SUCCESS) return static_cast<int>(status);
-  if ((key_tokens & 1) == 0) {
-    softmax_even_f16_kernel<<<rows, 32, 0, stream>>>(
-        g_mqa_logits, rows, key_tokens);
-  } else {
-    softmax_scalar_f16_kernel<<<rows, 32, 0, stream>>>(
-        g_mqa_logits, rows, key_tokens);
-  }
+  mqa_softmax_f16_block_kernel<<<rows, kMqaSoftmaxThreads, 0, stream>>>(
+      g_mqa_logits, rows, key_tokens);
   if (cudaPeekAtLastError() != cudaSuccess) {
     return static_cast<int>(CUBLAS_STATUS_EXECUTION_FAILED);
   }

@@ -73,16 +73,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using StrideV = StrideV_;
   using Mask = Mask_;
 
-  // Original stage counts (restored for FP8 — FP8 halves smem, so HD=256 fits)
   static constexpr int StageCountQ = 2;
   static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
-
-  // When KV has only 1 stage, K and V share the same smem buffer (union) and pipeline stage.
-  // The consumer must explicitly release K before producer can load V into the same stage.
-  // This requires the same sync points as ThreadShape N>1, even when ThreadShape N=1.
 
   using ClusterShape = Shape<_1, _1, _1>;
 
@@ -230,17 +225,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
-    // kPRescale compensates the P rescaling in softmax0() — P values are
-    // multiplied by kPRescale before FP8 conversion to improve precision
-    // (moves softmax probabilities from FP8 denorm to normal range).
-    // The PV MMA output is thus scaled by kPRescale, so we divide here.
-    constexpr float kPRescale = 256.0f;
-
     return Params{
         Load::to_underlying_arguments(problem_shape, args.load, workspace),
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
-        args.scale_v * args.inv_scale_o / kPRescale
+        args.scale_v * args.inv_scale_o
     };
   }
 
@@ -646,14 +635,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       tTMEM_LOADrS(i+0) = ::exp2f(tTMEM_LOADrS(i+0));
       tTMEM_LOADrS(i+1) = ::exp2f(tTMEM_LOADrS(i+1));
 
-      // FP8 precision protection: scale P values from denorm into normal FP8 range
-      // before FP8 conversion. Compensated by scale_output (see to_underlying_arguments).
-      // P_max=1.0 * 256 = 256 < FP8_max(448), safe. P_avg=0.004 * 256 = 1.024, normal range.
-      constexpr float kPRescale = 256.0f;
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL
       for (int j = 0; j < kConversionsPerStep; j++) {
-        in_conv[j] = tTMEM_LOADrS(i + j) * kPRescale;
+        in_conv[j] = tTMEM_LOADrS(i + j);
       }
       tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
 

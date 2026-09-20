@@ -251,14 +251,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-// FlashRT vendored patch: upstream v4.4.2 arch guard missed SM110.
-// SM110 (Jetson AGX Thor) is binary-compatible with SM100 TMA/UMMA and
-// CUTLASS arch/config.h does define CUTLASS_ARCH_MMA_SM110A/F_ENABLED for
-// -gencode=compute_110a, but this example kernel never honoured them.
-// Adding SM110A/F makes the real MMA path compile instead of asserting.
 #if (! defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && \
-    ! defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM103F_ENABLED) && \
-    ! defined(CUTLASS_ARCH_MMA_SM110A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM110F_ENABLED))
+    ! defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM103F_ENABLED))
     CUTE_INVALID_CONTROL_PATH("ERROR : Arch conditional MMA instruction used without targeting appropriate compute capability. Aborting.\n");
 #else
 

@@ -47,54 +47,63 @@ extern "C" int apxinf_static_fa2_bf16_splitkv(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
-    int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+    int head_dim, float softmax_scale, int num_splits, cudaStream_t stream) {
 #if defined(APXINF_FA2_HEAD_SPECIAL)
+  // Both arms below plan their own splits through the same three assignments
+  // `fa2_splitkv` uses, because `setup_splitkv` is gone: the count is chosen
+  // on the Rust side now and handed in.
   if(head_dim==256 && query_tokens>0 && query_tokens<=64) {
     if(!q||!k||!v||!output||!softmax_lse||!softmax_lse_accum||!o_accum||batch<=0||key_tokens<=0||
-        query_heads<=0||kv_heads<=0||query_heads%kv_heads||num_sms<=0)
+        query_heads<=0||kv_heads<=0||query_heads%kv_heads||num_splits<=0||num_splits>128)
       return static_cast<int>(cudaErrorInvalidValue);
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_params(params,true,q,k,v,output,softmax_lse,batch,query_tokens,key_tokens,
                 query_heads,kv_heads,head_dim,softmax_scale);
     if(query_tokens==1 && query_heads>kv_heads) {
+      // One decode row per group instead of one per head: the kernel sees
+      // `groups` rows of `kv_heads` heads. `plan_fa2_split_count` is given
+      // this same reshaped pair, so `num_splits` already fits what runs here.
       const int groups=query_heads/kv_heads;
       params.seqlen_q=groups;params.h=kv_heads;params.h_h_k_ratio=1;
       params.q_row_stride=params.o_row_stride=head_dim;
       params.q_head_stride=params.o_head_stride=groups*head_dim;
       params.seqlen_q_rounded=((groups+127)/128)*128;
     }
-    setup_splitkv(params,softmax_lse_accum,o_accum,num_sms,params.seqlen_q,
-                  key_tokens,head_dim,batch,params.h);
+    params.num_splits=num_splits;
+    params.softmax_lseaccum_ptr=num_splits>1?softmax_lse_accum:nullptr;
+    params.oaccum_ptr=num_splits>1?o_accum:nullptr;
     return FLASH_NAMESPACE::run_bf16_head256_splitkv(params,stream);
   }
   if (head_dim == 64) {
     if (!q || !k || !v || !output || !softmax_lse || !softmax_lse_accum || !o_accum ||
         batch <= 0 || query_tokens <= 0 || key_tokens <= 0 || query_heads <= 0 ||
-        kv_heads <= 0 || query_heads % kv_heads != 0 || num_sms <= 0)
+        kv_heads <= 0 || query_heads % kv_heads != 0 || num_splits <= 0 ||
+        num_splits > 128)
       return static_cast<int>(cudaErrorInvalidValue);
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_params(params, true, q, k, v, output, softmax_lse, batch, query_tokens,
                 key_tokens, query_heads, kv_heads, head_dim, softmax_scale);
-    setup_splitkv(params, softmax_lse_accum, o_accum, num_sms, query_tokens,
-                  key_tokens, head_dim, batch, query_heads);
+    params.num_splits = num_splits;
+    params.softmax_lseaccum_ptr = num_splits > 1 ? softmax_lse_accum : nullptr;
+    params.oaccum_ptr = num_splits > 1 ? o_accum : nullptr;
     return FLASH_NAMESPACE::run_bf16_head64_splitkv(params, stream);
   }
 #endif
   return apxinf::cuda::cutlass_ops::fa2_bf16_splitkv(
       q, k, v, output, softmax_lse, softmax_lse_accum, o_accum, batch,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
-      num_sms, stream);
+      num_splits, stream);
 }
 
 extern "C" int apxinf_static_fa2_bf16_causal_splitkv(
     const void* q, const void* k, const void* v, void* output,
     void* softmax_lse, void* softmax_lse_accum, void* o_accum, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
-    int head_dim, float softmax_scale, int num_sms, cudaStream_t stream) {
+    int head_dim, float softmax_scale, int num_splits, cudaStream_t stream) {
   return apxinf::cuda::cutlass_ops::fa2_bf16_causal_splitkv(
       q, k, v, output, softmax_lse, softmax_lse_accum, o_accum, batch,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, softmax_scale,
-      num_sms, stream);
+      num_splits, stream);
 }
 #endif
 
@@ -115,4 +124,13 @@ extern "C" int apxinf_static_fa2_f16(
   return apxinf::cuda::cutlass_ops::fa2_f16(
       q, k, v, output, softmax_lse, batch, query_tokens, key_tokens,
       query_heads, kv_heads, head_dim, softmax_scale, stream);
+}
+
+extern "C" int apxinf_static_fa2_f16_strided_qkv(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::fa2_f16_strided_qkv(
+      qkv, output, softmax_lse, batch, tokens, heads, head_dim,
+      softmax_scale, stream);
 }

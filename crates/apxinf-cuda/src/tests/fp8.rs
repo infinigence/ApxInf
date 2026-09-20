@@ -720,7 +720,7 @@ fn fa2_language_direct_e4m3_matches_packed4_bytes() {
     assert!(mqa_f16_e4m3_522(backend.context(), &q, &k, &v, f32::INFINITY).is_err());
 }
 
-#[cfg(apxinf_cutlass_fmha)]
+#[cfg(apxinf_fa2_f16_sm100)]
 #[test]
 fn packed_vision_qkv_matches_split_layout() {
     const TOKENS: usize = 768;
