@@ -7,12 +7,13 @@
 //! `f32` so generic consumers keep working, and the Python policy layer turns
 //! them back into actions with the FAST tokenizer.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
-use crate::auto::{LoadOptions, LoadedModel};
+use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
     Action, InferenceSpec, Observation, PreparedInference, VlaContract, VlaRequest,
     VisionObservation, VlaRuntime,
@@ -21,9 +22,22 @@ use crate::vla::{
 use super::backend::{
     kernels, DeviceBuffer as CudaBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
+use super::fp8_calibration::{checkpoint_identity, Pi0FastFp8Calibration};
 use super::{
-    Pi0FastBf16Runtime, Pi0FastConfig, Pi0FastWeights, StaticBf16Pi0FastWeights,
+    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime,
+    Pi0FastFp8Scales, Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
 };
+
+/// Explicit opt-in for an uncalibrated FP8 bring-up, in the form
+/// `APXINF_PI0FAST_FP8_ACTIVATION_SCALE=<positive float>`.
+///
+/// FP8 π0-FAST requires measured activation scales. Setting this variable is
+/// the only way to run without a profile, and it is deliberately a variable a
+/// caller has to set on purpose rather than a default that silently applies: a
+/// uniform scale is known to break the greedy token stream (see
+/// `devlocal/pi0-fast/reports/08-libero10-accuracy-and-fp8-diagnosis.md`), so it
+/// must never be what someone gets by forgetting to calibrate.
+const FP8_ACTIVATION_SCALE_ENV: &str = "APXINF_PI0FAST_FP8_ACTIVATION_SCALE";
 
 /// Translate the public image layout into the kernel's own enum.
 fn kernel_image_layout(layout: crate::vla::ImageLayout) -> KernelImageLayout {
@@ -42,10 +56,56 @@ fn artifact_root(path: &Path) -> PathBuf {
     }
 }
 
+/// Both runtimes expose the same `infer` entry point; only the precision of the
+/// projections differs, so the frontend dispatches once here rather than
+/// duplicating the VLA plumbing.
+enum RuntimeVariant {
+    Bf16(Arc<Pi0FastBf16Runtime>),
+    Fp8(Arc<Pi0FastFp8Runtime>),
+}
+
+impl RuntimeVariant {
+    fn infer(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Bf16(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
+            Self::Fp8(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
+        }
+    }
+
+    /// Record BF16 activation maxima from one full inference.
+    ///
+    /// Only the BF16 runtime can produce a profile: an FP8 run would quantize
+    /// each activation before the observer saw it, so the recorded maxima would
+    /// describe the already-quantized distribution and the derived scales would
+    /// ratchet further down on every regeneration.
+    fn calibrate(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        match self {
+            Self::Bf16(runtime) => runtime.calibrate(patches, token_ids, token_count, stop_token),
+            Self::Fp8(_) => Err(Error::Other(
+                "π0-FAST FP8 calibration needs the BF16 runtime: load the checkpoint with \
+                 precision=\"bf16\" (or model_variant bf16) to collect a profile"
+                    .into(),
+            )),
+        }
+    }
+}
+
 pub struct Pi0FastVlaRuntime {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi0FastConfig>,
-    runtime: Arc<Pi0FastBf16Runtime>,
+    runtime: RuntimeVariant,
 }
 
 impl Pi0FastVlaRuntime {
@@ -102,7 +162,8 @@ impl Pi0FastVlaRuntime {
         }
     }
 
-    fn run(&self, observation: &Observation, stop_token: Option<u32>) -> Result<Vec<u32>> {
+    /// Validate one Observation and materialize its device patches and tokens.
+    fn device_inputs(&self, observation: &Observation) -> Result<(Tensor, CudaBuffer)> {
         observation.validate()?;
         if observation.token_ids.len() > self.config.max_token_len {
             return Err(Error::Other(format!(
@@ -113,7 +174,28 @@ impl Pi0FastVlaRuntime {
         }
         let patches = self.device_patches(observation)?;
         let tokens = self.device_tokens(&observation.token_ids)?;
-        self.runtime.infer(&patches, &tokens, observation.token_ids.len(), stop_token)
+        Ok((patches, tokens))
+    }
+
+    fn run(&self, observation: &Observation, stop_token: Option<u32>) -> Result<Vec<u32>> {
+        let (patches, tokens) = self.device_inputs(observation)?;
+        self.runtime
+            .infer(&patches, &tokens, observation.token_ids.len(), stop_token)
+    }
+
+    /// Collect one Observation's BF16 activation maxima for FP8 calibration.
+    ///
+    /// `stop_token` ends the decode exactly where inference would, so the
+    /// captured decode-length distribution is the deployed one rather than the
+    /// full `max_action_tokens` budget the policy never pays.
+    fn calibrate_request(
+        &self,
+        observation: &Observation,
+        stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        let (patches, tokens) = self.device_inputs(observation)?;
+        self.runtime
+            .calibrate(&patches, &tokens, observation.token_ids.len(), stop_token)
     }
 
     fn token_tensor(&self, tokens: &[u32]) -> Result<Tensor> {
@@ -160,11 +242,109 @@ impl VlaRuntime for Pi0FastVlaRuntime {
         Ok(tokens.iter().map(|token| *token as f32).collect())
     }
 
+    fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
+        self.calibrate_request(request.observation, None)
+    }
+
+    fn calibration_amax_stop(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.calibrate_request(request.observation, stop_token)
+    }
+
+    fn calibration_plan(&self) -> Result<Vec<String>> {
+        Ok(Pi0FastCalibrationPlan::for_config(&self.config)
+            .sites()
+            .to_vec())
+    }
+
     fn prepare(&self, _spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
         Err(Error::Other(
             "π0-FAST does not implement prepared/captured execution yet".into(),
         ))
     }
+}
+
+/// π0-FAST resolves `auto` to BF16 deliberately.
+///
+/// The FP8 path is a different numerical regime for an autoregressive argmax
+/// decoder, and π0.5's rule (auto selects FP8 on SM100+) was validated on a flow
+/// matcher. Until FP8 token-stream agreement is measured, the fast path is opted
+/// into explicitly with `precision="fp8"`.
+fn resolve_precision(requested: ModelPrecision) -> Result<ModelPrecision> {
+    match requested {
+        ModelPrecision::Auto | ModelPrecision::Bf16 => Ok(ModelPrecision::Bf16),
+        ModelPrecision::Fp8 => Ok(ModelPrecision::Fp8),
+        ModelPrecision::W8A8 => Err(Error::Other(
+            "π0-FAST has no W8A8 path: the autoregressive decode is BF16 or FP8 E4M3".into(),
+        )),
+    }
+}
+
+/// The explicitly requested uncalibrated bring-up scale, if any.
+fn fp8_activation_scale() -> Result<Option<f32>> {
+    let raw = match std::env::var(FP8_ACTIVATION_SCALE_ENV) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let scale = raw.parse::<f32>().map_err(|error| {
+        Error::Other(format!("{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"))
+    })?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other(format!(
+            "π0-FAST FP8 activation scale must be finite and positive, got {scale}"
+        )));
+    }
+    Ok(Some(scale))
+}
+
+/// Resolve the FP8 activation scales for one checkpoint.
+///
+/// Order: an explicit `calibration=` path, then the checkpoint's own
+/// `calibration.json`, then — only when the caller asked for it by setting
+/// `APXINF_PI0FAST_FP8_ACTIVATION_SCALE` — a uniform bring-up scale. There is no
+/// implicit fallback: a uniform scale does not preserve π0-FAST's greedy token
+/// stream, so running FP8 without calibration has to be a decision rather than
+/// an omission.
+fn resolve_fp8_scales(
+    config: &Pi0FastConfig,
+    root: &Path,
+    checkpoint_path: &Path,
+    options: &LoadOptions,
+) -> Result<Pi0FastFp8Scales> {
+    let calibration_path = options.calibration_path.clone().or_else(|| {
+        let candidate = root.join("calibration.json");
+        candidate.is_file().then_some(candidate)
+    });
+    if let Some(calibration_path) = calibration_path {
+        let checkpoint = checkpoint_identity(checkpoint_path)?;
+        let calibration =
+            Pi0FastFp8Calibration::from_json_file(&calibration_path, config, &checkpoint)?;
+        eprintln!(
+            "[apxinf] π0-FAST FP8 calibration={} ({} activation scales, data={})",
+            calibration_path.display(),
+            calibration.len(),
+            checkpoint,
+        );
+        return Pi0FastFp8Scales::from_calibration(config, &calibration);
+    }
+    if let Some(scale) = fp8_activation_scale()? {
+        eprintln!(
+            "[apxinf] warning: π0-FAST FP8 is running on the uniform bring-up scale \
+             {scale} from {FP8_ACTIVATION_SCALE_ENV}; this path does not preserve the \
+             greedy token stream and is not a deployment configuration"
+        );
+        return Pi0FastFp8Scales::uniform(config, scale);
+    }
+    Err(Error::Other(format!(
+        "π0-FAST FP8 requires measured activation scales: pass calibration=<profile.json>, \
+         place calibration.json in {}, or set {FP8_ACTIVATION_SCALE_ENV}=<scale> to \
+         explicitly request the uncalibrated bring-up path \
+         (scripts/calibrate_pi0fast.py generates a profile)",
+        root.display()
+    )))
 }
 
 pub(super) fn load_registered(
@@ -195,15 +375,34 @@ pub(super) fn load_registered(
         Pi0FastConfig::default()
     });
     let host_weights = Pi0FastWeights::from_safetensors(&config, path)?;
-    let weights = Arc::new(StaticBf16Pi0FastWeights::from_host(
-        &host_weights,
-        &*backend,
-    )?);
-    let runtime = Arc::new(Pi0FastBf16Runtime::new(
-        Arc::clone(&backend),
-        Arc::clone(&config),
-        weights,
-    )?);
+    let runtime = match resolve_precision(options.precision)? {
+        ModelPrecision::Fp8 => {
+            let weights = Arc::new(StaticFp8Pi0FastWeights::from_host(
+                &host_weights,
+                &config,
+                &*backend,
+            )?);
+            let scales = Arc::new(resolve_fp8_scales(&config, &root, path, options)?);
+            RuntimeVariant::Fp8(Arc::new(Pi0FastFp8Runtime::new(
+                Arc::clone(&backend),
+                Arc::clone(&config),
+                weights,
+                scales,
+            )?))
+        }
+        _ => {
+            let weights = Arc::new(StaticBf16Pi0FastWeights::from_host(
+                &host_weights,
+                &config,
+                &*backend,
+            )?);
+            RuntimeVariant::Bf16(Arc::new(Pi0FastBf16Runtime::new(
+                Arc::clone(&backend),
+                Arc::clone(&config),
+                weights,
+            )?))
+        }
+    };
     Ok(LoadedModel::Vla(Box::new(Pi0FastVlaRuntime {
         backend,
         config,

@@ -43,3 +43,48 @@ pub fn argmax_bf16_into(ctx: &CudaContext, logits: &Tensor, out: &CudaBuffer) ->
         ))
     }
 }
+
+/// Greedy selection over a *pruned* logit slice, in global token id space.
+///
+/// The LM head of a token decoder that only emits a known slice of its
+/// vocabulary (`Pi0FastConfig::action_head_columns`) produces logits whose
+/// columns are local to the slice. `remap` must hold one `u32` per column,
+/// giving the global token id that column stands for; `out` receives that id
+/// rather than the raw column, so the embedding lookup and the caller's stop
+/// token keep working in the same id space as the full-vocabulary model.
+///
+/// `out` must hold at least one `u32` and `remap` at least `logits.numel()`.
+pub fn argmax_bf16_remapped_into(
+    ctx: &CudaContext,
+    logits: &Tensor,
+    remap: &CudaBuffer,
+    out: &CudaBuffer,
+) -> Result<()> {
+    if logits.dtype() != DType::BF16 {
+        return Err(Error::Other(format!(
+            "CUDA argmax supports BF16 logits, got {}",
+            logits.dtype()
+        )));
+    }
+    let n = logits.numel();
+    if n == 0 {
+        return Err(Error::Other("CUDA argmax needs at least one logit".into()));
+    }
+    if n > u32::MAX as usize {
+        return Err(Error::Other(format!(
+            "CUDA argmax supports at most {} logits, got {n}",
+            u32::MAX
+        )));
+    }
+    require_address(ctx, "argmax_remap", "out", out.address(), 4)?;
+    require_address(ctx, "argmax_remap", "remap", remap.address(), 4 * n)?;
+    unsafe {
+        check_cuda(ffi::apxinf_argmax_remap_bf16(
+            gpu_ptr(logits)?,
+            n as u32,
+            remap.address().ptr(),
+            out.address().ptr(),
+            ctx.stream().handle(),
+        ))
+    }
+}

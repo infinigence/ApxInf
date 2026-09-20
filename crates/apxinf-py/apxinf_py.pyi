@@ -117,6 +117,14 @@ class Model:
         noise: npt.NDArray[np.float32],
     ) -> dict[str, float]: ...
 
+    def _calibrate_tokens_rgb(
+        self,
+        rgb_u8: npt.NDArray[np.uint8],
+        layout: str,
+        token_ids: npt.NDArray[np.uint32],
+        stop_token: int | None = ...,
+    ) -> dict[str, float]: ...
+
     def _calibration_plan(self) -> list[str]: ...
 
     @property

@@ -64,7 +64,11 @@ pub struct StaticBf16Pi0FastWeights {
 }
 
 impl StaticBf16Pi0FastWeights {
-    pub fn from_host(weights: &Pi0FastWeights, backend: &dyn Backend) -> Result<Self> {
+    pub fn from_host(
+        weights: &Pi0FastWeights,
+        config: &super::Pi0FastConfig,
+        backend: &dyn Backend,
+    ) -> Result<Self> {
         Ok(Self {
             patch_embedding: VisionPatchEmbeddingF32::from_host(
                 &weights.vision.patch_embedding,
@@ -87,7 +91,7 @@ impl StaticBf16Pi0FastWeights {
             )?,
             token_embedding: bf16_to_device(&weights.lm_head, backend)?,
             lm_head: Bf16LinearWeights::from_host(
-                &LinearView::transposed(&weights.lm_head)?,
+                &LinearView::columns(&weights.lm_head, &config.action_head_columns()?)?,
                 backend,
             )?,
             language_layers: weights
@@ -104,7 +108,7 @@ impl StaticBf16Pi0FastWeights {
 }
 
 impl VisionPatchEmbeddingF32 {
-    fn from_host(
+    pub(super) fn from_host(
         projection: &super::LinearWeights,
         position: &Tensor,
         backend: &dyn Backend,
@@ -122,7 +126,7 @@ impl VisionPatchEmbeddingF32 {
 }
 
 impl Bf16DeviceLayerNorm {
-    fn from_host(weights: &LayerNormWeights, backend: &dyn Backend) -> Result<Self> {
+    pub(super) fn from_host(weights: &LayerNormWeights, backend: &dyn Backend) -> Result<Self> {
         Ok(Self {
             weight: bf16_to_device(&weights.weight, backend)?,
             bias: bf16_to_device(&weights.bias, backend)?,
@@ -171,26 +175,38 @@ impl Bf16DeviceLanguageLayer {
 
 /// Adapter that lets the LM head reuse the generic linear upload path after a
 /// host transpose, keeping the tied embedding readable as `[vocab, width]`.
-struct LinearView;
+///
+/// The head only ever needs the columns the decode can actually emit
+/// ([`super::Pi0FastConfig::action_head_columns`]), so the transpose is both a
+/// gather and a transpose: it touches a few thousand of the 257152 rows instead
+/// of materializing a full float32 copy of the tied embedding.
+pub(super) struct LinearView;
 
 impl LinearView {
-    fn transposed(tensor: &Tensor) -> Result<super::LinearWeights> {
+    pub(super) fn columns(tensor: &Tensor, columns: &[usize]) -> Result<super::LinearWeights> {
         let dims = tensor.shape().dims();
         if dims.len() != 2 {
             return Err(apxinf_core::Error::Other(format!(
                 "π0-FAST lm_head must be 2D, got {dims:?}"
             )));
         }
-        let (rows, cols) = (dims[0], dims[1]);
+        // Host tensor is `[vocab, width]`; the GEMM wants `[width, columns]`.
+        let (vocab, width) = (dims[0], dims[1]);
         let src = tensor.to_f32_vec()?;
-        let mut dst = vec![0.0f32; src.len()];
-        for row in 0..rows {
-            for col in 0..cols {
-                dst[col * rows + row] = src[row * cols + col];
+        let mut dst = vec![0.0f32; width * columns.len()];
+        for (slot, &column) in columns.iter().enumerate() {
+            if column >= vocab {
+                return Err(apxinf_core::Error::Other(format!(
+                    "π0-FAST lm_head column {column} is outside the {vocab}-row vocabulary"
+                )));
+            }
+            let source = &src[column * width..column * width + width];
+            for input in 0..width {
+                dst[input * columns.len() + slot] = source[input];
             }
         }
         Ok(super::LinearWeights {
-            weight: Tensor::from_f32(vec![cols, rows], &dst)?,
+            weight: Tensor::from_f32(vec![width, columns.len()], &dst)?,
             bias: None,
         })
     }

@@ -49,6 +49,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
+from ...calibration import CalibrationContext, CalibrationPlan
 from ...processors import ImageStack, ParseImage, Pipeline, ResizeWithPadNoAntialias
 from ...processors.tokenize import discretize_state
 from ...processors.transforms import OBSERVATION, PROMPT, RGB, lookup_key
@@ -472,6 +473,7 @@ class Pi0FastPolicy:
         num_flow_steps=None,
         flow_start_time=None,
         discrete_state: Optional[bool] = None,
+        autotune: bool = False,
         **kwargs,
     ) -> "Pi0FastPolicy":
         """Load a LeRobot π0-FAST checkpoint as an L2 policy.
@@ -486,10 +488,10 @@ class Pi0FastPolicy:
             raise TypeError(
                 f"Pi0FastPolicy.from_pretrained: unsupported options {sorted(kwargs)}"
             )
-        if calibration is not None or tactics is not None:
+        if tactics is not None:
             raise NotImplementedError(
-                "Pi0FastPolicy.from_pretrained: π0-FAST is a BF16 token decoder; "
-                "FP8 calibration and tactic search apply to the PI0.5 flow runtime"
+                "Pi0FastPolicy.from_pretrained: π0-FAST token decoding is not a "
+                "GEMM-tactic search target; pass calibration= for FP8 instead"
             )
         if norm_stats is not None or norm_key is not None:
             raise NotImplementedError(
@@ -534,9 +536,13 @@ class Pi0FastPolicy:
             import apxinf_py
 
             path = str(checkpoint) if checkpoint is not None else str(model_dir / "model.safetensors")
-            model = apxinf_py.Model.load(
+            model = apxinf_py.ModelRunner.load(
                 "pi0_fast-cuda", path, device=device, precision=precision,
-                sampling_seed=int(seed),
+                sampling_seed=int(seed), autotune=bool(autotune),
+                # FP8 needs measured activation scales; the native loader reads
+                # the checkpoint's own calibration.json when this is omitted and
+                # refuses to run on a guessed uniform scale.
+                **({"calibration": str(calibration)} if calibration is not None else {}),
             )
 
         if num_views is not None and int(num_views) != int(model.num_views):
@@ -760,6 +766,49 @@ class Pi0FastPolicy:
                 "total_ms": (time.perf_counter() - started) * 1000.0,
             },
         }
+
+    # --- FP8 calibration ---------------------------------------------------
+
+    def calibration_plan(self) -> CalibrationPlan:
+        """Return the stable sites selected by the native FP8 execution plan."""
+        native_plan = getattr(self.model, "_calibration_plan", None)
+        if not callable(native_plan):
+            raise RuntimeError("the loaded model does not expose an FP8 calibration plan")
+        return CalibrationPlan.runtime_validated_sites(
+            model_family="pi0fast",
+            sites=native_plan(),
+            schema="apxinf.pi0fast.fp8-calibration.v1",
+            seed_algorithm="greedy-argmax-deterministic-v1",
+        )
+
+    def collect_calibration(
+        self, observation: Mapping[str, Any], context: CalibrationContext
+    ) -> Mapping[str, float]:
+        """Record one Observation's BF16 activation maxima.
+
+        The capture reuses the inference path exactly — the same prompt
+        construction, the same resize, and the same FAST terminator — so the
+        scales describe the activations the FP8 runtime will actually quantize.
+        Free-running the decode instead would record the runaway activations of
+        the tokens every rollout discards, and one such maximum is enough to
+        coarsen a whole layer's scale. π0-FAST has no latent, so
+        ``context.seed`` is unused by construction; the plan says so rather than
+        recording a seed that changed nothing.
+        """
+        del context
+        if not isinstance(observation, Mapping):
+            raise TypeError(f"observation must be a mapping, got {type(observation)!r}")
+        self._require_keys(observation)
+        prompt = lookup_key(observation, self.prompt_key)
+        if not isinstance(prompt, str):
+            raise TypeError(f"{self.prompt_key} must be a string, got {type(prompt)!r}")
+        token_ids = self._prompt_ids(observation, prompt)
+        data = self.input_pipeline({OBSERVATION: observation, PROMPT: prompt})
+        rgb = data[RGB]
+        collect = getattr(self.model, "_calibrate_tokens_rgb", None)
+        if not callable(collect):
+            raise RuntimeError("the loaded model does not support π0-FAST calibration")
+        return collect(rgb, "nhwc", token_ids, stop_token=int(self.tokenizer.pipe_token_id))
 
     @property
     def action_dim(self) -> int:

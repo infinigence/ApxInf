@@ -1,41 +1,29 @@
-//! Fixed-shape native-BF16 π0-FAST inference runtime.
+//! Fixed-shape FP8 π0-FAST inference runtime.
 //!
-//! Execution is two explicit phases:
-//!
-//! 1. **Prefix**: the SigLIP tower + projector produce image embeddings, the
-//!    prompt token ids are looked up and scaled, the two are concatenated, and
-//!    the Gemma stack runs once with bidirectional attention. Each layer's
-//!    K/V is parked in a cache sized for the prefix plus every decoding step.
-//! 2. **Decode**: the LM head argmaxes the last position, the winning token is
-//!    written to a device buffer, and it is fed straight back into the tied
-//!    embedding lookup through the persistent cache. The token never leaves the
-//!    device inside the loop, so this path is CUDA-graph eligible.
-//!
-//! The runtime returns the raw action tokens. FAST detokenization (BPE + DCT)
-//! is action postprocessing and belongs to the Python policy layer.
+//! Identical structure to `bf16_runtime`: one prefix pass (SigLIP tower +
+//! projector + prompt prefill, K/V parked in a cache) followed by an
+//! autoregressive decode that keeps the token on device. Only the projection
+//! dispatch differs — `gemm::fp8_bf16` with E4M3 weights and calibrated
+//! activation scales.
 
-use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Backend, Error, Result, Tensor};
-use kernels::{cache, elementwise, embedding, gemm, norm, sampling, GraphWorkspace};
+use apxinf_core::{Error, Result, Tensor};
+use kernels::{cache, elementwise, embedding, norm, sampling, GraphWorkspace};
 
-use super::calibration::Pi0FastCalibrationObserver;
+use super::fp8_executor::fp8_projection;
 use super::{
-    language_layer_bf16, language_layer_cached_decode_bf16, vision_layer_bf16,
-    vision_patch_embed_f32_bf16, Pi0FastConfig, StaticBf16Pi0FastWeights,
+    language_layer_cached_decode_fp8, language_layer_fp8, vision_layer_fp8,
+    Pi0FastConfig, Pi0FastFp8Scales, StaticFp8Pi0FastWeights,
 };
+use super::bf16_executor::vision_patch_embed_f32_bf16;
 
-/// Conservative arena reservation for one `infer` traversal.
+/// Conservative arena reservation for one FP8 `infer` traversal.
 ///
-/// [`GraphWorkspace`] is a bump arena: every buffer `output_buffer` hands out
-/// during a call stays live until the scope ends, so the capacity has to cover
-/// the *sum* of the call's intermediates rather than their peak. The estimate
-/// follows `infer_arena` op by op and is deliberately generous; an
-/// under-estimate surfaces as a workspace-exhausted error naming the exact
-/// requirement.
+/// Same op-by-op accounting as the BF16 runtime, since every intermediate stays
+/// BF16; the extra 25% over the BF16 estimate covers the E4M3 copies each
+/// projection makes of its activation before the GEMM.
 fn arena_bytes(config: &Pi0FastConfig, token_count: usize) -> usize {
     const BF16: usize = 2;
     const F32: usize = 4;
@@ -53,7 +41,6 @@ fn arena_bytes(config: &Pi0FastConfig, token_count: usize) -> usize {
     let mut total = 0usize;
     let mut add = |bytes: usize| total += bytes + ALIGN;
 
-    // FP32 SigLIP patch embedding: projection, bias+position, BF16 output.
     add(patches * vw * F32);
     add(patches * vw * F32);
     add(patches * vw * BF16);
@@ -91,41 +78,46 @@ fn arena_bytes(config: &Pi0FastConfig, token_count: usize) -> usize {
         add(prefix * lw * BF16);
         add(prefix * lw * BF16);
     }
-    // Prefix KV cache copy plus the last-row gather.
     add(2 * config.language.depth * cache_rows * kv_cols * BF16);
     add(lw * BF16 * 4);
 
-    // Autoregressive steps: one token through every layer, plus lm_head logits.
     let per_step = config.language.depth * 7 * lw * BF16 + config.language.depth * 3 * lmlp * BF16;
     add(config.max_action_tokens * (per_step + config.action_head_width() * BF16));
 
-    total + (total / 4)
+    total + total / 2
 }
 
-pub struct Pi0FastBf16Runtime {
+pub struct Pi0FastFp8Runtime {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi0FastConfig>,
-    weights: Arc<StaticBf16Pi0FastWeights>,
+    weights: Arc<StaticFp8Pi0FastWeights>,
+    scales: Arc<Pi0FastFp8Scales>,
     /// Maps the pruned LM-head columns back to global token ids; see
     /// [`super::action_head_remap`].
     lm_head_remap: CudaBuffer,
-    /// Persistent arena for the per-call intermediates. Without it every
-    /// intermediate is a raw `cudaMalloc`/`cudaFree` pair.
     arena: Mutex<Option<GraphWorkspace>>,
 }
 
-impl Pi0FastBf16Runtime {
+impl Pi0FastFp8Runtime {
     pub fn new(
         backend: Arc<RuntimeBackend>,
         config: Arc<Pi0FastConfig>,
-        weights: Arc<StaticBf16Pi0FastWeights>,
+        weights: Arc<StaticFp8Pi0FastWeights>,
+        scales: Arc<Pi0FastFp8Scales>,
     ) -> Result<Self> {
         config.validate()?;
         if weights.vision_layers.len() != config.vision_depth
             || weights.language_layers.len() != config.language.depth
         {
             return Err(Error::Other(
-                "π0-FAST BF16 device weight depth mismatch".into(),
+                "π0-FAST FP8 device weight depth mismatch".into(),
+            ));
+        }
+        if scales.vision_layers.len() != config.vision_depth
+            || scales.language_layers.len() != config.language.depth
+        {
+            return Err(Error::Other(
+                "π0-FAST FP8 activation scale depth mismatch".into(),
             ));
         }
         let lm_head_remap = super::action_head_remap(&config, backend.context())?;
@@ -133,6 +125,7 @@ impl Pi0FastBf16Runtime {
             backend,
             config,
             weights,
+            scales,
             lm_head_remap,
             arena: Mutex::new(None),
         })
@@ -142,8 +135,6 @@ impl Pi0FastBf16Runtime {
         self.backend.context()
     }
 
-    /// Run `operation` inside the persistent arena, growing it when a call
-    /// needs more room than the current one provides.
     fn with_arena<T>(
         &self,
         token_count: usize,
@@ -153,7 +144,7 @@ impl Pi0FastBf16Runtime {
         let mut arena = self
             .arena
             .lock()
-            .map_err(|_| Error::Other("π0-FAST arena mutex is poisoned".into()))?;
+            .map_err(|_| Error::Other("π0-FAST FP8 arena mutex is poisoned".into()))?;
         if arena
             .as_ref()
             .is_none_or(|workspace| workspace.capacity() < capacity)
@@ -166,26 +157,10 @@ impl Pi0FastBf16Runtime {
         )
     }
 
-    /// Bytes of the arena the last call used.
-    pub fn arena_used_bytes(&self) -> usize {
-        self.arena
-            .lock()
-            .ok()
-            .and_then(|arena| arena.as_ref().map(|workspace| workspace.used()))
-            .unwrap_or(0)
-    }
-
-    /// Longest token sequence the decode loop can address: the whole prompt
-    /// (conversation prefix + BOS) plus every action token.
     pub fn max_sequence(&self, token_count: usize) -> usize {
         self.config.patch_tokens() + token_count + self.config.max_action_tokens
     }
 
-    /// Run the vision tower and projector, returning `[views*patches, hidden]`.
-    ///
-    /// `patches` is the FP32 patch-major tensor PaliGemma's SigLIP tower
-    /// consumes; the BF16 encoder input is produced inside the patch embedding.
-    
     fn embed_images(&self, patches: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let weights = &self.weights;
@@ -196,10 +171,11 @@ impl Pi0FastBf16Runtime {
             patches,
             patches_per_view,
         )?;
-        for layer in &weights.vision_layers {
-            hidden = vision_layer_bf16(
+        for (layer, scales) in weights.vision_layers.iter().zip(&self.scales.vision_layers) {
+            hidden = vision_layer_fp8(
                 self.ctx(),
                 layer,
+                *scales,
                 &hidden,
                 patches_per_view,
                 config.vision_heads,
@@ -214,7 +190,12 @@ impl Pi0FastBf16Runtime {
             &weights.vision_post_norm.bias,
             config.layer_norm_eps,
         )?;
-        let projected = gemm::bf16(self.ctx(), &hidden, &weights.multimodal_projector.weight)?;
+        let projected = fp8_projection(
+            self.ctx(),
+            &hidden,
+            &weights.multimodal_projector,
+            self.scales.multimodal_projector,
+        )?;
         elementwise::bias_bf16(
             self.ctx(),
             &projected,
@@ -222,8 +203,6 @@ impl Pi0FastBf16Runtime {
         )
     }
 
-    /// Full observation-to-token inference. `token_count` is the prompt length,
-    /// which already includes the BOS token the reference appends.
     pub fn infer(
         &self,
         patches: &Tensor,
@@ -236,33 +215,6 @@ impl Pi0FastBf16Runtime {
         })
     }
 
-    /// One complete inference with every BF16 projection input recorded.
-    ///
-    /// The captured distribution is the deployment one on purpose: the same
-    /// prefill, the same autoregressive steps, and (when the caller passes the
-    /// FAST terminator) the same stopping point the policy will use — not a
-    /// single-forward approximation that would miss the decode-time activations
-    /// the FP8 runtime actually quantizes.
-    pub fn calibrate(
-        &self,
-        patches: &Tensor,
-        token_ids: &CudaBuffer,
-        token_count: usize,
-        stop_token: Option<u32>,
-    ) -> Result<BTreeMap<String, f32>> {
-        let observer = Rc::new(Pi0FastCalibrationObserver::new(
-            Arc::clone(&self.backend),
-            &self.config,
-            &self.weights,
-        )?);
-        let _guard =
-            kernels::gemm::install_bf16_observer(observer.clone())?;
-        let _ = self.infer(patches, token_ids, token_count, stop_token)?;
-        self.backend.synchronize()?;
-        observer.records()
-    }
-
-    /// One full traversal. The caller has already bound the arena.
     fn infer_arena(
         &self,
         patches: &Tensor,
@@ -287,16 +239,10 @@ impl Pi0FastBf16Runtime {
         let prefix_len = token_count + config.patch_tokens();
 
         let step_bytes = std::mem::size_of::<u32>();
-        let tokens =
-            CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
-                .map_err(Error::Cuda)?;
+        let tokens = CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
+            .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
-        // One generated token per step: argmax on device, feed the id straight
-        // back into the tied embedding lookup, and only read the ids back once
-        // the loop ends. `stop_token` (the `|` terminator) ends the stream one
-        // step after it is emitted; the detokenizer truncates there regardless,
-        // so the decoded chunk is unchanged and the remaining steps are skipped.
         let mut produced = config.max_action_tokens;
         for step in 0..config.max_action_tokens {
             let slot = tokens
@@ -321,10 +267,11 @@ impl Pi0FastBf16Runtime {
             }
             let mut step_hidden = self.embed_tokens(&slot, 1)?;
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                step_hidden = language_layer_cached_decode_bf16(
+                step_hidden = language_layer_cached_decode_fp8(
                     self.ctx(),
                     config.language,
                     layer,
+                    self.scales.language_layers[index],
                     &step_hidden,
                     &keys[index],
                     &values[index],
@@ -354,11 +301,12 @@ impl Pi0FastBf16Runtime {
         let mut hidden = prefix;
         let mut keys = Vec::with_capacity(weights.language_layers.len());
         let mut values = Vec::with_capacity(weights.language_layers.len());
-        for layer in &weights.language_layers {
-            let output = language_layer_bf16(
+        for (index, layer) in weights.language_layers.iter().enumerate() {
+            let output = language_layer_fp8(
                 self.ctx(),
                 config.language,
                 layer,
+                self.scales.language_layers[index],
                 &hidden,
                 true,
                 0,
@@ -394,15 +342,14 @@ impl Pi0FastBf16Runtime {
             &self.weights.language_final_norm_scale,
             self.config.rms_norm_eps,
         )?;
-        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
+        fp8_projection(
+            self.ctx(),
+            &normalized,
+            &self.weights.lm_head,
+            self.scales.lm_head,
+        )
     }
 
-    /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
-    ///
-    /// LeRobot scales language and generated action-token embeddings but leaves
-    /// image embeddings alone, so the factor belongs to the caller's token
-    /// stream rather than to the lookup kernel. The text tower, the generated
-    /// action token, and the autoregressive feedback loop all share this path.
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
         let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;

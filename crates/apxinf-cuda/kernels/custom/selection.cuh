@@ -49,6 +49,50 @@ __global__ void argmax_bf16_kernel(
     }
 }
 
+// ── Argmax over a pruned [columns] bf16 logit slice → global token id ───────
+//
+// Identical reduction to `argmax_bf16_kernel`; the only difference is the final
+// store, which maps the winning column through `remap` to the global token id
+// that the embedding table, the decode loop and the caller's stop token all
+// speak. A pruned LM head emits a slice of the vocabulary, so a raw column index
+// would be meaningless outside the head.
+//
+// This is a separate operator rather than an extra argument on the full-vocab
+// one so that every other family keeps the unchanged, branch-free kernel.
+__global__ void argmax_remap_bf16_kernel(
+    const __nv_bfloat16* logits, uint32_t n, const uint32_t* remap,
+    uint32_t* out)
+{
+    uint32_t tid = threadIdx.x;
+    auto pack = [](float v, uint32_t i) -> uint64_t {
+        uint32_t bits = __float_as_uint(v);
+        uint32_t ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        return ((uint64_t)ordered << 32) | (uint64_t)i;
+    };
+    uint64_t best = 0;
+    float best_v = -INFINITY;
+    uint32_t best_i = 0;
+    for (uint32_t i = tid; i < n; i += blockDim.x) {
+        float v = __bfloat162float(logits[i]);
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    best = pack(best_v, best_i);
+    for (int off = 16; off > 0; off >>= 1) {
+        uint64_t other = __shfl_xor_sync(0xffffffff, best, off);
+        if (other > best) best = other;
+    }
+    uint32_t warp_id = tid / 32;
+    uint32_t lane = tid % 32;
+    __shared__ uint64_t warp_best[32];
+    if (lane == 0) warp_best[warp_id] = best;
+    __syncthreads();
+    if (warp_id == 0) {
+        uint64_t v = (tid < (blockDim.x + 31) / 32) ? warp_best[tid] : 0;
+        for (int off = 16; off > 0; off >>= 1)
+            v = max(v, __shfl_xor_sync(0xffffffff, v, off));
+        if (lane == 0) *out = remap[(uint32_t)v];   // low 32 bits = column
+    }
+}
 
 
 

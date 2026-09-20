@@ -1055,6 +1055,70 @@ impl ModelRunner {
         self.model.calibration_plan().map_err(runtime_err)
     }
 
+    /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi0fast.py``.
+    ///
+    /// π0-FAST has no latent to seed: the decode is a deterministic greedy
+    /// argmax, so the same Observation always produces the same activations.
+    /// ``stop_token`` ends the capture where inference would: a profile is only
+    /// valid for the activations deployment quantizes, and free-running past the
+    /// terminator records decode steps no rollout ever reaches.
+    #[pyo3(name = "_calibrate_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn calibrate_tokens_rgb(
+        &self,
+        rgb_u8: PyReadonlyArrayDyn<'_, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py._calibrate_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("_calibrate_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._calibrate_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        self.model
+            .calibration_amax_stop(&request, stop_token)
+            .map_err(runtime_err)
+    }
+
     /// Seeded L1 inference. This avoids creating or transferring a host noise
     /// array and fills the latent on the runtime's CUDA stream.
     #[pyo3(signature = (rgb_u8, layout, token_ids, seed, sequence=0, draw=0))]

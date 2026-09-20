@@ -1219,6 +1219,18 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+    /// Argmax over a pruned [n] logit slice → the global token id of the winner.
+    /// `remap` must hold `n` u32 entries mapping each column of the slice back
+    /// to the token id it stands for; a pruned LM head writes through it so the
+    /// decode loop keeps operating in global token space.
+    pub fn apxinf_argmax_remap_bf16(
+        logits: *const c_void,
+        n: u32,
+        remap: *const c_void,
+        out: *mut c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
     pub fn apxinf_rope_mrope_decode_bf16(
         input: *const c_void,
         output: *mut c_void,

@@ -341,6 +341,21 @@ pub trait VlaRuntime {
         ))
     }
 
+    /// Same capture, but a token decoder may end it at ``stop_token``.
+    ///
+    /// A calibration profile has to describe the activations deployment
+    /// actually quantizes. A token decoder that free-runs past its terminator
+    /// records activations from a token stream inference never produces, and a
+    /// maximum taken over them can be orders of magnitude above the real range.
+    /// Continuous-action families have no token stream and keep the default.
+    fn calibration_amax_stop(
+        &self,
+        request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.calibration_amax(request)
+    }
+
     /// Stable logical sites required by this runtime's calibration profile.
     fn calibration_plan(&self) -> Result<Vec<String>> {
         Err(Error::Other(

@@ -66,6 +66,7 @@ from .policies import (
     ComposablePolicy,
     Gr00tPolicy,
     Pi05Policy,
+    Pi0FastPolicy,
     Policy,
     WallossPolicy,
 )

@@ -711,3 +711,16 @@ extern "C" cudaError_t apxinf_argmax_bf16(
         (const __nv_bfloat16*)logits, n, (uint32_t*)out);
     return cudaGetLastError();
 }
+
+// Argmax over a pruned logit slice, storing the global token id the winning
+// column stands for. `remap` holds `n` u32 entries; the decode loop, the
+// embedding lookup and the stop token all keep working in global id space.
+extern "C" cudaError_t apxinf_argmax_remap_bf16(
+    const void* logits, uint32_t n, const void* remap, void* out, void* stream)
+{
+    cudaStream_t s = (cudaStream_t)stream;
+    argmax_remap_bf16_kernel<<<1, 256, 0, s>>>(
+        (const __nv_bfloat16*)logits, n, (const uint32_t*)remap,
+        (uint32_t*)out);
+    return cudaGetLastError();
+}

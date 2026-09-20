@@ -90,7 +90,7 @@ pub fn f32_to_device(tensor: &Tensor, backend: &dyn Backend) -> Result<Tensor> {
     backend.to_device(&Tensor::from_f32(tensor.shape().dims().to_vec(), &values)?)
 }
 
-fn concat_biases_bf16(tensors: &[&Tensor], backend: &dyn Backend) -> Result<Tensor> {
+pub(super) fn concat_biases_bf16(tensors: &[&Tensor], backend: &dyn Backend) -> Result<Tensor> {
     let mut values = Vec::new();
     for tensor in tensors {
         if tensor.shape().dims().len() != 1 || tensor.dtype() == DType::F8E4M3 {
