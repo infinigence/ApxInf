@@ -53,7 +53,8 @@ __global__ void quantize_rows_bf16_e4m3_kernel(
     const int64_t index = static_cast<int64_t>(row) * input_cols + col;
     maximum = fmaxf(maximum, fabsf(__bfloat162float(input[index])));
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 448.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 448.0f, 1.0e-12f);
   if (threadIdx.x == 0) scales[row] = scale;
   for (int col = threadIdx.x; col < output_cols; col += blockDim.x) {
     const int64_t output_index = static_cast<int64_t>(row) * output_cols + col;
@@ -242,7 +243,8 @@ __global__ void swiglu_quantize_rows_bf16_e4m3_kernel(
     activated[col] = value;
     maximum = fmaxf(maximum, fabsf(value));
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 448.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 448.0f, 1.0e-12f);
   if (threadIdx.x == 0) scales[row] = scale;
 
   for (int col = threadIdx.x; col < output_cols; col += blockDim.x) {
@@ -294,7 +296,8 @@ __global__ void swiglu_quantize_rows_bf16_e4m3_vec8_kernel(
       maximum = fmaxf(maximum, fabsf(value));
     }
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 448.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 448.0f, 1.0e-12f);
   const float inverse_scale = 1.0f / scale;
   if (threadIdx.x == 0) scales[row] = scale;
 
@@ -352,7 +355,8 @@ __global__ void swiglu_quantize_rows_bf16_e4m3_vec4_kernel(
       maximum = fmaxf(maximum, fabsf(value));
     }
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 448.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 448.0f, 1.0e-12f);
   const float inverse_scale = 1.0f / scale;
   if (threadIdx.x == 0) scales[row] = scale;
 
@@ -443,7 +447,8 @@ __global__ void quantize_rows_bf16_int8_kernel(
         maximum,
         fabsf(__bfloat162float(input[static_cast<int64_t>(row) * cols + col])));
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
   if (threadIdx.x == 0) scales[row] = scale;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const int64_t index = static_cast<int64_t>(row) * cols + col;
@@ -465,13 +470,16 @@ __global__ void adaptive_layer_norm_quantize_rows_bf16_int8_kernel(
   float sum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x)
     sum += __bfloat162float(input[base + col]);
-  const float mean = block_sum(sum, scratch) / cols;
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
   float variance_sum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const float centered = __bfloat162float(input[base + col]) - mean;
     variance_sum += centered * centered;
   }
-  const float inverse_std = rsqrtf(block_sum(variance_sum, scratch) / cols + eps);
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
   float maximum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const float normalized =
@@ -483,7 +491,10 @@ __global__ void adaptive_layer_norm_quantize_rows_bf16_int8_kernel(
     output[base + col] = rounded;
     maximum = fmaxf(maximum, fabsf(__bfloat162float(rounded)));
   }
-  const float row_scale = fmaxf(block_max(maximum, scratch) / 127.0f, 1.0e-12f);
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float row_scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
   if (threadIdx.x == 0) scales[row] = row_scale;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const float value = roundf(__bfloat162float(output[base + col]) / row_scale);
@@ -512,7 +523,8 @@ __global__ void silu_mul_quantize_rows_bf16_int8_kernel(
     rounded[col] = value;
     maximum = fmaxf(maximum, fabsf(__bfloat162float(value)));
   }
-  const float scale = fmaxf(block_max(maximum, scratch) / 127.0f, 1.0e-12f);
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
   if (threadIdx.x == 0) scales[row] = scale;
   __syncthreads();
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
