@@ -126,15 +126,19 @@ impl KvCache for CudaKVCache {
     }
 
     fn clear(&mut self) -> apxinf_core::Result<()> {
+        // Decode graphs retain these device addresses across requests. Replacing
+        // allocations here leaves captured kernels pointing at released storage.
+        // Use the same default-stream memset semantics as alloc_zeros, but retain
+        // every allocation. CudaContext streams participate in default-stream ordering.
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaSetDevice(self.device_id as i32))
+                .map_err(Error::Cuda)?;
+            for buf in self.k_buffers.iter().chain(&self.v_buffers) {
+                crate::ffi::check_cuda(crate::ffi::cudaMemset(buf.ptr(), 0, buf.len()))
+                    .map_err(Error::Cuda)?;
+            }
+        }
         self.seq_len = 0;
-        let layer_bytes =
-            self.n_kv_heads * self.max_seq_len * self.head_dim * std::mem::size_of::<f32>();
-        for buf in &mut self.k_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
-        }
-        for buf in &mut self.v_buffers {
-            *buf = CudaBuffer::alloc_zeros(layer_bytes, self.device_id).map_err(Error::Cuda)?;
-        }
         Ok(())
     }
 
