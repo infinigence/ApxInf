@@ -1,4 +1,5 @@
 mod backend;
+pub mod contracts;
 mod dtype;
 mod error;
 mod kv_cache;

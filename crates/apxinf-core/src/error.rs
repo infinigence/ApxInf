@@ -6,6 +6,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    /// A valid operator contract has no implementation in the selected backend.
+    #[error("operator not implemented by this backend: {0}")]
+    UnsupportedOp(&'static str),
+
     #[error("shape mismatch: expected {expected}, got {got}")]
     ShapeMismatch { expected: String, got: String },
 

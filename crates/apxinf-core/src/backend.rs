@@ -12,6 +12,43 @@ use crate::kv_cache::KvCache;
 ///
 /// Object-safe so models can hold `dyn Backend`.
 pub trait Backend: SamplingBackend {
+    // Portable composition extensions. Default errors preserve existing backend
+    // implementations while phase 2 adds device implementations and model wiring.
+    // See contracts and doc/backend-contracts.md for the normative semantics.
+
+    /// Convert F32/F16/BF16 with round-to-nearest-even; preserve shape/device.
+    /// Output is functional, including a same-dtype cast. No FP8 reinterpretation.
+    fn cast(&self, _input: &Tensor, _dtype: crate::DType) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("cast"))
+    }
+
+    /// Materialize a contiguous axis slice without mutating or aliasing inputs.
+    fn slice_axis(&self, _input: &Tensor, _slice: crate::contracts::AxisSlice) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("slice_axis"))
+    }
+
+    /// Concatenate on any axis. All inputs have identical dtype/device/rank.
+    fn concat_axis(&self, _inputs: &[&Tensor], _axis: usize) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("concat_axis"))
+    }
+
+    /// Reorder axes and return contiguous storage; unlike reshape this moves data.
+    fn permute(&self, _input: &Tensor, _axes: &[usize]) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("permute"))
+    }
+
+    /// Materialize right-aligned broadcasting, preserving dtype/device/bits.
+    fn broadcast_to(&self, _input: &Tensor, _shape: &[usize]) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("broadcast_to"))
+    }
+
+    /// Stateless MHA/GQA/MQA with explicit masking and intermediate precision.
+    /// Q[B,Q,Hq,D], K/V[B,K,Hkv,D] -> output shaped like Q. No KV mutation.
+    fn attention(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
+                 _options: &crate::contracts::AttentionOptions<'_>) -> Result<Tensor> {
+        Err(crate::Error::UnsupportedOp("attention"))
+    }
+
     // ── Primitive compute ops ────────────────────────────────────────
 
     /// RMS normalization: output = input * rsqrt(mean(input^2) + eps) * weight
