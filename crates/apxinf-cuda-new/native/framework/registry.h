@@ -1,12 +1,19 @@
+// Immutable candidate storage shared by operator adapters.
+//
+// Candidate must expose provider_id, implementation_id, and
+// implementation_version. find() restores a candidate only when that complete
+// identity matches; begin()/end() expose candidates to filtering or tuning.
+// The operator adapter remains responsible for selecting the semantic-specific
+// registry and for support checks, configurations, provider state, and fallback
+// policy.
 #pragma once
 
+#include <cstdint>
 #include <initializer_list>
 #include <vector>
 
 namespace apxinf::framework {
 
-// The registry owns only immutable candidate descriptors. Spec filtering and
-// provider state remain operator-specific.
 template <class Candidate>
 class Registry {
  public:

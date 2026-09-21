@@ -1,3 +1,13 @@
+// Shared runtime contracts for native operator adapters.
+//
+// Exported C ABI entry points should run inside abi_boundary(); adapters use
+// Failure and the status helpers to translate native errors consistently.
+// Recipe stores only a winner's provider/implementation/configuration identity,
+// never pointers or provider state. On a cache hit, the adapter must resolve the
+// exact implementation, revalidate it for the current Spec and Policy, and
+// prepare a fresh execution. Per-operator in-memory recipe maps are protected
+// by their corresponding mutexes. read_recipe()/write_recipe() provide optional
+// serialized disk persistence; an empty directory disables it.
 #pragma once
 
 #include "../include/apxinf_cuda/status.h"

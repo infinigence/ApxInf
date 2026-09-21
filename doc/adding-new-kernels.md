@@ -1,784 +1,311 @@
-# Workflow for Adding New Hardware, Models, and Missing Operators to ApxInf
+# Adding or Extending CUDA Kernels in ApxInf
 
-This guide covers the vertical path for a genuinely missing operator. Before
-adding one for a model port, use
-[Model Execution Wiring](model-execution-wiring.md) to check maintained fused
-interfaces, device compositions, and runtime lifetime requirements. Absence
-from the portable backend trait alone is not evidence that a CUDA capability is
-missing.
+This document is the kernel development procedure for `crates/apxinf-cuda-new`. The old `crates/apxinf-cuda` is no longer the recommended path for new implementations.
 
-Follow [Development artifacts](../AGENTS.md#development-artifacts) for
-one-off probes, experimental kernels, generated tuning reports, and validation
-captures. Keep them under `<project-root>/devlocal/<feat-name>/`; maintained
-operators and tests retain the source locations described below.
+GEMM and Attention are the current reference implementations, not the complete set of allowed operator families. Future operators may define their own Spec, Bindings, and candidate descriptor, but they must follow the cross-layer boundaries and execution lifecycle specified here.
 
-This document is intended for an agent responsible for porting a working PyTorch reference model to ApxInf. It assumes that the model already runs on the target hardware and that an initial scan has identified operators, data types, shapes, or hardware implementations missing from ApxInf.
+Before starting, read the [`apxinf-cuda-new` architecture](../crates/apxinf-cuda-new/README.md) and the [CUDA L3 operator catalog](../crates/apxinf-cuda-new/cuda-operator.md). This document does not repeat the architecture; it specifies only the files and interfaces that must change, prohibited practices, and acceptance criteria.
 
-The goal is not to translate the PyTorch graph node by node. The goal is to:
+Temporary probes, logs, and benchmark results must be placed in `devlocal/<feat-name>/` according to [`AGENTS.md`](../AGENTS.md), not mixed into production source directories.
 
-1. Confirm that the ApxInf backend, build system, and runtime capability detection support the target hardware.
-2. Map PyTorch computations to existing model-neutral ApxInf operators.
-3. Add operators or implementation paths only for genuine capability gaps.
-4. Connect the model layer through the safe Rust kernel, FFI, host adapter, and GPU implementation.
-5. Validate individual operators, layers, and the complete model against the PyTorch reference.
-6. Consider fusion and autotuning only after correctness is established and profiling data is available.
+## 0. Identify the Layer to Change First
 
-## 0. Execution Principles
-
-- Read the existing code and call paths before editing. Do not infer the architecture from filenames alone.
-- Model runtimes and executors may call only safe Rust operator APIs. They must not call raw FFI, cuBLAS, cuBLASLt, or CUDA kernels directly.
-- Organize `src/kernels/` by logical or physical operator and `src/ffi/` by the underlying provider.
-- Organize Custom CUDA sources by physical operation, not by model, executor, inference stage, or precision.
-- Prefer existing operators, reshapes, and vendor libraries. Do not add a kernel for every PyTorch expression.
-- The first implementation should be correct, verifiable, and have a safe fallback. Perform fusion and tuning only after profiling.
-- A CPU fallback may serve as a temporary correctness oracle while a target
-  accelerator path is under development. After replay proves the semantics,
-  continue through safe Rust API, FFI, adapter, CUDA implementation, workspace,
-  dispatch, and target-hardware replay. Repeated model-layer D2H/H2D is not a
-  completed accelerator implementation and must not be reclassified as generic
-  performance debt merely because end-to-end values pass.
-- CUDA compilation cost affects iteration strategy, not the required execution
-  path. Batch related kernel changes, use focused compile checks where the build
-  permits, and pay the full target build when validation requires it.
-- When no matching tactic exists, an operator must use its explicitly defined safe default or return a clear unsupported error. A model-level precision policy may explicitly require calibration or tuning artifacts.
-- Kernel launchers must not call `cudaStreamSynchronize`; doing so breaks asynchronous execution and CUDA Graph capture.
-- Unsupported hardware, dtype, shape, or alignment must use a correct fallback or return a clear error. It must never silently produce an incorrect result.
-
-## 1. Collect the Required Inputs
-
-Before coding, collect and preserve:
-
-- Target GPU model and compute capability.
-- CUDA Toolkit and driver versions.
-- PyTorch, CUDA, Transformers, and other reference environment versions.
-- Model configuration, weight format, tokenizer, and preprocessor.
-- Fixed inputs, random seeds, and complete model outputs.
-- Important intermediate tensors, including dtype, shape, stride/layout, and values.
-- Actual ranges of dynamic dimensions such as batch size, sequence length, image size, and head dimension.
-- The initial operator gap list.
-
-At minimum, save reference values at these points:
-
-```text
-model input
-embedding/preprocessing output
-per-layer normalization output
-Q/K/V
-attention logits/output
-MLP output
-final normalization
-final model output
-```
-
-Save debug tensors as FP32 when practical. Never label raw BF16 bytes as NumPy FP16.
-
-## 2. Confirm Target Hardware Support
-
-### 2.1 Backend-level support
-
-Start by inspecting:
-
-```text
-crates/apxinf-core/src/lib.rs
-crates/apxinf-model/src/accelerator.rs
-```
-
-The main device types are currently CPU and CUDA.
-
-| Target | Required work |
-| --- | --- |
-| Supported NVIDIA SM80/SM100-family GPU | Usually proceed directly to operator and model integration |
-| New NVIDIA SM architecture | Extend architecture detection, NVCC configuration, device capability classification, and kernel cfgs |
-| AMD GPU | Implement a HIP/ROCm backend first; this is not merely an operator task |
-| CPU | Use or extend the CPU backend |
-
-Do not put AMD-versus-NVIDIA decisions in a model runtime. Vendor-level dispatch belongs to the backend layer.
-
-### 2.2 NVIDIA architecture-level support
-
-Inspect and update as needed:
-
-```text
-crates/apxinf-cuda/build_support/cuda_arch.rs
-crates/apxinf-cuda/build.rs
-crates/apxinf-cuda/src/device_caps.rs
-crates/apxinf-cuda/src/context.rs
-```
-
-Confirm that:
-
-- `APXINF_CUDA_ARCH` and automatic detection recognize the target SM.
-- NVCC receives the correct `-arch=sm_XX` value.
-- The new architecture belongs to an existing `CudaArchFamily`, or a new family is genuinely required.
-- CUTLASS, FA2, cuBLASLt, and Custom kernels support the target architecture.
-- Compile-time cfgs agree with runtime capability checks.
-- Unavailable implementations have a fallback or return a clear error.
-
-Keep three dispatch levels separate:
-
-```text
-Compile-time dispatch
-  Decides which adapters and kernels are included in the build.
-
-Runtime hardware dispatch
-  Uses CudaDeviceCaps to choose implementations available on the current GPU.
-
-Runtime input dispatch
-  Uses dtype, shape, layout, and alignment to choose a concrete variant.
-```
-
-The current build is not a universal fat binary containing independent SM80, SM100, and other implementations. Each adapter is normally compiled with a single `-arch`, and automatic detection requires all visible GPUs to have the same compute capability. Build and test separately for every target SM. Set `APXINF_CUDA_ARCH` explicitly when cross-compiling. CUTLASS may also use `APXINF_CUDA_ARCH_CUTLASS` for an appropriate architecture-feature target.
-
-Adding genuine multi-architecture or fatbin support is a separate build-system task. A new runtime `CudaArchFamily` branch alone does not provide it.
-
-## 3. Build an Operator Gap Table
-
-Classify every relevant PyTorch graph node as one of the following:
-
-1. Already supported by ApxInf and directly reusable.
-2. Logical operator exists, but the required dtype is missing.
-3. Logical operator exists, but the required shape or layout is missing.
-4. Logical operator exists, but the target hardware implementation is missing.
-5. Expressible as existing operators plus a reshape or view.
-6. Requires a new model-neutral operator.
-7. Can initially use a composition, but may deserve fusion after profiling.
-
-Record at least these fields for each gap:
-
-| Field | Example |
-| --- | --- |
-| Logical operator | RMSNorm |
-| PyTorch semantics | `x * rsqrt(mean(x²) + eps) * weight` |
-| Input/output shape | `[B, S, H]` |
-| Kernel view | `[B*S, H]` |
-| Input/output dtype | BF16 |
-| Accumulation precision | FP32 |
-| Layout | Contiguous row-major |
-| Dynamic dimensions | Dynamic `B/S`, fixed `H` |
-| Target hardware | SM87 |
-| Call frequency | Twice per layer |
-| Performance importance | High |
-| ApxInf status | Missing BF16, missing shape, or entirely missing |
-| Initial implementation | Custom CUDA |
-| Fallback | Existing composition, ordinary cuBLAS, or none |
-
-Compare full semantics rather than operator names alone:
-
-- Dtype and accumulation precision.
-- Shape, broadcasting, and layout.
-- Causal versus non-causal masking.
-- Head layout and GQA/MQA rules.
-- RoPE pairing and position IDs.
-- Epsilon, approximation formula, and activation variant.
-- Weight transposition and physical storage layout.
-
-## 4. Choose an Implementation Path
-
-ApxInf CUDA operators primarily use four implementation paths:
-
-| Operator characteristics | Implementation path | Examples |
+| What Changes | Layer | Main Directories |
 | --- | --- | --- |
-| Elementwise, normalization, RoPE, quantization, cache, or project-specific logic | Custom CUDA | RMSNorm, SiLU, RoPE, KV-cache write |
-| Standard matrix multiplication | Ordinary cuBLAS | BF16 GEMM, strided batched GEMM |
-| GEMM requiring epilogue, heuristic, workspace, plan, or autotuning | cuBLASLt | FP8 GEMM, GEMM + bias + GELU |
-| Mature third-party CUDA template implementation exists | Vendored kernel | CUTLASS FP8 GEMM, CUTLASS FMHA, FA2 |
-
-Use this preference order:
+| Model-visible mathematical semantic or tensor contract | L3 Rust Semantic | public API in `src/ops/<operator>/`, `cuda-operator.md` |
+| normalize, execution cache, session, or graph lifecycle | L2 Rust Execution | `src/ops/<operator>/`, `src/workspace.rs`, `src/graph.rs`, `src/ffi/abi/` |
+| C ABI, recipe, kernel selection, autotune, fallback, candidate, or provider adaptation | L1 C++ Native operator | `native/include/`, `native/adapters/`, `native/framework/` |
+| CUDA implementation, template instance, or vendor patch | L0 Kernel | `native/kernels/`, `native/patches/`, `build.rs` |
 
 ```text
-Reuse an existing ApxInf operator
-→ compose existing operators with reshape/view
-→ use ordinary cuBLAS or cuBLASLt
-→ use a mature vendored kernel with an acceptable license
-→ write a Custom CUDA kernel
+model → L3 Rust → L2 Rust → C ABI → L1 C++ → L0 CUDA
 ```
 
-Record the selected backend, fallback, hardware constraints, and rationale in the gap table.
+A new L0 kernel must first be integrated into L1; L2 calls L1 only through the C ABI; models call only L3. See the [`apxinf-cuda-new` architecture](../crates/apxinf-cuda-new/README.md) for the core objects and keys.
 
-When the selected path is a temporary host scaffold, also record its **exit
-criterion**: the safe device API that will replace it, the required workspace
-lifetime, and the operator replay that removes the scaffold. A passing model
-fixture starts that replacement work; it does not close the gap.
+## 1. Single Decision Table
 
-## 5. Define the Safe Rust Operator Contract First
+First record the mathematical semantic, shape, layout, dtype, quantization, mask, scale, target GPU, workspace, CUDA Graph requirements, determinism, numerical tolerance, and performance target. Then classify the change only by the following table.
 
-Regardless of the implementation path, first expose a model-neutral API under:
+| Decision | Change Type | Section |
+| --- | --- | --- |
+| The catalog already has the same semantic, and an existing candidate meets correctness and performance requirements | Reuse directly | 2 |
+| The semantic exists, and the same candidate can safely cover the new shape/dtype/device | Extend a candidate | 3 |
+| The semantic exists, but a different implementation or technology stack is required | Add a candidate/provider | 4 |
+| The public mathematical semantic or a contract that the caller must express differs | Add an L3 semantic | 5 |
+| A new semantic cannot reasonably reuse an existing family's Spec, Bindings, or execution lifecycle | Create an operator family under Section 5 | 5 |
+
+Do not add a semantic in the following cases: only the provider changes; only a configuration, shape, dtype, alignment, or GPU is added; only packing, workspace, or epilogue changes; only the model function name differs; fallback is correct but too slow. If uncertain, do not add a semantic. First complete a comparison of the public mathematical contracts; if uncertainty remains, submit an interface review rather than letting the implementer choose the layer independently.
+
+## 2. Reuse an Existing Semantic Directly
+
+| Category | Requirement |
+| --- | --- |
+| Required files | Modify only the model caller and related model tests; do not modify the native registry/provider |
+| Required interface | Call only the safe Rust L3 API; do not call raw FFI, a provider, or a CUDA kernel |
+| Required tests | Correctness on real model shapes, target-GPU provider summary, and end-to-end profiling |
+| MUST NOT | Do not duplicate a semantic; do not branch on GPU/shape/provider in the model layer; do not bypass the registry |
+
+A provider-selection test cannot replace a performance test; results on one GPU architecture cannot replace acceptance on the target architecture.
+
+## 3. Extend an Existing Candidate
+
+Use this path only when the underlying implementation already has the capability. A `true` result from `supports()` is a correctness guarantee, not a performance hint.
+
+### Required Files
+
+| File | When to Modify |
+| --- | --- |
+| `native/adapters/<operator>/candidates.cpp` | Extend supports/alignment/resource/configurations |
+| `native/adapters/<operator>/providers/*` | The provider adapter must handle the new contract |
+| `native/kernels/*` | A new kernel branch or template instance is required |
+| `build.rs` | Add new sources, includes, macros, or target architectures to the build |
+| `build_support/<operator>_fingerprint.rs` | New inputs are outside the fingerprint's current coverage |
+| `src/ops/tests/precision/*` | Add an independent-reference all-candidate test for the expanded domain |
+| `src/ops/tests/l3_behavior.rs` | The public contract boundary is affected |
+
+### Required Interfaces
+
+| Interface | MUST |
+| --- | --- |
+| `supports(spec)` | Cover the semantic, shape, dtype, layout, mask, scale predicate, and quantization exactly |
+| `alignment_requirements(spec)` | Declare the minimum alignment for each binding |
+| `resource_requirements(spec)` | Report resource requirements knowable before provider construction so the workspace budget can prefilter candidates |
+| `enumerate_configs(spec, out)` | Return every stable configuration that requires independent benchmarking |
+| `prepare(execution)` | Construct complete provider state for every enumerated configuration |
+| `enqueue(execution)` | Be correct and asynchronous across the new domain |
+| `destroy(execution)` | Cover every successful prepare path |
+
+### Prohibited Practices and Tests
+
+MUST NOT: broaden `supports()` first and depend on runtime failure; read input values or pointer contents to select a kernel; enumerate only configurations predicted to be fastest; change the meaning of an old configuration number; add a shape-specific API; omit the target SM or a fingerprint input.
+
+Required tests: all-candidate reference for the new shape/dtype; alignment/workspace boundaries; prepare/enqueue/destroy for every new configuration; capture/replay; target-GPU compile and link; cold-cache tune and warm-cache hit; real-shape benchmark.
+
+## 4. Add a Candidate or Provider
+
+The semantic must already exist, and the provider name must not enter the public API.
+
+### Required Files
+
+| File | MUST |
+| --- | --- |
+| `native/adapters/<operator>/internal.h` | Declare provider callbacks and Execution state |
+| `native/adapters/<operator>/candidates.cpp` | Register the identity, attributes, and all callbacks |
+| `native/adapters/<operator>/providers/<provider>.*` | Thin provider adapter |
+| `native/kernels/<operator-or-provider>/` | Kernel, instance, or vendor source |
+| `build.rs` | Compile and link for the target architecture |
+| `build_support/<operator>_fingerprint.rs` | Cover candidate/ABI/kernel inputs |
+| `src/ops/tests/precision/*` | Independent-reference all-candidate tests |
+| `src/ops/tests/backend_framework.rs` | Selection, resource, and lifecycle regression tests; add corresponding regressions when recipe/fallback is used |
+
+A third-party provider must also include a `README.md` or `VENDOR.md` recording the upstream revision, license, and local modifications; place patches in `native/patches/`. Prefer a compatibility layer or build-time patch over modifying the vendor snapshot directly.
+
+### Stable Identity and Callbacks
+
+Every candidate must have a unique and stable `(provider_id, implementation_id, implementation_version)`. Do not reuse an identity for another implementation; configuration number meanings must remain stable; update the implementation version when an old configuration cannot be restored with its original meaning; include every implementation input in the operator build fingerprint.
+
+The current GEMM/Attention candidate descriptors use the following interfaces. When extending these two families, implement and register all of them:
+
+1. `supports(spec)`;
+2. `alignment_requirements(spec)`;
+3. `resource_requirements(spec)`;
+4. `enumerate_configs(spec, out)`;
+5. `prepare(execution)`;
+6. `enqueue(execution)`;
+7. `destroy(execution)`.
+
+Also set `required_device_features`, `graph_safe`, `deterministic`, `fallback`, and a diagnosable `name` accurately.
+
+A new operator family may define a different descriptor, but its adapter must map it without loss to the framework-required `Problem::registry/supports/configurations/prepare/enqueue/stream/graph_safe` protocol and explicitly represent capabilities, resources, configuration, and destroy lifecycle. Do not modify the common framework only for naming preference; deviations from the current descriptor template must be justified in that operator's architecture review.
+
+`prepare` may create handles, descriptors, algorithms, prepacks, and workspace, but must obey `resource_limit`. `enqueue` may only use prepared state to submit work to the bound stream; it must not tune, allocate long-lived resources, initialize lazily, or synchronize.
+
+### Fallback, Prohibited Practices, and Tests
+
+- Every semantic must have an explicit baseline fallback; high-performance specializations are not fallback by default.
+- The fallback must pass complete semantic tests; fallback selection belongs only to the operator adapter.
+- The registry must not store per-call state; the model layer must not select providers; the framework must not contain operator special cases.
+- Do not treat "can launch" as numerical correctness, and do not modify vendor source without a record.
+
+Required tests: every candidate/configuration against an independent reference; unsupported filtering; identity/version/configuration restoration; resource limits; fallback allow/deny; eager and graph consistency; target-GPU cold/warm cache and performance.
+
+## 5. Add an L3 Semantic
+
+Implement in the following order. Do not register a provider specialization before the public contract is settled.
+
+### Step 1: L3 Rust Args + L2 normalize/execute
+
+Required files:
 
 ```text
-crates/apxinf-cuda/src/kernels/
+src/ops/<operator>/contracts.rs (or the existing family contract)
+src/ops/<operator>/<semantic>.rs
+src/ops/<operator>/execution.rs (or the existing family execution file)
+src/ops/<operator>/mod.rs
+src/ops/mod.rs
+src/lib.rs
 ```
 
-For example:
+| Required Interface | MUST |
+| --- | --- |
+| `<Semantic>Args` | Express only the public mathematical semantic; make invalid combinations unrepresentable where practical |
+| `normalize(ctx, args)` | Validate device/dtype/shape/layout/alias/overflow and produce Spec/Policy/Bindings |
+| `<semantic>(ctx, args)` | Perform only `normalize → execute` |
+| public exports | Export correctly from the operator module and crate root |
+
+Normalize MUST: Spec stores only structural information required for the semantic, legality, and selection equivalence class; Bindings stores addresses, the stream, and dynamic values that do not affect selection; Policy stores the resource and selection constraints supported by the operator; when addresses affect candidate selection, normalize them to alignment classes; keep storage alive; equivalent calls produce the same Spec. A new operator does not need to copy every GEMM/Attention field.
+
+### Step 2: Stable L2/L1 C ABI
+
+Required files:
+
+```text
+native/include/apxinf_cuda/<operator>_types.h
+native/include/apxinf_cuda/<operator>.h
+src/ffi/abi/<operator>.rs
+src/ffi/abi/mod.rs
+```
+
+Required ABI:
+
+```c
+*_prepare(runtime, spec, policy, bindings, &execution);
+*_enqueue(execution);
+*_destroy(execution);
+```
+
+MUST: Spec has an explicit version that changes when layout or semantics change; use only C-compatible fixed-width fields and opaque pointers; Rust and C declarations match exactly; exceptions become status/last-error through the common ABI boundary; no failure path leaks an execution or provider resource.
+
+### Step 3: L1 C++ Operator Adapter
+
+Required files:
+
+```text
+native/adapters/<operator>/internal.h
+native/adapters/<operator>/candidates.cpp
+native/adapters/<operator>/execution.cpp
+```
+
+When persistent tuning is used, also add:
+
+```text
+native/adapters/<operator>/tuning_key.cpp
+native/adapters/<operator>/autotune.cpp
+```
+
+Required types: `Spec`, `Implementation`, `Execution`, and `ImplementationRegistry`. When persistent tuning is used, also add `TuningKeys` containing only one exact key.
+
+| Required Function | MUST |
+| --- | --- |
+| `registry(spec.semantic)` | Return the immutable candidate set for the semantic |
+| `tuning_keys(spec, policy, device)` | For a tunable operator, construct the single exact key |
+| `tune(spec, policy, bindings, device, report)` | For a tunable operator, adapt `framework::autotune` |
+| operator `prepare(...)` | Validate candidate/policy/resource and create an Execution |
+| C ABI `*_prepare` | Validate the ABI; for a tunable operator, look up recipe/tune/fallback; for a non-tuning operator, select a legal baseline directly; return the execution |
+| C ABI `*_enqueue` | Only enqueue the prepared execution |
+| C ABI `*_destroy` | Safely release all state |
+
+| L1 Prepare Strategy | Implementation |
+| --- | --- |
+| Single implementation | Validate + prepare directly |
+| Stable heuristic | Select from Spec/Policy inside the adapter; add `selection.cpp` only when the logic becomes complex |
+| Measurement required | Exact recipe lookup; call `framework::autotune` on a miss |
+
+| MUST NOT |
+| --- |
+| Add semantic-specific shape/dtype/registry/fallback logic to `native/framework` |
+| Add a compatible/hint key or runtime selection-mode metadata/dispatcher |
+| Put pointers/streams into a persistent key |
+| Perform first prepare inside capture |
+
+### Step 4: L1 Provider Callbacks + L0 Kernel
+
+Required files:
+
+```text
+native/adapters/<operator>/providers/
+native/kernels/<operator-or-provider>/
+build.rs
+build_support/<operator>_fingerprint.rs
+```
+
+Register at least one fallback that fully implements the semantic. Existing GEMM/Attention candidates must implement the seven callbacks listed in Section 4; a new operator family uses an equivalent reviewed descriptor. Every candidate must have a stable identity, complete device/policy constraints, and build-fingerprint coverage.
+
+### Step 5: Catalog and Tests
+
+Required files:
+
+```text
+cuda-operator.md
+src/ops/tests/operator_doc.rs
+src/ops/tests/l3_behavior.rs
+src/ops/tests/precision/precision.rs
+src/ops/tests/precision/generate_torch_l3_fixtures.py (when a Torch golden is required)
+src/ops/tests/backend_framework.rs (when new execution behavior is introduced)
+tests/public_ops.rs (when public exports/session behavior changes)
+```
+
+MUST: add a unique catalog marker and Rust semantic metadata; add an independent semantic test; add an independent reference covering every candidate/configuration; add prepare/capture/replay tests for new binding/resource/capture behavior; make the catalog test reject missing, unknown, and duplicate semantics.
+
+## 6. Recipe Invariants for Tunable Operators
+
+An operator with only one fixed implementation and no persisted selection may omit recipes. Any operator that tunes among multiple candidates/configurations and persists the winner must follow this section.
+
+| Scenario | MUST |
+| --- | --- |
+| exact hit | implementation/version/configuration still exists, and supports/device/alignment/policy/prepare all succeed; use it directly without benchmarking |
+| miss | When `online_tune=true`, fully benchmark every legal candidate/configuration |
+| invalid/corrupt | Treat as a miss; do not reuse approximately |
+| winner | Store only provider, implementation, version, and configuration |
+| real prepare fails after tuning | Fallback only when `allow_fallback=true` |
+| tuning disabled, fallback enabled | Use only the explicitly marked fallback |
+| tuning and fallback disabled | Return an explicit cache miss/unsupported error |
+| fallback execution | Do not persist as a tuned winner |
+
+The exact key must cover recipe schema, operator build fingerprint, target GPU, defined compatible versions of CUDA/critical libraries, Spec fields required for the tuning equivalence class, workspace, graph-safe, deterministic, and alignment class. Any critical change must miss; do not add a second-level compatible key.
+
+The autotuner does not validate numerical correctness; all-candidate tests must guarantee it.
+
+## 7. ExecutionSession and CUDA Graph Invariants
 
 ```rust
-pub fn rms_bf16_into(
-    ctx: &CudaContext,
-    input: &CudaBuffer,
-    weight: &CudaBuffer,
-    output: &CudaBuffer,
-    rows: usize,
-    cols: usize,
-    eps: f32,
-) -> Result<()>
+let session = ExecutionSession::with_capacity(workspace_bytes, device)?;
+prepare_with_session(&session, || forward())?;
+let graph = capture(&ctx, || with_session(&session, || forward()))?;
+graph.replay()?;
 ```
 
-This layer owns:
+| Stage | MUST | MUST NOT |
+| --- | --- | --- |
+| prepare | lookup/tune, create executions, allocate resources, record order | Run inside capture |
+| with_session | Hit the same Spec/bindings/device/stream/execution constraints/order | Temporarily prepare on a miss |
+| capture | Capture only asynchronous enqueue and keep resources alive | Multiple streams, synchronization, lazy initialization |
+| replay | Launch the graph directly | Reselect a kernel or modify a recipe |
 
-- Parameter, dtype, shape, buffer-size, and device-consistency checks.
-- Checked integer conversion and size arithmetic.
-- Output and workspace allocation.
-- Compile-time capability, runtime hardware, and runtime shape dispatch.
-- Persisted tactic lookup and the safe default path.
-- Conversion of lower-level errors to `apxinf_core::Result`.
+`graph_safe=true` means only that the prepared enqueue can be captured. Allocation, algorithm selection, and long-lived state initialization must complete in `prepare()`.
 
-Outputs and temporary buffers that must support CUDA Graphs should use the active workspace policy, such as `workspace::output_buffer()`. Do not allocate dynamically during capture or replay.
+## 8. Unified Acceptance
 
-Choose the Rust file by operator semantics:
+| Acceptance Item | Reuse | Extension | New Candidate/Provider | New Semantic |
+| --- | --- | --- | --- | --- |
+| Correctness on real model shapes | MUST | MUST | MUST | MUST |
+| Independent-reference all-candidate test | Existing | MUST | MUST | MUST |
+| Catalog/semantic test | Existing | When affected | When affected | MUST |
+| alignment/workspace | Existing | MUST | MUST | MUST |
+| hit/miss/invalid recipe | Existing | When the key changes | MUST when recipes are used | MUST when recipes are used |
+| fallback allow/deny | Existing | When fallback changes | MUST | MUST |
+| prepare/capture/replay | MUST | MUST | MUST | MUST |
+| target-SM compile and link | MUST | MUST | MUST | MUST |
+| cold tune, warm hit, profiling | MUST when tuning is used | MUST when tuning is used | MUST when tuning is used | MUST when tuning is used |
 
-| Operator category | Safe Rust kernel file |
-| --- | --- |
-| Activation | `src/kernels/activation.rs` |
-| Attention | `src/kernels/attention.rs` |
-| KV cache | `src/kernels/cache.rs` |
-| Elementwise | `src/kernels/elementwise.rs` |
-| Embedding | `src/kernels/embedding.rs` |
-| Fused operator | `src/kernels/fused.rs` |
-| GEMM | `src/kernels/gemm/*.rs` |
-| Normalization | `src/kernels/norm.rs` |
-| Preprocessing | `src/kernels/preprocess.rs` |
-| Quantization | `src/kernels/quantization.rs` |
-| RoPE | `src/kernels/rope.rs` |
+Run the complete tests from the repository root:
 
-Add a Rust module and export it from `src/kernels/mod.rs` only when introducing a new logical category.
-
-## 6. Connect the Lower-level Implementation
-
-### 6.1 Path A: Custom CUDA kernel
-
-Use this path for normalization, activation, elementwise, RoPE, embedding, preprocessing, quantization, KV cache, selection, and project-specific fused computation.
-
-Call path:
-
-```text
-src/kernels/<operator>.rs
-→ src/ffi/custom.rs
-→ adapters/custom_kernels.cu
-→ kernels/custom/<physical_type>.cuh
-→ GPU
+```bash
+bash crates/apxinf-cuda-new/test-new.sh \
+  test -p apxinf-cuda -- --nocapture --test-threads=1
 ```
 
-#### 6.1.1 Select the device-side file
+Finally, verify on the actual target GPU: correct `APXINF_CUDA_ARCH`; new sources are linked; semantic, all-candidate, graph, and applicable recipe tests pass; the actual provider/configuration is explainable; cold/warm cache behavior is correct when tuning is used; real-shape benchmarks and end-to-end model numerical/performance targets are met.
 
-Organize Custom CUDA sources by physical operation:
-
-| Operator | Device-side file |
-| --- | --- |
-| GELU, SiLU, GeGLU | `kernels/custom/activation.cuh` |
-| Mask, softmax, custom attention | `kernels/custom/attention.cuh` |
-| KV-cache write | `kernels/custom/cache.cuh` |
-| Add, multiply, scale, bias, concatenate | `kernels/custom/elementwise.cuh` |
-| Embedding lookup | `kernels/custom/embedding.cuh` |
-| Residual + normalization, QKV split + RoPE | `kernels/custom/fused.cuh` |
-| RMSNorm, LayerNorm, AdaNorm | `kernels/custom/normalization.cuh` |
-| Image preprocessing, patchification | `kernels/custom/preprocess.cuh` |
-| FP8/INT8 quantization and dequantization | `kernels/custom/quantization.cuh` |
-| RoPE | `kernels/custom/rope.cuh` |
-| Argmax, token selection | `kernels/custom/selection.cuh` |
-| Shared mathematical helpers | `kernels/custom/math.cuh` |
-| Warp/block reductions | `kernels/custom/reduction.cuh` |
-
-Add a kernel to an existing `.cuh` whenever the physical category already exists. Create a new `.cuh` only for a genuinely new physical category.
-
-Whenever adding a launcher to `custom_kernels.cu`, verify that the corresponding `.cuh` is included by that translation unit. Do not assume that a header is visible merely because a legacy adapter includes it. At present, `rope.cuh` and `selection.cuh` are included only by the legacy `core_kernels_adapter.cu`. A new ABI for those categories in `custom_kernels.cu` must add the include there or deliberately follow a controlled legacy-ABI extension strategy.
-
-Do not create aggregate headers named after a model, executor, or precision. Express precision through function suffixes or template specialization, for example `rms_norm_bf16_kernel`.
-
-#### 6.1.2 Add the host adapter
-
-New stable C ABIs for Custom operators should normally be added to:
-
-```text
-crates/apxinf-cuda/adapters/custom_kernels.cu
-```
-
-The adapter owns:
-
-- Raw-pointer and scalar-parameter validation.
-- Grid, block, and dynamic shared-memory selection.
-- Vectorized versus scalar dispatch based on shape and alignment.
-- Kernel launch on the supplied CUDA stream.
-- Returning `cudaGetLastError()`.
-
-`core_kernels_adapter.cu`, `static_bf16_adapter.cu`, and `w8a8_adapter.cu` primarily preserve legacy C ABIs. Do not use them as the default location for new Custom operators.
-
-#### 6.1.3 Add the Rust FFI declaration
-
-Declare the symbol exported by the adapter in:
-
-```text
-crates/apxinf-cuda/src/ffi/custom.rs
-```
-
-The FFI layer describes only the raw C ABI. It does not validate tensors, allocate memory, or choose hardware policies.
-
-#### 6.1.4 Handle the build
-
-Changing an existing `.cuh` and `custom_kernels.cu` normally does not require a `build.rs` change. Add a file to `kernel_files` only when introducing a separate `.cu` translation unit. Do not create an independent adapter for every Custom operator.
-
-### 6.2 Path B: ordinary cuBLAS
-
-Use this path for standard GEMM, strided batched GEMM, and matrix multiplications that do not need a custom epilogue or explicit heuristic selection.
-
-Call path:
-
-```text
-src/kernels/gemm/*.rs
-→ src/cublas.rs
-→ src/ffi/cublas.rs
-→ libcublas.so
-→ NVIDIA kernel
-```
-
-No project-owned GPU `.cu` kernel is required.
-
-#### 6.2.1 Existing `CublasHandle` method is sufficient
-
-If `CublasHandle::gemm()`, `batched_gemm()`, or another existing method already expresses the operation, modify only the relevant `src/kernels/gemm/*.rs` call site. Normally do not change `src/cublas.rs`, `src/ffi/cublas.rs`, adapters, or `build.rs`.
-
-#### 6.2.2 cuBLAS supports it, but Rust does not yet wrap it
-
-Add a high-level method to:
-
-```text
-crates/apxinf-cuda/src/cublas.rs
-```
-
-Centralize the following there:
-
-- `cublasHandle_t` lifetime and stream binding.
-- Rust dtype to CUDA/cuBLAS type conversion.
-- Row-major to column-major semantic conversion.
-- M/N, A/B, transpose, and leading-dimension handling.
-- Compute type, alpha/beta, and status checking.
-
-If the raw NVIDIA function is not declared yet, add the corresponding `extern "C"` declaration to `src/ffi/cublas.rs`.
-
-Do not put an ordinary cuBLAS operation in `kernels/custom/` or `adapters/custom_kernels.cu`.
-
-#### 6.2.3 When to use `cublas_adapter.cu`
-
-Use the C++ adapter only when one logical call requires multiple cuBLAS operations, C++-managed workspace, a stable composite ABI, or an interface too complex for direct Rust FFI:
-
-```text
-src/kernels/<operator>.rs
-→ src/ffi/cublas.rs
-→ adapters/cublas_adapter.cu
-→ cuBLAS
-```
-
-The project's cuBLAS MQA implementation is such a composite adapter. This is not the default path for ordinary GEMM.
-
-### 6.3 Path C: cuBLASLt
-
-Use this path for GEMM with bias, GELU, or residual epilogues; FP8 GEMM; and GEMM requiring descriptors, layouts, plans, workspace, heuristics, or autotuning.
-
-Call path:
-
-```text
-src/kernels/gemm/*.rs or src/kernels/fused.rs
-→ src/ffi/cublaslt.rs
-→ adapters/cublaslt_adapter.cu
-→ libcublasLt.so
-→ NVIDIA kernel
-```
-
-cuBLASLt normally does not pass through `src/cublas.rs`, because the C++ adapter manages its complex objects and plans.
-
-#### 6.3.1 Existing C ABI is sufficient
-
-If an existing `apxinf_static_*gemm*` interface already supports the new call, add only the safe Rust call and dispatch. Do not duplicate an adapter or FFI declaration.
-
-#### 6.3.2 Add an epilogue or GEMM variant
-
-Modify:
-
-```text
-crates/apxinf-cuda/adapters/cublaslt_adapter.cu
-crates/apxinf-cuda/src/ffi/cublaslt.rs
-crates/apxinf-cuda/src/kernels/gemm/*.rs or src/kernels/fused.rs
-```
-
-`cublaslt_adapter.cu` owns:
-
-- Creating and caching `cublasLtMatmulDesc_t` and matrix layouts.
-- Setting transpose flags, compute type, bias, and epilogue.
-- Setting workspace preferences.
-- Querying and selecting heuristics.
-- Caching plans and calling `cublasLtMatmul`.
-- Exporting a stable, simple C ABI.
-
-Provide a `prepare` API when native resources must be created before CUDA Graph capture. Provide heuristic setters and autotune APIs when tuning is required. The safe Rust kernel decides when to prepare resources, how to query persisted tactics, and which default path to use.
-
-Changing the existing `cublaslt_adapter.cu` normally does not require a `build.rs` change. NVIDIA provides the actual GPU kernel; do not reimplement the same GEMM under `kernels/custom/`.
-
-### 6.4 Path D: vendored third-party kernel
-
-Use this path for CUTLASS GEMM/FMHA, FlashAttention/FA2, or another mature third-party CUDA kernel optimized for the target architecture.
-
-Call path:
-
-```text
-src/kernels/<operator>.rs
-→ src/ffi/cutlass.rs or src/ffi/fa2.rs
-→ adapters/<vendor>_adapter.cu
-→ kernels/cutlass/<operator>.cu or vendored source
-→ GPU
-```
-
-#### 6.4.1 Store the third-party implementation
-
-Place CUTLASS, FMHA, and FA2 sources under:
-
-```text
-crates/apxinf-cuda/kernels/cutlass/
-```
-
-Filenames should identify the physical operation, dtype or quantization scheme, and target architecture, for example:
-
-```text
-fp8_gemm_sm100.cu
-w8a8_gemm_sm80.cu
-fmha_sm100.cu
-grouped_gemm_bf16_sm100.cu
-```
-
-Preserve the upstream repository, commit/version, license, and local modification notes. Update `kernels/cutlass/README.md`, `VENDOR.md`, and `licenses/` as needed.
-
-#### 6.4.2 Add a stable C ABI adapter
-
-Extend an existing `cutlass_*_adapter.cu` or `fa2_adapter.cu` under `crates/apxinf-cuda/adapters/`, or add an adapter for a genuinely new provider or operator family.
-
-The adapter hides C++ template types, converts raw arguments, passes workspace and tactics, invokes the vendored implementation, and returns a stable error code. The vendored operator implementation itself should not export the Rust-facing C ABI.
-
-#### 6.4.3 Add Rust FFI and the safe kernel
-
-- Put CUTLASS declarations in `src/ffi/cutlass.rs`.
-- Put FA2 declarations in `src/ffi/fa2.rs`.
-- Keep GEMM safe APIs in `src/kernels/gemm/*.rs`.
-- Keep FMHA and FA2 safe APIs in `src/kernels/attention.rs`.
-- Place other operators according to their logical category.
-
-The model must not call raw CUTLASS or FA2 FFI. It calls a logical operator, and the safe kernel selects the third-party implementation or fallback.
-
-#### 6.4.4 Update the build and cfgs
-
-Vendored kernels normally require changes to `crates/apxinf-cuda/build.rs`:
-
-1. Validate that sources, headers, include directories, and adapters exist.
-2. Follow the existing translation-unit pattern and avoid compiling the same operator twice.
-3. Add third-party include paths.
-4. Compile only for supported target SMs.
-5. Emit the corresponding `cargo:rustc-cfg`.
-6. Add `rerun-if-changed` entries.
-7. Ensure cfg-disabled builds use a fallback or return a clear unsupported error.
-
-The current CUTLASS GEMM/FMHA/W8A8 pattern has the adapter directly `#include` the operator `.cu`; only the adapter is added to `kernel_files`. Do not separately compile the included operator. FA2 instead compiles `fa2_adapter.cu` plus separate head-dimension instantiation `.cu` files. Compare against the existing implementation of the same category before adding a source.
-
-For every new cfg:
-
-- Add a matching `cargo:rustc-check-cfg=cfg(...)` declaration to `build.rs`.
-- Emit `cargo:rustc-cfg=...` only when the relevant object is actually compiled.
-- Use the same cfg to guard both the raw FFI declaration and the safe-kernel call.
-
-## 7. Integrate CUDA Graph and Workspace Lifecycles
-
-If the model uses CUDA Graphs, validate eager execution, preparation, capture, and replay. A successful standalone kernel launch is not sufficient.
-
-The basic ApxInf lifecycle is:
-
-```text
-create GraphWorkspace
-→ run eager preflight with prepare_with_workspace()
-→ create native plans/resources and validate workspace capacity
-→ begin_capture()
-→ capture through with_workspace()
-→ end_capture()/instantiate
-→ replay repeatedly
-```
-
-Requirements:
-
-- Allocate outputs and temporary buffers through `workspace::output_buffer()` or the relevant workspace helper. Without an active workspace, the helper may use eager allocation.
-- Include every temporary buffer introduced by the operator in the model's `GraphWorkspace` capacity calculation.
-- Create cuBLASLt plans and other native resources only when `workspace::may_prepare_native_resources()` is true, normally during preflight preparation.
-- Use stable addresses during capture and replay. Do not allocate dynamically, read back to the host, or synchronize the stream.
-- If capture fails, correctly end or invalidate it so that the stream remains usable.
-
-Validate at least:
-
-1. Eager execution works without an active workspace.
-2. Preparation works and detects shape, artifact, and capacity errors before capture.
-3. Capture does not create native plans or dynamic resources.
-4. Insufficient workspace returns a clear error.
-5. The graph can replay repeatedly.
-6. Updating the input changes replay output as expected.
-7. The stream remains usable after a capture failure.
-
-## 8. Add Hardware, Shape, and Backend Dispatch
-
-Dispatch responsibilities belong to different layers:
-
-| Dispatch type | Owner |
-| --- | --- |
-| CPU/CUDA/HIP backend | Accelerator/registry |
-| Model precision and calibration/tuning artifact policy | Model loader/runtime |
-| CUTLASS/cuBLASLt/cuBLAS/Custom implementation selection | Safe kernel |
-| Grid/block/vectorized kernel variant | Host adapter |
-
-The model layer may use device capabilities and artifact availability to choose an FP8, W8A8, BF16, or other model-level precision policy. It must not choose a specific CUTLASS tactic, cuBLASLt heuristic, or grid/block shape.
-
-Example safe-kernel implementation dispatch:
-
-```text
-logical GEMM
-├── persisted CUTLASS tactic
-├── persisted cuBLASLt heuristic
-└── ordinary cuBLAS safe default
-```
-
-Use this decision order:
-
-1. Was the implementation included at compile time?
-2. Does `CudaDeviceCaps` support it on the current device?
-3. Do dtype, shape, layout, and alignment satisfy its constraints?
-4. Does the tuning database contain a match allowed by this backend?
-5. Execute the selected implementation; otherwise use the safe default.
-
-Use compute capability and `CudaDeviceCaps` for primary hardware decisions. Do not rely primarily on GPU name strings.
-
-## 9. Decide Whether to Add Autotuning
-
-Autotuning is appropriate when:
-
-- Multiple CUTLASS tiles or tactics exist.
-- Multiple cuBLASLt heuristics exist.
-- One logical operator has multiple backends.
-- Performance depends strongly on M/N/K.
-- Different hardware has different optimal paths.
-
-Autotuning is usually unnecessary when:
-
-- A simple elementwise or normalization operator has one path.
-- The shape is fixed and the launch configuration is clearly optimal.
-- The first implementation only needs to establish correctness.
-
-The tuning key should include at least the device fingerprint/SM, dtype, important shapes, layout, and operator variant. Follow the matching semantics already defined by each backend:
-
-- The cuBLASLt backend and heuristic require an exact physical key.
-- CUTLASS may check exact first, then use a compatible bucket defined by the existing `GemmBucketKey`.
-- Do not invent an undefined fuzzy-shape match.
-- If no legal tactic exists, use the operator's explicit default policy or return a clear error.
-
-When adding persisted GEMM tactics, inspect and update as needed:
-
-```text
-crates/apxinf-cuda/src/tuning/key.rs
-crates/apxinf-cuda/src/tuning/tactic.rs
-crates/apxinf-cuda/src/tuning/db.rs
-crates/apxinf-cuda/src/tuning/store.rs
-crates/apxinf-cuda/src/tuning/session.rs
-crates/apxinf-cuda/src/tuning/engine.rs
-crates/apxinf-cuda/src/tuning/report.rs
-crates/apxinf-cuda/src/tuning/mod.rs
-crates/apxinf-cuda/src/kernels/gemm/plan.rs
-crates/apxinf-cuda/src/kernels/gemm/providers/
-the corresponding GEMM execution module
-```
-
-Verify `GemmOp`, epilogue, layout, legal backend/tactic ranges, lookup semantics,
-and the database header. Hardware databases live at
-`configs/tuning/<vendor>/<hardware>/tactics.json`, or
-`configs/tuning/<vendor>/<hardware>/cuda<major>.<minor>-cublas<major>.<minor>/tactics.json`
-when the running toolkit has a store of its own; `TuningPaths::resolve_for_cuda`
-prefers the qualified one and falls back to the unqualified one only when its
-header matches. The schema and SM are hard compatibility boundaries.
-CUDA/cuBLAS versions selectively invalidate records that depend on those
-libraries, which is why the toolkit pair is in the path: a store recorded
-elsewhere is otherwise loaded, rejected record by record, and silently replaced
-by the untuned heuristic. `kernel_build_id` is provenance only; a changed
-provider contract is invalidated through that provider's
-`implementation_version`. Each runtime owns its own `TuningSession`.
-
-Tuning workflow:
-
-```text
-enumerate legal tactics
-→ execute into temporary output
-→ compare with the safe reference
-→ warm up
-→ time with CUDA events
-→ select the fastest correct tactic
-→ atomically persist the Exact winner and report
-→ look up Exact → compatible Bucket → safe default
-```
-
-Autotuning runs only in an explicitly configured `AUTO_TUNE` session. An
-`INFERENCE` session never benchmarks or modifies the database. Resolve and
-prepare a plan before CUDA Graph capture; steady-state replay must not enter
-the executor, tuning store, provider, or mode-selection path.
-
-FP8 inference remains correct when no compatible database record is available:
-the GEMM planner prepares the provider's safe default tactic once before graph
-capture. This fallback may be slower than a tuned hardware database, but it
-must not turn a missing or version-filtered record into an unsafe launch.
-
-## 10. Integrate the Model and ModelRunner
-
-After lower-level operator tests pass, use the
-[current module ownership table](model-layer-architecture.md#current-module-names-and-responsibilities)
-and [registration procedure](adding-a-new-model.md#registration-and-public-integration).
-In PI0.5, wire safe calls through `backend.rs` into `model/blocks/`; keep forward
-order in `model/mod.rs`, physical weights in `weights/`, requirement reporting
-in the model, and workspace allocation/capture in `model_runner/prepare.rs`.
-WallOSS/GR00T retain their existing runtime/executor symbols. Operator work must
-not introduce a new model wrapper or family-specific dispatch in the backend.
-
-The model layer owns:
-
-- Model structure and inference flow.
-- Weight-name mapping, transposition, quantization, and upload.
-- Tensor-shape flow.
-- KV-cache and workspace lifetimes.
-- Calls into `apxinf-cuda/src/kernels/`.
-
-The model layer does not own:
-
-- Raw FFI.
-- Concrete kernel cfg, backend tactic, or launch-parameter decisions.
-- CUDA grid/block configuration.
-- cuBLAS handle lifetime.
-- cuBLASLt descriptors and plans.
-- Low-level CUTLASS template and tactic execution.
-
-Use the existing registry and backend-suffix mechanism for model registration. Do not reimplement CPU/CUDA dispatch inside a model.
-
-Quantized models also need an artifact workflow:
-
-```text
-generate and validate calibration data
-→ convert and validate quantized weights, scale mode, and physical layout
-→ generate tactics on the target hardware
-→ verify artifacts against weights, SM, provider implementation version, and relevant library versions
-→ install the tuning store
-→ create the runtime for the selected precision
-```
-
-An explicitly selected precision mode may require calibration or tuning artifacts and refuse to load when they are absent. An `Auto` mode should choose another supported precision according to the model's policy or return a clear explanation. Do not confuse an operator's default tactic with optional model-level quantization artifacts.
-
-## 11. Validate in Layers
-
-### 11.1 Individual operator
-
-Compare every new operator against the PyTorch reference. Cover:
-
-- Minimum, representative, and maximum shapes.
-- Irregular shapes.
-- Aligned and unaligned cases.
-- Dynamic-dimension boundaries.
-- Zeros, random values, and extremes.
-- Every supported dtype.
-- Every hardware/backend branch.
-- Every fallback branch.
-
-Record maximum absolute error, maximum relative error, mean error, and NaN/Inf occurrences. Use appropriate tolerances for BF16, FP16, FP8, and INT8; do not require bitwise equality for all of them.
-
-### 11.2 Complete layer
-
-Validate a complete model layer:
-
-```text
-Norm → QKV → RoPE → Attention → Projection → Residual → MLP
-```
-
-Compare intermediate results and identify the earliest point where error begins.
-
-### 11.3 Complete model
-
-Cover complete outputs, multi-step inference, KV-cache updates, dynamic batch/sequence lengths, eager and CUDA Graph paths, and the target hardware.
-
-### 11.4 Performance
-
-Record individual kernel latency, end-to-end latency, throughput, memory and workspace use, temporary allocations, host/device synchronization, graph compatibility, and comparisons with PyTorch and fallback implementations.
-
-Add fusion or a more specialized kernel only after profiling identifies an actual hotspot.
-
-### 11.5 Build and link matrix
-
-- Perform a clean build for each target SM and run it on the corresponding physical GPU.
-- Verify that every new C ABI links successfully; Rust type-checking alone is insufficient.
-- Test both cfg-enabled and cfg-disabled builds to cover optimized and fallback/unsupported paths.
-- Compare every tuning candidate against a reference. A successful kernel return code does not imply numerical correctness.
-
-## 12. File-selection Reference
-
-| Addition | Safe Rust API | Raw FFI | Host adapter | Actual implementation | `build.rs` |
-| --- | --- | --- | --- | --- | --- |
-| Custom RMSNorm | `src/kernels/norm.rs` | `src/ffi/custom.rs` | `custom_kernels.cu` | `custom/normalization.cuh` | Usually unchanged |
-| Custom SiLU | `src/kernels/activation.rs` | `src/ffi/custom.rs` | `custom_kernels.cu` | `custom/activation.cuh` | Usually unchanged |
-| Ordinary BF16 GEMM | `src/kernels/gemm/bf16.rs` | Reuse or add to `src/ffi/cublas.rs` | None | `libcublas.so` | Unchanged |
-| cuBLAS batched GEMM | `src/kernels/gemm/*.rs` | `src/ffi/cublas.rs` | Usually none | `libcublas.so` | Unchanged |
-| cuBLASLt GEMM + epilogue | `src/kernels/gemm/*.rs` or `fused.rs` | `src/ffi/cublaslt.rs` | `cublaslt_adapter.cu` | `libcublasLt.so` | Usually unchanged |
-| CUTLASS GEMM | `src/kernels/gemm/*.rs` | `src/ffi/cutlass.rs` | `cutlass_*_adapter.cu` | `kernels/cutlass/*.cu` | Required |
-| CUTLASS FMHA | `src/kernels/attention.rs` | `src/ffi/cutlass.rs` | `cutlass_fmha_adapter.cu` | `kernels/cutlass/fmha*.cu` | Required |
-| FA2 | `src/kernels/attention.rs` | `src/ffi/fa2.rs` | `fa2_adapter.cu` | `kernels/cutlass/fa2/` | Required |
-
-## 13. Required Agent Deliverables
-
-At completion, submit or report:
-
-1. **Hardware support conclusion:** target GPU/SM, architecture family, compile-time cfgs, unavailable implementations, and fallbacks.
-2. **Operator mapping table:** PyTorch operator, ApxInf safe API, lower-level path, shape/dtype/hardware constraints, and status.
-3. **Changed-file list:** grouped by model layer, safe kernel, FFI, adapter, GPU/vendored source, build, tuning, and tests.
-4. **New operator call paths:** from model runtime to the actual GPU implementation.
-5. **Correctness results:** operator, layer, and model errors, plus covered shapes, dtypes, and hardware.
-6. **Performance results:** hotspot latency, end-to-end results, fallback comparison, and tuning results.
-7. **Remaining risks:** uncovered hardware, shapes, graph capture, precision, or licensing concerns.
-
-Recommended operator mapping format:
-
-| PyTorch operator | ApxInf safe API | Lower-level implementation | Hardware restriction | Fallback | Status |
-| --- | --- | --- | --- | --- | --- |
-| `F.linear` | `gemm::bf16()` | Ordinary cuBLAS | CUDA | Not needed | Reused |
-| `rms_norm` | `norm::rms_*()` | Custom CUDA | CUDA | None | Added |
-| `scaled_dot_product_attention` | `attention::*()` | FA2 | Specific SM/head dimension | Custom/error | Pending validation |
-
-## 14. Recommended Execution Order and Acceptance Gates
-
-```text
-confirm target hardware and build architecture
-→ freeze the PyTorch reference
-→ build the complete operator gap table
-→ reuse existing operators and composition paths
-→ select one of the four lower-level implementations for each remaining gap
-→ define the safe Rust kernel contract
-→ connect FFI, adapter, and actual implementation
-→ add compile-time, hardware, shape, and backend dispatch
-→ pass individual-operator correctness tests
-→ integrate workspace and validate prepare/capture/replay
-→ integrate the model/Blocks and runner preparation
-→ pass layer and complete-model correctness tests
-→ profile
-→ optimize only measured hotspots
-→ add autotuning where justified
-→ complete target-hardware regression tests
-```
-
-Final acceptance criteria:
-
-- The model runtime depends only on safe Rust operator APIs.
-- Every new operator has a clear call path, hardware constraints, and fallback.
-- When no matching tactic exists, the operator uses a defined safe strategy or returns a clear error. Required model calibration/tuning artifacts have an explicit and verifiable loading policy.
-- Unsupported hardware, dtype, shape, and alignment never enter an invalid implementation silently.
-- Individual operator and complete model outputs agree with the PyTorch reference within the appropriate precision tolerance.
-- CUDA Graph paths perform no illegal resource creation, synchronization, or dynamic allocation.
-- Performance optimizations are supported by profiling data collected on the target hardware.
+Do not mark the work complete if any required interface, required test, target-GPU result, or documentation update is missing.

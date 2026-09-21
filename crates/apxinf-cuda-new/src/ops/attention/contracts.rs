@@ -5,6 +5,32 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::attention as abi;
 use crate::{CudaBuffer, CudaContext};
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Semantic {
+    Dense = abi::SEMANTIC_DENSE,
+    KvCache = abi::SEMANTIC_KV_CACHE,
+    Segmented = abi::SEMANTIC_SEGMENTED,
+}
+
+impl Semantic {
+    pub(crate) const fn abi_value(self) -> u32 {
+        self as u32
+    }
+
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[Self::Dense, Self::KvCache, Self::Segmented];
+
+    #[cfg(test)]
+    pub(crate) const fn doc_id(self) -> &'static str {
+        match self {
+            Self::Dense => "attention",
+            Self::KvCache => "kv_cache_attention",
+            Self::Segmented => "segmented_attention",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionMask {
     None,
@@ -235,7 +261,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
     Ok(Normalized {
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
-            semantic: abi::SEMANTIC_DENSE,
+            semantic: Semantic::Dense.abi_value(),
             dtype: dtype_code(dtype)?,
             output_dtype: output_dtype_code(output_dtype)?,
             mask: args.mask as u32,

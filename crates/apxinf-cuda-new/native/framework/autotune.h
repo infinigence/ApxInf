@@ -1,3 +1,14 @@
+// Operator-independent CUDA autotuning loop.
+//
+// A downstream adapter instantiates autotune<Problem> and must provide
+// Problem::Implementation, Problem::Execution, and these methods:
+//   registry(), supports(implementation, reason),
+//   configurations(implementation, values), prepare(implementation, config),
+//   enqueue(execution), stream(), and graph_safe().
+// Implementation exposes name and recipe identity fields; Execution exposes
+// implementation and configuration. The adapter must benchmark with isolated
+// output storage so tuning cannot modify caller-visible results. Cache lookup,
+// recipe persistence, and fallback policy remain in the operator adapter.
 #pragma once
 
 #include "runtime_internal.h"

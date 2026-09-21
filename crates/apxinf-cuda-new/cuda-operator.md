@@ -1,82 +1,118 @@
-# CUDA Operator Catalog
+# CUDA L3 Operator Catalog
 
-This catalog is for model authors choosing model-neutral L3 operators from
-`apxinf-cuda`. Match the complete mathematical expression and tensor contract,
-not only a familiar operator name. If no row matches exactly, treat that as an
-operator gap and follow [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md).
+This document lists the model-independent L3 semantics currently exposed by `apxinf-cuda-new`. Model code must match the complete mathematical semantic and tensor contract, not only the operator name. If no interface matches completely, record an operator gap and follow [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md).
 
-The catalog describes the public semantic API. Provider selection and tuning
-remain internal to the CUDA crate. All listed operators support eager execution
-and the `prepare_with_session` -> capture -> replay workflow. Inputs, outputs,
-biases, and scales must be CUDA tensors on the context's device, and output
-storage must not overlap an input.
+This document describes only public contracts and does not promise a specific provider, candidate, or autotune winner. Every operator supports eager execution and `prepare_with_session` → capture → replay.
 
-Each `l3-operator` comment below is checked against the Rust semantic registry.
-The test checks that every public semantic appears exactly once; reviewers must
-still verify that contract details and limitations are accurate.
+## Shared Constraints
 
-## Shared GEMM contract
+- Input, output, bias, and scale tensors must reside on the CUDA device of the current `CudaContext`.
+- Tensors use contiguous row-major layout; output storage must not overlap read-only inputs.
+- Shapes must be nonempty, and dimensions passed to the native layer must not exceed `i32::MAX`.
+- Policy fields such as workspace, graph-safe, and deterministic affect only candidate eligibility and the recipe; they do not change the L3 mathematical semantic.
+- `l3-operator` comments are machine-readable markers. A unit test compares them with the Rust semantic metadata registered by each operator family to ensure that every public semantic appears exactly once; a new family must be added to that set.
 
-- Public matrices are contiguous row-major: `A=[M,K]`, `B=[K,N]`.
-- Dimensions must be non-zero, mutually compatible, and fit in `i32`.
-- `alpha` is applied to the projection. The final value is divided by the
-  positive `output_scale`.
-- `GemmQuantization::None` requires matching, non-FP8, non-INT8 input dtypes.
-- `GemmQuantization::Fp8UnitScale` accepts two pre-quantized FP8 E4M3 tensors.
-- `GemmQuantization::Fp8` accepts FP8 E4M3 inputs with FP32 row scales `[M]`
-  and channel scales `[N]`.
-- `GemmQuantization::W8A8` accepts INT8 inputs with FP32 row scales `[M]` and
-  channel scales `[N]`; output must be BF16 and `K <= 131071`.
-- Quantization happens before these APIs. Dynamic quantization is not part of
-  the current L3 contracts.
+## Shared GEMM Contract
 
-## Available L3 operators
+GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the final result is divided by a finite positive `output_scale`. `projection(A,B)` interprets inputs according to the following quantization contract:
+
+- `None`: A/B have the same dtype, which is neither E4M3 nor INT8.
+- `Fp8UnitScale`: A/B are both E4M3 tensors with the expected scaling already applied.
+- `Fp8`: A/B are both E4M3; FP32 `row_scales=[M]` and `channel_scales=[N]` dequantize rows of A and columns of B, respectively.
+- `W8A8`: A/B are both INT8 and use FP32 row/channel scales with the same shapes; output is BF16, `K <= 131071`, and the mode applies only to `gemm` and `gemm_bias`.
+
+Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
 <!-- l3-operator:gemm -->
 ### `gemm`
 
-| Rust API | Semantics | Output | Supported quantization | Important restrictions | Reference test |
-|---|---|---|---|---|---|
-| `ops::gemm` | `Y = alpha * (A @ B) / output_scale` | `[M,N]` | None, FP8 unit-scale, FP8 row/channel, W8A8 row/channel | W8A8 output is BF16 | `gemm_all_candidates_match_torch` |
-
-Use for a plain linear projection when bias and activation are separate or
-absent.
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm(ctx, GemmArgs)` |
+| Inputs | `A=[M,K]`, `B=[K,N]`; supports `None`, `Fp8UnitScale`, `Fp8`, and `W8A8` |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = alpha * projection(A,B) / output_scale` |
+| Constraints | W8A8 output must be BF16; `WeightVersion` may declare immutable weights and allow prepare to cache an internal prepacked copy |
+| Reference test | `gemm_all_candidates_match_torch` |
 
 <!-- l3-operator:gemm_bias -->
 ### `gemm_bias`
 
-| Rust API | Semantics | Output | Supported quantization | Important restrictions | Reference test |
-|---|---|---|---|---|---|
-| `ops::gemm_bias` | `Y = (alpha * (A @ B) + bias) / output_scale` | `[M,N]` | None, FP8 unit-scale, FP8 row/channel, W8A8 row/channel | `bias=[N]`; W8A8 output is BF16 | `gemm_bias_all_candidates_match_torch` |
-
-Use when bias addition is part of the required L3 semantic.
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_bias(ctx, GemmBiasArgs { gemm, bias })` |
+| Inputs | `A=[M,K]`, `B=[K,N]`, `bias=[N]`; supports all four GEMM quantization contracts |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = (alpha * projection(A,B) + bias) / output_scale`, with bias broadcast across M |
+| Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
+| Reference test | `gemm_bias_all_candidates_match_torch` |
 
 <!-- l3-operator:gemm_bias_gelu -->
 ### `gemm_bias_gelu`
 
-| Rust API | Semantics | Output | Supported quantization | Important restrictions | Reference test |
-|---|---|---|---|---|---|
-| `ops::gemm_bias_gelu` | `Y = GELU(alpha * (A @ B) + bias) / output_scale` | `[M,N]` | None, FP8 unit-scale, FP8 row/channel | `bias=[N]`; W8A8 is not supported | `gemm_bias_gelu_all_candidates_match_torch` |
-
-The activation is the tanh-approximation GELU used by the checked Torch
-reference. Use only when the model requires this fused ordering.
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_bias_gelu(ctx, GemmBiasGeluArgs { gemm, bias })` |
+| Inputs | `A=[M,K]`, `B=[K,N]`, `bias=[N]`; supports `None`, `Fp8UnitScale`, and `Fp8` |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = GELU_tanh(alpha * projection(A,B) + bias) / output_scale` |
+| Constraints | bias dtype matches the projection dtype; GELU uses the Torch reference's tanh approximation; W8A8 is unsupported |
+| Reference test | `gemm_bias_gelu_all_candidates_match_torch` |
 
 <!-- l3-operator:gemm_geglu -->
 ### `gemm_geglu`
 
-| Rust API | Semantics | Output | Supported quantization | Important restrictions | Reference test |
-|---|---|---|---|---|---|
-| `ops::gemm_geglu` | `Y = GELU(alpha * (A @ B_gate)) * (alpha * (A @ B_up)) / output_scale` | `[M,N]` | None, FP8 unit-scale | Public `B=[K,2N]`: gate columns first, then up columns; scaled FP8 and W8A8 are not supported | `gemm_geglu_all_candidates_match_torch` |
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_geglu(ctx, GemmGegluArgs { gemm })` |
+| Inputs | `A=[M,K]`, `B=[K,2N]`; the first N columns of B are `B_gate`, and the last N columns are `B_up`; supports `None` and `Fp8UnitScale` |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = GELU_tanh(alpha*(A@B_gate)) * (alpha*(A@B_up)) / output_scale` |
+| Constraints | The second dimension of B is even; FP8 with row/channel scales and W8A8 are unsupported; candidate-specific packing may occur only internally |
+| Reference test | `gemm_geglu_all_candidates_match_torch` |
 
-Use for the complete GeGLU projection. Do not pre-pack or interleave the public
-weight: candidate-specific packing is internal. When a weight allocation is
-immutable, attach a `WeightVersion` so a prepared execution may safely cache a
-transformed copy.
+## Shared Attention Contract
 
-## Operator families not yet exposed by `cuda-new`
+Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same dtype, and `scale` is finite and positive with a default of `1/sqrt(head_dim)`. Dense and KV-cache support MHA, GQA, and MQA and require `query_heads % kv_heads == 0`.
 
-The legacy CUDA crate also contains activation, attention, cache, elementwise,
-embedding, normalization, preprocessing, quantization, RoPE, and additional
-fused operations. They do not yet have public L3 APIs in `cuda-new`. A new model
-that needs one of these semantics must record an operator gap rather than infer
-support from the legacy implementation.
+<!-- l3-operator:attention -->
+### `attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::attention(ctx, AttentionArgs)` |
+| Inputs | `Q=[B,Tq,Hq,D]`, `K/V=[B,Tk,Hkv,D]`; Q/K/V share F16 or BF16 dtype; mask is `None` or `Causal` |
+| Output | `Y=[B,Tq,Hq,D]`; ordinary output uses the input dtype, and F16 input may also be written as E4M3 |
+| Mathematical semantic | dense scaled dot-product attention |
+| Constraints | Causal requires `Tk>=Tq`, with queries aligned to the final positions of the key sequence; ordinary output requires `output_scale=1`; E4M3 stores `round_to_e4m3(attention/output_scale)` |
+| Reference test | `attention_all_candidates_match_reference` |
+
+<!-- l3-operator:kv_cache_attention -->
+### `kv_cache_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::kv_cache_attention(ctx, KvCacheAttentionArgs)` |
+| Inputs | `Q=[B,Tq,Hq,D]`, `K_cache/V_cache=[B,key_capacity,Hkv,D]`; all share F16 or BF16 dtype; mask is `None` or `Causal` |
+| Output | `Y=[B,Tq,Hq,D]`, with the same dtype as the inputs |
+| Mathematical semantic | scaled dot-product attention from the query to the first `valid_key_tokens` rows of the cache |
+| Constraints | `0<valid_key_tokens<=key_capacity`; when causal, token i is at `query_start+i`, and `query_start+Tq<=valid_key_tokens` is required |
+| Reference test | `kv_cache_attention_all_candidates_match_reference` |
+
+<!-- l3-operator:segmented_attention -->
+### `segmented_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::segmented_attention(ctx, SegmentedAttentionArgs)` |
+| Inputs | Q/K/V are all `[total_tokens,H,D]` with the same dtype (F16 or BF16); device U32 offsets match the contents of `host_offsets` |
+| Output | `Y=[total_tokens,H,D]`, with the same dtype as the inputs |
+| Mathematical semantic | independent non-causal self-attention for each segment of a packed token sequence |
+| Constraints | offsets contain at least two elements, are monotonically nondecreasing, begin at 0, and end at `total_tokens`; empty segments are allowed; causal and differing Q/KV head counts are unsupported |
+| Reference test | `segmented_attention_all_candidates_match_reference` |
+
+## Testing Responsibilities
+
+The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
+
+Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
