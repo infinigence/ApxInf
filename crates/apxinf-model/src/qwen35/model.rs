@@ -17,11 +17,12 @@ use crate::accelerator::cuda::downcast_arc;
 use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 
 use super::decode::{HybridUnit, HybridUnitMode, Qwen35LmHead};
-use super::Qwen35Config;
+use super::{Qwen35CheckpointReport, Qwen35Config};
 
 const HIDDEN: usize = 5120;
 const VOCAB: usize = 248_320;
 const PREFILL_TILE: usize = 8;
+const DEFAULT_MAX_MODEL_LEN: usize = 32_768;
 
 /// Native Qwen3.8-27B AWQ runtime exposed through the shared text interface.
 ///
@@ -56,6 +57,7 @@ impl Qwen35Model {
             path.parent().unwrap_or_else(|| Path::new("."))
         };
         let config = Qwen35Config::from_json_file(&model_dir.join("config.json"))?;
+        Qwen35CheckpointReport::inspect(model_dir, &config)?;
         let manifest = safetensors::inspect_path(model_dir).map_err(Error::Other)?;
         let embedding_entry = manifest
             .tensor("model.language_model.embed_tokens.weight")
@@ -69,13 +71,12 @@ impl Qwen35Model {
             )));
         }
         let embedding = safetensors::load_manifest_tensor(embedding_entry).map_err(Error::Other)?;
-        let max_seq_len = max_seq_len
-            .unwrap_or(config.text.max_position_embeddings)
-            .min(config.text.max_position_embeddings);
-        if max_seq_len == 0 {
-            return Err(Error::Other(
-                "Qwen3.8 max sequence length must be non-zero".into(),
-            ));
+        let max_seq_len = max_seq_len.unwrap_or(DEFAULT_MAX_MODEL_LEN);
+        if max_seq_len == 0 || max_seq_len > config.text.max_position_embeddings {
+            return Err(Error::Other(format!(
+                "Qwen3.8 max sequence length {max_seq_len} must be within 1..={}",
+                config.text.max_position_embeddings
+            )));
         }
         let decoder = HybridUnit::load_all_with_prefill_mode(
             &manifest,
