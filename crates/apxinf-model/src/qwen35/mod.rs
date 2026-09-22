@@ -8,6 +8,8 @@ mod checkpoint;
 mod config;
 #[cfg(feature = "cuda")]
 mod decode;
+#[cfg(feature = "cuda")]
+mod model;
 mod multimodal;
 #[cfg(feature = "cuda")]
 mod vision;
@@ -18,6 +20,8 @@ pub use config::{
 };
 #[cfg(feature = "cuda")]
 pub use decode::{load_embedding_row, HybridUnit, HybridUnitMode, Qwen35LmHead, Qwen35PrefillMode};
+#[cfg(feature = "cuda")]
+pub use model::Qwen35Model;
 pub use multimodal::{compute_mrope_positions, Qwen35MropePositions};
 #[cfg(feature = "cuda")]
 pub use vision::Qwen35VisionEncoder;

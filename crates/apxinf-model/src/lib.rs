@@ -31,6 +31,8 @@ pub use llm_trait::{
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;
+#[cfg(feature = "cuda")]
+pub use qwen35::Qwen35Model;
 pub use qwen35::{Qwen35CheckpointReport, Qwen35Config, Qwen35LayerType};
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use qwen_drive::QwenDriveConfig;

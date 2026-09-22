@@ -8,6 +8,8 @@ use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
 use crate::auto::{LoadOptions, LoadedModel};
 use crate::llama::{GeneralLlama, LlamaWeights};
+#[cfg(feature = "cuda")]
+use crate::qwen35::Qwen35Model;
 use crate::qwen3vl::{GeneralQwen3VL, Qwen3VLConfig};
 use crate::registry;
 
@@ -17,6 +19,11 @@ pub fn register_builtin_models() {
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
+    #[cfg(feature = "cuda")]
+    {
+        registry::register("qwen3_5", load_qwen35);
+        registry::register("qwen35", load_qwen35);
+    }
     registry::register("qwen_drive", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
@@ -27,6 +34,17 @@ pub fn register_builtin_models() {
     crate::pi0fast::register_builtin();
     #[cfg(feature = "cuda")]
     crate::gr00t::register_builtin();
+}
+
+#[cfg(feature = "cuda")]
+fn load_qwen35(
+    path: &Path,
+    _device: Device,
+    backend: Arc<dyn Backend>,
+    _options: &LoadOptions,
+) -> Result<LoadedModel> {
+    let model = Qwen35Model::from_path(path, backend, None)?;
+    Ok(LoadedModel::text(Box::new(model)))
 }
 fn load_llama(
     path: &Path,
@@ -87,9 +105,7 @@ fn load_qwen_drive(
         } else {
             path.parent().unwrap_or_else(|| Path::new("."))
         };
-        let model = crate::qwen_drive::QwenDriveModel::load_with_backend(
-            model_dir, None, backend,
-        )?;
+        let model = crate::qwen_drive::QwenDriveModel::load_with_backend(model_dir, None, backend)?;
         Ok(LoadedModel::text(Box::new(model)))
     }
     #[cfg(not(feature = "cuda"))]

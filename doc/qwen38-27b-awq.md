@@ -27,6 +27,31 @@ APXINF_CUDA_ARCH=sm_89 cargo build --release --features cuda
 `inspect` validates the model identity, layer schedule, shard metadata, tensor
 shapes, and AWQ packing before any resident service is started.
 
+## Common model loader
+
+The native runtime is also registered through the maintained model front door.
+With a CUDA build, `config.json:model_type` (`qwen3_5`) is resolved by
+`AutoModel` to `LoadedModel::Text(Qwen35Model)`, which implements the shared
+`LlmTrait` prefill/decode path. The HTTP service below is an application
+adapter over the same family-local CUDA decoder; it is not the model loading
+authority.
+
+```rust,no_run
+use apxinf_core::Device;
+use apxinf_model::{AutoModel, LoadOptions};
+
+let mut model = AutoModel::load_model(
+    Device::Cuda(0),
+    "/path/to/Qwen3.8-27B-AWQ-INT4",
+    &LoadOptions::default(),
+)?;
+let _ = model.text_capabilities()?;
+```
+
+The public `AutoModel` path currently accepts text prompts. The optional
+processor-backed image path remains scoped to the multimodal server adapter
+until its preprocessing contract is promoted to the shared `ImageInput` seam.
+
 ## Serve text requests
 
 ```bash
