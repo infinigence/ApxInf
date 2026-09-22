@@ -42,24 +42,10 @@ impl Qwen35VisionEncoder {
     }
 
     pub fn encode_cpu(&self, pixel_values: &Tensor, grid_thw: [u32; 3]) -> Result<Tensor> {
-        self.encode_impl(pixel_values, grid_thw, None)
+        self.encode_impl(pixel_values, grid_thw)
     }
 
-    pub fn encode_cpu_debug(
-        &self,
-        pixel_values: &Tensor,
-        grid_thw: [u32; 3],
-        dump_prefix: &str,
-    ) -> Result<Tensor> {
-        self.encode_impl(pixel_values, grid_thw, Some(dump_prefix))
-    }
-
-    fn encode_impl(
-        &self,
-        pixel_values: &Tensor,
-        grid_thw: [u32; 3],
-        dump_prefix: Option<&str>,
-    ) -> Result<Tensor> {
+    fn encode_impl(&self, pixel_values: &Tensor, grid_thw: [u32; 3]) -> Result<Tensor> {
         let patch_width = self
             .config
             .vision
@@ -86,23 +72,13 @@ impl Qwen35VisionEncoder {
             )));
         }
         let device_pixels = self.backend.to_device(pixel_values)?;
-        let output = match dump_prefix {
-            Some(prefix) => vision::forward_debug(
-                &self.config,
-                &self.weights,
-                &*self.backend,
-                &device_pixels,
-                &[grid_thw],
-                prefix,
-            )?,
-            None => vision::forward(
-                &self.config,
-                &self.weights,
-                &*self.backend,
-                &device_pixels,
-                &[grid_thw],
-            )?,
-        };
+        let output = vision::forward(
+            &self.config,
+            &self.weights,
+            &*self.backend,
+            &device_pixels,
+            &[grid_thw],
+        )?;
         if !output.deepstack.is_empty() {
             return Err(Error::Other(
                 "Qwen3.5 vision encoder produced unexpected deepstack outputs".into(),
