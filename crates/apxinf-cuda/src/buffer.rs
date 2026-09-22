@@ -432,7 +432,7 @@ impl CudaBuffer {
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
-    pub(crate) fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
+    pub fn into_tensor(self, shape: Shape, dtype: DType) -> Tensor {
         let device = Device::Cuda(self.device);
         let handle = GpuStorageHandle {
             ptr: self.ptr as usize,
