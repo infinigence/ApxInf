@@ -69,8 +69,14 @@ class Model:
         token_ids: npt.NDArray[np.uint32],
         attention_mask: npt.NDArray[np.uint8],
         state: npt.NDArray[np.float32],
-        embodiment_id: int,
+        embodiment_id: int | None,
         noise: npt.NDArray[np.float32],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
     ) -> npt.NDArray[np.float32]:
         """Private L0 path for processor-produced typed VLA inputs."""
         ...

@@ -8,11 +8,11 @@ reference ``QwenDriveProcessor`` contract exactly: PIL bicubic resize
 (torchvision dispatches PIL inputs to PIL resize), ``smart_resize`` factor
 snapping with Python ``round()``, pixel normalization ``(x/255 - 0.5) / 0.5``,
 block-ordered patchify (permute ``(1,3,6,4,7,0,2,5,8)``), ChatML prompt
-composition, history re-referencing/normalization, detokenization with
-think-block stripping, and trajectory denormalization with heading wrap.
+composition, history re-referencing/normalization, and trajectory
+denormalization with heading wrap. Reasoning stays internal to planning.
 
 All model computation runs in the Rust/CUDA executor through
-``apxinf_py.QwenDriveModel``. No torch/Transformers model execution, no CPU
+``apxinf.ModelRunner``. No torch/Transformers model execution, no CPU
 model hot path, no subprocess or remote inference fallback happens here.
 """
 
@@ -38,7 +38,6 @@ HISTORY_FRAME_LABELS = ("t-1.5s", "t-1.0s", "t-0.5s", "t-0s")
 REASONING_REQUEST = (
     "\n\nGive a one-sentence brief reasoning of the ego's future driving decision ONLY."
 )
-THINK_CLOSE = "</think>"
 
 _INSTRUCTION_HEADER = (
     "The input images are organized by camera view. Each view contains {num_frames} temporal "
@@ -48,11 +47,6 @@ _INSTRUCTION_HEADER = (
     "Positive x points forward, positive y points left, and a positive heading indicates a left "
     "turn\uff1a\n"
 )
-
-
-def _strip_thinking(text: str) -> str:
-    """Drop a leading thinking block, keeping the answer that follows it."""
-    return text.split(THINK_CLOSE)[-1].strip()
 
 
 def _round_by_factor(value: float, factor: int) -> int:
@@ -130,11 +124,11 @@ class _Tokenizer:
 
 @register_policy("qwen_drive")
 class QwenDrivePolicy:
-    """Scene dict -> native Qwen-Drive outputs, per the frozen public contract."""
+    """Driving scene -> trajectory, optionally with internal reasoning text."""
 
     def __init__(
         self,
-        model,
+        model_runner,
         *,
         config: Mapping[str, Any],
         tokenizer: _Tokenizer,
@@ -145,15 +139,19 @@ class QwenDrivePolicy:
         min_new_tokens: int,
         num_steps: int,
     ):
-        self.model = model
+        self.model_runner = model_runner
         self.config = dict(config)
         self.tokenizer = tokenizer
-        self.mode = mode
+        self.mode = self._validate_mode(mode)
         self.eos_token_ids = list(eos_token_ids)
         self.seed = int(seed)
         self.max_new_tokens = int(max_new_tokens)
         self.min_new_tokens = int(min_new_tokens)
         self.num_steps = int(num_steps)
+        if self.num_steps <= 0:
+            raise ValueError("QwenDrivePolicy: num_steps must be positive")
+        if self.max_new_tokens <= 0 or not 0 <= self.min_new_tokens <= self.max_new_tokens:
+            raise ValueError("QwenDrivePolicy: invalid reasoning token bounds")
 
         vlm = self.config["vlm_config"]
         self.image_token_id = int(vlm["image_token_id"])
@@ -183,12 +181,39 @@ class QwenDrivePolicy:
 
     # ------------------------------------------------------------------ construction
 
+    @staticmethod
+    def _validate_mode(mode: str) -> str:
+        if mode in ("direct", "direct_planning", "reasoning", "reasoning_planning"):
+            return mode
+        # Distinguish "not carried over yet" from "never existed": both paths shipped
+        # before this family moved to the shared VLA organization, and both are
+        # blocked on decisions rather than deleted outright. Reject at load time
+        # rather than at the first request.
+        if mode == "vqa":
+            raise ValueError(
+                "QwenDrivePolicy: VQA/text generation is not exposed by the planning "
+                "runtime; the Qwen backbone supplies scene context to the planner and "
+                "is not a separate language model. Re-introducing it is a VLM/LLM "
+                "interface decision, not a gap in this policy"
+            )
+        if mode == "perception":
+            raise ValueError(
+                "QwenDrivePolicy: perception is a declared pending gap - the BEV stack "
+                "(SimpleFPN/DepthNet/voxel pool/BEVFormer/deformable attention/occupancy/"
+                "map heads) requires the conv2d/conv3d/GroupNorm/grid_sample/"
+                "ms_deform_attn/voxel_pool kernel families, which are not yet in the "
+                "native kernel set"
+            )
+        raise ValueError(f"QwenDrivePolicy supports only direct/reasoning planning, got {mode!r}")
+
     @classmethod
     def from_pretrained(
         cls,
         model_dir,
         *,
-        precision: str = "bf16",
+        model_variant: str = "bf16",
+        tactics=None,
+        autotune: bool = False,
         mode: str = "direct_planning",
         planner=None,
         device: str = "cuda:0",
@@ -203,20 +228,22 @@ class QwenDrivePolicy:
             raise TypeError(
                 f"QwenDrivePolicy.from_pretrained: unexpected kwargs {sorted(kwargs)}"
             )
-        if precision not in ("bf16", "auto"):
+        if model_variant not in ("bf16", "auto"):
             raise ValueError(
-                f"QwenDrivePolicy: qwen_drive is bf16-native, got precision={precision!r}"
+                f"QwenDrivePolicy: qwen_drive is bf16-native, got model_variant={model_variant!r}"
             )
-        import apxinf_py  # lazy: processor-only users never import the binding
+        mode = cls._validate_mode(mode)
+        if num_steps is not None and int(num_steps) <= 0:
+            raise ValueError("QwenDrivePolicy: num_steps must be positive")
+        from apxinf import ModelRunner
 
         model_dir = Path(model_dir)
         config = json.loads((model_dir / "config.json").read_text())
         planner_path = Path(planner) if planner is not None else None
-        model = apxinf_py.QwenDriveModel.load(
-            model_dir,
-            planner_path,
-            device=device,
-            precision="bf16",
+        model_runner = ModelRunner.load(
+            "qwen_drive", model_dir, device=device, model_variant=model_variant,
+            assets={"planner": planner_path} if planner_path is not None else None,
+            tactics=tactics, autotune=autotune,
         )
         tokenizer = _Tokenizer(model_dir)
 
@@ -232,7 +259,7 @@ class QwenDrivePolicy:
             eos = [int(v) for v in value] if isinstance(value, list) else [int(value)]
 
         return cls(
-            model,
+            model_runner,
             config=config,
             tokenizer=tokenizer,
             mode=mode,
@@ -304,7 +331,7 @@ class QwenDrivePolicy:
         checked by hashing the concatenated output against the serial result,
         not assumed. It is worth doing because this is the largest single item
         in a scene that is not GPU work: on the RTX 4090 the twelve frames of a
-        VQA scene cost 219 ms of PIL bicubic resize and numpy permutation
+        multi-camera scene cost 219 ms of PIL bicubic resize and numpy permutation
         before the first kernel launches, which is 15% of the scene. Twelve
         workers take that to 50 ms. Both PIL's resampling and numpy's copies
         drop the GIL, which is why threads rather than processes: no image is
@@ -422,50 +449,6 @@ class QwenDrivePolicy:
             prompt += [self.im_end_id] + self.newline_ids
         return prompt
 
-    def _encode_vqa(self, observation) -> Tuple[list, np.ndarray, list]:
-        question = observation.get("question")
-        if not isinstance(question, str):
-            raise KeyError("QwenDrivePolicy: the VQA mode needs a 'question' string")
-        if "images" in observation:
-            raw_frames = []
-            for frame in observation["images"]:
-                if isinstance(frame, Mapping):
-                    raw_frames.append((frame["image"], frame.get("target_size"), True))
-                else:
-                    raw_frames.append((frame, None, True))
-        else:
-            views = self._scene_views(observation)
-            raw_frames = self._scene_frames(views)
-        # The reference preserves CameraFrame.target_size in VQA as well as
-        # planning; only frames without a target use the default pixel budget.
-        patch_list, grids, token_counts = [], [], []
-        for patches, (rows, cols) in self._patchify_batch(
-            [(image, target, self.current_pixels) for image, target, _cur in raw_frames]
-        ):
-            patch_list.append(patches)
-            grids.append([1, rows, cols])
-            token_counts.append(rows * cols // self.merge**2)
-        body: list = []
-        for count in token_counts:
-            body += [self.vision_start_id] + [self.image_token_id] * count + [self.vision_end_id]
-        body += self.tokenizer.encode(question)
-        prompt = (
-            [self.im_start_id]
-            + self.tokenizer.encode("user")
-            + self.newline_ids
-            + body
-            + [self.im_end_id]
-            + self.newline_ids
-            + [self.im_start_id]
-            + self.tokenizer.encode("assistant")
-            + self.newline_ids
-        )
-        return (
-            prompt,
-            np.ascontiguousarray(np.concatenate(patch_list, axis=0), dtype=np.float32),
-            grids,
-        )
-
     def _conditioning(self, observation):
         history = np.asarray(observation["history"], dtype=np.float32)
         shifted = _wrap_heading(history - history[0:1, :])
@@ -487,66 +470,6 @@ class QwenDrivePolicy:
             int(observation["nav_command"]),
         )
 
-    def _encode_perception(self, observation):
-        """Canonical perception inputs and camera calibration, without model work.
-
-        Projection conventions follow the Apache-2.0 Qwen-Drive reference's
-        perception dataset/geometry helpers (Alibaba Group Holding Limited).
-        """
-        frame = observation["frame"]
-        images = observation["images"]
-        target_width, target_height = 896, 512
-        patches, grids, counts = [], [], []
-        for patch, (height, width) in self._patchify_batch(
-            [(images[item["image"]], (target_width, target_height), self.current_pixels)
-             for item in frame["content"] if "image" in item]
-        ):
-            patches.append(patch)
-            grids.append([1, height, width])
-            counts.append(height * width // self.merge**2)
-        body = []
-        index = 0
-        for item in frame["content"]:
-            if "text" in item:
-                body.extend(self.tokenizer.encode(item["text"]))
-            elif "image" in item:
-                body.extend([self.vision_start_id] + [self.image_token_id] * counts[index] + [self.vision_end_id])
-                index += 1
-            else:
-                raise ValueError("perception content needs text or image")
-        ids = ([self.im_start_id] + self.tokenizer.encode("user") + self.newline_ids + body
-               + [self.im_end_id] + self.newline_ids + [self.im_start_id]
-               + self.tokenizer.encode("assistant") + self.newline_ids)
-        projections = []
-        cameras = frame["cam_order"]
-        if any(len(observation[key]) != len(cameras) for key in
-               ("cam_intrinsic", "sensor2lidar_rotation", "sensor2lidar_translation")):
-            raise ValueError("perception camera calibration count mismatch")
-        for camera, intrinsic, rotation, translation in zip(
-            cameras, observation["cam_intrinsic"], observation["sensor2lidar_rotation"],
-            observation["sensor2lidar_translation"]
-        ):
-            lidar_to_camera = np.linalg.inv(np.asarray(rotation, dtype=np.float32))
-            translation = np.asarray(translation, dtype=np.float32) @ lidar_to_camera.T
-            transform = np.eye(4, dtype=np.float32)
-            transform[:3, :3] = lidar_to_camera.T
-            transform[3, :3] = -translation
-            k = np.asarray(intrinsic, dtype=np.float32)
-            padded = np.eye(4, dtype=np.float32)
-            padded[:k.shape[0], :k.shape[1]] = k
-            projection = padded @ transform.T
-            height, width = np.asarray(images[camera]).shape[:2]
-            scale = np.diag(np.asarray([target_width / width, target_height / height, 1], dtype=np.float32))
-            projection[:3, :] = scale @ projection[:3, :]
-            projections.append(projection)
-        metadata = {
-            "sample_token": observation["token"], "dataset_type": frame["dataset_type"],
-            "cam_order": list(cameras), "lidar2img": np.stack(projections),
-            "lidar2ego": np.repeat(np.asarray(observation["lidar2ego"], dtype=np.float32)[None], len(cameras), axis=0),
-            "img_shape": [(target_height, target_width)] * len(cameras), "box_coord_system": "ego",
-        }
-        return ids, np.ascontiguousarray(np.concatenate(patches), dtype=np.float32), grids, metadata
-
     def _noise(self, observation, noise) -> np.ndarray:
         selected = noise
         if selected is None:
@@ -557,10 +480,10 @@ class QwenDrivePolicy:
             # Non-reference fallback: the acceptance contract always supplies
             # exact noise; without it we draw a deterministic numpy sample.
             rng = np.random.default_rng(self.seed)
-            array = rng.standard_normal((1, 50, 3), dtype=np.float32)
-        if array.size != 150:
+            array = rng.standard_normal((1, self.action_horizon, self.action_dim), dtype=np.float32) * float(self.config.get("noise_init_std", 1.0))
+        if array.shape not in ((self.action_horizon, self.action_dim), (1, self.action_horizon, self.action_dim)) or not np.isfinite(array).all():
             raise ValueError(
-                f"QwenDrivePolicy: noise must hold 50x3 values, got shape {array.shape}"
+                f"QwenDrivePolicy: noise must be finite [horizon, dim] or [1, horizon, dim], got shape {array.shape}"
             )
         return array
 
@@ -568,50 +491,14 @@ class QwenDrivePolicy:
 
     def infer(self, observation: Mapping[str, Any], *, noise: Optional[np.ndarray] = None) -> dict:
         started = time.perf_counter()
-        mode = observation.get("mode", self.mode)
-        if mode == "vqa":
-            return self._infer_vqa(observation, started)
+        mode = self._validate_mode(observation.get("mode", self.mode))
         if mode in ("direct", "direct_planning"):
             return self._infer_planning(observation, False, noise, started)
         if mode in ("reasoning", "reasoning_planning"):
             return self._infer_planning(observation, True, noise, started)
-        if mode == "perception":
-            raise RuntimeError(
-                "QwenDrivePolicy: perception is a declared pending gap in this revision - "
-                "the BEV stack (SimpleFPN/DepthNet/voxel pool/BEVFormer/deformable "
-                "attention/occupancy/map heads) requires the conv2d/conv3d/GroupNorm/"
-                "grid_sample/ms_deform_attn/voxel_pool kernel families, which are not "
-                "yet in the native kernel set"
-            )
         raise ValueError(f"QwenDrivePolicy: unknown mode {mode!r}")
 
     __call__ = infer
-
-    def _infer_vqa(self, observation, started) -> dict:
-        if bool(observation.get("do_sample", False)):
-            raise ValueError(
-                "QwenDrivePolicy: do_sample=True is unsupported; the frozen VQA protocol "
-                "is top_k=1 (greedy)"
-            )
-        token_ids, pixel_values, grid_thw = self._encode_vqa(observation)
-        max_new = int(observation.get("max_new_tokens", 2048))
-        model_started = time.perf_counter()
-        generated = self.model.generate_tokens(
-            token_ids,
-            pixel_values,
-            grid_thw,
-            max_new,
-            0,
-            self.eos_token_ids,
-        )
-        model_ms = (time.perf_counter() - model_started) * 1000.0
-        text = _strip_thinking(self.tokenizer.decode(generated, skip_special_tokens=True))
-        return {
-            "token_ids": list(generated),
-            "text": text,
-            "timing": {"model_ms": model_ms, "total_ms": (time.perf_counter() - started) * 1000.0},
-            "metadata": self.metadata,
-        }
 
     def _infer_planning(self, observation, with_reasoning: bool, noise, started) -> dict:
         views = self._scene_views(observation)
@@ -630,50 +517,26 @@ class QwenDrivePolicy:
         history, velocity, acceleration, ego, nav_command = self._conditioning(observation)
         noise_array = self._noise(observation, noise)
         model_started = time.perf_counter()
+        # Canonical state layout is validated by the native planning runner.
+        state = np.ascontiguousarray(
+            np.concatenate([history, velocity, acceleration, ego, [nav_command]]),
+            dtype=np.float32,
+        )
+        options = {"num_steps": self.num_steps}
         if with_reasoning:
             terminators = [self.im_end_id] + [
                 token for token in self.eos_token_ids if token != self.im_end_id
             ]
-            generated, trajectory = self.model.plan_reasoning(
-                token_ids,
-                pixel_values,
-                grids,
-                history,
-                velocity,
-                acceleration,
-                ego,
-                nav_command,
-                noise_array,
-                self.max_new_tokens,
-                self.min_new_tokens,
-                terminators,
-                self.im_end_id,
-                self.newline_ids,
-                self.num_steps,
+            options.update(
+                max_new_tokens=self.max_new_tokens, min_new_tokens=self.min_new_tokens,
+                terminator_ids=terminators, closing_ids=[self.im_end_id, *self.newline_ids],
             )
-            content = list(generated)
-            for position, token in enumerate(generated):
-                if token in terminators:
-                    content = list(generated[:position])
-                    break
-            reasoning = _strip_thinking(
-                self.tokenizer.decode(content, skip_special_tokens=True)
-            )
-        else:
-            generated = None
-            reasoning = None
-            trajectory = self.model.plan_direct(
-                token_ids,
-                pixel_values,
-                grids,
-                history,
-                velocity,
-                acceleration,
-                ego,
-                nav_command,
-                noise_array,
-                self.num_steps,
-            )
+        trajectory = self.model_runner._infer_preprocessed(
+            pixel_values, np.ascontiguousarray(grids, dtype=np.uint32),
+            np.ascontiguousarray(token_ids, dtype=np.uint32),
+            np.ones(len(token_ids), dtype=np.uint8), state, None, noise_array,
+            **options,
+        )
         model_ms = (time.perf_counter() - model_started) * 1000.0
         actions = _wrap_heading(
             np.asarray(trajectory, dtype=np.float32) * self.scale
@@ -683,9 +546,6 @@ class QwenDrivePolicy:
             "timing": {"model_ms": model_ms, "total_ms": (time.perf_counter() - started) * 1000.0},
             "metadata": self.metadata,
         }
-        if with_reasoning:
-            result["reasoning"] = reasoning
-            result["token_ids"] = list(generated)
         return result
 
     @property
@@ -697,7 +557,7 @@ class QwenDrivePolicy:
         return int(self.config["num_future_points"])
 
     def close(self) -> None:
-        self.model = None
+        self.model_runner = None
         pool = getattr(self, "_patch_pool", None)
         if pool is not None:
             pool.shutdown(wait=False)
