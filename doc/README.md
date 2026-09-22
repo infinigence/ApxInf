@@ -21,6 +21,11 @@ and [callable preparation contract](model-lifecycle/lifecycle.md#implemented-pi0
 describe implemented code. WallOSS/GR00T and LLM/VLM retain their own organization;
 read the coverage table before assuming identical readiness or config support.
 
+Qwen-Drive follows the same `model/`, `model_runner/`, `weights/` separation as a
+planning-only VLA runtime. Its [loading, request and validation contract](qwen-drive-planning.md)
+covers the supported modes and limits; [per-device kernel policy, tactic stores and the
+measurement protocol](qwen-drive-devices.md) cover Orin, Thor and the RTX 4090.
+
 ## Agent workflows
 
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.

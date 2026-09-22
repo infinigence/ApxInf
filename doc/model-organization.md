@@ -30,6 +30,7 @@ There is no Python `AutoModel` binding or Python PI0.5 network class.
 | `walloss/` | Existing BF16 runtime/executor, `fp8.rs`, schedule/geometry and weight files |
 | `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
 | `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |
+| `qwen_drive/` | Planning VLA: `load.rs`, `model/mod.rs`, one `model/blocks/bf16.rs`, `model_runner/` execution state/local GDN graphs, and `weights/`; [scope and current limits](qwen-drive-planning.md) |
 | `qwen3vl/` | `GeneralQwen3VL` in `general.rs`, text/vision weights, vision computation and family-specific multimodal/decode state |
 
 New VLA code names forward computation `Model` and execution ownership
