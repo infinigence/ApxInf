@@ -37,7 +37,8 @@ and turn delimiters. The policy's `num_steps` reaches the actual solver. Provide
 noise is preserved, validated against the configured horizon/dimension and copied
 into a private solver buffer. The CUDA VLA API can alternatively generate noise
 from the request RNG. Public actions use the configured `[horizon, 3]` shape;
-the Python policy includes the batch dimension and decodes physical coordinates.
+the Python policy decodes physical coordinates and returns that shape unchanged,
+matching the `[action_horizon, action_dim]` contract shared by every policy.
 
 The family uses common `tactics`/`autotune` loading options, resolved by
 `AutoModel` before the registry factory runs, so the planning runtime picks up

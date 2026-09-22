@@ -540,7 +540,7 @@ class QwenDrivePolicy:
         model_ms = (time.perf_counter() - model_started) * 1000.0
         actions = _wrap_heading(
             np.asarray(trajectory, dtype=np.float32) * self.scale
-        )[None]
+        )
         result = {
             "actions": np.ascontiguousarray(actions, dtype=np.float32),
             "timing": {"model_ms": model_ms, "total_ms": (time.perf_counter() - started) * 1000.0},

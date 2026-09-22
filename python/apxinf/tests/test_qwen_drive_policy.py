@@ -81,7 +81,8 @@ def test_planning_preserves_noise_steps_and_conditioning(config, mode):
     np.testing.assert_array_equal(sent_noise, noise)
     assert options["num_steps"] == 4
     assert result["metadata"]["num_inference_steps"] == 4
-    np.testing.assert_allclose(result["actions"], np.tile(config["trajectory_scale"], (1, 3, 1)), atol=3e-7)
+    assert result["actions"].shape == (config["num_future_points"], config["trajectory_point_dim"])
+    np.testing.assert_allclose(result["actions"], np.tile(config["trajectory_scale"], (3, 1)), atol=3e-7)
     if mode == "reasoning_planning":
         assert options["closing_ids"] == [12, 8]
         assert options["terminator_ids"] == [12, 13]
