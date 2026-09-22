@@ -24,7 +24,7 @@ __global__ void qwen35_attention_prepare_bf16_kernel(
   const __nv_bfloat16* norm_weight =
       is_query ? q_norm_weight : k_norm_weight;
   const float raw = __bfloat162float(source[dimension]);
-  const float square_sum = block_sum(raw * raw, scratch);
+  const float square_sum = block_sum_parallel_unsafe(raw * raw, scratch);
   const float inverse = rsqrtf(square_sum / kDim + kEpsilon);
   normalized[dimension] =
       raw * inverse * (1.0f + __bfloat162float(norm_weight[dimension]));
@@ -86,7 +86,7 @@ __global__ void qwen35_attention_prepare_m8_bf16_kernel(
   const __nv_bfloat16* norm_weight =
       is_query ? q_norm_weight : k_norm_weight;
   const float raw = __bfloat162float(source[dimension]);
-  const float square_sum = block_sum(raw * raw, scratch);
+  const float square_sum = block_sum_parallel_unsafe(raw * raw, scratch);
   const float inverse = rsqrtf(square_sum / kDim + kEpsilon);
   normalized[dimension] =
       raw * inverse * (1.0f + __bfloat162float(norm_weight[dimension]));

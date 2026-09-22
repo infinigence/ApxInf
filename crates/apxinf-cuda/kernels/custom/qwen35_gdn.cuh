@@ -20,15 +20,15 @@ __global__ void qwen35_gdn_recurrent_bf16_kernel(
   const float query_value =
       __bfloat162float(query[vector_offset + dimension]);
   const float key_value = __bfloat162float(key[vector_offset + dimension]);
-  const float query_sum = block_sum(query_value * query_value, scratch);
-  const float key_sum = block_sum(key_value * key_value, scratch);
+  const float query_sum = block_sum_parallel_unsafe(query_value * query_value, scratch);
+  const float key_sum = block_sum_parallel_unsafe(key_value * key_value, scratch);
   const float query_normalizer = rsqrtf(query_sum + kEpsilon) * kQueryScale;
   const float key_normalizer = rsqrtf(key_sum + kEpsilon);
   normalized_query[dimension] = query_value * query_normalizer;
   normalized_key[dimension] = key_value * key_normalizer;
   __syncthreads();
 
-  const float qk = block_sum(
+  const float qk = block_sum_parallel_unsafe(
       normalized_query[dimension] * normalized_key[dimension], scratch);
   const float decay = expf(g[head]);
   const float beta_value = beta[head];
@@ -120,7 +120,7 @@ __global__ void qwen35_gdn_gated_rmsnorm_bf16_kernel(
   const int dimension = threadIdx.x;
   const int64_t offset = static_cast<int64_t>(head) * kDim + dimension;
   const float value = __bfloat162float(input[offset]);
-  const float square_sum = block_sum(value * value, scratch);
+  const float square_sum = block_sum_parallel_unsafe(value * value, scratch);
   const float inverse_rms = rsqrtf(square_sum / kDim + epsilon);
   const __nv_bfloat16 normalized = __float2bfloat16(value * inverse_rms);
   const __nv_bfloat16 weighted = __float2bfloat16(
@@ -295,15 +295,15 @@ __global__ void qwen35_gdn_recurrent_m8_bf16_kernel(
         static_cast<int64_t>(token) * kWidth + head * kDim;
     const float query_value = __bfloat162float(query[vector_offset + dimension]);
     const float key_value = __bfloat162float(key[vector_offset + dimension]);
-    const float query_sum = block_sum(query_value * query_value, scratch);
-    const float key_sum = block_sum(key_value * key_value, scratch);
+    const float query_sum = block_sum_parallel_unsafe(query_value * query_value, scratch);
+    const float key_sum = block_sum_parallel_unsafe(key_value * key_value, scratch);
     const float query_normalizer =
         rsqrtf(query_sum + kEpsilon) * kQueryScale;
     const float key_normalizer = rsqrtf(key_sum + kEpsilon);
     normalized_query[dimension] = query_value * query_normalizer;
     normalized_key[dimension] = key_value * key_normalizer;
     __syncthreads();
-    const float qk = block_sum(
+    const float qk = block_sum_parallel_unsafe(
         normalized_query[dimension] * normalized_key[dimension], scratch);
     const float decay = expf(g[token * kHeads + head]);
     const float beta_value = beta[token * kHeads + head];
@@ -370,15 +370,15 @@ __global__ void qwen35_gdn_recurrent_m8_hybrid_bf16_kernel(
         static_cast<int64_t>(token) * kWidth + head * kDim;
     const float query_value = __bfloat162float(query[vector_offset + dimension]);
     const float key_value = __bfloat162float(key[vector_offset + dimension]);
-    const float query_sum = block_sum(query_value * query_value, scratch);
-    const float key_sum = block_sum(key_value * key_value, scratch);
+    const float query_sum = block_sum_parallel_unsafe(query_value * query_value, scratch);
+    const float key_sum = block_sum_parallel_unsafe(key_value * key_value, scratch);
     const float query_normalizer =
         rsqrtf(query_sum + kEpsilon) * kQueryScale;
     const float key_normalizer = rsqrtf(key_sum + kEpsilon);
     normalized_query[dimension] = query_value * query_normalizer;
     normalized_key[dimension] = key_value * key_normalizer;
     __syncthreads();
-    const float qk = block_sum(
+    const float qk = block_sum_parallel_unsafe(
         normalized_query[dimension] * normalized_key[dimension], scratch);
     const float decay = expf(g[token * kHeads + head]);
     const float beta_value = beta[token * kHeads + head];
@@ -451,7 +451,7 @@ __global__ void qwen35_gdn_gated_rmsnorm_m8_bf16_kernel(
       static_cast<int64_t>(token) * kWidth + head * kDim + dimension;
   const float value = __bfloat162float(input[offset]);
   const float inverse_rms =
-      rsqrtf(block_sum(value * value, scratch) / kDim + epsilon);
+      rsqrtf(block_sum_parallel_unsafe(value * value, scratch) / kDim + epsilon);
   const __nv_bfloat16 normalized = __float2bfloat16(value * inverse_rms);
   const __nv_bfloat16 weighted = __float2bfloat16(
       __bfloat162float(normalized) * __bfloat162float(weight[dimension]));

@@ -16,7 +16,7 @@ __global__ void qwen35_rmsnorm_offset_bf16_kernel(
     partial += value * value;
   }
   __shared__ float scratch[8];
-  const float inverse = rsqrtf(block_sum(partial, scratch) / columns + epsilon);
+  const float inverse = rsqrtf(block_sum_parallel_unsafe(partial, scratch) / columns + epsilon);
   for (int column = thread; column < columns; column += blockDim.x) {
     const float value = __bfloat162float(input[column]);
     const float gamma = 1.0f + __bfloat162float(weight[column]);
@@ -50,7 +50,7 @@ __global__ void qwen35_residual_add_rmsnorm_offset_bf16_kernel(
     partial += value * value;
   }
   __shared__ float scratch[8];
-  const float inverse = rsqrtf(block_sum(partial, scratch) / columns + epsilon);
+  const float inverse = rsqrtf(block_sum_parallel_unsafe(partial, scratch) / columns + epsilon);
   for (int column = thread; column < columns; column += blockDim.x) {
     const float value = updated[column];
     const float gamma = 1.0f + __bfloat162float(weight[column]);
