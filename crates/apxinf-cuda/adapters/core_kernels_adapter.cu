@@ -20,6 +20,7 @@
 #include "../kernels/custom/embedding.cuh"
 #include "../kernels/custom/elementwise.cuh"
 #include "../kernels/custom/selection.cuh"
+#include "../kernels/custom/quantization.cuh"
 #include "../kernels/custom/fused.cuh"
 
 extern "C" cudaError_t apxinf_rms_norm_f32(
