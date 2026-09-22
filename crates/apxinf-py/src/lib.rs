@@ -6,10 +6,10 @@
 //!
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
-//! * **L1** [`Model::infer_rgb`] — caller supplies resized RGB `uint8` images;
+//! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
 //!   vision→patches runs inside the Rust CUDA graph.
 //!
-//! **L0** [`Model::infer_patches`] (caller supplies pre-computed `patches`,
+//! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
 //! equivalent to a Rust `Observation(Patches)`) is exposed under the private
 //! `_infer_patches` name. It is the model-policy bridge for families such as
 //! WallOSS whose preprocessing stays in Python, and remains outside the public
@@ -25,6 +25,9 @@
 //! The VLA runtimes are only registered on CUDA devices, so real inference
 //! requires the `cuda` feature and a CUDA machine; without it the module still
 //! imports and reports shape contracts, but model loading errors.
+//!
+//! [`QwenDriveModel`] is the Qwen-Drive surface: VQA generation plus the two
+//! planning flows (direct and reasoning) against the native CUDA executor.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -43,6 +46,8 @@ use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
     SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
+#[cfg(feature = "cuda")]
+use apxinf_model::qwen_drive::ExpertConditioning;
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
 /// Hugging Face `tokenizer.json` runtime backed by the Rust `tokenizers` crate.
@@ -169,13 +174,13 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
     }
 }
 
-/// A loaded VLA model handle. Holds the runtime plus the resolved config used
-/// for shape-contract queries and input validation.
+/// Python binding for a loaded VLA runner. Holds the runtime and its contract,
+/// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
 /// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
-pub struct Model {
+pub struct ModelRunner {
     model: LoadedModel,
     contract: VlaContract,
     /// `Some` for autoregressive token VLAs (π0-FAST); `None` for continuous ones.
@@ -193,7 +198,7 @@ struct PreprocessedVlaInput {
     embodiment_id: usize,
 }
 
-impl Model {
+impl ModelRunner {
     fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
         if self.contract.accepts_rgb_u8 {
             Ok(self.contract)
@@ -442,35 +447,36 @@ impl Model {
 }
 
 #[pymethods]
-impl Model {
+impl ModelRunner {
     /// Load a VLA checkpoint through the unified `AutoModel` frontend.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `auto` (default), `fp8`, `bf16`, or `int8`.
+    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
+    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
     /// * `sampling_seed` — seed for the implicit device-side noise stream used
     ///   when inference is called without `noise`.
-    /// * `config_json` — optional `config.json`-shaped architecture JSON.
+    /// * `config_json` - optional `config.json`-shaped architecture JSON.
     ///   `None` delegates config loading to AutoModel.
-    /// * `action_horizon` — override the checkpoint's chunk length. `None`
+    /// * `action_horizon` - override the checkpoint's chunk length. `None`
     ///   (default) runs the native `config.json` value; an explicit value wins
     ///   over it. The horizon is a sequence length, not a weight dimension, so
     ///   the same weights load and run at the requested chunk length.
-    /// * `num_views` — serve fewer cameras than the checkpoint declares.
+    /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
-    /// equivalent to openpi zero-padding and masking them — a masked view is
-    /// excluded from attention and consumes no RoPE position, and the vision
-    /// tower has no per-slot parameters — while saving one view's worth of patch
+    /// equivalent to openpi zero-padding and masking them - a masked view is
+    /// excluded from attention, consumes no RoPE position, and the vision
+    /// tower has no per-slot parameters - while saving one view's worth of patch
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -486,6 +492,7 @@ impl Model {
         flow_start_time: Option<f32>,
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
+        model_variant: Option<String>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -527,6 +534,7 @@ impl Model {
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
+            model_variant,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
@@ -557,18 +565,18 @@ impl Model {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default) or `cpu`.
-    /// * `precision` — `bf16` (default), `fp8`, or `int8`.
+    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
-    /// * `tactics` — optional hardware-wide GEMM tactics json.
-    /// * `autotune` — tune missing exact GEMM keys from the first real request.
-    /// * `seed` — RNG seed for reproducible weights.
-    /// * `sampling_seed` — independent seed for implicit device-side noise.
+    /// * `tactics` - optional hardware-wide GEMM tactics json.
+    /// * `autotune` - tune missing exact GEMM keys from the first real request.
+    /// * `seed` - RNG seed for reproducible weights.
+    /// * `sampling_seed` - independent seed for implicit device-side noise.
     #[staticmethod]
     #[pyo3(signature = (
         model,
         device="cuda:0",
-        precision="bf16",
+        model_variant="bf16",
         num_views=2,
         image_size=224,
         action_horizon=10,
@@ -586,7 +594,7 @@ impl Model {
     fn random(
         model: &str,
         device: &str,
-        precision: &str,
+        model_variant: &str,
         num_views: usize,
         image_size: usize,
         action_horizon: usize,
@@ -628,7 +636,7 @@ impl Model {
 
         let options = LoadOptions {
             model_name: Some(model.to_owned()),
-            precision: parse_precision(precision)?,
+            model_variant: Some(model_variant.to_owned()),
             text_weight_dtype: None,
             calibration_path,
             tuning_path: tactics,
@@ -652,13 +660,13 @@ impl Model {
         })
     }
 
-    /// **L0** (internal, not public API) — infer from pre-computed patches. No
+    /// **L0** (internal, not public API) - infer from pre-computed patches. No
     /// processor is applied. Exposed to Python as the private `_infer_patches`
     /// for L0/L1 consistency tests only; may change or be removed without notice.
     ///
-    /// * `patches` — `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
-    /// * `token_ids` — `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `patches` - `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
+    /// * `token_ids` - `uint32` `[token_count]` (1..=max_token_len).
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -849,14 +857,14 @@ impl Model {
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw))
     }
 
-    /// **L1** — infer from resized RGB `uint8` images; vision→patches runs in the
+    /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
     /// Rust CUDA graph.
     ///
-    /// * `rgb_u8` — `uint8` images, `num_views * image_size * image_size * 3`
+    /// * `rgb_u8` - `uint8` images, `num_views * image_size * image_size * 3`
     ///   bytes total, in `layout` order.
-    /// * `layout` — `"nhwc"` or `"nchw"`.
-    /// * `token_ids` — `uint32` `[token_count]`.
-    /// * `noise` — optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `layout` - `"nhwc"` or `"nchw"`.
+    /// * `token_ids` - `uint32` `[token_count]`.
+    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -1123,6 +1131,12 @@ impl Model {
         }
     }
 
+    /// Actual loaded implementation; `auto` is resolved during loading.
+    #[getter]
+    fn model_variant(&self) -> PyResult<Option<&'static str>> {
+        Ok(self.model.vla().map_err(runtime_err)?.model_variant())
+    }
+
     #[getter]
     fn action_dim(&self) -> usize {
         self.action_shape()[1]
@@ -1165,7 +1179,7 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!(
-            "Model(device={}, action=[{}, {}], views={}, image={}, patch={})",
+            "ModelRunner(device={}, action=[{}, {}], views={}, image={}, patch={})",
             self.device(),
             self.action_horizon(),
             self.action_dim(),
@@ -1176,9 +1190,264 @@ impl Model {
     }
 }
 
+// ── Qwen-Drive native model surface ────────────────────────────────────────
+
+#[cfg(feature = "cuda")]
+fn qwen_pixels_tensor(pixels: &PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
+    let shape = pixels.shape();
+    let data = pixels.as_slice().map_err(|_| {
+        PyValueError::new_err(
+            "apxinf_py.QwenDriveModel: pixel_values must be C-contiguous float32",
+        )
+    })?;
+    Tensor::from_f32(shape.to_vec(), data).map_err(runtime_err)
+}
+
+#[cfg(feature = "cuda")]
+fn qwen_vector(array: &PyReadonlyArray1<'_, f32>, name: &str) -> PyResult<Vec<f32>> {
+    Ok(array
+        .as_slice()
+        .map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.QwenDriveModel: {name} must be C-contiguous float32"
+            ))
+        })?
+        .to_vec())
+}
+
+#[cfg(feature = "cuda")]
+fn qwen_noise(
+    noise: &PyReadonlyArrayDyn<'_, f32>,
+    points: usize,
+    point_dim: usize,
+) -> PyResult<Vec<f32>> {
+    let data = noise.as_slice().map_err(|_| {
+        PyValueError::new_err("apxinf_py.QwenDriveModel: noise must be C-contiguous float32")
+    })?;
+    if data.len() != points * point_dim {
+        return Err(PyValueError::new_err(format!(
+            "apxinf_py.QwenDriveModel: noise has {} values, expected {} ({}x{})",
+            data.len(),
+            points * point_dim,
+            points,
+            point_dim
+        )));
+    }
+    Ok(data.to_vec())
+}
+
+#[cfg(feature = "cuda")]
+fn qwen_trajectory<'py>(py: Python<'py>, flat: Vec<f32>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    if flat.len() != 150 {
+        return Err(PyRuntimeError::new_err(format!(
+            "apxinf_py.QwenDriveModel: model returned {} trajectory values, expected 150",
+            flat.len()
+        )));
+    }
+    if let Some(bad) = flat.iter().find(|value| !value.is_finite()) {
+        return Err(PyRuntimeError::new_err(format!(
+            "apxinf_py.QwenDriveModel: model produced non-finite trajectory value {bad}"
+        )));
+    }
+    let array = Array2::from_shape_vec((50, 3), flat).map_err(runtime_err)?;
+    Ok(array.into_pyarray_bound(py))
+}
+
+#[cfg(feature = "cuda")]
+fn qwen_conditioning(
+    history: &PyReadonlyArray1<'_, f32>,
+    history_velocity: &PyReadonlyArray1<'_, f32>,
+    history_acceleration: &PyReadonlyArray1<'_, f32>,
+    ego_status: &PyReadonlyArray1<'_, f32>,
+    nav_command: i64,
+) -> PyResult<ExpertConditioning> {
+    Ok(ExpertConditioning {
+        history: qwen_vector(history, "history")?,
+        history_velocity: qwen_vector(history_velocity, "history_velocity")?,
+        history_acceleration: qwen_vector(history_acceleration, "history_acceleration")?,
+        nav_command,
+        ego_status: qwen_vector(ego_status, "ego_status")?,
+    })
+}
+
+/// A loaded Qwen-Drive native model (Qwen3.5 VLM + optional planning expert).
+///
+/// VQA generation plus the direct/reasoning planning flows against the native
+/// CUDA executor. Tokenization and image preprocessing live in the Python
+/// policy layer; this class accepts canonical tensors.
+#[cfg(feature = "cuda")]
+#[pyclass(unsendable)]
+pub struct QwenDriveModel {
+    model: apxinf_model::qwen_drive::QwenDriveModel,
+    device: Device,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl QwenDriveModel {
+    /// Load the VLM from `path` and optionally a planning-expert head from
+    /// `planner`. Precision is fixed to the checkpoint's native bf16.
+    #[staticmethod]
+    #[pyo3(signature = (path, planner=None, device="cuda:0", precision="bf16"))]
+    fn load(
+        path: PathBuf,
+        planner: Option<PathBuf>,
+        device: &str,
+        precision: &str,
+    ) -> PyResult<Self> {
+        if precision != "bf16" && precision != "auto" {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.QwenDriveModel.load: qwen_drive is bf16-native (got `{precision}`)"
+            )));
+        }
+        let device = parse_device(device)?;
+        let model = apxinf_model::qwen_drive::QwenDriveModel::load(
+            &path,
+            planner.as_deref(),
+            device,
+        )
+        .map_err(runtime_err)?;
+        Ok(Self { model, device })
+    }
+
+    /// VQA / free-form generation (greedy; the reference's top_k=1 sampling is
+    /// equivalent). Returns the generated token ids, terminator included.
+    #[pyo3(signature = (token_ids, pixel_values, grid_thw, max_new_tokens, min_new_tokens=0, eos_token_ids=None))]
+    fn generate_tokens(
+        &mut self,
+        token_ids: Vec<u32>,
+        pixel_values: PyReadonlyArray2<'_, f32>,
+        grid_thw: Vec<[u32; 3]>,
+        max_new_tokens: usize,
+        min_new_tokens: usize,
+        eos_token_ids: Option<Vec<u32>>,
+    ) -> PyResult<Vec<u32>> {
+        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
+        let eos = eos_token_ids.unwrap_or_else(|| vec![248044, 248045]);
+        self.model
+            .generate(
+                &token_ids,
+                Some((&pixel_tensor, &grid_thw)),
+                max_new_tokens,
+                min_new_tokens,
+                &eos,
+            )
+            .map_err(runtime_err)
+    }
+
+    /// Direct planning from a closed empty assistant turn. Returns the
+    /// normalized fp32 trajectory `[50, 3]` (the policy denormalizes).
+    #[pyo3(signature = (token_ids, pixel_values, grid_thw, history, history_velocity, history_acceleration, ego_status, nav_command, noise, num_steps=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_direct<'py>(
+        &mut self,
+        py: Python<'py>,
+        token_ids: Vec<u32>,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        grid_thw: Vec<[u32; 3]>,
+        history: PyReadonlyArray1<'py, f32>,
+        history_velocity: PyReadonlyArray1<'py, f32>,
+        history_acceleration: PyReadonlyArray1<'py, f32>,
+        ego_status: PyReadonlyArray1<'py, f32>,
+        nav_command: i64,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
+        let cond = qwen_conditioning(
+            &history,
+            &history_velocity,
+            &history_acceleration,
+            &ego_status,
+            nav_command,
+        )?;
+        let noise_vec = qwen_noise(&noise, 50, 3)?;
+        let flat = self
+            .model
+            .plan_direct(&token_ids, &pixel_tensor, &grid_thw, &cond, &noise_vec, num_steps)
+            .map_err(runtime_err)?;
+        qwen_trajectory(py, flat)
+    }
+
+    /// Reasoning planning: greedy assistant turn (min/max bounds), trained
+    /// turn completion in the cache, then the sampler. Returns
+    /// `(generated_token_ids, normalized_trajectory[50, 3])`.
+    #[pyo3(signature = (token_ids, pixel_values, grid_thw, history, history_velocity, history_acceleration, ego_status, nav_command, noise, max_new_tokens, min_new_tokens, terminator_ids, im_end_id, newline_ids, num_steps=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_reasoning<'py>(
+        &mut self,
+        py: Python<'py>,
+        token_ids: Vec<u32>,
+        pixel_values: PyReadonlyArray2<'py, f32>,
+        grid_thw: Vec<[u32; 3]>,
+        history: PyReadonlyArray1<'py, f32>,
+        history_velocity: PyReadonlyArray1<'py, f32>,
+        history_acceleration: PyReadonlyArray1<'py, f32>,
+        ego_status: PyReadonlyArray1<'py, f32>,
+        nav_command: i64,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        max_new_tokens: usize,
+        min_new_tokens: usize,
+        terminator_ids: Vec<u32>,
+        im_end_id: u32,
+        newline_ids: Vec<u32>,
+        num_steps: Option<usize>,
+    ) -> PyResult<(Vec<u32>, Bound<'py, PyArray2<f32>>)> {
+        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
+        let cond = qwen_conditioning(
+            &history,
+            &history_velocity,
+            &history_acceleration,
+            &ego_status,
+            nav_command,
+        )?;
+        let noise_vec = qwen_noise(&noise, 50, 3)?;
+        let (generated, flat) = self
+            .model
+            .plan_reasoning(
+                &token_ids,
+                &pixel_tensor,
+                &grid_thw,
+                max_new_tokens,
+                min_new_tokens,
+                &terminator_ids,
+                im_end_id,
+                &newline_ids,
+                &cond,
+                &noise_vec,
+                num_steps,
+            )
+            .map_err(runtime_err)?;
+        Ok((generated, qwen_trajectory(py, flat)?))
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        match self.device {
+            Device::Cuda(index) => format!("cuda:{index}"),
+            Device::Cpu => "cpu".to_string(),
+        }
+    }
+
+    #[getter]
+    fn has_planner(&self) -> bool {
+        self.model.has_planner()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QwenDriveModel(device={}, planner={})",
+            self.device(),
+            self.model.has_planner(),
+        )
+    }
+}
+
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Model>()?;
+    module.add_class::<ModelRunner>()?;
+    #[cfg(feature = "cuda")]
+    module.add_class::<QwenDriveModel>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

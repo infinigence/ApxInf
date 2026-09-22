@@ -142,7 +142,7 @@ def test_caller_supplied_wire_keys_reach_the_published_metadata(tmp_path, monkey
 
     policy = WallossPolicy.from_pretrained(
         tmp_path,
-        model=_FakeModel(),
+        model_runner=_FakeModel(),
         image_keys=("observation/image", "observation/wrist_image"),
         state_key="observation/state",
         action_dim=7,
@@ -162,7 +162,7 @@ def test_walloss_rejects_disabling_checkpoint_state_encoding(tmp_path):
     with pytest.raises(ValueError, match="require discretized state"):
         WallossPolicy.from_pretrained(
             tmp_path,
-            model=_FakeModel(),
+            model_runner=_FakeModel(),
             discrete_state=False,
         )
 
@@ -175,7 +175,7 @@ def test_walloss_rejects_static_fp8_calibration(tmp_path):
     ):
         WallossPolicy.from_pretrained(
             tmp_path,
-            model=_FakeModel(),
+            model_runner=_FakeModel(),
             precision="fp8",
             calibration=tmp_path / "calibration.json",
         )
@@ -199,9 +199,9 @@ def test_walloss_action_width_uses_checkpoint_unless_user_overrides(
         ),
     )
 
-    native = WallossPolicy.from_pretrained(tmp_path, model=_FakeModel())
+    native = WallossPolicy.from_pretrained(tmp_path, model_runner=_FakeModel())
     overridden = WallossPolicy.from_pretrained(
-        tmp_path, model=_FakeModel(), action_dim=7
+        tmp_path, model_runner=_FakeModel(), action_dim=7
     )
 
     assert native.action_dim == 26
@@ -224,7 +224,7 @@ def test_walloss_from_pretrained_accepts_custom_python_processor(tmp_path, monke
 
     policy = WallossPolicy.from_pretrained(
         tmp_path,
-        model=_FakeModel(),
+        model_runner=_FakeModel(),
         processor=processor,
     )
 
@@ -256,7 +256,7 @@ def test_builtin_processor_selects_native_rgb_from_model_capability(
         ),
     )
 
-    policy = WallossPolicy.from_pretrained(tmp_path, model=_FakeNativeModel())
+    policy = WallossPolicy.from_pretrained(tmp_path, model_runner=_FakeNativeModel())
 
     assert captured["native_rgb"] is True
     assert policy.processor.native_rgb is True
@@ -281,7 +281,7 @@ def test_walloss_custom_processor_only_needs_to_be_callable(tmp_path, monkeypatc
 
     policy = WallossPolicy.from_pretrained(
         tmp_path,
-        model=_FakeModel(),
+        model_runner=_FakeModel(),
         processor=processor,
         image_keys=(),
         camera_names=(),
@@ -307,7 +307,7 @@ def test_custom_processor_cannot_implicitly_select_native_rgb(tmp_path, monkeypa
     model = _FakeNativeModel()
     policy = WallossPolicy.from_pretrained(
         tmp_path,
-        model=model,
+        model_runner=model,
         processor=_FakeNativeProcessor(),
     )
 
@@ -501,7 +501,7 @@ def test_walloss_state_bins_precedence(tmp_path, monkeypatch, override, expected
 
     policy = WallossPolicy.from_pretrained(
         tmp_path,
-        model=_FakeModel(),
+        model_runner=_FakeModel(),
         action_dim=7,
         state_bins=override,
     )

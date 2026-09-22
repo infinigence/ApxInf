@@ -782,3 +782,57 @@ pub fn euler_update_f16(
         output,
     ))
 }
+
+/// Concatenate NCHW feature maps along channels using device-to-device copies.
+pub fn concat_channels_bf16(ctx: &CudaContext, inputs: &[&Tensor]) -> Result<Tensor> {
+    let first = inputs
+        .first()
+        .ok_or_else(|| Error::Other("empty channel concatenation".into()))?;
+    let d = first.shape().dims();
+    if d.len() != 4 {
+        return Err(Error::Other("channel concatenation requires NCHW".into()));
+    }
+    let mut channels = 0usize;
+    for t in inputs {
+        let s = t.shape().dims();
+        if s.len() != 4
+            || s[0] != d[0]
+            || s[2..] != d[2..]
+            || t.dtype() != DType::BF16
+            || t.device() != Device::Cuda(ctx.device_id())
+        {
+            return Err(Error::Other(
+                "channel concatenation shape/device mismatch".into(),
+            ));
+        }
+        checked_bytes(DType::BF16, s, "channel concatenation input")?;
+        channels = channels
+            .checked_add(s[1])
+            .ok_or_else(|| Error::Other("channel overflow".into()))?;
+    }
+    let shape = vec![d[0], channels, d[2], d[3]];
+    let bytes = checked_bytes(DType::BF16, &shape, "channel concatenation output")?;
+    let out = output_buffer(ctx, bytes)?;
+    let pitch = bytes / d[0];
+    let mut offset = 0;
+    for t in inputs {
+        let source_pitch = t.size_in_bytes() / d[0];
+        crate::transfers::copy_tensor_2d_to_buffer(
+            ctx,
+            t,
+            &out,
+            offset,
+            pitch,
+            source_pitch,
+            source_pitch,
+            d[0],
+        )?;
+        offset += source_pitch;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(shape),
+        DType::BF16,
+        ctx.device_id(),
+        out,
+    ))
+}

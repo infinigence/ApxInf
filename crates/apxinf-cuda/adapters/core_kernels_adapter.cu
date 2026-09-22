@@ -316,6 +316,18 @@ extern "C" cudaError_t apxinf_rope_bf16(
 extern "C" cudaError_t apxinf_add_bf16(
     const void* a, const void* b, void* output, uint32_t count, void* stream)
 {
+    const uintptr_t aa = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
+    const uintptr_t oa = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (aa % 16u) == 0u && (ba % 16u) == 0u &&
+        (oa % 16u) == 0u) {
+        const uint32_t vec_count = count / 8u;
+        uint32_t blocks = (vec_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (blocks > 4096u) blocks = 4096u;
+        add_bf16_vec8_kernel<<<blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)a, (const float4*)b, (float4*)output, vec_count);
+        return cudaGetLastError();
+    }
     dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     add_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
@@ -492,12 +504,15 @@ extern "C" cudaError_t apxinf_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     uint32_t cols, uint32_t rows, float eps, void* stream)
 {
-    dim3 grid((cols + BLOCK_SIZE - 1) / BLOCK_SIZE, rows, 1);
+    // One block per row: block-parallel reduction over cols, matching the
+    // rms_norm_bf16 launch policy. The previous per-thread serial reduction
+    // made this the single largest GPU kernel in the vision tower.
+    dim3 grid(rows, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     layer_norm_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (const __nv_bfloat16*)weight,
         (const __nv_bfloat16*)bias, (__nv_bfloat16*)output,
-        cols, rows, eps);
+        rows, cols, eps);
     return cudaGetLastError();
 }
 
@@ -535,6 +550,19 @@ extern "C" cudaError_t apxinf_adaptive_layer_norm_quant_bf16_e4m3(
 extern "C" cudaError_t apxinf_gelu_tanh_bf16(
     const void* input, void* output, uint32_t count, void* stream)
 {
+    // Take the wide path when the shape and both pointers allow it; device
+    // allocations and workspace views are 256-byte aligned, so in practice it
+    // is always taken. The scalar kernel stays for anything else.
+    const uintptr_t in_addr = reinterpret_cast<uintptr_t>(input);
+    const uintptr_t out_addr = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (in_addr % 16u) == 0u && (out_addr % 16u) == 0u) {
+        const uint32_t vec_count = count / 8u;
+        uint32_t blocks = (vec_count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (blocks > 4096u) blocks = 4096u;
+        gelu_tanh_bf16_vec8_kernel<<<blocks, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)input, (float4*)output, vec_count);
+        return cudaGetLastError();
+    }
     dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
     dim3 block(BLOCK_SIZE, 1, 1);
     gelu_tanh_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(

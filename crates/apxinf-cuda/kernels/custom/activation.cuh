@@ -1,4 +1,11 @@
 #pragma once
+__global__ void relu_bf16_kernel(const __nv_bfloat16* x, __nv_bfloat16* y, int64_t count) {
+  for(int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=static_cast<int64_t>(blockDim.x)*gridDim.x) {
+    const float v=__bfloat162float(x[i]);
+    y[i]=v<0 ? __float2bfloat16(0) : x[i];
+  }
+}
+
 
 struct alignas(8) Bf16x4 {
   __nv_bfloat162 low;
@@ -136,18 +143,45 @@ __global__ void silu_mul_quant_bf16_e4m3_kernel(
 // PyTorch's `gelu_pytorch_tanh` (a.k.a. hidden_act="gelu_pytorch_tanh"):
 //     y = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 
+// The one place the expression lives, so the scalar and vector paths cannot
+// drift apart. sqrt(2/pi) ~= 0.7978845608028654.
+__device__ __forceinline__ __nv_bfloat16 gelu_tanh_bf16_one(__nv_bfloat16 value)
+{
+    float x = __bfloat162float(value);
+    const float kBeta  = 0.7978845608028654f;
+    const float kAlpha = 0.044715f;
+    float inner = kBeta * (x + kAlpha * x * x * x);
+    float y = 0.5f * x * (1.0f + tanhf(inner));
+    return __float2bfloat16(y);
+}
+
 __global__ void gelu_tanh_bf16_kernel(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
 {
     uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= count) return;
-    float x = __bfloat162float(input[gid]);
-    // sqrt(2/pi) ~= 0.7978845608028654
-    const float kBeta  = 0.7978845608028654f;
-    const float kAlpha = 0.044715f;
-    float inner = kBeta * (x + kAlpha * x * x * x);
-    float y = 0.5f * x * (1.0f + tanhf(inner));
-    output[gid] = __float2bfloat16(y);
+    output[gid] = gelu_tanh_bf16_one(input[gid]);
+}
+
+// Eight elements per thread through a 16-byte access. One bf16 per thread has a
+// warp fetching 64 bytes of a 128-byte sector and discarding half of every
+// transaction, which is why ncu measured the scalar kernel at 31% of memory,
+// 39% of compute and 11% of L1 -- saturating nothing at 58.9ms. The arithmetic
+// is per element and unchanged.
+__global__ void gelu_tanh_bf16_vec8_kernel(
+    const float4* __restrict__ input, float4* __restrict__ output,
+    uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 packed = input[v];
+        __nv_bfloat16* lane = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lane[i] = gelu_tanh_bf16_one(lane[i]);
+        }
+        output[v] = packed;
+    }
 }
 
 
@@ -578,6 +612,7 @@ __global__ void geglu_bf16_kernel(
   }
 }
 
+template <bool RoundSilu = false>
 __global__ void swiglu_bf16_kernel(
     const __nv_bfloat16* gate_up, __nv_bfloat16* output,
     int rows, int inner) {
@@ -589,8 +624,54 @@ __global__ void swiglu_bf16_kernel(
     const int col = static_cast<int>(index % inner);
     const float gate = __bfloat162float(gate_up[static_cast<int64_t>(row) * 2 * inner + col]);
     const float up = __bfloat162float(gate_up[static_cast<int64_t>(row) * 2 * inner + inner + col]);
-    output[index] = __float2bfloat16((gate / (1.0f + expf(-gate))) * up);
+    float silu = gate / (1.0f + expf(-gate));
+    if (RoundSilu) silu = __bfloat162float(__float2bfloat16(silu));
+    output[index] = __float2bfloat16(silu * up);
   }
+}
+
+// Eight output columns per thread through 16-byte accesses. The scalar loop
+// also pays an integer divide and a modulo per element to recover (row, col);
+// with inner a multiple of eight all eight land in one row, so that arithmetic
+// happens once per eight. Per-element expressions are unchanged.
+template <bool RoundSilu = false>
+__global__ void swiglu_bf16_vec8_kernel(
+    const __nv_bfloat16* __restrict__ gate_up, __nv_bfloat16* __restrict__ output,
+    int rows, int inner) {
+  const int64_t vec_per_row = inner / 8;
+  const int64_t vec_count = static_cast<int64_t>(rows) * vec_per_row;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       v < vec_count; v += stride) {
+    const int64_t row = v / vec_per_row;
+    const int64_t col = (v - row * vec_per_row) * 8;
+    const int64_t base = row * 2 * inner + col;
+    const float4 g4 = *reinterpret_cast<const float4*>(gate_up + base);
+    const float4 u4 = *reinterpret_cast<const float4*>(gate_up + base + inner);
+    const __nv_bfloat16* gl = reinterpret_cast<const __nv_bfloat16*>(&g4);
+    const __nv_bfloat16* ul = reinterpret_cast<const __nv_bfloat16*>(&u4);
+    float4 out;
+    __nv_bfloat16* ol = reinterpret_cast<__nv_bfloat16*>(&out);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float gate = __bfloat162float(gl[i]);
+      const float up = __bfloat162float(ul[i]);
+      float silu = gate / (1.0f + expf(-gate));
+      if (RoundSilu) silu = __bfloat162float(__float2bfloat16(silu));
+      ol[i] = __float2bfloat16(silu * up);
+    }
+    *reinterpret_cast<float4*>(output + row * inner + col) = out;
+  }
+}
+
+// True when every 16-byte access the wide kernel makes is aligned: eight
+// columns stay inside one row, and both halves of gate_up start on a multiple
+// of eight elements.
+__host__ __device__ __forceinline__ bool swiglu_vec8_ok(
+    const void* gate_up, const void* output, int inner) {
+  return (inner % 8) == 0 &&
+         (reinterpret_cast<uintptr_t>(gate_up) % 16u) == 0 &&
+         (reinterpret_cast<uintptr_t>(output) % 16u) == 0;
 }
 
 __global__ void geglu_bf16_packed2_kernel(

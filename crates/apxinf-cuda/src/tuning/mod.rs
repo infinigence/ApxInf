@@ -13,7 +13,10 @@ pub use key::{
     DeviceFingerprint, Epilogue, GemmLayout, GemmOp, GemmTuningKey, ScaleMode, TuningDType,
 };
 pub use report::outcome_json;
-pub use session::{ResolvedTactic, TacticMatch, TuningMode, TuningPaths, TuningSession};
+pub(crate) use session::autotune_suppressed;
+pub use session::{
+    without_autotune, ResolvedTactic, TacticMatch, TuningMode, TuningPaths, TuningSession,
+};
 pub use store::{GemmTuningRecord, TacticStore};
 pub use tactic::{
     decode_cublaslt_custom_tactic, CublasLtCustomConfig, TacticBackend, TacticCandidate, TacticId,

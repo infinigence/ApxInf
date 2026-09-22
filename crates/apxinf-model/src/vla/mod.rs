@@ -181,10 +181,43 @@ impl Action {
     }
 }
 
+/// Requested execution policy. A runtime must explicitly support this contract;
+/// legacy `prepare` implementations are not assumed to honor it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Eager,
+    PreferGraph,
+    RequireGraph,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Eager,
+    Graph,
+}
+
+/// Readiness for the plan's fixed specification, not whole-model readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreparationStatus {
+    /// The implementation has not adopted the explicit readiness contract.
+    RuntimeManaged,
+    Ready {
+        mode: ExecutionMode,
+        fallback_reason: Option<String>,
+    },
+    /// Execution choices changed; prepare a new plan before running again.
+    Invalidated,
+}
+
 /// A prepared, fixed-shape inference plan. Implementations own every resource
 /// referenced by eager execution or a captured graph.
 pub trait PreparedInference {
     fn spec(&self) -> &InferenceSpec;
+
+    fn status(&self) -> PreparationStatus {
+        PreparationStatus::RuntimeManaged
+    }
+
     fn run(&self, request: &VlaRequest<'_>) -> Result<Action>;
 }
 
@@ -208,6 +241,11 @@ pub struct VlaContract {
 /// The boxed return keeps this trait object-safe so `LoadedModel::Vla` can
 /// directly hold heterogeneous model runtimes.
 pub trait VlaRuntime {
+    /// Resolved model-local implementation ID, when supported by the family.
+    fn model_variant(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Fixed input/output capabilities of this loaded checkpoint.
     fn contract(&self) -> VlaContract;
 
@@ -218,6 +256,36 @@ pub trait VlaRuntime {
 
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
+
+    /// Prepare without tuning on placeholder data. Compatible runs do not
+    /// capture or autotune; unsupported implementations fail explicitly.
+    fn prepare_with_policy(
+        &self,
+        _spec: &InferenceSpec,
+        _policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        Err(Error::Other(
+            "explicit VLA preparation policy is not supported".into(),
+        ))
+    }
+
+    /// Optional real-input tuning followed by fixed-spec preparation. The
+    /// sample is not retained as semantic request state.
+    fn prepare_for(
+        &self,
+        _sample: &VlaRequest<'_>,
+        _policy: ExecutionPolicy,
+    ) -> Result<Box<dyn PreparedInference>> {
+        Err(Error::Other(
+            "real-input VLA preparation is not supported".into(),
+        ))
+    }
+
+    /// Evict implicit cached plans. Explicitly owned plans remain alive.
+    /// This is not a request/RNG reset.
+    fn clear_prepared(&self) -> Result<()> {
+        Err(Error::Other("VLA plan eviction is not supported".into()))
+    }
 
     /// Current execution path for diagnostics and benchmarks. Implementations
     /// should report an eager fallback explicitly after a graph attempt.

@@ -281,11 +281,11 @@ impl TuningDb {
     }
 }
 
-fn major_minor(version: &str) -> String {
+pub(super) fn major_minor(version: &str) -> String {
     version.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
-fn versions_compatible(expected: Option<&str>, actual: &str) -> bool {
+pub(super) fn versions_compatible(expected: Option<&str>, actual: &str) -> bool {
     expected.map_or(true, |expected| {
         major_minor(expected) == major_minor(actual)
     })

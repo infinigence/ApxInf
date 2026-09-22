@@ -4,7 +4,7 @@
 
     layout = detect_checkpoint(model_dir)
     normalization = layout.normalization  # None means identity passthrough
-    config_json = layout.config_json_text() # -> apxinf_py.Model.load(config_json=...)
+    config_json = layout.config_json_text() # -> apxinf_py.ModelRunner.load(config_json=...)
 
 :func:`inspect_checkpoint` is the same information rendered as a preflight
 report -- what resolved, from where, and what is missing -- for a server to log

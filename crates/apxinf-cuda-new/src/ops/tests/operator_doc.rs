@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::ops::contracts::Semantic;
+use crate::ops::{attention_contracts, contracts as gemm_contracts};
 
 const CATALOG: &str = include_str!("../../../cuda-operator.md");
 const MARKER_PREFIX: &str = "<!-- l3-operator:";
@@ -27,16 +27,31 @@ fn documented_operator_ids() -> Vec<&'static str> {
 fn every_l3_operator_appears_once_in_cuda_operator_doc() {
     let documented = documented_operator_ids();
     let documented_set: BTreeSet<_> = documented.iter().copied().collect();
-    let expected: BTreeSet<_> = Semantic::ALL
+    // This is the catalog of operator families, not a closed GEMM/Attention
+    // assumption. A new family must expose semantic doc IDs and join this
+    // iterator so its public L3 surface is covered by the same check.
+    let expected_ids: Vec<_> = gemm_contracts::Semantic::ALL
         .iter()
         .copied()
-        .map(Semantic::doc_id)
+        .map(gemm_contracts::Semantic::doc_id)
+        .chain(
+            attention_contracts::Semantic::ALL
+                .iter()
+                .copied()
+                .map(attention_contracts::Semantic::doc_id),
+        )
         .collect();
+    let expected: BTreeSet<_> = expected_ids.iter().copied().collect();
 
     assert_eq!(
         documented.len(),
         documented_set.len(),
         "cuda-operator.md contains duplicate L3 operator markers"
+    );
+    assert_eq!(
+        expected_ids.len(),
+        expected.len(),
+        "public L3 semantics contain duplicate documentation identifiers"
     );
     assert_eq!(
         documented_set, expected,

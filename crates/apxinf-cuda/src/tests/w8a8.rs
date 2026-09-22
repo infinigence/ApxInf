@@ -1,5 +1,5 @@
-use half::bf16;
 use apxinf_core::{Backend, Result, Tensor};
+use half::bf16;
 
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
@@ -183,5 +183,45 @@ fn fused_w8a8_matches_cublas_at_static_shape_classes() {
                 fused.len()
             );
         assert!(max_abs <= 0.03125, "fused GEMM diverged from cuBLAS");
+    }
+}
+
+#[test]
+fn default_w8a8_handles_dimensions_without_cutlass_alignment() {
+    let backend = CudaBackend::new(0).unwrap();
+    // PI0.5's patch projection has K=588. Also cover a non-aligned N.
+    // Use the public resolver: the forced-preference test helper bypasses it.
+    for (input_dim, output_dim) in [(588, 1152), (16, 10)] {
+        let mut values = vec![bf16::from_f32(1.0); 2 * input_dim];
+        values[input_dim..].fill(bf16::from_f32(-2.0));
+        let activation = backend
+            .to_device(&Tensor::from_bf16(vec![2, input_dim], &values).unwrap())
+            .unwrap();
+        let weight = CudaBuffer::alloc(input_dim * output_dim, backend.device_id()).unwrap();
+        weight
+            .copy_from_host(&vec![1u8; input_dim * output_dim])
+            .unwrap();
+        let scales = backend
+            .to_device(&Tensor::from_f32(vec![output_dim], &vec![1.0; output_dim]).unwrap())
+            .unwrap();
+        let output = crate::kernels::gemm::w8a8(
+            backend.context(),
+            &activation,
+            W8A8WeightView {
+                values_i8: &weight,
+                scales_f32: &scales,
+                input_dim,
+                output_dim,
+                scale_mode: W8A8ScaleMode::DynamicRowPerOutputChannel,
+                layout: W8A8Layout::OutputMajor,
+            },
+        )
+        .unwrap();
+        let actual = backend.to_cpu(&output).unwrap().to_f32_vec().unwrap();
+        assert_eq!(actual[..output_dim], vec![input_dim as f32; output_dim]);
+        assert_eq!(
+            actual[output_dim..],
+            vec![-2.0 * input_dim as f32; output_dim]
+        );
     }
 }

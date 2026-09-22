@@ -4,7 +4,7 @@ ApxInf serves the NVIDIA GR00T N1.7 model core through the same public path as
 the other VLA families:
 
 ```text
-AutoPolicy -> Gr00tPolicy -> apxinf_py.Model -> AutoModel -> VlaRuntime
+AutoPolicy -> Gr00tPolicy -> apxinf_py.ModelRunner -> AutoModel -> VlaRuntime
 ```
 
 `Gr00tPolicy` deliberately keeps NVIDIA's official checkpoint processor around

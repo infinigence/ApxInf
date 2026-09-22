@@ -11,6 +11,59 @@ use crate::context::CudaContext;
 use crate::ffi;
 use crate::workspace::output_buffer;
 
+/// NCHW channel LayerNorm with BF16 arithmetic boundaries, including the affine step.
+pub fn channel_layer_bf16_rounded(
+    ctx: &CudaContext,
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    if dims.len() != 4 || !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Other("invalid channel LayerNorm geometry".into()));
+    }
+    let bytes = checked_bytes(DType::BF16, dims, "channel LayerNorm")?;
+    if weight.shape().dims() != [dims[1]] || bias.shape() != weight.shape() {
+        return Err(Error::Other(
+            "channel LayerNorm affine width mismatch".into(),
+        ));
+    }
+    for t in [x, weight, bias] {
+        if t.dtype() != DType::BF16 || t.device() != apxinf_core::Device::Cuda(ctx.device_id()) {
+            return Err(Error::Other(
+                "channel LayerNorm requires BF16 tensors on the context device".into(),
+            ));
+        }
+    }
+    let int = |n: usize| {
+        i32::try_from(n).map_err(|_| Error::Other("channel LayerNorm dimension overflow".into()))
+    };
+    let spatial = dims[2]
+        .checked_mul(dims[3])
+        .ok_or_else(|| Error::Other("channel LayerNorm spatial overflow".into()))?;
+    int(dims[0]
+        .checked_mul(spatial)
+        .ok_or_else(|| Error::Other("channel LayerNorm grid overflow".into()))?)?;
+    let (n, c, s) = (int(dims[0])?, int(dims[1])?, int(spatial)?);
+    let out = output_buffer(ctx, bytes)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_channel_layer_norm_bf16_rounded(
+            gpu_ptr(x)?,
+            gpu_ptr(weight)?,
+            gpu_ptr(bias)?,
+            out.ptr(),
+            n,
+            c,
+            s,
+            eps,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(out.into_tensor(x.shape().clone(), DType::BF16))
+}
+
 /// RMS normalization into caller-owned storage.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_into(

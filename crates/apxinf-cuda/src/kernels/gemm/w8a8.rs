@@ -443,8 +443,12 @@ pub fn gemm_w8a8(
     activation: &Tensor,
     weight: W8A8WeightView<'_>,
 ) -> Result<Tensor> {
-    let prefer_cutlass =
-        cfg!(apxinf_cutlass_int8_sm80) && matches!(ctx.caps().arch_family, CudaArchFamily::Sm80);
+    // The plan resolver validates the default before the launch-time fallback.
+    // Match the quantized-input path's eligibility, including patch K=588.
+    let prefer_cutlass = cfg!(apxinf_cutlass_int8_sm80)
+        && matches!(ctx.caps().arch_family, CudaArchFamily::Sm80)
+        && weight.input_dim % 16 == 0
+        && weight.output_dim % 8 == 0;
     gemm_w8a8_impl(ctx, activation, weight, Some(prefer_cutlass), false)
 }
 

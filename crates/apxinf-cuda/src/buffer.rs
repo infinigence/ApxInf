@@ -31,6 +31,101 @@ impl CudaDeviceAddress {
 
 struct CudaAllocation {
     ptr: *mut c_void,
+    len: usize,
+    device: usize,
+    /// The stream this block belongs to, as the raw handle. Zero means the
+    /// block was allocated without one and is never cached; see `cache_put`.
+    stream: usize,
+}
+
+/// Device-memory free list, keyed by device and exact byte size.
+///
+/// One Qwen-Drive VQA inference issued 43,811 cudaMalloc/cudaFree pairs and
+/// spent 13.6s of host time inside them, against 7.9s of total kernel time:
+/// every per-layer intermediate took a fresh block and returned it. The shapes
+/// repeat exactly from layer to layer and from decode step to decode step, so
+/// an exact-size free list turns nearly all of that into a pointer pop.
+///
+/// The free list is keyed by the **stream** as well as the device and size,
+/// and that is a correctness requirement rather than a refinement. A CUDA
+/// launch is asynchronous, so a block dropped by one stream can still be in
+/// flight when the free list hands it out; if the taker is a different stream
+/// nothing orders the two and the second kernel can write the block while the
+/// first is still reading it. Within one stream the launches are ordered by
+/// definition, so reuse there needs nothing else. A block allocated without a
+/// stream is never cached, which is why `CudaBuffer::alloc` does not consult
+/// this at all and `alloc_on` does.
+///
+/// Opt-in through `APXINF_CUDA_ALLOC_CACHE` until it has been measured across
+/// the other model families. `APXINF_CUDA_ALLOC_CACHE_MB` caps retained bytes,
+/// default 4096, so a long-running process cannot grow without bound; past the
+/// cap a block is released to the driver as before.
+struct AllocCache {
+    /// Pointers held as `usize`; `*mut c_void` is not `Send`.
+    blocks: std::collections::HashMap<(usize, usize, usize), Vec<usize>>,
+    retained: usize,
+    cap: usize,
+}
+
+fn alloc_cache() -> Option<&'static std::sync::Mutex<AllocCache>> {
+    static CACHE: std::sync::OnceLock<Option<std::sync::Mutex<AllocCache>>> =
+        std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var_os("APXINF_CUDA_ALLOC_CACHE")?;
+            let cap = std::env::var("APXINF_CUDA_ALLOC_CACHE_MB")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(4096)
+                .saturating_mul(1024 * 1024);
+            Some(std::sync::Mutex::new(AllocCache {
+                blocks: std::collections::HashMap::new(),
+                retained: 0,
+                cap,
+            }))
+        })
+        .as_ref()
+}
+
+fn poison_allocations() -> bool {
+    static POISON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POISON.get_or_init(|| std::env::var_os("APXINF_CUDA_POISON_ALLOC").is_some())
+}
+
+/// Take a cached block of exactly `num_bytes` held for `stream` on `device`.
+fn cache_take(num_bytes: usize, device: usize, stream: usize) -> Option<*mut c_void> {
+    if stream == 0 {
+        return None;
+    }
+    let mut cache = alloc_cache()?.lock().ok()?;
+    let ptr = cache.blocks.get_mut(&(device, stream, num_bytes))?.pop()?;
+    cache.retained = cache.retained.saturating_sub(num_bytes);
+    Some(ptr as *mut c_void)
+}
+
+/// Retain a block for reuse on the stream that owned it. Returns false when the
+/// caller must free it -- including for every block that has no stream, which
+/// is the case that cannot be made safe by ordering.
+fn cache_put(ptr: *mut c_void, num_bytes: usize, device: usize, stream: usize) -> bool {
+    if stream == 0 {
+        return false;
+    }
+    let Some(cache) = alloc_cache() else {
+        return false;
+    };
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    if cache.retained.saturating_add(num_bytes) > cache.cap {
+        return false;
+    }
+    cache.retained += num_bytes;
+    cache
+        .blocks
+        .entry((device, stream, num_bytes))
+        .or_default()
+        .push(ptr as usize);
+    true
 }
 
 // SAFETY: this allocation is released through the CUDA runtime and its raw
@@ -40,10 +135,14 @@ unsafe impl Sync for CudaAllocation {}
 
 impl Drop for CudaAllocation {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                let _ = ffi::cudaFree(self.ptr);
-            }
+        if self.ptr.is_null() {
+            return;
+        }
+        if cache_put(self.ptr, self.len, self.device, self.stream) {
+            return;
+        }
+        unsafe {
+            let _ = ffi::cudaFree(self.ptr);
         }
     }
 }
@@ -62,16 +161,54 @@ unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
 
 impl CudaBuffer {
-    /// Allocate `num_bytes` of device memory.
+    /// Allocate `num_bytes` of device memory, outside any stream.
+    ///
+    /// Blocks allocated this way never enter the reuse cache, because nothing
+    /// orders their release against whatever is still reading them. Use
+    /// [`CudaBuffer::alloc_on`] for the per-operator buffers a model churns
+    /// through; that is where the cache was measured and where the ordering
+    /// exists to make it safe.
     pub fn alloc(num_bytes: usize, device: usize) -> Result<Self, String> {
+        Self::alloc_with_stream(num_bytes, device, 0)
+    }
+
+    /// Allocate `num_bytes` on `ctx`'s stream, eligible for stream-ordered
+    /// reuse.
+    pub fn alloc_on(ctx: &crate::CudaContext, num_bytes: usize) -> Result<Self, String> {
+        Self::alloc_with_stream(num_bytes, ctx.device_id(), ctx.stream().handle() as usize)
+    }
+
+    fn alloc_with_stream(num_bytes: usize, device: usize, stream: usize) -> Result<Self, String> {
         unsafe {
             ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
         }
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
+        let ptr: *mut c_void = match cache_take(num_bytes, device, stream) {
+            Some(cached) => cached,
+            None => {
+                let mut fresh: *mut c_void = std::ptr::null_mut();
+                unsafe {
+                    ffi::check_cuda(ffi::cudaMalloc(&mut fresh, num_bytes))?;
+                }
+                fresh
+            }
+        };
+        // Poison every allocation under APXINF_CUDA_POISON_ALLOC. 0xFF is NaN at
+        // every float width, so anything that reads a buffer before writing it
+        // shows up in the result. Unlike poisoning operator outputs alone, this
+        // covers the allocations a model makes directly, which is where a
+        // read-before-write would otherwise stay hidden behind whatever the
+        // previous owner of the block left there.
+        if poison_allocations() {
+            unsafe {
+                ffi::check_cuda(ffi::cudaMemset(ptr, 0xFF, num_bytes))?;
+            }
         }
-        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation {
+            ptr,
+            len: num_bytes,
+            device,
+            stream,
+        });
         Ok(Self {
             ptr,
             len: num_bytes,
@@ -80,7 +217,7 @@ impl CudaBuffer {
         })
     }
 
-    /// Allocate and zero-fill.
+    /// Allocate and zero-fill, outside any stream.
     pub fn alloc_zeros(num_bytes: usize, device: usize) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;
         buf.zero()?;
@@ -101,13 +238,111 @@ impl CudaBuffer {
         Ok(())
     }
 
+    /// Allocate and zero-fill on `ctx`'s stream.
+    pub fn alloc_zeros_on(ctx: &crate::CudaContext, num_bytes: usize) -> Result<Self, String> {
+        let buf = Self::alloc_on(ctx, num_bytes)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset(buf.ptr, 0, num_bytes))?;
+        }
+        Ok(buf)
+    }
+
+    /// Copy `num_bytes` from another device buffer on the given stream.
+    ///
+    /// A captured graph reads and writes fixed addresses, so a caller that
+    /// replays one has to move its inputs into the buffers the capture baked
+    /// and its results back out. Stream-ordered, so it sequences with the
+    /// replay without a host sync.
+    pub fn copy_from_device_async(
+        &self,
+        source: &CudaBuffer,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len || num_bytes > source.len {
+            return Err(format!(
+                "device copy of {num_bytes} bytes exceeds {} or {}",
+                self.len, source.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                num_bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fill `num_bytes` of this buffer with `value` on the given stream.
+    ///
+    /// Workspace views are reused rather than freshly allocated, so a caller
+    /// that needs cleared memory has to clear it explicitly.
+    pub fn memset_async(
+        &self,
+        value: i32,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len {
+            return Err(format!(
+                "memset of {num_bytes} bytes exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                value,
+                num_bytes,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Allocate and fill every byte with `value`.
+    ///
+    /// Used to poison operator outputs under test: 0xFF is NaN at every float
+    /// width, so a consumer that reads memory the producing kernel did not
+    /// write shows up in the result instead of passing unnoticed.
+    pub fn alloc_filled(num_bytes: usize, device: usize, value: i32) -> Result<Self, String> {
+        let buf = Self::alloc(num_bytes, device)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset(buf.ptr, value, num_bytes))?;
+        }
+        Ok(buf)
+    }
+
+    /// Allocate and fill on `ctx`'s stream.
+    pub fn alloc_filled_on(
+        ctx: &crate::CudaContext,
+        num_bytes: usize,
+        value: i32,
+    ) -> Result<Self, String> {
+        let buf = Self::alloc_on(ctx, num_bytes)?;
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset(buf.ptr, value, num_bytes))?;
+        }
+        Ok(buf)
+    }
+
     /// Allocate and zero-fill asynchronously on the given stream.
+    ///
+    /// Takes the stream by reference: `CudaStream` owns its stream and is
+    /// neither `Copy` nor `Clone`, so the by-value form this replaced could
+    /// not be called with the `&CudaStream` a context hands out, and had no
+    /// callers.
     pub fn alloc_zeros_async(
         num_bytes: usize,
         device: usize,
-        stream: crate::CudaStream,
+        stream: &crate::CudaStream,
     ) -> Result<Self, String> {
-        let buf = Self::alloc(num_bytes, device)?;
+        // The stream is right here, so this block is eligible for reuse on it.
+        let buf = Self::alloc_with_stream(num_bytes, device, stream.handle() as usize)?;
         unsafe {
             ffi::check_cuda(ffi::cudaMemsetAsync(buf.ptr, 0, num_bytes, stream.handle()))?;
         }

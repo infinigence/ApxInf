@@ -7,6 +7,22 @@ use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
     pub fn apxinf_static_prepare_bf16_gemm(m: i32, n: i32, k: i32) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_bf16_gemm_bias(
+        m: i32,
+        n: i32,
+        k: i32,
+        bias: *const c_void,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_bf16_gemm_bias(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_set_cublaslt_bf16_gemm_heuristic(
         m: i32,
         n: i32,
@@ -124,6 +140,7 @@ extern "C" {
         n: i32,
         k: i32,
         alpha: f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_fp8_gemm_bf16(
@@ -134,6 +151,7 @@ extern "C" {
         n: i32,
         k: i32,
         alpha: f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_fp8_gemm_split_f16(
@@ -249,6 +267,7 @@ extern "C" {
         benchmark_iterations: i32,
         returned_algorithms: *mut i32,
         milliseconds: *mut f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_autotune_cublaslt_fp8_gemm_bf16(
@@ -266,6 +285,7 @@ extern "C" {
         benchmark_iterations: i32,
         returned_algorithms: *mut i32,
         milliseconds: *mut f32,
+        weight_scratch: *mut c_void,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
 }

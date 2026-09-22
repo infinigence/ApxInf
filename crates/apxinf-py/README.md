@@ -7,19 +7,19 @@ Python frontend.
 inference. The policy-facing tier is L1; tokenize, normalize, and resize belong
 to the `apxinf` Python package:
 
-- **PI0.5 L1** `Model.infer_rgb(...)` — resized RGB in; vision patchification
+- **PI0.5 L1** `ModelRunner.infer_rgb(...)` — resized RGB in; vision patchification
   runs inside the Rust CUDA graph.
-- **WallOSS L1** `Model.infer_rgb(...)` — resized RGB in; Qwen2.5-VL
+- **WallOSS L1** `ModelRunner.infer_rgb(...)` — resized RGB in; Qwen2.5-VL
   normalization, temporal patchification, and spatial-merge ordering run in
   the captured CUDA path.
-- **WallOSS custom-processor bridge** `Model._infer_patches(...)` — canonical
+- **WallOSS custom-processor bridge** `ModelRunner._infer_patches(...)` — canonical
   patches/tokens/action mask in, preserving user-defined Python processors.
 
 Returns `float32` `[action_horizon, action_dim]` in the **normalized** domain.
 
 > **L0** (pre-computed patches in, equivalent to a Rust `Observation(Patches)`)
 > is not an end-user API. It is reachable only under the private name
-> `Model._infer_patches`, for policy implementations and parity tests.
+> `ModelRunner._infer_patches`, for policy implementations and parity tests.
 
 ## Build
 
@@ -49,7 +49,7 @@ cargo check -p apxinf-py
 import numpy as np
 import apxinf_py
 
-model = apxinf_py.Model.load("pi05", "/path/to/checkpoint", device="cuda:0", precision="bf16")
+model = apxinf_py.ModelRunner.load("pi05", "/path/to/checkpoint", device="cuda:0", model_variant="bf16")
 
 rgb = np.zeros((model.num_views, model.image_size, model.image_size, 3), np.uint8)
 tokens = np.zeros(16, np.uint32)
@@ -67,7 +67,7 @@ environment variables (they skip cleanly without CUDA / a checkpoint):
 
 ```sh
 pip install pytest numpy
-APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_PRECISION=bf16 \
+APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_MODEL_VARIANT=bf16 \
   pytest crates/apxinf-py/tests
 ```
 

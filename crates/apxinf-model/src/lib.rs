@@ -12,6 +12,7 @@ pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
 pub mod qwen3vl;
+pub mod qwen_drive;
 pub mod registry;
 pub mod vla;
 mod walloss;
@@ -30,8 +31,12 @@ pub use llm_trait::{
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
+pub use qwen_drive::QwenDriveConfig;
+#[cfg(feature = "cuda")]
+pub use qwen_drive::QwenDriveModel;
 pub use registry::{get, list, register};
 pub use vla::{
-    Action, ImageLayout, InferenceSpec, InitialLatent, Observation, PreparedInference,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    VlaRuntime,
 };

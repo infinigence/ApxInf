@@ -118,6 +118,7 @@ extern "C" {
     pub fn cudaStreamEndCapture(stream: cudaStream_t, pGraph: *mut *mut c_void) -> cudaError_t;
 
     pub fn cudaGetLastError() -> cudaError_t;
+    pub fn cudaPeekAtLastError() -> cudaError_t;
     pub fn cudaGetErrorString(error: cudaError_t) -> *const std::ffi::c_char;
 
     pub fn cudaSetDevice(device: i32) -> cudaError_t;

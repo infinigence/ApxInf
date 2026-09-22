@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "status.h"
+#include "tuning_types.h"
 #include "types.h"
 
 typedef enum {
@@ -63,14 +64,7 @@ typedef struct {
   uint32_t output_scale_is_unit;
 } apxinf_gemm_spec_t;
 
-typedef struct {
-  uint64_t workspace_limit;
-  uint32_t online_tune;
-  uint32_t allow_fallback;
-  uint32_t graph_safe;
-  uint32_t deterministic;
-  const char* cache_dir;
-} apxinf_gemm_policy_t;
+typedef apxinf_tuning_policy_t apxinf_gemm_policy_t;
 
 typedef struct {
   const void* a;

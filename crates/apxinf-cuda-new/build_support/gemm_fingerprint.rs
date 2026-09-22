@@ -8,6 +8,7 @@ const FNV1A_128_PRIME: u128 = 0x0000000001000000000000000000013b;
 // must not invalidate persisted GEMM recipes.
 const GEMM_INPUT_TREES: &[&str] = &[
     "adapters/gemm",
+    "framework",
     "kernels/cutlass/extensions",
     "kernels/cutlass/include",
     "kernels/cutlass/ops/gemm",
@@ -17,6 +18,7 @@ const GEMM_INPUT_FILES: &[&str] = &[
     "include/apxinf_cuda/gemm.h",
     "include/apxinf_cuda/gemm_types.h",
     "include/apxinf_cuda/status.h",
+    "include/apxinf_cuda/tuning_types.h",
     "include/apxinf_cuda/types.h",
     "kernels/custom/gemm.cuh",
 ];
@@ -39,7 +41,7 @@ fn collect_tree(root: &Path, files: &mut Vec<PathBuf>) {
         } else if path.extension().is_some_and(|extension| {
             matches!(
                 extension.to_string_lossy().as_ref(),
-                "cu" | "cuh" | "h" | "hh" | "hpp"
+                "cpp" | "cu" | "cuh" | "h" | "hh" | "hpp"
             )
         }) {
             files.push(path);

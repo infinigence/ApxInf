@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--tokenizer", type=pathlib.Path)
-    parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default="bf16")
+    parser.add_argument("--model-variant", choices=("auto", "fp8_static", "bf16", "int8_dynamic"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--action-dim",
@@ -45,7 +45,7 @@ def main() -> None:
     policy = Pi05Policy.from_pretrained(
         args.model_dir,
         device=args.device,
-        precision=args.precision,
+        model_variant=args.model_variant,
         tokenizer_path=args.tokenizer,
         action_dim=(args.action_dim or None),
     )
