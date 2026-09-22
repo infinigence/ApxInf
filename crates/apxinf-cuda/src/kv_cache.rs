@@ -19,7 +19,6 @@ pub struct CudaKVCache {
     head_dim: usize,
     max_seq_len: usize,
     seq_len: usize,
-    device_id: usize,
 }
 
 impl CudaKVCache {
@@ -48,7 +47,6 @@ impl CudaKVCache {
             head_dim,
             max_seq_len,
             seq_len: 0,
-            device_id,
         })
     }
 
@@ -130,13 +128,8 @@ impl KvCache for CudaKVCache {
         // allocations here leaves captured kernels pointing at released storage.
         // Use the same default-stream memset semantics as alloc_zeros, but retain
         // every allocation. CudaContext streams participate in default-stream ordering.
-        unsafe {
-            crate::ffi::check_cuda(crate::ffi::cudaSetDevice(self.device_id as i32))
-                .map_err(Error::Cuda)?;
-            for buf in self.k_buffers.iter().chain(&self.v_buffers) {
-                crate::ffi::check_cuda(crate::ffi::cudaMemset(buf.ptr(), 0, buf.len()))
-                    .map_err(Error::Cuda)?;
-            }
+        for buf in self.k_buffers.iter().chain(&self.v_buffers) {
+            buf.zero().map_err(Error::Cuda)?;
         }
         self.seq_len = 0;
         Ok(())
