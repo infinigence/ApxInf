@@ -12,6 +12,7 @@ pub mod elementwise;
 pub mod embedding;
 pub mod fused;
 pub mod gdn;
+pub mod gdn;
 pub mod gemm;
 pub mod norm;
 pub mod preprocess;
@@ -19,6 +20,8 @@ pub mod quantization;
 pub mod qwen35_attention;
 pub mod qwen35_common;
 pub mod rope;
+pub mod qwen35_attention;
+pub mod qwen35_common;
 
 pub use crate::workspace::GraphWorkspace;
 
