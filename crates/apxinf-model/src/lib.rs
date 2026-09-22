@@ -33,7 +33,7 @@ pub use profiling::GenerationProfile;
 pub use qwen3vl::{GeneralQwen3VL, Qwen3VLConfig, Qwen3VLTextWeights};
 pub use qwen_drive::QwenDriveConfig;
 #[cfg(feature = "cuda")]
-pub use qwen_drive::QwenDriveModel;
+pub use qwen_drive::QwenDriveModelRunner;
 pub use registry::{get, list, register};
 pub use vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,

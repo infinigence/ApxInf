@@ -169,11 +169,10 @@ impl PlanningExpertConfig {
                 "qwen_drive expert config: layers_per_kv must be greater than zero".into(),
             ));
         }
-        if self.n_layers % self.layers_per_kv != 0 {
+        if self.n_layers == 0 || self.n_layers % self.layers_per_kv != 0 {
             return Err(Error::Other(format!(
                 "qwen_drive expert config: {} layers not divisible by layers_per_kv {}",
-                self.n_layers,
-                self.layers_per_kv
+                self.n_layers, self.layers_per_kv
             )));
         }
         let rotary = self.rotary_dim();
@@ -250,16 +249,16 @@ impl QwenDriveConfig {
         }
         let layer_types: Vec<String> = tc["layer_types"]
             .as_array()
-            .ok_or_else(|| Error::Other("qwen_drive config: missing text_config.layer_types".into()))?
+            .ok_or_else(|| {
+                Error::Other("qwen_drive config: missing text_config.layer_types".into())
+            })?
             .iter()
             .filter_map(|entry| entry.as_str().map(str::to_owned))
             .collect();
         let rope = &tc["rope_parameters"];
-        let section = rope["mrope_section"]
-            .as_array()
-            .ok_or_else(|| {
-                Error::Other("qwen_drive config: missing rope_parameters.mrope_section".into())
-            })?;
+        let section = rope["mrope_section"].as_array().ok_or_else(|| {
+            Error::Other("qwen_drive config: missing rope_parameters.mrope_section".into())
+        })?;
         if section.len() != 3 {
             return Err(Error::Other(format!(
                 "qwen_drive config: mrope_section must have 3 entries, got {}",
@@ -279,7 +278,8 @@ impl QwenDriveConfig {
             n_kv_heads: tc["num_key_value_heads"].as_u64().unwrap_or(4) as usize,
             head_dim: tc["head_dim"].as_u64().unwrap_or(256) as usize,
             vocab_size: tc["vocab_size"].as_u64().unwrap_or(248320) as usize,
-            max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(32768) as usize,
+            max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(32768)
+                as usize,
             rms_norm_eps: tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             attn_output_gate: tc["attn_output_gate"].as_bool().unwrap_or(true),
             layer_types,
@@ -308,22 +308,29 @@ impl QwenDriveConfig {
             hidden_size: vc["hidden_size"].as_u64().unwrap_or(1024) as usize,
             intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(4096) as usize,
             num_heads: vc["num_heads"].as_u64().unwrap_or(16) as usize,
-            head_dim: vc.get("head_dim").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(0),
+            head_dim: vc
+                .get("head_dim")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(0),
             patch_size: vc["patch_size"].as_u64().unwrap_or(16) as usize,
             temporal_patch_size: vc["temporal_patch_size"].as_u64().unwrap_or(2) as usize,
             in_channels: vc["in_channels"].as_u64().unwrap_or(3) as usize,
             spatial_merge_size: vc["spatial_merge_size"].as_u64().unwrap_or(2) as usize,
-            num_position_embeddings: vc["num_position_embeddings"].as_u64().unwrap_or(2304) as usize,
+            num_position_embeddings: vc["num_position_embeddings"].as_u64().unwrap_or(2304)
+                as usize,
             out_hidden_size: vc["out_hidden_size"].as_u64().unwrap_or(2560) as usize,
         };
 
         let ec = &v["expert_config"];
         if !ec.is_object() {
-            return Err(Error::Other("qwen_drive config: missing expert_config".into()));
+            return Err(Error::Other(
+                "qwen_drive config: missing expert_config".into(),
+            ));
         }
-        let esection = ec["mrope_section"]
-            .as_array()
-            .ok_or_else(|| Error::Other("qwen_drive config: missing expert mrope_section".into()))?;
+        let esection = ec["mrope_section"].as_array().ok_or_else(|| {
+            Error::Other("qwen_drive config: missing expert mrope_section".into())
+        })?;
         if esection.len() != 3 {
             return Err(Error::Other(format!(
                 "qwen_drive config: expert mrope_section must have 3 entries, got {}",
@@ -389,7 +396,8 @@ impl QwenDriveConfig {
             history_image_pixels: v["history_image_pixels"].as_u64().unwrap_or(174080) as usize,
             current_image_pixels: v["current_image_pixels"].as_u64().unwrap_or(921600) as usize,
             image_patch_size: v["image_patch_size"].as_u64().unwrap_or(16) as usize,
-            image_temporal_patch_size: v["image_temporal_patch_size"].as_u64().unwrap_or(2) as usize,
+            image_temporal_patch_size: v["image_temporal_patch_size"].as_u64().unwrap_or(2)
+                as usize,
             image_spatial_merge_size: v["image_spatial_merge_size"].as_u64().unwrap_or(2) as usize,
             max_reasoning_tokens: v["max_reasoning_tokens"].as_u64().unwrap_or(256) as usize,
             min_reasoning_tokens: v["min_reasoning_tokens"].as_u64().unwrap_or(10) as usize,
@@ -402,7 +410,15 @@ impl QwenDriveConfig {
     /// post-rotary K/V directly, so their attention geometry must match and
     /// the number of exported caches must equal the expert's KV sources.
     pub fn validate(&self) -> Result<()> {
+        self.text.validate()?;
         self.expert.validate()?;
+        if self.num_future_points == 0
+            || self.trajectory_point_dim != 3
+            || self.num_inference_steps == 0
+            || self.vision.spatial_merge_size == 0
+        {
+            return Err(Error::Other("qwen_drive: planning requires positive horizon/steps/merge and 3D trajectory points".into()));
+        }
         let full = self.text.full_attention_layers();
         if full.len() != self.expert.num_kv_sources() {
             return Err(Error::Other(format!(
@@ -411,7 +427,9 @@ impl QwenDriveConfig {
                 self.expert.num_kv_sources()
             )));
         }
-        if self.text.n_kv_heads != self.expert.n_kv_heads || self.text.head_dim != self.expert.head_dim {
+        if self.text.n_kv_heads != self.expert.n_kv_heads
+            || self.text.head_dim != self.expert.head_dim
+        {
             return Err(Error::Other(format!(
                 "qwen_drive config: expert KV geometry ({} heads x dim {}) must match the VLM ({} x {})",
                 self.expert.n_kv_heads,
@@ -430,12 +448,12 @@ impl QwenDriveConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Abbreviated but schema-faithful excerpt of the released checkpoint
     // config (experiment/qwen-drive-k3/checkpoint-configs/config.json).
-    const CHECKPOINT_CONFIG: &str = r#"{
+    pub(crate) const CHECKPOINT_CONFIG: &str = r#"{
         "model_type": "qwen_drive",
         "num_future_points": 50,
         "num_history_points": 16,
@@ -547,29 +565,73 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_planner_cache_group_without_panicking() {
+        let mut config = QwenDriveConfig::from_json_str(CHECKPOINT_CONFIG).unwrap();
+        config.expert.layers_per_kv = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_expert_vlm_cache_mismatch() {
         // Growing the expert to 36 layers makes it expect 9 scene caches
         // while the VLM only has 8 full-attention layers.
-        let broken = CHECKPOINT_CONFIG.replacen("\"num_hidden_layers\": 32,", "\"num_hidden_layers\": 36,", 1);
+        let broken = CHECKPOINT_CONFIG.replacen(
+            "\"num_hidden_layers\": 32,",
+            "\"num_hidden_layers\": 36,",
+            1,
+        );
         let err = QwenDriveConfig::from_json_str(&broken);
         assert!(err.is_err());
         let message = format!("{}", err.err().unwrap());
-        assert!(message.contains("full-attention"), "unexpected error: {message}");
+        assert!(
+            message.contains("full-attention"),
+            "unexpected error: {message}"
+        );
     }
-
     #[test]
     fn rejects_zero_layers_per_kv_when_loading_json() {
         let broken = CHECKPOINT_CONFIG.replace("\"layers_per_kv\": 4", "\"layers_per_kv\": 0");
         let error = QwenDriveConfig::from_json_str(&broken).unwrap_err();
-        assert!(error.to_string().contains("layers_per_kv must be greater than zero"));
+        assert!(error
+            .to_string()
+            .contains("layers_per_kv must be greater than zero"));
     }
 
     #[test]
     fn validates_expert_before_counting_scene_caches() {
         let mut config = QwenDriveConfig::from_json_str(CHECKPOINT_CONFIG).unwrap();
         config.expert.layers_per_kv = 0;
-        assert!(config.validate().unwrap_err().to_string().contains("layers_per_kv"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("layers_per_kv"));
         config.expert.layers_per_kv = 3;
-        assert!(config.validate().unwrap_err().to_string().contains("not divisible"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not divisible"));
+    }
+}
+
+/// Physical layout selected once when constructing BF16 weights and Blocks.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionLayout {
+    Checkpoint,
+    Tuned,
+}
+#[cfg(feature = "cuda")]
+impl ProjectionLayout {
+    pub(crate) fn from_environment() -> Self {
+        if matches!(
+            std::env::var("APXINF_QWEN_LINEAR_TUNED").as_deref(),
+            Ok("0" | "off" | "false")
+        ) {
+            Self::Checkpoint
+        } else {
+            Self::Tuned
+        }
     }
 }

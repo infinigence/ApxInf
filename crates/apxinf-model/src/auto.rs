@@ -285,7 +285,12 @@ impl AutoModel {
             }
         };
 
-        if options.model_variant.is_some() && !matches!(model_name, "pi05" | "pi05-cuda") {
+        if options.model_variant.is_some()
+            && !matches!(
+                model_name,
+                "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+            )
+        {
             return Err(Error::Other(format!(
                 "model {model_name} does not yet support model_variant"
             )));

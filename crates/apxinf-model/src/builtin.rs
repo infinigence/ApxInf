@@ -71,34 +71,21 @@ fn load_qwen3vl(
     Ok(LoadedModel::text(Box::new(model)))
 }
 
-/// Load only the Qwen-Drive VLM through the text registry. Planning weights
-/// require an explicit planner path through the planning-capable model/policy
-/// entry point; an adjacent directory does not add capabilities to LlmTrait.
 fn load_qwen_drive(
     path: &Path,
     device: Device,
     backend: Arc<dyn Backend>,
-    _options: &LoadOptions,
+    options: &LoadOptions,
 ) -> Result<LoadedModel> {
     #[cfg(feature = "cuda")]
     {
-        let model_dir = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or_else(|| Path::new("."))
-        };
-        let model = crate::qwen_drive::QwenDriveModel::load_with_backend(
-            model_dir, None, backend,
-        )?;
-        Ok(LoadedModel::text(Box::new(model)))
+        crate::qwen_drive::load::load_registered(path, device, backend, options)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (path, device, backend);
+        let _ = (path, device, backend, options);
         Err(Error::Other(
-            "qwen_drive requires the cuda feature (native CUDA deployment); \
-             this build has no CUDA support"
-                .into(),
+            "qwen_drive planning requires the CUDA feature and a CUDA device".into(),
         ))
     }
 }
