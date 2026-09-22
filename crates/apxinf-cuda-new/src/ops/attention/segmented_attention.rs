@@ -1,7 +1,7 @@
 use apxinf_core::{DType, Result, Tensor};
 
 use super::contracts::{
-    alignment, dtype_code, invalid, range, required_bytes, tensor_storage, Normalized,
+    alignment, dtype_code, invalid, range, required_bytes, tensor_storage, Normalized, Semantic,
 };
 use super::{execution, AttentionMask, AttentionPolicy};
 use crate::ffi::abi::attention as abi;
@@ -150,7 +150,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
     Ok(Normalized {
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
-            semantic: abi::SEMANTIC_SEGMENTED,
+            semantic: Semantic::Segmented.abi_value(),
             dtype: dtype_code(dtype)?,
             output_dtype: dtype_code(dtype)?,
             mask: AttentionMask::None as u32,

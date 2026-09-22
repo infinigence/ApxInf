@@ -57,7 +57,7 @@ __device__ __forceinline__ float block_sum_parallel_unsafe(
   return scratch[0];
 }
 
-// Block-wide maximum for nonnegative values (unused lanes are padded with 0),
+// Block-wide maximum (unused lanes are padded with negative infinity),
 // with the SAME unsafe scratch-reuse contract as above.
 // WARNING: max -> max, max -> sum, or any overlapping scratch write can race
 // with the final result reads. Consume the result, then __syncthreads() in
@@ -72,7 +72,7 @@ __device__ __forceinline__ float block_max_parallel_unsafe(
   if (lane == 0) scratch[warp] = value;
   __syncthreads();
   if (warp == 0) {
-    value = lane < warps ? scratch[lane] : 0.0f;
+    value = lane < warps ? scratch[lane] : -INFINITY;
     value = warp_max(value);
     if (lane == 0) scratch[0] = value;
   }

@@ -1,3 +1,11 @@
+// Best-effort persistent storage for exact-key recipes.
+//
+// The file name is an FNV-1a hash of the caller-provided exact key. The file
+// stores the full key on its first line and the opaque serialized recipe on its
+// second, so reads still reject hash collisions and truncated content. Writes
+// use a process-specific temporary file followed by rename. Empty directories,
+// missing or malformed files, and I/O failures behave as cache misses; callers
+// own recipe serialization, parsing, and implementation validation.
 #include "runtime_internal.h"
 
 #include <filesystem>

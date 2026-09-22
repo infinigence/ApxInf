@@ -345,7 +345,11 @@ fn configure_cuda_tuning(
 ) -> Result<()> {
     use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
 
-    let default_paths = TuningPaths::for_cuda("configs/tuning", cuda.context().caps());
+    let default_paths = TuningPaths::resolve_for_cuda(
+        "configs/tuning",
+        cuda.context().caps(),
+        cuda.context().library_versions(),
+    );
     let model_root = if model_path.is_dir() {
         model_path
     } else {

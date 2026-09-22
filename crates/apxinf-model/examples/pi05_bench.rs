@@ -875,7 +875,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .map(apxinf_cuda::tuning::TuningPaths::from_tactics)
         .unwrap_or_else(|| {
-            apxinf_cuda::tuning::TuningPaths::for_cuda("configs/tuning", backend.context().caps())
+            apxinf_cuda::tuning::TuningPaths::resolve_for_cuda(
+                "configs/tuning",
+                backend.context().caps(),
+                backend.context().library_versions(),
+            )
         });
     let tuning = if tuning_paths.tactics.is_file() {
         Some(apxinf_cuda::tuning::TuningDb::from_json_file(

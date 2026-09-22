@@ -17,6 +17,7 @@ pub fn register_builtin_models() {
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
+    registry::register("qwen_drive", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
     crate::pi05::register_builtin();
@@ -68,6 +69,38 @@ fn load_qwen3vl(
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
     Ok(LoadedModel::text(Box::new(model)))
+}
+
+/// Load only the Qwen-Drive VLM through the text registry. Planning weights
+/// require an explicit planner path through the planning-capable model/policy
+/// entry point; an adjacent directory does not add capabilities to LlmTrait.
+fn load_qwen_drive(
+    path: &Path,
+    device: Device,
+    backend: Arc<dyn Backend>,
+    _options: &LoadOptions,
+) -> Result<LoadedModel> {
+    #[cfg(feature = "cuda")]
+    {
+        let model_dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        };
+        let model = crate::qwen_drive::QwenDriveModel::load_with_backend(
+            model_dir, None, backend,
+        )?;
+        Ok(LoadedModel::text(Box::new(model)))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (path, device, backend);
+        Err(Error::Other(
+            "qwen_drive requires the cuda feature (native CUDA deployment); \
+             this build has no CUDA support"
+                .into(),
+        ))
+    }
 }
 
 fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {

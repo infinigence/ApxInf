@@ -1,5 +1,48 @@
 #pragma once
 
+#include "rms_reduction.cuh"
+
+// NCHW channel normalization preserving the BF16 arithmetic boundaries of
+// mean -> centered square -> variance -> sqrt -> divide -> affine.
+__global__ void channel_layer_norm_bf16_rounded_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* out, int channels, int spatial, float eps) {
+  const int pixel = blockIdx.x % spatial;
+  const int batch = blockIdx.x / spatial;
+  const int64_t base = static_cast<int64_t>(batch) * channels * spatial + pixel;
+  __shared__ float partial[256];
+  float sum = 0.0f;
+  for (int c=threadIdx.x;c<channels;c+=blockDim.x) sum += __bfloat162float(x[base+static_cast<int64_t>(c)*spatial]);
+  partial[threadIdx.x]=sum;
+  __syncthreads();
+  for (int offset=128;offset>0;offset>>=1) {
+    if (threadIdx.x<offset) partial[threadIdx.x]+=partial[threadIdx.x+offset];
+    __syncthreads();
+  }
+  const float mean=__bfloat162float(__float2bfloat16(partial[0]/channels));
+  __syncthreads();
+  sum=0.0f;
+  for (int c=threadIdx.x;c<channels;c+=blockDim.x) {
+    const float d=__bfloat162float(__float2bfloat16(__bfloat162float(x[base+static_cast<int64_t>(c)*spatial])-mean));
+    sum+=__bfloat162float(__float2bfloat16(d*d));
+  }
+  partial[threadIdx.x]=sum;
+  __syncthreads();
+  for (int offset=128;offset>0;offset>>=1) {
+    if (threadIdx.x<offset) partial[threadIdx.x]+=partial[threadIdx.x+offset];
+    __syncthreads();
+  }
+  const float variance=__bfloat162float(__float2bfloat16(partial[0]/channels));
+  const float denom=__bfloat162float(__float2bfloat16(sqrtf(__bfloat162float(__float2bfloat16(variance+eps)))));
+  for (int c=threadIdx.x;c<channels;c+=blockDim.x) {
+    const int64_t i=base+static_cast<int64_t>(c)*spatial;
+    const float d=__bfloat162float(__float2bfloat16(__bfloat162float(x[i])-mean));
+    const float normalized=__bfloat162float(__float2bfloat16(d/denom));
+    const float scaled=__bfloat162float(__float2bfloat16(normalized*__bfloat162float(weight[c])));
+    out[i]=__float2bfloat16(scaled+__bfloat162float(bias[c]));
+  }
+}
+
 // Copyright 2026 apxinf contributors.
 // Pure CUDA operators grouped by physical operation; launch policy lives under adapters/.
 
@@ -323,12 +366,63 @@ __global__ void rms_norm_bf16_kernel(
     const float value = __bfloat162float(input[static_cast<int64_t>(row) * cols + col]);
     square_sum += value * value;
   }
-  const float inverse_rms =
-      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+  float mean = block_sum_parallel_unsafe(square_sum, scratch) / cols;
+  if (rows >= 16 && cols > 128 && cols % 4 == 0)
+    mean = rms_vector_square_mean_bf16(input + static_cast<int64_t>(row) * cols, cols);
+  const float inverse_rms = rsqrtf(__fadd_rn(mean, eps));
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const int64_t index = static_cast<int64_t>(row) * cols + col;
     output[index] = __float2bfloat16(
         __bfloat162float(input[index]) * inverse_rms * __bfloat162float(weight[col]));
+  }
+}
+
+// The row is read three times by the loop below -- once to sum, once for the
+// variance, once to normalise -- and at 96.8% occupancy there are no more warps
+// to hide that with, which is why ncu attributes 60% of this kernel's stalls to
+// long_scoreboard. Each thread owns only cols/blockDim values, four at the
+// shipped shape, so they fit in registers and the row need only be read once.
+//
+// A thread keeps exactly the columns it kept before, in the same order, so both
+// block reductions see the same partial sums and the result is unchanged. That
+// is also why the loads stay strided rather than becoming 16-byte reads:
+// widening them would reassign columns between threads and change the
+// summation order.
+template <int PER_THREAD>
+__global__ void layer_norm_bf16_cached_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_bfloat16* output,
+    int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float cache[PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    cache[i] = __bfloat162float(
+        input[base + threadIdx.x + i * static_cast<int64_t>(blockDim.x)]);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  // Every warp must consume the mean before the second reduction writes it.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+#pragma unroll
+  for (int i = 0; i < PER_THREAD; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const float value = (cache[i] - mean) * inverse_std *
+                            __bfloat162float(weight[col]) +
+                        __bfloat162float(bias[col]);
+    output[base + col] = __float2bfloat16(value);
   }
 }
 
@@ -382,5 +476,3 @@ __global__ void ada_rms_norm_bf16_kernel(
         __bfloat162float(style[cols + col]));
   }
 }
-
-

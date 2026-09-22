@@ -49,6 +49,30 @@ __global__ void add_bf16_kernel(
     output[gid] = __float2bfloat16(x);
 }
 
+// Eight elements per thread through 16-byte accesses, for the same reason the
+// GELU wanted them: one bf16 per thread has a warp touching 64 bytes of a
+// 128-byte sector. This kernel is 85.7 ms across a 64-token scene, spread over
+// 4145 launches in both prefill and decode. Per-element arithmetic unchanged.
+__global__ void add_bf16_vec8_kernel(
+    const float4* __restrict__ a, const float4* __restrict__ b,
+    float4* __restrict__ output, uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 pa = a[v];
+        float4 pb = b[v];
+        const __nv_bfloat16* la = reinterpret_cast<const __nv_bfloat16*>(&pa);
+        const __nv_bfloat16* lb = reinterpret_cast<const __nv_bfloat16*>(&pb);
+        float4 out;
+        __nv_bfloat16* lo = reinterpret_cast<__nv_bfloat16*>(&out);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lo[i] = __float2bfloat16(__bfloat162float(la[i]) + __bfloat162float(lb[i]));
+        }
+        output[v] = out;
+    }
+}
+
 
 
 // ── Mul (bf16) ────────────────────────────────────────────────────────────

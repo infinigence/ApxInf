@@ -1781,6 +1781,7 @@ fn launch_tactic_fp8_bf16(
             "FP8-to-BF16 online autotune cannot execute {tactic:?}"
         )));
     }
+    let scratch = fp8_weight_scratch(ctx, key.n, key.k)?;
     unsafe {
         ffi::check_cublas(ffi::apxinf_static_fp8_gemm_bf16(
             activation.ptr(),
@@ -1790,6 +1791,7 @@ fn launch_tactic_fp8_bf16(
             key.n as i32,
             key.k as i32,
             alpha,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)
@@ -1965,41 +1967,30 @@ pub fn gemm_fp8_bf16(
     let (m, k, n) = (a[0], a[1], b[1]);
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
-    let alpha = activation_scale * weight.scale;
     let key = bf16_output_tuning_key(ctx, m, n, k);
-    let plan = resolve_fp8_bf16_plan(ctx, &key, &activation, &weight_buffer, alpha)?;
-    let selected_tactic = plan.tactic;
-    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
-    let selected_result = launch_tactic_fp8_bf16(
+    resolve_fp8_bf16_plan(
         ctx,
         &key,
         &activation,
         &weight_buffer,
-        &output,
-        alpha,
-        selected_tactic,
-    );
-    if let Err(error) = selected_result {
-        if selected_tactic.backend == TacticBackend::Vendor {
-            return Err(error);
-        }
-        eprintln!(
-            "[apxinf] FP8-to-BF16 tactic {selected_tactic:?} failed for {key:?}: {error}; using vendor fallback"
-        );
-        ctx.gemm_plans().fallback(ctx, &key)?;
-        launch_tactic_fp8_bf16(
-            ctx,
-            &key,
-            &activation,
-            &weight_buffer,
-            &output,
-            alpha,
-            TacticId {
-                backend: TacticBackend::Vendor,
-                value: 0,
-            },
-        )?;
-    }
+        activation_scale * weight.scale,
+    )?;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bf16(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            activation_scale * weight.scale,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
@@ -2007,6 +1998,17 @@ pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<(
     let status =
         unsafe { ffi::apxinf_static_prepare_fp8_gemm_split_f16(m as i32, n as i32, k as i32) };
     ffi::check_cublas(status).map_err(Error::Cuda)
+}
+
+/// TN staging belongs to the calling stream/workspace, not to a shared
+/// shape plan: two contexts must never overwrite each other's FP8 weights.
+fn fp8_weight_scratch(ctx: &CudaContext, n: usize, k: usize) -> Result<Option<CudaBuffer>> {
+    if ctx.caps().arch_family == crate::CudaArchFamily::Sm100 {
+        return Ok(None);
+    }
+    let bytes = n.checked_mul(k)
+        .ok_or_else(|| Error::Other("FP8 weight staging size overflow".into()))?;
+    crate::workspace::output_buffer(ctx, bytes).map(Some)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2020,6 +2022,7 @@ pub fn cublaslt_fp8_gemm_f16(
     k: usize,
     alpha: f32,
 ) -> Result<()> {
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
     let status = unsafe {
         ffi::apxinf_static_fp8_gemm_f16(
             activation.ptr(),
@@ -2029,6 +2032,7 @@ pub fn cublaslt_fp8_gemm_f16(
             n as i32,
             k as i32,
             alpha,
+            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         )
     };

@@ -20,8 +20,8 @@ register themselves under a ``model_type`` via :func:`register_policy` so
 ``@register_policy("<name>")``), then re-export it from
 :mod:`apxinf.policies.impls`.
 
-None of this imports ``apxinf_py`` — policy classes load the CUDA binding lazily,
-inside ``from_pretrained`` — so importing the package stays offline-friendly.
+None of this imports ``apxinf_py`` - policy classes load the CUDA binding lazily,
+inside ``from_pretrained`` - so importing the package stays offline-friendly.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from .base import (
 from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
-from .impls import Pi05Policy, Pi0FastPolicy, Gr00tPolicy, WallossPolicy
+from .impls import Pi05Policy, Pi0FastPolicy, Gr00tPolicy, QwenDrivePolicy, WallossPolicy
 
 __all__ = [
     "Policy",
@@ -56,5 +56,6 @@ __all__ = [
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
+    "QwenDrivePolicy",
     "WallossPolicy",
 ]
