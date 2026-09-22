@@ -1967,30 +1967,41 @@ pub fn gemm_fp8_bf16(
     let (m, k, n) = (a[0], a[1], b[1]);
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let alpha = activation_scale * weight.scale;
     let key = bf16_output_tuning_key(ctx, m, n, k);
-    resolve_fp8_bf16_plan(
+    let plan = resolve_fp8_bf16_plan(ctx, &key, &activation, &weight_buffer, alpha)?;
+    let selected_tactic = plan.tactic;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let selected_result = launch_tactic_fp8_bf16(
         ctx,
         &key,
         &activation,
         &weight_buffer,
-        activation_scale * weight.scale,
-    )?;
-    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
-    let scratch = fp8_weight_scratch(ctx, n, k)?;
-    let status = unsafe {
-        ffi::apxinf_static_fp8_gemm_bf16(
-            activation.ptr(),
-            weight_buffer.ptr(),
-            output.ptr(),
-            m as i32,
-            n as i32,
-            k as i32,
-            activation_scale * weight.scale,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
-            ctx.stream().handle(),
-        )
-    };
-    ffi::check_cublas(status).map_err(Error::Cuda)?;
+        &output,
+        alpha,
+        selected_tactic,
+    );
+    if let Err(error) = selected_result {
+        if selected_tactic.backend == TacticBackend::Vendor {
+            return Err(error);
+        }
+        eprintln!(
+            "[apxinf] FP8-to-BF16 tactic {selected_tactic:?} failed for {key:?}: {error}; using vendor fallback"
+        );
+        ctx.gemm_plans().fallback(ctx, &key)?;
+        launch_tactic_fp8_bf16(
+            ctx,
+            &key,
+            &activation,
+            &weight_buffer,
+            &output,
+            alpha,
+            TacticId {
+                backend: TacticBackend::Vendor,
+                value: 0,
+            },
+        )?;
+    }
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
