@@ -32,9 +32,8 @@ shapes, and AWQ packing before any resident service is started.
 The native runtime is also registered through the maintained model front door.
 With a CUDA build, `config.json:model_type` (`qwen3_5`) is resolved by
 `AutoModel` to `LoadedModel::Text(Qwen35Model)`, which implements the shared
-`LlmTrait` prefill/decode path. The HTTP service below is an application
-adapter over the same family-local CUDA decoder; it is not the model loading
-authority.
+`LlmTrait` prefill/decode path. Application servers should call the same public model path; the model loader remains the
+framework authority.
 
 ```rust,no_run
 use apxinf_core::Device;
@@ -51,34 +50,6 @@ let _ = model.text_capabilities()?;
 The public `AutoModel` path currently accepts text prompts. The optional
 processor-backed image path remains scoped to the multimodal server adapter
 until its preprocessing contract is promoted to the shared `ImageInput` seam.
-
-## Serve text requests
-
-```bash
-./target/release/apxinf serve \
-  --model /path/to/Qwen3.8-27B-AWQ-INT4 \
-  --host 127.0.0.1 \
-  --port 8001 \
-  --max-model-len 32768 \
-  --enable-experimental-marlin-m64
-```
-
-```bash
-curl http://127.0.0.1:8001/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen3.8-27B-AWQ-INT4",
-    "messages": [{"role": "user", "content": "Explain CUDA graphs briefly."}],
-    "max_tokens": 32,
-    "temperature": 0,
-    "stream": false
-  }'
-```
-
-The server also exposes `GET /health`, `GET /v1/models`, and the deterministic
-`POST /v1/evaluations/generate` endpoint for pre-tokenized evaluation. The
-current contract is one resident model, one request at a time, greedy decoding,
-and `prompt_tokens + completion_tokens <= max_model_len <= 32768`.
 
 ## Enable one-image requests
 
