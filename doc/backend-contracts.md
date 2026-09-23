@@ -60,6 +60,12 @@
 
 `contracts` 提供形状、设备、dtype、容量和溢出验证。验证通过只证明参数结构合法，不证明后端具备实现或数值结果正确。正维度限制适用于新算子，scalar 可用于布局操作；现有 Tensor 对空张量的行为未在本阶段改写。
 
+### 验证入口与实现钩子
+
+`Backend` 只声明 `*_impl` 钩子（`cast_impl`、`slice_axis_impl`、`concat_axis_impl`、`permute_impl`、`broadcast_to_impl`、`attention_impl`），默认返回 `UnsupportedOp`。调用方一律走 `PortableOps` trait：它对每个 `Backend`（含 `dyn Backend`）blanket 实现，先用 `contracts` 校验参数、再分发到 `*_impl`、最后核对返回形状是否与契约一致。后端无法覆盖或跳过校验，只实现 `*_impl` 并假定参数结构已合法。校验先于分发，因此契约违规（如非排列 axes、越界 slice、dtype 不符）报告为对应的结构化错误而非 `UnsupportedOp`，不会被“未实现”掩盖。返回形状核对成本随 rank 增长，release 下保留，使后端 kernel 的形状 bug 直接暴露为错误。
+
+布局算子保持位不变，接受任意 dtype（走 `tensor_storage` 只校验设备与 storage extent）；`cast` 等算术仅接受 F32/F16/BF16（走 `float_tensor`），FP8/INT8 返回 `UnsupportedDType`。`contracts` 的校验错误使用结构化变体：形状不符用 `ShapeMismatch`，dtype 不符用 `UnsupportedDType`/`DTypeMismatch`，无形状可展示的不变量违规用 `Contract(&'static str)`（不分配）。所有 `Backend` 默认方法的“未实现”统一用 `UnsupportedOp(name)`，可经 `Error::unsupported_op()` 识别缺失算子名，无需匹配消息文本。
+
 ### Mask 校验时机
 
 `validate_mask_values(&Tensor)` 显式扫描 CPU F32 additive mask 的逻辑元素，复杂度 O(mask.numel())，不展开广播；允许有限 bias 和负无穷，拒绝 NaN/正无穷。它不替代 attention 的 rank 和广播检查。非 CPU mask 明确返回 `UnsupportedDevice`，不隐式下载，也不静默跳过。

@@ -8,24 +8,25 @@
 
 use crate::{DType, Device, Error, Result, Tensor};
 
-fn invalid(message: impl Into<String>) -> Error {
-    Error::Other(message.into())
+fn shape_mismatch(expected: &[usize], got: &[usize]) -> Error {
+    Error::ShapeMismatch {
+        expected: format!("{expected:?}"),
+        got: format!("{got:?}"),
+    }
 }
 
-/// Validate a floating-point operand and its storage extent before launch.
-pub fn float_tensor(input: &Tensor, device: Device) -> Result<()> {
+/// Validate device residency and storage extent for any dtype. Layout operators
+/// preserve bits, so they accept every dtype; only arithmetic is float-only.
+pub fn tensor_storage(input: &Tensor, device: Device) -> Result<()> {
     if input.device() != device {
         return Err(Error::DeviceMismatch {
             expected: device,
             got: input.device(),
         });
     }
-    if !matches!(input.dtype(), DType::F32 | DType::F16 | DType::BF16) {
-        return Err(invalid("portable arithmetic requires f32, f16 or bf16"));
-    }
     let bytes = checked_elements(input.shape().dims())?
         .checked_mul(input.dtype().size_in_bytes())
-        .ok_or_else(|| invalid("tensor byte size overflow"))?;
+        .ok_or(Error::Contract("tensor byte size overflow"))?;
     if input.storage().len() < bytes {
         return Err(Error::DataLengthMismatch {
             expected: bytes,
@@ -35,14 +36,28 @@ pub fn float_tensor(input: &Tensor, device: Device) -> Result<()> {
     Ok(())
 }
 
+/// Validate a floating-point operand and its storage extent before launch.
+pub fn float_tensor(input: &Tensor, device: Device) -> Result<()> {
+    tensor_storage(input, device)?;
+    if !input.dtype().is_float() {
+        return Err(Error::UnsupportedDType {
+            got: input.dtype(),
+            allowed: "f32, f16, bf16",
+        });
+    }
+    Ok(())
+}
+
 /// Scalars are supported; empty dimensions and overflowing shapes are rejected.
 pub fn checked_elements(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
         if d == 0 {
-            return Err(invalid("portable operators reject empty dimensions"));
+            return Err(Error::Contract(
+                "portable operators reject empty dimensions",
+            ));
         }
         n.checked_mul(d)
-            .ok_or_else(|| invalid("shape element count overflow"))
+            .ok_or(Error::Contract("shape element count overflow"))
     })
 }
 
@@ -104,7 +119,9 @@ impl<'a> AttentionOptions<'a> {
             float_tensor(t, device)?;
         }
         if !self.scale.is_finite() || self.scale <= 0. {
-            return Err(invalid("attention scale must be finite and positive"));
+            return Err(Error::Contract(
+                "attention scale must be finite and positive",
+            ));
         }
         for dtype in [k.dtype(), v.dtype()] {
             if dtype != q.dtype() {
@@ -116,28 +133,40 @@ impl<'a> AttentionOptions<'a> {
         }
         for dtype in [self.scores, self.probabilities] {
             if dtype != DType::F32 && dtype != q.dtype() {
-                return Err(invalid(
-                    "attention intermediate dtype must be f32 or input dtype",
-                ));
+                return Err(Error::UnsupportedDType {
+                    got: dtype,
+                    allowed: "f32 or the Q/K/V dtype",
+                });
             }
         }
         let qs = q.shape().dims();
         let ks = k.shape().dims();
-        if qs.len() != 4 || ks.len() != 4 || v.shape().dims() != ks {
-            return Err(invalid("attention expects Q[B,Q,Hq,D], K/V[B,K,Hkv,D]"));
+        if qs.len() != 4 || ks.len() != 4 {
+            return Err(Error::Contract(
+                "attention expects Q[B,Q,Hq,D] and K/V[B,K,Hkv,D]",
+            ));
         }
-        if qs[0] != ks[0] || qs[3] != ks[3] || qs[2] % ks[2] != 0 {
-            return Err(invalid("attention batch/head dimensions do not match"));
+        if v.shape().dims() != ks {
+            return Err(shape_mismatch(ks, v.shape().dims()));
+        }
+        // Report K against the shape Q implies, so the differing axis is visible.
+        if qs[0] != ks[0] || qs[3] != ks[3] {
+            return Err(shape_mismatch(&[qs[0], ks[1], ks[2], qs[3]], ks));
+        }
+        if !qs[2].is_multiple_of(ks[2]) {
+            return Err(Error::Contract(
+                "Hq must be a multiple of Hkv (MHA/GQA/MQA grouping)",
+            ));
         }
         match self.mask {
             AttentionMask::Full => {}
             AttentionMask::Causal { q_start, k_start } => {
                 q_start
                     .checked_add(qs[1] - 1)
-                    .ok_or_else(|| invalid("query position overflow"))?;
+                    .ok_or(Error::Contract("query position overflow"))?;
                 k_start
                     .checked_add(ks[1] - 1)
-                    .ok_or_else(|| invalid("key position overflow"))?;
+                    .ok_or(Error::Contract("key position overflow"))?;
             }
             AttentionMask::Additive(mask) => {
                 float_tensor(mask, device)?;
@@ -149,7 +178,7 @@ impl<'a> AttentionOptions<'a> {
                 }
                 let target = [qs[0], qs[2], qs[1], ks[1]];
                 if mask.ndim() != 4 {
-                    return Err(invalid("attention bias requires rank four"));
+                    return Err(Error::Contract("attention bias requires rank four"));
                 }
                 broadcast_shape(mask.shape().dims(), &target)?;
             }
@@ -184,7 +213,9 @@ pub fn validate_mask_values(mask: &Tensor) -> Result<()> {
         .iter()
         .any(|x| x.is_nan() || *x == f32::INFINITY)
     {
-        return Err(invalid("attention bias contains NaN or positive infinity"));
+        return Err(Error::Contract(
+            "attention bias contains NaN or positive infinity",
+        ));
     }
     Ok(())
 }
@@ -206,7 +237,9 @@ impl AxisSlice {
             });
         }
         if self.start >= self.end || self.end > shape[self.axis] {
-            return Err(invalid("invalid or empty slice"));
+            return Err(Error::Contract(
+                "slice must be a non-empty in-bounds [start,end)",
+            ));
         }
         let mut out = shape.to_vec();
         out[self.axis] = self.end - self.start;
@@ -225,7 +258,7 @@ pub fn broadcast_shape(source: &[usize], target: &[usize]) -> Result<()> {
             .zip(target.iter().rev())
             .any(|(&s, &t)| s != 1 && s != t)
     {
-        return Err(invalid("incompatible broadcast shape"));
+        return Err(shape_mismatch(target, source));
     }
     Ok(())
 }
@@ -234,13 +267,13 @@ pub fn broadcast_shape(source: &[usize], target: &[usize]) -> Result<()> {
 pub fn permuted_shape(shape: &[usize], axes: &[usize]) -> Result<Vec<usize>> {
     checked_elements(shape)?;
     if axes.len() != shape.len() {
-        return Err(invalid("permutation rank mismatch"));
+        return Err(shape_mismatch(shape, axes));
     }
     let mut seen = vec![false; shape.len()];
     let mut out = Vec::with_capacity(shape.len());
     for &a in axes {
         if a >= shape.len() || seen[a] {
-            return Err(invalid("axes must be a permutation"));
+            return Err(Error::Contract("axes must be a permutation of 0..rank"));
         }
         seen[a] = true;
         out.push(shape[a]);
@@ -252,7 +285,7 @@ pub fn permuted_shape(shape: &[usize], axes: &[usize]) -> Result<Vec<usize>> {
 pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>> {
     let first = *shapes
         .first()
-        .ok_or_else(|| invalid("concat requires at least one input"))?;
+        .ok_or(Error::Contract("concat requires at least one input"))?;
     checked_elements(first)?;
     if axis >= first.len() {
         return Err(Error::InvalidAxis {
@@ -271,11 +304,11 @@ pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>
                 .enumerate()
                 .any(|(i, (a, b))| i != axis && a != b)
         {
-            return Err(invalid("concat shape mismatch"));
+            return Err(shape_mismatch(first, shape));
         }
         out[axis] = out[axis]
             .checked_add(shape[axis])
-            .ok_or_else(|| invalid("concat axis overflow"))?;
+            .ok_or(Error::Contract("concat axis overflow"))?;
     }
     checked_elements(&out)?;
     Ok(out)

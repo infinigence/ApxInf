@@ -15,6 +15,12 @@ pub enum DType {
 }
 
 impl DType {
+    /// Whether this dtype participates in portable floating-point arithmetic.
+    /// FP8/INT8 carry scales and quantization policy, so they are excluded.
+    pub fn is_float(self) -> bool {
+        matches!(self, DType::F32 | DType::F16 | DType::BF16)
+    }
+
     /// Size of one element in bytes.
     pub fn size_in_bytes(self) -> usize {
         match self {

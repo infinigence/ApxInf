@@ -1,4 +1,4 @@
-use apxinf_core::{contracts::*, Backend, CpuBackend, DType, Device, Error, Tensor};
+use apxinf_core::{contracts::*, Backend, CpuBackend, DType, Device, Error, PortableOps, Tensor};
 fn t(shape: &[usize]) -> Tensor {
     Tensor::zeros(shape.to_vec(), DType::F32)
 }
@@ -229,4 +229,134 @@ fn extensions_remain_object_safe_and_never_fake_execution() {
         b.attention(&q, &q, &q, &AttentionOptions::full(0.5)),
         Err(Error::UnsupportedOp("attention"))
     ));
+}
+
+/// #3: validation runs before dispatch, so a contract violation is reported as a
+/// contract error even when the backend has no implementation at all. Without the
+/// sealed wrapper these would all surface as UnsupportedOp and hide the real bug.
+#[test]
+fn validated_entry_points_reject_bad_arguments_before_dispatch() {
+    let b: &dyn Backend = &CpuBackend;
+    let x = t(&[2, 3]);
+
+    // Non-permutation axes: caught by contracts, not by the missing impl.
+    assert!(matches!(
+        b.permute(&x, &[0, 0]),
+        Err(Error::Contract("axes must be a permutation of 0..rank"))
+    ));
+    // Out-of-bounds slice end.
+    assert!(matches!(
+        b.slice_axis(
+            &x,
+            AxisSlice {
+                axis: 1,
+                start: 0,
+                end: 9
+            }
+        ),
+        Err(Error::Contract(_))
+    ));
+    // Broadcast that would shrink an axis.
+    assert!(matches!(
+        b.broadcast_to(&x, &[3]),
+        Err(Error::ShapeMismatch { .. })
+    ));
+    // Mixed dtypes into concat.
+    assert!(matches!(
+        b.concat_axis(&[&x, &Tensor::zeros(vec![2, 3], DType::BF16)], 0),
+        Err(Error::DTypeMismatch { .. })
+    ));
+    // FP8 is not a portable arithmetic dtype.
+    assert!(matches!(
+        b.cast(&x, DType::F8E4M3),
+        Err(Error::UnsupportedDType {
+            got: DType::F8E4M3,
+            ..
+        })
+    ));
+    // Attention with Hq not a multiple of Hkv.
+    let q = t(&[1, 2, 3, 8]);
+    let k = t(&[1, 2, 2, 8]);
+    assert!(matches!(
+        b.attention(&q, &k, &k, &AttentionOptions::full(0.5)),
+        Err(Error::Contract(_))
+    ));
+    // Device mismatch is caught before the impl is consulted.
+    assert!(matches!(
+        b.permute(&big_cuda_tensor(), &[1, 0]),
+        Err(Error::DeviceMismatch { .. })
+    ));
+}
+
+/// #3: layout ops are bit-preserving, so they must accept non-float dtypes that
+/// `float_tensor` would reject. Proves the tensor_storage/float_tensor split.
+#[test]
+fn layout_ops_admit_non_float_dtypes_while_cast_does_not() {
+    let b: &dyn Backend = &CpuBackend;
+    let fp8 = Tensor::zeros(vec![2, 3], DType::F8E4M3);
+    // Reaches the impl (UnsupportedOp) rather than failing dtype validation.
+    assert!(matches!(
+        b.permute(&fp8, &[1, 0]),
+        Err(Error::UnsupportedOp("permute"))
+    ));
+    assert!(matches!(
+        b.slice_axis(
+            &fp8,
+            AxisSlice {
+                axis: 0,
+                start: 0,
+                end: 1
+            }
+        ),
+        Err(Error::UnsupportedOp("slice_axis"))
+    ));
+    // Arithmetic still refuses it.
+    assert!(matches!(
+        b.cast(&fp8, DType::F32),
+        Err(Error::UnsupportedDType { .. })
+    ));
+}
+
+fn big_cuda_tensor() -> Tensor {
+    Tensor::from_raw_parts(
+        vec![2, 3].into(),
+        DType::F32,
+        Device::Cuda(0),
+        apxinf_core::Storage::Gpu {
+            device: Device::Cuda(0),
+            handle: unsafe { apxinf_core::storage::GpuStorageHandle::from_raw_parts(0, 24, None) },
+        },
+    )
+}
+
+/// #4: every legacy default now reports UnsupportedOp with its own name, so a
+/// portable path can identify the missing op without matching on message text.
+#[test]
+fn legacy_defaults_report_unsupported_op_by_name() {
+    let b: &dyn Backend = &CpuBackend;
+    let x = t(&[2, 3]);
+    let names = [
+        b.layer_norm(&x, &x, &x, 1e-5).unwrap_err(),
+        b.gelu_tanh(&x).unwrap_err(),
+        b.add_bias(&x, &x).unwrap_err(),
+        b.concat_2d(&[&x]).unwrap_err(),
+        b.vision_sdpa(&x, &x, &x, 2, 1, 3).unwrap_err(),
+        b.rope_mrope(&x, 1, 3, 1e4, [1, 1, 1], &[0]).unwrap_err(),
+        b.rope_vision_2d(&x, 1, 3, 1e4, &[0, 0]).unwrap_err(),
+    ];
+    assert_eq!(
+        names
+            .iter()
+            .filter_map(|e| e.unsupported_op())
+            .collect::<Vec<_>>(),
+        vec![
+            "layer_norm",
+            "gelu_tanh",
+            "add_bias",
+            "concat_2d",
+            "vision_sdpa",
+            "rope_mrope",
+            "rope_vision_2d"
+        ]
+    );
 }
