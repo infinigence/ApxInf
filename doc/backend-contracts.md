@@ -55,10 +55,16 @@
 
 - `Full`：所有 key 可见；PI0.5 prefix、action 使用 full attention，但 action 的 K/V 为 prefix 加本轮 suffix。多视图放入 batch 维，不能跨视图 attention。
 - `Causal { q_start, k_start }`：允许 `k_start+j <= q_start+i`，适用于 Q/K 长度不同的增量查询。
-- `Additive`：同设备 F32 `[B|1,Hq|1,Q|1,K|1]`，有限 bias 或负无穷；NaN/正无穷非法。全部被 mask 的行输出零。结构验证器检查 shape；GPU mask 值验证仍由执行后端负责。
+- `Additive`：同设备 F32 `[B|1,Hq|1,Q|1,K|1]`，有限 bias 或负无穷；NaN/正无穷非法。全部被 mask 的行输出零。`AttentionOptions::validate()` 只检查结构（shape、dtype、device、storage extent）和标量配置，不扫描张量内容、不传输数据，成本随 rank 而非元素数量增长。
 - QK 的 F32 累加结果依次应用 scale、bias/mask，再舍入为 `scores`；softmax 采用 F32 reduction，结果舍入为 `probabilities`；PV 用 F32 累加，再舍入为输入 dtype。中间类型只能是 F32 或输入 dtype，配置中明确记录。不允许悄悄改为 TF32。
 
 `contracts` 提供形状、设备、dtype、容量和溢出验证。验证通过只证明参数结构合法，不证明后端具备实现或数值结果正确。正维度限制适用于新算子，scalar 可用于布局操作；现有 Tensor 对空张量的行为未在本阶段改写。
+
+### Mask 校验时机
+
+`validate_mask_values(&Tensor)` 显式扫描 CPU F32 additive mask 的逻辑元素，复杂度 O(mask.numel())，不展开广播；允许有限 bias 和负无穷，拒绝 NaN/正无穷。它不替代 attention 的 rank 和广播检查。非 CPU mask 明确返回 `UnsupportedDevice`，不隐式下载，也不静默跳过。
+
+阶段二应在 mask 构建或内容更新时校验一次，CPU mask 在上传前校验，跨层复用不重复扫描。设备生成的 mask 由保证该数值契约的受控生成逻辑或显式设备值校验路径负责。校验不是永久有效的标记：任何内容更新（包括共享存储写入）都必须重新保证契约。debug/release 使用相同的显式校验语义，不用 debug-only 扫描掩盖缺失的检查。
 
 ### 融合分解与舍入位置
 

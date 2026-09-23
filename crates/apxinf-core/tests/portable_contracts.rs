@@ -96,9 +96,77 @@ fn causal_offsets_and_mask_broadcast_are_explicit() {
     .unwrap();
     o.mask = AttentionMask::Additive(&mask);
     o.validate(Device::Cpu, &q, &k, &k).unwrap();
-    let bad = Tensor::from_f32(vec![1, 1, 1, 1], &[f32::INFINITY]).unwrap();
-    o.mask = AttentionMask::Additive(&bad);
-    assert!(o.validate(Device::Cpu, &q, &k, &k).is_err());
+    validate_mask_values(&mask).unwrap();
+}
+#[test]
+fn attention_structure_validation_does_not_scan_mask_values() {
+    let q = t(&[1, 2, 4, 8]);
+    let k = t(&[1, 7, 2, 8]);
+    for value in [f32::NAN, f32::INFINITY] {
+        let mask = Tensor::from_f32(vec![1, 1, 1, 1], &[value]).unwrap();
+        let mut o = AttentionOptions::full(0.5);
+        o.mask = AttentionMask::Additive(&mask);
+        assert_eq!(o.validate(Device::Cpu, &q, &k, &k).unwrap(), [1, 2, 4, 8]);
+        assert!(validate_mask_values(&mask).is_err());
+    }
+    // Value validity does not replace rank, broadcast or dtype checks.
+    for mask in [t(&[7]), t(&[1, 1, 1, 8])] {
+        validate_mask_values(&mask).unwrap();
+        let mut o = AttentionOptions::full(0.5);
+        o.mask = AttentionMask::Additive(&mask);
+        assert!(o.validate(Device::Cpu, &q, &k, &k).is_err());
+    }
+    let mask = Tensor::zeros(vec![1, 1, 1, 7], DType::BF16);
+    let mut o = AttentionOptions::full(0.5);
+    o.mask = AttentionMask::Additive(&mask);
+    assert!(matches!(
+        o.validate(Device::Cpu, &q, &k, &k),
+        Err(Error::DTypeMismatch { .. })
+    ));
+}
+#[test]
+fn mask_values_are_checked_explicitly_at_creation_and_update() {
+    let mut mask = Tensor::from_f32(
+        vec![1, 1, 1, 5],
+        &[f32::MIN, -1., 0., f32::MAX, f32::NEG_INFINITY],
+    )
+    .unwrap();
+    validate_mask_values(&mask).unwrap();
+    mask.as_f32_mut().unwrap()[0] = f32::NAN;
+    assert!(validate_mask_values(&mask).is_err());
+    mask.as_f32_mut().unwrap()[0] = f32::INFINITY;
+    assert!(validate_mask_values(&mask).is_err());
+    mask.as_f32_mut().unwrap()[0] = f32::NEG_INFINITY;
+    validate_mask_values(&mask).unwrap();
+    assert!(matches!(
+        validate_mask_values(&Tensor::zeros(vec![1, 1, 1, 1], DType::BF16)),
+        Err(Error::DTypeMismatch {
+            expected: DType::F32,
+            ..
+        })
+    ));
+}
+#[test]
+fn mask_value_validation_rejects_device_storage_without_reading_it() {
+    // Empty device storage needs no CUDA allocation/runtime. Even with no values
+    // to scan, a device mask must not silently report successful value validation.
+    let mask = Tensor::from_raw_parts(
+        vec![1, 1, 1, 0].into(),
+        DType::F32,
+        Device::Cuda(0),
+        apxinf_core::Storage::Gpu {
+            device: Device::Cuda(0),
+            handle: apxinf_core::storage::GpuStorageHandle {
+                ptr: 0,
+                len: 0,
+                _prevent_leak: None,
+            },
+        },
+    );
+    assert!(matches!(
+        validate_mask_values(&mask),
+        Err(Error::UnsupportedDevice(Device::Cuda(0)))
+    ));
 }
 #[test]
 fn attention_rejects_mismatched_precision_shape_or_device() {

@@ -58,7 +58,9 @@ pub enum AttentionMask<'a> {
     /// Additive F32 bias with shape [B|1, Hq|1, Q|1, K|1], on the same device.
     /// Zero keeps an entry, negative infinity masks it. Finite values are valid
     /// additive biases; NaN and positive infinity are invalid. All-masked rows
-    /// produce zero output. A backend validates values before executing them.
+    /// produce zero output. Validate values when constructing or updating a mask
+    /// (see [`validate_mask_values`]), then reuse it without per-layer scans.
+    /// Device-generated masks require a trusted generator or explicit device validation.
     Additive(&'a Tensor),
 }
 
@@ -85,7 +87,11 @@ impl<'a> AttentionOptions<'a> {
         }
     }
 
-    /// Return the output shape or a validation error; no kernel launch occurs.
+    /// Return the output shape after structural and scalar-option validation.
+    /// Checks shape, dtype, device and storage extent without reading tensor
+    /// contents, copying data or launching kernels. Work scales with tensor rank,
+    /// not element count. Mask values must be validated separately at construction
+    /// or update time; see [`validate_mask_values`].
     /// Query head h uses KV head floor(h / (Hq/Hkv)) (MHA/GQA/MQA).
     pub fn validate(
         &self,
@@ -146,18 +152,41 @@ impl<'a> AttentionOptions<'a> {
                     return Err(invalid("attention bias requires rank four"));
                 }
                 broadcast_shape(mask.shape().dims(), &target)?;
-                if device == Device::Cpu
-                    && mask
-                        .as_f32()?
-                        .iter()
-                        .any(|x| x.is_nan() || *x == f32::INFINITY)
-                {
-                    return Err(invalid("attention bias contains NaN or positive infinity"));
-                }
             }
         }
         Ok(qs.to_vec())
     }
+}
+
+/// Check additive F32 mask values on CPU in O(mask.numel()) time.
+/// Finite biases and negative infinity are valid; NaN and positive infinity
+/// are rejected. Only logical tensor elements are scanned, without broadcasting.
+///
+/// Call once when constructing a mask, and again after any content update, before
+/// sharing it across attention layers. This is not a structural attention check:
+/// [`AttentionOptions::validate`] still checks rank and broadcast compatibility.
+/// Non-CPU masks return [`Error::UnsupportedDevice`]; this function never downloads
+/// data or silently skips validation. Validate before upload, or use a trusted
+/// device-side generator or explicit backend value-validation path.
+pub fn validate_mask_values(mask: &Tensor) -> Result<()> {
+    if mask.device() != Device::Cpu {
+        return Err(Error::UnsupportedDevice(mask.device()));
+    }
+    if mask.dtype() != DType::F32 {
+        return Err(Error::DTypeMismatch {
+            expected: DType::F32,
+            got: mask.dtype(),
+        });
+    }
+    float_tensor(mask, Device::Cpu)?;
+    let elements = checked_elements(mask.shape().dims())?;
+    if mask.as_f32()?[..elements]
+        .iter()
+        .any(|x| x.is_nan() || *x == f32::INFINITY)
+    {
+        return Err(invalid("attention bias contains NaN or positive infinity"));
+    }
+    Ok(())
 }
 
 /// A contiguous range along one axis; end is exclusive, no negative indexing.
