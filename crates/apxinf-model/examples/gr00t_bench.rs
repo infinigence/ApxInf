@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         attention_mask: Some(&fixture.attention_mask),
         image_grid_thw: Some(&fixture.grid),
         embodiment_id: Some(fixture.embodiment_id),
+        planning: None,
     };
     let request = VlaRequest::provided_with_metadata(&observation, &fixture.noise, metadata);
 

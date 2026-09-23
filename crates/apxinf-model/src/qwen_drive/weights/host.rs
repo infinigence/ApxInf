@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use apxinf_core::{Error, Result, Tensor};
 
-use super::config::QwenDriveConfig;
+use super::super::config::QwenDriveConfig;
 
 /// VLM (Qwen3.5) weights, keyed by their checkpoint names.
 pub struct QwenDriveVlmWeights {
@@ -110,7 +110,8 @@ impl QwenDriveVlmWeights {
         if visual.is_empty() {
             return Err(Error::Other(
                 "qwen_drive weights: no model.visual.* tensors found; the vision \
-                 tower is required for VQA and planning scene encoding".into(),
+                 tower is required for planning scene encoding"
+                    .into(),
             ));
         }
         Ok(Self { language, visual })
@@ -195,14 +196,16 @@ fn take_mlp(map: &mut HashMap<String, Tensor>, prefix: &str) -> Result<ExpertMlp
     // Reference `_mlp` = nn.Sequential(Linear, SiLU, Linear), i.e. `.0` and `.2`.
     let (fc1_w, fc1_b) = take_linear(map, &format!("{prefix}.0"))?;
     let (fc2_w, fc2_b) = take_linear(map, &format!("{prefix}.2"))?;
-    Ok(ExpertMlp { fc1_w, fc1_b, fc2_w, fc2_b })
+    Ok(ExpertMlp {
+        fc1_w,
+        fc1_b,
+        fc2_w,
+        fc2_b,
+    })
 }
 
 impl QwenDriveExpertWeights {
-    pub fn from_map(
-        config: &QwenDriveConfig,
-        tensors: &HashMap<String, Tensor>,
-    ) -> Result<Self> {
+    pub fn from_map(config: &QwenDriveConfig, tensors: &HashMap<String, Tensor>) -> Result<Self> {
         // Strip the optional `planning_expert.` prefix exactly like the
         // reference `load_planner`, cloning tensors (the planner head is 1.0B
         // parameters; the clone happens once at load, not on the hot path).
@@ -265,35 +268,111 @@ impl QwenDriveExpertWeights {
 
     /// Shape-level validation. Runs once at load; the first tuple element of
     /// every 2D weight is its input width after the load-time transpose.
-    pub fn validate(&self, config: &QwenDriveConfig, leftover: &HashMap<String, Tensor>) -> Result<()> {
+    pub fn validate(
+        &self,
+        config: &QwenDriveConfig,
+        leftover: &HashMap<String, Tensor>,
+    ) -> Result<()> {
         let expert = &config.expert;
         let hidden = expert.hidden_size;
         let heads_per_group = expert.n_heads / expert.n_kv_heads;
         let qkv_out = expert.n_kv_heads * (2 * heads_per_group + 2) * expert.head_dim;
         for (index, layer) in self.layers.iter().enumerate() {
-            expect_shape(&layer.qkv_w, &[hidden, qkv_out], &format!("layers.{index}.qkv_proj"))?;
-            expect_shape(&layer.o_w, &[expert.n_heads * expert.head_dim, hidden], &format!("layers.{index}.o_proj"))?;
-            expect_shape(&layer.gate_up_w, &[hidden, 2 * expert.intermediate_size], &format!("layers.{index}.gate_up_proj"))?;
-            expect_shape(&layer.down_w, &[expert.intermediate_size, hidden], &format!("layers.{index}.down_proj"))?;
-            expect_shape(&layer.modulation_w, &[hidden, 6 * hidden], &format!("layers.{index}.adaln_modulation"))?;
-            expect_shape(&layer.q_norm, &[expert.head_dim], &format!("layers.{index}.q_norm"))?;
-            expect_shape(&layer.k_norm, &[expert.head_dim], &format!("layers.{index}.k_norm"))?;
+            expect_shape(
+                &layer.qkv_w,
+                &[hidden, qkv_out],
+                &format!("layers.{index}.qkv_proj"),
+            )?;
+            expect_shape(
+                &layer.o_w,
+                &[expert.n_heads * expert.head_dim, hidden],
+                &format!("layers.{index}.o_proj"),
+            )?;
+            expect_shape(
+                &layer.gate_up_w,
+                &[hidden, 2 * expert.intermediate_size],
+                &format!("layers.{index}.gate_up_proj"),
+            )?;
+            expect_shape(
+                &layer.down_w,
+                &[expert.intermediate_size, hidden],
+                &format!("layers.{index}.down_proj"),
+            )?;
+            expect_shape(
+                &layer.modulation_w,
+                &[hidden, 6 * hidden],
+                &format!("layers.{index}.adaln_modulation"),
+            )?;
+            expect_shape(
+                &layer.q_norm,
+                &[expert.head_dim],
+                &format!("layers.{index}.q_norm"),
+            )?;
+            expect_shape(
+                &layer.k_norm,
+                &[expert.head_dim],
+                &format!("layers.{index}.k_norm"),
+            )?;
         }
-        expect_shape(&self.trajectory_proj_w, &[config.trajectory_point_dim, hidden], "trajectory_proj")?;
-        expect_shape(&self.waypoint_embed, &[config.num_future_points, hidden], "waypoint_embed")?;
-        expect_shape(&self.out_proj_w, &[hidden, config.trajectory_point_dim], "out_proj")?;
+        expect_shape(
+            &self.trajectory_proj_w,
+            &[config.trajectory_point_dim, hidden],
+            "trajectory_proj",
+        )?;
+        expect_shape(
+            &self.waypoint_embed,
+            &[config.num_future_points, hidden],
+            "waypoint_embed",
+        )?;
+        expect_shape(
+            &self.out_proj_w,
+            &[hidden, config.trajectory_point_dim],
+            "out_proj",
+        )?;
         let history_dim = (config.num_history_points - 1) * config.trajectory_point_dim
             + expert.nav_command_classes;
-        expect_shape(&self.history_encoder.fc1_w, &[history_dim, hidden], "history_encoder.0")?;
+        expect_shape(
+            &self.history_encoder.fc1_w,
+            &[history_dim, hidden],
+            "history_encoder.0",
+        )?;
         let dynamics_dim = config.num_history_points * expert.history_dynamics_dim;
-        expect_shape(&self.history_velocity_encoder.fc1_w, &[dynamics_dim, hidden], "history_velocity_encoder.0")?;
-        expect_shape(&self.history_acceleration_encoder.fc1_w, &[dynamics_dim, hidden], "history_acceleration_encoder.0")?;
-        expect_shape(&self.query_fusion.fc1_w, &[7 * hidden, hidden], "query_fusion.0")?;
-        expect_shape(&self.time_mlp.fc1_w, &[expert.time_embed_dim, hidden], "time_mlp.0")?;
-        expect_shape(&self.nav_mlp.fc1_w, &[expert.nav_command_classes, hidden], "nav_mlp.0")?;
-        expect_shape(&self.ego_mlp.fc1_w, &[expert.ego_status_dim, hidden], "ego_mlp.0")?;
+        expect_shape(
+            &self.history_velocity_encoder.fc1_w,
+            &[dynamics_dim, hidden],
+            "history_velocity_encoder.0",
+        )?;
+        expect_shape(
+            &self.history_acceleration_encoder.fc1_w,
+            &[dynamics_dim, hidden],
+            "history_acceleration_encoder.0",
+        )?;
+        expect_shape(
+            &self.query_fusion.fc1_w,
+            &[7 * hidden, hidden],
+            "query_fusion.0",
+        )?;
+        expect_shape(
+            &self.time_mlp.fc1_w,
+            &[expert.time_embed_dim, hidden],
+            "time_mlp.0",
+        )?;
+        expect_shape(
+            &self.nav_mlp.fc1_w,
+            &[expert.nav_command_classes, hidden],
+            "nav_mlp.0",
+        )?;
+        expect_shape(
+            &self.ego_mlp.fc1_w,
+            &[expert.ego_status_dim, hidden],
+            "ego_mlp.0",
+        )?;
         let fourier_in = config.trajectory_point_dim * expert.fourier_num_features * 2;
-        expect_shape(&self.fourier_encoder.fc1_w, &[fourier_in, hidden], "fourier_encoder.net.0")?;
+        expect_shape(
+            &self.fourier_encoder.fc1_w,
+            &[fourier_in, hidden],
+            "fourier_encoder.net.0",
+        )?;
         if !leftover.is_empty() {
             let mut names: Vec<&String> = leftover.keys().collect();
             names.sort_unstable();
@@ -392,7 +471,10 @@ mod tests {
     #[test]
     fn vlm_weights_reject_expert_head_maps() {
         let mut map = HashMap::new();
-        map.insert("planning_expert.layers.0.qkv_proj.weight".to_string(), tensor(4, 4, 0.0));
+        map.insert(
+            "planning_expert.layers.0.qkv_proj.weight".to_string(),
+            tensor(4, 4, 0.0),
+        );
         let err = QwenDriveVlmWeights::from_map(map).err().unwrap();
         assert!(format!("{err}").contains("planning-expert"));
     }
@@ -420,23 +502,49 @@ mod tests {
         let qkv_out = config.expert.n_kv_heads * (2 * heads_per_group + 2) * config.expert.head_dim;
         for index in 0..config.expert.n_layers {
             let p = format!("planning_expert.layers.{index}");
-            map.insert(format!("{p}.input_layernorm.weight"), tensor(1, hidden, 1.0));
+            map.insert(
+                format!("{p}.input_layernorm.weight"),
+                tensor(1, hidden, 1.0),
+            );
             map.insert(format!("{p}.qkv_proj.weight"), tensor(qkv_out, hidden, 0.0));
             // RMSNorm weights are 1D `[head_dim]` in the real checkpoint.
             map.insert(
                 format!("{p}.q_norm.weight"),
-                Tensor::from_f32(vec![config.expert.head_dim], &vec![1.0; config.expert.head_dim]).unwrap(),
+                Tensor::from_f32(
+                    vec![config.expert.head_dim],
+                    &vec![1.0; config.expert.head_dim],
+                )
+                .unwrap(),
             );
             map.insert(
                 format!("{p}.k_norm.weight"),
-                Tensor::from_f32(vec![config.expert.head_dim], &vec![1.0; config.expert.head_dim]).unwrap(),
+                Tensor::from_f32(
+                    vec![config.expert.head_dim],
+                    &vec![1.0; config.expert.head_dim],
+                )
+                .unwrap(),
             );
-            map.insert(format!("{p}.o_proj.weight"), tensor(hidden, config.expert.n_heads * config.expert.head_dim, 0.0));
-            map.insert(format!("{p}.post_attention_layernorm.weight"), tensor(1, hidden, 1.0));
-            map.insert(format!("{p}.gate_up_proj.weight"), tensor(2 * inter, hidden, 0.0));
+            map.insert(
+                format!("{p}.o_proj.weight"),
+                tensor(hidden, config.expert.n_heads * config.expert.head_dim, 0.0),
+            );
+            map.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                tensor(1, hidden, 1.0),
+            );
+            map.insert(
+                format!("{p}.gate_up_proj.weight"),
+                tensor(2 * inter, hidden, 0.0),
+            );
             map.insert(format!("{p}.down_proj.weight"), tensor(hidden, inter, 0.0));
-            map.insert(format!("{p}.adaln_modulation.1.weight"), tensor(6 * hidden, hidden, 0.0));
-            map.insert(format!("{p}.adaln_modulation.1.bias"), tensor(1, 6 * hidden, 0.0));
+            map.insert(
+                format!("{p}.adaln_modulation.1.weight"),
+                tensor(6 * hidden, hidden, 0.0),
+            );
+            map.insert(
+                format!("{p}.adaln_modulation.1.bias"),
+                tensor(1, 6 * hidden, 0.0),
+            );
         }
         let mlp = |map: &mut HashMap<String, Tensor>, prefix: &str, input: usize| {
             map.insert(format!("{prefix}.0.weight"), tensor(hidden, input, 0.0));
@@ -446,27 +554,68 @@ mod tests {
         };
         let fourier_in = config.trajectory_point_dim * config.expert.fourier_num_features * 2;
         mlp(&mut map, "planning_expert.fourier_encoder.net", fourier_in);
-        mlp(&mut map, "planning_expert.time_mlp", config.expert.time_embed_dim);
-        mlp(&mut map, "planning_expert.nav_mlp", config.expert.nav_command_classes);
-        mlp(&mut map, "planning_expert.ego_mlp", config.expert.ego_status_dim);
+        mlp(
+            &mut map,
+            "planning_expert.time_mlp",
+            config.expert.time_embed_dim,
+        );
+        mlp(
+            &mut map,
+            "planning_expert.nav_mlp",
+            config.expert.nav_command_classes,
+        );
+        mlp(
+            &mut map,
+            "planning_expert.ego_mlp",
+            config.expert.ego_status_dim,
+        );
         let history_dim = (config.num_history_points - 1) * config.trajectory_point_dim
             + config.expert.nav_command_classes;
         mlp(&mut map, "planning_expert.history_encoder", history_dim);
         let dynamics_dim = config.num_history_points * config.expert.history_dynamics_dim;
-        mlp(&mut map, "planning_expert.history_velocity_encoder", dynamics_dim);
-        mlp(&mut map, "planning_expert.history_acceleration_encoder", dynamics_dim);
+        mlp(
+            &mut map,
+            "planning_expert.history_velocity_encoder",
+            dynamics_dim,
+        );
+        mlp(
+            &mut map,
+            "planning_expert.history_acceleration_encoder",
+            dynamics_dim,
+        );
         mlp(&mut map, "planning_expert.query_fusion", 7 * hidden);
-        map.insert("planning_expert.trajectory_proj.weight".to_string(), tensor(hidden, config.trajectory_point_dim, 0.0));
-        map.insert("planning_expert.trajectory_proj.bias".to_string(), tensor(1, hidden, 0.0));
-        map.insert("planning_expert.waypoint_embed.weight".to_string(), tensor(config.num_future_points, hidden, 0.0));
-        map.insert("planning_expert.final_layernorm.weight".to_string(), tensor(1, hidden, 1.0));
-        map.insert("planning_expert.out_proj.weight".to_string(), tensor(config.trajectory_point_dim, hidden, 0.0));
-        map.insert("planning_expert.out_proj.bias".to_string(), tensor(1, config.trajectory_point_dim, 0.0));
+        map.insert(
+            "planning_expert.trajectory_proj.weight".to_string(),
+            tensor(hidden, config.trajectory_point_dim, 0.0),
+        );
+        map.insert(
+            "planning_expert.trajectory_proj.bias".to_string(),
+            tensor(1, hidden, 0.0),
+        );
+        map.insert(
+            "planning_expert.waypoint_embed.weight".to_string(),
+            tensor(config.num_future_points, hidden, 0.0),
+        );
+        map.insert(
+            "planning_expert.final_layernorm.weight".to_string(),
+            tensor(1, hidden, 1.0),
+        );
+        map.insert(
+            "planning_expert.out_proj.weight".to_string(),
+            tensor(config.trajectory_point_dim, hidden, 0.0),
+        );
+        map.insert(
+            "planning_expert.out_proj.bias".to_string(),
+            tensor(1, config.trajectory_point_dim, 0.0),
+        );
 
         let weights = QwenDriveExpertWeights::from_map(&config, &map).unwrap();
         assert_eq!(weights.layers.len(), config.expert.n_layers);
         assert_eq!(weights.layers[0].qkv_w.shape().dims(), &[hidden, qkv_out]);
-        assert_eq!(weights.query_fusion.fc1_w.shape().dims(), &[7 * hidden, hidden]);
+        assert_eq!(
+            weights.query_fusion.fc1_w.shape().dims(),
+            &[7 * hidden, hidden]
+        );
         assert_eq!(weights.waypoint_embed.dtype(), DType::F32);
     }
 }

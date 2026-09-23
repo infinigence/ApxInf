@@ -1681,6 +1681,35 @@ pub fn cutlass_fp8_gemm_f16(
     Ok(status == 0)
 }
 
+#[cfg(apxinf_cutlass_gemm)]
+#[allow(clippy::too_many_arguments)]
+pub fn cutlass_fp8_gemm_bf16(
+    ctx: &CudaContext,
+    activation: &CudaBuffer,
+    weight: &CudaBuffer,
+    output: &CudaBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    tactic: i32,
+) -> Result<bool> {
+    let status = unsafe {
+        ffi::apxinf_static_cutlass_fp8_gemm_bf16(
+            activation.ptr(),
+            weight.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            tactic,
+            ctx.stream().handle(),
+        )
+    };
+    Ok(status == 0)
+}
+
 pub fn prepare_cublaslt_fp8_gemm(m: usize, n: usize, k: usize) -> Result<()> {
     let status = unsafe { ffi::apxinf_static_prepare_fp8_gemm_f16(m as i32, n as i32, k as i32) };
     ffi::check_cublas(status).map_err(Error::Cuda)
@@ -1717,6 +1746,33 @@ fn launch_tactic_fp8_bf16(
     alpha: f32,
     tactic: TacticId,
 ) -> Result<()> {
+    if tactic.backend == TacticBackend::Cutlass {
+        #[cfg(apxinf_cutlass_gemm)]
+        {
+            return cutlass_fp8_gemm_bf16(
+                ctx,
+                activation,
+                weight,
+                output,
+                key.m,
+                key.n,
+                key.k,
+                alpha,
+                tactic.value,
+            )?
+            .then_some(())
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "CUTLASS tactic {} rejected [{},{},{}]",
+                    tactic.value, key.m, key.n, key.k
+                ))
+            });
+        }
+        #[cfg(not(apxinf_cutlass_gemm))]
+        return Err(Error::Other(
+            "CUTLASS FP8-to-BF16 autotune requires an SM100-family build".into(),
+        ));
+    }
     if !matches!(
         tactic.backend,
         TacticBackend::Vendor | TacticBackend::CublasLt
@@ -1911,30 +1967,41 @@ pub fn gemm_fp8_bf16(
     let (m, k, n) = (a[0], a[1], b[1]);
     let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let alpha = activation_scale * weight.scale;
     let key = bf16_output_tuning_key(ctx, m, n, k);
-    resolve_fp8_bf16_plan(
+    let plan = resolve_fp8_bf16_plan(ctx, &key, &activation, &weight_buffer, alpha)?;
+    let selected_tactic = plan.tactic;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+    let selected_result = launch_tactic_fp8_bf16(
         ctx,
         &key,
         &activation,
         &weight_buffer,
-        activation_scale * weight.scale,
-    )?;
-    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
-    let scratch = fp8_weight_scratch(ctx, n, k)?;
-    let status = unsafe {
-        ffi::apxinf_static_fp8_gemm_bf16(
-            activation.ptr(),
-            weight_buffer.ptr(),
-            output.ptr(),
-            m as i32,
-            n as i32,
-            k as i32,
-            activation_scale * weight.scale,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
-            ctx.stream().handle(),
-        )
-    };
-    ffi::check_cublas(status).map_err(Error::Cuda)?;
+        &output,
+        alpha,
+        selected_tactic,
+    );
+    if let Err(error) = selected_result {
+        if selected_tactic.backend == TacticBackend::Vendor {
+            return Err(error);
+        }
+        eprintln!(
+            "[apxinf] FP8-to-BF16 tactic {selected_tactic:?} failed for {key:?}: {error}; using vendor fallback"
+        );
+        ctx.gemm_plans().fallback(ctx, &key)?;
+        launch_tactic_fp8_bf16(
+            ctx,
+            &key,
+            &activation,
+            &weight_buffer,
+            &output,
+            alpha,
+            TacticId {
+                backend: TacticBackend::Vendor,
+                value: 0,
+            },
+        )?;
+    }
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 

@@ -220,10 +220,22 @@ impl CudaBuffer {
     /// Allocate and zero-fill, outside any stream.
     pub fn alloc_zeros(num_bytes: usize, device: usize) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;
-        unsafe {
-            ffi::check_cuda(ffi::cudaMemset(buf.ptr, 0, num_bytes))?;
-        }
+        buf.zero()?;
         Ok(buf)
+    }
+
+    /// Zero this buffer in place, preserving its allocation and shared aliases.
+    ///
+    /// Selects the owning device and uses CUDA's default-stream memset semantics.
+    /// Callers must order accesses on non-blocking streams explicitly.
+    pub fn zero(&self) -> Result<(), String> {
+        // SAFETY: owner keeps the allocation alive, and len bounds this buffer's
+        // valid storage. Select its device before submitting the memset.
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(self.device as i32))?;
+            ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len))?;
+        }
+        Ok(())
     }
 
     /// Allocate and zero-fill on `ctx`'s stream.

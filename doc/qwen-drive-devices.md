@@ -5,9 +5,10 @@ Thor (sm_110) and the RTX 4090 (sm_89). This is what to know before changing
 anything that behaves differently on one of them: where each kind of
 per-device decision belongs, and what the constants currently are.
 
-The Rust text registry loads only the VLM. An adjacent `planner-sft` directory
-does not enable planning through `LlmTrait`; the planning-capable model/Python
-policy must explicitly request its planner checkpoint. Projection layout is
+Planning loads through the shared `AutoModel` registry as a CUDA VLA runtime and
+the planner checkpoint is required; see
+[Qwen-Drive planning runtime](qwen-drive-planning.md) for the loading, request
+and validation contract. Projection layout is
 selected once during model construction and retained with the device weights,
 so weight packing and execution use the same physical representation.
 
@@ -20,8 +21,15 @@ scene is three camera views (front, front-left, front-right) of four frames at
 acceleration, and the driving and navigation commands. The four differ in ego
 state: stationary, just-braked, 2.67 m/s, 6.99 m/s.
 
-`control/verify_perf_orin.py` runs it; `control/verify_gpu_orin.py` is the
-four-mode correctness gate over the same inputs.
+This workload was recorded against the VQA generation path, which the
+planning-only runtime no longer exposes. The constants below are kernel-level
+and still apply — reasoning planning drives the same GDN and attention kernels —
+but reproducing these exact numbers now needs an equivalent token budget through
+`mode="reasoning_planning"` rather than the VQA entry point.
+
+The probe that runs it, and the four-mode correctness gate over the same inputs,
+are private workflow artifacts under `devlocal/qwen-drive/` per `AGENTS.md`;
+they are not part of the maintained tree.
 
 ## Where the per-device decisions live
 
@@ -58,8 +66,8 @@ subdirectory is named by the same truncation the loader compares, so a store
 found under it is one this toolkit can use in full. Nothing relocates: a board
 running the toolkit its store was recorded on resolves to exactly the file it
 resolved to before. A second toolkit now writes beside the first rather than
-over it. See `doc/jetson-roofline.md` for what regenerating is worth — 12.6% on
-Orin, 0.05% on Thor after the accuracy filter, nothing at all on the 4090.
+over it. Regenerating a store is worth 12.6% on Orin, 0.05% on Thor after the
+accuracy filter, and nothing at all on the 4090.
 
 ## What the constants actually are
 
@@ -96,10 +104,10 @@ ULPs 0.0403 and 0.0806, so it flips on changes that move nothing:
 1. `cargo test -p apxinf-cuda gdn_ -- --nocapture` runs the fp64 operator
    oracles for the GDN kernels and the bit-exactness test for the value split.
    A kernel change that claims to preserve the arithmetic has to say so here.
-2. `control/precision_probe.py` reports token agreement and error
-   distributions over every scene of every runnable mode, which move
+2. The precision probe under `devlocal/qwen-drive/` reports token agreement and
+   error distributions over every scene of every runnable mode, which move
    continuously where the gate does not.
-3. `control/verify_perf_orin.py` for speed, always as alternating A/B rounds on
+3. The Orin performance probe for speed, always as alternating A/B rounds on
    one machine.
 
 A recorded store belongs to the toolkit that measured it, so it is committed

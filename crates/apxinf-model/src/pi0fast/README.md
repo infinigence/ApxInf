@@ -9,8 +9,8 @@ time, and a FAST tokenizer turns them back into a continuous action chunk.
 The two families are deliberately independent. This module carries its own
 architecture code, config parser, weight loader and executors, and reaches the
 accelerator only through model-neutral kernels; nothing here is shared with
-`pi05`/`walloss` except those kernels. Because the whole model is validated in
-BF16, that is the only precision this module implements.
+`pi05`/`walloss` except those kernels. Decode runs in native BF16, or in FP8
+E4M3 with `precision="fp8"`; see [Precisions](#precisions).
 
 ## Checkpoint
 
@@ -24,6 +24,7 @@ checkpoint's own `config.json`:
 | images | 224x224, patch 14 -> 256 patches per view |
 | views | 2 real + 1 padded (`empty_cameras: 1`) -> 512 patch tokens |
 | vocabulary | 257152, with `fast_skip_tokens: 128` reserved for FAST ids |
+| LM head | tied token embedding, pruned to 2112 of 257152 columns (see below) |
 | actions | 7-dim, chunk 10, `max_action_tokens: 256` |
 
 The third camera is padding, not a sensor. LeRobot appends an all-`-1` view with
@@ -65,6 +66,16 @@ instead of 0.86 s. The whole traversal runs inside one persistent
 `GraphWorkspace` (bump arena) sized from the config and reused across calls, so
 no operator allocates: this is what took `cudaMalloc`/`cudaFree` per call from
 ~6051 pairs to ~25.
+
+## Precisions
+
+`precision="bf16"` is the default, and what `auto` resolves to. `precision="fp8"`
+runs every projection as E4M3 with per-tensor weight scales and per-site measured
+activation scales from a calibration profile. An autoregressive argmax decoder has
+no error budget to spend on a guessed scale, so FP8 **requires** a profile
+(`<model-dir>/calibration.json`, or an explicit `calibration=`) and refuses to
+load without one; `APXINF_PI0FAST_FP8_ACTIVATION_SCALE` overrides that for
+bring-up and prints a warning. See `doc/pi0fast-fp8-calibration.md`.
 
 ## Accuracy: LIBERO-10
 
@@ -109,6 +120,21 @@ Two caveats on reading this table:
   99.99% of elements scored 3/10 on the same protocol. The gate is much sharper
   than its apparent statistical power.
 
+### Jetson AGX Thor
+
+Same protocol on Thor (sm_110, 20 SMs), one trial per task, seed 7:
+
+| precision | LIBERO-10 | mean model time per call |
+|---|---|---|
+| BF16 | 6/10 | 504 ms |
+| FP8 E4M3, calibrated | 4/10 | 313 ms |
+
+FP8 **without** a profile scored 0/6 before that run was abandoned: the decode
+never emits its `|` terminator, so every rollout spends the full step budget on
+tokens the policy throws away. The calibrated profile recovers the terminating
+stream but not the last two tasks, so treat FP8 as a speed path with its own
+accuracy budget rather than as a drop-in for BF16.
+
 ## Latency
 
 Orin AGX 64GB (sm87), BF16, 2 views / 512 patch tokens, 20 held-out LIBERO
@@ -130,6 +156,22 @@ therefore runs at ~156 GB/s, inside the 141-165 GB/s this board sustains on a
 pure streaming read: the decode step is at the memory roofline. `nsys` already
 shows 97.9% GPU busy, so no launch overhead remains to remove, and the only
 headroom left is reading *fewer* bytes.
+
+### Jetson AGX Thor
+
+Thor (sm_110, 20 SMs), the shipped `configs/tuning/nvidia/thor-sm110/tactics.json`,
+pruned LM head. Step numbers are a least-squares fit from
+`devlocal/pi0-fast/scripts/step_sweep.py` (2 frames x 3 repeats, terminator forced
+through the binding, `r2 = 1.0000`); the call numbers are
+`bench_pi0_fast.py --mode latency` over 10 synthetic frames at the full
+256-token budget, and the same policy inside a LIBERO-10 rollout.
+
+| | BF16 | FP8 E4M3 |
+|---|---|---|
+| prefix (vision tower + prefill + first argmax) | 38.1 ms | 34.7 ms |
+| per autoregressive token | **18.7 ms** | **10.6 ms** |
+| full 256-token call, L1 p50 | 4860 ms | 3071 ms |
+| LIBERO-10 rollout, mean model time per call | 504 ms | 313 ms |
 
 ## The decode GEMV: tuned cuBLASLt tactics
 
@@ -182,17 +224,27 @@ kernel replaced every projection including `o_proj`, while this change leaves
 `devlocal/pi0-fast/reports/18-decode-gemv-dispatch.md` and
 `20-spatial-and-gemv3-accuracy.md`.
 
-## Next step: the LM head
+## The pruned LM head
 
-The LM head is the largest untuned read left in a decode step: 1.05 GB of the
-5.01 GB total (21%). It already runs at 178 GB/s, so the win has to come from
-reading *less*. Production only needs the argmax, and FAST action ids occupy a
-narrow band of the 257152-entry vocabulary; restricting the candidates is a pure
-subset operation that changes no already-computed value, so unlike the tactics
-above it can in principle be exact. The obstacle is that the reference does a
-plain **unmasked** argmax and observed token streams contain ids outside a single
-contiguous FAST band, so this needs a proof about which ids are reachable - a
-measurement is not enough.
+The head is the largest read in a decode step (1.05 GB of 5.01 GB in BF16, 21%)
+and only its argmax matters, so it keeps the columns the decode can emit
+(`Pi0FastConfig::action_head_columns()`): the 2048-wide action window at the tail
+of the vocabulary, plus `action_head_extra_tokens` - `"Action: "` (4022, 235292,
+235248) and the `"|"` terminator (235371). The extras are not optional: they are
+nowhere near the tail, so a tail-only window would change the first three steps
+and make the stop condition unreachable. That is 2112 of 257152 columns, padded
+to a multiple of 64 because cuBLASLt rejects an unaligned E4M3 leading dimension;
+the padding repeats the last column and remaps to the same id.
+
+The argmax writes `remap[argmax]`, so the decode loop, the tied embedding lookup
+and `stop_token` all keep speaking global token ids. The pruned head is the
+full-vocabulary argmax restricted to the retained set, which makes it identical
+whenever the unpruned winner is in that set - a property of the FAST protocol
+rather than of the arithmetic. Widen `action_head_extra_tokens` (or
+`action_vocab_size`) if a deployment ever emits an id outside it.
+
+The head read drops from 1.05 GB to 8.6 MB per step in BF16, and from 526 MB to
+4.3 MB in FP8.
 
 ## Reproducing
 
@@ -202,6 +254,15 @@ MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
   --model-dir <checkpoint> --precision bf16 \
   --action-dim 7 --suite libero_10 --trials-per-task 1 \
   --results-jsonl out/libero_10.jsonl --summary-json out/libero_10.summary.json
+
+# FP8: calibrate on the same suite first. The profile lands in
+# <checkpoint>/calibration.json and the evaluator picks it up by itself.
+MUJOCO_GL=egl python scripts/calibrate_pi0fast.py \
+  --model-dir <checkpoint> --libero-suite libero_10
+MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
+  --model-dir <checkpoint> --precision fp8 \
+  --action-dim 7 --suite libero_10 --trials-per-task 1 \
+  --results-jsonl out/libero_10_fp8.jsonl --summary-json out/libero_10_fp8.summary.json
 
 # latency, and the fixed / per-step split
 python scripts/bench_pi0_fast.py --model-dir <checkpoint> \
@@ -220,3 +281,7 @@ that compatibility domain and are not portable between Orin and, say, RTX 4090.
 A new board stays on the cuBLAS default until it runs its own autotune
 (`Model.load(..., tactics=<db>, autotune=True)`, or
 `devlocal/pi0-fast/scripts/autotune_decode_gemv.py --phase tune`).
+
+The FP8-to-BF16 projections have their own records (`op=fp8_bf16`) in the same
+database and likewise ship only a Thor entry: on another board FP8 keeps the
+cuBLASLt default until that board runs its own autotune.

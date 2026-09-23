@@ -2373,6 +2373,9 @@ fn cutlass_vision_qkv_tactics_match_cublaslt() {
 
     let run = |tactic: Option<i32>| {
         let output = CudaBuffer::alloc_zeros(M * N * 2, backend.device_id()).unwrap();
+        // The legacy cuBLASLt TN route stages KN weights on this stream.
+        // Keep its scratch alive until the synchronization below.
+        let weight_scratch = crate::workspace::output_buffer(backend.context(), K * N).unwrap();
         let status = unsafe {
             match tactic {
                 Some(tactic) => ffi::apxinf_static_cutlass_fp8_gemm_f16(
@@ -2394,6 +2397,7 @@ fn cutlass_vision_qkv_tactics_match_cublaslt() {
                     N as i32,
                     K as i32,
                     activation_scale * weight_scale,
+                    weight_scratch.ptr(),
                     backend.context().stream().handle(),
                 ),
             }

@@ -14,12 +14,15 @@
 //! The runtime returns the raw action tokens. FAST detokenization (BPE + DCT)
 //! is action postprocessing and belongs to the Python policy layer.
 
+use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{Backend, Error, Result, Tensor};
 use kernels::{cache, elementwise, embedding, gemm, norm, sampling, GraphWorkspace};
 
+use super::calibration::Pi0FastCalibrationObserver;
 use super::{
     language_layer_bf16, language_layer_cached_decode_bf16, vision_layer_bf16,
     vision_patch_embed_f32_bf16, Pi0FastConfig, StaticBf16Pi0FastWeights,
@@ -94,7 +97,7 @@ fn arena_bytes(config: &Pi0FastConfig, token_count: usize) -> usize {
 
     // Autoregressive steps: one token through every layer, plus lm_head logits.
     let per_step = config.language.depth * 7 * lw * BF16 + config.language.depth * 3 * lmlp * BF16;
-    add(config.max_action_tokens * (per_step + config.vocab_size * BF16));
+    add(config.max_action_tokens * (per_step + config.action_head_width() * BF16));
 
     total + (total / 4)
 }
@@ -103,6 +106,9 @@ pub struct Pi0FastBf16Runtime {
     backend: Arc<RuntimeBackend>,
     config: Arc<Pi0FastConfig>,
     weights: Arc<StaticBf16Pi0FastWeights>,
+    /// Maps the pruned LM-head columns back to global token ids; see
+    /// [`super::action_head_remap`].
+    lm_head_remap: CudaBuffer,
     /// Persistent arena for the per-call intermediates. Without it every
     /// intermediate is a raw `cudaMalloc`/`cudaFree` pair.
     arena: Mutex<Option<GraphWorkspace>>,
@@ -122,10 +128,12 @@ impl Pi0FastBf16Runtime {
                 "π0-FAST BF16 device weight depth mismatch".into(),
             ));
         }
+        let lm_head_remap = super::action_head_remap(&config, backend.context())?;
         Ok(Self {
             backend,
             config,
             weights,
+            lm_head_remap,
             arena: Mutex::new(None),
         })
     }
@@ -228,6 +236,32 @@ impl Pi0FastBf16Runtime {
         })
     }
 
+    /// One complete inference with every BF16 projection input recorded.
+    ///
+    /// The captured distribution is the deployment one on purpose: the same
+    /// prefill, the same autoregressive steps, and (when the caller passes the
+    /// FAST terminator) the same stopping point the policy will use — not a
+    /// single-forward approximation that would miss the decode-time activations
+    /// the FP8 runtime actually quantizes.
+    pub fn calibrate(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        let observer = Rc::new(Pi0FastCalibrationObserver::new(
+            Arc::clone(&self.backend),
+            &self.config,
+            &self.weights,
+        )?);
+        let _guard =
+            kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _ = self.infer(patches, token_ids, token_count, stop_token)?;
+        self.backend.synchronize()?;
+        observer.records()
+    }
+
     /// One full traversal. The caller has already bound the arena.
     fn infer_arena(
         &self,
@@ -268,7 +302,12 @@ impl Pi0FastBf16Runtime {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_into(self.ctx(), &logits, &slot)?;
+            sampling::argmax_bf16_remapped_into(
+                self.ctx(),
+                &logits,
+                &self.lm_head_remap,
+                &slot,
+            )?;
             if let Some(stop) = stop_token {
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;

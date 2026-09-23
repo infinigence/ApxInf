@@ -26,8 +26,6 @@
 //! requires the `cuda` feature and a CUDA machine; without it the module still
 //! imports and reports shape contracts, but model loading errors.
 //!
-//! [`QwenDriveModel`] is the Qwen-Drive surface: VQA generation plus the two
-//! planning flows (direct and reasoning) against the native CUDA executor.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -46,8 +44,6 @@ use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
     SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
-#[cfg(feature = "cuda")]
-use apxinf_model::qwen_drive::ExpertConditioning;
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
 /// Hugging Face `tokenizer.json` runtime backed by the Rust `tokenizers` crate.
@@ -195,7 +191,7 @@ struct PreprocessedVlaInput {
     latent: Tensor,
     attention_mask: Vec<u8>,
     image_grid_thw: Vec<[u32; 3]>,
-    embodiment_id: usize,
+    embodiment_id: Option<usize>,
 }
 
 impl ModelRunner {
@@ -316,7 +312,7 @@ impl ModelRunner {
         token_ids: PyReadonlyArray1<'py, u32>,
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
-        embodiment_id: usize,
+        embodiment_id: Option<usize>,
         noise: PyReadonlyArrayDyn<'py, f32>,
     ) -> PyResult<PreprocessedVlaInput> {
         let pixels_shape = pixel_values.shape();
@@ -731,6 +727,8 @@ impl ModelRunner {
         state,
         embodiment_id,
         noise,
+        *, num_steps=None, max_new_tokens=None, min_new_tokens=0,
+        terminator_ids=None, closing_ids=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn infer_preprocessed<'py>(
@@ -741,8 +739,13 @@ impl ModelRunner {
         token_ids: PyReadonlyArray1<'py, u32>,
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
-        embodiment_id: usize,
+        embodiment_id: Option<usize>,
         noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let input = self.preprocessed_vla_input(
             "_infer_preprocessed",
@@ -754,10 +757,35 @@ impl ModelRunner {
             embodiment_id,
             noise,
         )?;
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+        };
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
             image_grid_thw: Some(&input.image_grid_thw),
-            embodiment_id: Some(input.embodiment_id),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some() || options.reasoning.is_some())
+                .then_some(&options),
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -795,13 +823,14 @@ impl ModelRunner {
             token_ids,
             attention_mask,
             state,
-            embodiment_id,
+            Some(embodiment_id),
             noise,
         )?;
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
             image_grid_thw: Some(&input.image_grid_thw),
-            embodiment_id: Some(input.embodiment_id),
+            embodiment_id: input.embodiment_id,
+            planning: None,
         };
         self.model
             .calibration_amax(&VlaRequest::provided_with_metadata(
@@ -1005,7 +1034,10 @@ impl ModelRunner {
                 token_shape[1]
             )));
         }
-        let ids = values.into_iter().map(|value| value as u32).collect::<Vec<u32>>();
+        let ids = values
+            .into_iter()
+            .map(|value| value as u32)
+            .collect::<Vec<u32>>();
         Ok(Array1::from_vec(ids).into_pyarray_bound(py))
     }
 
@@ -1058,6 +1090,70 @@ impl ModelRunner {
     #[pyo3(name = "_calibration_plan")]
     fn calibration_plan(&self) -> PyResult<Vec<String>> {
         self.model.calibration_plan().map_err(runtime_err)
+    }
+
+    /// Internal native-BF16 activation probe used by ``scripts/calibrate_pi0fast.py``.
+    ///
+    /// π0-FAST has no latent to seed: the decode is a deterministic greedy
+    /// argmax, so the same Observation always produces the same activations.
+    /// ``stop_token`` ends the capture where inference would: a profile is only
+    /// valid for the activations deployment quantizes, and free-running past the
+    /// terminator records decode steps no rollout ever reaches.
+    #[pyo3(name = "_calibrate_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    fn calibrate_tokens_rgb(
+        &self,
+        rgb_u8: PyReadonlyArrayDyn<'_, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        stop_token: Option<u32>,
+    ) -> PyResult<BTreeMap<String, f32>> {
+        self.action_tokens.ok_or_else(|| {
+            PyValueError::new_err(
+                "apxinf_py._calibrate_tokens_rgb: loaded model does not produce \
+                 discrete action tokens (it is a continuous-action runtime)",
+            )
+        })?;
+        let contract = self.require_rgb_contract("_calibrate_tokens_rgb")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py._calibrate_tokens_rgb: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py._calibrate_tokens_rgb: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: None,
+        };
+        let unused_latent = Tensor::zeros(Shape::new(vec![1, 1]), DType::F32);
+        let request = VlaRequest::provided(&observation, &unused_latent);
+        self.model
+            .calibration_amax_stop(&request, stop_token)
+            .map_err(runtime_err)
     }
 
     /// Seeded L1 inference. This avoids creating or transferring a host noise
@@ -1190,264 +1286,9 @@ impl ModelRunner {
     }
 }
 
-// ── Qwen-Drive native model surface ────────────────────────────────────────
-
-#[cfg(feature = "cuda")]
-fn qwen_pixels_tensor(pixels: &PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
-    let shape = pixels.shape();
-    let data = pixels.as_slice().map_err(|_| {
-        PyValueError::new_err(
-            "apxinf_py.QwenDriveModel: pixel_values must be C-contiguous float32",
-        )
-    })?;
-    Tensor::from_f32(shape.to_vec(), data).map_err(runtime_err)
-}
-
-#[cfg(feature = "cuda")]
-fn qwen_vector(array: &PyReadonlyArray1<'_, f32>, name: &str) -> PyResult<Vec<f32>> {
-    Ok(array
-        .as_slice()
-        .map_err(|_| {
-            PyValueError::new_err(format!(
-                "apxinf_py.QwenDriveModel: {name} must be C-contiguous float32"
-            ))
-        })?
-        .to_vec())
-}
-
-#[cfg(feature = "cuda")]
-fn qwen_noise(
-    noise: &PyReadonlyArrayDyn<'_, f32>,
-    points: usize,
-    point_dim: usize,
-) -> PyResult<Vec<f32>> {
-    let data = noise.as_slice().map_err(|_| {
-        PyValueError::new_err("apxinf_py.QwenDriveModel: noise must be C-contiguous float32")
-    })?;
-    if data.len() != points * point_dim {
-        return Err(PyValueError::new_err(format!(
-            "apxinf_py.QwenDriveModel: noise has {} values, expected {} ({}x{})",
-            data.len(),
-            points * point_dim,
-            points,
-            point_dim
-        )));
-    }
-    Ok(data.to_vec())
-}
-
-#[cfg(feature = "cuda")]
-fn qwen_trajectory<'py>(py: Python<'py>, flat: Vec<f32>) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    if flat.len() != 150 {
-        return Err(PyRuntimeError::new_err(format!(
-            "apxinf_py.QwenDriveModel: model returned {} trajectory values, expected 150",
-            flat.len()
-        )));
-    }
-    if let Some(bad) = flat.iter().find(|value| !value.is_finite()) {
-        return Err(PyRuntimeError::new_err(format!(
-            "apxinf_py.QwenDriveModel: model produced non-finite trajectory value {bad}"
-        )));
-    }
-    let array = Array2::from_shape_vec((50, 3), flat).map_err(runtime_err)?;
-    Ok(array.into_pyarray_bound(py))
-}
-
-#[cfg(feature = "cuda")]
-fn qwen_conditioning(
-    history: &PyReadonlyArray1<'_, f32>,
-    history_velocity: &PyReadonlyArray1<'_, f32>,
-    history_acceleration: &PyReadonlyArray1<'_, f32>,
-    ego_status: &PyReadonlyArray1<'_, f32>,
-    nav_command: i64,
-) -> PyResult<ExpertConditioning> {
-    Ok(ExpertConditioning {
-        history: qwen_vector(history, "history")?,
-        history_velocity: qwen_vector(history_velocity, "history_velocity")?,
-        history_acceleration: qwen_vector(history_acceleration, "history_acceleration")?,
-        nav_command,
-        ego_status: qwen_vector(ego_status, "ego_status")?,
-    })
-}
-
-/// A loaded Qwen-Drive native model (Qwen3.5 VLM + optional planning expert).
-///
-/// VQA generation plus the direct/reasoning planning flows against the native
-/// CUDA executor. Tokenization and image preprocessing live in the Python
-/// policy layer; this class accepts canonical tensors.
-#[cfg(feature = "cuda")]
-#[pyclass(unsendable)]
-pub struct QwenDriveModel {
-    model: apxinf_model::qwen_drive::QwenDriveModel,
-    device: Device,
-}
-
-#[cfg(feature = "cuda")]
-#[pymethods]
-impl QwenDriveModel {
-    /// Load the VLM from `path` and optionally a planning-expert head from
-    /// `planner`. Precision is fixed to the checkpoint's native bf16.
-    #[staticmethod]
-    #[pyo3(signature = (path, planner=None, device="cuda:0", precision="bf16"))]
-    fn load(
-        path: PathBuf,
-        planner: Option<PathBuf>,
-        device: &str,
-        precision: &str,
-    ) -> PyResult<Self> {
-        if precision != "bf16" && precision != "auto" {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.QwenDriveModel.load: qwen_drive is bf16-native (got `{precision}`)"
-            )));
-        }
-        let device = parse_device(device)?;
-        let model = apxinf_model::qwen_drive::QwenDriveModel::load(
-            &path,
-            planner.as_deref(),
-            device,
-        )
-        .map_err(runtime_err)?;
-        Ok(Self { model, device })
-    }
-
-    /// VQA / free-form generation (greedy; the reference's top_k=1 sampling is
-    /// equivalent). Returns the generated token ids, terminator included.
-    #[pyo3(signature = (token_ids, pixel_values, grid_thw, max_new_tokens, min_new_tokens=0, eos_token_ids=None))]
-    fn generate_tokens(
-        &mut self,
-        token_ids: Vec<u32>,
-        pixel_values: PyReadonlyArray2<'_, f32>,
-        grid_thw: Vec<[u32; 3]>,
-        max_new_tokens: usize,
-        min_new_tokens: usize,
-        eos_token_ids: Option<Vec<u32>>,
-    ) -> PyResult<Vec<u32>> {
-        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
-        let eos = eos_token_ids.unwrap_or_else(|| vec![248044, 248045]);
-        self.model
-            .generate(
-                &token_ids,
-                Some((&pixel_tensor, &grid_thw)),
-                max_new_tokens,
-                min_new_tokens,
-                &eos,
-            )
-            .map_err(runtime_err)
-    }
-
-    /// Direct planning from a closed empty assistant turn. Returns the
-    /// normalized fp32 trajectory `[50, 3]` (the policy denormalizes).
-    #[pyo3(signature = (token_ids, pixel_values, grid_thw, history, history_velocity, history_acceleration, ego_status, nav_command, noise, num_steps=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn plan_direct<'py>(
-        &mut self,
-        py: Python<'py>,
-        token_ids: Vec<u32>,
-        pixel_values: PyReadonlyArray2<'py, f32>,
-        grid_thw: Vec<[u32; 3]>,
-        history: PyReadonlyArray1<'py, f32>,
-        history_velocity: PyReadonlyArray1<'py, f32>,
-        history_acceleration: PyReadonlyArray1<'py, f32>,
-        ego_status: PyReadonlyArray1<'py, f32>,
-        nav_command: i64,
-        noise: PyReadonlyArrayDyn<'py, f32>,
-        num_steps: Option<usize>,
-    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
-        let cond = qwen_conditioning(
-            &history,
-            &history_velocity,
-            &history_acceleration,
-            &ego_status,
-            nav_command,
-        )?;
-        let noise_vec = qwen_noise(&noise, 50, 3)?;
-        let flat = self
-            .model
-            .plan_direct(&token_ids, &pixel_tensor, &grid_thw, &cond, &noise_vec, num_steps)
-            .map_err(runtime_err)?;
-        qwen_trajectory(py, flat)
-    }
-
-    /// Reasoning planning: greedy assistant turn (min/max bounds), trained
-    /// turn completion in the cache, then the sampler. Returns
-    /// `(generated_token_ids, normalized_trajectory[50, 3])`.
-    #[pyo3(signature = (token_ids, pixel_values, grid_thw, history, history_velocity, history_acceleration, ego_status, nav_command, noise, max_new_tokens, min_new_tokens, terminator_ids, im_end_id, newline_ids, num_steps=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn plan_reasoning<'py>(
-        &mut self,
-        py: Python<'py>,
-        token_ids: Vec<u32>,
-        pixel_values: PyReadonlyArray2<'py, f32>,
-        grid_thw: Vec<[u32; 3]>,
-        history: PyReadonlyArray1<'py, f32>,
-        history_velocity: PyReadonlyArray1<'py, f32>,
-        history_acceleration: PyReadonlyArray1<'py, f32>,
-        ego_status: PyReadonlyArray1<'py, f32>,
-        nav_command: i64,
-        noise: PyReadonlyArrayDyn<'py, f32>,
-        max_new_tokens: usize,
-        min_new_tokens: usize,
-        terminator_ids: Vec<u32>,
-        im_end_id: u32,
-        newline_ids: Vec<u32>,
-        num_steps: Option<usize>,
-    ) -> PyResult<(Vec<u32>, Bound<'py, PyArray2<f32>>)> {
-        let pixel_tensor = qwen_pixels_tensor(&pixel_values)?;
-        let cond = qwen_conditioning(
-            &history,
-            &history_velocity,
-            &history_acceleration,
-            &ego_status,
-            nav_command,
-        )?;
-        let noise_vec = qwen_noise(&noise, 50, 3)?;
-        let (generated, flat) = self
-            .model
-            .plan_reasoning(
-                &token_ids,
-                &pixel_tensor,
-                &grid_thw,
-                max_new_tokens,
-                min_new_tokens,
-                &terminator_ids,
-                im_end_id,
-                &newline_ids,
-                &cond,
-                &noise_vec,
-                num_steps,
-            )
-            .map_err(runtime_err)?;
-        Ok((generated, qwen_trajectory(py, flat)?))
-    }
-
-    #[getter]
-    fn device(&self) -> String {
-        match self.device {
-            Device::Cuda(index) => format!("cuda:{index}"),
-            Device::Cpu => "cpu".to_string(),
-        }
-    }
-
-    #[getter]
-    fn has_planner(&self) -> bool {
-        self.model.has_planner()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "QwenDriveModel(device={}, planner={})",
-            self.device(),
-            self.model.has_planner(),
-        )
-    }
-}
-
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ModelRunner>()?;
-    #[cfg(feature = "cuda")]
-    module.add_class::<QwenDriveModel>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

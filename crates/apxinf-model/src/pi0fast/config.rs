@@ -10,6 +10,15 @@ use std::path::Path;
 
 use apxinf_core::{Error, Result};
 
+/// Column alignment of the pruned LM head.
+///
+/// E4M3 tensor-core GEMMs in cuBLASLt reject a leading dimension that is not
+/// vector-width aligned (`CUBLAS_STATUS_NOT_SUPPORTED`), so the pruned head is
+/// padded out to this multiple with repeats of its last column. A repeated
+/// column can only ever win the argmax where the original would have won too,
+/// and it remaps to the same token id, so the padding is behaviour-neutral.
+pub const ACTION_HEAD_COLUMN_ALIGN: usize = 64;
+
 /// Per-variant Gemma dimensions used by the PaliGemma text tower.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pi0FastLanguageConfig {
@@ -72,6 +81,17 @@ pub struct Pi0FastConfig {
     pub max_action_tokens: usize,
     /// PaliGemma token-space offset between language and action tokens.
     pub fast_skip_tokens: usize,
+    /// Width of the contiguous action-token window at the tail of the
+    /// vocabulary. FAST action ids live in
+    /// `[vocab_size - fast_skip_tokens - 1024, vocab_size - fast_skip_tokens)`;
+    /// 2048 is the conservative superset the reference implementation prunes to.
+    pub action_vocab_size: usize,
+    /// Token ids outside the action window that the decode must still be able
+    /// to emit. π0-FAST writes the deterministic prefix `"Action: "` before the
+    /// action tokens and terminates on `"|"`, and none of those ids sit near the
+    /// vocabulary tail, so a naive tail-only window would change both the first
+    /// three steps and the terminator.
+    pub action_head_extra_tokens: Vec<u32>,
     /// Prompt token budget (padded/truncated, `tokenizer_max_length`).
     pub max_token_len: usize,
     pub num_views: usize,
@@ -101,6 +121,10 @@ impl Default for Pi0FastConfig {
             max_action_dim: 32,
             max_action_tokens: 256,
             fast_skip_tokens: 128,
+            action_vocab_size: 2048,
+            // PaliGemma ids, fixed by the π0-FAST prompt protocol:
+            // 1 = <eos>, 4022 = "Action", 235248 = " ", 235292 = ":", 235371 = "|".
+            action_head_extra_tokens: vec![1, 4022, 235_248, 235_292, 235_371],
             max_token_len: 200,
             num_views: 3,
             empty_cameras: 1,
@@ -143,6 +167,20 @@ impl Pi0FastConfig {
         cfg.max_action_dim = usize_field(&v, &["max_action_dim"], cfg.max_action_dim);
         cfg.max_action_tokens = usize_field(&v, &["max_action_tokens"], cfg.max_action_tokens);
         cfg.fast_skip_tokens = usize_field(&v, &["fast_skip_tokens"], cfg.fast_skip_tokens);
+        cfg.action_vocab_size =
+            usize_field(&v, &["action_vocab_size"], cfg.action_vocab_size);
+        if let Some(tokens) = v.get("action_head_extra_tokens").and_then(|x| x.as_array()) {
+            cfg.action_head_extra_tokens = tokens
+                .iter()
+                .map(|token| {
+                    token.as_u64().map(|value| value as u32).ok_or_else(|| {
+                        Error::Other(format!(
+                            "pi0fast action_head_extra_tokens entries must be integers, got {token}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
         cfg.max_token_len = usize_field(
             &v,
             &["tokenizer_max_length", "max_token_len"],
@@ -181,6 +219,57 @@ impl Pi0FastConfig {
         self.effective_views() * self.patches_per_view()
     }
 
+    /// Upper bound on the number of vocabulary columns the pruned LM head keeps,
+    /// including the alignment padding `action_head_columns` appends.
+    ///
+    /// `validate` rejects configurations whose extras overlap the window, so at
+    /// construction time this is exact; using the bound elsewhere keeps arena
+    /// sizing infallible and only ever over-reserves.
+    pub fn action_head_width(&self) -> usize {
+        (self.action_vocab_size + self.action_head_extra_tokens.len())
+            .next_multiple_of(ACTION_HEAD_COLUMN_ALIGN)
+    }
+
+    /// First vocabulary index of the contiguous action-token window.
+    pub fn action_token_start(&self) -> usize {
+        self.vocab_size - self.fast_skip_tokens - self.action_vocab_size
+    }
+
+    /// One past the last vocabulary index of the action-token window.
+    pub fn action_token_end(&self) -> usize {
+        self.vocab_size - self.fast_skip_tokens
+    }
+
+    /// Vocabulary columns the LM head keeps, in the order the pruned head emits
+    /// them. Column `i` of the pruned head corresponds to token
+    /// `action_head_columns()[i]`, which is exactly the table the argmax kernel
+    /// remaps through.
+    pub fn action_head_columns(&self) -> Result<Vec<usize>> {
+        let (start, end) = (self.action_token_start(), self.action_token_end());
+        let mut columns = Vec::with_capacity(self.action_vocab_size + self.action_head_extra_tokens.len());
+        columns.extend(start..end);
+        for &token in &self.action_head_extra_tokens {
+            let index = token as usize;
+            if index >= self.vocab_size {
+                return Err(Error::Other(format!(
+                    "pi0fast action_head_extra_tokens entry {token} is outside the \
+                     {}-wide vocabulary",
+                    self.vocab_size
+                )));
+            }
+            // The action window is a contiguous range, so a duplicate can only
+            // hide inside it or earlier in this (tiny) extra list.
+            if (start..end).contains(&index) || columns[end - start..].contains(&index) {
+                continue;
+            }
+            columns.push(index);
+        }
+        let padded = columns.len().next_multiple_of(ACTION_HEAD_COLUMN_ALIGN);
+        let last = *columns.last().expect("the action window is never empty");
+        columns.resize(padded, last);
+        Ok(columns)
+    }
+
     pub fn max_prefix_len(&self) -> usize {
         self.patch_tokens() + self.max_token_len + 1
     }
@@ -207,6 +296,19 @@ impl Pi0FastConfig {
                 "pi0fast max_action_tokens must be > 0".into(),
             ));
         }
+        if self.action_vocab_size == 0 {
+            return Err(Error::Other(
+                "pi0fast action_vocab_size must be > 0".into(),
+            ));
+        }
+        if self.fast_skip_tokens + self.action_vocab_size > self.vocab_size {
+            return Err(Error::Other(format!(
+                "pi0fast fast_skip_tokens {} + action_vocab_size {} exceeds the \
+                 {}-wide vocabulary",
+                self.fast_skip_tokens, self.action_vocab_size, self.vocab_size
+            )));
+        }
+        self.action_head_columns()?;
         if self.num_views == 0 {
             return Err(Error::Other("pi0fast requires at least one view".into()));
         }
@@ -315,6 +417,38 @@ mod tests {
         assert_eq!(cfg.effective_views(), 2);
         assert_eq!(cfg.patch_tokens(), 512);
         cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn action_head_columns_keep_the_reachable_ids() {
+        let cfg = Pi0FastConfig::from_json_str(CHECKPOINT).expect("parse");
+        let columns = cfg.action_head_columns().expect("columns");
+        let window = cfg.action_vocab_size;
+
+        assert_eq!(columns.len(), cfg.action_head_width());
+        assert_eq!(columns.len() % ACTION_HEAD_COLUMN_ALIGN, 0);
+        assert_eq!(columns.len(), 2112);
+
+        // The action window stays contiguous and in place.
+        assert_eq!(columns[0], 257_152 - 128 - 2048);
+        assert_eq!(columns[window - 1], 257_023);
+
+        // Ids pi0-FAST emits outside the window must survive pruning: the
+        // "Action: " prefix (4022, 235292, 235248), the "|" terminator
+        // (235371) and <eos> (1).
+        for token in [1usize, 4022, 235_248, 235_292, 235_371] {
+            assert!(columns.contains(&token), "token {token} was pruned");
+        }
+
+        // Padding repeats the last retained id so it can never change an argmax.
+        let last = columns[window + 4];
+        assert!(columns[window + 5..].iter().all(|column| *column == last));
+    }
+
+    #[test]
+    fn action_window_must_fit_the_vocabulary() {
+        let raw = CHECKPOINT.replace("\"max_action_tokens\": 256", "\"max_action_tokens\": 256, \"action_vocab_size\": 257152");
+        assert!(Pi0FastConfig::from_json_str(&raw).is_err());
     }
 
     #[test]

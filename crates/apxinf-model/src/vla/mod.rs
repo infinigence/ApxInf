@@ -63,6 +63,23 @@ pub enum InitialLatent<'a> {
     Provided(&'a Tensor),
 }
 
+/// Internal autoregressive reasoning before continuous action generation.
+/// Token IDs and turn completion are supplied by the policy/tokenizer.
+#[derive(Clone, Debug)]
+pub struct ReasoningOptions {
+    pub max_new_tokens: usize,
+    pub min_new_tokens: usize,
+    pub terminator_ids: Vec<u32>,
+    pub closing_ids: Vec<u32>,
+}
+
+/// Per-request planning controls for runtimes with a planning-options contract.
+#[derive(Clone, Debug, Default)]
+pub struct PlanningOptions {
+    pub num_steps: Option<usize>,
+    pub reasoning: Option<ReasoningOptions>,
+}
+
 /// Optional typed metadata emitted by preprocessors for VLA families whose
 /// inputs include more than image patches and token IDs.
 ///
@@ -75,6 +92,7 @@ pub struct VlaMetadata<'a> {
     pub attention_mask: Option<&'a [u8]>,
     pub image_grid_thw: Option<&'a [[u32; 3]]>,
     pub embodiment_id: Option<usize>,
+    pub planning: Option<&'a PlanningOptions>,
 }
 
 /// Complete VLA request: an environment observation plus the model-generation
@@ -95,6 +113,7 @@ impl<'a> VlaRequest<'a> {
                 attention_mask: None,
                 image_grid_thw: None,
                 embodiment_id: None,
+                planning: None,
             },
         }
     }
@@ -107,6 +126,7 @@ impl<'a> VlaRequest<'a> {
                 attention_mask: None,
                 image_grid_thw: None,
                 embodiment_id: None,
+                planning: None,
             },
         }
     }
@@ -339,6 +359,21 @@ pub trait VlaRuntime {
         Err(Error::Other(
             "activation calibration is not supported by this VLA runtime".into(),
         ))
+    }
+
+    /// Same capture, but a token decoder may end it at ``stop_token``.
+    ///
+    /// A calibration profile has to describe the activations deployment
+    /// actually quantizes. A token decoder that free-runs past its terminator
+    /// records activations from a token stream inference never produces, and a
+    /// maximum taken over them can be orders of magnitude above the real range.
+    /// Continuous-action families have no token stream and keep the default.
+    fn calibration_amax_stop(
+        &self,
+        request: &VlaRequest<'_>,
+        _stop_token: Option<u32>,
+    ) -> Result<BTreeMap<String, f32>> {
+        self.calibration_amax(request)
     }
 
     /// Stable logical sites required by this runtime's calibration profile.

@@ -20,9 +20,9 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
     }
     let valid = match tactic.backend {
         TacticBackend::Cutlass => match key.op {
-            GemmOp::Fp8F16 => fp8_supported(key, tactic.value),
+            GemmOp::Fp8F16 | GemmOp::Fp8Bf16 => fp8_supported(key, tactic.value),
             GemmOp::W8A8 => w8a8_supported(key, tactic.value),
-            GemmOp::Bf16 | GemmOp::Fp8Bf16 => false,
+            GemmOp::Bf16 => false,
         },
         TacticBackend::CutlassFp8DualGeGlu => {
             key.op == GemmOp::Fp8F16
@@ -54,7 +54,7 @@ pub(super) fn prepare(key: &GemmTuningKey, tactic: TacticId) -> Result<()> {
 
 pub(super) fn candidates(key: &GemmTuningKey) -> Vec<TacticId> {
     let mut candidates = Vec::new();
-    if key.op == GemmOp::Fp8F16 {
+    if matches!(key.op, GemmOp::Fp8F16 | GemmOp::Fp8Bf16) {
         for value in 0..=7 {
             if fp8_supported(key, value) {
                 candidates.push(TacticId {
@@ -109,7 +109,7 @@ pub(super) fn geglu_candidates(key: &GemmTuningKey) -> Vec<TacticId> {
 fn fp8_supported(key: &GemmTuningKey, tactic: i32) -> bool {
     #[cfg(apxinf_cutlass_gemm)]
     {
-        key.op == GemmOp::Fp8F16
+        matches!(key.op, GemmOp::Fp8F16 | GemmOp::Fp8Bf16)
             && (0..=7).contains(&tactic)
             && key.n >= 1024
             && key.n % 16 == 0

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use apxinf_core::Device;
-use apxinf_model::{qwen_drive::QwenDriveModel, AutoModel, LoadOptions, LoadedModel};
+use apxinf_model::{AutoModel, LoadOptions};
 
 struct Fixture(PathBuf);
 
@@ -19,7 +19,7 @@ impl Drop for Fixture {
 
 #[test]
 #[ignore = "requires CUDA and APXINF_QWEN_DRIVE_TEST_MODEL with a real VLM checkpoint"]
-fn text_registry_ignores_adjacent_invalid_planner_but_explicit_loading_rejects_it() {
+fn vla_registry_rejects_invalid_default_and_explicit_planners() {
     let source = PathBuf::from(
         std::env::var_os("APXINF_QWEN_DRIVE_TEST_MODEL")
             .expect("set APXINF_QWEN_DRIVE_TEST_MODEL to the VLM checkpoint"),
@@ -54,16 +54,17 @@ fn text_registry_ignores_adjacent_invalid_planner_but_explicit_loading_rejects_i
     )
     .unwrap();
 
-    let loaded = AutoModel::load_model(Device::Cuda(0), &fixture.0, &LoadOptions::default())
-        .expect("text loading must not inspect the adjacent planner");
-    assert!(matches!(loaded, LoadedModel::Text { .. }));
-    drop(loaded);
-
-    let error = QwenDriveModel::load(&fixture.0, Some(&planner), Device::Cuda(0))
-        .err()
-        .expect("an explicitly requested invalid planner must fail");
-    assert!(
-        error.to_string().contains("load planner weights"),
-        "unexpected error: {error}"
-    );
+    for explicit in [false, true] {
+        let mut options = LoadOptions::default();
+        if explicit {
+            options.assets.insert("planner".into(), planner.clone());
+        }
+        let error = AutoModel::load_model(Device::Cuda(0), &fixture.0, &options)
+            .err()
+            .expect("planning must reject an invalid selected planner");
+        assert!(
+            error.to_string().contains("load qwen_drive planner"),
+            "unexpected error: {error}"
+        );
+    }
 }

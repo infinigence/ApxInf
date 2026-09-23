@@ -10,6 +10,13 @@ extern "C" int apxinf_static_cutlass_fp8_gemm_f16(
       activation, weight, output, m, n, k, alpha, tactic, stream);
 }
 
+extern "C" int apxinf_static_cutlass_fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::fp8_gemm_bf16(
+      activation, weight, output, m, n, k, alpha, tactic, stream);
+}
+
 extern "C" int apxinf_dynamic_cutlass_fp8_gemm_bf16(
     const void* activation, const void* weight_nk,
     const float* activation_scales, const float* weight_scales,
