@@ -2079,4 +2079,3 @@ __global__ void Marlin(
 }  // namespace MARLIN_NAMESPACE_NAME
 
 #endif
-

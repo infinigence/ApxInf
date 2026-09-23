@@ -607,4 +607,3 @@ __device__ inline void sub_zp_and_dequant<__nv_fp8x4_e4m3, vllm::kU4.id(),
 #endif
 
 }  // namespace MARLIN_NAMESPACE_NAME
-

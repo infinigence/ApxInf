@@ -147,4 +147,3 @@ class MarlinScalarType2<int8_t> : public MarlinScalarType<vllm::kS8.id()> {};
 }  // namespace MARLIN_NAMESPACE_NAME
 
 #endif
-

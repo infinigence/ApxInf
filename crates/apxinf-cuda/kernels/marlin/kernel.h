@@ -41,4 +41,3 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }
-
