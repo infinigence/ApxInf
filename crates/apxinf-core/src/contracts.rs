@@ -48,6 +48,15 @@ pub fn float_tensor(input: &Tensor, device: Device) -> Result<()> {
     Ok(())
 }
 
+/// Byte size of a materialized output, rejecting element-count and byte overflow.
+/// Callers validate the *output* extent before dispatch so a backend that trusts
+/// "arguments are already validated" cannot compute an allocation size that wrapped.
+pub fn checked_bytes(shape: &[usize], dtype: DType) -> Result<usize> {
+    checked_elements(shape)?
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or(Error::Contract("output byte size overflow"))
+}
+
 /// Scalars are supported; empty dimensions and overflowing shapes are rejected.
 pub fn checked_elements(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {

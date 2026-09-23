@@ -255,22 +255,42 @@ pub trait PortableOps {
                  options: &contracts::AttentionOptions<'_>) -> Result<Tensor>;
 }
 
-/// Confirm an implementation honoured the shape its contract promised. Cheap
-/// (rank-sized) and kept in release builds so a backend bug surfaces as an error
-/// rather than as silently misinterpreted downstream data.
-fn check_output(op: &'static str, out: Tensor, expected: &[usize]) -> Result<Tensor> {
+/// Confirm an implementation honoured the contract it was given: exact shape and
+/// dtype, the backend's own device, and storage large enough for the result it
+/// claims. Cheap (rank-sized) and kept in release builds so a backend bug surfaces
+/// as an error rather than as silently misinterpreted downstream data.
+///
+/// Shape alone is not enough: a `cast` that returns its input unchanged preserves
+/// the shape while ignoring the requested dtype, and a short-storage result would
+/// be read out of bounds downstream.
+fn check_output(
+    op: &'static str,
+    out: Tensor,
+    expected: &[usize],
+    dtype: crate::DType,
+    device: Device,
+) -> Result<Tensor> {
     if out.shape().dims() != expected {
         return Err(Error::ShapeMismatch {
             expected: format!("{op} -> {expected:?}"),
             got: format!("{:?}", out.shape().dims()),
         });
     }
+    if out.dtype() != dtype {
+        return Err(Error::DTypeMismatch {
+            expected: dtype,
+            got: out.dtype(),
+        });
+    }
+    // Device residency plus storage extent for the shape/dtype just checked.
+    contracts::tensor_storage(&out, device)?;
     Ok(out)
 }
 
 impl<B: Backend + ?Sized> PortableOps for B {
     fn cast(&self, input: &Tensor, dtype: crate::DType) -> Result<Tensor> {
-        contracts::float_tensor(input, self.device())?;
+        let device = self.device();
+        contracts::float_tensor(input, device)?;
         if !dtype.is_float() {
             return Err(Error::UnsupportedDType {
                 got: dtype,
@@ -278,22 +298,33 @@ impl<B: Backend + ?Sized> PortableOps for B {
             });
         }
         let expected = input.shape().dims().to_vec();
-        check_output("cast", self.cast_impl(input, dtype)?, &expected)
+        // Output dtype may be wider than the input's, so re-check the byte extent.
+        contracts::checked_bytes(&expected, dtype)?;
+        check_output("cast", self.cast_impl(input, dtype)?, &expected, dtype, device)
     }
 
     fn slice_axis(&self, input: &Tensor, slice: contracts::AxisSlice) -> Result<Tensor> {
         // Layout ops preserve bits, so any dtype is admissible.
-        contracts::tensor_storage(input, self.device())?;
+        let device = self.device();
+        contracts::tensor_storage(input, device)?;
         let expected = slice.output_shape(input.shape().dims())?;
-        check_output("slice_axis", self.slice_axis_impl(input, slice)?, &expected)
+        contracts::checked_bytes(&expected, input.dtype())?;
+        check_output(
+            "slice_axis",
+            self.slice_axis_impl(input, slice)?,
+            &expected,
+            input.dtype(),
+            device,
+        )
     }
 
     fn concat_axis(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor> {
+        let device = self.device();
         let first = *inputs
             .first()
             .ok_or(Error::Contract("concat requires at least one input"))?;
         for t in inputs {
-            contracts::tensor_storage(t, self.device())?;
+            contracts::tensor_storage(t, device)?;
             if t.dtype() != first.dtype() {
                 return Err(Error::DTypeMismatch {
                     expected: first.dtype(),
@@ -303,24 +334,58 @@ impl<B: Backend + ?Sized> PortableOps for B {
         }
         let dims: Vec<&[usize]> = inputs.iter().map(|t| t.shape().dims()).collect();
         let expected = contracts::concatenated_shape(&dims, axis)?;
-        check_output("concat_axis", self.concat_axis_impl(inputs, axis)?, &expected)
+        // The concatenated result is larger than any single validated input.
+        contracts::checked_bytes(&expected, first.dtype())?;
+        check_output(
+            "concat_axis",
+            self.concat_axis_impl(inputs, axis)?,
+            &expected,
+            first.dtype(),
+            device,
+        )
     }
 
     fn permute(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor> {
-        contracts::tensor_storage(input, self.device())?;
+        let device = self.device();
+        contracts::tensor_storage(input, device)?;
         let expected = contracts::permuted_shape(input.shape().dims(), axes)?;
-        check_output("permute", self.permute_impl(input, axes)?, &expected)
+        contracts::checked_bytes(&expected, input.dtype())?;
+        check_output(
+            "permute",
+            self.permute_impl(input, axes)?,
+            &expected,
+            input.dtype(),
+            device,
+        )
     }
 
     fn broadcast_to(&self, input: &Tensor, shape: &[usize]) -> Result<Tensor> {
-        contracts::tensor_storage(input, self.device())?;
+        let device = self.device();
+        contracts::tensor_storage(input, device)?;
         contracts::broadcast_shape(input.shape().dims(), shape)?;
-        check_output("broadcast_to", self.broadcast_to_impl(input, shape)?, shape)
+        // Broadcasting expands the element count, so the byte extent can overflow
+        // even when the element count itself is representable.
+        contracts::checked_bytes(shape, input.dtype())?;
+        check_output(
+            "broadcast_to",
+            self.broadcast_to_impl(input, shape)?,
+            shape,
+            input.dtype(),
+            device,
+        )
     }
 
     fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor,
                  options: &contracts::AttentionOptions<'_>) -> Result<Tensor> {
-        let expected = options.validate(self.device(), q, k, v)?;
-        check_output("attention", self.attention_impl(q, k, v, options)?, &expected)
+        let device = self.device();
+        let expected = options.validate(device, q, k, v)?;
+        contracts::checked_bytes(&expected, q.dtype())?;
+        check_output(
+            "attention",
+            self.attention_impl(q, k, v, options)?,
+            &expected,
+            q.dtype(),
+            device,
+        )
     }
 }

@@ -360,3 +360,150 @@ fn legacy_defaults_report_unsupported_op_by_name() {
         ]
     );
 }
+
+/// A backend whose `cast_impl` ignores the requested dtype and echoes the input.
+/// Proves the public entry point rejects a wrong-dtype result even when the shape
+/// is correct — reproduces the reviewer's cast(F32 -> BF16) case.
+struct EchoCastBackend;
+impl apxinf_core::SamplingBackend for EchoCastBackend {
+    fn create_token_sampler(
+        &self,
+        _spec: apxinf_core::TokenSamplingSpec,
+    ) -> Result<Box<dyn apxinf_core::TokenSampler>, Error> {
+        unimplemented!()
+    }
+    fn create_normal_generator(
+        &self,
+        _output: Tensor,
+    ) -> Result<Box<dyn apxinf_core::NormalGenerator>, Error> {
+        unimplemented!()
+    }
+}
+impl Backend for EchoCastBackend {
+    // The one misbehaving hook: returns the input verbatim, ignoring `dtype`.
+    fn cast_impl(&self, input: &Tensor, _dtype: DType) -> Result<Tensor, Error> {
+        input.reshape(input.shape().dims().to_vec())
+    }
+    fn rms_norm(&self, _i: &Tensor, _w: &Tensor, _e: f32) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn silu(&self, _i: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn add(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn mul(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn scale(&self, _i: &Tensor, _f: f32) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn rope(&self, _i: &Tensor, _h: usize, _d: usize, _t: f32, _p: u32) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn embedding(&self, _t: &Tensor, _ids: &[u32]) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn sdpa_decode(
+        &self,
+        _q: &Tensor,
+        _kv: &mut dyn apxinf_core::KvCache,
+        _l: usize,
+        _h: usize,
+        _kvh: usize,
+        _d: usize,
+        _kl: usize,
+        _m: usize,
+    ) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn sdpa_prefill(
+        &self,
+        _q: &Tensor,
+        _kv: &mut dyn apxinf_core::KvCache,
+        _l: usize,
+        _h: usize,
+        _kvh: usize,
+        _d: usize,
+        _kl: usize,
+        _m: usize,
+    ) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn create_kv_cache(
+        &self,
+        _n: usize,
+        _kvh: usize,
+        _d: usize,
+        _m: usize,
+    ) -> Box<dyn apxinf_core::KvCache> {
+        unimplemented!()
+    }
+    fn kv_append(
+        &self,
+        _kv: &mut dyn apxinf_core::KvCache,
+        _l: usize,
+        _k: &Tensor,
+        _v: &Tensor,
+        _n: usize,
+    ) -> Result<(), Error> {
+        unimplemented!()
+    }
+    fn synchronize(&self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn begin_capture(&self) -> Result<(), Error> {
+        unimplemented!()
+    }
+    fn end_capture(&self) -> Result<Box<dyn apxinf_core::Graph>, Error> {
+        unimplemented!()
+    }
+    fn device(&self) -> Device {
+        Device::Cpu
+    }
+    fn to_device(&self, _t: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn to_cpu(&self, _t: &Tensor) -> Result<Tensor, Error> {
+        unimplemented!()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Output validation rejects a result with the right shape but the wrong dtype.
+/// Without the dtype check the public `cast` entry would return success.
+#[test]
+fn output_check_rejects_wrong_dtype_even_when_shape_matches() {
+    let b: &dyn Backend = &EchoCastBackend;
+    let x = t(&[2, 3]);
+    // Shape is preserved, so a shape-only check would pass; dtype is still F32.
+    assert!(matches!(
+        b.cast(&x, DType::BF16),
+        Err(Error::DTypeMismatch {
+            expected: DType::BF16,
+            got: DType::F32,
+        })
+    ));
+    // Sanity: a same-dtype echo satisfies every output check.
+    assert!(b.cast(&x, DType::F32).is_ok());
+}
+
+/// Output byte size is validated before dispatch: a broadcast whose element count
+/// fits usize but whose byte extent (elements * 4) overflows is rejected with a
+/// contract error rather than reaching the backend. The tiny input means the guard
+/// fires before any large allocation is attempted.
+#[test]
+fn output_byte_overflow_is_rejected_before_dispatch() {
+    let b: &dyn Backend = &CpuBackend;
+    let huge = usize::MAX / 4 + 1; // element count is legal, * 4 bytes overflows
+    assert!(matches!(
+        b.broadcast_to(&t(&[1]), &[huge]),
+        Err(Error::Contract("output byte size overflow"))
+    ));
+}
