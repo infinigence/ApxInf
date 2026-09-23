@@ -260,28 +260,9 @@ impl Tokenizer {
             .render(context)
             .map_err(|e| Error::Other(format!("template render error: {e}")))?;
 
-        // Jinja2 in Python strips whitespace around control blocks, but minijinja doesn't.
-        // Normalize by collapsing all consecutive newlines to single newlines.
-        let mut normalized = String::new();
-        let mut prev_was_newline = false;
-        for c in result.trim().chars() {
-            if c == '\n' {
-                if !prev_was_newline {
-                    normalized.push('\n');
-                    prev_was_newline = true;
-                }
-            } else {
-                normalized.push(c);
-                prev_was_newline = false;
-            }
-        }
-
-        // Ensure trailing newline (matching PyTorch behavior)
-        if !normalized.ends_with('\n') {
-            normalized.push('\n');
-        }
-
-        Ok(normalized)
+        // Preserve the rendered message verbatim. Collapsing newlines changes
+        // user content and produces different token IDs from the HF template.
+        Ok(result)
     }
 
     /// Encode messages using chat template.
@@ -371,5 +352,24 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
         assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
         assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn chat_template_preserves_message_newlines() {
+        let model = WordLevel::builder()
+            .vocab(HashMap::from([("[UNK]".to_string(), 0)]))
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(model),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ messages[0].content }}".to_string()),
+        };
+
+        assert_eq!(
+            tokenizer.apply_chat_template(&[ChatMessage::user("first\n\nsecond")]).unwrap(),
+            "first\n\nsecond"
+        );
     }
 }
