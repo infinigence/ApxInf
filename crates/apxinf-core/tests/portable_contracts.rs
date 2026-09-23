@@ -529,25 +529,34 @@ fn plan_cannot_be_silently_reused_with_other_operands() {
 
     // Different Q length.
     let other_len = Tensor::zeros(vec![1, 11, 8, 256], DType::BF16);
-    assert!(plan.check_operands(&other_len, &k, &k, &o).is_err());
+    assert!(plan
+        .check_operands(Device::Cpu, &other_len, &k, &k, &o)
+        .is_err());
     // Different dtype.
     let other_dtype = Tensor::zeros(vec![1, 10, 8, 256], DType::F32);
-    assert!(plan.check_operands(&other_dtype, &k, &k, &o).is_err());
+    assert!(plan
+        .check_operands(Device::Cpu, &other_dtype, &k, &k, &o)
+        .is_err());
     // Different options (scale changed).
     assert!(plan
-        .check_operands(&q, &k, &k, &AttentionOptions::full(0.5))
+        .check_operands(Device::Cpu, &q, &k, &k, &AttentionOptions::full(0.5))
         .is_err());
     // A mask appearing where the plan had none.
     let mask = Tensor::zeros(vec![1, 1, 10, 522], DType::F32);
     let mut masked = AttentionOptions::full(0.0625);
     masked.mask = AttentionMask::Additive(&mask);
-    assert!(plan.check_operands(&q, &k, &k, &masked).is_err());
+    assert!(plan
+        .check_operands(Device::Cpu, &q, &k, &k, &masked)
+        .is_err());
     // The configuration it was built for still passes.
-    plan.check_operands(&q, &k, &k, &o).unwrap();
+    plan.check_operands(Device::Cpu, &q, &k, &k, &o).unwrap();
 }
 
+/// The plan stores no device: the dispatch path takes it from `self.device()`,
+/// the single authority, and rejects operands that do not live there. There is no
+/// second copy of the device to disagree with, so no reconciliation check.
 #[test]
-fn planned_attention_rejects_other_backend_device_before_dispatch() {
+fn planned_attention_rejects_operands_not_on_the_backend_device() {
     let q = t(&[1, 2, 1, 4]);
     let options = AttentionOptions::full(0.5);
     let plan = AttentionPlan::new(Device::Cpu, &q, &q, &q, &options).unwrap();
@@ -596,7 +605,11 @@ fn planned_attention_preserves_mask_kind_and_causal_offsets() {
                 mask: other,
                 ..options
             };
-            assert_eq!(plan.check_operands(&q, &q, &q, &changed).is_ok(), i == j);
+            assert_eq!(
+                plan.check_operands(Device::Cpu, &q, &q, &q, &changed)
+                    .is_ok(),
+                i == j
+            );
         }
         for mask in [
             AttentionMask::Causal {
@@ -610,11 +623,56 @@ fn planned_attention_preserves_mask_kind_and_causal_offsets() {
         ] {
             let changed = AttentionOptions { mask, ..options };
             assert!(changed.validate(Device::Cpu, &q, &q, &q).is_err());
-            assert!(plan.check_operands(&q, &q, &q, &changed).is_err());
+            assert!(plan
+                .check_operands(Device::Cpu, &q, &q, &q, &changed)
+                .is_err());
             assert!(matches!(
                 EchoCastBackend(Device::Cpu).attention_planned(&plan, &q, &q, &q, &changed),
                 Err(Error::Contract(_))
             ));
         }
     }
+}
+
+/// A plan captures only device-independent facts — dtype, rank, head grouping,
+/// scale, mask configuration and byte extents — so it stays valid on any backend
+/// whose operands match. Binding it to one device would have made this a false
+/// negative; the operands still have to live on the dispatching backend's device.
+#[test]
+fn plan_is_device_agnostic_when_operands_match() {
+    let cpu_q = t(&[1, 2, 1, 4]);
+    let options = AttentionOptions::full(0.5);
+    let plan = AttentionPlan::new(Device::Cpu, &cpu_q, &cpu_q, &cpu_q, &options).unwrap();
+
+    // Same configuration, operands resident on a different device.
+    let gpu_q = device_tensor(&[1, 2, 1, 4], DType::F32, Device::Cuda(0));
+    plan.check_operands(Device::Cuda(0), &gpu_q, &gpu_q, &gpu_q, &options)
+        .unwrap();
+
+    // The operands must still match the device actually dispatching.
+    assert!(matches!(
+        plan.check_operands(Device::Cuda(1), &gpu_q, &gpu_q, &gpu_q, &options),
+        Err(Error::DeviceMismatch { .. })
+    ));
+    assert!(matches!(
+        plan.check_operands(Device::Cuda(0), &cpu_q, &cpu_q, &cpu_q, &options),
+        Err(Error::DeviceMismatch { .. })
+    ));
+}
+
+/// Device-resident tensor with a claimed extent but no real allocation. Nothing
+/// in these tests dereferences it; only metadata is inspected.
+fn device_tensor(dims: &[usize], dtype: DType, device: Device) -> Tensor {
+    let bytes = dims.iter().product::<usize>() * dtype.size_in_bytes();
+    Tensor::from_raw_parts(
+        dims.to_vec().into(),
+        dtype,
+        device,
+        apxinf_core::Storage::Gpu {
+            device,
+            handle: unsafe {
+                apxinf_core::storage::GpuStorageHandle::from_raw_parts(0, bytes, None)
+            },
+        },
+    )
 }

@@ -77,9 +77,11 @@
 校验分成两层,避免把测试已能覆盖的确定性检查重复放进热路径。
 
 - **配置级**(计划期一次):dtype 集合、rank、`Hq % Hkv`、scale、mask 广播兼容、元素数与字节数溢出。这些只由模型 config 和组网结构决定,同一计划内每次调用结果相同,因此由 `AttentionPlan::new()` 在构建执行计划时验证一次。
-- **实例级**(每次调用):device、精确 shape、dtype、storage extent。这些必须对实际传入的 tensor 成立,由 `AttentionPlan::check_operands()` 用固定次数的比较完成,无 dim 循环、无分配。
+- **实例级**(每次调用):device、精确 shape、dtype、storage extent。这些必须对实际传入的 tensor 成立,由 `AttentionPlan::check_operands(device, ...)` 用固定次数的比较完成,无 dim 循环、无分配。其中 `device` 由分派方传入,不存放在计划里。
 
-热路径经 `PortableOps::attention_planned(&plan, ...)` 分派;`attention()` 仍保留为便利入口,内部自行建计划后分派,适合非热路径与测试。计划不是可信标记:形状、dtype、options 或 mask 与计划不符一律报错,不会被静默复用。 `attention_planned` 在进入后端实现前检查 backend device 与 plan device 完全一致（含设备编号）。计划固定 mask 类型及 causal 的 `q_start`/`k_start`；位置偏移变化须重建计划并重新验证位置溢出。Additive mask 可替换为同设备、同 shape/dtype 且容量足够的张量，内容仍按前述构建/更新规则独立校验。
+热路径经 `PortableOps::attention_planned(&plan, ...)` 分派;`attention()` 仍保留为便利入口,内部自行建计划后分派,适合非热路径与测试。计划不是可信标记:形状、dtype、options 或 mask 与计划不符一律报错,不会被静默复用。计划固定 mask 类型及 causal 的 `q_start`/`k_start`;位置偏移变化须重建计划并重新验证位置溢出。Additive mask 可替换为同设备、同 shape/dtype 且容量足够的张量,内容仍按前述构建/更新规则独立校验。
+
+计划**不持有 device**。计划捕获的全部事实——dtype、rank、`Hq % Hkv`、scale、mask 配置、字节容量——都与设备无关,因此同一计划在任何 backend 上都成立,只要操作数位于该 backend 的设备上。分派时 device 只有一个权威来源 `self.device()`,`check_operands` 以它校验操作数;不存在第二份可与之不一致的副本,也就不需要对账检查。把 device 存进计划会让"跨 backend 复用"变成假阴性,并把"两个真值来源必须对齐"这一类错误引入接口。`AttentionPlan::new(device, ...)` 的 device 参数只用于构建时校验操作数,不被保存。
 
 其余算子的输出校验改为惰性比较(`check_output` 接受迭代器),只在出错时才为错误消息分配。`validate_permutation`、`validate_concat`、`AxisSlice::validate`、`checked_bytes_iter` 是对应的无分配校验核心;返回 `Vec` 的 `permuted_shape`/`concatenated_shape`/`output_shape` 保留为计划期与测试用的便利封装。
 

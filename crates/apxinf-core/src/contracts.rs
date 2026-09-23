@@ -265,9 +265,15 @@ enum PlannedMask {
 /// configuration cannot be silently used with tensors of another.
 /// Mask kind and causal offsets are fixed by the plan. Changing either requires
 /// a new plan so causal position overflow is checked again at construction.
+///
+/// The plan holds **no device**. Every fact it captures is device-independent, so
+/// it stays valid on any backend whose operands match. The dispatching device is
+/// passed to [`AttentionPlan::check_operands`] by the one authority that knows it
+/// (`Backend::device()`), leaving no second copy to disagree with and therefore no
+/// reconciliation check. The `device` argument to [`AttentionPlan::new`] validates
+/// the operands at construction and is not retained.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttentionPlan {
-    device: Device,
     dtype: DType,
     scale_bits: u32,
     scores: DType,
@@ -308,7 +314,6 @@ impl AttentionPlan {
             }
         };
         Ok(Self {
-            device,
             dtype,
             scale_bits: options.scale.to_bits(),
             scores: options.scores,
@@ -329,11 +334,6 @@ impl AttentionPlan {
     }
 
     #[inline]
-    pub fn device(&self) -> Device {
-        self.device
-    }
-
-    #[inline]
     pub fn dtype(&self) -> DType {
         self.dtype
     }
@@ -342,6 +342,7 @@ impl AttentionPlan {
     /// validated for. Fixed number of comparisons, no allocation, no dim loops.
     pub fn check_operands(
         &self,
+        device: Device,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
@@ -358,11 +359,11 @@ impl AttentionPlan {
             (k, &self.kv_dims, self.kv_bytes),
             (v, &self.kv_dims, self.kv_bytes),
         ] {
-            operand_matches(t, dims, self.dtype, self.device, bytes)?;
+            operand_matches(t, dims, self.dtype, device, bytes)?;
         }
         match (options.mask, self.mask) {
             (AttentionMask::Additive(m), PlannedMask::Additive { dims }) => {
-                operand_matches(m, &dims, DType::F32, self.device, self.mask_bytes)?
+                operand_matches(m, &dims, DType::F32, device, self.mask_bytes)?
             }
             (AttentionMask::Full, PlannedMask::Full) => {}
             (

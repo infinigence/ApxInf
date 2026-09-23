@@ -47,10 +47,10 @@ fn dispatch_path_does_not_allocate() {
     let plan = AttentionPlan::new(Device::Cpu, &q, &k, &k, &o).unwrap();
     // Warm up: the first call through any path may trigger one-time lazy init.
     for _ in 0..100 {
-        plan.check_operands(&q, &k, &k, &o).unwrap();
+        plan.check_operands(Device::Cpu, &q, &k, &k, &o).unwrap();
     }
     assert_eq!(
-        allocations(|| plan.check_operands(&q, &k, &k, &o).unwrap()),
+        allocations(|| plan.check_operands(Device::Cpu, &q, &k, &k, &o).unwrap()),
         0,
         "planned attention dispatch must not allocate"
     );
@@ -66,7 +66,9 @@ fn dispatch_path_does_not_allocate() {
         let options = AttentionOptions { mask, ..o };
         let plan = AttentionPlan::new(Device::Cpu, &q, &k, &k, &options).unwrap();
         assert_eq!(
-            allocations(|| plan.check_operands(&q, &k, &k, &options).unwrap()),
+            allocations(|| plan
+                .check_operands(Device::Cpu, &q, &k, &k, &options)
+                .unwrap()),
             0
         );
     }

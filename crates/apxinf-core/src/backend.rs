@@ -400,13 +400,7 @@ impl<B: Backend + ?Sized> PortableOps for B {
         options: &contracts::AttentionOptions<'_>,
     ) -> Result<Tensor> {
         let device = self.device();
-        if plan.device() != device {
-            return Err(Error::DeviceMismatch {
-                expected: device,
-                got: plan.device(),
-            });
-        }
-        plan.check_operands(q, k, v, options)?;
+        plan.check_operands(device, q, k, v, options)?;
         let out = self.attention_impl(q, k, v, options)?;
         check_output(
             "attention",
