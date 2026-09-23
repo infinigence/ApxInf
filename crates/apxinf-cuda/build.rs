@@ -346,6 +346,7 @@ fn main() {
             let cutlass_bf16_sm89 =
                 std::path::Path::new(&adapters_dir).join("cutlass_bf16_sm89_adapter.cu");
             let cutlass_int8 = std::path::Path::new(&adapters_dir).join("cutlass_w8a8_adapter.cu");
+            let marlin_adapter = std::path::Path::new(&adapters_dir).join("marlin_adapter.cu");
             let mut cutlass_includes = Vec::new();
             if cutlass_arch.as_deref().is_some_and(is_cutlass_sm100_family) {
                 let fmha = cutlass_root.join("fmha");
@@ -521,6 +522,21 @@ fn main() {
                 emit_rerun_if_changed_tree(&fa2_compat);
             }
 
+            if nvcc_arch.as_deref() == Some("sm_89") {
+                let marlin_root = std::path::Path::new(&kernels_dir).join("marlin");
+                assert!(
+                    marlin_adapter.is_file()
+                        && marlin_root.join("kernel.h").is_file()
+                        && marlin_root.join("marlin_template.h").is_file()
+                        && marlin_root.join("core/scalar_type.hpp").is_file(),
+                    "vendored SM89 Marlin sources are incomplete under {}",
+                    marlin_root.display()
+                );
+                kernel_files.push(marlin_adapter.clone());
+                println!("cargo:rustc-cfg=apxinf_marlin_sm89");
+                emit_rerun_if_changed_tree(&marlin_root);
+            }
+
             if !kernel_files.is_empty() {
                 let target_include_dirs = [
                     format!("{cuda_path}/include"),
@@ -600,6 +616,9 @@ fn main() {
                         for include in &cutlass_int8_includes {
                             cmd.arg(format!("-I{}", include.display()));
                         }
+                    }
+                    if entry == &marlin_adapter {
+                        cmd.arg("--expt-relaxed-constexpr");
                     }
                     if fa2_sources.contains(entry) {
                         cmd.args([

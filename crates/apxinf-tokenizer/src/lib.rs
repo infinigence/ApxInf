@@ -4,12 +4,46 @@
 use std::path::Path;
 
 use apxinf_core::{Error, Result};
-use minijinja::Environment;
+use minijinja::{Environment, Error as JinjaError, ErrorKind, State, Value};
 use serde::{Deserialize, Serialize};
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 #[cfg(feature = "sentencepiece")]
 use sentencepiece::SentencePieceProcessor;
+
+fn python_string_method(
+    _state: &State,
+    value: &Value,
+    method: &str,
+    args: &[Value],
+) -> std::result::Result<Value, JinjaError> {
+    if !matches!(method, "startswith" | "endswith") {
+        return Err(JinjaError::from(ErrorKind::UnknownMethod));
+    }
+    let source = value.as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string receiver"),
+        )
+    })?;
+    if args.len() != 1 {
+        return Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires exactly one argument"),
+        ));
+    }
+    let needle = args[0].as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string argument"),
+        )
+    })?;
+    Ok(Value::from(if method == "startswith" {
+        source.starts_with(needle)
+    } else {
+        source.ends_with(needle)
+    }))
+}
 
 /// Chat message for template rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +227,7 @@ impl Tokenizer {
 
         // Create environment and template on demand
         let mut env = Environment::new();
+        env.set_unknown_method_callback(python_string_method);
         env.add_template("chat", template_str)
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
@@ -239,35 +274,15 @@ impl Tokenizer {
             .render(context)
             .map_err(|e| Error::Other(format!("template render error: {e}")))?;
 
-        // Jinja2 in Python strips whitespace around control blocks, but minijinja doesn't.
-        // Normalize by collapsing all consecutive newlines to single newlines.
-        let mut normalized = String::new();
-        let mut prev_was_newline = false;
-        for c in result.trim().chars() {
-            if c == '\n' {
-                if !prev_was_newline {
-                    normalized.push('\n');
-                    prev_was_newline = true;
-                }
-            } else {
-                normalized.push(c);
-                prev_was_newline = false;
-            }
-        }
-
-        // Ensure trailing newline (matching PyTorch behavior)
-        if !normalized.ends_with('\n') {
-            normalized.push('\n');
-        }
-
-        Ok(normalized)
+        // Preserve the rendered message verbatim. Collapsing newlines changes
+        // user content and produces different token IDs from the HF template.
+        Ok(result)
     }
 
     /// Encode messages using chat template.
     /// Convenience method that applies template and encodes the result.
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let prompt = self.apply_chat_template(messages)?;
-        println!("Formatted prompt:\n{}", prompt);
         self.encode(&prompt)
     }
 }
@@ -350,5 +365,26 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
         assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
         assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn chat_template_preserves_message_newlines() {
+        let model = WordLevel::builder()
+            .vocab(HashMap::from([("[UNK]".to_string(), 0)]))
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(model),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ messages[0].content }}".to_string()),
+        };
+
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&[ChatMessage::user("first\n\nsecond")])
+                .unwrap(),
+            "first\n\nsecond"
+        );
     }
 }

@@ -372,6 +372,9 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
             }
             Tensor::from_f8_e4m3(vec![cols, rows], &dst)
         }
+        DType::I32 | DType::I64 => Err(Error::Other(
+            "π0-FAST linear weights do not support integer dtypes".into(),
+        )),
     }
 }
 
@@ -400,6 +403,9 @@ fn add_one(tensor: Tensor) -> Result<Tensor> {
         }
         DType::F8E4M3 => Err(Error::Other(
             "π0-FAST RMSNorm parameters cannot be stored as unscaled FP8".into(),
+        )),
+        DType::I32 | DType::I64 => Err(Error::Other(
+            "π0-FAST RMSNorm parameters cannot use integer dtypes".into(),
         )),
     }
 }

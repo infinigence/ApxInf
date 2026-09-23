@@ -2,6 +2,9 @@ mod bf16;
 mod fp8;
 mod plan;
 mod providers;
+mod marlin;
+mod w4a16;
+mod w8a16;
 mod w8a8;
 
 use std::cell::RefCell;
@@ -139,6 +142,9 @@ pub(crate) use plan::GemmPlanCache;
 pub use plan::{PlanSource, PreparedGemmPlan};
 
 pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
+pub use marlin::{w4a16_marlin_write, MarlinPreparedWeight, MarlinW4A16WeightView, MarlinWorkspace};
+pub use w4a16::{gemm_w4a16_m8_write as w4a16_m8_write, gemv_w4a16 as w4a16, gemv_w4a16_write as w4a16_write, gemv_w4a16_write_direct as w4a16_write_direct, W4A16Layout, W4A16WeightView};
+pub use w8a16::{gemv_w8a16_write as w8a16_write, W8A16WeightView};
 #[cfg(test)]
 pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
 pub use fp8::{

@@ -11,6 +11,7 @@ mod contracts;
 pub mod elementwise;
 pub mod embedding;
 pub mod fused;
+pub mod gdn;
 pub mod gdn_policy;
 pub mod gemm;
 pub mod linear_attention;
@@ -18,6 +19,8 @@ pub mod norm;
 pub mod preprocess;
 pub mod quantization;
 pub mod rope;
+pub mod qwen35_attention;
+pub mod qwen35_common;
 pub mod sampling;
 
 pub use crate::workspace::GraphWorkspace;

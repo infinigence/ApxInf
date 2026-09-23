@@ -721,6 +721,12 @@ extern "C" cudaError_t apxinf_flash_attn_decode_bf16(
             (const __nv_bfloat16*)v_cache, (__nv_bfloat16*)out,
             n_heads, n_kv_heads, bucket_kv_len, max_seq_len, scale,
             (const uint32_t*)pos_ptr);
+    } else if (head_dim == 256) {
+        flash_attn_decode_bf16_splitk_kernel<256, SPLITK_WARPS><<<grid, block, 0, s>>>(
+            (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache,
+            (const __nv_bfloat16*)v_cache, (__nv_bfloat16*)out,
+            n_heads, n_kv_heads, bucket_kv_len, max_seq_len, scale,
+            (const uint32_t*)pos_ptr);
     } else {
         return cudaErrorInvalidConfiguration;
     }

@@ -176,6 +176,7 @@ fn dtype_name(dtype: super::TuningDType) -> &'static str {
         super::TuningDType::F8E4M3 => "f8e4m3",
         super::TuningDType::I8 => "i8",
         super::TuningDType::I32 => "i32",
+        super::TuningDType::I64 => "i64",
     }
 }
 
