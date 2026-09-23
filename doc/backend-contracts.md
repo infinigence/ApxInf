@@ -72,6 +72,19 @@
 
 阶段二应在 mask 构建或内容更新时校验一次，CPU mask 在上传前校验，跨层复用不重复扫描。设备生成的 mask 由保证该数值契约的受控生成逻辑或显式设备值校验路径负责。校验不是永久有效的标记：任何内容更新（包括共享存储写入）都必须重新保证契约。debug/release 使用相同的显式校验语义，不用 debug-only 扫描掩盖缺失的检查。
 
+### 校验时机:计划期与热路径
+
+校验分成两层,避免把测试已能覆盖的确定性检查重复放进热路径。
+
+- **配置级**(计划期一次):dtype 集合、rank、`Hq % Hkv`、scale、mask 广播兼容、元素数与字节数溢出。这些只由模型 config 和组网结构决定,同一计划内每次调用结果相同,因此由 `AttentionPlan::new()` 在构建执行计划时验证一次。
+- **实例级**(每次调用):device、精确 shape、dtype、storage extent。这些必须对实际传入的 tensor 成立,由 `AttentionPlan::check_operands()` 用固定次数的比较完成,无 dim 循环、无分配。
+
+热路径经 `PortableOps::attention_planned(&plan, ...)` 分派;`attention()` 仍保留为便利入口,内部自行建计划后分派,适合非热路径与测试。计划不是可信标记:形状、dtype、options 或 mask 与计划不符一律报错,不会被静默复用。
+
+其余算子的输出校验改为惰性比较(`check_output` 接受迭代器),只在出错时才为错误消息分配。`validate_permutation`、`validate_concat`、`AxisSlice::validate`、`checked_bytes_iter` 是对应的无分配校验核心;返回 `Vec` 的 `permuted_shape`/`concatenated_shape`/`output_shape` 保留为计划期与测试用的便利封装。
+
+实测(PI0.5 decode 形状 B=1 Q=10 K=522 Hq=8 Hkv=1 D=256,release,两次运行取区间):每次全量校验约 55–57 ns → 计划期分派约 11–12 ns,快 4.5–5.4x;计划构建约 81–83 ns,摊到 36 层约 2.3 ns/op。作为对照,单次 CUDA kernel launch 约 3–10 μs,所以校验在改动前也只占约 1–2%;此处收益在于把重复的确定性检查移出热路径,而非解决瓶颈。`tests/portable_hot_path.rs` 固定这两条性质:分派路径零分配,且计划不可被静默误用。
+
 ### 融合分解与舍入位置
 
 PI0.5 style `[3D]` 顺序为 scale、shift、gate。AdaRMS 的数学表达为 `rms(x) * (1+scale) + shift`，gate-residual 为 `residual + gate*projection`。使用 `slice_axis` 取 style，broadcast 到 token 维后组合。为了匹配一次舍入的融合语义，可把输入、style 和 residual 转为 F32，在归一化/乘加完成后显式转回 BF16；不能简单串联多个 BF16 OP 后声称数值相同。

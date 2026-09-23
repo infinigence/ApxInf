@@ -57,6 +57,20 @@ pub fn checked_bytes(shape: &[usize], dtype: DType) -> Result<usize> {
         .ok_or(Error::Contract("output byte size overflow"))
 }
 
+/// Byte size of an output whose dims are produced lazily, so callers on hot paths
+/// never materialize the shape just to check it. Same rules as [`checked_bytes`].
+pub fn checked_bytes_iter(mut dims: impl Iterator<Item = usize>, dtype: DType) -> Result<usize> {
+    dims.try_fold(1usize, |n, d| {
+        if d == 0 {
+            return Err(Error::Contract("portable operators reject empty dimensions"));
+        }
+        n.checked_mul(d)
+            .ok_or(Error::Contract("shape element count overflow"))
+    })?
+    .checked_mul(dtype.size_in_bytes())
+    .ok_or(Error::Contract("output byte size overflow"))
+}
+
 /// Scalars are supported; empty dimensions and overflowing shapes are rejected.
 pub fn checked_elements(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
@@ -229,6 +243,151 @@ pub fn validate_mask_values(mask: &Tensor) -> Result<()> {
     Ok(())
 }
 
+/// A validated attention configuration, built once per execution plan.
+///
+/// Splits validation in two. Construction runs the **configuration-level** checks
+/// — dtype sets, rank, head grouping, scale, mask broadcast compatibility, element
+/// and byte overflow — which depend only on the model config and therefore cannot
+/// change between calls that share a plan. Dispatch then re-checks only the
+/// **instance-level** facts (device, exact shape, dtype, storage extent), which are
+/// a handful of comparisons with no loops over dims and no allocation.
+///
+/// This keeps the hot path cheap without trusting the caller: a plan built for one
+/// configuration cannot be silently used with tensors of another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttentionPlan {
+    device: Device,
+    dtype: DType,
+    scale_bits: u32,
+    scores: DType,
+    probabilities: DType,
+    q_dims: [usize; 4],
+    kv_dims: [usize; 4],
+    mask_dims: Option<[usize; 4]>,
+    q_bytes: usize,
+    kv_bytes: usize,
+    mask_bytes: usize,
+}
+
+impl AttentionPlan {
+    /// Run the full structural validation once. Cost is the same as
+    /// [`AttentionOptions::validate`]; amortize it over every call that reuses it.
+    pub fn new(
+        device: Device,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &AttentionOptions<'_>,
+    ) -> Result<Self> {
+        let out = options.validate(device, q, k, v)?;
+        let dtype = q.dtype();
+        checked_bytes(&out, dtype)?;
+        let dims = |t: &Tensor| -> [usize; 4] {
+            let d = t.shape().dims();
+            [d[0], d[1], d[2], d[3]]
+        };
+        let (mask_dims, mask_bytes) = match options.mask {
+            AttentionMask::Additive(m) => (Some(dims(m)), checked_bytes(m.shape().dims(), DType::F32)?),
+            _ => (None, 0),
+        };
+        Ok(Self {
+            device,
+            dtype,
+            scale_bits: options.scale.to_bits(),
+            scores: options.scores,
+            probabilities: options.probabilities,
+            q_dims: dims(q),
+            kv_dims: dims(k),
+            mask_dims,
+            q_bytes: checked_bytes(q.shape().dims(), dtype)?,
+            kv_bytes: checked_bytes(k.shape().dims(), dtype)?,
+            mask_bytes,
+        })
+    }
+
+    /// Output shape this plan guarantees (same as Q).
+    #[inline]
+    pub fn output_shape(&self) -> &[usize; 4] {
+        &self.q_dims
+    }
+
+    #[inline]
+    pub fn device(&self) -> Device {
+        self.device
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Per-call check that these operands match the configuration this plan was
+    /// validated for. Fixed number of comparisons, no allocation, no dim loops.
+    pub fn check_operands(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &AttentionOptions<'_>,
+    ) -> Result<()> {
+        if options.scale.to_bits() != self.scale_bits
+            || options.scores != self.scores
+            || options.probabilities != self.probabilities
+        {
+            return Err(Error::Contract("attention options differ from the plan"));
+        }
+        for (t, dims, bytes) in [
+            (q, &self.q_dims, self.q_bytes),
+            (k, &self.kv_dims, self.kv_bytes),
+            (v, &self.kv_dims, self.kv_bytes),
+        ] {
+            operand_matches(t, dims, self.dtype, self.device, bytes)?;
+        }
+        match (options.mask, self.mask_dims) {
+            (AttentionMask::Additive(m), Some(dims)) => {
+                operand_matches(m, &dims, DType::F32, self.device, self.mask_bytes)?
+            }
+            (AttentionMask::Additive(_), None) | (_, Some(_)) => {
+                return Err(Error::Contract("attention mask differs from the plan"))
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Shape/dtype/device/extent equality against a plan entry. No allocation.
+fn operand_matches(
+    t: &Tensor,
+    dims: &[usize; 4],
+    dtype: DType,
+    device: Device,
+    bytes: usize,
+) -> Result<()> {
+    if t.device() != device {
+        return Err(Error::DeviceMismatch {
+            expected: device,
+            got: t.device(),
+        });
+    }
+    if t.dtype() != dtype {
+        return Err(Error::DTypeMismatch {
+            expected: dtype,
+            got: t.dtype(),
+        });
+    }
+    if t.shape().dims() != dims {
+        return Err(shape_mismatch(dims, t.shape().dims()));
+    }
+    if t.storage().len() < bytes {
+        return Err(Error::DataLengthMismatch {
+            expected: bytes,
+            got: t.storage().len(),
+        });
+    }
+    Ok(())
+}
+
 /// A contiguous range along one axis; end is exclusive, no negative indexing.
 #[derive(Clone, Copy, Debug)]
 pub struct AxisSlice {
@@ -237,7 +396,9 @@ pub struct AxisSlice {
     pub end: usize,
 }
 impl AxisSlice {
-    pub fn output_shape(&self, shape: &[usize]) -> Result<Vec<usize>> {
+    /// Validate against `shape` and return the sliced axis length. Allocation-free,
+    /// so hot paths can validate without materializing the output shape.
+    pub fn validate(&self, shape: &[usize]) -> Result<usize> {
         checked_elements(shape)?;
         if self.axis >= shape.len() {
             return Err(Error::InvalidAxis {
@@ -250,8 +411,23 @@ impl AxisSlice {
                 "slice must be a non-empty in-bounds [start,end)",
             ));
         }
+        Ok(self.end - self.start)
+    }
+
+    /// Expected dim `i` of the slice output, without materializing the shape.
+    #[inline]
+    pub fn output_dim(&self, shape: &[usize], i: usize) -> usize {
+        if i == self.axis {
+            self.end - self.start
+        } else {
+            shape[i]
+        }
+    }
+
+    pub fn output_shape(&self, shape: &[usize]) -> Result<Vec<usize>> {
+        let len = self.validate(shape)?;
         let mut out = shape.to_vec();
-        out[self.axis] = self.end - self.start;
+        out[self.axis] = len;
         Ok(out)
     }
 }
@@ -272,26 +448,36 @@ pub fn broadcast_shape(source: &[usize], target: &[usize]) -> Result<()> {
     Ok(())
 }
 
-/// Permute axes then materialize a contiguous result (not a strided view).
-pub fn permuted_shape(shape: &[usize], axes: &[usize]) -> Result<Vec<usize>> {
+/// Validate that `axes` is a permutation of `0..shape.len()`. Allocation-free:
+/// ranks are small, so membership uses a bitmask rather than a heap `Vec<bool>`.
+pub fn validate_permutation(shape: &[usize], axes: &[usize]) -> Result<()> {
     checked_elements(shape)?;
     if axes.len() != shape.len() {
         return Err(shape_mismatch(shape, axes));
     }
-    let mut seen = vec![false; shape.len()];
-    let mut out = Vec::with_capacity(shape.len());
+    if shape.len() > usize::BITS as usize {
+        return Err(Error::Contract("permutation rank exceeds usize::BITS"));
+    }
+    let mut seen = 0usize;
     for &a in axes {
-        if a >= shape.len() || seen[a] {
+        if a >= shape.len() || seen & (1 << a) != 0 {
             return Err(Error::Contract("axes must be a permutation of 0..rank"));
         }
-        seen[a] = true;
-        out.push(shape[a]);
+        seen |= 1 << a;
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Permute axes then materialize a contiguous result (not a strided view).
+pub fn permuted_shape(shape: &[usize], axes: &[usize]) -> Result<Vec<usize>> {
+    validate_permutation(shape, axes)?;
+    Ok(axes.iter().map(|&a| shape[a]).collect())
 }
 
 /// Concatenate equal-rank shapes. Only the concatenation axis may differ.
-pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>> {
+/// Validate equal-rank concat inputs and return the summed axis length.
+/// Allocation-free, so hot paths skip materializing the output shape.
+pub fn validate_concat(shapes: &[&[usize]], axis: usize) -> Result<usize> {
     let first = *shapes
         .first()
         .ok_or(Error::Contract("concat requires at least one input"))?;
@@ -302,8 +488,7 @@ pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>
             ndim: first.len(),
         });
     }
-    let mut out = first.to_vec();
-    out[axis] = 0;
+    let mut total = 0usize;
     for shape in shapes {
         checked_elements(shape)?;
         if shape.len() != first.len()
@@ -315,10 +500,30 @@ pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>
         {
             return Err(shape_mismatch(first, shape));
         }
-        out[axis] = out[axis]
+        total = total
             .checked_add(shape[axis])
             .ok_or(Error::Contract("concat axis overflow"))?;
     }
-    checked_elements(&out)?;
+    // Guard the materialized element count, which exceeds any single input.
+    // Folded in place so the hot path never allocates a probe shape.
+    first
+        .iter()
+        .enumerate()
+        .try_fold(1usize, |n, (i, &d)| {
+            let d = if i == axis { total } else { d };
+            if d == 0 {
+                return Err(Error::Contract("portable operators reject empty dimensions"));
+            }
+            n.checked_mul(d)
+                .ok_or(Error::Contract("shape element count overflow"))
+        })?;
+    Ok(total)
+}
+
+/// Concatenate equal-rank shapes. Only the concatenation axis may differ.
+pub fn concatenated_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>> {
+    let total = validate_concat(shapes, axis)?;
+    let mut out = shapes[0].to_vec();
+    out[axis] = total;
     Ok(out)
 }

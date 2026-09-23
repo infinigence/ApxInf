@@ -507,3 +507,31 @@ fn output_byte_overflow_is_rejected_before_dispatch() {
         Err(Error::Contract("output byte size overflow"))
     ));
 }
+
+/// A plan is not a trust token: operands or options that differ from the
+/// configuration it was validated for must be rejected, not silently reused.
+#[test]
+fn plan_cannot_be_silently_reused_with_other_operands() {
+    let q = Tensor::zeros(vec![1, 10, 8, 256], DType::BF16);
+    let k = Tensor::zeros(vec![1, 522, 1, 256], DType::BF16);
+    let o = AttentionOptions::full(0.0625);
+    let plan = AttentionPlan::new(Device::Cpu, &q, &k, &k, &o).unwrap();
+
+    // Different Q length.
+    let other_len = Tensor::zeros(vec![1, 11, 8, 256], DType::BF16);
+    assert!(plan.check_operands(&other_len, &k, &k, &o).is_err());
+    // Different dtype.
+    let other_dtype = Tensor::zeros(vec![1, 10, 8, 256], DType::F32);
+    assert!(plan.check_operands(&other_dtype, &k, &k, &o).is_err());
+    // Different options (scale changed).
+    assert!(plan
+        .check_operands(&q, &k, &k, &AttentionOptions::full(0.5))
+        .is_err());
+    // A mask appearing where the plan had none.
+    let mask = Tensor::zeros(vec![1, 1, 10, 522], DType::F32);
+    let mut masked = AttentionOptions::full(0.0625);
+    masked.mask = AttentionMask::Additive(&mask);
+    assert!(plan.check_operands(&q, &k, &k, &masked).is_err());
+    // The configuration it was built for still passes.
+    plan.check_operands(&q, &k, &k, &o).unwrap();
+}

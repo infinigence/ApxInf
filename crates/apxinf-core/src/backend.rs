@@ -253,6 +253,18 @@ pub trait PortableOps {
     fn broadcast_to(&self, input: &Tensor, shape: &[usize]) -> Result<Tensor>;
     fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor,
                  options: &contracts::AttentionOptions<'_>) -> Result<Tensor>;
+
+    /// Dispatch against a plan validated once at plan-build time. The per-call
+    /// cost is a fixed set of comparisons (device, shape, dtype, extent) instead
+    /// of a full structural validation. Prefer this on hot paths.
+    fn attention_planned(
+        &self,
+        plan: &contracts::AttentionPlan,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &contracts::AttentionOptions<'_>,
+    ) -> Result<Tensor>;
 }
 
 /// Confirm an implementation honoured the contract it was given: exact shape and
@@ -260,20 +272,27 @@ pub trait PortableOps {
 /// claims. Cheap (rank-sized) and kept in release builds so a backend bug surfaces
 /// as an error rather than as silently misinterpreted downstream data.
 ///
+/// `expected` is an iterator so the caller never materializes the expected shape;
+/// a `Vec` is built only on the error path, to format the message.
+///
 /// Shape alone is not enough: a `cast` that returns its input unchanged preserves
 /// the shape while ignoring the requested dtype, and a short-storage result would
 /// be read out of bounds downstream.
-fn check_output(
+fn check_output<I>(
     op: &'static str,
     out: Tensor,
-    expected: &[usize],
+    expected: I,
     dtype: crate::DType,
     device: Device,
-) -> Result<Tensor> {
-    if out.shape().dims() != expected {
+) -> Result<Tensor>
+where
+    I: ExactSizeIterator<Item = usize> + Clone,
+{
+    let dims = out.shape().dims();
+    if dims.len() != expected.len() || !dims.iter().copied().eq(expected.clone()) {
         return Err(Error::ShapeMismatch {
-            expected: format!("{op} -> {expected:?}"),
-            got: format!("{:?}", out.shape().dims()),
+            expected: format!("{op} -> {:?}", expected.collect::<Vec<_>>()),
+            got: format!("{dims:?}"),
         });
     }
     if out.dtype() != dtype {
@@ -297,25 +316,22 @@ impl<B: Backend + ?Sized> PortableOps for B {
                 allowed: "f32, f16, bf16",
             });
         }
-        let expected = input.shape().dims().to_vec();
         // Output dtype may be wider than the input's, so re-check the byte extent.
-        contracts::checked_bytes(&expected, dtype)?;
-        check_output("cast", self.cast_impl(input, dtype)?, &expected, dtype, device)
+        contracts::checked_bytes(input.shape().dims(), dtype)?;
+        let out = self.cast_impl(input, dtype)?;
+        check_output("cast", out, input.shape().dims().iter().copied(), dtype, device)
     }
 
     fn slice_axis(&self, input: &Tensor, slice: contracts::AxisSlice) -> Result<Tensor> {
         // Layout ops preserve bits, so any dtype is admissible.
         let device = self.device();
+        let dims = input.shape().dims();
         contracts::tensor_storage(input, device)?;
-        let expected = slice.output_shape(input.shape().dims())?;
-        contracts::checked_bytes(&expected, input.dtype())?;
-        check_output(
-            "slice_axis",
-            self.slice_axis_impl(input, slice)?,
-            &expected,
-            input.dtype(),
-            device,
-        )
+        slice.validate(dims)?;
+        let expected = (0..dims.len()).map(|i| slice.output_dim(dims, i));
+        contracts::checked_bytes_iter(expected.clone(), input.dtype())?;
+        let out = self.slice_axis_impl(input, slice)?;
+        check_output("slice_axis", out, expected, input.dtype(), device)
     }
 
     fn concat_axis(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor> {
@@ -333,30 +349,23 @@ impl<B: Backend + ?Sized> PortableOps for B {
             }
         }
         let dims: Vec<&[usize]> = inputs.iter().map(|t| t.shape().dims()).collect();
-        let expected = contracts::concatenated_shape(&dims, axis)?;
-        // The concatenated result is larger than any single validated input.
-        contracts::checked_bytes(&expected, first.dtype())?;
-        check_output(
-            "concat_axis",
-            self.concat_axis_impl(inputs, axis)?,
-            &expected,
-            first.dtype(),
-            device,
-        )
+        let total = contracts::validate_concat(&dims, axis)?;
+        let base = first.shape().dims();
+        let expected = (0..base.len()).map(|i| if i == axis { total } else { base[i] });
+        contracts::checked_bytes_iter(expected.clone(), first.dtype())?;
+        let out = self.concat_axis_impl(inputs, axis)?;
+        check_output("concat_axis", out, expected, first.dtype(), device)
     }
 
     fn permute(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor> {
         let device = self.device();
+        let dims = input.shape().dims();
         contracts::tensor_storage(input, device)?;
-        let expected = contracts::permuted_shape(input.shape().dims(), axes)?;
-        contracts::checked_bytes(&expected, input.dtype())?;
-        check_output(
-            "permute",
-            self.permute_impl(input, axes)?,
-            &expected,
-            input.dtype(),
-            device,
-        )
+        contracts::validate_permutation(dims, axes)?;
+        let expected = axes.iter().map(|&a| dims[a]);
+        // Same element count as the validated input, so no byte re-check needed.
+        let out = self.permute_impl(input, axes)?;
+        check_output("permute", out, expected, input.dtype(), device)
     }
 
     fn broadcast_to(&self, input: &Tensor, shape: &[usize]) -> Result<Tensor> {
@@ -366,10 +375,11 @@ impl<B: Backend + ?Sized> PortableOps for B {
         // Broadcasting expands the element count, so the byte extent can overflow
         // even when the element count itself is representable.
         contracts::checked_bytes(shape, input.dtype())?;
+        let out = self.broadcast_to_impl(input, shape)?;
         check_output(
             "broadcast_to",
-            self.broadcast_to_impl(input, shape)?,
-            shape,
+            out,
+            shape.iter().copied(),
             input.dtype(),
             device,
         )
@@ -377,15 +387,26 @@ impl<B: Backend + ?Sized> PortableOps for B {
 
     fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor,
                  options: &contracts::AttentionOptions<'_>) -> Result<Tensor> {
-        let device = self.device();
-        let expected = options.validate(device, q, k, v)?;
-        contracts::checked_bytes(&expected, q.dtype())?;
+        let plan = contracts::AttentionPlan::new(self.device(), q, k, v, options)?;
+        self.attention_planned(&plan, q, k, v, options)
+    }
+
+    fn attention_planned(
+        &self,
+        plan: &contracts::AttentionPlan,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &contracts::AttentionOptions<'_>,
+    ) -> Result<Tensor> {
+        plan.check_operands(q, k, v, options)?;
+        let out = self.attention_impl(q, k, v, options)?;
         check_output(
             "attention",
-            self.attention_impl(q, k, v, options)?,
-            &expected,
-            q.dtype(),
-            device,
+            out,
+            plan.output_shape().iter().copied(),
+            plan.dtype(),
+            plan.device(),
         )
     }
 }
