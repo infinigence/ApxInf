@@ -364,7 +364,7 @@ fn legacy_defaults_report_unsupported_op_by_name() {
 /// A backend whose `cast_impl` ignores the requested dtype and echoes the input.
 /// Proves the public entry point rejects a wrong-dtype result even when the shape
 /// is correct — reproduces the reviewer's cast(F32 -> BF16) case.
-struct EchoCastBackend;
+struct EchoCastBackend(Device);
 impl apxinf_core::SamplingBackend for EchoCastBackend {
     fn create_token_sampler(
         &self,
@@ -380,6 +380,16 @@ impl apxinf_core::SamplingBackend for EchoCastBackend {
     }
 }
 impl Backend for EchoCastBackend {
+    fn attention_impl(
+        &self,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+        _: &AttentionOptions<'_>,
+    ) -> Result<Tensor, Error> {
+        panic!("invalid planned attention must be rejected before dispatch");
+    }
+
     // The one misbehaving hook: returns the input verbatim, ignoring `dtype`.
     fn cast_impl(&self, input: &Tensor, _dtype: DType) -> Result<Tensor, Error> {
         input.reshape(input.shape().dims().to_vec())
@@ -463,7 +473,7 @@ impl Backend for EchoCastBackend {
         unimplemented!()
     }
     fn device(&self) -> Device {
-        Device::Cpu
+        self.0
     }
     fn to_device(&self, _t: &Tensor) -> Result<Tensor, Error> {
         unimplemented!()
@@ -480,7 +490,7 @@ impl Backend for EchoCastBackend {
 /// Without the dtype check the public `cast` entry would return success.
 #[test]
 fn output_check_rejects_wrong_dtype_even_when_shape_matches() {
-    let b: &dyn Backend = &EchoCastBackend;
+    let b: &dyn Backend = &EchoCastBackend(Device::Cpu);
     let x = t(&[2, 3]);
     // Shape is preserved, so a shape-only check would pass; dtype is still F32.
     assert!(matches!(
@@ -534,4 +544,77 @@ fn plan_cannot_be_silently_reused_with_other_operands() {
     assert!(plan.check_operands(&q, &k, &k, &masked).is_err());
     // The configuration it was built for still passes.
     plan.check_operands(&q, &k, &k, &o).unwrap();
+}
+
+#[test]
+fn planned_attention_rejects_other_backend_device_before_dispatch() {
+    let q = t(&[1, 2, 1, 4]);
+    let options = AttentionOptions::full(0.5);
+    let plan = AttentionPlan::new(Device::Cpu, &q, &q, &q, &options).unwrap();
+    let backend: &dyn Backend = &EchoCastBackend(Device::Cuda(0));
+    assert!(matches!(
+        backend.attention_planned(&plan, &q, &q, &q, &options),
+        Err(Error::DeviceMismatch {
+            expected: Device::Cuda(0),
+            got: Device::Cpu
+        })
+    ));
+    assert!(matches!(
+        CpuBackend.attention_planned(&plan, &q, &q, &q, &options),
+        Err(Error::UnsupportedOp("attention"))
+    ));
+}
+
+#[test]
+fn planned_attention_preserves_mask_kind_and_causal_offsets() {
+    let q = t(&[1, 2, 1, 4]);
+    let bias = t(&[1, 1, 2, 2]);
+    let masks = [
+        AttentionMask::Full,
+        AttentionMask::Causal {
+            q_start: 0,
+            k_start: 0,
+        },
+        AttentionMask::Causal {
+            q_start: 1,
+            k_start: 0,
+        },
+        AttentionMask::Causal {
+            q_start: 0,
+            k_start: 1,
+        },
+        AttentionMask::Additive(&bias),
+    ];
+    for (i, &mask) in masks.iter().enumerate() {
+        let options = AttentionOptions {
+            mask,
+            ..AttentionOptions::full(0.5)
+        };
+        let plan = AttentionPlan::new(Device::Cpu, &q, &q, &q, &options).unwrap();
+        for (j, &other) in masks.iter().enumerate() {
+            let changed = AttentionOptions {
+                mask: other,
+                ..options
+            };
+            assert_eq!(plan.check_operands(&q, &q, &q, &changed).is_ok(), i == j);
+        }
+        for mask in [
+            AttentionMask::Causal {
+                q_start: usize::MAX,
+                k_start: 0,
+            },
+            AttentionMask::Causal {
+                q_start: 0,
+                k_start: usize::MAX,
+            },
+        ] {
+            let changed = AttentionOptions { mask, ..options };
+            assert!(changed.validate(Device::Cpu, &q, &q, &q).is_err());
+            assert!(plan.check_operands(&q, &q, &q, &changed).is_err());
+            assert!(matches!(
+                EchoCastBackend(Device::Cpu).attention_planned(&plan, &q, &q, &q, &changed),
+                Err(Error::Contract(_))
+            ));
+        }
+    }
 }

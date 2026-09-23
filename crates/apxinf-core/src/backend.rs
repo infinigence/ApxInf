@@ -399,6 +399,13 @@ impl<B: Backend + ?Sized> PortableOps for B {
         v: &Tensor,
         options: &contracts::AttentionOptions<'_>,
     ) -> Result<Tensor> {
+        let device = self.device();
+        if plan.device() != device {
+            return Err(Error::DeviceMismatch {
+                expected: device,
+                got: plan.device(),
+            });
+        }
         plan.check_operands(q, k, v, options)?;
         let out = self.attention_impl(q, k, v, options)?;
         check_output(
@@ -406,7 +413,7 @@ impl<B: Backend + ?Sized> PortableOps for B {
             out,
             plan.output_shape().iter().copied(),
             plan.dtype(),
-            plan.device(),
+            device,
         )
     }
 }

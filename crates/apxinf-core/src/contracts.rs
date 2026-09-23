@@ -62,7 +62,9 @@ pub fn checked_bytes(shape: &[usize], dtype: DType) -> Result<usize> {
 pub fn checked_bytes_iter(mut dims: impl Iterator<Item = usize>, dtype: DType) -> Result<usize> {
     dims.try_fold(1usize, |n, d| {
         if d == 0 {
-            return Err(Error::Contract("portable operators reject empty dimensions"));
+            return Err(Error::Contract(
+                "portable operators reject empty dimensions",
+            ));
         }
         n.checked_mul(d)
             .ok_or(Error::Contract("shape element count overflow"))
@@ -243,6 +245,13 @@ pub fn validate_mask_values(mask: &Tensor) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlannedMask {
+    Full,
+    Causal { q_start: usize, k_start: usize },
+    Additive { dims: [usize; 4] },
+}
+
 /// A validated attention configuration, built once per execution plan.
 ///
 /// Splits validation in two. Construction runs the **configuration-level** checks
@@ -254,6 +263,8 @@ pub fn validate_mask_values(mask: &Tensor) -> Result<()> {
 ///
 /// This keeps the hot path cheap without trusting the caller: a plan built for one
 /// configuration cannot be silently used with tensors of another.
+/// Mask kind and causal offsets are fixed by the plan. Changing either requires
+/// a new plan so causal position overflow is checked again at construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AttentionPlan {
     device: Device,
@@ -263,7 +274,7 @@ pub struct AttentionPlan {
     probabilities: DType,
     q_dims: [usize; 4],
     kv_dims: [usize; 4],
-    mask_dims: Option<[usize; 4]>,
+    mask: PlannedMask,
     q_bytes: usize,
     kv_bytes: usize,
     mask_bytes: usize,
@@ -286,9 +297,15 @@ impl AttentionPlan {
             let d = t.shape().dims();
             [d[0], d[1], d[2], d[3]]
         };
-        let (mask_dims, mask_bytes) = match options.mask {
-            AttentionMask::Additive(m) => (Some(dims(m)), checked_bytes(m.shape().dims(), DType::F32)?),
-            _ => (None, 0),
+        let (mask, mask_bytes) = match options.mask {
+            AttentionMask::Additive(m) => (
+                PlannedMask::Additive { dims: dims(m) },
+                checked_bytes(m.shape().dims(), DType::F32)?,
+            ),
+            AttentionMask::Full => (PlannedMask::Full, 0),
+            AttentionMask::Causal { q_start, k_start } => {
+                (PlannedMask::Causal { q_start, k_start }, 0)
+            }
         };
         Ok(Self {
             device,
@@ -298,7 +315,7 @@ impl AttentionPlan {
             probabilities: options.probabilities,
             q_dims: dims(q),
             kv_dims: dims(k),
-            mask_dims,
+            mask,
             q_bytes: checked_bytes(q.shape().dims(), dtype)?,
             kv_bytes: checked_bytes(k.shape().dims(), dtype)?,
             mask_bytes,
@@ -343,14 +360,19 @@ impl AttentionPlan {
         ] {
             operand_matches(t, dims, self.dtype, self.device, bytes)?;
         }
-        match (options.mask, self.mask_dims) {
-            (AttentionMask::Additive(m), Some(dims)) => {
+        match (options.mask, self.mask) {
+            (AttentionMask::Additive(m), PlannedMask::Additive { dims }) => {
                 operand_matches(m, &dims, DType::F32, self.device, self.mask_bytes)?
             }
-            (AttentionMask::Additive(_), None) | (_, Some(_)) => {
-                return Err(Error::Contract("attention mask differs from the plan"))
-            }
-            _ => {}
+            (AttentionMask::Full, PlannedMask::Full) => {}
+            (
+                AttentionMask::Causal { q_start, k_start },
+                PlannedMask::Causal {
+                    q_start: planned_q,
+                    k_start: planned_k,
+                },
+            ) if q_start == planned_q && k_start == planned_k => {}
+            _ => return Err(Error::Contract("attention mask differs from the plan")),
         }
         Ok(())
     }
@@ -506,17 +528,16 @@ pub fn validate_concat(shapes: &[&[usize]], axis: usize) -> Result<usize> {
     }
     // Guard the materialized element count, which exceeds any single input.
     // Folded in place so the hot path never allocates a probe shape.
-    first
-        .iter()
-        .enumerate()
-        .try_fold(1usize, |n, (i, &d)| {
-            let d = if i == axis { total } else { d };
-            if d == 0 {
-                return Err(Error::Contract("portable operators reject empty dimensions"));
-            }
-            n.checked_mul(d)
-                .ok_or(Error::Contract("shape element count overflow"))
-        })?;
+    first.iter().enumerate().try_fold(1usize, |n, (i, &d)| {
+        let d = if i == axis { total } else { d };
+        if d == 0 {
+            return Err(Error::Contract(
+                "portable operators reject empty dimensions",
+            ));
+        }
+        n.checked_mul(d)
+            .ok_or(Error::Contract("shape element count overflow"))
+    })?;
     Ok(total)
 }
 

@@ -55,21 +55,51 @@ fn dispatch_path_does_not_allocate() {
         "planned attention dispatch must not allocate"
     );
 
+    let bias = Tensor::zeros(vec![1, 1, 10, 522], DType::F32);
+    for mask in [
+        AttentionMask::Causal {
+            q_start: 512,
+            k_start: 0,
+        },
+        AttentionMask::Additive(&bias),
+    ] {
+        let options = AttentionOptions { mask, ..o };
+        let plan = AttentionPlan::new(Device::Cpu, &q, &k, &k, &options).unwrap();
+        assert_eq!(
+            allocations(|| plan.check_operands(&q, &k, &k, &options).unwrap()),
+            0
+        );
+    }
+
     let x = Tensor::zeros(vec![2, 3, 4], DType::F32);
     let dims = x.shape().dims();
     assert_eq!(
-        allocations(|| { validate_permutation(dims, &[2, 0, 1]).unwrap(); }),
+        allocations(|| {
+            validate_permutation(dims, &[2, 0, 1]).unwrap();
+        }),
         0
     );
-    assert_eq!(allocations(|| { validate_concat(&[dims, dims], 0).unwrap(); }), 0);
+    assert_eq!(
+        allocations(|| {
+            validate_concat(&[dims, dims], 0).unwrap();
+        }),
+        0
+    );
     let slice = AxisSlice {
         axis: 1,
         start: 0,
         end: 2,
     };
-    assert_eq!(allocations(|| { slice.validate(dims).unwrap(); }), 0);
     assert_eq!(
-        allocations(|| { checked_bytes_iter([2usize, 3, 4].into_iter(), DType::F32).unwrap(); }),
+        allocations(|| {
+            slice.validate(dims).unwrap();
+        }),
+        0
+    );
+    assert_eq!(
+        allocations(|| {
+            checked_bytes_iter([2usize, 3, 4].into_iter(), DType::F32).unwrap();
+        }),
         0
     );
 }
