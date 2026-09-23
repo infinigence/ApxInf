@@ -20,15 +20,29 @@ fn python_string_method(
     if !matches!(method, "startswith" | "endswith") {
         return Err(JinjaError::from(ErrorKind::UnknownMethod));
     }
-    let source = value.as_str().ok_or_else(|| JinjaError::new(
-        ErrorKind::InvalidOperation, format!("{method} requires a string receiver")))?;
+    let source = value.as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string receiver"),
+        )
+    })?;
     if args.len() != 1 {
-        return Err(JinjaError::new(ErrorKind::InvalidOperation,
-            format!("{method} requires exactly one argument")));
+        return Err(JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires exactly one argument"),
+        ));
     }
-    let needle = args[0].as_str().ok_or_else(|| JinjaError::new(
-        ErrorKind::InvalidOperation, format!("{method} requires a string argument")))?;
-    Ok(Value::from(if method == "startswith" { source.starts_with(needle) } else { source.ends_with(needle) }))
+    let needle = args[0].as_str().ok_or_else(|| {
+        JinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("{method} requires a string argument"),
+        )
+    })?;
+    Ok(Value::from(if method == "startswith" {
+        source.starts_with(needle)
+    } else {
+        source.ends_with(needle)
+    }))
 }
 
 /// Chat message for template rendering.
@@ -269,7 +283,6 @@ impl Tokenizer {
     /// Convenience method that applies template and encodes the result.
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let prompt = self.apply_chat_template(messages)?;
-        println!("Formatted prompt:\n{}", prompt);
         self.encode(&prompt)
     }
 }
@@ -368,7 +381,9 @@ mod tests {
         };
 
         assert_eq!(
-            tokenizer.apply_chat_template(&[ChatMessage::user("first\n\nsecond")]).unwrap(),
+            tokenizer
+                .apply_chat_template(&[ChatMessage::user("first\n\nsecond")])
+                .unwrap(),
             "first\n\nsecond"
         );
     }
