@@ -27,6 +27,64 @@ fn silu_ref(x: f32) -> f32 {
     x / (1.0f32 + (-x).exp())
 }
 
+#[test]
+fn flash_decode_bf16_head256_handles_short_and_padded_kv() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kv_heads, head_dim, max_seq_len) = (24, 4, 256, 8);
+    let query = upload_fp32_as_bf16(&ctx, &vec![0.0; heads * head_dim], vec![heads, head_dim])
+        .unwrap();
+    let key = upload_fp32_as_bf16(
+        &ctx,
+        &vec![0.0; kv_heads * max_seq_len * head_dim],
+        vec![kv_heads, max_seq_len, head_dim],
+    )
+    .unwrap();
+    let values = (0..kv_heads * max_seq_len * head_dim)
+        .map(|index| ((index / head_dim) % max_seq_len + 1) as f32)
+        .collect::<Vec<_>>();
+    let value = upload_fp32_as_bf16(
+        &ctx,
+        &values,
+        vec![kv_heads, max_seq_len, head_dim],
+    )
+    .unwrap();
+    let query = CudaBuffer::from_tensor(&query).unwrap();
+    let key = CudaBuffer::from_tensor(&key).unwrap();
+    let value = CudaBuffer::from_tensor(&value).unwrap();
+    let position = HostMappedBuffer::alloc(4, ctx.device_id()).unwrap();
+
+    for (token_position, bucket, expected) in [(0_u32, 1_usize, 1.0_f32), (4, 8, 3.0)] {
+        position.write_u32(token_position).unwrap();
+        let output = CudaBuffer::alloc(
+            heads * head_dim * DType::BF16.size_in_bytes(),
+            ctx.device_id(),
+        )
+        .unwrap();
+        crate::kernels::attention::flash_bf16_into(
+            &ctx,
+            &query,
+            &key,
+            &value,
+            &output,
+            heads,
+            kv_heads,
+            head_dim,
+            bucket,
+            max_seq_len,
+            (head_dim as f32).sqrt().recip(),
+            position.address(),
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        let actual = download_bf16_as_fp32(
+            &output.into_tensor(Shape::new(vec![heads, head_dim]), DType::BF16),
+        )
+        .unwrap();
+        assert!(actual.iter().all(|x| x.is_finite()));
+        assert_bf16_close_reduction(&actual, &vec![expected; heads * head_dim]);
+    }
+}
+
 #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
 #[test]
 fn sdpa_fa2_prefill_supports_direct_output_projection() {
