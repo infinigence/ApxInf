@@ -416,6 +416,19 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16(
     const void* residual, const void* norm_weight, const void* norm_bias,
     void* hidden, void* normalized, int rows, int cols, float eps,
     cudaStream_t stream) {
+  // Qwen-Drive vision uses 1024 columns and no projection bias. Retain the
+  // original generic kernel for every other call shape or bias mode.
+  if (cols == 1024 && projection_bias == nullptr) {
+    bias_residual_layer_norm_bf16_carry_1024_kernel<<<rows, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projection),
+        nullptr,
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(norm_weight),
+        static_cast<const __nv_bfloat16*>(norm_bias),
+        static_cast<__nv_bfloat16*>(hidden),
+        static_cast<__nv_bfloat16*>(normalized), rows, cols, eps);
+    return cudaGetLastError();
+  }
   bias_residual_layer_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(projection_bias),
@@ -550,7 +563,9 @@ extern "C" cudaError_t apxinf_static_vision_qkv_rope_bf16(
       !(theta > 0.0f)) {
     return cudaErrorInvalidValue;
   }
-  vision_qkv_rope_kernel<__nv_bfloat16><<<tokens, kThreads, 0, stream>>>(
+  // Two axes of head_dim/4 rotations, held as sine then cosine.
+  const size_t rope_smem = static_cast<size_t>(head_dim) * sizeof(float);
+  vision_qkv_rope_kernel<__nv_bfloat16><<<tokens, kThreads, rope_smem, stream>>>(
       static_cast<const __nv_bfloat16*>(qkv),
       static_cast<const __nv_bfloat16*>(bias), position_ids,
       static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),
@@ -568,7 +583,8 @@ extern "C" cudaError_t apxinf_static_vision_qkv_rope_f16(
       !(theta > 0.0f)) {
     return cudaErrorInvalidValue;
   }
-  vision_qkv_rope_kernel<half><<<tokens, kThreads, 0, stream>>>(
+  const size_t rope_smem = static_cast<size_t>(head_dim) * sizeof(float);
+  vision_qkv_rope_kernel<half><<<tokens, kThreads, rope_smem, stream>>>(
       static_cast<const half*>(qkv),
       static_cast<const __nv_bfloat16*>(bias), position_ids,
       static_cast<__nv_bfloat16*>(q), static_cast<__nv_bfloat16*>(k),

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rms_reduction.cuh"
+
 // Copyright 2026 apxinf contributors.
 // Pure CUDA operators grouped by physical operation; launch policy lives under adapters/.
 
@@ -769,6 +771,53 @@ __global__ void bias_residual_layer_norm_bf16_kernel(
   }
 }
 
+// Exact 1024-column vision shape: each of 256 threads retains its four
+// explicitly rounded BF16 hidden values across the original two reductions.
+__global__ __launch_bounds__(256) void bias_residual_layer_norm_bf16_carry_1024_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_bfloat16* normalized, int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * 1024;
+  float rounded_values[4];
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * 256;
+    const int64_t index = base + col;
+    float value = __bfloat162float(projection[index]) +
+                  __bfloat162float(residual[index]);
+    if (projection_bias != nullptr) value += __bfloat162float(projection_bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[index] = rounded;
+    rounded_values[i] = __bfloat162float(rounded);
+    sum += rounded_values[i];
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float centered = rounded_values[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * 256;
+    const int64_t index = base + col;
+    const float value =
+        (rounded_values[i] - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]);
+    normalized[index] = __float2bfloat16(value);
+  }
+}
+
+
 __global__ void ada_gate_residual_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* residual,
     const __nv_bfloat16* style, __nv_bfloat16* output,
@@ -973,6 +1022,29 @@ __global__ void vision_qkv_rope_kernel(
   const int fused_width = 3 * projection_width;
   const int pairs_per_projection = heads * half_dim;
 
+  // The rotation a pair receives depends on its axis and its index within that
+  // axis, and on the token's position -- and the token is the block, so the
+  // whole block draws on two positions and half_dim/2 frequencies. Each work
+  // item was computing its own powf and sincosf for one of those few values:
+  // at the shipped vision shape that is 1024 work items over 32 distinct
+  // rotations, every one of them through a transcendental pair.
+  //
+  // Build the table once per block instead. Same expression, same inputs, so
+  // each rotation is bit-for-bit the value the per-item form produced.
+  extern __shared__ float rope_smem[];
+  const int quarter = half_dim / 2;
+  float* rope_sin = rope_smem;              // [2][quarter]
+  float* rope_cos = rope_smem + 2 * quarter;
+  for (int slot = threadIdx.x; slot < 2 * quarter; slot += blockDim.x) {
+    const int axis = slot / quarter;
+    const int pair_in_axis = slot - axis * quarter;
+    const float position = static_cast<float>(position_ids[token * 2 + axis]);
+    const float frequency =
+        powf(theta, -2.0f * static_cast<float>(pair_in_axis) / half_dim);
+    sincosf(position * frequency, &rope_sin[slot], &rope_cos[slot]);
+  }
+  __syncthreads();
+
   for (int work = threadIdx.x; work < 2 * pairs_per_projection;
        work += blockDim.x) {
     const bool is_key = work >= pairs_per_projection;
@@ -990,13 +1062,10 @@ __global__ void vision_qkv_rope_kernel(
     }
     first = __bfloat162float(__float2bfloat16(first));
     second = __bfloat162float(__float2bfloat16(second));
-    const int axis = pair < half_dim / 2 ? 0 : 1;
-    const int pair_in_axis = pair < half_dim / 2 ? pair : pair - half_dim / 2;
-    const float position = static_cast<float>(position_ids[token * 2 + axis]);
-    const float frequency =
-        powf(theta, -2.0f * static_cast<float>(pair_in_axis) / half_dim);
-    float sine, cosine;
-    sincosf(position * frequency, &sine, &cosine);
+    const int axis = pair < quarter ? 0 : 1;
+    const int slot = axis * quarter + (pair < quarter ? pair : pair - quarter);
+    const float sine = rope_sin[slot];
+    const float cosine = rope_cos[slot];
     __nv_bfloat16* destination = (is_key ? k : q) +
         (token * heads + head) * head_dim;
     destination[pair] = __float2bfloat16(first * cosine - second * sine);
@@ -1009,5 +1078,55 @@ __global__ void vision_qkv_rope_kernel(
     float value = qkv_input_as_bf16(qkv[source]);
     if (bias != nullptr) value += __bfloat162float(bias[2 * projection_width + col]);
     v[token * projection_width + col] = __float2bfloat16(value);
+  }
+}
+
+// Weighted adaLN with unit-offset gate and explicit BF16 arithmetic boundaries.
+__global__ void adaln_gate_residual_rms_bf16_kernel(
+    const __nv_bfloat16* proj, const __nv_bfloat16* residual,
+    const __nv_bfloat16* gate, const __nv_bfloat16* weight,
+    const __nv_bfloat16* scale, const __nv_bfloat16* shift,
+    __nv_bfloat16* hidden, __nv_bfloat16* out, int cols, float eps) {
+  const int row = blockIdx.x;
+  extern __shared__ float la_adaln[];
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float partial = 0.0f;
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float multiplier = __bfloat162float(
+        __float2bfloat16(1.0f + __bfloat162float(gate[i])));
+    const float projected = __bfloat162float(
+        __float2bfloat16(__bfloat162float(proj[base + i]) * multiplier));
+    const __nv_bfloat16 rounded =
+        __float2bfloat16(__bfloat162float(residual[base + i]) + projected);
+    hidden[base + i] = rounded;
+    const float v = __bfloat162float(rounded);
+    la_adaln[i] = v;
+    partial += v * v;
+  }
+  __shared__ float warp_sums[32];
+  for (int offset = 16; offset > 0; offset >>= 1)
+    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_sums[warp] = partial;
+  __syncthreads();
+  if (warp == 0) {
+    float v = (lane < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+      v += __shfl_xor_sync(0xffffffff, v, offset);
+    if (lane == 0) warp_sums[0] = v;
+  }
+  __syncthreads();
+  float mean = warp_sums[0] / cols;
+  if (gridDim.x >= 16 && cols > 128 && cols % 4 == 0)
+    mean = rms_vector_square_mean_bf16(hidden + base, cols);
+  const float rms = rsqrtf(__fadd_rn(mean, eps));
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    const float normed = __bfloat162float(__float2bfloat16(
+        la_adaln[i] * rms * __bfloat162float(weight[i])));
+    const float multiplier = __bfloat162float(
+        __float2bfloat16(1.0f + __bfloat162float(scale[i])));
+    const float scaled = __bfloat162float(__float2bfloat16(normed * multiplier));
+    out[base + i] = __float2bfloat16(scaled + __bfloat162float(shift[i]));
   }
 }

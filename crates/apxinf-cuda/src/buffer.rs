@@ -304,6 +304,55 @@ impl CudaBuffer {
         Ok(())
     }
 
+    /// Fill `height` runs of `width` bytes, the first at `offset` and each
+    /// `pitch` bytes after the last.
+    ///
+    /// A caller that owns a `[groups, rows, cols]` region and only needs the
+    /// trailing rows cleared writes the tail directly instead of the whole
+    /// allocation; the difference is the ratio of padding to payload.
+    pub fn memset_2d_async(
+        &self,
+        value: i32,
+        offset: usize,
+        pitch: usize,
+        width: usize,
+        height: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if width > pitch {
+            return Err(format!("memset2d width {width} exceeds pitch {pitch}"));
+        }
+        let span = match height.checked_sub(1).and_then(|last| {
+            last.checked_mul(pitch)
+                .and_then(|skip| skip.checked_add(width))
+                .and_then(|end| end.checked_add(offset))
+        }) {
+            Some(span) => span,
+            None if height == 0 => return Ok(()),
+            None => return Err("memset2d extent overflow".into()),
+        };
+        if span > self.len {
+            return Err(format!(
+                "memset2d of {height}x{width} bytes at {offset} exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        if width == 0 {
+            return Ok(());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset2DAsync(
+                (self.ptr as *mut u8).add(offset) as *mut std::ffi::c_void,
+                pitch,
+                value,
+                width,
+                height,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Allocate and fill every byte with `value`.
     ///
     /// Used to poison operator outputs under test: 0xFF is NaN at every float

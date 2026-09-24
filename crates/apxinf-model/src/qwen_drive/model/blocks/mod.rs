@@ -23,3 +23,9 @@ pub(crate) trait GdnExecution {
         eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
     ) -> Result<(Tensor, bool)>;
 }
+/// Execute one phase of a whole-model direct plan. The runner may reuse a
+/// workspace between these sequential computations, so cross-phase values are
+/// in persistent storage before the callback returns.
+pub(crate) trait DirectExecution {
+    fn run(&mut self, operation: &mut dyn FnMut() -> Result<Tensor>) -> Result<Tensor>;
+}

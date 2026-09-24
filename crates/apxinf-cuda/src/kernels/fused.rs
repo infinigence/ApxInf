@@ -1,6 +1,6 @@
 //! Fused multi-operator contracts used by static inference plans.
 
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::contracts::{
     bf16_output, f16_output, fp8_output, gpu_ptr, make_gpu_tensor, matrix_shape, matrix_tensor,
@@ -1122,4 +1122,78 @@ pub fn adaptive_gate_residual_f16(
         ctx.device_id(),
         output,
     ))
+}
+
+/// Unit-offset gated residual followed by weighted adaptive RMSNorm.
+/// Preserves BF16 rounding after (1 + gate), gate multiplication, residual add,
+/// weighted normalization, (1 + scale), scale multiplication and shift addition.
+/// Returns the residual as well as normalized rows for the next sublayer.
+#[allow(clippy::too_many_arguments)]
+pub fn adaln_gate_residual_rms_bf16(
+    ctx: &CudaContext,
+    projection: &Tensor,
+    residual: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    scale: &Tensor,
+    shift: &Tensor,
+    eps: f32,
+) -> Result<ResidualNormTensors> {
+    let (rows, cols) = matrix_shape(projection, "weighted AdaLN residual")?;
+    if rows == 0
+        || cols == 0
+        || cols > 8192
+        || !eps.is_finite()
+        || eps <= 0.0
+        || projection.shape() != residual.shape()
+        || [gate, weight, scale, shift]
+            .iter()
+            .any(|t| t.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "weighted AdaLN residual shape/epsilon unsupported".into(),
+        ));
+    }
+    for t in [projection, residual, gate, weight, scale, shift] {
+        if t.dtype() != DType::BF16 || t.device() != Device::Cuda(ctx.device_id()) {
+            return Err(Error::Other(
+                "weighted AdaLN residual requires BF16 on the context device".into(),
+            ));
+        }
+        let bytes = super::contracts::checked_bytes(
+            DType::BF16,
+            t.shape().dims(),
+            "weighted AdaLN residual",
+        )?;
+        let buffer = crate::buffer::CudaBuffer::from_tensor(t).map_err(Error::Cuda)?;
+        super::contracts::require_buffers(
+            ctx,
+            "weighted AdaLN residual",
+            &[("input", &buffer, bytes)],
+        )?;
+    }
+    let m = i32::try_from(rows).map_err(|_| Error::Other("AdaLN row count overflow".into()))?;
+    let hidden = bf16_output(ctx, rows, cols)?;
+    let normalized = bf16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_adaln_gate_residual_rms_bf16(
+            gpu_ptr(projection)?,
+            gpu_ptr(residual)?,
+            gpu_ptr(gate)?,
+            gpu_ptr(weight)?,
+            gpu_ptr(scale)?,
+            gpu_ptr(shift)?,
+            hidden.ptr(),
+            normalized.ptr(),
+            m,
+            cols as i32,
+            eps,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(ResidualNormTensors {
+        hidden: matrix_tensor(ctx, rows, cols, hidden),
+        normalized: matrix_tensor(ctx, rows, cols, normalized),
+    })
 }

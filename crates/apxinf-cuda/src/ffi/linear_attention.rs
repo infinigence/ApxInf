@@ -71,6 +71,22 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_static_gdn_qk_prep_qk_bf16(
+        conv_out: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        seq: i32,
+        seq_pad: i32,
+        conv_dim: i32,
+        key_dim: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        scale: f32,
+        eps: f32,
+        recurrent: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
     pub fn apxinf_static_gdn_vb_prep_bf16(
         conv_out: *const c_void,
         b_proj: *const c_void,
@@ -87,6 +103,19 @@ extern "C" {
         num_v_heads: i32,
         ba_row_stride: i32,
         head_v_dim: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_gdn_gate_prep_bf16(
+        b_proj: *const c_void,
+        a_proj: *const c_void,
+        dt_bias: *const c_void,
+        a_log: *const c_void,
+        beta_out: *mut c_void,
+        g_out: *mut c_void,
+        seq: i32,
+        seq_pad: i32,
+        num_v_heads: i32,
+        ba_row_stride: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_gdn_cumsum_f32(
@@ -112,6 +141,22 @@ extern "C" {
         policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_static_gdn_attn_raw_solve_f1_qk_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        beta: *const c_void,
+        g_cum: *const c_void,
+        a_out: *mut c_void,
+        t_out: *mut c_void,
+        seq_pad: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        chunk_size: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
     pub fn apxinf_static_gdn_tri_solve_f32(
         a: *mut c_void,
         matrices: i32,
@@ -136,7 +181,50 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_static_gdn_chunk_gemm_tri_k_bf16_direct_v(
+        a: *const c_void,
+        conv_out: *const c_void,
+        k: *const c_void,
+        beta: *const c_void,
+        g_cum: *const c_void,
+        vt_out: *mut c_void,
+        kcd_out: *mut c_void,
+        seq: i32,
+        seq_pad: i32,
+        conv_dim: i32,
+        v_offset: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        chunk_size: i32,
+        policy: *const GdnLaunchPolicy,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn apxinf_static_gdn_chunk_state_f32(
+        q: *const c_void,
+        k: *const c_void,
+        g_cum: *const c_void,
+        t_in: *const c_void,
+        vt_in: *const c_void,
+        kcd_in: *const c_void,
+        state: *mut c_void,
+        out: *mut c_void,
+        seq: i32,
+        seq_pad: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        chunk_size: i32,
+        total_chunks: i32,
+        out_row_width: i32,
+        policy: *const GdnLaunchPolicy,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn apxinf_static_gdn_chunk_state_qk_bf16(
         q: *const c_void,
         k: *const c_void,
         g_cum: *const c_void,

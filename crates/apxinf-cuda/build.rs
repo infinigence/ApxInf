@@ -152,8 +152,7 @@ fn is_fa2_sm80_family(arch: &str) -> bool {
 // kernels. The sm80 family and Blackwell (sm_120/121, GB10/DGX Spark) all run
 // the same v2.7.4 instantiations; the -arch flag selects the real target.
 fn is_fa2_bf16_arch(arch: &str) -> bool {
-    is_fa2_sm80_family(arch)
-        || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
+    is_fa2_sm80_family(arch) || matches!(arch, "sm_120" | "sm_120a" | "sm_121" | "sm_121a")
 }
 
 fn is_cutlass_sm89_family(arch: &str) -> bool {
@@ -161,6 +160,7 @@ fn is_cutlass_sm89_family(arch: &str) -> bool {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(nvtx_header)");
     println!("cargo:rustc-check-cfg=cfg(nvtx_v2)");
     println!("cargo:rustc-check-cfg=cfg(nvtx_v3)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_cutlass_fmha)");
@@ -174,7 +174,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
-    println!("cargo:rerun-if-env-changed=APXINF_FA2_TRIM_UNUSED");
+    println!("cargo:rerun-if-env-changed=APXINF_FA2_HEAD64_MAXREG");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-env-changed=NVIDIA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
@@ -231,15 +231,24 @@ fn main() {
                 std::path::Path::new(&format!("{d}/libnvToolsExt.so")).exists()
                     || std::path::Path::new(&format!("{d}/libnvToolsExt.so.1")).exists()
             });
-            if has_v3 {
+            let header = format!("{cuda_path}/include/nvtx3/nvToolsExt.h");
+            if std::path::Path::new(&header).exists() {
+                println!("cargo:rerun-if-changed=adapters/nvtx.c");
+                println!("cargo:rerun-if-changed={header}");
+                cc::Build::new()
+                    .file("adapters/nvtx.c")
+                    .include(format!("{cuda_path}/include"))
+                    .compile("apxinf_nvtx");
+                println!("cargo:rustc-link-lib=dl");
+                println!("cargo:rustc-cfg=nvtx_header");
+            } else if has_v3 {
                 // Desktop CUDA 12.x. `nvtx.rs` will use `#[link(name = "nvtx3interop")]`.
                 println!("cargo:rustc-cfg=nvtx_v3");
             } else if has_v2 {
                 // Drive OS / embedded CUDA. `nvtx.rs` falls back to `-lnvToolsExt`.
                 println!("cargo:rustc-cfg=nvtx_v2");
             } else {
-                println!("cargo:warning=NVTX feature enabled but neither libnvtx3interop nor libnvToolsExt found in any of {lib_dirs:?} — build will fail at link time");
-                println!("cargo:rustc-cfg=nvtx_v3"); // preserve prior behavior
+                println!("cargo:warning=NVTX unavailable: no NVTX3 headers or legacy libraries; markers disabled");
             }
             // Suppress the "unexpected cfg" warning under Rust 1.80+ check-cfg.
         }
@@ -491,7 +500,8 @@ fn main() {
                 if fa2_head_special {
                     fa2_sources
                         .push(std::path::Path::new(&adapters_dir).join("fa2_head64_adapter.cu"));
-                    fa2_sources.push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
+                    fa2_sources
+                        .push(std::path::Path::new(&adapters_dir).join("fa2_head256_adapter.cu"));
                 }
                 if fa2_f16_sm100 {
                     println!("cargo:rustc-cfg=apxinf_fa2_f16_sm100");
@@ -602,14 +612,12 @@ fn main() {
                         }
                     }
                     if fa2_sources.contains(entry) {
-                        cmd.args([
-                            "--expt-relaxed-constexpr",
-                            "--expt-extended-lambda",
-                        ]);
+                        cmd.args(["--expt-relaxed-constexpr", "--expt-extended-lambda"]);
                         // Reference SDPA specializations use libdevice exp/log in the
                         // split combiner; fast math changes BF16 output rounding.
                         if !entry.ends_with("fa2_head256_adapter.cu")
-                            && !entry.ends_with("fa2_head64_adapter.cu") {
+                            && !entry.ends_with("fa2_head64_adapter.cu")
+                        {
                             cmd.arg("--use_fast_math");
                         }
                         cmd.args([
@@ -631,6 +639,23 @@ fn main() {
                                 || entry.ends_with("fa2_head256_adapter.cu"))
                         {
                             cmd.arg("-DAPXINF_FA2_HEAD_SPECIAL=1");
+                        }
+                        // The head-64 vision kernel is latency-bound at 16.67%
+                        // theoretical occupancy: ptxas gives it 244 registers,
+                        // which together with its 73.7 KB of shared memory caps
+                        // residency at two blocks per SM on a 20-SM part.
+                        //
+                        // Capping the count buys a third block and loses more
+                        // to spills than it gains: on Thor the scene goes from
+                        // 889.9 ms to 911.9 at 168 registers, bit-identically,
+                        // so this stays off. Kept as a knob
+                        // because the trade is a per-board measurement.
+                        if entry.ends_with("fa2_head64_adapter.cu") {
+                            if let Ok(cap) = std::env::var("APXINF_FA2_HEAD64_MAXREG") {
+                                if cap.trim().parse::<u32>().is_ok() {
+                                    cmd.arg(format!("-maxrregcount={}", cap.trim()));
+                                }
+                            }
                         }
                         cmd.arg("-DAPXINF_FA2_SPLITKV=1");
                         // Drop the FlashAttention-2 feature axes the adapter

@@ -7,8 +7,7 @@ build = "build.rs"
 
 [features]
 default = ["nvtx"]
-# nsys profiling markers. Requires libnvtx3interop from the CUDA toolkit,
-# which some embedded CUDA runtimes (e.g. NVIDIA DRIVE OS) don't ship.
+# nsys markers via CUDA NVTX3 headers, with legacy shared-library fallback.
 # Disable with --no-default-features to build without profiling markers.
 nvtx = []
 

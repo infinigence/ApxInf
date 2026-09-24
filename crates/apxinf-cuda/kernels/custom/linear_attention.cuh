@@ -77,31 +77,73 @@ __global__ void cast_bf16_to_f32_kernel(
 // kernel_size-1 pre-conv activations), zero left-pad when state == nullptr.
 // new_state receives the last kernel_size entries of cat(effective_state, x),
 // matching the reference cache contract for prefill and cached continuation.
-// One thread per (token, channel); the last token's threads also emit the new
-// state so state writes never race the reads of other tokens.
+//
+// A block owns CONV_TOKENS consecutive tokens for one 256-channel slab. One
+// thread per channel walks those tokens in sequence.
+//
+// The obvious shape -- one block per (token, slab) -- reads every x element
+// kernel_size times, once for each output whose window covers it, and rereads
+// the channel's filter taps for every token. At the shipped prefill that is
+// 222 MB of loads where the data is 55 MB, and 108k blocks each doing four
+// fused multiply-adds per thread. Staging the window in shared memory instead
+// brings the redundancy from kernel_size to (CONV_TOKENS + kernel_size - 1) /
+// CONV_TOKENS, which is 35/32, and cuts the block count by CONV_TOKENS.
+//
+// The per-output accumulation is still the same kernel_size products summed in
+// the same order over the same values, so the result is bit-identical.
+#define CONV_TOKENS 32
 
 __global__ void causal_conv1d_silu_bf16_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight,
     const __nv_bfloat16* state, __nv_bfloat16* out, __nv_bfloat16* new_state,
     int channels, int seq, int kernel_size, int64_t x_row_stride) {
-  const int channel = blockIdx.y * blockDim.x + threadIdx.x;
-  if (channel >= channels) return;
-  const int token = blockIdx.x;
-  float acc = 0.0f;
-  for (int i = 0; i < kernel_size; ++i) {
-    const int src = token - (kernel_size - 1) + i;
+  extern __shared__ __nv_bfloat16 conv_smem[];  // [tokens + kernel_size - 1][blockDim.x]
+  const int lane = static_cast<int>(threadIdx.x);
+  const int channel = blockIdx.y * blockDim.x + lane;
+  const int width = static_cast<int>(blockDim.x);
+  const int token_base = blockIdx.x * CONV_TOKENS;
+  if (token_base >= seq) return;
+  const int tokens = min(CONV_TOKENS, seq - token_base);
+  const int active = channel < channels;
+
+  // Stage this block's window once: the kernel_size - 1 tokens of left context
+  // followed by the tokens it owns. Out-of-range reads take the cached state,
+  // or zero, exactly as the per-token form did.
+  for (int r = 0; r < tokens + kernel_size - 1; ++r) {
+    const int src = token_base - (kernel_size - 1) + r;
     float value = 0.0f;
-    if (src >= 0) {
-      value = __bfloat162float(x[static_cast<int64_t>(src) * x_row_stride + channel]);
-    } else if (state != nullptr) {
-      value = __bfloat162float(state[channel * kernel_size + kernel_size + src]);
+    if (active) {
+      if (src >= 0) {
+        value = __bfloat162float(x[static_cast<int64_t>(src) * x_row_stride + channel]);
+      } else if (state != nullptr) {
+        value = __bfloat162float(state[channel * kernel_size + kernel_size + src]);
+      }
     }
-    acc += value * __bfloat162float(weight[channel * kernel_size + i]);
+    conv_smem[r * width + lane] = __float2bfloat16(value);
   }
-  // Preserve the BF16 convolution output before the separate SiLU operation.
-  const float conv = __bfloat162float(__float2bfloat16(acc));
-  out[static_cast<int64_t>(token) * channels + channel] = __float2bfloat16(la_silu(conv));
-  if (token == seq - 1) {
+  __syncthreads();
+  if (!active) return;
+
+  float taps[8];
+  for (int i = 0; i < kernel_size; ++i) {
+    taps[i] = __bfloat162float(weight[channel * kernel_size + i]);
+  }
+
+  for (int t = 0; t < tokens; ++t) {
+    float acc = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+      acc += __bfloat162float(conv_smem[(t + i) * width + lane]) * taps[i];
+    }
+    // Preserve the BF16 convolution output before the separate SiLU operation.
+    const float conv = __bfloat162float(__float2bfloat16(acc));
+    const int token = token_base + t;
+    out[static_cast<int64_t>(token) * channels + channel] =
+        __float2bfloat16(la_silu(conv));
+  }
+
+  // The last token's threads emit the new state, so state writes never race
+  // the reads of other tokens.
+  if (token_base + tokens == seq) {
     for (int i = 0; i < kernel_size; ++i) {
       float value = 0.0f;
       if (seq + i < kernel_size) {
@@ -127,8 +169,20 @@ __global__ void causal_conv1d_silu_bf16_kernel(
 // tail keeps the caller's zero fill. One block per (token, key head) with
 // head_k_dim threads.
 
-__global__ void gdn_qk_prep_kernel(
-    const __nv_bfloat16* conv_out, float* q_out, float* k_out,
+__device__ __forceinline__ float gdn_qk_widen(float value) { return value; }
+__device__ __forceinline__ float gdn_qk_widen(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+__device__ __forceinline__ void gdn_qk_store(float* out, int64_t idx, float value) {
+  out[idx] = value;
+}
+__device__ __forceinline__ void gdn_qk_store(__nv_bfloat16* out, int64_t idx, float value) {
+  out[idx] = __float2bfloat16(value);
+}
+
+template <typename Output>
+__global__ void gdn_qk_prep_kernel_t(
+    const __nv_bfloat16* conv_out, Output* q_out, Output* k_out,
     int seq, int seq_pad, int conv_dim, int key_dim,
     int num_v_heads, int head_k_dim, float scale, float eps, bool recurrent) {
   const int token = blockIdx.x;
@@ -159,35 +213,82 @@ __global__ void gdn_qk_prep_kernel(
   for (int r = 0; r < reps; ++r) {
     const int head = k_head * reps + r;
     const int64_t dst = (static_cast<int64_t>(head) * seq_pad + token) * head_k_dim + d;
-    q_out[dst] = q_normed;
-    k_out[dst] = k_normed;
+    gdn_qk_store(q_out, dst, q_normed);
+    gdn_qk_store(k_out, dst, k_normed);
   }
 }
 
 // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias); v copied to the
-// fp32 head-major layout. b_proj/a_proj point at the first row of their column
+// head-major layout. b_proj/a_proj point at the first row of their column
 // slice inside a fused projection output (row stride given in elements).
+//
+// v carries the convolution output unchanged, so it is stored at the width it
+// already has. Widening it to fp32 on the way out doubled the buffer and every
+// read of it downstream without adding a bit: at the shipped prefill that is
+// 55 MB a layer written and another 55 read to carry BF16 values.
+//
+// A block covers VB_TOKENS tokens of one head. One token per block gave every
+// thread a single load and a single store -- 108k blocks of 128 threads to move
+// the buffer, which reaches about half the board's bandwidth. The per-token
+// scalars stay on one thread each, as before.
+#define VB_TOKENS 16
+
 __global__ void gdn_vb_prep_kernel(
     const __nv_bfloat16* conv_out,
     const __nv_bfloat16* b_proj, const __nv_bfloat16* a_proj,
     const float* dt_bias, const float* a_log,
-    float* v_out, float* beta_out, float* g_out,
+    __nv_bfloat16* v_out, float* beta_out, float* g_out,
     int seq, int seq_pad, int conv_dim, int v_offset,
     int ba_row_stride, int head_v_dim) {
-  const int token = blockIdx.x;
   const int head = blockIdx.y;
+  const int token_base = blockIdx.x * VB_TOKENS;
+  if (token_base >= seq) return;
+  const int tokens = min(VB_TOKENS, seq - token_base);
   const int d = threadIdx.x;
+
+  // One thread per token folds the gate scalars, which depend on the token and
+  // the head but not on the value channel.
+  if (d < tokens) {
+    const int token = token_base + d;
+    const float b_value =
+        __bfloat162float(b_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
+    const float a_value =
+        __bfloat162float(a_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
+    beta_out[static_cast<int64_t>(head) * seq_pad + token] =
+        __bfloat162float(__float2bfloat16(la_sigmoid(b_value)));
+    g_out[static_cast<int64_t>(head) * seq_pad + token] =
+        -expf(a_log[head]) * la_softplus(a_value + dt_bias[head]);
+  }
   if (d >= head_v_dim) return;
-  const int64_t conv_base = static_cast<int64_t>(token) * conv_dim;
-  const float b_value = __bfloat162float(b_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
-  const float a_value = __bfloat162float(a_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
-  const float beta = __bfloat162float(__float2bfloat16(la_sigmoid(b_value)));
-  const float g = -expf(a_log[head]) * la_softplus(a_value + dt_bias[head]);
-  v_out[(static_cast<int64_t>(head) * seq_pad + token) * head_v_dim + d] =
-      __bfloat162float(conv_out[conv_base + v_offset + head * head_v_dim + d]);
-  if (d == 0) {
-    beta_out[static_cast<int64_t>(head) * seq_pad + token] = beta;
-    g_out[static_cast<int64_t>(head) * seq_pad + token] = g;
+  for (int t = 0; t < tokens; ++t) {
+    const int token = token_base + t;
+    v_out[(static_cast<int64_t>(head) * seq_pad + token) * head_v_dim + d] =
+        conv_out[static_cast<int64_t>(token) * conv_dim + v_offset +
+                 head * head_v_dim + d];
+  }
+}
+
+// Same gate arithmetic as vb-prep, without materializing V.
+__global__ void gdn_gate_only_kernel(
+    const __nv_bfloat16* b_proj, const __nv_bfloat16* a_proj,
+    const float* dt_bias, const float* a_log,
+    float* beta_out, float* g_out,
+    int seq, int seq_pad, int ba_row_stride) {
+  const int head = blockIdx.y;
+  const int token_base = blockIdx.x * VB_TOKENS;
+  if (token_base >= seq) return;
+  const int tokens = min(VB_TOKENS, seq - token_base);
+  const int d = threadIdx.x;
+  if (d < tokens) {
+    const int token = token_base + d;
+    const float b_value =
+        __bfloat162float(b_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
+    const float a_value =
+        __bfloat162float(a_proj[static_cast<int64_t>(token) * ba_row_stride + head]);
+    beta_out[static_cast<int64_t>(head) * seq_pad + token] =
+        __bfloat162float(__float2bfloat16(la_sigmoid(b_value)));
+    g_out[static_cast<int64_t>(head) * seq_pad + token] =
+        -expf(a_log[head]) * la_softplus(a_value + dt_bias[head]);
   }
 }
 
@@ -219,7 +320,7 @@ __global__ void gdn_cumsum_kernel(
 // Q remains unscaled until the final attention output. One block per chunk/head.
 __global__ __launch_bounds__(256, 4) void gdn_attn_raw_kernel(
     const float* q, const float* k, const float* beta, const float* g_cum,
-    float* a_out, float* t_out,
+    float* a_out, __nv_bfloat16* t_out,
     int seq_pad, int head_k_dim, int chunk_size) {
   const int head = blockIdx.y;
   const int chunk = blockIdx.x;
@@ -309,7 +410,7 @@ __global__ __launch_bounds__(256, 4) void gdn_attn_raw_kernel(
           a_out[matrix_base + cell] =
               (j < i) ? -__fmul_rn(__fmul_rn(a1[ii][jj], decay), beta_i) : 0.0f;
           t_out[matrix_base + cell] =
-              (j <= i) ? __bfloat162float(__float2bfloat16(a2[ii][jj] * decay)) : 0.0f;
+              __float2bfloat16((j <= i) ? a2[ii][jj] * decay : 0.0f);
         }
       }
     }
@@ -329,7 +430,7 @@ __global__ __launch_bounds__(256, 4) void gdn_attn_raw_kernel(
       }
       const float decay = gdn_exp2_approx(g_cum[token_base + i] - g_cum[token_base + j]);
       a_out[matrix_base + cell] = (j < i) ? -__fmul_rn(__fmul_rn(a1, decay), beta_i) : 0.0f;
-      t_out[matrix_base + cell] = (j <= i) ? __bfloat162float(__float2bfloat16(a2 * decay)) : 0.0f;
+      t_out[matrix_base + cell] = __float2bfloat16((j <= i) ? a2 * decay : 0.0f);
     }
   }
 }
@@ -371,8 +472,8 @@ __global__ void gdn_tri_solve_kernel(float* a, int chunk_size) {
 // rather than chosen.
 template <int GEMM_TILE>
 __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
-    const float* a, const float* v, const float* k, const float* beta,
-    const float* g_cum, float* vt_out, float* kcd_out,
+    const float* a, const __nv_bfloat16* v, const float* k, const float* beta,
+    const float* g_cum, __nv_bfloat16* vt_out, __nv_bfloat16* kcd_out,
     int seq_pad, int head_k_dim, int head_v_dim, int chunk_size) {
   const int head = blockIdx.y;
   const int chunk = blockIdx.x;
@@ -396,7 +497,8 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
     const int m = idx / head_v_dim;
     const int j = idx - m * head_v_dim;
     vb_tile[idx] = __float2bfloat16(
-        v[(token_base + m) * head_v_dim + j] * beta[token_base + m]);
+        __bfloat162float(v[(token_base + m) * head_v_dim + j]) *
+        beta[token_base + m]);
   }
   for (int idx = threadIdx.x; idx < chunk_size * head_k_dim; idx += blockDim.x) {
     const int m = idx / head_k_dim;
@@ -450,8 +552,8 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
       #pragma unroll
       for (int s = 0; s < GEMM_TILE; ++s) {
         const int off = base + s * static_cast<int>(blockDim.x);
-        vt_out[vt_base + off] = __bfloat162float(__float2bfloat16(vt[s]));
-        kcd_out[kcd_base + off] = __bfloat162float(__float2bfloat16(kcd[s]));
+        vt_out[vt_base + off] = __float2bfloat16(vt[s]);
+        kcd_out[kcd_base + off] = __float2bfloat16(kcd[s]);
       }
     }
   } else if (v_cells % v_span == 0 && blockDim.x % head_v_dim == 0) {
@@ -473,7 +575,7 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
       #pragma unroll
       for (int s = 0; s < GEMM_TILE; ++s) {
         vt_out[vt_base + base + s * static_cast<int>(blockDim.x)] =
-            __bfloat162float(__float2bfloat16(vt[s]));
+            __float2bfloat16(vt[s]);
       }
     }
   } else {
@@ -485,7 +587,7 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
         vt += a[a_base + i * chunk_size + m] *
               __bfloat162float(vb_tile[m * head_v_dim + j]);
       }
-      vt_out[vt_base + cell] = __bfloat162float(__float2bfloat16(vt));
+      vt_out[vt_base + cell] = __float2bfloat16(vt);
     }
   }
   if (head_v_dim == head_k_dim && v_cells == k_cells &&
@@ -510,7 +612,7 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
       #pragma unroll
       for (int s = 0; s < GEMM_TILE; ++s) {
         kcd_out[kcd_base + base + s * static_cast<int>(blockDim.x)] =
-            __bfloat162float(__float2bfloat16(kcd[s]));
+            __float2bfloat16(kcd[s]);
       }
     }
   } else {
@@ -522,7 +624,7 @@ __global__ __launch_bounds__(256, 4) void gdn_chunk_gemm_kernel(
         kcd += a[a_base + i * chunk_size + m] *
                __bfloat162float(kb_tile[m * head_k_dim + j]);
       }
-      kcd_out[kcd_base + cell] = __bfloat162float(__float2bfloat16(kcd));
+      kcd_out[kcd_base + cell] = __float2bfloat16(kcd);
     }
   }
 }
@@ -571,7 +673,8 @@ __device__ __forceinline__ void gdn_load_bf16_tile(const __nv_bfloat16* src,
 template <int GDN_TILE, bool V_SPLIT>
 __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
     const float* q, const float* k,
-    const float* g_cum, const float* t_in, const float* vt_in, const float* kcd_in,
+    const float* g_cum, const __nv_bfloat16* t_in,
+    const __nv_bfloat16* vt_in, const __nv_bfloat16* kcd_in,
     float* state, __nv_bfloat16* out,
     int seq, int seq_pad, int head_k_dim, int head_v_dim, int chunk_size,
     int total_chunks, int out_row_width, float scale, int v_split) {
@@ -674,9 +777,14 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
         // one wide load per m, this is what is left of the inner loop's
         // instruction count. Same values, same order over m.
         for (int m = 0; m < head_k_dim; m += 4) {
-          const float4 kv4 = *reinterpret_cast<const float4*>(kcd_in + krow + m);
+          // kcd is stored at BF16 width, so four of them are one eight-byte
+          // load rather than one sixteen-byte load. q is still fp32.
+          const __nv_bfloat162* kp =
+              reinterpret_cast<const __nv_bfloat162*>(kcd_in + krow + m);
+          const float2 k01 = __bfloat1622float2(kp[0]);
+          const float2 k23 = __bfloat1622float2(kp[1]);
           const float4 qv4 = *reinterpret_cast<const float4*>(q + qrow + m);
-          const float kv[4] = {kv4.x, kv4.y, kv4.z, kv4.w};
+          const float kv[4] = {k01.x, k01.y, k23.x, k23.y};
           const float qv[4] = {qv4.x, qv4.y, qv4.z, qv4.w};
 #pragma unroll
           for (int u = 0; u < 4; ++u) {
@@ -694,7 +802,9 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
         for (int t = 0; t < GDN_TILE; ++t, ++it) {
           const int cell = base + t;
           v_new[cell] =
-              vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j + t : cell)] - vp[t];
+              __bfloat162float(
+                  vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j + t : cell)]) -
+              vp[t];
           attn_inter[it] = ai[t] * qg;
         }
       }
@@ -707,10 +817,13 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
         const float qg = gdn_exp2_approx(g_cum[token_base + i]);
         for (int m = 0; m < head_k_dim; ++m) {
           const float s = __bfloat162float(state_cache[m * v_cols + j]);
-          vp += kcd_in[kcd_base + i * head_k_dim + m] * s;
+          vp += __bfloat162float(kcd_in[kcd_base + i * head_k_dim + m]) * s;
           ai += q[(token_base + i) * head_k_dim + m] * s;
         }
-        v_new[cell] = vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j : cell)] - vp;
+        v_new[cell] =
+            __bfloat162float(
+                vt_in[vt_base + (V_SPLIT ? i * head_v_dim + j0 + j : cell)]) -
+            vp;
         attn_inter[it] = ai * qg;
       }
     }
@@ -738,8 +851,12 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
         for (int s = 0; s < GDN_TILE; ++s) intra[s] = 0.0f;
         const int64_t arow = a_base + static_cast<int64_t>(i) * chunk_size;
         for (int m = 0; m < chunk_size; m += 4) {
-          const float4 tv4 = *reinterpret_cast<const float4*>(t_in + arow + m);
-          const float tv[4] = {tv4.x, tv4.y, tv4.z, tv4.w};
+          // t is stored at BF16 width; four entries are one eight-byte load.
+          const __nv_bfloat162* tp =
+              reinterpret_cast<const __nv_bfloat162*>(t_in + arow + m);
+          const float2 t01 = __bfloat1622float2(tp[0]);
+          const float2 t23 = __bfloat1622float2(tp[1]);
+          const float tv[4] = {t01.x, t01.y, t23.x, t23.y};
           #pragma unroll
           for (int u = 0; u < 4; ++u) {
             float vv[GDN_TILE];
@@ -766,7 +883,8 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
         const int j = cell - i * v_cols;
         float intra = 0.0f;
         for (int m = 0; m < chunk_size; ++m) {
-          intra += t_in[a_base + i * chunk_size + m] * __bfloat162float(v_round[m * v_cols + j]);
+          intra += __bfloat162float(t_in[a_base + i * chunk_size + m]) *
+                   __bfloat162float(v_round[m * v_cols + j]);
         }
         const float acc = attn_inter[it] * scale + intra * scale;
         const int token = c * chunk_size + i;
@@ -852,7 +970,7 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_kernel(
 template <int SPLIT, int HEAD_K>
 __global__ void gdn_recurrent_split_kernel(
     const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ v, const float* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ v, const float* __restrict__ beta,
     const float* __restrict__ g, float* state, __nv_bfloat16* out,
     int head_k_dim, int head_v_dim) {
   const int head = blockIdx.x;
@@ -894,7 +1012,8 @@ __global__ void gdn_recurrent_split_kernel(
     kv_total += partial[sp * head_v_dim + j];
   }
   const float delta =
-      (v[static_cast<int64_t>(head) * head_v_dim + j] - kv_total) * beta[head];
+      (__bfloat162float(v[static_cast<int64_t>(head) * head_v_dim + j]) -
+       kv_total) * beta[head];
 
   // Pass 2: update this thread's stripe from registers, write once, and sum
   // q . updated over it.
@@ -920,7 +1039,7 @@ __global__ void gdn_recurrent_split_kernel(
 }
 
 __global__ void gdn_recurrent_kernel(
-    const float* q, const float* k, const float* v, const float* beta,
+    const float* q, const float* k, const __nv_bfloat16* v, const float* beta,
     const float* g, float* state, __nv_bfloat16* out,
     int head_k_dim, int head_v_dim) {
   const int head = blockIdx.x;
@@ -955,7 +1074,9 @@ __global__ void gdn_recurrent_kernel(
     const float decayed = __fmul_rn(state_head[m * head_v_dim + j], g_exp);
     kv_mem += decayed * k_row[m];
   }
-  const float delta = (v[static_cast<int64_t>(head) * head_v_dim + j] - kv_mem) * beta_h;
+  const float delta =
+      (__bfloat162float(v[static_cast<int64_t>(head) * head_v_dim + j]) - kv_mem) *
+      beta_h;
   float acc = 0.0f;
   for (int m = 0; m < head_k_dim; ++m) {
     // Keep `decayed` a separate product rather than folding it into the sum.
@@ -988,38 +1109,117 @@ __global__ void gdn_recurrent_kernel(
 // instead of one, with two of the latencies overlapping the reduction.
 //
 // Values, expressions and the reduction tree are all unchanged.
+// A block walks GRS_ROWS rows, one thread per column, rather than taking a row
+// each: at the shipped shape that is 108k blocks of 128 threads doing one
+// 128-wide reduction apiece. The per-row reduction tree below is untouched --
+// same partials, same shuffle order, same two-stage warp sum -- so the rows
+// come out bit-for-bit as they did. Only the weight load and the block launch
+// are amortised.
+#define GRS_ROWS 8
+
+
+// Fixed 128-column gated RMSNorm. One warp owns one row, and each lane owns
+// columns lane, lane+32, lane+64, lane+96. Four warps handle four rows in
+// parallel, twice per CTA. Reconstruct the original four warp sums and second
+// XOR tree within each row's warp, including the +0 lanes.
+__global__ __launch_bounds__(128, 4) void gated_rms_silu_bf16_warp4_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ z,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int rows, int cols, int z_heads, int64_t z_row_stride,
+    int64_t z_col_offset, float eps) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  float wv[4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+    wv[s] = __bfloat162float(weight[lane + 32 * s]);
+
+#pragma unroll
+  for (int wave = 0; wave < 2; ++wave) {
+    const int row = blockIdx.x * 8 + wave * 4 + warp;
+    if (row >= rows) continue;  // Warp-uniform; no CTA barrier in this kernel.
+    const int64_t base = static_cast<int64_t>(row) * 128;
+    const int64_t z_base = static_cast<int64_t>(row / z_heads) * z_row_stride +
+                           z_col_offset + static_cast<int64_t>(row % z_heads) * 128;
+    float xv[4], zf[4], partial[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int col = lane + 32 * s;
+      xv[s] = __bfloat162float(x[base + col]);
+      zf[s] = __bfloat162float(z[z_base + col]);
+      partial[s] = xv[s] * xv[s];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+      for (int s = 0; s < 4; ++s)
+        partial[s] += __shfl_xor_sync(0xffffffff, partial[s], offset);
+    }
+
+    // Only lane 0 of each original warp was written to warp_sums[s].
+    const float w0 = __shfl_sync(0xffffffff, partial[0], 0);
+    const float w1 = __shfl_sync(0xffffffff, partial[1], 0);
+    const float w2 = __shfl_sync(0xffffffff, partial[2], 0);
+    const float w3 = __shfl_sync(0xffffffff, partial[3], 0);
+    float v = lane == 0 ? w0 : (lane == 1 ? w1 :
+              (lane == 2 ? w2 : (lane == 3 ? w3 : 0.0f)));
+    // Match old warp 0: lanes 4..31 enter as +0 and participate in
+    // XOR16,8,4,2,1 rather than directly summing four warp totals.
+    for (int offset = 16; offset > 0; offset >>= 1)
+      v += __shfl_xor_sync(0xffffffff, v, offset);
+    const float sum = __shfl_sync(0xffffffff, v, 0);
+    const float rms = rsqrtf(sum / cols + eps);
+
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const float y1 = wv[s] * (xv[s] * rms);
+      out[base + lane + 32 * s] = __float2bfloat16(
+          __fmul_rn(__fmul_rn(y1, zf[s]), la_triton_sigmoid(zf[s])));
+    }
+  }
+}
+
+
 __global__ void gated_rms_silu_bf16_rowfit_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ z,
     const __nv_bfloat16* __restrict__ weight, __nv_bfloat16* __restrict__ out,
-    int cols, int z_heads, int64_t z_row_stride, int64_t z_col_offset,
+    int rows, int cols, int z_heads, int64_t z_row_stride, int64_t z_col_offset,
     float eps) {
-  const int row = blockIdx.x;
   const int i = threadIdx.x;
-  const int64_t base = static_cast<int64_t>(row) * cols;
-  const int64_t z_base = static_cast<int64_t>(row / z_heads) * z_row_stride +
-                         z_col_offset + static_cast<int64_t>(row % z_heads) * cols;
-  const float xv = __bfloat162float(x[base + i]);
-  const float zf = __bfloat162float(z[z_base + i]);
-  const float wv = __bfloat162float(weight[i]);
-  float partial = xv * xv;
-  __shared__ float warp_sums[32];
-  for (int offset = 16; offset > 0; offset >>= 1)
-    partial += __shfl_xor_sync(0xffffffff, partial, offset);
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  if (lane == 0) warp_sums[warp] = partial;
-  __syncthreads();
-  if (warp == 0) {
-    float v = (lane < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0f;
+  const float wv = __bfloat162float(weight[i]);
+  __shared__ float warp_sums[32];
+  const int row_base = blockIdx.x * GRS_ROWS;
+
+  for (int r = 0; r < GRS_ROWS; ++r) {
+    const int row = row_base + r;
+    if (row >= rows) return;
+    const int64_t base = static_cast<int64_t>(row) * cols;
+    const int64_t z_base = static_cast<int64_t>(row / z_heads) * z_row_stride +
+                           z_col_offset + static_cast<int64_t>(row % z_heads) * cols;
+    const float xv = __bfloat162float(x[base + i]);
+    const float zf = __bfloat162float(z[z_base + i]);
+    float partial = xv * xv;
     for (int offset = 16; offset > 0; offset >>= 1)
-      v += __shfl_xor_sync(0xffffffff, v, offset);
-    if (lane == 0) warp_sums[0] = v;
+      partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+      float v = (lane < (blockDim.x + 31) / 32) ? warp_sums[lane] : 0.0f;
+      for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, offset);
+      if (lane == 0) warp_sums[0] = v;
+    }
+    __syncthreads();
+    const float rms = rsqrtf(warp_sums[0] / cols + eps);
+    const float y1 = wv * (xv * rms);
+    out[base + i] = __float2bfloat16(
+        __fmul_rn(__fmul_rn(y1, zf), la_triton_sigmoid(zf)));
+    // The next row reuses warp_sums, so no lane may still be reading it.
+    __syncthreads();
   }
-  __syncthreads();
-  const float rms = rsqrtf(warp_sums[0] / cols + eps);
-  const float y1 = wv * (xv * rms);
-  out[base + i] = __float2bfloat16(
-      __fmul_rn(__fmul_rn(y1, zf), la_triton_sigmoid(zf)));
 }
 
 __global__ void gated_rms_silu_bf16_kernel(
@@ -1100,6 +1300,30 @@ __global__ void rms_norm_plus1_bf16_kernel(
   }
 }
 
+// Identical four-accumulator/warp summation order; input is the existing
+// shared FP32 conversion of the explicitly BF16-rounded sum.
+__device__ __forceinline__ float rms_vector_square_mean_f32_staged(
+    const float* input, int cols) {
+  __shared__ float mean;
+  if (threadIdx.x < 32) {
+    float sums[4] = {0, 0, 0, 0};
+    for (int col = threadIdx.x * 4; col < cols; col += 128) {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float value = input[col + j];
+        sums[j] = __fadd_rn(sums[j], __fmul_rn(value, value));
+      }
+    }
+    float sum = ((sums[0] + sums[1]) + sums[2]) + sums[3];
+    for (int offset = 16; offset > 0; offset >>= 1)
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (threadIdx.x == 0)
+      mean = __fmul_rn(sum, __fdiv_rn(1.f, static_cast<float>(cols)));
+  }
+  __syncthreads();
+  return mean;
+}
+
 // The residual add fused into the norm that always follows it.
 //
 // x = a + b; out = rms_norm_plus1(x). Both halves of every text block end this
@@ -1107,12 +1331,12 @@ __global__ void rms_norm_plus1_bf16_kernel(
 // 2560-element row, a couple of microseconds of work behind a kernel's fixed
 // cost. Fusing removes one launch and one round trip through the sum per pair.
 //
-// The sum still goes to memory in BF16 and the reduction still reads it back
-// from there. That is not an oversight: the separate pair rounds, and carrying
-// the fp32 sum into the reduction instead would be a different model. Nothing
-// below the first __syncthreads differs from rms_norm_plus1_bf16_kernel, the
-// gridDim.x switch to the vectorised mean included, so the two keep agreeing
-// on prefill and decode shapes alike.
+// The sum still goes to memory in BF16. The default path retains the
+// separate norm's reduction and its vector-mean reload. The prefill template
+// reads that same BF16-rounded value from the existing shared stage while
+// keeping the vector mean's four-accumulator order. Both keep the explicit
+// (1 + weight) and BF16 output rounding boundaries.
+template <bool STAGED_MEAN = false>
 __global__ void add_rms_norm_plus1_bf16_kernel(
     const __nv_bfloat16* a, const __nv_bfloat16* b,
     const __nv_bfloat16* weight, __nv_bfloat16* sum_out, __nv_bfloat16* output,
@@ -1164,30 +1388,38 @@ __global__ void add_rms_norm_plus1_bf16_kernel(
       la_fused_plus1[i] = __bfloat162float(t);
     }
   }
+  // Publish the explicitly BF16-rounded sum before either reduction reads it.
   __syncthreads();
-  float partial = 0.0f;
-  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-    const float v = la_fused_plus1[i];
-    partial += v * v;
-  }
-  __shared__ float fused_warp_sums[32];
-  for (int offset = 16; offset > 0; offset >>= 1)
-    partial += __shfl_xor_sync(0xffffffff, partial, offset);
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  if (lane == 0) fused_warp_sums[warp] = partial;
-  __syncthreads();
-  if (warp == 0) {
-    float v = (lane < (blockDim.x + 31) / 32) ? fused_warp_sums[lane] : 0.0f;
+  float mean;
+  if constexpr (STAGED_MEAN) {
+    // Prefill shape: the vector mean below overwrites the generic reduction.
+    // Read identical rounded values from shared with its original FP32 order.
+    mean = rms_vector_square_mean_f32_staged(la_fused_plus1, cols);
+  } else {
+    float partial = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+      const float v = la_fused_plus1[i];
+      partial += v * v;
+    }
+    __shared__ float fused_warp_sums[32];
     for (int offset = 16; offset > 0; offset >>= 1)
-      v += __shfl_xor_sync(0xffffffff, v, offset);
-    if (lane == 0) fused_warp_sums[0] = v;
+      partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) fused_warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+      float v = (lane < (blockDim.x + 31) / 32) ? fused_warp_sums[lane] : 0.0f;
+      for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_xor_sync(0xffffffff, v, offset);
+      if (lane == 0) fused_warp_sums[0] = v;
+    }
+    __syncthreads();
+    mean =
+        __fmul_rn(fused_warp_sums[0], __fdiv_rn(1.0f, static_cast<float>(cols)));
+    if (gridDim.x >= 16 && cols > 128 && cols % 4 == 0)
+      mean = rms_vector_square_mean_bf16(sum_out + base, cols);
   }
-  __syncthreads();
-  float mean =
-      __fmul_rn(fused_warp_sums[0], __fdiv_rn(1.0f, static_cast<float>(cols)));
-  if (gridDim.x >= 16 && cols > 128 && cols % 4 == 0)
-    mean = rms_vector_square_mean_bf16(sum_out + base, cols);
   const float rms = rsqrtf(__fadd_rn(mean, eps));
   for (int i = threadIdx.x; i < cols; i += blockDim.x) {
     output[base + i] = __float2bfloat16(__fmul_rn(
