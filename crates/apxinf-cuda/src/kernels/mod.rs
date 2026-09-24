@@ -72,3 +72,19 @@ pub fn scratch_buffer_zeroed(
 ) -> apxinf_core::Result<crate::CudaBuffer> {
     crate::workspace::output_buffer_zeroed(ctx, bytes)
 }
+
+/// Scratch for a `[groups, rows, cols]` region whose consumer writes every row
+/// a token maps to and leaves the padding rows alone.
+///
+/// Only that padding is cleared: `group_bytes - used_bytes` trailing bytes in
+/// each of `groups` groups. Clearing the whole allocation instead costs the
+/// ratio between the padded and the used extent, which the callers here push
+/// past two orders of magnitude.
+pub fn scratch_buffer_tail_zeroed(
+    ctx: &crate::CudaContext,
+    groups: usize,
+    group_bytes: usize,
+    used_bytes: usize,
+) -> apxinf_core::Result<crate::CudaBuffer> {
+    crate::workspace::output_buffer_tail_zeroed(ctx, groups, group_bytes, used_bytes)
+}

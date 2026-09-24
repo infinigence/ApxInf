@@ -270,7 +270,7 @@ pub fn scale(ctx: &CudaContext, input: &Tensor, scale_factor: f32) -> Result<Ten
     let count = input.numel() as u32;
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {

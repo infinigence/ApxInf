@@ -50,16 +50,26 @@ cannot change weight layout.
 
 ## Execution and validation limits
 
-Existing BF16 kernels and fused operations are retained. This organization change
-does not establish a new fusion scheme or a performance baseline. Direct planning
-skips the unused final language projection; reasoning still computes token logits.
+Direct planning skips the unused final language projection; reasoning still
+computes token logits.
 
-`APXINF_QWEN_DECODE_GRAPH` enables the inherited local GDN decode graph path,
-including separate convolution parity captures. It does not capture vision,
-full-attention cache management or the planner/flow loop. Full VLA `prepare`
-returns an explicit unsupported error; callers must not treat local captures as
-a prepared full-model execution plan. Vision position interpolation still uses
-host computation on cache misses.
+Direct planning prepares the whole model. `prepare_for(sample, policy)` walks
+the request once to resolve address-dependent native resources, captures the
+vision, language and planner phases into one graph against fixed input
+addresses, and replays it per request; the plan owns its weights, stable
+inputs, KV/state and workspace, and outlives the runner that made it. A plan is
+rejected rather than silently reused when the observation shape, image-token
+positions, image grids or step count change, and it reports `Invalidated` after
+a tactic update. Shape-only `prepare(&InferenceSpec)` still returns an explicit
+unsupported error, because an `InferenceSpec` does not describe image grids,
+image-token positions or planner steps. Variable-length reasoning has no fixed
+profile to capture and stays eager.
+
+`APXINF_QWEN_DECODE_GRAPH` enables the inherited local GDN decode graph path
+for that eager route, including separate convolution parity captures. It does
+not capture vision, full-attention cache management or the planner/flow loop;
+callers must not treat those local captures as a prepared full-model execution
+plan. Vision position interpolation still uses host computation on cache misses.
 
 Local checks cover Rust types, portable conditioning/configuration logic and
 Python direct/reasoning request wiring. A CUDA-feature check on a machine without

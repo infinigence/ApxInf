@@ -1375,7 +1375,6 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-
     pub fn apxinf_vision_sdpa_bf16_v3(
         q: *const c_void,
         k: *const c_void,
@@ -1387,7 +1386,6 @@ extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
-
 
     pub fn apxinf_vision_sdpa_bf16_v3_hd72(
         q: *const c_void,
@@ -1413,4 +1411,21 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
+}
+
+extern "C" {
+    pub fn apxinf_adaln_gate_residual_rms_bf16(
+        projection: *const c_void,
+        residual: *const c_void,
+        gate: *const c_void,
+        weight: *const c_void,
+        scale: *const c_void,
+        shift: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }

@@ -621,8 +621,9 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     // above, so the oracle has to start from those, not from the fp32 draws.
     let to_bf16 = |x: f32| -> f64 {
         let bits = x.to_bits();
-        let rounded = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32
-            | ((bits >> 16) & 1)))) << 16;
+        let rounded = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(rounded) as f64
     };
 
@@ -639,7 +640,14 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
     }
 
     let out = crate::kernels::attention::segmented_mha_bf16(
-        &ctx, &q, &k, &v, &offsets, &host_offsets, segments, seg_tokens,
+        &ctx,
+        &q,
+        &k,
+        &v,
+        &offsets,
+        &host_offsets,
+        segments,
+        seg_tokens,
     )
     .unwrap();
     let got = download_bf16_as_fp32(&out).unwrap();
@@ -772,18 +780,34 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
         }
         buf
     };
-    let (qb, kb, vb, bb, gb) = (upload(&q), upload(&k), upload(&v), upload(&beta), upload(&g));
+    let (qb, kb, vb, bb, gb) = (
+        upload(&q),
+        upload(&k),
+        upload(&v),
+        upload(&beta),
+        upload(&g),
+    );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(heads * vdim * 2, 0).unwrap();
 
     crate::kernels::linear_attention::gdn_recurrent(
-        &ctx, &qb, &kb, &vb, &bb, &gb, &sb,
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
-        heads, kdim, vdim,
+        &ctx,
+        &qb,
+        &kb,
+        &vb,
+        &bb,
+        &gb,
+        &sb,
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
+        heads,
+        kdim,
+        vdim,
     )
     .unwrap();
     let got = download_bf16_as_fp32(
-        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16).unwrap(),
+        &out.as_tensor(Shape::new(vec![1, heads * vdim]), DType::BF16)
+            .unwrap(),
     )
     .unwrap();
 
@@ -896,7 +920,12 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         buf
     };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload(&q),
+        upload(&k),
+        upload(&g_cum),
+        upload(&t),
+        upload(&vt),
+        upload(&kcd),
     );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
@@ -915,7 +944,9 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let v = x as f32;
         let bits = v.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let scale = 1.0f64 / (kdim as f64).sqrt();
@@ -1055,7 +1086,12 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
         buf
     };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q), upload(&k), upload(&g_cum), upload(&t), upload(&vt), upload(&kcd),
+        upload(&q),
+        upload(&k),
+        upload(&g_cum),
+        upload(&t),
+        upload(&vt),
+        upload(&kcd),
     );
 
     // The scan carries its state in the buffer it was given, so each run needs
@@ -1103,7 +1139,10 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
             base_out.len()
         );
         assert_eq!(out_diff, 0, "value split {split} changed the output");
-        assert_eq!(state_diff, 0, "value split {split} changed the carried state");
+        assert_eq!(
+            state_diff, 0,
+            "value split {split} changed the carried state"
+        );
     }
     std::env::remove_var("APXINF_GDN_CHUNK_STATE_V_SPLIT");
 }
@@ -1161,7 +1200,13 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
         }
         b
     };
-    let (ab, vb, kb, bb, gb) = (upload(&a), upload(&v), upload(&k), upload(&beta), upload(&g_cum));
+    let (ab, vb, kb, bb, gb) = (
+        upload(&a),
+        upload(&v),
+        upload(&k),
+        upload(&beta),
+        upload(&g_cum),
+    );
     let n_vt = heads * chunks * chunk * vdim;
     let n_kcd = heads * chunks * chunk * kdim;
     let vt = CudaBuffer::alloc(n_vt * 4, 0).unwrap();
@@ -1182,7 +1227,9 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     let bf = |x: f64| -> f64 {
         let f = x as f32;
         let bits = f.to_bits();
-        let r = ((bits >> 16) + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1)))) << 16;
+        let r = ((bits >> 16)
+            + (((bits >> 15) & 1) & ((bits & 0x7FFF != 0) as u32 | ((bits >> 16) & 1))))
+            << 16;
         f32::from_bits(r) as f64
     };
     let mut sum_abs = 0.0f64;
@@ -1927,4 +1974,364 @@ fn concat_2d_bf16_packs_gate_up_correctly() {
         }
     }
     assert_bf16_close_elementwise(&out, &expected);
+}
+
+/// The fused contract must retain all unit-offset and BF16 rounding boundaries,
+/// including the vector reduction used by planner-sized matrices.
+#[test]
+fn weighted_adaln_residual_fusion_matches_composition() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    for (rows, cols) in [
+        (1, 7),
+        (3, 129),
+        (15, 256),
+        (16, 256),
+        (50, 1024),
+        (2, 8192),
+    ] {
+        for amplitude in [0.0, 0.3, 10.0] {
+            let matrix = |phase: f32| {
+                let data: Vec<f32> = (0..rows * cols)
+                    .map(|i| ((i as f32) * 0.13 + phase).sin() * amplitude)
+                    .collect();
+                upload_fp32_as_bf16(&ctx, &data, vec![rows, cols]).unwrap()
+            };
+            let vector = |phase: f32| {
+                let data: Vec<f32> = (0..cols)
+                    .map(|i| ((i as f32) * 0.17 + phase).cos())
+                    .collect();
+                upload_fp32_as_bf16(&ctx, &data, vec![cols]).unwrap()
+            };
+            let (projection, residual) = (matrix(0.1), matrix(0.9));
+            let (gate, weight, scale, shift) = (vector(0.2), vector(0.7), vector(1.2), vector(1.7));
+            let expected_hidden = crate::kernels::linear_attention::adaln_gate_residual(
+                &ctx,
+                &projection,
+                &residual,
+                &gate,
+            )
+            .unwrap();
+            let expected_norm = crate::kernels::linear_attention::adaln_rms_norm(
+                &ctx,
+                &expected_hidden,
+                &weight,
+                &scale,
+                &shift,
+                1e-6,
+            )
+            .unwrap();
+            let actual = crate::kernels::fused::adaln_gate_residual_rms_bf16(
+                &ctx,
+                &projection,
+                &residual,
+                &gate,
+                &weight,
+                &scale,
+                &shift,
+                1e-6,
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                download_bf16_as_fp32(&actual.hidden).unwrap(),
+                download_bf16_as_fp32(&expected_hidden).unwrap(),
+                "hidden {rows}x{cols}"
+            );
+            assert_eq!(
+                download_bf16_as_fp32(&actual.normalized).unwrap(),
+                download_bf16_as_fp32(&expected_norm).unwrap(),
+                "norm {rows}x{cols}"
+            );
+        }
+    }
+}
+
+// The causal conv stages a window of tokens in shared memory so each input is
+// read once instead of kernel_size times. The shapes that can break that are
+// the ones where the window is not a whole tile: a sequence that straddles the
+// CONV_TOKENS boundary, one shorter than a tile, and the single-token decode
+// that carries its left context entirely in the cached state. The reference
+// below is the per-token form the kernel replaced, rounding where it rounded.
+#[test]
+fn causal_conv_tiling_matches_the_per_token_reference() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let draw = |salt: u64, n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                half::bf16::from_f32(((x & 0xFFFF) as f32 / 32768.0 - 1.0) * scale).to_f32()
+            })
+            .collect()
+    };
+    // 70 straddles the 32-token tile, 5 is shorter than one, 1 is decode, and
+    // 64 lands exactly on a tile edge. 300 channels crosses the 256-wide slab.
+    for &seq in &[70usize, 5, 1, 64] {
+        for &cached in &[false, true] {
+            let (channels, kernel_size) = (300usize, 4usize);
+            let x_stride = channels + 37; // the real caller passes a wider row
+            let x = draw(1, seq * x_stride, 0.8);
+            let weight = draw(2, channels * kernel_size, 0.5);
+            let state = draw(3, channels * kernel_size, 0.7);
+
+            let mut expected = vec![0.0f32; seq * channels];
+            for token in 0..seq {
+                for channel in 0..channels {
+                    let mut acc = 0.0f32;
+                    for i in 0..kernel_size {
+                        let src = token as isize - (kernel_size as isize - 1) + i as isize;
+                        let value = if src >= 0 {
+                            x[src as usize * x_stride + channel]
+                        } else if cached {
+                            state[channel * kernel_size + (kernel_size as isize + src) as usize]
+                        } else {
+                            0.0
+                        };
+                        acc += value * weight[channel * kernel_size + i];
+                    }
+                    let conv = half::bf16::from_f32(acc).to_f32();
+                    expected[token * channels + channel] =
+                        half::bf16::from_f32(silu_ref(conv)).to_f32();
+                }
+            }
+
+            let xt = upload_fp32_as_bf16(&ctx, &x, vec![seq, x_stride]).unwrap();
+            let wt = upload_fp32_as_bf16(&ctx, &weight, vec![channels, kernel_size]).unwrap();
+            let st = upload_fp32_as_bf16(&ctx, &state, vec![channels, kernel_size]).unwrap();
+            let out =
+                upload_fp32_as_bf16(&ctx, &vec![0.0; seq * channels], vec![seq, channels]).unwrap();
+            let new_state = upload_fp32_as_bf16(
+                &ctx,
+                &vec![0.0; channels * kernel_size],
+                vec![channels, kernel_size],
+            )
+            .unwrap();
+            crate::kernels::linear_attention::causal_conv1d_silu_bf16(
+                &ctx,
+                &xt,
+                &wt,
+                if cached { Some(&st) } else { None },
+                &out,
+                &new_state,
+                kernel_size,
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                download_bf16_as_fp32(&out).unwrap(),
+                expected,
+                "seq={seq} cached={cached}"
+            );
+
+            // The cache handoff: the last kernel_size pre-conv activations.
+            let mut expected_state = vec![0.0f32; channels * kernel_size];
+            for channel in 0..channels {
+                for i in 0..kernel_size {
+                    expected_state[channel * kernel_size + i] = if seq + i < kernel_size {
+                        if cached {
+                            state[channel * kernel_size + seq + i]
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        x[(seq + i - kernel_size) * x_stride + channel]
+                    };
+                }
+            }
+            assert_eq!(
+                download_bf16_as_fp32(&new_state).unwrap(),
+                expected_state,
+                "new_state seq={seq} cached={cached}"
+            );
+        }
+    }
+}
+
+// The chunk-state scan runs one BF16 pass over each product rather than the
+// two the split form uses. That is only sound because every left operand it
+// reads -- q, k, the chunk transition and the key-decay product -- is written
+// through __float2bfloat16 by the kernel that produces it, so `x - bf16(x)` is
+// zero and the split's low pass accumulates nothing.
+//
+// Nothing in the type system holds the producers to that. This does: feed the
+// scan operands that are exactly BF16, run both forms, and require the outputs
+// to agree bit for bit. If a producer starts emitting a value BF16 cannot hold,
+// the two forms diverge here rather than silently in a trajectory.
+//
+//   cargo test --release -p apxinf-cuda chunk_state_split_is_dead -- --nocapture
+#[test]
+fn chunk_state_split_is_dead_when_operands_are_bf16() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let (heads, kdim, vdim, chunk, chunks) = (2usize, 128usize, 128usize, 64usize, 2usize);
+    let seq_pad = chunk * chunks;
+    // Every value is round-tripped through BF16, exactly as the producers leave
+    // them. g_cum stays fp32: the scan reads it as a scalar, not as an operand.
+    let bf = |salt: u64, n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+                x ^= x >> 32;
+                half::bf16::from_f32(((x & 0xFFFF) as f32 / 32768.0 - 1.0) * scale).to_f32()
+            })
+            .collect()
+    };
+    let upload = |data: &[f32]| -> CudaBuffer {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let buf = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
+        buf.copy_from_host(&bytes).unwrap();
+        buf
+    };
+    let q = upload(&bf(1, heads * seq_pad * kdim, 0.5));
+    let k = upload(&bf(2, heads * seq_pad * kdim, 0.5));
+    let t = upload(&bf(3, heads * chunks * chunk * chunk, 0.3));
+    let vt = upload(&bf(4, heads * seq_pad * vdim, 0.6));
+    let kcd = upload(&bf(5, heads * seq_pad * kdim, 0.4));
+    let mut g = vec![0.0f32; heads * seq_pad];
+    for (i, value) in g.iter_mut().enumerate() {
+        *value = -((i % chunk) as f32) * 0.01;
+    }
+    let g_cum = upload(&g);
+
+    let run = |mode: &str| -> Vec<f32> {
+        // SAFETY: single-threaded test; the policy reads this at launch.
+        unsafe { std::env::set_var("APXINF_GDN_CHUNK_STATE_WMMA", mode) };
+        let state = upload(&vec![0.0f32; heads * kdim * vdim]);
+        let out = upload_fp32_as_bf16(
+            &ctx,
+            &vec![0.0; seq_pad * heads * vdim],
+            vec![seq_pad, heads * vdim],
+        )
+        .unwrap();
+        crate::kernels::linear_attention::gdn_chunk_state(
+            &ctx, &q, &k, &g_cum, &t, &vt, &kcd, &state, &out, seq_pad, heads, kdim, vdim, chunk,
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        download_bf16_as_fp32(&out).unwrap()
+    };
+    let split = run("2");
+    let single = run("1");
+    unsafe { std::env::remove_var("APXINF_GDN_CHUNK_STATE_WMMA") };
+    assert_eq!(
+        split, single,
+        "a producer is emitting a value BF16 cannot hold; the chunk-state scan's \
+         single-pass default is no longer exact"
+    );
+}
+
+// Is the vendor's own pick the best one available?
+//
+// With no tuned tactic the BF16 path falls through to cublasGemmEx and takes
+// whatever heuristic cuBLAS chose. cuBLASLt exposes its candidate list ranked,
+// and rank 0 is not always the fastest -- the ordering is a prediction. This
+// walks the ranks for the shapes qwen_drive actually issues and prints what the
+// vendor default costs beside the best rank found, so the gap is a measurement
+// rather than an assumption.
+//
+// Note: as written this reports nothing. Every rank returns a non-zero
+// cuBLASLt status outside the normal call path -- the plan wants the context
+// state that `gemm::bf16` sets up around it, which a raw FFI call does not
+// carry. The supported way to get this comparison is the tuner itself, whose
+// report records vendor against winner per shape with an L2 evictor between
+// candidates; run it with APXINF_QWEN_GRAPH unset and `autotune=True` now that
+// the direct runner traverses once eagerly first. Kept for the record.
+//
+//   cargo test --release -p apxinf-cuda vendor_gemm_heuristic_sweep -- --nocapture --ignored
+#[test]
+#[ignore = "superseded by the tuner's own report; see the note above"]
+fn vendor_gemm_heuristic_sweep() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    // Dumped from a direct-planning request via APXINF_GEMM_DUMP_SHAPES.
+    let shapes: &[(usize, usize, usize, &str)] = &[
+        (3385, 18432, 2560, "L ffn gate/up"),
+        (3385, 12352, 2560, "L gdn zba"),
+        (3385, 10240, 2560, "L (10240)"),
+        (3385, 2560, 9216, "L ffn down"),
+        (3385, 2560, 4096, "L gdn out"),
+        (12216, 1024, 1536, "V patch/qkv"),
+        (50, 10240, 1024, "A ffn gate/up"),
+        (50, 7168, 1024, "A qkv"),
+        (50, 1024, 4096, "A ffn down"),
+        (50, 1024, 3584, "A out"),
+    ];
+    let iters = 20;
+    println!(
+        "{:<16}{:>7}{:>7}{:>7}{:>11}{:>11}{:>7}{:>8}",
+        "op", "m", "n", "k", "vendor ms", "best ms", "rank", "gain"
+    );
+    let mut total_vendor = 0.0f64;
+    let mut total_best = 0.0f64;
+    for &(m, n, k, label) in shapes {
+        let a = CudaBuffer::alloc(m * k * 2, ctx.device_id()).unwrap();
+        let b = CudaBuffer::alloc(k * n * 2, ctx.device_id()).unwrap();
+        let c = CudaBuffer::alloc(m * n * 2, ctx.device_id()).unwrap();
+        let time = |run: &dyn Fn()| -> f64 {
+            for _ in 0..3 {
+                run();
+            }
+            ctx.synchronize().unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            ctx.synchronize().unwrap();
+            start.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        };
+        let vendor = time(&|| {
+            ctx.cublas()
+                .gemm(DType::BF16, m, n, k, 1.0, &a, &b, 0.0, &c)
+                .unwrap();
+        });
+        let lt_status = || unsafe {
+            crate::ffi::apxinf_static_bf16_gemm(
+                a.ptr(),
+                b.ptr(),
+                c.ptr(),
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                ctx.stream().handle(),
+            )
+        };
+        let lt = || {
+            let status = lt_status();
+            assert_eq!(status, 0, "cuBLASLt BF16 gemm returned {status}");
+        };
+        let (mut best, mut best_rank) = (f64::INFINITY, -1i32);
+        for rank in 0..12i32 {
+            // A rank the library does not offer for this shape is skipped.
+            if unsafe {
+                crate::ffi::apxinf_static_set_cublaslt_bf16_gemm_heuristic(
+                    m as i32, n as i32, k as i32, rank,
+                )
+            } != 0
+            {
+                continue;
+            }
+            if lt_status() != 0 {
+                continue;
+            }
+            let ms = time(&lt);
+            if ms < best {
+                best = ms;
+                best_rank = rank;
+            }
+        }
+        total_vendor += vendor;
+        total_best += best.min(vendor);
+        println!(
+            "{label:<16}{m:>7}{n:>7}{k:>7}{vendor:>11.4}{best:>11.4}{best_rank:>7}{:>7.1}%",
+            (vendor - best) / vendor * 100.0
+        );
+    }
+    println!(
+        "\nsum over one call each: vendor {total_vendor:.3} ms, best-of {total_best:.3} ms, \
+         {:.1}% off the vendor pick",
+        (total_vendor - total_best) / total_vendor * 100.0
+    );
 }

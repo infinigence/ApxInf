@@ -5,5 +5,6 @@
 //! not the layer topology. Mirrors the maintained pi05 pattern.
 
 pub(crate) use crate::accelerator::cuda::{
-    downcast_arc, kernels, transfers, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
+    downcast_arc, kernels, nvtx, transfers, tuning, Context, CublasTranspose, DeviceBuffer,
+    RuntimeBackend,
 };

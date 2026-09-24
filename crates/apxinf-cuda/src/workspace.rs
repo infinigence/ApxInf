@@ -320,6 +320,40 @@ pub(crate) fn output_buffer_zeroed(ctx: &CudaContext, bytes: usize) -> Result<Cu
     })
 }
 
+/// As [`output_buffer_zeroed`], but only the trailing rows of each group.
+///
+/// The prep kernels that consume these buffers write every row a token maps to
+/// and leave the padding that rounds the sequence up to a chunk multiple. Zeroing
+/// the whole allocation to establish that padding costs the ratio between them,
+/// which at the shipped prefill is 3392 rows written to clear 7.
+pub(crate) fn output_buffer_tail_zeroed(
+    ctx: &CudaContext,
+    groups: usize,
+    group_bytes: usize,
+    used_bytes: usize,
+) -> Result<CudaBuffer> {
+    let bytes = groups
+        .checked_mul(group_bytes)
+        .ok_or_else(|| Error::Other("scratch extent overflow".into()))?;
+    let tail = group_bytes.saturating_sub(used_bytes);
+    ACTIVE_WORKSPACE.with(|active| {
+        let workspace = active.get();
+        let buffer = if workspace.is_null() {
+            // A fresh driver allocation still has to establish the tail, but it
+            // is not a reused arena, so the payload rows need no clearing.
+            CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?
+        } else {
+            unsafe { &*workspace }.allocate(bytes, ctx.device_id())?
+        };
+        if tail > 0 && groups > 0 {
+            buffer
+                .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
+                .map_err(Error::Cuda)?;
+        }
+        Ok(buffer)
+    })
+}
+
 pub(crate) fn fp8_emulation_required(ctx: &CudaContext) -> Result<bool> {
     Ok(ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();

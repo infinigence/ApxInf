@@ -19,19 +19,15 @@
 use crate::device_caps::{CudaArchFamily, CudaDeviceCaps};
 
 /// Which form of a kernel that has a tensor-core implementation to run.
-///
-/// The split forms carry an fp32 operand as two or three BF16 terms so that
-/// every partial product is exact; see the kernels for what each costs against
-/// an fp64 reference.
 pub mod wmma {
     /// The scalar fp32 kernel.
     pub const OFF: i32 = 0;
     /// One BF16 pass: the fp32 operand is rounded.
+    ///
+    /// On the prefill path every operand reaching the chunk-state scan was
+    /// already written through `__float2bfloat16` by the kernel that produced
+    /// it, so this pass is exact there rather than merely close.
     pub const LOSSY: i32 = 1;
-    /// Two BF16 terms, about 2^-16 relative.
-    pub const SPLIT2: i32 = 2;
-    /// Three BF16 terms, about 2^-24, which is fp32's own resolution.
-    pub const SPLIT3: i32 = 3;
 }
 
 /// Launch constants handed to the GDN adapters. Plain `i32` fields in a
@@ -47,10 +43,6 @@ pub struct GdnLaunchPolicy {
     pub chunk_state_wmma: i32,
     /// Columns accumulated per thread in the chunk-gemm kernel.
     pub chunk_gemm_tile: i32,
-    /// Which form of the chunk GEMM to run; see [`wmma`].
-    pub chunk_gemm_wmma: i32,
-    /// Which form of the raw-attention term to run; see [`wmma`].
-    pub attn_raw_wmma: i32,
     /// Threads per output column in the decode recurrence.
     pub recurrent_split: i32,
     /// How many blocks share one head's chunk-state scan, splitting the value
@@ -89,28 +81,28 @@ impl GdnLaunchPolicy {
     /// way, from 1024 back to 512 (5.7645 against 5.7787 over four interleaved
     /// pairs), because the column tile needs fewer registers per thread and the
     /// cap already bought back the residency the wider block was there to
-    /// provide. The tensor-core forms stay off: those kernels need an
-    /// SM100-family tensor core to be worth their extra passes.
+    /// provide. The tensor-core form stays off: that kernel needs an
+    /// SM100-family tensor core to be worth its extra pass.
     ///
     /// sm100 family (Thor sm_110): chunk-state tile 4 rather than 8 and
     /// chunk-gemm tile 4 rather than 32, both re-swept here; the chunk-state
-    /// scan on tensor cores, which is 21.9% of the fixed cost at an operator
-    /// error of 1.422947e-3 against the scalar form's 1.418808e-3; and four
+    /// scan on tensor cores, which is 21.9% of the fixed cost; and four
     /// threads per output column in the decode recurrence, which takes it from
     /// 39.383 to 37.373 ms/token.
     ///
-    /// The other two tensor-core forms are built and measured but default off:
-    /// each is worth under 2% and each moves the end-to-end probe. See their
-    /// kernels for the numbers.
+    /// The chunk-state scan runs one BF16 pass. That pass is exact here rather
+    /// than merely close: on the prefill path q, k, the chunk transition and
+    /// the key-decay product are each written through `__float2bfloat16` by the
+    /// kernel that produces them, so no operand carries a low term for a second
+    /// pass to accumulate. `chunk_state_split_is_dead_when_operands_are_bf16`
+    /// holds the producers to that. Worth 27% of the scan.
     pub fn defaults_for(family: CudaArchFamily) -> Self {
         match family {
             CudaArchFamily::Sm100 => Self {
                 chunk_state_tile: 4,
                 chunk_state_threads: 1024,
-                chunk_state_wmma: wmma::SPLIT2,
+                chunk_state_wmma: wmma::LOSSY,
                 chunk_gemm_tile: 4,
-                chunk_gemm_wmma: wmma::OFF,
-                attn_raw_wmma: wmma::OFF,
                 recurrent_split: 4,
                 chunk_state_v_split: 1,
             },
@@ -119,8 +111,6 @@ impl GdnLaunchPolicy {
                 chunk_state_threads: 512,
                 chunk_state_wmma: wmma::OFF,
                 chunk_gemm_tile: 8,
-                chunk_gemm_wmma: wmma::OFF,
-                attn_raw_wmma: wmma::OFF,
                 recurrent_split: 1,
                 chunk_state_v_split: 1,
             },
@@ -128,7 +118,11 @@ impl GdnLaunchPolicy {
     }
 
     fn apply_overrides(&mut self) {
-        override_from("APXINF_GDN_CHUNK_TILE", &mut self.chunk_state_tile, &[1, 2, 4, 8, 16]);
+        override_from(
+            "APXINF_GDN_CHUNK_TILE",
+            &mut self.chunk_state_tile,
+            &[1, 2, 4, 8, 16],
+        );
         override_from(
             "APXINF_GDN_CHUNK_STATE_THREADS",
             &mut self.chunk_state_threads,
@@ -140,9 +134,11 @@ impl GdnLaunchPolicy {
             &mut self.chunk_gemm_tile,
             &[1, 2, 4, 8, 16, 32],
         );
-        override_wmma("APXINF_GDN_CHUNK_GEMM_WMMA", &mut self.chunk_gemm_wmma);
-        override_wmma("APXINF_GDN_ATTN_RAW_WMMA", &mut self.attn_raw_wmma);
-        override_from("APXINF_GDN_RECURRENT_SPLIT", &mut self.recurrent_split, &[1, 2, 4]);
+        override_from(
+            "APXINF_GDN_RECURRENT_SPLIT",
+            &mut self.recurrent_split,
+            &[1, 2, 4],
+        );
         override_from(
             "APXINF_GDN_CHUNK_STATE_V_SPLIT",
             &mut self.chunk_state_v_split,
@@ -176,23 +172,24 @@ fn chunk_state_v_split_for(multiprocessor_count: u32) -> i32 {
 /// Accept only values the kernels are instantiated for; anything else is
 /// ignored rather than passed through to a launch that would fail.
 fn override_from(name: &str, slot: &mut i32, allowed: &[i32]) {
-    if let Some(value) = std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok()) {
+    if let Some(value) = std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+    {
         if allowed.contains(&value) {
             *slot = value;
         }
     }
 }
 
-/// `0`/`off`/`false` for the scalar kernel, `lossy` for one BF16 pass, or the
-/// number of BF16 terms.
+/// `0`/`off`/`false` for the scalar kernel, `1`/`lossy`/`on`/`true` for the
+/// one-pass BF16 kernel.
 fn override_wmma(name: &str, slot: &mut i32) {
     let Ok(raw) = std::env::var(name) else { return };
     let value = raw.trim();
     *slot = match value {
         "0" | "off" | "false" => wmma::OFF,
-        "lossy" | "1" => wmma::LOSSY,
-        "2" => wmma::SPLIT2,
-        "3" | "on" | "true" => wmma::SPLIT3,
+        "1" | "lossy" | "on" | "true" => wmma::LOSSY,
         _ => return,
     };
 }
@@ -207,10 +204,13 @@ mod tests {
         let orin = GdnLaunchPolicy::defaults_for(CudaArchFamily::Sm80);
         assert_eq!((thor.chunk_state_tile, thor.chunk_gemm_tile), (4, 4));
         assert_eq!((orin.chunk_state_tile, orin.chunk_gemm_tile), (8, 8));
-        assert_eq!((thor.chunk_state_threads, orin.chunk_state_threads), (1024, 512));
+        assert_eq!(
+            (thor.chunk_state_threads, orin.chunk_state_threads),
+            (1024, 512)
+        );
         assert_eq!(thor.recurrent_split, 4);
         assert_eq!(orin.recurrent_split, 1);
-        assert_eq!(thor.chunk_state_wmma, wmma::SPLIT2);
+        assert_eq!(thor.chunk_state_wmma, wmma::LOSSY);
         assert_eq!(orin.chunk_state_wmma, wmma::OFF);
     }
 

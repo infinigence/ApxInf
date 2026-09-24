@@ -1,8 +1,8 @@
 //! Planning computation: multimodal prefix, optional reasoning, then flow sampling.
 //! The caller owns backbone state and chooses how GDN blocks execute.
 use super::blocks::bf16::{expert, upload_u32, BackboneBf16, BackboneState, PlannerBf16};
-use super::blocks::GdnExecution;
-use super::{PlanningState, VisionState};
+use super::blocks::{DirectExecution, GdnExecution};
+use super::{DirectInputs, PlanningState, VisionState};
 use crate::qwen_drive::backend::kernels::linear_attention;
 use crate::qwen_drive::inputs::ExpertConditioning;
 use apxinf_core::{
@@ -57,6 +57,43 @@ impl QwenDriveModel {
     }
     pub fn new_state(&self, vision: std::rc::Rc<VisionState>) -> Result<PlanningState> {
         self.backbone.new_state(vision)
+    }
+    pub fn reset_state(&self, state: &mut PlanningState) -> Result<()> {
+        self.backbone.reset_state(state)
+    }
+
+    pub(crate) fn validate_layout(&self, token_ids: &[u32], grids: &[[u32; 3]]) -> Result<()> {
+        self.backbone.rope_index(token_ids, grids).map(|_| ())
+    }
+    pub(crate) fn prepare_direct_inputs(
+        &self,
+        state: &mut PlanningState,
+        vision: &VisionState,
+        token_ids: &[u32],
+        pixels: &Tensor,
+        grids: &[[u32; 3]],
+        cond: ExpertConditioning,
+        steps: usize,
+    ) -> Result<DirectInputs> {
+        DirectInputs::new(
+            &self.backbone,
+            &self.planner,
+            state,
+            vision,
+            token_ids,
+            pixels,
+            grids,
+            cond,
+            steps,
+        )
+    }
+    pub(crate) fn forward_direct(
+        &self,
+        inputs: &DirectInputs,
+        state: &mut PlanningState,
+        execution: &mut dyn DirectExecution,
+    ) -> Result<Tensor> {
+        inputs.forward(&self.backbone, &self.planner, state, execution)
     }
 
     pub fn infer(

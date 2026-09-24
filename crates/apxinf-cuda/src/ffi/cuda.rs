@@ -91,6 +91,15 @@ extern "C" {
         count: usize,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    /// Row-strided fill: `height` runs of `width` bytes, each `pitch` apart.
+    pub fn cudaMemset2DAsync(
+        devPtr: *mut c_void,
+        pitch: usize,
+        value: i32,
+        width: usize,
+        height: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
     pub fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError_t;

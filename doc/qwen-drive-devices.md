@@ -135,3 +135,30 @@ Jetson the same build measures several percent apart over an afternoon, and
 6.29 s/scene at 14:20 became 6.75 s at 17:40 with nothing changed. Any
 comparison has to be alternating rounds of both sides on one machine within
 one run. Two numbers an hour apart are not a comparison.
+
+## Whole-model direct planning on Thor (sm_110)
+
+Measured on Thor with clocks and fan pinned (`nvpmodel` MAXN,
+`jetson_clocks --fan`, GPU min=max=1575 MHz, `nvfancontrol` stopped), scene 0
+of the fixed workload, BF16, ten flow steps, batch 1, ten warm-up and thirty
+timed calls per arm. Both arms are the same checkout's Python package and the
+same empty tactic store, so the native library is the only variable. Eight
+arms interleaved ABBA then BAAB, because of the drift note above.
+
+| arm | request p50 | model p50 |
+| --- | --- | --- |
+| before, four arms | 2122.801 ms | 2092.855 ms |
+| after, four arms | 778.346 ms | 743.799 ms |
+
+That is 1344.455 ms, a 2.73x speedup and 63.3% off the request. Arm spread was
+42.772 ms before and 39.668 ms after, so the gain is two orders of magnitude
+clear of the variation the board contributes.
+
+Equivalence is stronger than a tolerance here. Every trajectory is repeatable
+within an arm, and across the whole 242-scene fixed-profile NAVSIM set all 242
+trajectories are **bit-identical** between the two arms -- not close, equal.
+Any PDM score computed from them is therefore identical by construction, so no
+scoring run can distinguish the two. The 128-key/64-token GDN specializations
+that produce the speedup keep each output's accumulation order, and the BF16
+Q/K storage only makes physical a rounding their producers had already applied.
+

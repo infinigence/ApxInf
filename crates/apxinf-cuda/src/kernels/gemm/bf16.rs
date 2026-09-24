@@ -121,6 +121,18 @@ impl ColdL2Evictor {
 }
 
 fn tuning_key(ctx: &CudaContext, m: usize, n: usize, k: usize) -> GemmTuningKey {
+    // TEMP-DIAG: APXINF_GEMM_DUMP_SHAPES prints each distinct BF16 GEMM shape
+    // once, to drive an offline heuristic sweep. Remove with the sweep's result.
+    if std::env::var_os("APXINF_GEMM_DUMP_SHAPES").is_some() {
+        static SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<(usize, usize, usize)>>> =
+            std::sync::Mutex::new(None);
+        if let Ok(mut guard) = SEEN.lock() {
+            let seen = guard.get_or_insert_with(std::collections::BTreeSet::new);
+            if seen.insert((m, n, k)) {
+                eprintln!("[apxinf] gemm-shape m={m} n={n} k={k}");
+            }
+        }
+    }
     GemmTuningKey {
         op: GemmOp::Bf16,
         device: DeviceFingerprint::from(ctx.caps()),

@@ -169,10 +169,8 @@ pub struct DeviceMlp {
 
 pub struct FullAttentionLayerWeights {
     pub input_norm: Tensor,
-    /// Separate checkpoint [out,hidden] projections; Q contains q|gate per head.
-    pub q_w: Tensor,
-    pub k_w: Tensor,
-    pub v_w: Tensor,
+    /// Packed Q/K/V projection; Q contains q|gate per head.
+    pub qkv_w: Tensor,
     pub q_norm: Tensor,
     pub k_norm: Tensor,
     pub o_w: Tensor,
@@ -410,9 +408,7 @@ impl BackboneDeviceWeights {
                 }
                 layers.push(MixerWeights::FullAttention(FullAttentionLayerWeights {
                     input_norm,
-                    q_w: up(backend, &projection(&q)?)?,
-                    k_w: up(backend, &projection(&k)?)?,
-                    v_w: up(backend, &projection(&v)?)?,
+                    qkv_w: up(backend, &projection(&concat_rows_bf16(&[&q, &k, &v])?)?)?,
                     q_norm: up(
                         backend,
                         &take(&mut language, &format!("{p}.self_attn.q_norm.weight"))?,
