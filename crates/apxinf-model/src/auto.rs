@@ -304,6 +304,15 @@ impl AutoModel {
                 "model {model_name} does not yet support model_variant"
             )));
         }
+
+        if matches!(model_name, "pi05" | "pi05-cuda") {
+            #[cfg(feature = "cuda")]
+            return crate::pi05::load_with_cuda_new(path, device, options);
+
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
@@ -339,6 +348,50 @@ impl AutoModel {
             *generation_defaults = defaults;
         }
         Ok(loaded)
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CudaRecipeOptions {
+    pub cache_dir: Option<String>,
+    pub online_tune: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOptions> {
+    let cache_dir = options
+        .tuning_path
+        .as_deref()
+        .map(exact_recipe_directory)
+        .map(|path| {
+            path.to_str().map(str::to_owned).ok_or_else(|| {
+                Error::Other(format!(
+                    "exact recipe cache path is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(CudaRecipeOptions {
+        cache_dir,
+        online_tune: options.autotune,
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn exact_recipe_directory(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+    let legacy_json_name = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if path.is_file() || legacy_json_name {
+        path.with_extension("recipes")
+    } else {
+        path.to_path_buf()
     }
 }
 

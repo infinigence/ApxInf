@@ -93,7 +93,7 @@ impl CudaBuffer {
     pub fn alloc_zeros_async(
         num_bytes: usize,
         device: usize,
-        stream: crate::CudaStream,
+        stream: &crate::CudaStream,
     ) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;
         unsafe {

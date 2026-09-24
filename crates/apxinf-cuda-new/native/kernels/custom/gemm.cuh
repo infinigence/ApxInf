@@ -3,7 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-namespace apxinf::cuda::custom {
+namespace apxinf::cuda_new::custom {
 __device__ inline float load(const void* p, int type, int64_t i) {
  if(type==4)return float(((const int8_t*)p)[i]);
  if(type==5)return float(((const int32_t*)p)[i]);
@@ -47,7 +47,7 @@ static __global__ void dequantize_i8_bf16(const int8_t* src,
 }
 __device__ inline float gelu(float x) {return 0.5f*x*(1.f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x)));}
 static __global__ void finish(const void* projection,int projection_type,void* output,int out_type,
- const void* bias,int bias_type,const float* as,const float* bs,
+ const void* bias,int bias_type,const void* residual,int residual_type,const float* as,const float* bs,
  int64_t m,int64_t n,int semantic,int scale_mode,float alpha,float output_scale) {
  int64_t width=semantic==2?n/2:n;
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<m*width;i+=int64_t(gridDim.x)*blockDim.x) {
@@ -60,6 +60,7 @@ static __global__ void finish(const void* projection,int projection_type,void* o
    x=gelu(x)*up;
   } else {
    if(bias) x+=load(bias,bias_type,c);
+   if(semantic==4) x+=load(residual,residual_type,i);
    if(semantic==1) x=gelu(x);
   }
   save(output,out_type,i,x/output_scale);

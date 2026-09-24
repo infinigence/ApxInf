@@ -49,7 +49,7 @@ struct Implementation {
   bool fallback;
   bool (*supports)(const Spec&);
   AlignmentRequirements (*alignment_requirements)(const Spec&);
-  size_t (*resource_requirements)(const Spec&);
+  size_t (*resource_requirements)(const Spec&, int configuration);
   void (*enumerate_configs)(const Spec&, std::vector<int>&);
   PrepareExecutionFn prepare;
   EnqueueFn enqueue;
@@ -91,20 +91,25 @@ Recipe tune(const Spec& spec, const apxinf_attention_policy_t& policy,
 TuningKeys tuning_keys(const Spec& spec,
                        const apxinf_attention_policy_t& policy, int device);
 
-size_t custom_resource_requirements(const Spec& spec);
+size_t custom_resource_requirements(const Spec& spec, int configuration);
 void prepare_custom(Execution& execution);
 cudaError_t launch_custom(Execution& execution);
 void destroy_custom(Execution& execution) noexcept;
 
 #if defined(APXINF_ATTENTION_FA2)
-size_t fa2_resource_requirements(const Spec& spec);
+size_t fa2_resource_requirements(const Spec& spec, int configuration);
 void prepare_fa2(Execution& execution);
 cudaError_t launch_fa2(Execution& execution);
 void destroy_fa2(Execution& execution) noexcept;
+size_t fa2_splitkv_resource_requirements(const Spec& spec,
+                                         int configuration);
+void prepare_fa2_splitkv(Execution& execution);
+cudaError_t launch_fa2_splitkv(Execution& execution);
+void destroy_fa2_splitkv(Execution& execution) noexcept;
 #endif
 
 #if defined(APXINF_ATTENTION_CUTLASS)
-size_t cutlass_resource_requirements(const Spec& spec);
+size_t cutlass_resource_requirements(const Spec& spec, int configuration);
 void prepare_cutlass(Execution& execution);
 cudaError_t launch_cutlass(Execution& execution);
 void destroy_cutlass(Execution& execution) noexcept;

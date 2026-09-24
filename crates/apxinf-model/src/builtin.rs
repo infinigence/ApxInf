@@ -20,8 +20,6 @@ pub fn register_builtin_models() {
     registry::register("qwen_drive", load_qwen_drive);
 
     #[cfg(feature = "cuda")]
-    crate::pi05::register_builtin();
-    #[cfg(feature = "cuda")]
     crate::walloss::register_builtin();
     #[cfg(feature = "cuda")]
     crate::pi0fast::register_builtin();

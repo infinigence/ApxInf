@@ -11,6 +11,7 @@ pub(crate) enum Semantic {
     Dense = abi::SEMANTIC_DENSE,
     KvCache = abi::SEMANTIC_KV_CACHE,
     Segmented = abi::SEMANTIC_SEGMENTED,
+    PackedQkv = abi::SEMANTIC_PACKED_QKV,
 }
 
 impl Semantic {
@@ -27,6 +28,9 @@ impl Semantic {
             Self::Dense => "attention",
             Self::KvCache => "kv_cache_attention",
             Self::Segmented => "segmented_attention",
+            // Packed QKV is a storage layout for the dense mathematical
+            // semantic, not a separate public operator family.
+            Self::PackedQkv => "attention",
         }
     }
 }
@@ -95,6 +99,31 @@ impl<'a> AttentionArgs<'a> {
     pub fn causal(mut self) -> Self {
         self.mask = AttentionMask::Causal;
         self
+    }
+}
+
+/// Dense self-attention over a zero-copy packed QKV projection.
+///
+/// `qkv` is contiguous `[batch, tokens, 3, heads, head_dim]`, with Q/K/V
+/// adjacent inside each token row. The provider consumes the token-row stride
+/// directly, so this operation does not materialize three separate tensors.
+/// The current kernel is the production SigLIP shape `[batch, 256, 3, 16, 72]`.
+pub struct PackedQkvAttentionArgs<'a> {
+    pub qkv: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub scale: f32,
+    pub policy: AttentionPolicy,
+}
+
+impl<'a> PackedQkvAttentionArgs<'a> {
+    pub fn new(qkv: &'a Tensor, out: &'a mut Tensor) -> Self {
+        let head_dim = qkv.shape().dims().get(4).copied().unwrap_or(1);
+        Self {
+            qkv,
+            out,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            policy: AttentionPolicy::default(),
+        }
     }
 }
 
@@ -290,5 +319,105 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         policy: args.policy,
         bindings,
         storage: vec![q, k, v, out],
+    })
+}
+
+pub(crate) fn normalize_packed_qkv(
+    ctx: &CudaContext,
+    args: PackedQkvAttentionArgs<'_>,
+) -> Result<Normalized> {
+    let shape = args.qkv.shape().dims();
+    if shape.len() != 5 || shape[2] != 3 {
+        return Err(invalid(
+            "Packed QKV Attention requires [batch, tokens, 3, heads, head_dim] input",
+        ));
+    }
+    let (batch, tokens, heads, head_dim) = (shape[0], shape[1], shape[3], shape[4]);
+    let out_shape = [batch, tokens, heads, head_dim];
+    if batch == 0
+        || tokens != 256
+        || heads != 16
+        || head_dim != 72
+        || args.out.shape().dims() != out_shape
+        || args.out.dtype() != args.qkv.dtype()
+        || args.qkv.dtype() != DType::F16
+    {
+        return Err(invalid(
+            "invalid packed QKV Attention shape or dtype contract",
+        ));
+    }
+    if [batch, tokens, heads, head_dim]
+        .iter()
+        .any(|value| *value > i32::MAX as usize)
+    {
+        return Err(invalid("Attention dimension exceeds native limits"));
+    }
+    if !args.scale.is_finite() || args.scale <= 0.0 {
+        return Err(invalid("Attention scale must be finite and positive"));
+    }
+
+    let dtype = args.qkv.dtype();
+    let qkv = tensor_storage(ctx, args.qkv, dtype, shape)?;
+    let out = tensor_storage(ctx, args.out, dtype, &out_shape)?;
+    let qkv_range = range(&qkv, required_bytes(dtype, shape)?)?;
+    let out_range = range(&out, required_bytes(dtype, &out_shape)?)?;
+    if out_range.start < qkv_range.end && qkv_range.start < out_range.end {
+        return Err(invalid(
+            "Attention output overlaps read-only packed QKV storage",
+        ));
+    }
+
+    let plane_bytes = heads
+        .checked_mul(head_dim)
+        .and_then(|elements| elements.checked_mul(dtype.size_in_bytes()))
+        .ok_or_else(|| invalid("packed QKV pointer offset overflow"))?;
+    let value_offset = plane_bytes
+        .checked_mul(2)
+        .ok_or_else(|| invalid("packed QKV pointer offset overflow"))?;
+    let key = qkv
+        .view(plane_bytes, qkv.len() - plane_bytes)
+        .map_err(Error::Cuda)?;
+    let value = qkv
+        .view(value_offset, qkv.len() - value_offset)
+        .map_err(Error::Cuda)?;
+    let default_scale = 1.0 / (head_dim as f32).sqrt();
+    let bindings = abi::Bindings {
+        query: qkv.ptr(),
+        key: key.ptr(),
+        value: value.ptr(),
+        offsets: std::ptr::null(),
+        output: out.ptr(),
+        stream: ctx.stream().handle(),
+        scale: args.scale,
+        output_scale: 1.0,
+    };
+    Ok(Normalized {
+        spec: abi::Spec {
+            version: abi::SPEC_VERSION,
+            semantic: Semantic::PackedQkv.abi_value(),
+            dtype: dtype_code(dtype)?,
+            output_dtype: dtype_code(dtype)?,
+            mask: AttentionMask::None as u32,
+            q_alignment: alignment(bindings.query),
+            k_alignment: alignment(bindings.key),
+            v_alignment: alignment(bindings.value),
+            output_alignment: alignment(bindings.output.cast_const()),
+            offsets_alignment: 0,
+            batch: batch as i64,
+            query_tokens: tokens as i64,
+            key_tokens: tokens as i64,
+            key_capacity: tokens as i64,
+            query_heads: heads as i64,
+            kv_heads: heads as i64,
+            head_dim: head_dim as i64,
+            query_start: 0,
+            segments: 0,
+            max_segment_tokens: 0,
+            offsets_hash: 0,
+            scale_is_default: u32::from(args.scale == default_scale),
+        },
+        policy: args.policy,
+        bindings,
+        storage: vec![qkv, key, value, out],
     })
 }

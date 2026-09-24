@@ -1,21 +1,19 @@
 //! Shared PI0.5 preparation and captured resource ownership.
 use crate::pi05::backend::{
-    kernels, transfers, Context, DeviceBuffer as CudaBuffer, RuntimeBackend,
+    self, capture as capture_cuda_graph, ops, transfers, Context, DeviceBuffer as CudaBuffer,
+    ExecutionSession,
 };
 use crate::pi05::model::Pi05Model;
 use crate::pi05::model::{ModelOperation, ModelVariant, PrepareBlocks, WorkspaceRequirements};
 use crate::pi05::{Pi05Config, Pi05ImageLayout};
-use apxinf_core::{Backend, Error, Graph, Result, Tensor};
+use apxinf_core::{Error, Graph, Result, Tensor};
 use std::sync::Arc;
 
-fn allocate_workspace(
+fn allocate_session(
     requirements: &WorkspaceRequirements,
     device: usize,
-) -> Result<kernels::GraphWorkspace> {
-    match requirements.fp8_scratch {
-        Some((a, w)) => kernels::GraphWorkspace::new_fp8(requirements.bytes, a, w, device),
-        None => kernels::GraphWorkspace::new(requirements.bytes, device),
-    }
+) -> Result<ExecutionSession> {
+    ExecutionSession::with_capacity(requirements.bytes, device)
 }
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
@@ -26,10 +24,10 @@ pub struct CapturedGraph {
     noise: Tensor,
     token_ids: CudaBuffer,
     token_count: usize,
-    backend: Arc<RuntimeBackend>,
+    backend: Arc<Context>,
     // Retain every fixed weight referenced by the captured computation.
     _fixed: Box<dyn std::any::Any>,
-    workspace: kernels::GraphWorkspace,
+    session: ExecutionSession,
 }
 
 impl CapturedGraph {
@@ -39,7 +37,7 @@ impl CapturedGraph {
 
     pub fn replay_and_synchronize(&self) -> Result<()> {
         self.graph.replay()?;
-        self.backend.synchronize()
+        backend::synchronize(&self.backend)
     }
 
     pub fn output(&self) -> &Tensor {
@@ -76,7 +74,7 @@ impl CapturedGraph {
                 token_ids.len()
             )));
         }
-        self.backend.synchronize()?;
+        backend::synchronize(&self.backend)?;
         transfers::copy_cpu_to_cuda(patches, &self.patches)?;
         self.update_tokens(token_ids)
     }
@@ -113,28 +111,28 @@ impl CapturedGraph {
                 token_ids.len()
             )));
         }
-        self.backend.synchronize()?;
+        backend::synchronize(&self.backend)?;
         raw_images.copy_from_host(images).map_err(Error::Cuda)?;
         self.update_tokens(token_ids)
     }
 
     pub fn workspace_bytes(&self) -> usize {
-        self.workspace.capacity()
+        self.session.workspace().capacity()
     }
 
     pub fn workspace_used_bytes(&self) -> usize {
-        self.workspace.used()
+        self.session.workspace().used()
     }
 }
 
 struct CaptureBuilder<'a, B: PrepareBlocks> {
     model: &'a Arc<Pi05Model<B>>,
-    backend: &'a Arc<RuntimeBackend>,
+    backend: &'a Arc<Context>,
     config: &'a Pi05Config,
 }
 impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
     fn ctx(&self) -> &Context {
-        self.backend.context()
+        self.backend
     }
     #[allow(clippy::too_many_arguments)]
     fn infer_captured_inputs(
@@ -179,22 +177,35 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         noise: &Tensor,
         time_embeddings: &[Tensor],
     ) -> Result<CapturedGraph> {
-        let backend = &self.backend;
+        let backend = self.backend;
         if raw_images.is_some() != raw_image_layout.is_some() {
             return Err(Error::Other(
                 "π0.5 raw image capture state is inconsistent".into(),
             ));
         }
         let modulation = self.model.prepare_all_modulation(time_embeddings)?;
-        backend.synchronize()?;
-        let workspace = allocate_workspace(
+        backend::synchronize(backend)?;
+        let session = allocate_session(
             &self.model.workspace_requirements(token_count)?,
             self.ctx().device_id(),
         )?;
-        let mut stable = false;
-        for _ in 0..4 {
-            let generation = self.ctx().tuning().generation();
-            let eager_output = kernels::prepare_with_workspace(&workspace, || {
+        let eager_output = ops::prepare_with_session(&session, || {
+            self.infer_captured_inputs(
+                &patches,
+                raw_images.as_ref(),
+                raw_image_layout,
+                token_ids,
+                token_count,
+                noise,
+                &modulation,
+            )
+        })?;
+        backend::synchronize(backend)?;
+        drop(eager_output);
+
+        let captured_output = std::cell::RefCell::new(None);
+        let graph = capture_cuda_graph(self.ctx(), || {
+            let output = ops::with_session(&session, || {
                 self.infer_captured_inputs(
                     &patches,
                     raw_images.as_ref(),
@@ -205,34 +216,14 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                     &modulation,
                 )
             })?;
-            backend.synchronize()?;
-            drop(eager_output);
-            if self.ctx().tuning().generation() == generation {
-                stable = true;
-                break;
-            }
-        }
-        if !stable {
-            return Err(Error::Other(
-                "GEMM tactic store did not stabilize before PI0.5 graph capture".into(),
-            ));
-        }
-
-        let (graph, output) = backend.capture_graph(|| {
-            kernels::with_workspace(&workspace, || {
-                self.infer_captured_inputs(
-                    &patches,
-                    raw_images.as_ref(),
-                    raw_image_layout,
-                    token_ids,
-                    token_count,
-                    noise,
-                    &modulation,
-                )
-            })
+            captured_output.replace(Some(output));
+            Ok(())
         })?;
+        let output = captured_output
+            .into_inner()
+            .ok_or_else(|| Error::Other("PI0.5 graph capture produced no output tensor".into()))?;
         Ok(CapturedGraph {
-            graph,
+            graph: Box::new(graph),
             output,
             patches,
             raw_images,
@@ -242,7 +233,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             token_count,
             backend: Arc::clone(&self.backend),
             _fixed: Box::new((Arc::clone(&self.model), modulation)),
-            workspace,
+            session,
         })
     }
 
@@ -285,7 +276,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             .map_err(Error::Cuda)?;
         let patch_rows = self.config.num_views * self.config.patches_per_view();
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
-        let patches = backend.to_device(&Tensor::zeros(
+        let patches = backend::to_device(backend, &Tensor::zeros(
             vec![patch_rows, patch_width],
             self.model.raw_patch_dtype(),
         ))?;

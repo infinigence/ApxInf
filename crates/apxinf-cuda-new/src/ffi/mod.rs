@@ -1,7 +1,7 @@
-//! Private raw foreign-function bindings used by `apxinf-cuda`.
+//! Private foreign-function bindings used by cuda-new.
 //!
-//! Provider-specific declarations live in child modules. The flat re-exports
-//! intentionally preserve the existing internal `crate::ffi::<name>` API.
+//! Typed operator ABIs live under `abi`; only CUDA runtime and sampling retain
+//! small raw bindings.
 
 #![allow(non_camel_case_types, dead_code, unused_imports)]
 

@@ -8,11 +8,6 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
-enum CaptureMode {
-    ThreadLocal,
-}
-
 pub struct CapturedGraph {
     exec: ffi::cudaGraphExec_t,
     graph: ffi::cudaGraph_t,
@@ -30,6 +25,12 @@ impl CapturedGraph {
     }
 }
 
+impl apxinf_core::Graph for CapturedGraph {
+    fn replay(&self) -> Result<()> {
+        CapturedGraph::replay(self)
+    }
+}
+
 impl Drop for CapturedGraph {
     fn drop(&mut self) {
         let _ = self.stream.with_current_device(|| unsafe {
@@ -39,10 +40,8 @@ impl Drop for CapturedGraph {
     }
 }
 
-fn begin(ctx: &CudaContext, mode: CaptureMode) -> std::result::Result<(), String> {
-    let mode = match mode {
-        CaptureMode::ThreadLocal => ffi::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
-    };
+pub(crate) fn begin(ctx: &CudaContext) -> std::result::Result<(), String> {
+    let mode = ffi::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal;
     // Keep this device current until `end`; switching devices during capture
     // can invalidate a thread-local capture.
     ctx.stream().set_current_device()?;
@@ -53,7 +52,7 @@ fn begin(ctx: &CudaContext, mode: CaptureMode) -> std::result::Result<(), String
     Ok(())
 }
 
-fn end(ctx: &CudaContext) -> std::result::Result<CapturedGraph, String> {
+pub(crate) fn end(ctx: &CudaContext) -> std::result::Result<CapturedGraph, String> {
     let device_status = ctx.stream().set_current_device();
     let stream = ctx.stream().handle();
     let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
@@ -93,7 +92,7 @@ pub fn capture(ctx: &CudaContext, operation: impl FnOnce() -> Result<()>) -> Res
             "nested CUDA Graph capture is not supported".into(),
         ));
     }
-    begin(ctx, CaptureMode::ThreadLocal).map_err(Error::Cuda)?;
+    begin(ctx).map_err(Error::Cuda)?;
     let operation_result = catch_unwind(AssertUnwindSafe(operation));
     let graph_result = end(ctx).map_err(Error::Cuda);
     match operation_result {

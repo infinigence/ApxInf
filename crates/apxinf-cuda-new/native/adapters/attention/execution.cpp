@@ -25,7 +25,7 @@ void validate_spec(const Spec& spec) {
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != 3 ||
-      spec.semantic > APXINF_ATTENTION_SEMANTIC_SEGMENTED ||
+      spec.semantic > APXINF_ATTENTION_SEMANTIC_PACKED_QKV ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!native_output && !static_e4m3_output) ||
       spec.mask > APXINF_ATTENTION_MASK_CAUSAL || spec.batch <= 0 ||
@@ -51,6 +51,17 @@ void validate_spec(const Spec& spec) {
        spec.offsets_hash != 0 || spec.offsets_alignment != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
+  }
+  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_PACKED_QKV &&
+      (spec.key_tokens != spec.query_tokens ||
+       spec.key_capacity != spec.query_tokens ||
+       spec.query_heads != spec.kv_heads ||
+       spec.mask != APXINF_ATTENTION_MASK_NONE || spec.query_start != 0 ||
+       spec.segments != 0 || spec.max_segment_tokens != 0 ||
+       spec.offsets_hash != 0 || spec.offsets_alignment != 0 ||
+       spec.output_dtype != spec.dtype)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid packed-QKV Attention semantic fields");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
       (spec.query_start < 0 || spec.query_start > spec.key_tokens ||
@@ -253,6 +264,43 @@ void check_output(const std::vector<float>& actual, const float* expected,
               " expected=" + std::to_string(expected[index]));
     }
   }
+}
+
+struct CandidateGraph {
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+
+  CandidateGraph() = default;
+  CandidateGraph(const CandidateGraph&) = delete;
+  CandidateGraph& operator=(const CandidateGraph&) = delete;
+  CandidateGraph(CandidateGraph&& other) noexcept
+      : graph(other.graph), executable(other.executable) {
+    other.graph = nullptr;
+    other.executable = nullptr;
+  }
+
+  ~CandidateGraph() {
+    if (executable != nullptr) cudaGraphExecDestroy(executable);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+  }
+};
+
+CandidateGraph capture_candidate(
+    const apxinf::attention::Implementation& implementation,
+    Execution& candidate, cudaStream_t stream) {
+  CandidateGraph captured;
+  apxinf::attention::check_cuda(
+      cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  try {
+    apxinf::attention::check_cuda(implementation.enqueue(candidate));
+  } catch (...) {
+    cudaStreamEndCapture(stream, &captured.graph);
+    throw;
+  }
+  apxinf::attention::check_cuda(cudaStreamEndCapture(stream, &captured.graph));
+  apxinf::attention::check_cuda(cudaGraphInstantiate(
+      &captured.executable, captured.graph, nullptr, nullptr, 0));
+  return captured;
 }
 
 }  // namespace
@@ -461,6 +509,17 @@ extern "C" apxinf_status_t apxinf_attention_test_validate_candidates(
         check_output(read_output(normalized, *bindings, count), expected_output,
                      std::string(implementation.name) + "#" +
                          std::to_string(configuration));
+        if (policy->graph_safe) {
+          auto graph = capture_candidate(implementation, *candidate, stream);
+          apxinf::attention::check_cuda(
+              cudaMemsetAsync(bindings->output, 0xff, bytes, stream));
+          apxinf::attention::check_cuda(
+              cudaGraphLaunch(graph.executable, stream));
+          check_output(
+              read_output(normalized, *bindings, count), expected_output,
+              std::string(implementation.name) + "#" +
+                  std::to_string(configuration) + " graph");
+        }
       }
       ++implementations_checked;
     }

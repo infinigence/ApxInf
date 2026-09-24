@@ -1,8 +1,7 @@
 //! π0.5 FP8 CUDA transformer-layer computation.
 
-use crate::pi05::backend::{kernels, Context};
-use apxinf_core::{Error, Result, Tensor};
-use kernels::{activation, attention, embedding, fused, gemm, norm, quantization, rope};
+use crate::pi05::backend::{ops, Context, DeviceBuffer};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use crate::pi05::{
     Fp8StaticDeviceActionLayer, Fp8StaticDeviceLanguageLayer, Fp8StaticDeviceVisionBlock,
@@ -23,35 +22,443 @@ pub struct Fp8StaticActionLayerOutput {
     pub next_normalized: Tensor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Fa2DirectE4m3Mode {
-    Auto,
-    Off,
-    On,
+fn action_attention_args<'a>(
+    query: &'a Tensor,
+    key: &'a Tensor,
+    value: &'a Tensor,
+    output: &'a mut Tensor,
+    valid_key_tokens: usize,
+    policy: &ops::AttentionPolicy,
+) -> ops::KvCacheAttentionArgs<'a> {
+    let mut args = ops::KvCacheAttentionArgs::new(query, key, value, output).non_causal();
+    args.valid_key_tokens = valid_key_tokens;
+    args.policy = policy.clone();
+    args
 }
 
-fn parse_fa2_direct_e4m3_mode(value: Option<&str>) -> Result<Fa2DirectE4m3Mode> {
-    match value {
-        None | Some("auto") => Ok(Fa2DirectE4m3Mode::Auto),
-        Some("0" | "off") => Ok(Fa2DirectE4m3Mode::Off),
-        Some("1" | "on") => Ok(Fa2DirectE4m3Mode::On),
-        Some(value) => Err(Error::Other(format!(
-            "APXINF_PI05_FA2_DIRECT_E4M3 must be auto, 0/off, or 1/on; got {value}"
-        ))),
+pub(in crate::pi05) type Fp8L3Policies = super::L3Policies;
+
+struct QkvTensors {
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+}
+
+fn output(ctx: &Context, shape: impl Into<Vec<usize>>, dtype: DType) -> Result<Tensor> {
+    ctx.allocate_output(Shape::new(shape.into()), dtype)
+}
+
+fn fixed_quantize(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let mut out = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    let mut args = ops::QuantizationArgs::new(
+        ops::QuantizationSemantic::FixedScaleE4m3,
+        input,
+        &mut out,
+    );
+    args.scale = scale;
+    ops::quantization(ctx, args)?;
+    Ok(out)
+}
+
+fn fp8_gemm(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    input: &Tensor,
+    input_scale: f32,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    let weight_dims = weights.weight.shape().dims();
+    if dims.len() != 2 || weight_dims.len() != 2 || dims[1] != weight_dims[0] {
+        return Err(Error::Other("π0.5 FP8 GEMM shape mismatch".into()));
     }
+    let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
+    let mut args = ops::GemmArgs::new(input, &weights.weight, &mut out)
+        .with_immutable_weight(ops::WeightVersion::new(1));
+    args.quantization = ops::GemmQuantization::Fp8UnitScale;
+    args.alpha = input_scale * weights.weight_scale;
+    args.policy = policies.gemm.clone();
+    ops::gemm(ctx, args)?;
+    Ok(out)
 }
 
-fn fa2_direct_e4m3_mode() -> Result<Fa2DirectE4m3Mode> {
-    match std::env::var("APXINF_PI05_FA2_DIRECT_E4M3") {
-        Ok(value) => parse_fa2_direct_e4m3_mode(Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_fa2_direct_e4m3_mode(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(Error::Other(
-            "APXINF_PI05_FA2_DIRECT_E4M3 must be valid Unicode".into(),
-        )),
+fn fp8_gemm_bias(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    input: &Tensor,
+    input_scale: f32,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+) -> Result<Tensor> {
+    let bias = weights
+        .bias
+        .as_ref()
+        .ok_or_else(|| Error::Other("π0.5 FP8 fused GEMM requires a bias".into()))?;
+    let dims = input.shape().dims();
+    let weight_dims = weights.weight.shape().dims();
+    let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
+    let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
+        .with_immutable_weight(ops::WeightVersion::new(1));
+    gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
+    gemm.alpha = input_scale * weights.weight_scale;
+    gemm.policy = policies.gemm.clone();
+    ops::gemm_bias(ctx, ops::GemmBiasArgs { gemm, bias })?;
+    Ok(out)
+}
+
+fn fp8_gemm_bias_gelu_quant(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    input: &Tensor,
+    input_scale: f32,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+    output_scale: f32,
+) -> Result<Tensor> {
+    let bias = weights
+        .bias
+        .as_ref()
+        .ok_or_else(|| Error::Other("π0.5 FP8 fused GEMM+GELU requires a bias".into()))?;
+    let dims = input.shape().dims();
+    let weight_dims = weights.weight.shape().dims();
+    if dims.len() != 2 || weight_dims.len() != 2 || dims[1] != weight_dims[0] {
+        return Err(Error::Other("π0.5 FP8 GEMM+GELU shape mismatch".into()));
     }
+    let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F8E4M3)?;
+    let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
+        .with_immutable_weight(ops::WeightVersion::new(1));
+    gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
+    gemm.alpha = input_scale * weights.weight_scale;
+    gemm.output_scale = output_scale;
+    gemm.policy = policies.gemm.clone();
+    ops::gemm_bias_gelu(ctx, ops::GemmBiasGeluArgs { gemm, bias })?;
+    Ok(out)
 }
 
-fn fa2_direct_e4m3_exact_shape(q: &Tensor, k: &Tensor, v: &Tensor) -> bool {
+fn fp8_gemm_bias_residual(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    input: &Tensor,
+    input_scale: f32,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    let weight_dims = weights.weight.shape().dims();
+    if dims.len() != 2 || weight_dims.len() != 2 || dims[1] != weight_dims[0] {
+        return Err(Error::Other(
+            "π0.5 FP8 GEMM+bias+residual shape mismatch".into(),
+        ));
+    }
+    let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
+    let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
+        .with_immutable_weight(ops::WeightVersion::new(1));
+    gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
+    gemm.alpha = input_scale * weights.weight_scale;
+    gemm.policy = policies.gemm.clone();
+    ops::gemm_bias_residual(
+        ctx,
+        ops::GemmBiasResidualArgs {
+            gemm,
+            bias: weights.bias.as_ref(),
+            residual,
+        },
+    )?;
+    Ok(out)
+}
+
+fn fp8_gemm_geglu(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    input: &Tensor,
+    input_scale: f32,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+    output_scale: f32,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    let weight_dims = weights.weight.shape().dims();
+    if weight_dims[1] % 2 != 0 {
+        return Err(Error::Other("π0.5 FP8 GeGLU width must be even".into()));
+    }
+    let fused_shape = matches!(dims[0], 522 | 533)
+        && dims[1] == 2048
+        && weight_dims == [2048, 32768];
+    if fused_shape {
+        let mut out = output(ctx, vec![dims[0], weight_dims[1] / 2], DType::F8E4M3)?;
+        let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
+            .with_immutable_weight(ops::WeightVersion::new(1));
+        gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
+        gemm.alpha = input_scale * weights.weight_scale;
+        gemm.output_scale = output_scale;
+        gemm.policy = policies.gemm.clone();
+        ops::gemm_geglu(ctx, ops::GemmGegluArgs { gemm })?;
+        return Ok(out);
+    }
+
+    let gate_up = fp8_gemm(ctx, policies, input, input_scale, weights)?;
+    let mut out = output(ctx, vec![dims[0], weight_dims[1] / 2], DType::F8E4M3)?;
+    let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Geglu, &gate_up, &mut out);
+    args.output_scale = output_scale;
+    ops::pointwise(ctx, args)?;
+    Ok(out)
+}
+
+fn bias_activation(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    activation: ops::PointwiseActivation,
+) -> Result<Tensor> {
+    let mut out = output(ctx, input.shape().dims().to_vec(), input.dtype())?;
+    let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut out);
+    args.bias = bias;
+    args.activation = activation;
+    ops::pointwise(ctx, args)?;
+    Ok(out)
+}
+
+fn rms_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    let mut args = ops::RmsNormArgs::new(input, weight, &mut normalized, eps);
+    args.output_scale = scale;
+    ops::rms_norm(ctx, args)?;
+    Ok(normalized)
+}
+
+fn layer_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    let mut args = ops::LayerNormArgs::new(input, weight, bias, &mut normalized, eps);
+    args.output_scale = scale;
+    ops::layer_norm(ctx, args)?;
+    Ok(normalized)
+}
+
+fn f16_vector_prefix(tensor: &Tensor, elements: usize) -> Result<Tensor> {
+    if tensor.dtype() != DType::F16 {
+        return Err(Error::Other(format!(
+            "PI0.5 FP8 modulation must use F16 storage, got {}",
+            tensor.dtype()
+        )));
+    }
+    let bytes = elements
+        .checked_mul(DType::F16.size_in_bytes())
+        .ok_or_else(|| Error::Other("PI0.5 F16 vector size overflow".into()))?;
+    DeviceBuffer::from_tensor(tensor)
+        .and_then(|buffer| buffer.view(0, bytes))
+        .and_then(|buffer| buffer.as_tensor(Shape::new(vec![elements]), DType::F16))
+        .map_err(Error::Cuda)
+}
+
+fn adaptive_rms_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    norm_style: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let cols = input
+        .shape()
+        .dims()
+        .last()
+        .copied()
+        .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
+    let norm_style = f16_vector_prefix(norm_style, 2 * cols)?;
+    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    let mut args = ops::AdaptiveRmsNormArgs::new(input, &norm_style, &mut normalized, eps);
+    args.output_scale = scale;
+    ops::adaptive_rms_norm(ctx, args)?;
+    Ok(normalized)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bias_residual_rms_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let shape = input.shape().dims().to_vec();
+    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
+    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
+    let mut args = ops::BiasResidualRmsNormArgs::new(
+        input, bias, residual, weight, &mut hidden, &mut normalized, eps,
+    );
+    args.output_scale = scale;
+    ops::bias_residual_rms_norm(ctx, args)?;
+    Ok((hidden, normalized))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bias_residual_layer_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    weight: &Tensor,
+    norm_bias: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let shape = input.shape().dims().to_vec();
+    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
+    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
+    let mut args = ops::BiasResidualLayerNormArgs::new(
+        input, bias, residual, weight, norm_bias, &mut hidden, &mut normalized, eps,
+    );
+    args.output_scale = scale;
+    ops::bias_residual_layer_norm(ctx, args)?;
+    Ok((hidden, normalized))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ada_gate_residual_rms_normalized_fp8(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    input: &Tensor,
+    residual: &Tensor,
+    norm_style: &Tensor,
+    gate_style: &Tensor,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let cols = input
+        .shape()
+        .dims()
+        .last()
+        .copied()
+        .ok_or_else(|| Error::Other("PI0.5 AdaRMS input has no columns".into()))?;
+    let norm_style = f16_vector_prefix(norm_style, 2 * cols)?;
+    let shape = input.shape().dims().to_vec();
+    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
+    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
+    let mut args = ops::AdaGateResidualRmsNormArgs::new(
+        input, residual, &norm_style, gate_style, &mut hidden, &mut normalized, eps,
+    );
+    args.output_scale = scale;
+    ops::ada_gate_residual_rms_norm(ctx, args)?;
+    Ok((hidden, normalized))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    position_offset: usize,
+) -> Result<QkvTensors> {
+    let tokens = qkv.shape().dims()[0];
+    let mut q = output(ctx, vec![tokens, q_heads, head_dim], qkv.dtype())?;
+    let mut k = output(ctx, vec![tokens, kv_heads, head_dim], qkv.dtype())?;
+    let mut v = output(ctx, vec![tokens, kv_heads, head_dim], qkv.dtype())?;
+    let args = ops::RopeArgs {
+        semantic: ops::RopeSemantic::SplitQkvRope,
+        qkv,
+        bias,
+        q: &mut q,
+        k: &mut k,
+        v: &mut v,
+        q_heads,
+        kv_heads,
+        head_dim,
+        theta,
+        position_offset,
+        kv_output_offset: 0,
+    };
+    ops::rope(ctx, args)?;
+    Ok(QkvTensors { q, k, v })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_to_cache(
+    ctx: &Context,
+    _policies: &Fp8L3Policies,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    position_offset: usize,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+) -> Result<Tensor> {
+    let tokens = qkv.shape().dims()[0];
+    let mut q = output(ctx, vec![tokens, q_heads, head_dim], qkv.dtype())?;
+    let mut key_cache = key_cache.clone();
+    let mut value_cache = value_cache.clone();
+    let args = ops::RopeArgs {
+        semantic: ops::RopeSemantic::SplitQkvRope,
+        qkv,
+        bias,
+        q: &mut q,
+        k: &mut key_cache,
+        v: &mut value_cache,
+        q_heads,
+        kv_heads,
+        head_dim,
+        theta,
+        position_offset,
+        kv_output_offset: position_offset,
+    };
+    ops::rope(ctx, args)?;
+    Ok(q)
+}
+
+fn dense_attention(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output_scale: Option<f32>,
+) -> Result<Tensor> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let q4 = q.reshape(vec![1, q_dims[0], q_dims[1], q_dims[2]])?;
+    let k4 = k.reshape(vec![1, k_dims[0], k_dims[1], k_dims[2]])?;
+    let v4 = v.reshape(vec![1, k_dims[0], k_dims[1], k_dims[2]])?;
+    let dtype = output_scale.map_or(q.dtype(), |_| DType::F8E4M3);
+    let mut out = output(ctx, q4.shape().dims().to_vec(), dtype)?;
+    let mut args = ops::AttentionArgs::new(&q4, &k4, &v4, &mut out);
+    if let Some(scale) = output_scale {
+        args.output_scale = scale;
+    }
+    args.policy = policies.attention.clone();
+    ops::attention(ctx, args)?;
+    Ok(out.reshape(vec![q_dims[0], q_dims[1] * q_dims[2]])?)
+}
+
+fn uses_direct_e4m3_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> bool {
     q.shape().dims() == [522, 8, 256]
         && k.shape().dims() == [522, 1, 256]
         && v.shape().dims() == [522, 1, 256]
@@ -68,21 +475,45 @@ pub fn language_layer_fp8_static(
     rms_eps: f32,
     rope_theta: f32,
 ) -> Result<Fp8StaticLanguageLayerOutput> {
-    let normalized = norm::rms_quant_f16_e4m3(
+    language_layer_fp8_static_with_policies(
         ctx,
+        &Fp8L3Policies::default(),
+        config,
+        weights,
+        scales,
+        input,
+        compute_tail,
+        position_offset,
+        rms_eps,
+        rope_theta,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn language_layer_fp8_static_with_policies(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    config: GemmaVariantConfig,
+    weights: &Fp8StaticDeviceLanguageLayer,
+    scales: Fp8StaticTransformerLayerScales,
+    input: &Tensor,
+    compute_tail: bool,
+    position_offset: usize,
+    rms_eps: f32,
+    rope_theta: f32,
+) -> Result<Fp8StaticLanguageLayerOutput> {
+    let normalized = rms_normalized_fp8(
+        ctx,
+        policies,
         input,
         &weights.input_norm_scale,
         rms_eps,
         scales.attention_norm,
     )?;
-    let qkv = gemm::fp8(
+    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
+    let qkv = split_qkv(
         ctx,
-        &normalized,
-        scales.attention_norm,
-        weights.qkv.as_kernel_view(),
-    )?;
-    let qkv = rope::split_qkv_apply_f16(
-        ctx,
+        policies,
         &qkv,
         weights.qkv.bias.as_ref(),
         config.num_heads,
@@ -99,30 +530,32 @@ pub fn language_layer_fp8_static(
             value: qkv.v.reshape(vec![tokens, config.head_dim])?,
         });
     }
-    let fa2_direct = match fa2_direct_e4m3_mode()? {
-        Fa2DirectE4m3Mode::Auto => fa2_direct_e4m3_exact_shape(&qkv.q, &qkv.k, &qkv.v),
-        Fa2DirectE4m3Mode::Off => false,
-        Fa2DirectE4m3Mode::On => true,
-    };
-    let attention = if fa2_direct {
-        attention::mqa_f16_e4m3_522(ctx, &qkv.q, &qkv.k, &qkv.v, scales.attention_output)?.reshape(
-            vec![input.shape().dims()[0], config.num_heads * config.head_dim],
+    // Preserve the validated legacy path: only the production T10 shape has
+    // a fused F16-to-E4M3 FA2 epilogue. Other token lengths, including T21,
+    // use ordinary F16 attention followed by the direct quantization kernel.
+    let attention = if uses_direct_e4m3_attention(&qkv.q, &qkv.k, &qkv.v) {
+        dense_attention(
+            ctx,
+            policies,
+            &qkv.q,
+            &qkv.k,
+            &qkv.v,
+            Some(scales.attention_output),
         )?
     } else {
-        let attention = attention::mqa_f16(ctx, &qkv.q, &qkv.k, &qkv.v)?.reshape(vec![
-            input.shape().dims()[0],
-            config.num_heads * config.head_dim,
-        ])?;
-        quantization::quantize_f16_e4m3(ctx, &attention, scales.attention_output)?
+        let attention = dense_attention(ctx, policies, &qkv.q, &qkv.k, &qkv.v, None)?;
+        fixed_quantize(ctx, policies, &attention, scales.attention_output)?
     };
-    let projected = gemm::fp8(
+    let projected = fp8_gemm(
         ctx,
+        policies,
         &attention,
         scales.attention_output,
-        weights.output.as_kernel_view(),
+        &weights.output,
     )?;
-    let fused = fused::bias_residual_rms_quant_f16_e4m3(
+    let (hidden, normalized) = bias_residual_rms_normalized_fp8(
         ctx,
+        policies,
         &projected,
         weights.output.bias.as_ref(),
         input,
@@ -130,71 +563,27 @@ pub fn language_layer_fp8_static(
         rms_eps,
         scales.mlp_norm,
     )?;
-    let hidden = fused.hidden;
-    let normalized = fused.normalized;
-    let activated = if let Some(activated) = gemm::fp8_geglu_fused(
+    let activated = fp8_gemm_geglu(
         ctx,
+        policies,
         &normalized,
         scales.mlp_norm,
-        weights.gate_up.as_kernel_view(),
+        &weights.gate_up,
         scales.mlp_activation,
-    )? {
-        activated
-    } else {
-        let gate_up = gemm::fp8(
-            ctx,
-            &normalized,
-            scales.mlp_norm,
-            weights.gate_up.as_kernel_view(),
-        )?;
-        activation::geglu_quant_f16_e4m3(ctx, &gate_up, scales.mlp_activation)?
-    };
-    let hidden = fused::gemm_bias_residual_fp8(
+    )?;
+    let hidden = fp8_gemm_bias_residual(
         ctx,
+        policies,
         &activated,
-        &weights.down.weight,
-        weights.down.bias.as_ref(),
-        &hidden,
         scales.mlp_activation,
-        weights.down.weight_scale,
+        &weights.down,
+        &hidden,
     )?;
     Ok(Fp8StaticLanguageLayerOutput {
         hidden,
         key: qkv.k.reshape(vec![tokens, config.head_dim])?,
         value: qkv.v.reshape(vec![tokens, config.head_dim])?,
     })
-}
-
-#[cfg(test)]
-mod fa2_direct_e4m3_tests {
-    use super::{parse_fa2_direct_e4m3_mode, Fa2DirectE4m3Mode};
-
-    #[test]
-    fn fa2_direct_e4m3_parser_is_fail_closed() {
-        assert_eq!(
-            parse_fa2_direct_e4m3_mode(None).unwrap(),
-            Fa2DirectE4m3Mode::Auto
-        );
-        assert_eq!(
-            parse_fa2_direct_e4m3_mode(Some("auto")).unwrap(),
-            Fa2DirectE4m3Mode::Auto
-        );
-        for value in ["0", "off"] {
-            assert_eq!(
-                parse_fa2_direct_e4m3_mode(Some(value)).unwrap(),
-                Fa2DirectE4m3Mode::Off
-            );
-        }
-        for value in ["1", "on"] {
-            assert_eq!(
-                parse_fa2_direct_e4m3_mode(Some(value)).unwrap(),
-                Fa2DirectE4m3Mode::On
-            );
-        }
-        for value in ["", "true", "AUTO", "2"] {
-            assert!(parse_fa2_direct_e4m3_mode(Some(value)).is_err());
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -215,24 +604,60 @@ pub fn action_layer_fp8_static(
     rms_eps: f32,
     rope_theta: f32,
 ) -> Result<Fp8StaticActionLayerOutput> {
+    action_layer_fp8_static_with_policies(
+        ctx,
+        &Fp8L3Policies::default(),
+        config,
+        weights,
+        scales,
+        input,
+        attention_normalized,
+        attention_modulation,
+        mlp_modulation,
+        next_norm_modulation,
+        next_norm_scale,
+        prefix_k,
+        prefix_v,
+        position_offset,
+        rms_eps,
+        rope_theta,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_layer_fp8_static_with_policies(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    config: GemmaVariantConfig,
+    weights: &Fp8StaticDeviceActionLayer,
+    scales: Fp8StaticTransformerLayerScales,
+    input: &Tensor,
+    attention_normalized: Option<&Tensor>,
+    attention_modulation: &Tensor,
+    mlp_modulation: &Tensor,
+    next_norm_modulation: &Tensor,
+    next_norm_scale: f32,
+    prefix_k: &Tensor,
+    prefix_v: &Tensor,
+    position_offset: usize,
+    rms_eps: f32,
+    rope_theta: f32,
+) -> Result<Fp8StaticActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(normalized) => normalized.clone(),
-        None => norm::adaptive_rms_quant_f16_e4m3(
+        None => adaptive_rms_normalized_fp8(
             ctx,
+            policies,
             input,
             attention_modulation,
             rms_eps,
             scales.attention_norm,
         )?,
     };
-    let qkv = gemm::fp8(
+    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
+    let q = split_qkv_to_cache(
         ctx,
-        &normalized,
-        scales.attention_norm,
-        weights.qkv.as_kernel_view(),
-    )?;
-    let q = rope::apply_q_write_kv_f16(
-        ctx,
+        policies,
         &qkv,
         weights.qkv.bias.as_ref(),
         config.num_heads,
@@ -242,56 +667,70 @@ pub fn action_layer_fp8_static(
         position_offset,
         prefix_k,
         prefix_v,
-        position_offset,
     )?;
     let key_tokens = position_offset + input.shape().dims()[0];
-    let attention = attention::mqa_cached_f16(ctx, &q, prefix_k, prefix_v, key_tokens)?;
-    let attention =
-        quantization::quantize_f16_e4m3(ctx, &attention, scales.attention_output)?.reshape(
-            vec![input.shape().dims()[0], config.num_heads * config.head_dim],
-        )?;
-    let projected = gemm::fp8(
+    let q_dims = q.shape().dims();
+    let cache_rows = prefix_k.shape().dims()[0];
+    let q4 = q.reshape(vec![1, q_dims[0], q_dims[1], q_dims[2]])?;
+    let k4 = prefix_k.reshape(vec![1, cache_rows, config.num_kv_heads, config.head_dim])?;
+    let v4 = prefix_v.reshape(vec![1, cache_rows, config.num_kv_heads, config.head_dim])?;
+    let mut attention = output(ctx, q4.shape().dims().to_vec(), DType::F16)?;
+    let attention_args = action_attention_args(
+        &q4,
+        &k4,
+        &v4,
+        &mut attention,
+        key_tokens,
+        &policies.attention,
+    );
+    ops::kv_cache_attention(ctx, attention_args)?;
+    let attention = attention.reshape(vec![q_dims[0], config.num_heads * config.head_dim])?;
+    let attention = fixed_quantize(ctx, policies, &attention, scales.attention_output)?;
+    let projected = fp8_gemm(
         ctx,
+        policies,
         &attention,
         scales.attention_output,
-        weights.output.as_kernel_view(),
+        &weights.output,
     )?;
-    let fused = fused::adaptive_gate_residual_rms_quant_f16_e4m3(
+    let (hidden, normalized) = ada_gate_residual_rms_normalized_fp8(
         ctx,
+        policies,
         &projected,
         input,
-        attention_modulation,
         mlp_modulation,
+        attention_modulation,
         rms_eps,
         scales.mlp_norm,
     )?;
-    let hidden = fused.hidden;
-    let normalized = fused.normalized;
-    let gate_up = gemm::fp8(
+    let activated = fp8_gemm_geglu(
         ctx,
+        policies,
         &normalized,
         scales.mlp_norm,
-        weights.gate_up.as_kernel_view(),
+        &weights.gate_up,
+        scales.mlp_activation,
     )?;
-    let activated = activation::geglu_quant_f16_e4m3(ctx, &gate_up, scales.mlp_activation)?;
-    let projected = gemm::fp8(
+    let projected = fp8_gemm(
         ctx,
+        policies,
         &activated,
         scales.mlp_activation,
-        weights.down.as_kernel_view(),
+        &weights.down,
     )?;
-    let fused = fused::adaptive_gate_residual_rms_quant_f16_e4m3(
+    let (hidden, normalized) = ada_gate_residual_rms_normalized_fp8(
         ctx,
+        policies,
         &projected,
         &hidden,
-        mlp_modulation,
         next_norm_modulation,
+        mlp_modulation,
         rms_eps,
         next_norm_scale,
     )?;
     Ok(Fp8StaticActionLayerOutput {
-        hidden: fused.hidden,
-        next_normalized: fused.normalized,
+        hidden,
+        next_normalized: normalized,
     })
 }
 
@@ -303,9 +742,11 @@ pub fn vision_patch_embed_fp8_static(
     patches_per_view: usize,
     input_scale: f32,
 ) -> Result<Tensor> {
-    let patches = quantization::quantize_f16_e4m3(ctx, patches, input_scale)?;
-    vision_patch_embed_fp8_static_native(
+    let policies = Fp8L3Policies::default();
+    let patches = fixed_quantize(ctx, &policies, patches, input_scale)?;
+    vision_patch_embed_fp8_static_native_with_policies(
         ctx,
+        &policies,
         weights,
         position_embedding,
         &patches,
@@ -324,30 +765,34 @@ pub fn vision_patch_embed_fp8_static_native(
     patches_per_view: usize,
     input_scale: f32,
 ) -> Result<Tensor> {
-    let projection = gemm::fp8(ctx, patches, input_scale, weights.as_kernel_view())?;
-    embedding::add_position_f16(
+    vision_patch_embed_fp8_static_native_with_policies(
         ctx,
-        &projection,
-        weights.bias.as_ref(),
+        &Fp8L3Policies::default(),
+        weights,
         position_embedding,
+        patches,
         patches_per_view,
+        input_scale,
     )
 }
 
-pub fn vision_qkv_packed_from_env() -> Result<bool> {
-    let Some(value) = std::env::var_os("APXINF_CUDA_VISION_QKV_LAYOUT") else {
-        return Ok(true);
-    };
-    match value.to_str() {
-        Some("packed") => Ok(true),
-        Some("split") => Ok(false),
-        Some(value) => Err(apxinf_core::Error::Other(format!(
-            "APXINF_CUDA_VISION_QKV_LAYOUT must be packed or split, got {value}"
-        ))),
-        None => Err(apxinf_core::Error::Other(
-            "APXINF_CUDA_VISION_QKV_LAYOUT must be valid UTF-8".into(),
-        )),
-    }
+fn vision_patch_embed_fp8_static_native_with_policies(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    weights: &crate::pi05::Fp8StaticLinearWeights,
+    position_embedding: &Tensor,
+    patches: &Tensor,
+    patches_per_view: usize,
+    input_scale: f32,
+) -> Result<Tensor> {
+    let projection = fp8_gemm(ctx, policies, patches, input_scale, weights)?;
+    let mut out = output(ctx, projection.shape().dims().to_vec(), projection.dtype())?;
+    let mut args = ops::GatherArgs::new(ops::GatherSemantic::BiasPosition, &projection, &mut out);
+    args.bias = weights.bias.as_ref();
+    args.position = Some(position_embedding);
+    args.tokens_per_view = patches_per_view;
+    ops::gather(ctx, args)?;
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -359,55 +804,107 @@ pub fn vision_layer_fp8_static(
     patches_per_view: usize,
     heads: usize,
     head_dim: usize,
-    packed_qkv: bool,
     layer_norm_eps: f32,
 ) -> Result<Tensor> {
-    let normalized = norm::layer_quant_f16_e4m3(
+    vision_layer_fp8_static_with_policies(
         ctx,
+        &Fp8L3Policies::default(),
+        weights,
+        scales,
+        input,
+        patches_per_view,
+        heads,
+        head_dim,
+        layer_norm_eps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vision_layer_fp8_static_with_policies(
+    ctx: &Context,
+    policies: &Fp8L3Policies,
+    weights: &Fp8StaticDeviceVisionBlock,
+    scales: Fp8StaticVisionLayerScales,
+    input: &Tensor,
+    patches_per_view: usize,
+    heads: usize,
+    head_dim: usize,
+    layer_norm_eps: f32,
+) -> Result<Tensor> {
+    let normalized = layer_normalized_fp8(
+        ctx,
+        policies,
         input,
         &weights.norm1.weight,
         &weights.norm1.bias,
         layer_norm_eps,
         scales.attention_norm,
     )?;
-    let qkv = if packed_qkv {
-        let bias =
-            weights.qkv.bias.as_ref().ok_or_else(|| {
-                apxinf_core::Error::Other("π0.5 SigLIP QKV bias is required".into())
-            })?;
-        fused::gemm_bias_fp8(
-            ctx,
-            &normalized,
-            &weights.qkv.weight,
-            bias,
-            scales.attention_norm,
-            weights.qkv.weight_scale,
-        )?
+    let use_packed_qkv = ctx.caps().arch_family == apxinf_cuda_new::CudaArchFamily::Sm100
+        && patches_per_view == 256
+        && heads == 16
+        && head_dim == 72
+        && weights.qkv.bias.is_some();
+    let qkv = if use_packed_qkv {
+        fp8_gemm_bias(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
     } else {
-        gemm::fp8(
-            ctx,
-            &normalized,
-            scales.attention_norm,
-            weights.qkv.as_kernel_view(),
-        )?
+        fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
     };
-    let attention = if packed_qkv {
-        attention::mha_packed_qkv_bias_f16(ctx, &qkv, None, patches_per_view, heads, head_dim)?
+    let tokens = input.shape().dims()[0];
+    let views = tokens / patches_per_view;
+    let attention = if use_packed_qkv {
+        let qkv = qkv.reshape(vec![views, patches_per_view, 3, heads, head_dim])?;
+        let mut attention = output(
+            ctx,
+            vec![views, patches_per_view, heads, head_dim],
+            DType::F16,
+        )?;
+        let mut args = ops::PackedQkvAttentionArgs::new(&qkv, &mut attention);
+        args.policy = policies.attention.clone();
+        ops::packed_qkv_attention(ctx, args)?;
+        attention
     } else {
-        let qkv =
-            attention::split_qkv_bias_f16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
-        attention::mha_f16(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
-    }
-    .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
-    let attention = quantization::quantize_f16_e4m3(ctx, &attention, scales.attention_output)?;
-    let projection = gemm::fp8(
+        let mut q = output(ctx, vec![tokens, heads, head_dim], DType::F16)?;
+        let mut k = output(ctx, vec![tokens, heads, head_dim], DType::F16)?;
+        let mut v = output(ctx, vec![tokens, heads, head_dim], DType::F16)?;
+        ops::rope(
+            ctx,
+            ops::RopeArgs {
+                semantic: ops::RopeSemantic::SplitQkvBias,
+                qkv: &qkv,
+                bias: weights.qkv.bias.as_ref(),
+                q: &mut q,
+                k: &mut k,
+                v: &mut v,
+                q_heads: heads,
+                kv_heads: heads,
+                head_dim,
+                theta: 1.0,
+                position_offset: 0,
+                kv_output_offset: 0,
+            },
+        )?;
+        let q = q.reshape(vec![views, patches_per_view, heads, head_dim])?;
+        let k = k.reshape(vec![views, patches_per_view, heads, head_dim])?;
+        let v = v.reshape(vec![views, patches_per_view, heads, head_dim])?;
+        let mut attention = output(ctx, q.shape().dims().to_vec(), DType::F16)?;
+        let mut args = ops::AttentionArgs::new(&q, &k, &v, &mut attention);
+        args.policy = policies.attention.clone();
+        ops::attention(ctx, args)?;
+        attention
+    };
+    let attention = attention.reshape(vec![tokens, heads * head_dim])?;
+    let attention = fixed_quantize(ctx, policies, &attention, scales.attention_output)?;
+    let projection = fp8_gemm(
         ctx,
+        policies,
         &attention,
         scales.attention_output,
-        weights.output.as_kernel_view(),
+        &weights.output,
     )?;
-    let fused = fused::bias_residual_layer_quant_f16_e4m3(
+    let (hidden, normalized) = bias_residual_layer_normalized_fp8(
         ctx,
+        policies,
         &projection,
         weights.output.bias.as_ref(),
         input,
@@ -416,45 +913,36 @@ pub fn vision_layer_fp8_static(
         layer_norm_eps,
         scales.mlp_norm,
     )?;
-    let hidden = fused.hidden;
-    let normalized = fused.normalized;
-    let bias = weights
-        .fc1
-        .bias
-        .as_ref()
-        .ok_or_else(|| apxinf_core::Error::Other("π0.5 SigLIP fc1 bias is required".into()))?;
-    let activation = fused::gemm_bias_gelu_fp8(
+    let activation = fp8_gemm_bias_gelu_quant(
         ctx,
+        policies,
         &normalized,
-        &weights.fc1.weight,
-        bias,
         scales.mlp_norm,
-        weights.fc1.weight_scale,
+        &weights.fc1,
         scales.mlp_activation,
     )?;
-    fused::gemm_bias_residual_fp8(
+    fp8_gemm_bias_residual(
         ctx,
+        policies,
         &activation,
-        &weights.fc2.weight,
-        weights.fc2.bias.as_ref(),
-        &hidden,
         scales.mlp_activation,
-        weights.fc2.weight_scale,
+        &weights.fc2,
+        &hidden,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use apxinf_core::{Backend, Tensor};
+    use apxinf_core::Tensor;
     use half::f16;
 
     use super::*;
-    use crate::pi05::backend::RuntimeBackend as CudaBackend;
+    use crate::pi05::backend::{self, Context};
     use crate::pi05::{
         Fp8StaticDeviceLayerNorm, Fp8StaticDeviceVisionBlock, Fp8StaticLinearWeights, LinearWeights,
     };
 
-    fn zero_linear(input: usize, output: usize, backend: &dyn Backend) -> Fp8StaticLinearWeights {
+    fn zero_linear(input: usize, output: usize, backend: &Context) -> Fp8StaticLinearWeights {
         Fp8StaticLinearWeights::from_host(
             &LinearWeights {
                 weight: Tensor::from_f32(vec![input, output], &vec![0.0; input * output]).unwrap(),
@@ -468,7 +956,7 @@ mod tests {
     fn zero_linear_with_bias(
         input: usize,
         output: usize,
-        backend: &dyn Backend,
+        backend: &Context,
     ) -> Fp8StaticLinearWeights {
         Fp8StaticLinearWeights::from_host(
             &LinearWeights {
@@ -482,7 +970,7 @@ mod tests {
 
     #[test]
     fn zero_weight_language_layer_is_residual_identity() {
-        let backend = CudaBackend::new(0).unwrap();
+        let backend = Context::new(0).unwrap();
         let config = GemmaVariantConfig {
             width: 16,
             depth: 1,
@@ -493,21 +981,23 @@ mod tests {
         };
         let norm = Tensor::from_f16(vec![16], &vec![f16::ONE; 16]).unwrap();
         let weights = Fp8StaticDeviceLanguageLayer {
-            input_norm_scale: backend.to_device(&norm).unwrap(),
+            input_norm_scale: backend::to_device(&backend, &norm).unwrap(),
             qkv: zero_linear(16, 32, &backend),
             output: zero_linear(16, 16, &backend),
-            post_attention_norm_scale: backend.to_device(&norm).unwrap(),
+            post_attention_norm_scale: backend::to_device(&backend, &norm).unwrap(),
             gate_up: zero_linear(16, 64, &backend),
             down: zero_linear(32, 16, &backend),
         };
         let source = (0..64)
             .map(|i| f16::from_f32((i as f32 - 31.0) / 32.0))
             .collect::<Vec<_>>();
-        let input = backend
-            .to_device(&Tensor::from_f16(vec![4, 16], &source).unwrap())
-            .unwrap();
+        let input = backend::to_device(
+            &backend,
+            &Tensor::from_f16(vec![4, 16], &source).unwrap(),
+        )
+        .unwrap();
         let output = language_layer_fp8_static(
-            backend.context(),
+            &backend,
             config,
             &weights,
             Fp8StaticTransformerLayerScales {
@@ -523,24 +1013,28 @@ mod tests {
             10_000.0,
         )
         .unwrap();
-        let output = backend.to_cpu(&output.hidden).unwrap();
+        let output = backend::to_cpu(&output.hidden).unwrap();
         assert_eq!(output.as_f16().unwrap(), source.as_slice());
     }
 
     #[test]
     fn zero_weight_vision_layer_is_residual_identity_across_views() {
-        let backend = CudaBackend::new(0).unwrap();
+        let backend = Context::new(0).unwrap();
         let width = 16;
         let inner = 32;
         let heads = 2;
         let head_dim = 8;
         let affine = Fp8StaticDeviceLayerNorm {
-            weight: backend
-                .to_device(&Tensor::from_f16(vec![width], &vec![f16::ONE; width]).unwrap())
-                .unwrap(),
-            bias: backend
-                .to_device(&Tensor::from_f16(vec![width], &vec![f16::ZERO; width]).unwrap())
-                .unwrap(),
+            weight: backend::to_device(
+                &backend,
+                &Tensor::from_f16(vec![width], &vec![f16::ONE; width]).unwrap(),
+            )
+            .unwrap(),
+            bias: backend::to_device(
+                &backend,
+                &Tensor::from_f16(vec![width], &vec![f16::ZERO; width]).unwrap(),
+            )
+            .unwrap(),
         };
         let weights = Fp8StaticDeviceVisionBlock {
             norm1: Fp8StaticDeviceLayerNorm {
@@ -556,11 +1050,13 @@ mod tests {
         let source = (0..8 * width)
             .map(|i| f16::from_f32((i as f32 - 63.0) / 64.0))
             .collect::<Vec<_>>();
-        let input = backend
-            .to_device(&Tensor::from_f16(vec![8, width], &source).unwrap())
-            .unwrap();
+        let input = backend::to_device(
+            &backend,
+            &Tensor::from_f16(vec![8, width], &source).unwrap(),
+        )
+        .unwrap();
         let output = vision_layer_fp8_static(
-            backend.context(),
+            &backend,
             &weights,
             Fp8StaticVisionLayerScales {
                 attention_norm: 0.01,
@@ -572,23 +1068,51 @@ mod tests {
             4,
             heads,
             head_dim,
-            true,
             1e-6,
         )
         .unwrap();
-        let output = backend.to_cpu(&output).unwrap();
+        let output = backend::to_cpu(&output).unwrap();
         assert_eq!(output.as_f16().unwrap(), source.as_slice());
+    }
+
+    #[test]
+    fn action_attention_contract_is_non_causal_and_executes() {
+        let backend = Context::new(0).unwrap();
+        let query_shape = vec![1, 10, 8, 256];
+        let cache_shape = vec![1, 533, 1, 256];
+        let query = output(&backend, query_shape.clone(), DType::F16).unwrap();
+        let key = output(&backend, cache_shape.clone(), DType::F16).unwrap();
+        let value = output(&backend, cache_shape, DType::F16).unwrap();
+        let mut attention = output(&backend, query_shape, DType::F16).unwrap();
+        let mut policy = ops::AttentionPolicy::default();
+        policy.workspace_limit = 64 * 1024 * 1024;
+        policy.online_tune = false;
+        policy.allow_fallback = true;
+        policy.graph_safe = false;
+        policy.deterministic = true;
+        policy.cache_dir = Some("action-attention-test".into());
+        let args = action_attention_args(&query, &key, &value, &mut attention, 532, &policy);
+        assert_eq!(args.mask, ops::AttentionMask::None);
+        assert_eq!(args.query_start, 0);
+        assert_eq!(args.valid_key_tokens, 532);
+        assert_eq!(args.policy.workspace_limit, policy.workspace_limit);
+        assert_eq!(args.policy.online_tune, policy.online_tune);
+        assert_eq!(args.policy.allow_fallback, policy.allow_fallback);
+        assert_eq!(args.policy.graph_safe, policy.graph_safe);
+        assert_eq!(args.policy.deterministic, policy.deterministic);
+        assert_eq!(args.policy.cache_dir, policy.cache_dir);
+        ops::kv_cache_attention(&backend, args).unwrap();
+        backend::synchronize(&backend).unwrap();
     }
 }
 
 // Precision-specific backbone operations share this file with their layers.
 pub(in crate::pi05::model) mod backbone {
     use super::*;
-    use crate::pi05::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+    use crate::pi05::backend::{Context, DeviceBuffer as CudaBuffer};
     use crate::pi05::weights::*;
     use crate::pi05::Pi05Config;
     use apxinf_core::{Error, Result, Tensor};
-    use kernels::{activation, cache, elementwise, embedding, gemm, norm, quantization};
     use std::sync::Arc;
     pub struct Fp8StaticPrefixKvCache {
         pub keys: Vec<Tensor>,
@@ -602,22 +1126,22 @@ pub(in crate::pi05::model) mod backbone {
         final_norm: Tensor,
     }
     pub struct Fp8StaticBlocks {
-        pub(in crate::pi05::model) backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05::model) backend: Arc<Context>,
         pub(in crate::pi05::model) config: Arc<Pi05Config>,
         pub(in crate::pi05::model) weights: Arc<Fp8StaticWeights>,
         pub(in crate::pi05::model) scales: Arc<Fp8StaticActivationScales>,
-        packed_vision_qkv: bool,
+        pub(in crate::pi05::model) policies: Fp8L3Policies,
     }
     impl Fp8StaticBlocks {
-        pub fn new(
-            backend: Arc<RuntimeBackend>,
+        pub(in crate::pi05) fn new(
+            backend: Arc<Context>,
             config: Arc<Pi05Config>,
             weights: Arc<Fp8StaticWeights>,
             scales: Arc<Fp8StaticActivationScales>,
+            policies: Fp8L3Policies,
         ) -> Result<Self> {
             config.validate()?;
             scales.validate(&config)?;
-            let packed_vision_qkv = vision_qkv_packed_from_env()?;
             if weights.vision_layers.len() != config.vision_depth
                 || weights.language_layers.len() != config.language.depth
                 || weights.action_layers.len() != config.action_expert.depth
@@ -629,17 +1153,18 @@ pub(in crate::pi05::model) mod backbone {
                 config,
                 weights,
                 scales,
-                packed_vision_qkv,
+                policies,
             })
         }
 
         fn ctx(&self) -> &Context {
-            self.backend.context()
+            &self.backend
         }
 
         pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
-            let patches = quantization::quantize_f16_e4m3(
+            let patches = fixed_quantize(
                 self.ctx(),
+                &self.policies,
                 patches,
                 self.scales.vision_patch_input,
             )?;
@@ -658,13 +1183,17 @@ pub(in crate::pi05::model) mod backbone {
                     self.config.max_token_len
                 )));
             }
-            let language = embedding::lookup_f16(
-                self.ctx(),
+            let width = self.weights.token_embedding.shape().dims()[1];
+            let mut language = output(self.ctx(), vec![token_count, width], DType::F16)?;
+            let mut args = ops::GatherArgs::new(
+                ops::GatherSemantic::EmbeddingLookup,
                 &self.weights.token_embedding,
-                token_ids,
-                token_count,
-            )?;
-            elementwise::concat_rows_f16(self.ctx(), vision_tokens, &language)
+                &mut language,
+            );
+            args.ids = Some(token_ids);
+            args.vocab_size = self.weights.token_embedding.shape().dims()[0];
+            ops::gather(self.ctx(), args)?;
+            ops::concat_rows(self.ctx(), vision_tokens, &language)
         }
 
         pub fn prefix_forward(&self, prefix: &Tensor) -> Result<Fp8StaticPrefixKvCache> {
@@ -678,8 +1207,9 @@ pub(in crate::pi05::model) mod backbone {
                 .zip(&self.scales.language_layers)
                 .enumerate()
             {
-                let output = language_layer_fp8_static(
+                let output = language_layer_fp8_static_with_policies(
                     self.ctx(),
+                    &self.policies,
                     self.config.language,
                     layer,
                     *scale,
@@ -691,12 +1221,12 @@ pub(in crate::pi05::model) mod backbone {
                 )?;
                 hidden = output.hidden;
                 let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
-                keys.push(cache::reserve_prefix_f16(
+                keys.push(ops::reserve_prefix(
                     self.ctx(),
                     &output.key,
                     cache_rows,
                 )?);
-                values.push(cache::reserve_prefix_f16(
+                values.push(ops::reserve_prefix(
                     self.ctx(),
                     &output.value,
                     cache_rows,
@@ -710,30 +1240,46 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
-            let input = quantization::quantize_f16_e4m3(
+            let input = fixed_quantize(
                 self.ctx(),
+                &self.policies,
                 time_embedding,
                 self.scales.time_input,
             )?;
-            let hidden = gemm::fp8(
+            let hidden = fp8_gemm(
                 self.ctx(),
+                &self.policies,
                 &input,
                 self.scales.time_input,
-                self.weights.time_mlp_in.as_kernel_view(),
+                &self.weights.time_mlp_in,
             )?;
-            let hidden = activation::bias_silu_quant_f16_e4m3(
+            let hidden = bias_activation(
                 self.ctx(),
+                &self.policies,
                 &hidden,
                 self.weights.time_mlp_in.bias.as_ref(),
-                self.scales.time_hidden,
+                ops::PointwiseActivation::Silu,
             )?;
-            let output = gemm::fp8(
+            let hidden = fixed_quantize(
                 self.ctx(),
+                &self.policies,
                 &hidden,
                 self.scales.time_hidden,
-                self.weights.time_mlp_out.as_kernel_view(),
             )?;
-            activation::bias_silu_f16(self.ctx(), &output, self.weights.time_mlp_out.bias.as_ref())
+            let output = fp8_gemm(
+                self.ctx(),
+                &self.policies,
+                &hidden,
+                self.scales.time_hidden,
+                &self.weights.time_mlp_out,
+            )?;
+            bias_activation(
+                self.ctx(),
+                &self.policies,
+                &output,
+                self.weights.time_mlp_out.bias.as_ref(),
+                ops::PointwiseActivation::Silu,
+            )
         }
 
         fn modulation(
@@ -741,13 +1287,23 @@ pub(in crate::pi05::model) mod backbone {
             conditioning: &Tensor,
             weights: &crate::pi05::Fp8StaticLinearWeights,
         ) -> Result<Tensor> {
-            let projected = gemm::fp8(
+            let projected = fp8_gemm(
                 self.ctx(),
+                &self.policies,
                 conditioning,
                 self.scales.conditioning,
-                weights.as_kernel_view(),
+                weights,
             )?;
-            let modulation = elementwise::bias_f16(self.ctx(), &projected, weights.bias.as_ref())?;
+            let modulation = match weights.bias.as_ref() {
+                Some(bias) => bias_activation(
+                    self.ctx(),
+                    &self.policies,
+                    &projected,
+                    Some(bias),
+                    ops::PointwiseActivation::None,
+                )?,
+                None => projected,
+            };
             modulation.reshape(vec![modulation.numel()])
         }
 
@@ -756,8 +1312,9 @@ pub(in crate::pi05::model) mod backbone {
             time_embedding: &Tensor,
         ) -> Result<Fp8StaticStepModulation> {
             let conditioning = self.conditioning(time_embedding)?;
-            let conditioning = quantization::quantize_f16_e4m3(
+            let conditioning = fixed_quantize(
                 self.ctx(),
+                &self.policies,
                 &conditioning,
                 self.scales.conditioning,
             )?;
@@ -809,16 +1366,29 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 prefix KV/modulation depth mismatch".into(),
                 ));
             }
-            let state_fp8 =
-                quantization::quantize_f16_e4m3(self.ctx(), state, self.scales.action_input)?;
-            let hidden = gemm::fp8(
+            let state_fp8 = fixed_quantize(
                 self.ctx(),
+                &self.policies,
+                state,
+                self.scales.action_input,
+            )?;
+            let hidden = fp8_gemm(
+                self.ctx(),
+                &self.policies,
                 &state_fp8,
                 self.scales.action_input,
-                self.weights.action_in.as_kernel_view(),
+                &self.weights.action_in,
             )?;
-            let mut hidden =
-                elementwise::bias_f16(self.ctx(), &hidden, self.weights.action_in.bias.as_ref())?;
+            let mut hidden = match self.weights.action_in.bias.as_ref() {
+                Some(bias) => bias_activation(
+                    self.ctx(),
+                    &self.policies,
+                    &hidden,
+                    Some(bias),
+                    ops::PointwiseActivation::None,
+                )?,
+                None => hidden,
+            };
 
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
@@ -832,8 +1402,9 @@ pub(in crate::pi05::model) mod backbone {
                     } else {
                         (&modulation.final_norm, self.scales.action_final_norm)
                     };
-                let output = action_layer_fp8_static(
+                let output = action_layer_fp8_static_with_policies(
                     self.ctx(),
+                    &self.policies,
                     self.config.action_expert,
                     layer,
                     self.scales.action_layers[index],
@@ -855,18 +1426,30 @@ pub(in crate::pi05::model) mod backbone {
             let hidden = attention_normalized.ok_or_else(|| {
                 Error::Other("π0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = gemm::fp8(
+            let velocity = fp8_gemm(
                 self.ctx(),
+                &self.policies,
                 &hidden,
                 self.scales.action_final_norm,
-                self.weights.action_out.as_kernel_view(),
+                &self.weights.action_out,
             )?;
-            let velocity = elementwise::bias_f16(
-                self.ctx(),
-                &velocity,
-                self.weights.action_out.bias.as_ref(),
-            )?;
-            elementwise::euler_update_f16(self.ctx(), state, &velocity, dt)
+            let velocity = match self.weights.action_out.bias.as_ref() {
+                Some(bias) => bias_activation(
+                    self.ctx(),
+                    &self.policies,
+                    &velocity,
+                    Some(bias),
+                    ops::PointwiseActivation::None,
+                )?,
+                None => velocity,
+            };
+            let mut updated = output(self.ctx(), state.shape().dims().to_vec(), state.dtype())?;
+            let mut args =
+                ops::PointwiseArgs::new(ops::PointwiseSemantic::EulerUpdate, state, &mut updated);
+            args.secondary = Some(&velocity);
+            args.dt = dt;
+            ops::pointwise(self.ctx(), args)?;
+            Ok(updated)
         }
 
         pub fn denoise_step(
@@ -881,8 +1464,9 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         fn encode_vision_fp8_patches(&self, patches: &Tensor) -> Result<Tensor> {
-            let mut hidden = vision_patch_embed_fp8_static_native(
+            let mut hidden = vision_patch_embed_fp8_static_native_with_policies(
                 self.ctx(),
+                &self.policies,
                 &self.weights.patch_embedding,
                 &self.weights.position_embedding,
                 patches,
@@ -895,37 +1479,44 @@ pub(in crate::pi05::model) mod backbone {
                 .iter()
                 .zip(&self.scales.vision_layers)
             {
-                hidden = vision_layer_fp8_static(
+                hidden = vision_layer_fp8_static_with_policies(
                     self.ctx(),
+                    &self.policies,
                     layer,
                     *scale,
                     &hidden,
                     self.config.patches_per_view(),
                     self.config.vision_heads,
                     self.config.vision_head_dim,
-                    self.packed_vision_qkv,
                     self.config.layer_norm_eps,
                 )?;
             }
-            let hidden = norm::layer_quant_f16_e4m3(
+            let hidden = layer_normalized_fp8(
                 self.ctx(),
+                &self.policies,
                 &hidden,
                 &self.weights.vision_post_norm.weight,
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
                 self.scales.vision_post_norm,
             )?;
-            let projected = gemm::fp8(
+            let projected = fp8_gemm(
                 self.ctx(),
+                &self.policies,
                 &hidden,
                 self.scales.vision_post_norm,
-                self.weights.multimodal_projector.as_kernel_view(),
+                &self.weights.multimodal_projector,
             )?;
-            elementwise::bias_f16(
-                self.ctx(),
-                &projected,
-                self.weights.multimodal_projector.bias.as_ref(),
-            )
+            match self.weights.multimodal_projector.bias.as_ref() {
+                Some(bias) => bias_activation(
+                    self.ctx(),
+                    &self.policies,
+                    &projected,
+                    Some(bias),
+                    ops::PointwiseActivation::None,
+                ),
+                None => Ok(projected),
+            }
         }
     }
 
@@ -979,7 +1570,7 @@ pub(in crate::pi05::model) mod backbone {
 }
 
 impl crate::pi05::model::PrepareBlocks for backbone::Fp8StaticBlocks {
-    fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::RuntimeBackend> {
+    fn backend(&self) -> &std::sync::Arc<crate::pi05::backend::Context> {
         &self.backend
     }
     fn workspace_requirements(
@@ -988,7 +1579,6 @@ impl crate::pi05::model::PrepareBlocks for backbone::Fp8StaticBlocks {
     ) -> apxinf_core::Result<crate::pi05::model::WorkspaceRequirements> {
         Ok(crate::pi05::model::WorkspaceRequirements {
             bytes: self.config.cuda_graph_workspace_bytes_fp8_static(tokens)?,
-            fp8_scratch: Some(self.config.fp8_emulation_scratch_elements(tokens)?),
         })
     }
     fn raw_patch_dtype(&self) -> apxinf_core::DType {
@@ -1000,15 +1590,23 @@ impl crate::pi05::model::PrepareBlocks for backbone::Fp8StaticBlocks {
         patches: &Tensor,
         layout: crate::pi05::Pi05ImageLayout,
     ) -> Result<()> {
-        crate::pi05::backend::kernels::preprocess::rgb_u8_to_patches_e4m3(
-            self.backend.context(),
-            images,
-            patches,
-            self.config.num_views,
-            self.config.image_size,
-            self.config.patch_size,
-            layout,
-            self.scales.vision_patch_input,
-        )
+        let ctx = &self.backend;
+        let mut f16_patches = output(ctx, patches.shape().dims().to_vec(), DType::F16)?;
+        let geometry = ops::GatherPatchGeometry {
+            views: self.config.num_views,
+            image_size: self.config.image_size,
+            patch_size: self.config.patch_size,
+            nhwc: matches!(layout, crate::pi05::Pi05ImageLayout::Nhwc),
+        };
+        let gather = ops::GatherArgs::rgb_to_patches(images, &mut f16_patches, geometry);
+        ops::gather(ctx, gather)?;
+        let mut patches = patches.clone();
+        let mut quantization = ops::QuantizationArgs::new(
+            ops::QuantizationSemantic::FixedScaleE4m3,
+            &f16_patches,
+            &mut patches,
+        );
+        quantization.scale = self.scales.vision_patch_input;
+        ops::quantization(ctx, quantization)
     }
 }

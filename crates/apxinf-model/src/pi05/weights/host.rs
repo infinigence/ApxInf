@@ -550,6 +550,9 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
             }
             Tensor::from_f8_e4m3(vec![cols, rows], &dst)
         }
+        dtype => Err(Error::Other(format!(
+            "π0.5 cannot transpose a {dtype} checkpoint tensor"
+        ))),
     }
 }
 
@@ -579,6 +582,9 @@ fn add_one(tensor: Tensor) -> Result<Tensor> {
         DType::F8E4M3 => Err(Error::Other(
             "π0.5 RMSNorm parameters cannot be stored as unscaled FP8".into(),
         )),
+        dtype => Err(Error::Other(format!(
+            "π0.5 RMSNorm parameters cannot use dtype {dtype}"
+        ))),
     }
 }
 

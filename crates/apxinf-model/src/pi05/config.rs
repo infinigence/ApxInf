@@ -185,15 +185,6 @@ impl Pi05Config {
         self.num_views * self.patches_per_view() + self.max_token_len
     }
 
-    /// Whether this model profile can ever produce one of the exact language
-    /// M shapes supported by the paired Gate/Up + GeGLU kernels.
-    pub fn language_dual_geglu_shape_possible(&self) -> bool {
-        let patch_tokens = self.num_views * self.patches_per_view();
-        [522usize, 533usize]
-            .into_iter()
-            .any(|m| m > patch_tokens && m - patch_tokens <= self.max_token_len)
-    }
-
     /// Device arena size for one allocation-free full inference capture.
     ///
     /// The current graph intentionally gives every intermediate a stable
@@ -217,7 +208,7 @@ impl Pi05Config {
         let patches = self.num_views * self.patches_per_view();
         let patch_width = 3 * self.patch_size * self.patch_size;
         let vision = self.vision_width;
-        allocate(patches * patch_width);
+        allocate(patches * patch_width * 2);
         allocate(patches * vision * 2);
         allocate(patches * vision * 2);
         for _ in 0..self.vision_depth {
@@ -230,13 +221,17 @@ impl Pi05Config {
             allocate(patches * vision);
             allocate(patches * vision * 2);
             allocate(patches * vision * 2);
+            allocate(patches * vision * 2);
+            allocate(patches * vision * 2);
             allocate(patches * vision);
+            allocate(patches * self.vision_mlp_dim * 2);
             allocate(patches * self.vision_mlp_dim * 2);
             allocate(patches * self.vision_mlp_dim);
             allocate(patches * vision * 2);
             allocate(patches * vision * 2);
         }
         allocate(patches * vision);
+        allocate(patches * vision * 2);
         allocate(patches * self.language.width * 2);
         allocate(patches * self.language.width * 2);
 
@@ -252,10 +247,12 @@ impl Pi05Config {
             allocate(prefix * language_q * 2);
             allocate(prefix * language_kv * 2);
             allocate(prefix * language_kv * 2);
+            allocate(prefix * self.language.width * 2);
             if layer_index + 1 < self.language.depth {
                 allocate(prefix * language_q * 2);
                 allocate(prefix * self.language.num_heads * std::mem::size_of::<f32>());
                 allocate(prefix * language_q);
+                allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width * 2);
                 allocate(prefix * self.language.width);
@@ -277,12 +274,15 @@ impl Pi05Config {
             allocate(horizon * self.action_dim);
             allocate(horizon * action * 2);
             allocate(horizon * action * 2);
+            allocate(horizon * action * 2);
             for _ in 0..self.action_expert.depth {
                 allocate(horizon * action);
                 allocate(horizon * action_qkv * 2);
                 allocate(horizon * action_q * 2);
                 allocate(horizon * action_q * 2);
                 allocate(horizon * action_q);
+                allocate(horizon * action * 2);
+                allocate(horizon * action * 2);
                 allocate(horizon * action * 2);
                 allocate(horizon * action * 2);
                 allocate(horizon * action);
@@ -605,18 +605,25 @@ mod tests {
     }
 
     #[test]
-    fn language_dual_geglu_shapes_are_reachable_only_for_two_view_profile() {
-        assert!(Pi05Config::thor_two_view().language_dual_geglu_shape_possible());
-        assert!(!Pi05Config::default().language_dual_geglu_shape_possible());
-    }
-
-    #[test]
     fn thor_graph_workspace_is_bounded() {
         let bytes = Pi05Config::thor_two_view()
             .cuda_graph_workspace_bytes_fp8_static(200)
             .unwrap();
         assert!(bytes > 1_800_000_000);
         assert!(bytes < 2_500_000_000);
+    }
+
+    #[test]
+    fn thor_three_view_fp8_workspace_covers_t10_and_t21() {
+        let config = Pi05Config::thor_three_view();
+        assert_eq!(
+            config.cuda_graph_workspace_bytes_fp8_static(10).unwrap(),
+            2_954_794_880
+        );
+        assert_eq!(
+            config.cuda_graph_workspace_bytes_fp8_static(21).unwrap(),
+            2_979_016_832
+        );
     }
 
     #[test]
@@ -658,6 +665,17 @@ impl ModelVariantChoice {
             Self::Auto => Self::Bf16,
             explicit => explicit,
         }
+    }
+
+    /// Reject an explicitly selected implementation before loading or
+    /// quantizing weights when the device cannot execute its full model path.
+    pub fn ensure_supported(self, sm: u32) -> Result<Self> {
+        if self == Self::Fp8Static && sm < 100 {
+            return Err(Error::Other(format!(
+                "PI0.5 model_variant=fp8_static is unsupported on sm_{sm}; it requires sm_100 or newer and will not fall back to bf16"
+            )));
+        }
+        Ok(self)
     }
 }
 impl std::str::FromStr for ModelVariantChoice {
@@ -701,6 +719,16 @@ mod model_variant_tests {
         assert_eq!(
             ModelVariantChoice::Bf16.resolve(110, true),
             ModelVariantChoice::Bf16
+        );
+        let error = ModelVariantChoice::Fp8Static
+            .ensure_supported(89)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported on sm_89"));
+        assert!(error.contains("will not fall back to bf16"));
+        assert_eq!(
+            ModelVariantChoice::Fp8Static.ensure_supported(110).unwrap(),
+            ModelVariantChoice::Fp8Static
         );
     }
 }

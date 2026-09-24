@@ -8,6 +8,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
@@ -18,7 +20,7 @@
 #include "extensions/gemm/gemm_universal_base_compat.h"
 #include "extensions/gemm/gemm_with_epilogue_visitor.h"
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <
     typename ThreadblockShape_,
@@ -221,17 +223,14 @@ cudaError_t run_interleaved_geglu(
   Gemm gemm;
   auto can = gemm.can_implement(args);
   if (can != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "sm89 geglu can_implement failed m=%d n=%d k=%d status=%d\n", m, n, k, int(can));
     return cudaErrorInvalidValue;
   }
   auto workspace = gemm.get_workspace_size(args);
   if (workspace != 0) {
-    std::fprintf(stderr, "sm89 geglu workspace nonzero m=%d n=%d k=%d workspace=%zu\n", m, n, k, workspace);
     return cudaErrorInvalidValue;
   }
   auto launched = gemm(args, nullptr, stream);
   if (launched != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "sm89 geglu launch failed m=%d n=%d k=%d status=%d\n", m, n, k, int(launched));
     return cudaErrorUnknown;
   }
   return cudaGetLastError();
@@ -255,13 +254,13 @@ int interleaved_geglu(
     return static_cast<int>(cudaErrorInvalidValue);
   }
   if (n == 4096 && k == 1024) {
-    return static_cast<int>(::apxinf::cuda::cutlass_ops::run_interleaved_geglu<
+    return static_cast<int>(::apxinf::cuda_new::cutlass_ops::run_interleaved_geglu<
         cutlass::gemm::GemmShape<32, 64, 32>,
         cutlass::gemm::GemmShape<32, 32, 32>,
         3>(activation, interleaved_weight, output, m, n, k, stream));
   }
   if (n == 16384 && k == 2048) {
-    return static_cast<int>(::apxinf::cuda::cutlass_ops::run_interleaved_geglu<
+    return static_cast<int>(::apxinf::cuda_new::cutlass_ops::run_interleaved_geglu<
         cutlass::gemm::GemmShape<64, 128, 32>,
         cutlass::gemm::GemmShape<32, 64, 32>,
         3>(activation, interleaved_weight, output, m, n, k, stream));
@@ -270,4 +269,4 @@ int interleaved_geglu(
 }
 
 }  // namespace bf16_sm89_detail
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

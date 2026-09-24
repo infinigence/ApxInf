@@ -1,5 +1,7 @@
 #include "internal.h"
 
+#include <algorithm>
+
 namespace apxinf::attention {
 namespace {
 
@@ -55,6 +57,39 @@ bool supports_fa2(const Spec& spec) {
          spec.output_dtype == spec.dtype;
 }
 
+bool supports_fa2_packed_qkv(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_PACKED_QKV &&
+         spec.dtype == APXINF_DTYPE_F16 &&
+         spec.output_dtype == APXINF_DTYPE_F16 && spec.query_tokens == 256 &&
+         spec.query_heads == 16 && spec.kv_heads == 16 &&
+         spec.head_dim == 72;
+}
+
+bool supports_fa2_splitkv(const Spec& spec) {
+  const int64_t key_tile = spec.head_dim == 128 ? 128 : 64;
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+         spec.dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.query_tokens <= 64 && spec.key_tokens > spec.query_tokens &&
+         spec.query_heads > spec.kv_heads &&
+         spec.query_heads % spec.kv_heads == 0 &&
+         (spec.head_dim == 128 || spec.head_dim == 256) &&
+         spec.key_tokens > key_tile;
+}
+
+void splitkv_configurations(const Spec& spec,
+                            std::vector<int>& configurations) {
+  const uint64_t key_tile = spec.head_dim == 128 ? 128 : 64;
+  const uint64_t key_tiles =
+      (static_cast<uint64_t>(spec.key_tokens) + key_tile - 1) / key_tile;
+  const int limit = static_cast<int>(std::min<uint64_t>(128, key_tiles));
+  for (int splits = 2; splits <= limit; ++splits) {
+    const uint64_t current = (key_tiles + splits - 1) / splits;
+    const uint64_t previous = (key_tiles + splits - 2) / (splits - 1);
+    if (current != previous) configurations.push_back(splits);
+  }
+}
+
 #if defined(APXINF_ATTENTION_FA2_E4M3)
 bool supports_fa2_direct_e4m3_522(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
@@ -106,6 +141,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        fa2_resource_requirements, one_configuration, prepare_fa2, launch_fa2,
        destroy_fa2},
 #endif
+      {kProviderFa2, 3, 1, "flash-attention-2-split-kv",
+       apxinf::gemm::kDeviceFeatureFa2, true, true, false,
+       supports_fa2_splitkv, fa2_alignment,
+       fa2_splitkv_resource_requirements, splitkv_configurations,
+       prepare_fa2_splitkv, launch_fa2_splitkv, destroy_fa2_splitkv},
       {kProviderFa2, 1, 1, "flash-attention-2",
        apxinf::gemm::kDeviceFeatureFa2, true, true, false, supports_fa2,
        fa2_alignment, fa2_resource_requirements, one_configuration,
@@ -134,6 +174,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        custom_resource_requirements, one_configuration, prepare_custom,
        launch_custom, destroy_custom},
   };
+  static const ImplementationRegistry packed_qkv_entries = {
+#if defined(APXINF_ATTENTION_FA2)
+      {kProviderFa2, 4, 1, "flash-attention-2-packed-qkv",
+       apxinf::gemm::kDeviceFeatureCutlassSm100, true, true, true,
+       supports_fa2_packed_qkv, fa2_alignment, fa2_resource_requirements,
+       one_configuration, prepare_fa2, launch_fa2, destroy_fa2},
+#endif
+  };
   switch (semantic) {
     case APXINF_ATTENTION_SEMANTIC_DENSE:
       return dense_entries;
@@ -141,6 +189,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       return kv_cache_entries;
     case APXINF_ATTENTION_SEMANTIC_SEGMENTED:
       return segmented_entries;
+    case APXINF_ATTENTION_SEMANTIC_PACKED_QKV:
+      return packed_qkv_entries;
   }
   throw Failure(APXINF_STATUS_INTERNAL_ERROR,
                 "unknown Attention semantic registry");
@@ -216,7 +266,8 @@ std::unique_ptr<Execution> prepare(
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "Attention candidate is not deterministic");
   }
-  const size_t required = implementation.resource_requirements(spec);
+  const size_t required =
+      implementation.resource_requirements(spec, configuration);
   if (required > policy.workspace_limit) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "Attention workspace policy exceeded before allocation");

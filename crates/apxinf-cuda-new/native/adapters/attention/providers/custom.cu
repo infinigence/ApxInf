@@ -10,7 +10,7 @@ struct CustomState {
 
 }  // namespace
 
-size_t custom_resource_requirements(const Spec& spec) {
+size_t custom_resource_requirements(const Spec& spec, int) {
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_SEGMENTED) return 0;
   const auto rows = static_cast<uint64_t>(spec.batch) * spec.query_tokens *
                     spec.query_heads;
@@ -24,7 +24,8 @@ size_t custom_resource_requirements(const Spec& spec) {
 
 void prepare_custom(Execution& execution) {
   auto state = std::make_unique<CustomState>();
-  const size_t bytes = custom_resource_requirements(execution.spec);
+  const size_t bytes =
+      custom_resource_requirements(execution.spec, execution.configuration);
   if (bytes > execution.resource_limit) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "Attention probability workspace exceeds policy");

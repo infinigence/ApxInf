@@ -113,7 +113,7 @@ struct FusionCallbacksTraits<apxinf_cuda_cutlass_bf16_detail::GeGluEVT> {
 };
 }  // namespace cutlass::epilogue::fusion
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <typename TileShape, typename ClusterShape,
           typename MainloopSchedule>
@@ -228,4 +228,4 @@ int bf16_gemm_geglu(
   }
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

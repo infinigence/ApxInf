@@ -52,7 +52,7 @@ using StrideO = StrideQ;
 using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;
 using ProblemShape = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <typename Element, typename ElementOut>
 struct FmhaTypes {
@@ -219,4 +219,4 @@ int mha_bf16(
       kv_heads, head_dim, 0, 0, scale, stream, state, resource_limit, false);
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

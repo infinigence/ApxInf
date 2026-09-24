@@ -115,7 +115,7 @@ struct FusionCallbacksTraits<apxinf_cuda_cutlass_detail::GeGluEVT> {
 };
 }  // namespace cutlass::epilogue::fusion
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 template <typename TileShape, typename ClusterShape>
 struct Fp8Gemm {
   using ElementInput = cutlass::float_e4m3_t;
@@ -612,4 +612,4 @@ int fp8_gemm_geglu_e4m3(
   }
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

@@ -3,7 +3,7 @@
 
 #include <cuda_runtime_api.h>
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 int bf16_gemm_geglu(
     const void* activation, const void* packed_weight, const void* gate,
@@ -17,4 +17,4 @@ int production_dual_geglu_bf16(
     int m, int n, int k, int full_n, cudaStream_t stream);
 
 }  // namespace bf16_dual_geglu_detail
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

@@ -52,6 +52,7 @@ struct AlignmentRequirements {
   uint32_t a = 1;
   uint32_t b = 1;
   uint32_t bias = 1;
+  uint32_t residual = 1;
   uint32_t a_scales = 1;
   uint32_t b_scales = 1;
   uint32_t output = 1;
@@ -85,13 +86,18 @@ bool supports_device(const Implementation& implementation,
 inline bool supports_alignment(const Implementation& implementation,
                                const Spec& spec) {
   const auto required = implementation.alignment_requirements(spec);
+  const bool has_bias =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU ||
+      (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
+       spec.bias_alignment != 0);
+  const bool has_residual =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL;
   return spec.a_alignment >= required.a &&
          spec.b_alignment >= required.b &&
-         spec.bias_alignment >=
-             (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-                      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU
-                                     ? required.bias
-                                     : 0) &&
+         spec.bias_alignment >= (has_bias ? required.bias : 0) &&
+         spec.residual_alignment >=
+             (has_residual ? required.residual : 0) &&
          spec.a_scales_alignment >=
              (has_row_channel_scales(spec) ? required.a_scales : 0) &&
          spec.b_scales_alignment >=
@@ -142,18 +148,22 @@ void destroy_cublas(Execution& execution) noexcept;
 cudaError_t launch_cublas(Execution& execution);
 void prepare_cublaslt(Execution& execution);
 void prepare_cublaslt_native_fp8(Execution& execution);
+void prepare_cublaslt_native_fp8_gelu(Execution& execution);
 size_t cublaslt_resource_requirements(const Spec& spec);
 size_t cublaslt_native_fp8_resource_requirements(const Spec& spec);
+size_t cublaslt_native_fp8_gelu_resource_requirements(const Spec& spec);
 void destroy_cublaslt(Execution& execution) noexcept;
 cudaError_t launch_cublaslt(Execution& execution);
 void prepare_cutlass_fp8_gemm(Execution& execution);
 void prepare_cutlass_geglu(Execution& execution);
+void prepare_cutlass_geglu_sm89(Execution& execution);
 size_t cutlass_fp8_resource_requirements(const Spec& spec);
 size_t cutlass_geglu_resource_requirements(const Spec& spec);
 void destroy_cutlass(Execution& execution) noexcept;
 cudaError_t launch_cutlass_fp8_gemm(Execution& execution);
 cudaError_t launch_cutlass_fp8_geglu(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu(Execution& execution);
+cudaError_t launch_cutlass_bf16_geglu_sm89(Execution& execution);
 uint64_t cutlass_weight_prepack_count(const Execution& execution);
 
 TuningKeys tuning_keys(const Spec& spec,
