@@ -10,9 +10,13 @@ are retained at the end; they are not additional APIs to implement by name.
 
 These Rust interfaces are implemented on the refactor branch. Hardware evidence
 and model coverage are recorded in the [migration tracker](migration.md).
-PI0.5 supports them for all three ModelVariantChoice choices. Other VLA families
-retain their existing prepare path and return an unsupported error for the new
-policy methods; their default status is RuntimeManaged, never a fabricated Ready.
+PI0.5 supports them for all three ModelVariantChoice choices. Qwen-Drive supports
+sample-based `prepare_for` for fixed-profile BF16 direct planning, with owning
+eager/whole-graph plans and a bounded implicit cache; its shape-only `prepare`
+still lacks the required geometry. See its [family contract](../qwen-drive-planning.md)
+for the exact scope, workspace and validation. Other VLA families retain their
+existing prepare path and return an unsupported error for the new policy methods;
+their default status is RuntimeManaged, never a fabricated Ready.
 Python processing and action decoding are unchanged; PI0.5 loading uses the new
 model_variant field. See the architecture document for breaking entry changes.
 
