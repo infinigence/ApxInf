@@ -116,10 +116,15 @@ struct FusionCallbacksTraits<apxinf_cuda_cutlass_detail::GeGluEVT> {
 }  // namespace cutlass::epilogue::fusion
 
 namespace apxinf::cuda::cutlass_ops {
-template <typename TileShape, typename ClusterShape>
+// OutputElement is a parameter because the ApxInf projection contract writes
+// BF16, not F16. Everything else -- tile, cluster, layouts, the scaled-acc
+// epilogue -- is identical, so the BF16 arm is the same kernel with a
+// different epilogue conversion rather than a second implementation.
+template <typename TileShape, typename ClusterShape,
+          typename OutputElement = cutlass::half_t>
 struct Fp8Gemm {
   using ElementInput = cutlass::float_e4m3_t;
-  using ElementOutput = cutlass::half_t;
+  using ElementOutput = OutputElement;
   using ElementAccumulator = float;
   using LayoutA = cutlass::layout::RowMajor;
   // ApxInf stores linear weights physically as contiguous [K, N]. The original
@@ -451,42 +456,65 @@ int launch_geglu(
     return -2;
   return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
 }
-int fp8_gemm_f16(
+template <typename OutputElement>
+static int fp8_gemm_tactic(
     const void* activation, const void* weight, void* output,
     int m, int n, int k, float alpha, int tactic, cudaStream_t stream) {
   switch (tactic) {
     case 0:
-      return launch<Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _4, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _4, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 1:
-      return launch<Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _1, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_64, _64, _128>, Shape<_1, _1, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 2:
-      return launch<Fp8Gemm<Shape<_128, _128, _128>, Shape<_2, _1, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_128, _128, _128>, Shape<_2, _1, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 3:
-      return launch<Fp8Gemm<Shape<_256, _128, _64>, Shape<_2, _2, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_256, _128, _64>, Shape<_2, _2, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 4:
-      return launch<Fp8Gemm<Shape<_256, _256, _128>, Shape<_2, _2, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_256, _256, _128>, Shape<_2, _2, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 5:
-      return launch<Fp8Gemm<Shape<_256, _128, _128>, Shape<_2, _2, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_256, _128, _128>, Shape<_2, _2, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 6:
       // Safe tall-N auto-scheduled candidate. Unlike the former
       // tactic 6, this is a regular one-SM schedule and is graph-replay safe.
-      return launch<Fp8Gemm<Shape<_128, _256, _128>, Shape<_1, _2, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_128, _256, _128>, Shape<_1, _2, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     case 7:
       // Alternate wide auto-scheduled candidate. Keep the 2x1
       // cluster while avoiding the explicit two-SM epilogue that wedges the
       // current Thor-U driver during graph replay.
-      return launch<Fp8Gemm<Shape<_256, _128, _128>, Shape<_2, _1, _1>>>(
+      return launch<
+          Fp8Gemm<Shape<_256, _128, _128>, Shape<_2, _1, _1>, OutputElement>>(
           activation, weight, output, m, n, k, alpha, stream);
     default:
       return -5;
   }
+}
+
+int fp8_gemm_f16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream) {
+  return fp8_gemm_tactic<cutlass::half_t>(
+      activation, weight, output, m, n, k, alpha, tactic, stream);
+}
+
+int fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream) {
+  return fp8_gemm_tactic<cutlass::bfloat16_t>(
+      activation, weight, output, m, n, k, alpha, tactic, stream);
 }
 
 int fp8_rowwise_gemm_bf16(

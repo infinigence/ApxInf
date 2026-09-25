@@ -1,19 +1,43 @@
 #include "vendor.h"
 #include "../../../kernels/custom/gemm.cuh"
 
+#include <cstdlib>
+
 namespace apxinf::gemm::vendor {
+namespace {
+
+// Escape hatch for the pre-change behaviour, kept so the two projection
+// dtypes can be compared inside one binary.
+bool fp8_f32_projection_forced() {
+  static const bool forced =
+      std::getenv("APXINF_GEMM_FP8_F32_PROJECTION") != nullptr;
+  return forced;
+}
+
+}  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
-  return spec.a_dtype == APXINF_DTYPE_I8
-             ? APXINF_DTYPE_I32
-             : has_row_channel_scales(spec)
-                   ? APXINF_DTYPE_F32
-                   : (spec.a_dtype == APXINF_DTYPE_E4M3 ||
-                      spec.b_dtype == APXINF_DTYPE_E4M3)
-                         ? (spec.output_dtype == APXINF_DTYPE_F16
-                                ? APXINF_DTYPE_F16
-                                : APXINF_DTYPE_F32)
-                         : spec.a_dtype;
+  if (spec.a_dtype == APXINF_DTYPE_I8) {
+    return APXINF_DTYPE_I32;
+  }
+  if (has_row_channel_scales(spec)) {
+    return APXINF_DTYPE_F32;
+  }
+  if (spec.a_dtype != APXINF_DTYPE_E4M3 && spec.b_dtype != APXINF_DTYPE_E4M3) {
+    return spec.a_dtype;
+  }
+  if (spec.output_dtype == APXINF_DTYPE_F16) {
+    return APXINF_DTYPE_F16;
+  }
+  // A 16-bit output needs no wider intermediate. Every vendor FP8 path already
+  // accumulates in F32 and converts in its own epilogue, so projecting through
+  // F32 buys no precision and costs a full-size write, read and convert pass
+  // per call -- plus, at prefill widths, an unpack budget large enough to
+  // prefilter every candidate that is not native FP8.
+  if (spec.output_dtype == APXINF_DTYPE_BF16 && !fp8_f32_projection_forced()) {
+    return APXINF_DTYPE_BF16;
+  }
+  return APXINF_DTYPE_F32;
 }
 
 CommonResources::~CommonResources() {

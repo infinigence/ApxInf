@@ -9,6 +9,13 @@ int fp8_gemm_f16(
     const void* activation, const void* weight, void* output,
     int m, int n, int k, float alpha, int tactic, cudaStream_t stream);
 
+// Same kernel family as fp8_gemm_f16 with a BF16 epilogue conversion. The
+// ApxInf projection contract writes BF16, and routing that through F16 would
+// clip dot products this checkpoint actually produces.
+int fp8_gemm_bf16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream);
+
 int fp8_rowwise_gemm_bf16(
     const void* activation, const void* weight_nk,
     const float* activation_scales, const float* weight_scales,

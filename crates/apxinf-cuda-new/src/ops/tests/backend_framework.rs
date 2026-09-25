@@ -413,6 +413,99 @@ fn fp8_unit_scale_bf16_output_does_not_round_through_f16() {
     assert!(values(&out).iter().all(|&value| value == expected));
 }
 
+/// Decode one OCP E4M3 code (bias 7) exactly, so the reference below is the
+/// arithmetic the kernels are supposed to perform rather than an approximation
+/// of it.
+fn e4m3_value(code: u8) -> f32 {
+    let exponent = ((code >> 3) & 0x0F) as i32;
+    let mantissa = (code & 0x07) as f32;
+    let magnitude = if exponent == 0 {
+        mantissa / 8.0 * (-6.0f32).exp2()
+    } else {
+        (1.0 + mantissa / 8.0) * ((exponent - 7) as f32).exp2()
+    };
+    if code & 0x80 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Every FP8 candidate eligible for a BF16 projection must reproduce the
+/// projection at a shape with more than one tile.
+///
+/// `fp8_unit_scale_bf16_output_does_not_round_through_f16` also runs
+/// `validate_candidates`, but at M=1, K=16, N=16 -- one tile, one K iteration,
+/// and a single output row. A mainloop or epilogue that indexes wrongly
+/// across tiles passes that and fails here. This matters because the CUTLASS
+/// FP8 candidate accepts BF16 outputs, which is every projection in the
+/// Qwen3.8 checkpoint, and `validate_candidates` rejects an implementation
+/// that has no executable configuration -- so this also proves the candidate
+/// is genuinely reached rather than silently skipped.
+#[test]
+fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (128usize, 512usize, 256usize);
+    // A spread of finite E4M3 codes. Constant operands would hide an indexing
+    // fault, because every element of the result would be identical.
+    const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
+    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
+    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
+    let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+
+    // The checkpoint-shaped alpha: `weight_scale * input_scale`, not unit.
+    let alpha = 0.0123_f32;
+    let mut expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for column in 0..n {
+            let mut accumulator = 0.0f32;
+            for index in 0..k {
+                accumulator += e4m3_value(a_codes[row * k + index])
+                    * e4m3_value(b_codes[index * n + column]);
+            }
+            expected[row * n + column] = accumulator * alpha;
+        }
+    }
+    // Guard the magnitude as well as the direction: a candidate that is the
+    // right shape and the wrong scale scores near-perfect cosine.
+    let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
+    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    args.alpha = alpha;
+    args.policy.online_tune = true;
+    args.policy.allow_fallback = false;
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+
+    // And the candidate the tuner actually selects has to land there too.
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    let summary = execution.summary().to_owned();
+    eprintln!("GPU_BF16_FP8_CANDIDATES {summary}");
+    assert!(
+        summary.contains("cutlass-fp8#"),
+        "the CUTLASS FP8 candidate was not reached for a BF16 output: {summary}"
+    );
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    let produced = values(&out);
+    let mut error_energy = 0.0f64;
+    let mut signal_energy = 0.0f64;
+    for (got, want) in produced.iter().zip(&expected) {
+        error_energy += (*got as f64 - *want as f64).powi(2);
+        signal_energy += (*want as f64).powi(2);
+    }
+    let relative_l2 = (error_energy / signal_energy).sqrt();
+    eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
+    // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
+    // bound is deliberately far above that and far below any real fault.
+    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+}
+
 #[test]
 fn gpu_e2e_autotune_times_candidates_and_checks_winner_capture() {
     let ctx = CudaContext::new(0).unwrap();

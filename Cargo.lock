@@ -97,11 +97,9 @@ name = "apxinf-cuda"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
- "bytemuck",
- "cc",
+ "apxinf-loader",
+ "apxinf-tokenizer",
  "half",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

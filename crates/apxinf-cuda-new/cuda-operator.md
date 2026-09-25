@@ -20,6 +20,11 @@ GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the fi
 - `Fp8UnitScale`: A/B are both E4M3 tensors with the expected scaling already applied.
 - `Fp8`: A/B are both E4M3; FP32 `row_scales=[M]` and `channel_scales=[N]` dequantize rows of A and columns of B, respectively.
 - `W8A8`: A/B are both INT8 and use FP32 row/channel scales with the same shapes; output is BF16, `K <= 131071`, and the mode applies only to `gemm` and `gemm_bias`.
+- `Nvfp4`: A/B are both packed FP4 (`DType::E2M1Pair`, two E2M1 values per byte, low nibble first) with one unsigned-E4M3 scale per `block_size` elements along K. Output is BF16, `K` is a multiple of `block_size`, and the mode applies only to `gemm`.
+
+`Nvfp4` is the one contract whose operand storage is not the canonical `A=[M,K]`, `B=[K,N]`: both operands are K-packed, so `A` is stored `[M, K/2]` and `B` is stored `[N, K/2]`. That is the orientation a ModelOpt checkpoint already uses and the one the block-scaled kernel consumes, so requiring the usual layout would force a transpose that buys nothing. Any per-tensor scale a checkpoint carries alongside the block scales (ModelOpt's `weight_scale_2` and `input_scale`) multiplies the whole projection and therefore belongs in `alpha`, which also keeps it out of the tuning key.
+
+Block-scale tensors must be in the layout the candidate reads, which is **not** a plain `[rows, K/block_size]` array. Build them once with `ops::nvfp4_pack_block_scales` into a buffer sized by `ops::nvfp4_scale_buffer_bytes`; the layout depends only on `block_size`, so the result stays valid when the autotuner selects a different configuration.
 
 Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
@@ -29,11 +34,11 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Item | Contract |
 | --- | --- |
 | Rust API | `ops::gemm(ctx, GemmArgs)` |
-| Inputs | `A=[M,K]`, `B=[K,N]`; supports `None`, `Fp8UnitScale`, `Fp8`, and `W8A8` |
+| Inputs | `A=[M,K]`, `B=[K,N]`; supports `None`, `Fp8UnitScale`, `Fp8`, `W8A8`, and `Nvfp4` (whose operands are stored `A=[M,K/2]`, `B=[N,K/2]`) |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = alpha * projection(A,B) / output_scale` |
-| Constraints | W8A8 output must be BF16; `WeightVersion` may declare immutable weights and allow prepare to cache an internal prepacked copy |
-| Reference test | `gemm_all_candidates_match_torch` |
+| Constraints | W8A8 and NVFP4 output must be BF16; `WeightVersion` may declare immutable weights and allow prepare to cache an internal prepacked copy |
+| Reference test | `gemm_all_candidates_match_torch`, `nvfp4_all_candidates_match_reference` |
 
 <!-- l3-operator:gemm_bias -->
 ### `gemm_bias`

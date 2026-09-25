@@ -16,3 +16,7 @@ apxinf-core = { path = "../apxinf-core", features = ["quantized-dtypes"] }
 
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }
+# Integration tests read a real checkpoint to prove the on-disk bytes are
+# consumed correctly; the library itself does not depend on the loader.
+apxinf-loader = { path = "../apxinf-loader" }
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }

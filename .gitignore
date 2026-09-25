@@ -13,3 +13,5 @@ experiment/
 
 # Local development artifacts (see AGENTS.md)
 /devlocal/
+crates/.gemm-pilot-link.lock
+target-gemm-pilot/

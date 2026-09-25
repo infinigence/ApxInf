@@ -1,5 +1,11 @@
 #include "internal.h"
 
+#include <cstdlib>
+
+#ifdef APXINF_GEMM_CUTLASS
+#include "../../kernels/cutlass/ops/gemm/gemm_nvfp4_sm100.h"
+#endif
+
 namespace apxinf::gemm {
 namespace {
 
@@ -8,6 +14,14 @@ constexpr uint32_t kProviderCublasLt = 2;
 constexpr uint32_t kProviderCutlass = 3;
 
 bool supports_vendor(const Spec& spec) {
+  // Packed FP4 has no vendor BLAS path: cuBLAS would read the bytes as some
+  // other dtype rather than fail, so exclude it by encoding, not by dtype
+  // equality.
+  if (spec.a_dtype == APXINF_DTYPE_E2M1_PAIR ||
+      spec.b_dtype == APXINF_DTYPE_E2M1_PAIR ||
+      spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK) {
+    return false;
+  }
   return spec.a_dtype == spec.b_dtype &&
          ((spec.a_dtype == APXINF_DTYPE_I8 &&
            spec.accumulation_dtype == APXINF_DTYPE_I32) ||
@@ -69,11 +83,24 @@ void cublaslt_configurations(const Spec&,
 }
 
 #ifdef APXINF_GEMM_CUTLASS
+// Escape hatch for the pre-change candidate set, kept so the F16-only and the
+// F16-or-BF16 registries can be compared inside one binary.
+bool cutlass_fp8_bf16_disabled() {
+  static const bool disabled =
+      std::getenv("APXINF_GEMM_FP8_NO_CUTLASS_BF16") != nullptr;
+  return disabled;
+}
+
 bool supports_cutlass_fp8(const Spec& spec) {
+  // The kernel is one template over the epilogue output element, so BF16 is
+  // the same candidate rather than a second implementation id.
+  const bool output_supported =
+      spec.output_dtype == APXINF_DTYPE_F16 ||
+      (spec.output_dtype == APXINF_DTYPE_BF16 && !cutlass_fp8_bf16_disabled());
   return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
          spec.a_dtype == APXINF_DTYPE_E4M3 &&
          spec.b_dtype == APXINF_DTYPE_E4M3 &&
-         spec.output_dtype == APXINF_DTYPE_F16 &&
+         output_supported &&
          spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
          spec.n % 16 == 0 &&
          spec.k % 16 == 0 && spec.output_scale_is_unit != 0;
@@ -107,6 +134,46 @@ void cutlass_configurations(const Spec&,
                             std::vector<int>& configs) {
   for (int configuration = 0; configuration < 4; ++configuration) {
     configs.push_back(configuration);
+  }
+}
+
+AlignmentRequirements cutlass_nvfp4_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  // 32 stored bytes = 64 FP4 values, which is the operand alignment the
+  // block-scaled mainloop requires.
+  requirements.a = 32;
+  requirements.b = 32;
+  requirements.a_block_scales = 16;
+  requirements.b_block_scales = 16;
+  requirements.output = 16;
+  return requirements;
+}
+
+bool supports_cutlass_nvfp4(const Spec& spec) {
+  if (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
+      spec.quantization != APXINF_GEMM_QUANT_NVFP4_BLOCK ||
+      spec.a_dtype != APXINF_DTYPE_E2M1_PAIR ||
+      spec.b_dtype != APXINF_DTYPE_E2M1_PAIR ||
+      spec.output_dtype != APXINF_DTYPE_BF16) {
+    return false;
+  }
+  // Tactic 0 carries the tightest shape constraints. Gating on it keeps every
+  // enumerated configuration launchable, so a tuned winner can never be a
+  // configuration that aborts the context at run time -- which on this device
+  // is unrecoverable rather than merely slow.
+  return apxinf::cuda::cutlass_ops::nvfp4_gemm_tactic_supported(
+      0, static_cast<int>(spec.m), static_cast<int>(spec.n),
+      static_cast<int>(spec.k), static_cast<int>(spec.sf_vec_size));
+}
+
+void cutlass_nvfp4_configurations(const Spec& spec, std::vector<int>& configs) {
+  const int tactics = apxinf::cuda::cutlass_ops::nvfp4_gemm_tactic_count();
+  for (int tactic = 0; tactic < tactics; ++tactic) {
+    if (apxinf::cuda::cutlass_ops::nvfp4_gemm_tactic_supported(
+            tactic, static_cast<int>(spec.m), static_cast<int>(spec.n),
+            static_cast<int>(spec.k), static_cast<int>(spec.sf_vec_size))) {
+      configs.push_back(tactic);
+    }
   }
 }
 #endif
@@ -187,6 +254,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled",
+       kDeviceFeatureCutlassSm100, true, true, false,
+       supports_cutlass_nvfp4, cutlass_nvfp4_alignment,
+       cutlass_nvfp4_resource_requirements, cutlass_nvfp4_configurations,
+       prepare_cutlass_nvfp4, launch_cutlass_nvfp4, destroy_cutlass},
 #endif
   };
   static const ImplementationRegistry gemm_geglu_entries = {
