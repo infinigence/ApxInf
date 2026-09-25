@@ -59,12 +59,22 @@ pub(super) struct GdnGraphs {
     gdn_graph_result: Vec<Option<Tensor>>,
     /// Stable-address arena the captured bodies allocate from.
     gdn_graph_workspace: Option<kernels::GraphWorkspace>,
+    #[cfg(test)]
+    force_decode_graph: bool,
 }
 impl GdnGraphs {
+    fn enabled_for(&self, layer: usize) -> bool {
+        #[cfg(test)]
+        if self.force_decode_graph {
+            return true;
+        }
+        decode_graph_enabled_for(layer)
+    }
+
     fn forward_gdn_captured(
         &mut self,
         request: &GdnRequest<'_>,
-        eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
+        eager: &mut dyn FnMut(Tensor, Option<usize>) -> Result<Tensor>,
         x: Tensor,
         layer_idx: usize,
         parity: usize,
@@ -98,7 +108,7 @@ impl GdnGraphs {
             .map(|value| value.contains("alloc"))
             .unwrap_or(false)
         {
-            return eager(x).map(|x| (x, false));
+            return eager(x, None).map(|x| (x, false));
         }
 
         if self.gdn_graph_in.is_none() {
@@ -127,9 +137,9 @@ impl GdnGraphs {
                 .unwrap_or(false);
             let workspace = self.gdn_graph_workspace.take().expect("graph arena");
             let produced = if prepare {
-                kernels::prepare_with_workspace(&workspace, || eager(input))
+                kernels::prepare_with_workspace(&workspace, || eager(input, None))
             } else {
-                kernels::with_workspace(&workspace, || eager(input))
+                kernels::with_workspace(&workspace, || eager(input, None))
             };
             self.gdn_graph_workspace = Some(workspace);
             let output = produced?;
@@ -147,7 +157,8 @@ impl GdnGraphs {
             // Declared preflight: executes, so its output is this step's real
             // result and the recurrent and conv state advance exactly once.
             let workspace = self.gdn_graph_workspace.take().expect("graph arena");
-            let prepared = kernels::prepare_with_workspace(&workspace, || eager(staged.clone()));
+            let prepared =
+                kernels::prepare_with_workspace(&workspace, || eager(staged.clone(), None));
             self.gdn_graph_workspace = Some(workspace);
             let output = prepared?;
             cuda.synchronize()?;
@@ -159,15 +170,12 @@ impl GdnGraphs {
             return Ok((landing, false));
         }
 
-        // A capture executes the Rust body, so the host-side conv flip advances
-        // on that step and must not be advanced again after the replay below.
-        let mut captured_now = false;
         if self.gdn_graphs[layer_idx][parity].is_none() {
-            captured_now = true;
             cuda.synchronize()?;
             let workspace = self.gdn_graph_workspace.take().expect("graph arena");
-            let captured = cuda
-                .capture_graph(|| kernels::with_workspace(&workspace, || eager(staged.clone())));
+            let captured = cuda.capture_graph(|| {
+                kernels::with_workspace(&workspace, || eager(staged.clone(), Some(parity)))
+            });
             self.gdn_graph_workspace = Some(workspace);
             let (graph, output) = captured?;
             self.gdn_graph_out[layer_idx][parity] = Some(output);
@@ -188,7 +196,7 @@ impl GdnGraphs {
             .clone()
             .expect("landing buffer");
         device_copy(ctx, &landing, &produced, bytes)?;
-        Ok((landing, !captured_now))
+        Ok((landing, true))
     }
 }
 impl GdnExecution for GdnGraphs {
@@ -196,14 +204,88 @@ impl GdnExecution for GdnGraphs {
         &mut self,
         request: &GdnRequest<'_>,
         input: Tensor,
-        eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
+        eager: &mut dyn FnMut(Tensor, Option<usize>) -> Result<Tensor>,
     ) -> Result<(Tensor, bool)> {
         if !request.decode
             || request.decode_step < DECODE_GRAPH_WARMUP_STEPS
-            || !decode_graph_enabled_for(request.layer)
+            || !self.enabled_for(request.layer)
         {
-            return eager(input).map(|output| (output, false));
+            return eager(input, None).map(|output| (output, false));
         }
         self.forward_gdn_captured(request, eager, input, request.layer, request.parity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen_drive::backend::{transfers, RuntimeBackend};
+    use half::bf16;
+
+    #[test]
+    fn gdn_graphs_run_binds_parity_and_advances_state_once() -> Result<()> {
+        let backend = Arc::new(RuntimeBackend::new(0)?);
+        let input = Tensor::from_bf16(vec![1, 4], &[bf16::from_f32(1.0); 4])?;
+        let input = transfers::to_cuda(&input, backend.device_id())?;
+        let sources = [2.0f32, 3.0]
+            .map(|value| {
+                let source = Tensor::from_bf16(vec![1, 4], &[bf16::from_f32(value); 4])?;
+                transfers::to_cuda(&source, backend.device_id())
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = [
+            persistent_tensor(backend.context(), &[1, 4], DType::BF16)?,
+            persistent_tensor(backend.context(), &[1, 4], DType::BF16)?,
+        ];
+        let mut graphs = GdnGraphs {
+            force_decode_graph: true,
+            ..GdnGraphs::default()
+        };
+        let mut flip = false;
+        let mut body_calls = Vec::new();
+
+        // parity-0 preflight, parity-1 preflight, capture+replay of both
+        // parities, then replay both already-captured graphs.
+        for (step, expected) in [2.0f32, 3.0, 2.0, 3.0, 2.0, 3.0]
+            .into_iter()
+            .enumerate()
+        {
+            let request = GdnRequest {
+                backend: &backend,
+                layer: 0,
+                layer_count: 1,
+                parity: usize::from(flip),
+                decode: true,
+                decode_step: DECODE_GRAPH_WARMUP_STEPS + step,
+            };
+            let (output, replayed) = graphs.run(&request, input.clone(), &mut |x, explicit| {
+                body_calls.push(explicit);
+                let parity = explicit.unwrap_or(usize::from(flip));
+                if explicit.is_none() {
+                    flip = !flip;
+                }
+                device_copy(
+                    backend.context(),
+                    &outputs[parity],
+                    &sources[parity],
+                    x.size_in_bytes(),
+                )?;
+                Ok(outputs[parity].clone())
+            })?;
+            if replayed {
+                flip = !flip;
+            }
+
+            backend.synchronize()?;
+            let output = transfers::to_cpu(&output)?.to_f32_vec()?;
+            assert_eq!(output, vec![expected; 4]);
+            assert_eq!(flip, step % 2 == 0);
+        }
+
+        assert_eq!(body_calls, vec![None, None, Some(0), Some(1)]);
+        assert!(graphs.gdn_graphs[0][0].is_some());
+        assert!(graphs.gdn_graphs[0][1].is_some());
+        Ok(())
     }
 }
