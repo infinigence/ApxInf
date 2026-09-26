@@ -103,6 +103,7 @@ pub(crate) struct Normalized {
     pub policy: AttentionPolicy,
     pub bindings: abi::Bindings,
     pub storage: Vec<CudaBuffer>,
+    pub resources: Vec<std::rc::Rc<dyn std::any::Any>>,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
@@ -253,6 +254,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         key: k.ptr(),
         value: v.ptr(),
         offsets: std::ptr::null(),
+        decode_meta: std::ptr::null(),
         output: out.ptr(),
         stream: ctx.stream().handle(),
         scale: args.scale,
@@ -286,9 +288,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
             max_segment_tokens: 0,
             offsets_hash: 0,
             scale_is_default: u32::from(args.scale == default_scale),
+            dynamic_decode: 0,
         },
         policy: args.policy,
         bindings,
         storage: vec![q, k, v, out],
+        resources: Vec::new(),
     })
 }

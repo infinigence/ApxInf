@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use apxinf_core::{DType, Result, Tensor};
 
 use super::contracts::{
@@ -5,7 +7,61 @@ use super::contracts::{
 };
 use super::{execution, AttentionMask, AttentionPolicy};
 use crate::ffi::abi::attention as abi;
-use crate::{CudaBuffer, CudaContext};
+use crate::{CudaBuffer, CudaContext, HostMappedBuffer};
+
+/// Fixed-address runtime metadata for CUDA Graph-safe KV-cache decoding.
+///
+/// Allocate one instance with the model and reuse it for every decode step.
+/// The mapped device words contain `[valid_key_tokens, query_start]` and may
+/// be updated between graph replays without changing the captured pointer.
+#[derive(Clone)]
+pub struct KvCacheDecodeMeta {
+    storage: Rc<HostMappedBuffer>,
+    key_capacity: usize,
+}
+
+impl KvCacheDecodeMeta {
+    pub fn new(device: usize, key_capacity: usize) -> Result<Self> {
+        if key_capacity == 0 || key_capacity > i32::MAX as usize {
+            return Err(invalid(
+                "decode metadata key_capacity must fit the native Attention limits",
+            ));
+        }
+        Ok(Self {
+            storage: Rc::new(
+                HostMappedBuffer::alloc(2 * std::mem::size_of::<u32>(), device)
+                    .map_err(apxinf_core::Error::Cuda)?,
+            ),
+            key_capacity,
+        })
+    }
+
+    /// Publish the runtime length and query position for a later graph replay.
+    ///
+    /// The caller must ensure that all earlier CUDA work reading this metadata
+    /// has completed before updating it. In particular, synchronize or wait on
+    /// the previous replay before reusing one metadata allocation.
+    pub fn update(&self, valid_key_tokens: usize, query_start: usize) -> Result<()> {
+        if valid_key_tokens == 0 || query_start >= valid_key_tokens {
+            return Err(invalid(
+                "decode metadata requires 0 <= query_start < valid_key_tokens",
+            ));
+        }
+        if valid_key_tokens > self.key_capacity {
+            return Err(invalid(format!(
+                "valid_key_tokens {valid_key_tokens} exceeds decode metadata capacity {}",
+                self.key_capacity
+            )));
+        }
+        let valid_key_tokens = u32::try_from(valid_key_tokens)
+            .map_err(|_| invalid("valid_key_tokens exceeds decode metadata limits"))?;
+        let query_start = u32::try_from(query_start)
+            .map_err(|_| invalid("query_start exceeds decode metadata limits"))?;
+        self.storage
+            .write_u32s(&[valid_key_tokens, query_start])
+            .map_err(apxinf_core::Error::Cuda)
+    }
+}
 
 /// Contiguous KV-cache attention.
 ///
@@ -13,11 +69,17 @@ use crate::{CudaBuffer, CudaContext};
 /// `[batch, key_capacity, kv_heads, head_dim]`. Only their leading
 /// `valid_key_tokens` rows participate. For a causal mask, query token `i`
 /// occupies cache position `query_start + i`.
+///
+/// The default is static KV attention, whose exact length and position are
+/// part of the Spec and may select FA2. Call [`Self::with_decode_meta`] for
+/// dynamic graph decode; that mode keys recipes and executions by capacity
+/// while reading the current length and position from fixed-address metadata.
 pub struct KvCacheAttentionArgs<'a> {
     pub query: &'a Tensor,
     pub key_cache: &'a Tensor,
     pub value_cache: &'a Tensor,
     pub out: &'a mut Tensor,
+    pub decode_meta: Option<KvCacheDecodeMeta>,
     pub valid_key_tokens: usize,
     pub query_start: usize,
     pub mask: AttentionMask,
@@ -41,12 +103,23 @@ impl<'a> KvCacheAttentionArgs<'a> {
             key_cache,
             value_cache,
             out,
+            decode_meta: None,
             valid_key_tokens,
             query_start: valid_key_tokens.saturating_sub(query_tokens),
             mask: AttentionMask::Causal,
             scale: 1.0 / (head_dim as f32).sqrt(),
             policy: AttentionPolicy::default(),
         }
+    }
+
+    /// Use fixed-address runtime metadata for CUDA Graph decode replay.
+    ///
+    /// One prepared execution and captured graph can then cover every valid
+    /// position up to the metadata capacity. Dynamic metadata is intentionally
+    /// limited to causal single-token decode.
+    pub fn with_decode_meta(mut self, decode_meta: &KvCacheDecodeMeta) -> Self {
+        self.decode_meta = Some(decode_meta.clone());
+        self
     }
 
     pub fn non_causal(mut self) -> Self {
@@ -84,6 +157,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
         (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
     let (key_batch, key_capacity, kv_heads, key_head_dim) =
         (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+    let dynamic_decode = args.decode_meta.is_some();
+    if dynamic_decode && (batch != 1 || query_tokens != 1 || args.mask != AttentionMask::Causal) {
+        return Err(invalid(
+            "dynamic KV-cache decode metadata requires batch-1 causal single-token queries",
+        ));
+    }
     if [
         batch,
         query_tokens,
@@ -157,11 +236,34 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
     }
 
     let default_scale = 1.0 / (head_dim as f32).sqrt();
+    let mut resources: Vec<Rc<dyn std::any::Any>> = Vec::new();
+    let decode_meta = if let Some(meta) = args.decode_meta.as_ref() {
+        if meta.key_capacity != key_capacity {
+            return Err(invalid(format!(
+                "decode metadata capacity {} does not match KV-cache capacity {key_capacity}",
+                meta.key_capacity
+            )));
+        }
+        meta.update(args.valid_key_tokens, args.query_start)?;
+        let address = meta.storage.address();
+        if address.device() != ctx.device_id() {
+            return Err(invalid(format!(
+                "KV-cache decode metadata is on CUDA {}, but Attention targets CUDA {}",
+                address.device(),
+                ctx.device_id()
+            )));
+        }
+        resources.push(meta.storage.clone());
+        address.ptr().cast_const().cast()
+    } else {
+        std::ptr::null()
+    };
     let bindings = abi::Bindings {
         query: q.ptr(),
         key: k.ptr(),
         value: v.ptr(),
         offsets: std::ptr::null(),
+        decode_meta,
         output: out.ptr(),
         stream: ctx.stream().handle(),
         scale: args.scale,
@@ -181,20 +283,30 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
             offsets_alignment: 0,
             batch: batch as i64,
             query_tokens: query_tokens as i64,
-            key_tokens: args.valid_key_tokens as i64,
+            key_tokens: if dynamic_decode {
+                key_capacity as i64
+            } else {
+                args.valid_key_tokens as i64
+            },
             key_capacity: key_capacity as i64,
             query_heads: query_heads as i64,
             kv_heads: kv_heads as i64,
             head_dim: head_dim as i64,
-            query_start: args.query_start as i64,
+            query_start: if dynamic_decode {
+                0
+            } else {
+                args.query_start as i64
+            },
             segments: 0,
             max_segment_tokens: 0,
             offsets_hash: 0,
             scale_is_default: u32::from(args.scale == default_scale),
+            dynamic_decode: u32::from(dynamic_decode),
         },
         policy: args.policy,
         bindings,
         storage: vec![q, k, v, out],
+        resources,
     })
 }
 

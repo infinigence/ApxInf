@@ -19,6 +19,7 @@ struct ExecutionKey {
     key: usize,
     value: usize,
     offsets: usize,
+    decode_meta: usize,
     output: usize,
     stream: usize,
     scale: u32,
@@ -37,6 +38,7 @@ impl ExecutionKey {
             key: normalized.bindings.key as usize,
             value: normalized.bindings.value as usize,
             offsets: normalized.bindings.offsets as usize,
+            decode_meta: normalized.bindings.decode_meta as usize,
             output: normalized.bindings.output as usize,
             stream: normalized.bindings.stream as usize,
             scale: normalized.bindings.scale.to_bits(),
@@ -52,6 +54,7 @@ pub(crate) struct Execution {
     raw: abi::Execution,
     stream: Arc<crate::CudaStream>,
     _storage: Vec<CudaBuffer>,
+    _resources: Vec<Rc<dyn std::any::Any>>,
     #[cfg(test)]
     summary: String,
     _not_send: PhantomData<Rc<()>>,
@@ -116,6 +119,7 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         raw,
         stream: ctx.shared_stream(),
         _storage: normalized.storage,
+        _resources: normalized.resources,
         #[cfg(test)]
         summary,
         _not_send: PhantomData,

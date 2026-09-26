@@ -420,6 +420,123 @@ fn kv_cache_attention_honors_capacity_valid_length_and_query_position() {
 }
 
 #[test]
+fn kv_cache_graph_replays_all_positions_with_one_capacity_spec() {
+    let ctx = CudaContext::new(0).unwrap();
+    let head_dim = 64;
+    let key_capacity = 64;
+    let query_values: Vec<_> = (0..head_dim)
+        .map(|index| ((index * 3 % 17) as f32 - 8.0) / 16.0)
+        .collect();
+    let key_values: Vec<_> = (0..key_capacity * head_dim)
+        .map(|index| ((index * 5 % 19) as f32 - 9.0) / 16.0)
+        .collect();
+    let value_values: Vec<_> = (0..key_capacity * head_dim)
+        .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
+        .collect();
+    let query = tensor(0, vec![1, 1, 1, head_dim], &query_values);
+    let key = tensor(0, vec![1, key_capacity, 1, head_dim], &key_values);
+    let value = tensor(0, vec![1, key_capacity, 1, head_dim], &value_values);
+    let mut out = tensor(0, vec![1, 1, 1, head_dim], &vec![0.0; head_dim]);
+    let decode_meta = KvCacheDecodeMeta::new(0, key_capacity).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+
+    prepare_with_session(&session, || {
+        let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
+            .with_decode_meta(&decode_meta);
+        args.valid_key_tokens = 1;
+        args.query_start = 0;
+        args.policy.online_tune = false;
+        kv_cache_attention(&ctx, args)
+    })
+    .unwrap();
+
+    let graph = crate::capture(&ctx, || {
+        with_session(&session, || {
+            let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
+                .with_decode_meta(&decode_meta);
+            args.valid_key_tokens = 1;
+            args.query_start = 0;
+            args.policy.online_tune = false;
+            kv_cache_attention(&ctx, args)
+        })
+    })
+    .unwrap();
+
+    // This crosses every old power-of-two bucket boundary, including 7/8/9,
+    // and reaches valid_len == key_capacity without preparing or capturing
+    // another execution.
+    for valid_key_tokens in 1..=key_capacity {
+        // Updating after synchronization is required because replay is async.
+        decode_meta
+            .update(valid_key_tokens, valid_key_tokens - 1)
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let expected = kv_cache_attention_reference(
+            &query_values,
+            &key_values,
+            &value_values,
+            1,
+            1,
+            valid_key_tokens,
+            key_capacity,
+            1,
+            1,
+            head_dim,
+            valid_key_tokens - 1,
+            1.0 / (head_dim as f32).sqrt(),
+            true,
+        );
+        let actual = values(&out);
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (*actual - expected).abs() < 0.03 + 0.02 * expected.abs(),
+                "step-{valid_key_tokens} graph output {index} is {actual}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn kv_cache_decode_meta_enforces_capacity() {
+    let decode_meta = KvCacheDecodeMeta::new(0, 9).unwrap();
+    decode_meta.update(9, 8).unwrap();
+    assert!(decode_meta.update(10, 9).is_err());
+}
+
+#[test]
+fn kv_cache_decode_meta_rejects_non_decode_queries() {
+    let ctx = CudaContext::new(0).unwrap();
+    let key = tensor(0, vec![1, 4, 1, 2], &[0.25; 8]);
+    let value = tensor(0, vec![1, 4, 1, 2], &[0.5; 8]);
+    let decode_meta = KvCacheDecodeMeta::new(0, 4).unwrap();
+
+    let query = tensor(0, vec![1, 2, 1, 2], &[0.75; 4]);
+    let mut out = tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
+    let args =
+        KvCacheAttentionArgs::new(&query, &key, &value, &mut out).with_decode_meta(&decode_meta);
+    let error = kv_cache_attention(&ctx, args).unwrap_err();
+    assert!(error.to_string().contains("causal single-token"), "{error}");
+
+    let query = tensor(0, vec![1, 1, 1, 2], &[0.75; 2]);
+    let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+    let args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
+        .with_decode_meta(&decode_meta)
+        .non_causal();
+    let error = kv_cache_attention(&ctx, args).unwrap_err();
+    assert!(error.to_string().contains("causal single-token"), "{error}");
+
+    let query = tensor(0, vec![2, 1, 1, 2], &[0.75; 4]);
+    let key = tensor(0, vec![2, 4, 1, 2], &[0.25; 16]);
+    let value = tensor(0, vec![2, 4, 1, 2], &[0.5; 16]);
+    let mut out = tensor(0, vec![2, 1, 1, 2], &[0.0; 4]);
+    let args =
+        KvCacheAttentionArgs::new(&query, &key, &value, &mut out).with_decode_meta(&decode_meta);
+    let error = kv_cache_attention(&ctx, args).unwrap_err();
+    assert!(error.to_string().contains("batch-1"), "{error}");
+}
+
+#[test]
 fn kv_cache_attention_non_causal_uses_only_valid_cache_rows() {
     let ctx = CudaContext::new(0).unwrap();
     let query_values = vec![0.5, -0.25];

@@ -24,7 +24,7 @@ void validate_spec(const Spec& spec) {
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
-  if (spec.version != 3 ||
+  if (spec.version != 4 ||
       spec.semantic > APXINF_ATTENTION_SEMANTIC_SEGMENTED ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!native_output && !static_e4m3_output) ||
@@ -38,7 +38,7 @@ void validate_spec(const Spec& spec) {
       spec.query_heads > INT32_MAX || spec.kv_heads > INT32_MAX ||
       spec.head_dim > INT32_MAX || spec.query_start > INT32_MAX ||
       spec.segments > INT32_MAX || spec.max_segment_tokens > INT32_MAX ||
-      spec.scale_is_default > 1) {
+      spec.scale_is_default > 1 || spec.dynamic_decode > 1) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Attention Spec");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
@@ -48,13 +48,20 @@ void validate_spec(const Spec& spec) {
                 ? spec.key_tokens - spec.query_tokens
                 : 0) ||
        spec.segments != 0 || spec.max_segment_tokens != 0 ||
-       spec.offsets_hash != 0 || spec.offsets_alignment != 0)) {
+       spec.offsets_hash != 0 || spec.offsets_alignment != 0 ||
+       spec.dynamic_decode != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
-      (spec.query_start < 0 || spec.query_start > spec.key_tokens ||
-       (spec.mask == APXINF_ATTENTION_MASK_NONE && spec.query_start != 0) ||
+      ((spec.dynamic_decode != 0 &&
+        (spec.batch != 1 || spec.key_tokens != spec.key_capacity ||
+         spec.query_start != 0 ||
+         spec.query_tokens != 1 ||
+         spec.mask != APXINF_ATTENTION_MASK_CAUSAL)) ||
+       (spec.dynamic_decode == 0 &&
+        (spec.query_start < 0 || spec.query_start > spec.key_tokens ||
+         (spec.mask == APXINF_ATTENTION_MASK_NONE && spec.query_start != 0))) ||
        spec.segments != 0 || spec.max_segment_tokens != 0 ||
        spec.offsets_hash != 0 || spec.offsets_alignment != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -65,11 +72,14 @@ void validate_spec(const Spec& spec) {
        spec.key_capacity != spec.key_tokens || spec.query_heads != spec.kv_heads ||
        spec.mask != APXINF_ATTENTION_MASK_NONE || spec.query_start != 0 ||
        spec.segments <= 0 || spec.max_segment_tokens <= 0 ||
+       spec.dynamic_decode != 0 ||
        spec.max_segment_tokens > spec.query_tokens)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid segmented Attention semantic fields");
   }
-  if (spec.mask == APXINF_ATTENTION_MASK_CAUSAL &&
+  if ((spec.semantic != APXINF_ATTENTION_SEMANTIC_KV_CACHE ||
+       spec.dynamic_decode == 0) &&
+      spec.mask == APXINF_ATTENTION_MASK_CAUSAL &&
       (spec.query_start < 0 ||
        spec.query_start + spec.query_tokens > spec.key_tokens)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -115,7 +125,9 @@ void validate_bindings(const Spec& spec,
       ((bindings.scale == 1.0F / std::sqrt(static_cast<float>(spec.head_dim))) !=
        (spec.scale_is_default != 0)) ||
       ((spec.semantic == APXINF_ATTENTION_SEMANTIC_SEGMENTED) !=
-       (bindings.offsets != nullptr))) {
+       (bindings.offsets != nullptr)) ||
+      ((spec.dynamic_decode != 0) !=
+       (bindings.decode_meta != nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Attention bindings");
   }
@@ -123,6 +135,12 @@ void validate_bindings(const Spec& spec,
       reinterpret_cast<uintptr_t>(bindings.offsets) % spec.offsets_alignment != 0) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "Attention offsets pointer contradicts recorded alignment");
+  }
+  if (bindings.decode_meta != nullptr &&
+      reinterpret_cast<uintptr_t>(bindings.decode_meta) % alignof(uint32_t) !=
+          0) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "Attention decode metadata is not uint32-aligned");
   }
   for (const auto [pointer, alignment] : {
            std::pair{bindings.query, spec.q_alignment},

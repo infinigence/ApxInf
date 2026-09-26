@@ -18,7 +18,7 @@ pub(crate) use gemm::gemm_execution as execution;
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use attention::{
     attention, kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask,
-    AttentionPolicy, KvCacheAttentionArgs, SegmentedAttentionArgs,
+    AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
 };
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_geglu, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,

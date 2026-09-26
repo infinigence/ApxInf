@@ -10,7 +10,7 @@ pub use context::CudaContext;
 pub use graph::{capture, CapturedGraph};
 pub use ops::{
     attention, kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask,
-    AttentionPolicy, ExecutionSession, GraphWorkspace, KvCacheAttentionArgs,
+    AttentionPolicy, ExecutionSession, GraphWorkspace, KvCacheAttentionArgs, KvCacheDecodeMeta,
     SegmentedAttentionArgs,
 };
 pub use stream::CudaStream;

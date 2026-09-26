@@ -93,10 +93,11 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Item | Contract |
 | --- | --- |
 | Rust API | `ops::kv_cache_attention(ctx, KvCacheAttentionArgs)` |
-| Inputs | `Q=[B,Tq,Hq,D]`, `K_cache/V_cache=[B,key_capacity,Hkv,D]`; all share F16 or BF16 dtype; mask is `None` or `Causal` |
+| Inputs | `Q=[B,Tq,Hq,D]`, `K_cache/V_cache=[B,key_capacity,Hkv,D]`; all share F16 or BF16 dtype; mask is `None` or `Causal`; one model-owned `KvCacheDecodeMeta` supplies `[valid_key_tokens, query_start]` from a fixed device-visible address |
 | Output | `Y=[B,Tq,Hq,D]`, with the same dtype as the inputs |
 | Mathematical semantic | scaled dot-product attention from the query to the first `valid_key_tokens` rows of the cache |
 | Constraints | `0<valid_key_tokens<=key_capacity`; when causal, token i is at `query_start+i`, and `query_start+Tq<=valid_key_tokens` is required |
+| Graph/tuning identity | For dynamic decode, `key_tokens` in the Spec equals fixed `key_capacity`; exact valid length and query position live only in `decode_meta`, so one execution and graph cover all positions within capacity |
 | Reference test | `kv_cache_attention_all_candidates_match_reference` |
 
 <!-- l3-operator:segmented_attention -->
