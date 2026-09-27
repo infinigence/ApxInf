@@ -567,6 +567,7 @@ impl BackboneBf16 {
         x: Tensor,
         layer_idx: usize,
         seq: usize,
+        graph_parity: Option<usize>,
     ) -> Result<Tensor> {
         let cuda = Arc::clone(&self.cuda);
         let ctx = cuda.context();
@@ -620,7 +621,13 @@ impl BackboneBf16 {
                 flip,
                 ..
             } => {
-                if *flip {
+                let parity = graph_parity.unwrap_or(usize::from(*flip));
+                if parity > 1 {
+                    return Err(Error::Other(format!(
+                        "qwen_drive: invalid GDN graph parity {parity}"
+                    )));
+                }
+                if parity == 1 {
                     (conv_state_b.clone(), conv_state_a.clone())
                 } else {
                     (conv_state_a.clone(), conv_state_b.clone())
@@ -641,8 +648,10 @@ impl BackboneBf16 {
             &state_next,
             kernel,
         )?;
-        if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer_idx] {
-            *flip = !*flip;
+        if graph_parity.is_none() {
+            if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer_idx] {
+                *flip = !*flip;
+            }
         }
         if layer_idx == 0 && seq > 1 {
             trace_rows("text0_conv_silu", &conv_out)?;
@@ -993,8 +1002,8 @@ impl BackboneBf16 {
                         decode: seq == 1 && state.cache_len > 0,
                         decode_step: state.decode_step.unwrap_or(0),
                     };
-                    let (output, replayed) = execution.run(&request, hidden, &mut |x| {
-                        self.forward_gdn_eager(state, x, layer, seq)
+                    let (output, replayed) = execution.run(&request, hidden, &mut |x, parity| {
+                        self.forward_gdn_eager(state, x, layer, seq, parity)
                     })?;
                     if replayed {
                         if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer] {

@@ -13,13 +13,14 @@ pub(crate) struct GdnRequest<'a> {
     pub decode_step: usize,
 }
 /// Execute the supplied computation eagerly or replay its captured kernels.
-/// The bool reports replay without running the host body, so Blocks advances
-/// its own double-buffer parity exactly once.
+/// `Some(parity)` asks the eager body to bind a graph to an explicit GDN state
+/// pair without advancing host state. The bool reports a successful replay, so
+/// Blocks advances its own double-buffer parity exactly once.
 pub(crate) trait GdnExecution {
     fn run(
         &mut self,
         request: &GdnRequest<'_>,
         input: Tensor,
-        eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
+        eager: &mut dyn FnMut(Tensor, Option<usize>) -> Result<Tensor>,
     ) -> Result<(Tensor, bool)>;
 }
