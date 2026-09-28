@@ -1010,7 +1010,7 @@ __global__ void gqa_qkv_mrope_cache_kernel(
   v_cache[destination_base + half_dim + pair] = __float2bfloat16(second);
 }
 
-template <typename Input>
+template <typename Input, bool kSkipV = false>
 __global__ void vision_qkv_rope_kernel(
     const Input* qkv, const __nv_bfloat16* bias,
     const uint32_t* position_ids, __nv_bfloat16* q,
@@ -1073,11 +1073,13 @@ __global__ void vision_qkv_rope_kernel(
         __float2bfloat16(first * sine + second * cosine);
   }
 
-  for (int col = threadIdx.x; col < projection_width; col += blockDim.x) {
-    const int source = token * fused_width + 2 * projection_width + col;
-    float value = qkv_input_as_bf16(qkv[source]);
-    if (bias != nullptr) value += __bfloat162float(bias[2 * projection_width + col]);
-    v[token * projection_width + col] = __float2bfloat16(value);
+  if constexpr (!kSkipV) {
+    for (int col = threadIdx.x; col < projection_width; col += blockDim.x) {
+      const int source = token * fused_width + 2 * projection_width + col;
+      float value = qkv_input_as_bf16(qkv[source]);
+      if (bias != nullptr) value += __bfloat162float(bias[2 * projection_width + col]);
+      v[token * projection_width + col] = __float2bfloat16(value);
+    }
   }
 }
 
@@ -1128,5 +1130,67 @@ __global__ void adaln_gate_residual_rms_bf16_kernel(
         __float2bfloat16(1.0f + __bfloat162float(scale[i])));
     const float scaled = __bfloat162float(__float2bfloat16(normed * multiplier));
     out[base + i] = __float2bfloat16(scaled + __bfloat162float(shift[i]));
+  }
+}
+
+__global__ __launch_bounds__(256)
+void bias_residual_layer_norm_bf16_carry_1024_load_ahead_kernel(
+    const __nv_bfloat16* projection,
+    const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual,
+    const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias,
+    __nv_bfloat16* __restrict__ hidden,
+    __nv_bfloat16* __restrict__ normalized,
+    int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * 1024;
+  float projection_values[4];
+  float residual_values[4];
+  float rounded_values[4];
+
+  // Only changed schedule: issue all eight global input loads before the
+  // first hidden store. The non-alias contract allows the compiler to retain
+  // this ordering; SASS inspection is required before claiming it happened.
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int64_t index = base + threadIdx.x + i * 256;
+    projection_values[i] = __bfloat162float(projection[index]);
+    residual_values[i] = __bfloat162float(residual[index]);
+  }
+
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * 256;
+    const int64_t index = base + col;
+    float value = projection_values[i] + residual_values[i];
+    if (projection_bias != nullptr)
+      value += __bfloat162float(projection_bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[index] = rounded;
+    rounded_values[i] = __bfloat162float(rounded);
+    sum += rounded_values[i];
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float centered = rounded_values[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * 256;
+    const int64_t index = base + col;
+    const float value =
+        (rounded_values[i] - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]);
+    normalized[index] = __float2bfloat16(value);
   }
 }

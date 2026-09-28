@@ -1,5 +1,6 @@
 //! BF16 is the only maintained computation variant.
 pub(crate) mod bf16;
+pub(crate) mod direct;
 use crate::qwen_drive::backend::RuntimeBackend;
 use apxinf_core::{Result, Tensor};
 use std::sync::Arc;
@@ -22,10 +23,4 @@ pub(crate) trait GdnExecution {
         input: Tensor,
         eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
     ) -> Result<(Tensor, bool)>;
-}
-/// Execute one phase of a whole-model direct plan. The runner may reuse a
-/// workspace between these sequential computations, so cross-phase values are
-/// in persistent storage before the callback returns.
-pub(crate) trait DirectExecution {
-    fn run(&mut self, operation: &mut dyn FnMut() -> Result<Tensor>) -> Result<Tensor>;
 }

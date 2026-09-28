@@ -2,3 +2,6 @@
 crates/apxinf-cuda/kernels/cutlass/fmha/** whitespace=-trailing-space,-space-before-tab
 crates/apxinf-cuda/kernels/cutlass/include/** whitespace=-trailing-space,-space-before-tab
 crates/apxinf-cuda/kernels/cutlass/tools/** whitespace=-trailing-space,-space-before-tab
+
+# Unified patches encode empty context lines as a single space.
+crates/apxinf-cuda/aot/patches/*.patch whitespace=-blank-at-eol

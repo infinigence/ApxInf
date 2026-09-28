@@ -1,8 +1,8 @@
 //! Planning computation: multimodal prefix, optional reasoning, then flow sampling.
 //! The caller owns backbone state and chooses how GDN blocks execute.
 use super::blocks::bf16::{expert, upload_u32, BackboneBf16, BackboneState, PlannerBf16};
-use super::blocks::{DirectExecution, GdnExecution};
-use super::{DirectInputs, PlanningState, VisionState};
+use super::blocks::GdnExecution;
+use super::{PlanningState, VisionState};
 use crate::qwen_drive::backend::kernels::linear_attention;
 use crate::qwen_drive::inputs::ExpertConditioning;
 use apxinf_core::{
@@ -18,6 +18,12 @@ pub(crate) struct ReasoningInput<'a> {
 }
 pub(crate) struct PlanningInput<'a> {
     pub token_ids: &'a [u32],
+    /// Unmasked tokens in `token_ids`. Equal to `token_ids.len()` for an unpadded
+    /// prompt, smaller when the caller padded to a fixed width to keep the
+    /// shape-specialised kernels reachable. Everything semantic — the expert's
+    /// scene extent, the planner KV offset, the attention key count — uses this;
+    /// buffer shapes use `token_ids.len()`.
+    pub prompt_len: usize,
     pub pixels: &'a Tensor,
     pub grids: &'a [[u32; 3]],
     pub conditioning: &'a ExpertConditioning,
@@ -70,17 +76,19 @@ impl QwenDriveModel {
         state: &mut PlanningState,
         vision: &VisionState,
         token_ids: &[u32],
+        prompt_len: usize,
         pixels: &Tensor,
         grids: &[[u32; 3]],
         cond: ExpertConditioning,
         steps: usize,
-    ) -> Result<DirectInputs> {
-        DirectInputs::new(
+    ) -> Result<super::blocks::direct::DirectInputs> {
+        super::blocks::direct::DirectInputs::new(
             &self.backbone,
             &self.planner,
             state,
             vision,
             token_ids,
+            prompt_len,
             pixels,
             grids,
             cond,
@@ -89,9 +97,9 @@ impl QwenDriveModel {
     }
     pub(crate) fn forward_direct(
         &self,
-        inputs: &DirectInputs,
+        inputs: &super::blocks::direct::DirectInputs,
         state: &mut PlanningState,
-        execution: &mut dyn DirectExecution,
+        execution: &mut dyn super::blocks::direct::DirectExecution,
     ) -> Result<Tensor> {
         inputs.forward(&self.backbone, &self.planner, state, execution)
     }
@@ -153,13 +161,18 @@ impl QwenDriveModel {
             }
             prompt_anchor + closed.len() as i64
         } else {
-            state.last_position
+            let positions = b.rope_index(input.token_ids, input.grids)?;
+            *positions[input.prompt_len - 1].iter().max().unwrap() as i64
         };
         // Direct planning and turn completion need caches, not language logits.
         let scene = b.scene_caches(state)?;
         let expert_input = expert::ExpertPlan {
             scene: &scene,
-            scene_len: state.cache_len,
+            scene_len: if input.reasoning.is_some() {
+                state.cache_len
+            } else {
+                input.prompt_len
+            },
             anchor,
             cond: input.conditioning,
             noise: input.noise,

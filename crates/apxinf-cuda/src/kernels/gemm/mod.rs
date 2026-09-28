@@ -2,6 +2,8 @@ mod bf16;
 mod fp8;
 mod plan;
 mod providers;
+mod swiglu;
+pub use swiglu::bf16_swiglu_checkpoint;
 mod w8a8;
 
 use std::cell::RefCell;
@@ -79,10 +81,134 @@ pub fn bf16_addmv(
     Ok(output)
 }
 
+/// BF16 `input @ weight.T + bias` for checkpoint-row-major weight `[N,K]`.
+/// Inputs are `[M,K]` and `[N]`; output is `[M,N]`. Bias is broadcast into
+/// an FP32 accumulator, with one final BF16 rounding after the GEMM.
+/// All work uses the context stream and workspace-backed device buffers.
+pub fn bf16_addmm_checkpoint(
+    ctx: &CudaContext,
+    weight: &Tensor,
+    input: &Tensor,
+    bias: &Tensor,
+) -> Result<Tensor> {
+    let w = weight.shape().dims();
+    let x = input.shape().dims();
+    if w.len() != 2
+        || x.len() != 2
+        || w.contains(&0)
+        || x.contains(&0)
+        || x[1] != w[1]
+        || bias.shape().dims() != [w[0]]
+    {
+        return Err(Error::Other(
+            "BF16 checkpoint addmm expects weight[N,K], input[M,K], bias[N]".into(),
+        ));
+    }
+    for tensor in [weight, input, bias] {
+        if tensor.dtype() != DType::BF16 || tensor.device() != Device::Cuda(ctx.device_id()) {
+            return Err(Error::Other(
+                "BF16 checkpoint addmm requires BF16 inputs on the context device".into(),
+            ));
+        }
+    }
+    let m = i32::try_from(x[0]).map_err(|_| Error::Other("addmm row count overflow".into()))?;
+    let n = i32::try_from(w[0]).map_err(|_| Error::Other("addmm output width overflow".into()))?;
+    let k = i32::try_from(w[1]).map_err(|_| Error::Other("addmm input width overflow".into()))?;
+    let weight_bytes = checked_bytes(DType::BF16, w, "BF16 checkpoint addmm weight")?;
+    let input_bytes = checked_bytes(DType::BF16, x, "BF16 checkpoint addmm input")?;
+    let bias_bytes = checked_bytes(DType::BF16, &[w[0]], "BF16 checkpoint addmm bias")?;
+    let shape = [x[0], w[0]];
+    let accumulator_bytes = checked_bytes(DType::F32, &shape, "BF16 addmm accumulator")?;
+    let output_bytes = checked_bytes(DType::BF16, &shape, "BF16 addmm output")?;
+    // The existing cast launch adapter narrows ceil(elements / 256) to int
+    // before clamping its grid. Reject an extent which cannot represent that.
+    let elements = accumulator_bytes / DType::F32.size_in_bytes();
+    i32::try_from((elements - 1) / 256 + 1)
+        .map_err(|_| Error::Other("addmm output exceeds cast launch extent".into()))?;
+    let wp = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
+    let xp = CudaBuffer::from_tensor(input).map_err(Error::Cuda)?;
+    let bp = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "BF16 checkpoint addmm",
+        &[
+            ("weight", &wp, weight_bytes),
+            ("input", &xp, input_bytes),
+            ("bias", &bp, bias_bytes),
+        ],
+    )?;
+    let accumulator = crate::workspace::output_buffer(ctx, accumulator_bytes)?
+        .into_tensor(apxinf_core::Shape::new(shape.to_vec()), DType::F32);
+    let cp = CudaBuffer::from_tensor(&accumulator).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "BF16 checkpoint addmm",
+        &[("accumulator", &cp, accumulator_bytes)],
+    )?;
+    unsafe {
+        crate::ffi::check_cuda(crate::ffi::apxinf_static_broadcast_bf16_f32_rows(
+            bp.ptr(),
+            cp.ptr(),
+            m,
+            n,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    ctx.cublas()
+        .gemm_bf16_f32_ex(
+            CublasTranspose::None,
+            CublasTranspose::Transpose,
+            x[0],
+            w[0],
+            w[1],
+            1.0,
+            &xp,
+            k,
+            &wp,
+            k,
+            1.0,
+            &cp,
+            n,
+        )
+        .map_err(Error::Cuda)?;
+    let output = crate::workspace::output_buffer(ctx, output_bytes)?
+        .into_tensor(apxinf_core::Shape::new(shape.to_vec()), DType::BF16);
+    let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "BF16 checkpoint addmm",
+        &[("output", &output_buffer, output_bytes)],
+    )?;
+    super::linear_attention::cast_f32_to_bf16(ctx, &accumulator, &output)?;
+    Ok(output)
+}
+
 /// BF16 linear projection with bias added before the final BF16 output rounding.
 /// Uses the bias epilogue's default legal cuBLASLt heuristic, separate from
 /// plain-GEMM tactics whose epilogue contract does not include a bias.
 pub fn bf16_bias(ctx: &CudaContext, x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    bf16_bias_epilogue(ctx, x, weight, bias, false)
+}
+
+/// BF16 projection with FP32 accumulation, bias, and tanh GELU before the
+/// final BF16 rounding. This omits the standalone projection's BF16 boundary.
+pub fn bf16_bias_gelu_tanh(
+    ctx: &CudaContext,
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+) -> Result<Tensor> {
+    bf16_bias_epilogue(ctx, x, weight, bias, true)
+}
+
+fn bf16_bias_epilogue(
+    ctx: &CudaContext,
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    gelu: bool,
+) -> Result<Tensor> {
     let a = x.shape().dims();
     let b = weight.shape().dims();
     if a.len() != 2 || b.len() != 2 || a[1] != b[0] || bias.shape().dims() != [b[1]] {
@@ -109,17 +235,42 @@ pub fn bf16_bias(ctx: &CudaContext, x: &Tensor, weight: &Tensor, bias: &Tensor) 
     let xp = CudaBuffer::from_tensor(x).map_err(Error::Cuda)?;
     let wp = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     let bp = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "BF16 biased GEMM",
+        &[
+            (
+                "input",
+                &xp,
+                checked_bytes(DType::BF16, a, "biased GEMM input")?,
+            ),
+            (
+                "weight",
+                &wp,
+                checked_bytes(DType::BF16, b, "biased GEMM weight")?,
+            ),
+            (
+                "bias",
+                &bp,
+                checked_bytes(DType::BF16, &[b[1]], "biased GEMM bias")?,
+            ),
+        ],
+    )?;
+    let prepare = if gelu {
+        crate::ffi::apxinf_static_prepare_bf16_gemm_bias_gelu
+    } else {
+        crate::ffi::apxinf_static_prepare_bf16_gemm_bias
+    };
+    let execute = if gelu {
+        crate::ffi::apxinf_static_bf16_gemm_bias_gelu
+    } else {
+        crate::ffi::apxinf_static_bf16_gemm_bias
+    };
     unsafe {
         if crate::workspace::may_prepare_native_resources() {
-            crate::ffi::check_cublas(crate::ffi::apxinf_static_prepare_bf16_gemm_bias(
-                m,
-                n,
-                k,
-                bp.ptr(),
-            ))
-            .map_err(Error::Cuda)?;
+            crate::ffi::check_cublas(prepare(m, n, k, bp.ptr())).map_err(Error::Cuda)?;
         }
-        crate::ffi::check_cublas(crate::ffi::apxinf_static_bf16_gemm_bias(
+        crate::ffi::check_cublas(execute(
             xp.ptr(),
             wp.ptr(),
             bp.ptr(),
@@ -419,6 +570,72 @@ mod contract_tests {
 mod addmv_graph_tests {
     use super::*;
     use half::bf16;
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn addmm_preserves_bias_rounding_and_replays_changed_rows() {
+        let ctx = CudaContext::new(0).unwrap();
+        let (n, k) = (1024, 256);
+        let upload = |shape, values: &[bf16]| {
+            crate::transfers::to_cuda(&Tensor::from_bf16(shape, values).unwrap(), 0).unwrap()
+        };
+        // Cancellation exposes a premature BF16 rounding of the projection.
+        let mut weights = vec![bf16::from_f32(1.0 / 4096.0); n * k];
+        for row in 0..n {
+            weights[row * k] = bf16::ONE;
+        }
+        let weight = upload(vec![n, k], &weights);
+        let bias = upload(vec![n], &vec![bf16::from_f32(-1.0); n]);
+        for m in [1, 10] {
+            let values: Vec<_> = (0..m)
+                .flat_map(|row| std::iter::repeat_n(bf16::from_f32((row + 1) as f32), k))
+                .collect();
+            let input = upload(vec![m, k], &values);
+            let expected = |bias: f32, multiplier: f32| -> Vec<f32> {
+                (0..m)
+                    .flat_map(|row| {
+                        let dot = (row + 1) as f32 * multiplier * (1.0 + (k - 1) as f32 / 4096.0);
+                        std::iter::repeat_n(bf16::from_f32(dot + bias).to_f32(), n)
+                    })
+                    .collect()
+            };
+            let workspace = crate::workspace::GraphWorkspace::new(1024 * 1024, 0).unwrap();
+            let invoke = || bf16_addmm_checkpoint(&ctx, &weight, &input, &bias);
+            let eager = crate::workspace::prepare_with_workspace(&workspace, invoke).unwrap();
+            ctx.synchronize().unwrap();
+            let read = |tensor: &Tensor| {
+                crate::transfers::to_cpu(tensor)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap()
+            };
+            assert_eq!(read(&eager), expected(-1.0, 1.0));
+            crate::graph::begin(&ctx, crate::graph::CaptureMode::ThreadLocal).unwrap();
+            let result = crate::workspace::with_workspace(&workspace, invoke);
+            if result.is_err() {
+                crate::graph::abort(&ctx);
+            }
+            let output = result.unwrap();
+            let graph = crate::graph::end(&ctx).unwrap();
+            for _ in 0..3 {
+                graph.replay().unwrap();
+                ctx.synchronize().unwrap();
+                assert_eq!(read(&output), expected(-1.0, 1.0));
+            }
+            let changed: Vec<_> = values
+                .iter()
+                .map(|v| bf16::from_f32(v.to_f32() * 2.0))
+                .collect();
+            crate::transfers::copy_cpu_to_cuda(
+                &Tensor::from_bf16(vec![m, k], &changed).unwrap(),
+                &input,
+            )
+            .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(read(&output), expected(-1.0, 2.0));
+        }
+    }
 
     #[test]
     #[ignore = "requires a CUDA device"]

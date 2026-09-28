@@ -2,3 +2,5 @@
 mod prepare;
 mod runner;
 pub use runner::QwenDriveModelRunner;
+
+mod direct;

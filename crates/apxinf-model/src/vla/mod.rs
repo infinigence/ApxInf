@@ -78,6 +78,20 @@ pub struct ReasoningOptions {
 pub struct PlanningOptions {
     pub num_steps: Option<usize>,
     pub reasoning: Option<ReasoningOptions>,
+    /// Caller-selected source, first-stage and final RGB geometry. The policy
+    /// still decides whether each resize is needed; the runtime only executes
+    /// the Pillow-12.3 integer operator on this declared representation.
+    pub raw_rgb_resize: Option<Vec<RawRgbResizeFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RawRgbResizeFrame {
+    pub source_width: u32,
+    pub source_height: u32,
+    pub stage_width: u32,
+    pub stage_height: u32,
+    pub final_width: u32,
+    pub final_height: u32,
 }
 
 /// Optional typed metadata emitted by preprocessors for VLA families whose

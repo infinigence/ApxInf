@@ -21,6 +21,7 @@ namespace {
 #include "../kernels/custom/reduction.cuh"
 #include "../kernels/custom/quantization.cuh"
 #include "../kernels/custom/preprocess.cuh"
+#include "../kernels/custom/pillow_bicubic_u8.cuh"
 #include "../kernels/custom/attention.cuh"
 #include "../kernels/custom/normalization.cuh"
 #include "../kernels/custom/activation.cuh"
@@ -925,6 +926,18 @@ extern "C" cudaError_t apxinf_static_cast_bf16_f32(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_broadcast_bf16_f32_rows(
+    const void* bias, void* output, int rows, int cols, cudaStream_t stream) {
+  if (bias == nullptr || output == nullptr || rows <= 0 || cols <= 0)
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  const int64_t requested_blocks = (count + 255) / 256;
+  const int blocks = static_cast<int>(requested_blocks > 4096 ? 4096 : requested_blocks);
+  broadcast_bf16_f32_rows_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(bias), static_cast<float*>(output), count, cols);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_causal_conv1d_silu_bf16(
     const void* x, const void* weight, const void* state, void* out,
     void* new_state, int channels, int seq, int kernel_size,
@@ -1481,6 +1494,23 @@ extern "C" cudaError_t apxinf_static_full_attn_prepare_bf16(
       !(eps > 0.0f)) {
     return cudaErrorInvalidValue;
   }
+  // Opt-in only for the measured D256 BF16 prefill geometry. Keep the
+  // original C ABI and generic route for all other inputs and decode.
+  if (seq > 1 && q_heads == 16 && kv_heads == 4 && head_dim == 256 &&
+      rotary_dim == 64 && fused_width == 10240 && cache_width == 1024) {
+    full_attn_prepare_bf16_warp_kernel
+        <<<dim3(seq, 6), 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(fused),
+        static_cast<const __nv_bfloat16*>(q_norm_w),
+        static_cast<const __nv_bfloat16*>(k_norm_w),
+        static_cast<const __nv_bfloat16*>(cos),
+        static_cast<const __nv_bfloat16*>(sin),
+        static_cast<__nv_bfloat16*>(q_out),
+        static_cast<__nv_bfloat16*>(k_cache),
+        static_cast<__nv_bfloat16*>(v_cache),
+        cache_offset, q_heads, kv_heads, fused_width, cache_width, eps);
+    return cudaGetLastError();
+  }
   const size_t smem = static_cast<size_t>(head_dim) * sizeof(float);
   full_attn_prepare_bf16_kernel
       <<<dim3(seq, q_heads + 2 * kv_heads), 128, smem, stream>>>(
@@ -1503,6 +1533,24 @@ extern "C" cudaError_t apxinf_static_sigmoid_gate_mul_bf16(
   if (attn == nullptr || fused == nullptr || rows <= 0 || heads <= 0 ||
       head_dim <= 0) {
     return cudaErrorInvalidValue;
+  }
+  // Vector BF16 route for D256 prefill. Inputs must be aligned and disjoint
+  // because the vector kernel promises restrict; retain the generic fallback.
+  if (rows > 1 && rows <= 65536 && heads == 16 && head_dim == 256 &&
+      fused_width == 10240) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(attn);
+    const uintptr_t f = reinterpret_cast<uintptr_t>(fused);
+    const uint64_t a_bytes = static_cast<uint64_t>(rows) * 4096 * 2;
+    const uint64_t f_bytes = static_cast<uint64_t>(rows) * 10240 * 2;
+    const bool aligned = ((a | f) & 15U) == 0;
+    const bool no_overflow = a <= UINTPTR_MAX - a_bytes && f <= UINTPTR_MAX - f_bytes;
+    const bool disjoint = no_overflow && (a + a_bytes <= f || f + f_bytes <= a);
+    if (aligned && disjoint) {
+      sigmoid_gate_mul_bf16_vec8_kernel<<<rows * 2, 256, 0, stream>>>(
+          static_cast<__nv_bfloat16*>(attn),
+          static_cast<const __nv_bfloat16*>(fused), rows);
+      return cudaGetLastError();
+    }
   }
   sigmoid_gate_mul_bf16_kernel<<<rows, 256, 0, stream>>>(
       static_cast<__nv_bfloat16*>(attn),
@@ -1828,5 +1876,40 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_qk_bf16(
           static_cast<const __nv_bfloat16*>(kcd_in),
           static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
           seq, seq_pad, total_chunks, out_row_width, scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(
+    const void* rgb, void* patches, const void* lut, int grid_h, int grid_w,
+    cudaStream_t stream) {
+  if (!rgb || !patches || !lut || grid_h <= 0 || grid_w <= 0 ||
+      (grid_h & 1) || (grid_w & 1) ||
+      static_cast<int64_t>(grid_h) * grid_w > std::numeric_limits<int>::max())
+    return cudaErrorInvalidValue;
+  rgb_u8_to_temporal2_merge2_rect_bf16_kernel<<<grid_h * grid_w, 256, 0, stream>>>(
+      static_cast<const uint8_t*>(rgb), static_cast<uint16_t*>(patches),
+      static_cast<const uint16_t*>(lut), grid_h, grid_w);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_pillow_bicubic_u8_axis(
+    const void* input, void* output, const void* input_offsets,
+    const void* output_offsets, const void* bounds, const void* weights,
+    int ksize, int in_w, int in_h, int out_w, int out_h,
+    int batch, bool horizontal, cudaStream_t stream) {
+  if (!input || !output || !input_offsets || !output_offsets || !bounds || !weights ||
+      ksize <= 0 || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0 ||
+      batch <= 0 || batch > 65535 ||
+      static_cast<int64_t>(out_w) * out_h > std::numeric_limits<int>::max())
+    return cudaErrorInvalidValue;
+  const int64_t output_pixels = static_cast<int64_t>(out_w) * out_h;
+  const int64_t blocks = (output_pixels + 255) / 256;
+  if (blocks > std::numeric_limits<int>::max()) return cudaErrorInvalidValue;
+  pillow_bicubic_u8_axis_kernel<<<dim3(static_cast<unsigned int>(blocks), batch), 256, 0, stream>>>(
+      static_cast<const uint8_t*>(input), static_cast<uint8_t*>(output),
+      static_cast<const int64_t*>(input_offsets),
+      static_cast<const int64_t*>(output_offsets),
+      static_cast<const int32_t*>(bounds), static_cast<const int32_t*>(weights),
+      ksize, in_w, in_h, out_w, out_h, horizontal);
   return cudaGetLastError();
 }

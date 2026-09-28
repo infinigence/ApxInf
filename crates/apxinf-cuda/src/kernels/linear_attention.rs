@@ -19,6 +19,123 @@ use crate::ffi;
 use crate::kernels::gdn_policy::{wmma, GdnLaunchPolicy};
 use crate::workspace::output_buffer;
 
+/// Fused first-prefill causal convolution and gated delta-rule scan.
+/// Returns no implementation for unsupported geometry or device, before any
+/// allocation. Stateful continuation uses the recurrent operators instead.
+#[allow(clippy::too_many_arguments)]
+pub fn try_causal_conv_gdn_prefill_bf16(
+    ctx: &CudaContext,
+    zba: &Tensor,
+    conv_weight: &Tensor,
+    new_conv_state: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    final_state: &CudaBuffer,
+    geometry: [usize; 4],
+) -> Result<Option<Tensor>> {
+    if !cfg!(apxinf_aot_sm110)
+        || ctx.caps().sm != 110
+        || ctx.caps().multiprocessor_count != 20
+        || geometry != [16, 32, 128, 128]
+        || zba.shape().dims() != [3387, 12352]
+        || conv_weight.shape().dims() != [8192, 4]
+    {
+        return Ok(None);
+    }
+    #[cfg(apxinf_aot_sm110)]
+    {
+        if new_conv_state.shape().dims() != [8192, 4]
+            || a_log.shape().dims() != [32]
+            || a_log.dtype() != DType::F32
+            || dt_bias.shape().dims() != [32]
+        {
+            return Err(Error::Other(
+                "fused GDN prefill state/weight contract mismatch".into(),
+            ));
+        }
+        for tensor in [zba, conv_weight, new_conv_state, dt_bias] {
+            expect_bf16(tensor, "fused GDN prefill")?;
+        }
+        let z = CudaBuffer::from_tensor(zba).map_err(Error::Cuda)?;
+        let weight = CudaBuffer::from_tensor(conv_weight).map_err(Error::Cuda)?;
+        let conv_state = CudaBuffer::from_tensor(new_conv_state).map_err(Error::Cuda)?;
+        let log = CudaBuffer::from_tensor(a_log).map_err(Error::Cuda)?;
+        let bias = CudaBuffer::from_tensor(dt_bias).map_err(Error::Cuda)?;
+        require_buffers(
+            ctx,
+            "fused GDN prefill",
+            &[
+                ("zba", &z, 3387 * 12352 * 2),
+                ("conv_weight", &weight, 8192 * 4 * 2),
+                ("conv_state", &conv_state, 8192 * 4 * 2),
+                ("a_log", &log, 32 * 4),
+                ("dt_bias", &bias, 32 * 2),
+                ("final_state", final_state, 32 * 128 * 128 * 4),
+            ],
+        )?;
+        if crate::workspace::may_prepare_native_resources() {
+            let status = unsafe { ffi::apxinf_static_gdn_flashinfer64_init() };
+            if status != 0 {
+                return Err(Error::Other(format!(
+                    "fused GDN AOT prepare failed: {status}"
+                )));
+            }
+        }
+        const PAD: usize = 3392;
+        let scratch = output_buffer(ctx, 2 * PAD * 32 * 4 + 10240)?;
+        if scratch.ptr() as usize & 255 != 0 {
+            return Err(Error::Other(
+                "fused GDN scratch requires 256-byte alignment".into(),
+            ));
+        }
+        let q = output_buffer(ctx, PAD * 16 * 128 * 2)?;
+        let k = output_buffer(ctx, PAD * 16 * 128 * 2)?;
+        let v = output_buffer(ctx, PAD * 32 * 128 * 2)?;
+        let a = output_buffer(ctx, PAD * 32 * 2)?;
+        let b = output_buffer(ctx, PAD * 32 * 2)?;
+        let state = output_buffer(ctx, 32 * 128 * 128 * 4)?;
+        let output = output_buffer(ctx, PAD * 32 * 128 * 2)?;
+        let offsets = output_buffer(ctx, 2 * 4)?;
+        let status = unsafe {
+            ffi::apxinf_static_gdn_flashinfer64_prefill_compact_v(
+                z.ptr(),
+                weight.ptr(),
+                conv_state.ptr(),
+                log.ptr(),
+                bias.ptr(),
+                scratch.ptr(),
+                q.ptr(),
+                k.ptr(),
+                v.ptr(),
+                a.ptr(),
+                b.ptr(),
+                state.ptr(),
+                final_state.ptr(),
+                output.ptr(),
+                offsets.ptr(),
+                3387,
+                PAD as i32,
+                ctx.stream().handle(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Other(format!(
+                "fused GDN AOT enqueue failed: {status}"
+            )));
+        }
+        return output
+            .view(0, 3387 * 4096 * 2)
+            .map_err(Error::Cuda)?
+            .as_tensor(Shape::new(vec![3387, 4096]), DType::BF16)
+            .map(Some)
+            .map_err(Error::Cuda);
+    }
+    #[cfg(not(apxinf_aot_sm110))]
+    let _ = (new_conv_state, a_log, dt_bias, final_state);
+    #[cfg(not(apxinf_aot_sm110))]
+    Ok(None)
+}
+
 fn expect_bf16(tensor: &Tensor, name: &str) -> Result<()> {
     if tensor.dtype() != DType::BF16 {
         return Err(Error::Other(format!(

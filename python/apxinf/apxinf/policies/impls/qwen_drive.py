@@ -278,7 +278,7 @@ class QwenDrivePolicy:
 
     # ------------------------------------------------------------------ preprocessing
 
-    def _patchify(self, image: np.ndarray, target_size, budget: int):
+    def _patchify(self, image: np.ndarray, target_size, budget: int, destination=None):
         """Resize one frame onto the patch grid and flatten it into patches."""
         from PIL import Image
 
@@ -300,8 +300,13 @@ class QwenDrivePolicy:
         if (grid_h, grid_w) != (height, width):
             pil = pil.resize((grid_w, grid_h), resample=Image.BICUBIC)
         pixels = np.asarray(pil, dtype=np.float32)
-        pixels = pixels / 255.0
-        pixels = (pixels - 0.5) / 0.5
+        if destination is None:
+            pixels = pixels / 255.0
+            pixels = (pixels - 0.5) / 0.5
+        else:
+            pixels /= 255.0
+            pixels -= 0.5
+            pixels /= 0.5
         rows = grid_h // self.patch_size
         cols = grid_w // self.patch_size
         merge = self.merge
@@ -319,8 +324,44 @@ class QwenDrivePolicy:
             self.patch_size,
         )
         x = x.transpose(1, 3, 6, 4, 7, 0, 2, 5, 8)
-        patches = np.ascontiguousarray(x.reshape(rows * cols, -1), dtype=np.float32)
+        if destination is None:
+            patches = np.ascontiguousarray(x.reshape(rows * cols, -1), dtype=np.float32)
+        else:
+            if destination.shape != (rows * cols, 3 * self.temporal * self.patch_size**2):
+                raise ValueError("QwenDrivePolicy: patch destination shape mismatch")
+            np.copyto(destination.reshape(x.shape), x)
+            patches = destination
         return patches, (rows, cols)
+
+    def _resized_rgb(self, image: np.ndarray, target_size, budget: int):
+        """Keep both PIL bicubic stages; defer checkpoint tensor conversion to CUDA."""
+        from PIL import Image
+
+        array = np.ascontiguousarray(image, dtype=np.uint8)
+        if array.ndim != 3 or array.shape[2] != 3:
+            raise ValueError(f"QwenDrivePolicy: expected RGB uint8, got {array.shape}")
+        pil = Image.fromarray(array, mode="RGB")
+        max_pixels = budget
+        if target_size is not None:
+            width, height = int(target_size[0]), int(target_size[1])
+            pil = pil.resize((width, height), resample=Image.BICUBIC)
+            max_pixels = self.grid_pixel_limit
+        width, height = pil.size
+        grid_h, grid_w = smart_resize(
+            height, width, self.factor, self.min_pixels, max_pixels
+        )
+        if (grid_h, grid_w) != (height, width):
+            pil = pil.resize((grid_w, grid_h), resample=Image.BICUBIC)
+        rgb = np.ascontiguousarray(np.asarray(pil, dtype=np.uint8))
+        return rgb.reshape(-1), (grid_h // self.patch_size, grid_w // self.patch_size)
+
+    def _resized_rgb_batch(self, items):
+        workers = self._preproc_workers(len(items))
+        if workers < 2:
+            return [self._resized_rgb(*item) for item in items]
+        return list(self._preproc_pool(workers).map(
+            lambda item: self._resized_rgb(*item), items
+        ))
 
     def _patchify_batch(self, items):
         """Patchify several frames, in order, on as many cores as are useful.
@@ -347,6 +388,36 @@ class QwenDrivePolicy:
             return [self._patchify(image, target, budget) for image, target, budget in items]
         pool = self._preproc_pool(workers)
         return list(pool.map(lambda item: self._patchify(*item), items))
+
+    def _patchify_packed(self, items):
+        """Build one contiguous patch batch, preserving frame and pixel order."""
+        if not items:
+            results = self._patchify_batch(items)
+            return (np.ascontiguousarray(np.concatenate([p for p, _ in results], axis=0), dtype=np.float32),
+                    [grid for _, grid in results])
+        grids, offsets = [], [0]
+        for image, target, budget in items:
+            shape = np.asarray(image).shape
+            if len(shape) != 3 or shape[2] != 3:
+                raise ValueError(f"QwenDrivePolicy: expected an RGB uint8 image, got shape {shape}")
+            height, width = shape[:2]
+            if target is not None:
+                width, height = int(target[0]), int(target[1])
+                budget = self.grid_pixel_limit
+            height, width = smart_resize(height, width, self.factor, self.min_pixels, budget)
+            rows, cols = height // self.patch_size, width // self.patch_size
+            grids.append((rows, cols))
+            offsets.append(offsets[-1] + rows * cols)
+        packed = np.empty((offsets[-1], 3 * self.temporal * self.patch_size**2), dtype=np.float32)
+        jobs = [(*item, packed[offsets[i]:offsets[i + 1]]) for i, item in enumerate(items)]
+        workers = self._preproc_workers(len(items))
+        if workers < 2:
+            results = [self._patchify(*job) for job in jobs]
+        else:
+            results = list(self._preproc_pool(workers).map(lambda job: self._patchify(*job), jobs))
+        if [grid for _, grid in results] != grids:
+            raise ValueError("QwenDrivePolicy: patch grid changed during preprocessing")
+        return packed, grids
 
     def _preproc_workers(self, frames: int) -> int:
         override = os.environ.get("APXINF_QWEN_PREPROC_THREADS")
@@ -503,17 +574,85 @@ class QwenDrivePolicy:
     def _infer_planning(self, observation, with_reasoning: bool, noise, started) -> dict:
         views = self._scene_views(observation)
         frames = self._scene_frames(views)
-        patch_list, grids, token_counts = [], [], []
-        for patches, (rows, cols) in self._patchify_batch(
-            [(image, target,
-              self.current_pixels if is_current else self.history_pixels)
-             for image, target, is_current in frames]
-        ):
-            patch_list.append(patches)
-            grids.append([1, rows, cols])
-            token_counts.append(rows * cols // self.merge**2)
-        pixel_values = np.ascontiguousarray(np.concatenate(patch_list, axis=0), dtype=np.float32)
+        jobs = [(image, target,
+                 self.current_pixels if is_current else self.history_pixels)
+                for image, target, is_current in frames]
+        rgb_mode = (not with_reasoning and
+                    self.patch_size == 16 and self.merge == 2 and self.temporal == 2 and
+                    hasattr(self.model_runner, "_infer_resized_rgb"))
+        raw_mode = (rgb_mode and
+                    os.environ.get("APXINF_QWEN_TRACE_DIR") is None)
+        if raw_mode:
+            from PIL import __version__ as pillow_version
+            raw_mode = pillow_version == "12.3.0"
+        raw_resize_frames = None
+        packed_raw = None
+        if raw_mode:
+            raw_values, raw_frames, raw_grids = [], [], []
+            raw_bytes, final_bytes = 0, 0
+            if len(jobs) > 65535:
+                raw_mode = False
+            for image, target, budget in jobs:
+                if not raw_mode:
+                    break
+                raw = np.ascontiguousarray(image, dtype=np.uint8)
+                if raw.ndim != 3 or raw.shape[2] != 3:
+                    raise ValueError(f"QwenDrivePolicy: expected RGB uint8, got {raw.shape}")
+                source_h, source_w = raw.shape[:2]
+                if target is None:
+                    stage_w, stage_h = source_w, source_h
+                else:
+                    stage_w, stage_h = int(target[0]), int(target[1])
+                    budget = self.grid_pixel_limit
+                final_h, final_w = smart_resize(
+                    stage_h, stage_w, self.factor, self.min_pixels, budget)
+                sizes = (source_w, source_h, stage_w, stage_h, final_w, final_h)
+                if any(size <= 0 or size > 8192 for size in sizes) or any(
+                    sizes[i] * sizes[i+1] > 2**31 - 1 for i in (0, 2, 4)
+                ):
+                    raw_mode = False
+                    break
+                raw_bytes += source_w * source_h * 3
+                final_bytes += final_w * final_h * 3
+                if raw_bytes > 512 * 1024**2 or final_bytes > 256 * 1024**2:
+                    raw_mode = False
+                    break
+                raw_values.append(raw.reshape(-1))
+                raw_frames.append(sizes)
+                raw_grids.append((final_h // self.patch_size, final_w // self.patch_size))
+            if raw_mode:
+                use_owned_pack = (
+                    hasattr(self.model_runner, "_pack_rgb_u8_frames")
+                    and hasattr(self.model_runner, "_infer_resized_rgb_packed")
+                )
+                if use_owned_pack:
+                    # The holder snapshots all frames here and is consumed once by native infer.
+                    packed_raw = self.model_runner._pack_rgb_u8_frames(raw_values)
+                    raw_values.clear()
+                    pixel_values = packed_raw
+                else:
+                    pixel_values = np.ascontiguousarray(
+                        np.concatenate(raw_values), dtype=np.uint8
+                    )
+                patch_grids = raw_grids
+                raw_resize_frames = np.ascontiguousarray(raw_frames, dtype=np.uint32)
+        if not raw_mode and rgb_mode:
+            values = self._resized_rgb_batch(jobs)
+            pixel_values = np.ascontiguousarray(
+                np.concatenate([pixels for pixels, _ in values]), dtype=np.uint8
+            )
+            patch_grids = [grid for _, grid in values]
+        elif not raw_mode:
+            pixel_values, patch_grids = self._patchify_packed(jobs)
+        grids = [[1, rows, cols] for rows, cols in patch_grids]
+        token_counts = [rows * cols // self.merge**2 for rows, cols in patch_grids]
         token_ids = self._build_scene_ids(observation, views, token_counts, with_reasoning)
+        attention_mask = np.ones(len(token_ids), dtype=np.uint8)
+        if not with_reasoning:
+            target = 3387
+            if len(token_ids) < target:
+                attention_mask = np.pad(attention_mask, (0, target - len(token_ids)))
+                token_ids = [*token_ids, *([0] * (target - len(token_ids)))]
         history, velocity, acceleration, ego, nav_command = self._conditioning(observation)
         noise_array = self._noise(observation, noise)
         model_started = time.perf_counter()
@@ -531,10 +670,15 @@ class QwenDrivePolicy:
                 max_new_tokens=self.max_new_tokens, min_new_tokens=self.min_new_tokens,
                 terminator_ids=terminators, closing_ids=[self.im_end_id, *self.newline_ids],
             )
-        trajectory = self.model_runner._infer_preprocessed(
+        infer_native = (self.model_runner._infer_resized_rgb_packed if packed_raw is not None
+                        else self.model_runner._infer_resized_rgb if rgb_mode
+                        else self.model_runner._infer_preprocessed)
+        if raw_mode:
+            options["raw_resize_frames"] = raw_resize_frames
+        trajectory = infer_native(
             pixel_values, np.ascontiguousarray(grids, dtype=np.uint32),
             np.ascontiguousarray(token_ids, dtype=np.uint32),
-            np.ones(len(token_ids), dtype=np.uint8), state, None, noise_array,
+            attention_mask, state, None, noise_array,
             **options,
         )
         model_ms = (time.perf_counter() - model_started) * 1000.0

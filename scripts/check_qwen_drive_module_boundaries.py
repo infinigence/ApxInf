@@ -27,8 +27,8 @@ def main():
                 violations.append(f"{path.relative_to(ROOT)}: forbidden dependency for {module}")
             if re.search(r"use\s+crate::qwen_drive::\*", code):
                 violations.append(f"{path.relative_to(ROOT)}: root wildcard hides dependencies")
-    if sorted(p.name for p in (ROOT / "model/blocks").iterdir()) != ["bf16.rs", "mod.rs"]:
-        violations.append("model/blocks: expected one BF16 implementation and its execution seam")
+    if sorted(p.name for p in (ROOT / "model/blocks").iterdir()) != ["bf16.rs", "direct.rs", "mod.rs"]:
+        violations.append("model/blocks: expected one BF16 implementation, direct inputs and execution seams")
     load = source(ROOT / "load.rs")
     if re.search(r"QwenDriveModelRunner\s*\{|\.prepared\b", load):
         violations.append("load.rs: construct ModelRunner through its interface, not its fields")

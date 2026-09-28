@@ -1,0 +1,215 @@
+{
+  "schema": 1,
+  "target": "aarch64-unknown-linux-gnu",
+  "sm": "sm_110",
+  "cuda": "13.2",
+  "cutlass_dsl": "4.7.0",
+  "kernels": [
+    {
+      "id": "gdn-prefill-bf16",
+      "exporter": "export_gdn.py",
+      "symbol": "flashinfer_gdn_bf16_t64_sm110_real3392",
+      "inputs": {
+        "--gdn-src": "gdn_source",
+        "--cutlass-deps": "cutlass_dependencies"
+      },
+      "args": [],
+      "contract": {
+        "dtype": "bf16",
+        "tokens": 3387,
+        "padded_tokens": 3392,
+        "qk_heads": 16,
+        "v_heads": 32,
+        "head_dim": 128,
+        "sm_count": 20,
+        "initial_state": false
+      },
+      "source": {
+        "project": "FlashInfer",
+        "revision": "19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23",
+        "license": "Apache-2.0",
+        "repository": "https://github.com/flashinfer-ai/flashinfer"
+      }
+    },
+    {
+      "id": "language-attention",
+      "exporter": "export_attention_d256.py",
+      "symbol": "apxinf_fa4_d256_l_sm110",
+      "inputs": {
+        "--fa4-src": "fa4_source",
+        "--cutlass-deps": "cutlass_dependencies",
+        "--extra-deps": "extra_dependencies"
+      },
+      "args": [],
+      "contract": {
+        "dtype": "bf16",
+        "q": [
+          1,
+          3387,
+          16,
+          256
+        ],
+        "kv": [
+          1,
+          3387,
+          4,
+          256
+        ],
+        "causal": true
+      },
+      "source": {
+        "project": "FlashAttention",
+        "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
+        "license": "BSD-3-Clause",
+        "repository": "https://github.com/Dao-AILab/flash-attention"
+      }
+    },
+    {
+      "id": "action-attention",
+      "exporter": "export_attention_split.py",
+      "symbol": "apxinf_fa4_d256_a_splitbatch_sm110",
+      "inputs": {
+        "--fa4-src": "fa4_source",
+        "--cutlass-deps": "cutlass_dependencies",
+        "--extra-deps": "extra_dependencies"
+      },
+      "args": [],
+      "contract": {
+        "dtype": "bf16",
+        "q": [
+          2,
+          50,
+          16,
+          256
+        ],
+        "kv": [
+          2,
+          1720,
+          4,
+          256
+        ],
+        "batch_stride": 1718,
+        "valid_k": [
+          1718,
+          "real_len+50-1718"
+        ],
+        "causal": false
+      },
+      "source": {
+        "project": "FlashAttention",
+        "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
+        "license": "BSD-3-Clause",
+        "repository": "https://github.com/Dao-AILab/flash-attention"
+      },
+      "specialization": {
+        "kv": [
+          2,
+          1718,
+          4,
+          256
+        ],
+        "note": "Preserve the accepted compiler specialization; runtime views and masks support the larger padded extent."
+      }
+    },
+    {
+      "id": "gemm-swiglu-bf16",
+      "exporter": "export_swiglu.py",
+      "symbol": "apxinf_quack_swiglu_bf16_m256n256_sm110",
+      "inputs": {
+        "--quack-deps": "quack_dependencies",
+        "--cutlass-deps": "cutlass_dependencies"
+      },
+      "args": [],
+      "contract": {
+        "dtype": "bf16",
+        "input": [
+          3387,
+          2560
+        ],
+        "weight": [
+          18432,
+          2560
+        ],
+        "output": [
+          3387,
+          9216
+        ],
+        "tile": [
+          256,
+          256
+        ],
+        "sm_count": 20
+      },
+      "source": {
+        "project": "Quack",
+        "revision": "0.6.5",
+        "license": "Apache-2.0",
+        "repository": "https://github.com/Dao-AILab/quack"
+      }
+    },
+    {
+      "id": "vision-attention-624",
+      "exporter": "export_attention_fixed.py",
+      "symbol": "apxinf_fa4_vfixed_b3_l624_sm110",
+      "inputs": {
+        "--fa4-src": "fa4_source",
+        "--cutlass-deps": "cutlass_dependencies",
+        "--extra-deps": "extra_dependencies"
+      },
+      "args": [
+        "--length",
+        "624"
+      ],
+      "contract": {
+        "dtype": "bf16",
+        "shape": [
+          3,
+          624,
+          16,
+          64
+        ],
+        "batch_token_stride": 4072,
+        "value_token_stride": 3072,
+        "causal": false
+      },
+      "source": {
+        "project": "FlashAttention",
+        "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
+        "license": "BSD-3-Clause",
+        "repository": "https://github.com/Dao-AILab/flash-attention"
+      }
+    },
+    {
+      "id": "vision-attention-2200",
+      "exporter": "export_attention_fixed.py",
+      "symbol": "apxinf_fa4_vfixed_b3_l2200_sm110",
+      "inputs": {
+        "--fa4-src": "fa4_source",
+        "--cutlass-deps": "cutlass_dependencies",
+        "--extra-deps": "extra_dependencies"
+      },
+      "args": [
+        "--length",
+        "2200"
+      ],
+      "contract": {
+        "dtype": "bf16",
+        "shape": [
+          3,
+          2200,
+          16,
+          64
+        ],
+        "batch_token_stride": 4072,
+        "value_token_stride": 3072,
+        "causal": false
+      },
+      "source": {
+        "project": "FlashAttention",
+        "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
+        "license": "BSD-3-Clause",
+        "repository": "https://github.com/Dao-AILab/flash-attention"
+      }
+    }
+  ]
+}

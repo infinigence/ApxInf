@@ -13,3 +13,6 @@ experiment/
 
 # Local development artifacts (see AGENTS.md)
 /devlocal/
+
+# Offline native operator bundle (produced or downloaded separately).
+/crates/apxinf-cuda/aot/bundle/

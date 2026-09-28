@@ -68,6 +68,16 @@ __global__ void cast_bf16_to_f32_kernel(
   }
 }
 
+// Broadcast a BF16 bias vector to FP32 accumulator rows without rounding.
+__global__ void broadcast_bf16_f32_rows_kernel(
+    const __nv_bfloat16* bias, float* output, int64_t count, int cols) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t i = index; i < count; i += stride) {
+    output[i] = __bfloat162float(bias[i % cols]);
+  }
+}
+
 // depthwise causal conv1d + SiLU
 //
 // x is a strided token-major stream [seq, x_row_stride] whose first `channels`
@@ -1760,4 +1770,88 @@ __global__ void gelu_exact_bf16_kernel(
     const float x = __bfloat162float(input[index]);
     output[index] = __float2bfloat16(x * 0.5f * (1.0f + erff(x * 0.70710678f)));
   }
+}
+
+__global__ void full_attn_prepare_bf16_warp_kernel(
+    const __nv_bfloat16* fused, const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
+    __nv_bfloat16* q_out, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+    int cache_offset, int q_heads, int kv_heads, int64_t fused_width,
+    int64_t cache_width, float eps) {
+  const int token = blockIdx.x;
+  const int slot = blockIdx.y * 4 + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (slot >= q_heads + 2 * kv_heads) return;
+  const int64_t row = static_cast<int64_t>(token) * fused_width;
+  if (slot >= q_heads + kv_heads) {
+    const int head = slot - q_heads - kv_heads;
+    const int64_t src = row + static_cast<int64_t>(q_heads) * 512
+        + static_cast<int64_t>(kv_heads) * 256 + head * 256;
+    __nv_bfloat16* dst = v_cache + static_cast<int64_t>(cache_offset + token) * cache_width
+        + head * 256;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) dst[lane + 32 * j] = fused[src + lane + 32 * j];
+    return;
+  }
+  const bool is_q = slot < q_heads;
+  const int head = is_q ? slot : slot - q_heads;
+  const __nv_bfloat16* norm_w = is_q ? q_norm_w : k_norm_w;
+  const int64_t src = row + (is_q ? static_cast<int64_t>(head) * 512
+      : static_cast<int64_t>(q_heads) * 512 + head * 256);
+  float x[8], partial[4];
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) x[j] = __bfloat162float(fused[src + lane + 32 * j]);
+  // Match the original four virtual warps: each original thread owns d,d+128.
+  #pragma unroll
+  for (int w = 0; w < 4; ++w) partial[w] = x[w] * x[w] + x[w+4] * x[w+4];
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    #pragma unroll
+    for (int w = 0; w < 4; ++w)
+      partial[w] += __shfl_xor_sync(0xffffffff, partial[w], off);
+  }
+  #pragma unroll
+  for (int w = 0; w < 4; ++w)
+    partial[w] = __shfl_sync(0xffffffff, partial[w], 0);
+  // Original CTA's second XOR tree combines lanes 0..3 as (0+2)+(1+3).
+  const float sum = (partial[0] + partial[2]) + (partial[1] + partial[3]);
+  const float rms = rsqrtf(sum / 256.0f + eps);
+  float y[8];
+  #pragma unroll
+  for (int j = 0; j < 8; ++j)
+    y[j] = __bfloat162float(__float2bfloat16(
+        x[j] * rms * (1.0f + __bfloat162float(norm_w[lane + 32*j]))));
+  __nv_bfloat16* dst = is_q
+      ? q_out + (static_cast<int64_t>(token) * q_heads + head) * 256
+      : k_cache + static_cast<int64_t>(cache_offset + token) * cache_width + head * 256;
+  const int64_t table_base = static_cast<int64_t>(token) * 64;
+  const float a = y[0], b = y[1];
+  const float c = __bfloat162float(cos[table_base + lane]);
+  const float s = __bfloat162float(sin[table_base + lane]);
+  const float t1 = __bfloat162float(__float2bfloat16(a * c));
+  const float t2 = __bfloat162float(__float2bfloat16(-b * s));
+  const float t3 = __bfloat162float(__float2bfloat16(b * c));
+  const float t4 = __bfloat162float(__float2bfloat16(a * s));
+  dst[lane] = __float2bfloat16(t1 + t2);
+  dst[32 + lane] = __float2bfloat16(t3 + t4);
+  #pragma unroll
+  for (int j = 2; j < 8; ++j) dst[lane + 32*j] = __float2bfloat16(y[j]);
+}
+
+struct alignas(16) SigmoidGatePack8 { __nv_bfloat16 v[8]; };
+__global__ void sigmoid_gate_mul_bf16_vec8_kernel(__nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ f, int rows) {
+  const int vi=blockIdx.x*256+threadIdx.x;
+  const int row=vi/512;
+  if(row>=rows)return;
+  const int within=(vi%512)*8, head=within/256, d=within%256;
+  SigmoidGatePack8 x=*reinterpret_cast<const SigmoidGatePack8*>(a+static_cast<int64_t>(row)*4096+within);
+  SigmoidGatePack8 gate=*reinterpret_cast<const SigmoidGatePack8*>(f+static_cast<int64_t>(row)*10240+head*512+256+d);
+  #pragma unroll
+  for(int j=0;j<8;++j) {
+    const float g=__bfloat162float(gate.v[j]);
+    const float sg=__bfloat162float(__float2bfloat16(la_sigmoid(g)));
+    x.v[j]=__float2bfloat16(__bfloat162float(x.v[j])*sg);
+  }
+  *reinterpret_cast<SigmoidGatePack8*>(a+static_cast<int64_t>(row)*4096+within)=x;
 }

@@ -8,9 +8,31 @@ per-device decision belongs, and what the constants currently are.
 Planning loads through the shared `AutoModel` registry as a CUDA VLA runtime and
 the planner checkpoint is required; see
 [Qwen-Drive planning runtime](qwen-drive-planning.md) for the loading, request
-and validation contract. Projection layout is
-selected once during model construction and retained with the device weights,
-so weight packing and execution use the same physical representation.
+and validation contract. BF16 gate/up weights retain the checkpoint row-major layout. Other projections
+use the normal packed device representation; there is no experimental layout
+switch.
+
+## SM110 direct planning
+
+The BF16 direct planner pads prompts up to 3387 tokens with a trailing zero
+attention mask. It preserves the real prefix length for action attention and
+prepared graph compatibility. Prompts longer than 3387 are not truncated;
+reasoning planning retains its variable-length path.
+
+On the 20-SM Thor profile, the native operator bundle supplies GDN prefill,
+language attention, masked split action attention, fused SwiGLU GEMM, and two
+fixed vision attention groups. These are selected by hardware and tensor
+contracts. Their offline export and static linking live in
+[`apxinf-cuda/aot`](../crates/apxinf-cuda/aot/README.md).
+
+The direct RGB path transfers owned uint8 frames and performs normalization and
+patch packing on CUDA. Compatible resize geometry with Pillow 12.3.0 also uses
+the CUDA bicubic implementation; other cases retain the CPU preprocessing
+contract. Diagnostic tracing uses the explicit intermediate-tensor path.
+
+The Python policy continues to return actions shaped `[50, 3]`. Padding affects
+internal execution only. A changed logical prompt length invalidates prepared
+graph state because the action KV views and masks must be rebuilt.
 
 ## The fixed workload
 
@@ -136,7 +158,10 @@ Jetson the same build measures several percent apart over an afternoon, and
 comparison has to be alternating rounds of both sides on one machine within
 one run. Two numbers an hour apart are not a comparison.
 
-## Whole-model direct planning on Thor (sm_110)
+## Earlier whole-model graph baseline on Thor (sm_110)
+
+This historical measurement predates the native CuTe operators and prompt
+padding described above; it is not the current revision's acceptance result.
 
 Measured on Thor with clocks and fan pinned (`nvpmodel` MAXN,
 `jetson_clocks --fan`, GPU min=max=1575 MHz, `nvfancontrol` stopped), scene 0

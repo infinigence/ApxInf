@@ -614,24 +614,3 @@ pub(crate) mod tests {
             .contains("not divisible"));
     }
 }
-
-/// Physical layout selected once when constructing BF16 weights and Blocks.
-#[cfg(feature = "cuda")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProjectionLayout {
-    Checkpoint,
-    Tuned,
-}
-#[cfg(feature = "cuda")]
-impl ProjectionLayout {
-    pub(crate) fn from_environment() -> Self {
-        if matches!(
-            std::env::var("APXINF_QWEN_LINEAR_TUNED").as_deref(),
-            Ok("0" | "off" | "false")
-        ) {
-            Self::Checkpoint
-        } else {
-            Self::Tuned
-        }
-    }
-}

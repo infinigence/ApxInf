@@ -18,5 +18,10 @@ half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
 serde_json = "1"
 
+[[example]]
+name = "build-aot"
+path = "aot/build.rs"
+
 [build-dependencies]
 cc = "1"
+serde_json = "1"

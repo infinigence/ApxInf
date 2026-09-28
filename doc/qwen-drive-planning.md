@@ -104,3 +104,17 @@ CUDA regressions cover cancellation-sensitive projection inputs and graph
 capture/replay with an updated bias. These operator checks do not establish
 whole-model graph support or downstream planning accuracy; those remain subject
 to the validation limits above.
+
+## Direct execution ownership
+
+`model_runner/direct.rs` owns whole-model preparation, stable input binding,
+workspace allocation, capture and invalidation. `model/blocks/direct.rs` holds
+the model's direct input representation and execution callback; `bf16.rs` remains
+the single BF16 layer composition. The runner invokes model operations through
+these interfaces. The shared module-boundary check covers this layout.
+
+Direct requests use trailing zero-mask padding to 3387 tokens. The logical
+prefix length remains part of prepared-plan compatibility, and action attention
+excludes the padded suffix. Longer prompts and variable-length reasoning retain
+their generic execution contracts. See [device capabilities](qwen-drive-devices.md)
+and the [native operator bundle](../crates/apxinf-cuda/aot/README.md).

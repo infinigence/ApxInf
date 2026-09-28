@@ -42,7 +42,11 @@ class Runner:
         self.calls = []
 
     def _infer_preprocessed(self, pixels, grids, tokens, attention_mask, state, embodiment_id, noise, **options):
-        np.testing.assert_array_equal(attention_mask, np.ones(len(tokens), dtype=np.uint8))
+        real = int(attention_mask.sum())
+        assert real > 0 and len(attention_mask) == len(tokens)
+        np.testing.assert_array_equal(attention_mask[:real], 1)
+        np.testing.assert_array_equal(attention_mask[real:], 0)
+        np.testing.assert_array_equal(tokens[real:], 0)
         assert embodiment_id is None
         self.calls.append((pixels, grids, tokens, state, noise, options))
         return np.ones((3, 3), np.float32)

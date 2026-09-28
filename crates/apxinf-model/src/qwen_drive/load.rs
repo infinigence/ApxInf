@@ -1,7 +1,7 @@
 //! Checkpoint loading and construction of the planning-only VLA.
 use super::{
     backend::downcast_arc,
-    config::{ProjectionLayout, QwenDriveConfig},
+    config::QwenDriveConfig,
     model::QwenDriveModel,
     model_runner::QwenDriveModelRunner,
     weights::{
@@ -64,12 +64,7 @@ pub(crate) fn load_registered(
     let (tensors, _) = apxinf_loader::safetensors::load_native_path(&planner)
         .map_err(|e| Error::Other(format!("load qwen_drive planner: {e}")))?;
     let expert = QwenDriveExpertWeights::from_map(&config, &tensors)?;
-    let backbone = BackboneDeviceWeights::from_maps(
-        &config,
-        vlm,
-        ProjectionLayout::from_environment(),
-        &*backend,
-    )?;
+    let backbone = BackboneDeviceWeights::from_maps(&config, vlm, &*backend)?;
     let planner = ExpertDeviceWeights::from_weights(&config, expert, &*backend)?;
     let model = QwenDriveModel::new(config, cuda, backbone, planner);
     Ok(LoadedModel::Vla(Box::new(QwenDriveModelRunner::new(model))))

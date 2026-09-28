@@ -6,6 +6,36 @@ use super::cuda::{cudaError_t, cudaStream_t};
 use crate::kernels::gdn_policy::GdnLaunchPolicy;
 
 extern "C" {
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_gdn_flashinfer64_init() -> i32;
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_gdn_flashinfer64_prefill_compact_v(
+        zba: *const c_void,
+        conv_weight: *const c_void,
+        new_conv_state: *mut c_void,
+        a_log: *const c_void,
+        dt_bias_bf16: *const c_void,
+        raw_qk_scratch: *mut c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        a: *mut c_void,
+        b: *mut c_void,
+        h_out_vmajor: *mut c_void,
+        final_state_kmajor: *mut c_void,
+        out_pad: *mut c_void,
+        cu_seqlens: *mut c_void,
+        seq: i32,
+        pad: i32,
+        stream: cudaStream_t,
+    ) -> i32;
+    pub fn apxinf_static_broadcast_bf16_f32_rows(
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_cast_f32_bf16(
         input: *const c_void,
         output: *mut c_void,

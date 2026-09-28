@@ -472,6 +472,30 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(
+        rgb: *const c_void,
+        patches: *mut c_void,
+        lut: *const c_void,
+        grid_h: i32,
+        grid_w: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_pillow_bicubic_u8_axis(
+        input: *const c_void,
+        output: *mut c_void,
+        input_offsets: *const c_void,
+        output_offsets: *const c_void,
+        bounds: *const c_void,
+        weights: *const c_void,
+        ksize: i32,
+        in_w: i32,
+        in_h: i32,
+        out_w: i32,
+        out_h: i32,
+        batch: i32,
+        horizontal: bool,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     /// Same addressing as the BF16 variant, but the normalized patch value stays
     /// in FP32 for a patch projection that is kept at full precision.
     pub fn apxinf_static_rgb_u8_to_patches_f32(
@@ -817,6 +841,17 @@ extern "C" {
         q: *mut c_void,
         k: *mut c_void,
         v: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        theta: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_vision_qk_rope_bf16_no_v(
+        qkv: *const c_void,
+        position_ids: *const u32,
+        q: *mut c_void,
+        k: *mut c_void,
         tokens: i32,
         heads: i32,
         head_dim: i32,

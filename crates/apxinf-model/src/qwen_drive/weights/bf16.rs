@@ -1,9 +1,10 @@
 //! BF16 weights and load-time physical layouts.
+use crate::qwen_drive::backend::RuntimeBackend;
 use std::collections::HashMap;
 
-use apxinf_core::{Backend, DType, Error, Result, Tensor};
+use apxinf_core::{Backend, Error, Result, Tensor};
 
-use super::super::config::{ProjectionLayout, QwenDriveConfig};
+use super::super::config::QwenDriveConfig;
 use super::host::{transpose_2d, QwenDriveExpertWeights, QwenDriveVlmWeights};
 
 fn take(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
@@ -13,37 +14,6 @@ fn take(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
 
 fn take_transposed(map: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
     transpose_2d(&take(map, name)?)
-}
-
-/// Host-side column concat of equally tall `[in, out_i]` matrices into
-/// `[in, sum(out_i)]`. BF16 only (all checkpoint projections are bf16).
-fn concat_columns(tensors: &[&Tensor]) -> Result<Tensor> {
-    if tensors.is_empty() {
-        return Err(Error::Other("qwen_drive concat: no tensors".into()));
-    }
-    let rows = tensors[0].shape().dims()[0];
-    let mut cols = 0usize;
-    for tensor in tensors {
-        let dims = tensor.shape().dims();
-        if dims.len() != 2 || dims[0] != rows || tensor.dtype() != DType::BF16 {
-            return Err(Error::Other(
-                "qwen_drive concat: expected equally tall BF16 matrices".into(),
-            ));
-        }
-        cols += dims[1];
-    }
-    let mut out = vec![half::bf16::from_f32(0.0); rows * cols];
-    for r in 0..rows {
-        let mut offset = 0usize;
-        for tensor in tensors {
-            let width = tensor.shape().dims()[1];
-            let data = tensor.as_bf16()?;
-            out[r * cols + offset..r * cols + offset + width]
-                .copy_from_slice(&data[r * width..(r + 1) * width]);
-            offset += width;
-        }
-    }
-    Tensor::from_bf16(vec![rows, cols], &out)
 }
 
 /// Exact bf16 -> f32 widening on the host (for fp32-consumed constants).
@@ -80,29 +50,9 @@ fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
     Tensor::from_bf16(dims, &narrowed)
 }
 
-/// Concatenate `[out, hidden]` checkpoint-layout weights along their output
-/// rows.
-///
-/// The GDN input projections were applied as one GEMM each and then packed on
-/// device. Four GEMMs over the same activation read the same weight bytes as
-/// one, but two of them are only `[32, hidden]`, so the group ran at about
-/// 70GB/s against the 172GB/s the MLP projections reach on this board. Packed
-/// here instead, the layer issues a single GEMM whose output already has the
-/// layout the pack produced. BF16 through f32 and back is exact, so the values
-/// are unchanged.
-/// Store a projection weight in the layout its GEMM path wants.
-///
-/// These arrive from the checkpoint as `[out, in]`, which the raw `write_ex`
-/// call consumes with a transposed B. The tuned `gemm::bf16` path is row-major
-/// `[m,k] @ [k,n]` and needs `[in, out]`. Transposing once here keeps the
-/// per-call cost at zero; doing it the other way -- leaving the layout alone
-/// and transposing at each call -- would cost more than the tuning saves.
-fn projection(tensor: &Tensor, layout: ProjectionLayout) -> Result<Tensor> {
-    if layout == ProjectionLayout::Tuned {
-        transpose_2d(tensor)
-    } else {
-        Ok(tensor.clone())
-    }
+/// Store checkpoint `[out, in]` weights as `[in, out]` for row-major GEMM.
+fn projection(tensor: &Tensor) -> Result<Tensor> {
+    transpose_2d(tensor)
 }
 
 fn concat_rows_bf16(parts: &[&Tensor]) -> Result<Tensor> {
@@ -175,9 +125,14 @@ pub struct FullAttentionLayerWeights {
     pub k_norm: Tensor,
     pub o_w: Tensor,
     pub post_norm: Tensor,
-    /// Fused `[hidden, 2*intermediate]` (gate rows first).
+    /// Fused `[2*intermediate, hidden]`, gate rows followed by up rows.
     pub gate_up_w: Tensor,
     pub down_w: Tensor,
+}
+
+pub struct GdnInputSplitWeights {
+    pub main: Tensor, // [2560,12288], QKV then Z
+    pub ab: Tensor,   // [2560,64], b then a
 }
 
 pub struct GdnLayerWeights {
@@ -185,10 +140,12 @@ pub struct GdnLayerWeights {
     /// The four input projections packed along their output rows, in the order
     /// qkv, z, b, a -- the layout the on-device pack used to build.
     pub zba_w: Tensor,
+    pub input_split: Option<GdnInputSplitWeights>,
     /// `[conv_dim, kernel_size]` (squeezed depthwise conv weight).
     pub conv_w: Tensor,
     /// `[num_v_heads]` fp32.
     pub dt_bias: Tensor,
+    pub dt_bias_bf16: Tensor,
     /// `[num_v_heads]` fp32.
     pub a_log: Tensor,
     /// `[head_v_dim]` gated RMSNorm weight (plain semantics).
@@ -306,21 +263,13 @@ mod frequency_tests {
     use super::fourier_freq_table;
 
     #[test]
-    fn projection_packing_obeys_the_explicit_layout() {
+    fn projection_packing_transposes_checkpoint_weights() {
         let values: Vec<_> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
             .into_iter()
             .map(half::bf16::from_f32)
             .collect();
         let weight = apxinf_core::Tensor::from_bf16(vec![2, 3], &values).unwrap();
-        let checkpoint = super::projection(
-            &weight,
-            crate::qwen_drive::config::ProjectionLayout::Checkpoint,
-        )
-        .unwrap();
-        assert_eq!(checkpoint.shape().dims(), &[2, 3]);
-        assert_eq!(checkpoint.as_bf16().unwrap(), values);
-        let in_out =
-            super::projection(&weight, crate::qwen_drive::config::ProjectionLayout::Tuned).unwrap();
+        let in_out = super::projection(&weight).unwrap();
         assert_eq!(in_out.shape().dims(), &[3, 2]);
         assert_eq!(in_out.to_f32_vec().unwrap(), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
@@ -350,17 +299,14 @@ pub struct BackboneDeviceWeights {
     pub layers: Vec<MixerWeights>,
     pub final_norm: Tensor,
     pub vision: VisionDeviceWeights,
-    pub projection_layout: ProjectionLayout,
 }
 
 impl BackboneDeviceWeights {
     pub fn from_maps(
         config: &QwenDriveConfig,
         vlm: QwenDriveVlmWeights,
-        projection_layout: ProjectionLayout,
         backend: &dyn Backend,
     ) -> Result<Self> {
-        let projection = |tensor: &Tensor| projection(tensor, projection_layout);
         let mut language = vlm.language;
         let mut visual = vlm.visual;
         let text = &config.text;
@@ -368,6 +314,12 @@ impl BackboneDeviceWeights {
         let kv_width = text.n_kv_heads * text.head_dim;
         let q_width = text.n_heads * 2 * text.head_dim;
 
+        let split_gdn_input = backend
+            .as_any()
+            .downcast_ref::<RuntimeBackend>()
+            .is_some_and(|cuda| {
+                cuda.context().caps().sm == 110 && cuda.context().caps().multiprocessor_count == 20
+            });
         let mut layers = Vec::with_capacity(text.n_layers);
         // FIX (implement_r3 / synthesis_r3): confirmation-line accumulators for the A_log
         // bf16-grid rounding below; max_delta over the PRE-round values proves the fix
@@ -387,9 +339,10 @@ impl BackboneDeviceWeights {
                     &format!("{p}.post_attention_layernorm.weight"),
                 )?,
             )?;
-            let gate = take_transposed(&mut language, &format!("{p}.mlp.gate_proj.weight"))?;
-            let up_w = take_transposed(&mut language, &format!("{p}.mlp.up_proj.weight"))?;
-            let gate_up_w = up(backend, &concat_columns(&[&gate, &up_w])?)?;
+            let gate = take(&mut language, &format!("{p}.mlp.gate_proj.weight"))?;
+            let up_w = take(&mut language, &format!("{p}.mlp.up_proj.weight"))?;
+            // One checkpoint-row-major representation for the fused gate/up operator.
+            let gate_up_w = up(backend, &concat_rows_bf16(&[&gate, &up_w])?)?;
             let down_w = up(
                 backend,
                 &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?)?,
@@ -436,6 +389,19 @@ impl BackboneDeviceWeights {
                 let in_z = take(&mut language, &format!("{p}.linear_attn.in_proj_z.weight"))?;
                 let in_b = take(&mut language, &format!("{p}.linear_attn.in_proj_b.weight"))?;
                 let in_a = take(&mut language, &format!("{p}.linear_attn.in_proj_a.weight"))?;
+                let input_split = if split_gdn_input
+                    && in_qkv.shape().dims() == [8192, 2560]
+                    && in_z.shape().dims() == [4096, 2560]
+                    && in_b.shape().dims() == [32, 2560]
+                    && in_a.shape().dims() == [32, 2560]
+                {
+                    Some(GdnInputSplitWeights {
+                        main: up(backend, &projection(&concat_rows_bf16(&[&in_qkv, &in_z])?)?)?,
+                        ab: up(backend, &projection(&concat_rows_bf16(&[&in_b, &in_a])?)?)?,
+                    })
+                } else {
+                    None
+                };
                 let conv = take(&mut language, &format!("{p}.linear_attn.conv1d.weight"))?;
                 let conv_dims = conv.shape().dims().to_vec();
                 let conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim
@@ -457,17 +423,17 @@ impl BackboneDeviceWeights {
                 if index == 0 {
                     a_log_layer0_first4 = a_log_pre[..a_log_pre.len().min(4)].to_vec();
                 }
+                let dt_bias = take(&mut language, &format!("{p}.linear_attn.dt_bias"))?;
                 layers.push(MixerWeights::Gdn(GdnLayerWeights {
                     input_norm,
                     zba_w: up(
                         backend,
                         &projection(&concat_rows_bf16(&[&in_qkv, &in_z, &in_b, &in_a])?)?,
                     )?,
+                    input_split,
                     conv_w: up(backend, &conv.reshape(vec![conv_dim, kernel])?)?,
-                    dt_bias: up(
-                        backend,
-                        &widen_to_f32(&take(&mut language, &format!("{p}.linear_attn.dt_bias"))?)?,
-                    )?,
+                    dt_bias: up(backend, &widen_to_f32(&dt_bias)?)?,
+                    dt_bias_bf16: up(backend, &narrow_to_bf16(&dt_bias)?)?,
                     a_log: up(backend, &bf16_grid_round_f32(&a_log_raw)?)?,
                     gated_norm: up(
                         backend,
@@ -626,7 +592,6 @@ impl BackboneDeviceWeights {
             layers,
             final_norm,
             vision,
-            projection_layout,
         })
     }
 }

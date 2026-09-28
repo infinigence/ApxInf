@@ -38,6 +38,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
@@ -186,6 +187,50 @@ pub struct ModelRunner {
     sampling_draw: Cell<u64>,
 }
 
+/// Request-owned RGB snapshot. This object has no NumPy references and can be
+/// transferred to the model observation exactly once.
+#[pyclass(name = "_PackedRgbU8")]
+struct PackedRgbU8 {
+    bytes: Option<Vec<u8>>,
+}
+
+impl PackedRgbU8 {
+    fn from_slices(parts: &[&[u8]]) -> PyResult<Self> {
+        const MAX_RGB_BYTES: usize = 512 * 1024 * 1024;
+        if parts.is_empty() || parts.len() > 65_535 {
+            return Err(PyValueError::new_err(
+                "RGB frame count must be in 1..=65535",
+            ));
+        }
+        let mut total = 0usize;
+        for part in parts {
+            if part.is_empty() {
+                return Err(PyValueError::new_err("RGB frames must not be empty"));
+            }
+            total = total
+                .checked_add(part.len())
+                .filter(|&n| n <= MAX_RGB_BYTES)
+                .ok_or_else(|| PyValueError::new_err("RGB byte budget exceeded"))?;
+        }
+        let mut packed = Vec::new();
+        packed
+            .try_reserve_exact(total)
+            .map_err(|_| PyValueError::new_err("RGB byte buffer allocation failed"))?;
+        for part in parts {
+            packed.extend_from_slice(part);
+        }
+        Ok(Self {
+            bytes: Some(packed),
+        })
+    }
+
+    fn take_bytes(&mut self) -> PyResult<Vec<u8>> {
+        self.bytes
+            .take()
+            .ok_or_else(|| PyValueError::new_err("packed RGB holder was already consumed"))
+    }
+}
+
 struct PreprocessedVlaInput {
     observation: Observation,
     latent: Tensor,
@@ -196,12 +241,16 @@ struct PreprocessedVlaInput {
 
 impl ModelRunner {
     fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
-        if self.contract.accepts_rgb_u8 {
-            Ok(self.contract)
-        } else {
+        if !self.contract.accepts_rgb_u8 {
             Err(PyValueError::new_err(format!(
                 "apxinf_py.{method}: loaded model accepts preprocessed patches, not RGB"
             )))
+        } else if self.contract.num_views == 0 || self.contract.image_size == 0 {
+            Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: variable-grid RGB requires the model policy bridge"
+            )))
+        } else {
+            Ok(self.contract)
         }
     }
 
@@ -413,6 +462,252 @@ impl ModelRunner {
             image_grid_thw: grids,
             embodiment_id,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resized_rgb_vla_input<'py>(
+        &self,
+        rgb: Vec<u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        raw_expected: Option<usize>,
+    ) -> PyResult<PreprocessedVlaInput> {
+        if !self.contract.accepts_rgb_u8
+            || self.contract.num_views != 0
+            || self.contract.image_size != 0
+        {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb requires a variable-grid RGB model",
+            ));
+        }
+        let grid_shape = image_grid_thw.shape();
+        if grid_shape.len() != 2 || grid_shape[0] == 0 || grid_shape[1] != 3 {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: grids must be [images,3]",
+            ));
+        }
+        let grids = image_grid_thw
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: grids must be contiguous uint32")
+            })?
+            .chunks_exact(3)
+            .map(|g| [g[0], g[1], g[2]])
+            .collect::<Vec<_>>();
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: token IDs must be contiguous uint32")
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mask = attention_mask
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: attention mask must be contiguous uint8")
+            })?
+            .to_vec();
+        if mask.len() != tokens.len() {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: attention mask length mismatch",
+            ));
+        }
+        let patch = self.contract.patch_size;
+        let expected = grids
+            .iter()
+            .try_fold(0usize, |total, g| {
+                (g[0] == 1).then_some(())?;
+                total.checked_add(
+                    (g[1] as usize)
+                        .checked_mul(g[2] as usize)?
+                        .checked_mul(patch)?
+                        .checked_mul(patch)?
+                        .checked_mul(3)?,
+                )
+            })
+            .ok_or_else(|| {
+                PyValueError::new_err("_infer_resized_rgb: invalid or overflowing grids")
+            })?;
+        let expected = raw_expected.unwrap_or(expected);
+        if rgb.len() != expected {
+            return Err(PyValueError::new_err(format!(
+                "_infer_resized_rgb: RGB length {} does not match grids ({expected})",
+                rgb.len()
+            )));
+        }
+        let state = Tensor::from_f32(
+            Shape::new(state.shape().to_vec()),
+            state.as_slice().map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: state must be contiguous float32")
+            })?,
+        )
+        .map_err(runtime_err)?;
+        let [horizon, dim] = self.action_shape();
+        if noise.shape() != [horizon, dim] && noise.shape() != [1, horizon, dim] {
+            return Err(PyValueError::new_err(
+                "_infer_resized_rgb: noise shape mismatch",
+            ));
+        }
+        let latent = Tensor::from_f32(
+            Shape::new(noise.shape().to_vec()),
+            noise.as_slice().map_err(|_| {
+                PyValueError::new_err("_infer_resized_rgb: noise must be contiguous float32")
+            })?,
+        )
+        .map_err(runtime_err)?;
+        Ok(PreprocessedVlaInput {
+            observation: Observation {
+                vision: VisionObservation::RgbU8 {
+                    bytes: rgb,
+                    layout: ImageLayout::Nhwc,
+                },
+                token_ids: tokens,
+                state: Some(state),
+                action_mask: None,
+            },
+            latent,
+            attention_mask: mask,
+            image_grid_thw: grids,
+            embodiment_id,
+        })
+    }
+
+    // Shared by the NumPy bridge and the one-shot owned RGB bridge.
+    fn infer_resized_rgb_owned<'py>(
+        &self,
+        py: Python<'py>,
+        rgb: Vec<u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        use apxinf_model::vla::RawRgbResizeFrame;
+        let raw_frames = if let Some(raw) = raw_resize_frames {
+            if image_grid_thw.shape().len() != 2 || image_grid_thw.shape()[1] != 3 {
+                return Err(PyValueError::new_err("grids must be [images,3]"));
+            }
+            if raw.shape().len() != 2
+                || raw.shape()[0] == 0
+                || raw.shape()[1] != 6
+                || raw.shape()[0] != image_grid_thw.shape()[0]
+            {
+                return Err(PyValueError::new_err(
+                    "raw_resize_frames must be [images,6]",
+                ));
+            }
+            let values = raw.as_slice().map_err(|_| {
+                PyValueError::new_err("raw_resize_frames must be contiguous uint32")
+            })?;
+            let mut frames = Vec::with_capacity(values.len() / 6);
+            let grids = image_grid_thw
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("grids must be contiguous uint32"))?;
+            for (index, row) in values.chunks_exact(6).enumerate() {
+                let [sw, sh, tw, th, fw, fh] = [row[0], row[1], row[2], row[3], row[4], row[5]];
+                let grid = &grids[index * 3..index * 3 + 3];
+                if sw == 0
+                    || sh == 0
+                    || tw == 0
+                    || th == 0
+                    || fw == 0
+                    || fh == 0
+                    || grid[0] != 1
+                    || grid[2].checked_mul(self.contract.patch_size as u32) != Some(fw)
+                    || grid[1].checked_mul(self.contract.patch_size as u32) != Some(fh)
+                {
+                    return Err(PyValueError::new_err(
+                        "raw resize geometry and final grid disagree",
+                    ));
+                }
+                frames.push(RawRgbResizeFrame {
+                    source_width: sw,
+                    source_height: sh,
+                    stage_width: tw,
+                    stage_height: th,
+                    final_width: fw,
+                    final_height: fh,
+                });
+            }
+            Some(frames)
+        } else {
+            None
+        };
+        let raw_expected = if let Some(frames) = &raw_frames {
+            Some(
+                frames
+                    .iter()
+                    .try_fold(0usize, |total, frame| {
+                        total.checked_add(
+                            (frame.source_width as usize)
+                                .checked_mul(frame.source_height as usize)?
+                                .checked_mul(3)?,
+                        )
+                    })
+                    .ok_or_else(|| PyValueError::new_err("raw RGB byte count overflow"))?,
+            )
+        } else {
+            None
+        };
+        let input = self.resized_rgb_vla_input(
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            raw_expected,
+        )?;
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+            raw_rgb_resize: raw_frames,
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some()
+                || options.reasoning.is_some()
+                || options.raw_rgb_resize.is_some())
+            .then_some(&options),
+        };
+        let request =
+            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        self.action_array(py, flat)
     }
 
     /// Run with an exact caller-provided latent. This is the correctness and
@@ -779,6 +1074,7 @@ impl ModelRunner {
         let options = PlanningOptions {
             num_steps,
             reasoning,
+            raw_rgb_resize: None,
         };
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
@@ -791,6 +1087,126 @@ impl ModelRunner {
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
+    }
+
+    /// Snapshot contiguous uint8 frames at the old concatenate point. The
+    /// returned request-local holder has no Python array references.
+    #[staticmethod]
+    #[pyo3(name = "_pack_rgb_u8_frames")]
+    fn pack_rgb_u8_frames<'py>(frames: &Bound<'py, PyList>) -> PyResult<PackedRgbU8> {
+        if frames.is_empty() || frames.len() > 65_535 {
+            return Err(PyValueError::new_err(
+                "RGB frame count must be in 1..=65535",
+            ));
+        }
+        let mut arrays = Vec::with_capacity(frames.len());
+        for item in frames.iter() {
+            let frame = item.extract::<PyReadonlyArray1<'py, u8>>().map_err(|_| {
+                PyValueError::new_err("RGB frames must be one-dimensional uint8 arrays")
+            })?;
+            arrays.push(frame);
+        }
+        let mut parts = Vec::with_capacity(arrays.len());
+        for frame in &arrays {
+            parts.push(
+                frame
+                    .as_slice()
+                    .map_err(|_| PyValueError::new_err("RGB frames must be C-contiguous uint8"))?,
+            );
+        }
+        PackedRgbU8::from_slices(&parts)
+    }
+
+    /// Internal variable-grid NHWC RGB bridge. Both entry points share the
+    /// same geometry, planning options, and native request path.
+    #[pyo3(name = "_infer_resized_rgb", signature = (
+        rgb_u8, image_grid_thw, token_ids, attention_mask, state,
+        embodiment_id, noise, *, num_steps=None, max_new_tokens=None,
+        min_new_tokens=0, terminator_ids=None, closing_ids=None,
+        raw_resize_frames=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_resized_rgb<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArray1<'py, u8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let rgb = rgb_u8
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("_infer_resized_rgb: RGB must be contiguous uint8"))?
+            .to_vec();
+        self.infer_resized_rgb_owned(
+            py,
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            num_steps,
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            raw_resize_frames,
+        )
+    }
+
+    #[pyo3(name = "_infer_resized_rgb_packed", signature = (
+        packed, image_grid_thw, token_ids, attention_mask, state,
+        embodiment_id, noise, *, num_steps=None, max_new_tokens=None,
+        min_new_tokens=0, terminator_ids=None, closing_ids=None,
+        raw_resize_frames=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_resized_rgb_packed<'py>(
+        &self,
+        py: Python<'py>,
+        mut packed: PyRefMut<'py, PackedRgbU8>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PyReadonlyArrayDyn<'py, f32>,
+        embodiment_id: Option<usize>,
+        noise: PyReadonlyArrayDyn<'py, f32>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        raw_resize_frames: Option<PyReadonlyArray2<'py, u32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let rgb = packed.take_bytes()?;
+        drop(packed);
+        self.infer_resized_rgb_owned(
+            py,
+            rgb,
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            state,
+            embodiment_id,
+            noise,
+            num_steps,
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            raw_resize_frames,
+        )
     }
 
     /// Internal bridge used by the public model-neutral calibration runner.
@@ -1289,6 +1705,7 @@ impl ModelRunner {
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ModelRunner>()?;
+    module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1329,5 +1746,23 @@ mod tests {
     fn missing_config_falls_back_to_default() {
         let config = load_config(Path::new("/nonexistent/checkpoint")).unwrap();
         assert_eq!(config, Pi05Config::default());
+    }
+
+    #[test]
+    fn packed_rgb_snapshots_and_consumes_once() {
+        let mut first = vec![1u8, 2, 3];
+        let second = vec![4u8, 5];
+        let mut holder = PackedRgbU8::from_slices(&[&first, &second]).unwrap();
+        first[0] = 99;
+        assert_eq!(holder.take_bytes().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert!(holder.take_bytes().is_err());
+    }
+
+    #[test]
+    fn packed_rgb_rejects_empty_and_excess_frames() {
+        assert!(PackedRgbU8::from_slices(&[]).is_err());
+        assert!(PackedRgbU8::from_slices(&[&[]]).is_err());
+        let part = &[1u8][..];
+        assert!(PackedRgbU8::from_slices(&vec![part; 65_536]).is_err());
     }
 }

@@ -2,7 +2,7 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 
-use super::contracts::gpu_ptr;
+use super::contracts::{gpu_ptr, require_buffers};
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
@@ -31,6 +31,104 @@ impl std::fmt::Display for ImageLayout {
             Self::Nchw => formatter.write_str("nchw"),
         }
     }
+}
+
+/// Final resized NHWC RGB frame geometry, expressed in 16x16 patch rows/columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbRectFrame {
+    pub grid_h: usize,
+    pub grid_w: usize,
+}
+
+/// Convert packed, heterogeneously sized NHWC still frames into the BF16
+/// temporal-2 / spatial-merge-2 patch stream used by compatible vision towers.
+/// `lut` contains 256 BF16 bit patterns; its construction belongs to the model.
+/// The safe boundary checks every byte/row range before launching any frame.
+pub fn rgb_u8_to_temporal2_merge2_rect_bf16(
+    ctx: &CudaContext,
+    rgb: &CudaBuffer,
+    patches: &Tensor,
+    lut: &CudaBuffer,
+    frames: &[RgbRectFrame],
+) -> Result<()> {
+    if frames.is_empty()
+        || rgb.device() != ctx.device_id()
+        || lut.device() != ctx.device_id()
+        || lut.len() != 512
+        || patches.device() != apxinf_core::Device::Cuda(ctx.device_id())
+        || patches.dtype() != DType::BF16
+    {
+        return Err(Error::Other(
+            "invalid RGB temporal-merged device inputs".into(),
+        ));
+    }
+    let mut bytes = 0usize;
+    let mut rows = 0usize;
+    for frame in frames {
+        if frame.grid_h == 0
+            || frame.grid_w == 0
+            || frame.grid_h % 2 != 0
+            || frame.grid_w % 2 != 0
+            || i32::try_from(frame.grid_h).is_err()
+            || i32::try_from(frame.grid_w).is_err()
+        {
+            return Err(Error::Other("invalid rectangular RGB patch grid".into()));
+        }
+        let frame_rows = frame
+            .grid_h
+            .checked_mul(frame.grid_w)
+            .filter(|&n| n <= i32::MAX as usize)
+            .ok_or_else(|| Error::Other("RGB patch grid overflow".into()))?;
+        rows = rows
+            .checked_add(frame_rows)
+            .ok_or_else(|| Error::Other("RGB patch row overflow".into()))?;
+        bytes = bytes
+            .checked_add(
+                frame_rows
+                    .checked_mul(16 * 16 * 3)
+                    .ok_or_else(|| Error::Other("RGB byte count overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Other("RGB byte count overflow".into()))?;
+    }
+    let output_bytes = rows
+        .checked_mul(1536)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| Error::Other("RGB BF16 patch byte count overflow".into()))?;
+    if rgb.len() != bytes || patches.shape().dims() != [rows, 1536] {
+        return Err(Error::Other(
+            "RGB byte count or BF16 patch shape does not match grids".into(),
+        ));
+    }
+    let mut byte_offset = 0usize;
+    let mut word_offset = 0usize;
+    let output = CudaBuffer::from_tensor(patches).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "rectangular RGB BF16 patches",
+        &[
+            ("rgb", rgb, bytes),
+            ("patches", &output, output_bytes),
+            ("lut", lut, 512),
+        ],
+    )?;
+    let output_ptr = output.ptr() as *mut u16;
+    for frame in frames {
+        let frame_rows = frame.grid_h * frame.grid_w;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(
+                (rgb.ptr() as *const u8).add(byte_offset).cast(),
+                output_ptr.add(word_offset).cast(),
+                lut.ptr().cast(),
+                frame.grid_h as i32,
+                frame.grid_w as i32,
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        byte_offset += frame_rows * 16 * 16 * 3;
+        word_offset += frame_rows * 1536;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -88,3 +88,6 @@ pub fn scratch_buffer_tail_zeroed(
 ) -> apxinf_core::Result<crate::CudaBuffer> {
     crate::workspace::output_buffer_tail_zeroed(ctx, groups, group_bytes, used_bytes)
 }
+
+pub mod fixed_profile;
+pub mod pillow_bicubic;

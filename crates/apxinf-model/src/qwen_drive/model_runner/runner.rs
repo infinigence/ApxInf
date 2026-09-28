@@ -1,15 +1,16 @@
 //! Planning request validation, device input binding and mutable execution state.
-use super::prepare::{DirectPlan, GdnGraphs};
+use super::direct::DirectPlan;
+use super::prepare::GdnGraphs;
 use crate::qwen_drive::{
-    backend::{kernels, transfers, tuning, DeviceBuffer},
+    backend::{kernels, transfers, tuning, Context, DeviceBuffer},
     inputs::ExpertConditioning,
     model::{PlanningInput, PlanningState, QwenDriveModel, ReasoningInput, VisionState},
 };
 use crate::vla::{
-    Action, ExecutionPolicy, InferenceSpec, InitialLatent, PreparedInference, VisionObservation,
-    VlaContract, VlaRequest, VlaRuntime,
+    Action, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, PreparedInference,
+    RawRgbResizeFrame, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
 };
-use apxinf_core::{DType, Device, Error, Result, SamplingBackend, Shape, Tensor};
+use apxinf_core::{Backend, DType, Device, Error, Result, SamplingBackend, Shape, Tensor};
 use std::cell::RefCell;
 
 struct ExecutionState {
@@ -42,7 +43,54 @@ impl QwenDriveModelRunner {
         let backend = self.model.backend();
         let c = self.model.config();
         let observation = request.observation;
-        let pixels = valid.pixels;
+        let mut rgb_hold = None;
+        let pixels = match valid.vision {
+            ValidatedVision::Patches(pixels) => (*pixels).clone(),
+            ValidatedVision::Rgb(bytes) => {
+                let ctx = backend.context();
+                let resize = valid
+                    .resize_frames()
+                    .map(|frames| kernels::pillow_bicubic::PillowBicubicRgbPlan::new(ctx, &frames))
+                    .transpose()?;
+                let raw = if let Some(plan) = &resize {
+                    plan.raw().clone()
+                } else {
+                    DeviceBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?
+                };
+                raw.copy_from_host(bytes).map_err(Error::Cuda)?;
+                let output_bytes = valid
+                    .rows
+                    .checked_mul(valid.width)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| Error::Other("qwen_drive BF16 patch size overflow".into()))?;
+                let output = DeviceBuffer::alloc(output_bytes, ctx.device_id())
+                    .map_err(Error::Cuda)?
+                    .as_tensor(Shape::new(vec![valid.rows, valid.width]), DType::BF16)
+                    .map_err(Error::Cuda)?;
+                let lut = rgb_bf16_lut(ctx)?;
+                if let Some(plan) = &resize {
+                    if let Err(error) = plan.run(ctx) {
+                        // A prior axis may already be queued on this stream.
+                        ctx.synchronize().map_err(Error::Cuda)?;
+                        return Err(error);
+                    }
+                }
+                let rgb = resize.as_ref().map(|plan| plan.final_rgb()).unwrap_or(&raw);
+                if let Err(error) = kernels::preprocess::rgb_u8_to_temporal2_merge2_rect_bf16(
+                    ctx,
+                    rgb,
+                    &output,
+                    &lut,
+                    &valid.rgb_frames(),
+                ) {
+                    // Earlier frame launches may already be queued on the stream.
+                    ctx.synchronize().map_err(Error::Cuda)?;
+                    return Err(error);
+                }
+                rgb_hold = Some((raw, lut, resize));
+                output
+            }
+        };
         let grids = valid.grids;
         let cond = valid.cond;
         let steps = valid.steps;
@@ -73,7 +121,8 @@ impl QwenDriveModelRunner {
         };
         let input = PlanningInput {
             token_ids: &observation.token_ids,
-            pixels,
+            prompt_len: valid.prompt_len,
+            pixels: &pixels,
             grids,
             conditioning: &cond,
             noise: &noise,
@@ -100,8 +149,15 @@ impl QwenDriveModelRunner {
         let ExecutionState {
             graphs, backbone, ..
         } = &mut *execution;
-        self.model
-            .infer(backbone.as_mut().expect("fresh backbone"), graphs, &input)
+        let result = self
+            .model
+            .infer(backbone.as_mut().expect("fresh backbone"), graphs, &input);
+        // Eager RGB input is temporary; complete its stream consumers before
+        // dropping the raw bytes and LUT. The direct graph uses stable buffers.
+        if rgb_hold.is_some() {
+            backend.synchronize()?;
+        }
+        result
     }
 }
 impl VlaRuntime for QwenDriveModelRunner {
@@ -123,7 +179,10 @@ impl VlaRuntime for QwenDriveModelRunner {
             num_views: 0,
             image_size: 0,
             patch_size: c.vision.patch_size,
-            accepts_rgb_u8: false,
+            accepts_rgb_u8: c.vision.in_channels == 3
+                && c.vision.patch_size == 16
+                && c.vision.temporal_patch_size == 2
+                && c.vision.spatial_merge_size == 2,
         }
     }
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
@@ -236,11 +295,68 @@ impl VlaRuntime for QwenDriveModelRunner {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ValidatedVision<'a> {
+    Patches(&'a Tensor),
+    Rgb(&'a [u8]),
+}
+
 pub(super) struct Validated<'a> {
-    pub pixels: &'a Tensor,
+    pub vision: ValidatedVision<'a>,
     pub grids: &'a [[u32; 3]],
+    pub rows: usize,
+    pub width: usize,
     pub cond: ExpertConditioning,
     pub steps: usize,
+    pub raw_resize: Option<&'a [RawRgbResizeFrame]>,
+    /// Unmasked prompt tokens. Equal to `token_ids.len()` unless the caller padded
+    /// the prompt, in which case `token_ids.len()` is the padded width and this is
+    /// the length everything semantic must use.
+    pub prompt_len: usize,
+}
+impl Validated<'_> {
+    pub fn rgb_frames(&self) -> Vec<kernels::preprocess::RgbRectFrame> {
+        self.grids
+            .iter()
+            .map(|g| kernels::preprocess::RgbRectFrame {
+                grid_h: g[1] as usize,
+                grid_w: g[2] as usize,
+            })
+            .collect()
+    }
+    pub fn resize_frames(&self) -> Option<Vec<kernels::pillow_bicubic::RgbResizeFrame>> {
+        self.raw_resize.map(|frames| {
+            frames
+                .iter()
+                .map(|f| kernels::pillow_bicubic::RgbResizeFrame {
+                    source_width: f.source_width,
+                    source_height: f.source_height,
+                    stage_width: f.stage_width,
+                    stage_height: f.stage_height,
+                    final_width: f.final_width,
+                    final_height: f.final_height,
+                })
+                .collect()
+        })
+    }
+    pub fn input_dtype(&self) -> DType {
+        match self.vision {
+            ValidatedVision::Patches(p) => p.dtype(),
+            ValidatedVision::Rgb(_) => DType::BF16,
+        }
+    }
+}
+
+pub(super) fn rgb_bf16_lut(ctx: &Context) -> Result<DeviceBuffer> {
+    // Same f32 sequence as QwenDrivePolicy._patchify, rounded once to BF16.
+    let mut bytes = Vec::with_capacity(512);
+    for value in 0..=255 {
+        let f = ((value as f32 / 255.0f32) - 0.5f32) / 0.5f32;
+        bytes.extend_from_slice(&half::bf16::from_f32(f).to_bits().to_ne_bytes());
+    }
+    let lut = DeviceBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+    lut.copy_from_host(&bytes).map_err(Error::Cuda)?;
+    Ok(lut)
 }
 pub(super) fn validate<'a>(
     model: &QwenDriveModel,
@@ -254,36 +370,69 @@ pub(super) fn validate<'a>(
             "qwen_drive does not accept action masks or embodiment IDs".into(),
         ));
     }
+    // Without a mask every token is real; a mask may pad the prompt out to a
+    // fixed length so the shape-specialised kernels stay reachable.
+    let mut prompt_len = observation.token_ids.len();
     if let Some(mask) = request.metadata.attention_mask {
-        if mask.len() != observation.token_ids.len() || mask.iter().any(|&x| x != 1) {
+        if mask.len() != observation.token_ids.len() {
             return Err(Error::Other(
-                "qwen_drive requires an unpadded prompt (all-one attention mask)".into(),
+                "qwen_drive attention mask length does not match the prompt".into(),
             ));
         }
-    }
-    let pixels = match &observation.vision {
-        VisionObservation::Patches(p) => p,
-        _ => {
+        // Padding is inert only because it is trailing: the backbone is causal and
+        // the expert masks a suffix of its joint KV, so an interior zero would be
+        // silently attended to rather than rejected. Require the zeros to reach the
+        // end, and take the real length from the mask instead of carrying a second,
+        // desynchronisable copy of it.
+        let real_len = mask.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+        if real_len == 0 {
             return Err(Error::Other(
-                "qwen_drive requires canonical image patches".into(),
-            ))
+                "qwen_drive requires at least one unmasked prompt token".into(),
+            ));
         }
-    };
-    if !matches!(pixels.device(), Device::Cpu)
-        && pixels.device() != Device::Cuda(model.backend().device_id())
-    {
-        return Err(Error::Other(
-            "qwen_drive pixels are on another device".into(),
-        ));
+        if mask[..real_len].iter().any(|&x| x != 1) {
+            return Err(Error::Other(
+                "qwen_drive requires trailing attention padding; the mask has an interior zero"
+                    .into(),
+            ));
+        }
+        prompt_len = real_len;
+    }
+    if prompt_len != observation.token_ids.len() {
+        if request
+            .metadata
+            .planning
+            .and_then(|p| p.reasoning.as_ref())
+            .is_some()
+        {
+            return Err(Error::Other(
+                "qwen_drive padded reasoning is unsupported".into(),
+            ));
+        }
+        if observation.token_ids[prompt_len..]
+            .iter()
+            .any(|&id| id != 0)
+        {
+            return Err(Error::Other(
+                "qwen_drive padding token IDs must be zero".into(),
+            ));
+        }
     }
     let grids = request
         .metadata
         .image_grid_thw
         .ok_or_else(|| Error::Other("qwen_drive requires image_grid_thw".into()))?;
-    let width = c.vision.in_channels
-        * c.vision.temporal_patch_size
-        * c.vision.patch_size
-        * c.vision.patch_size;
+    let raw_resize = request
+        .metadata
+        .planning
+        .and_then(|options| options.raw_rgb_resize.as_deref());
+    let width = c
+        .vision
+        .in_channels
+        .checked_mul(c.vision.temporal_patch_size)
+        .and_then(|n| n.checked_mul(c.vision.patch_size))
+        .and_then(|n| n.checked_mul(c.vision.patch_size))
+        .ok_or_else(|| Error::Other("qwen_drive patch width overflow".into()))?;
     let merge = c.vision.spatial_merge_size as u32;
     let rows = grids.iter().try_fold(0usize, |sum, g| {
         if g.contains(&0) || g[1] % merge != 0 || g[2] % merge != 0 {
@@ -295,14 +444,131 @@ pub(super) fn validate<'a>(
             .and_then(|n| sum.checked_add(n));
         n.ok_or_else(|| Error::Other("qwen_drive image grid overflow".into()))
     })?;
-    if grids.is_empty()
-        || pixels.shape().dims() != [rows, width]
-        || !matches!(pixels.dtype(), DType::F32 | DType::BF16)
-    {
-        return Err(Error::Other(
-            "qwen_drive patch shape/dtype does not match image grids".into(),
-        ));
+    if grids.is_empty() {
+        return Err(Error::Other("qwen_drive requires image grids".into()));
     }
+    rows.checked_mul(width)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| Error::Other("qwen_drive pixel buffer size overflow".into()))?;
+    let vision = match &observation.vision {
+        VisionObservation::Patches(pixels) => {
+            if raw_resize.is_some() {
+                return Err(Error::Other(
+                    "raw RGB resize metadata requires RGB input".into(),
+                ));
+            }
+            if (pixels.device() != Device::Cpu
+                && pixels.device() != Device::Cuda(model.backend().device_id()))
+                || pixels.shape().dims() != [rows, width]
+                || !matches!(pixels.dtype(), DType::F32 | DType::BF16)
+            {
+                return Err(Error::Other(
+                    "qwen_drive patch shape/dtype/device does not match image grids".into(),
+                ));
+            }
+            ValidatedVision::Patches(pixels)
+        }
+        VisionObservation::RgbU8 { bytes, layout } => {
+            if *layout != ImageLayout::Nhwc
+                || c.vision.patch_size != 16
+                || c.vision.temporal_patch_size != 2
+                || c.vision.spatial_merge_size != 2
+                || c.vision.in_channels != 3
+                || grids.iter().any(|g| {
+                    g[0] != 1
+                        || g[1] > i32::MAX as u32
+                        || g[2] > i32::MAX as u32
+                        || (g[1] as u64) * (g[2] as u64) > i32::MAX as u64
+                })
+            {
+                return Err(Error::Other(
+                    "qwen_drive RGB path requires NHWC still frames and 16/2/2 patch geometry"
+                        .into(),
+                ));
+            }
+            let final_expected = rows
+                .checked_mul(c.vision.patch_size)
+                .and_then(|n| n.checked_mul(c.vision.patch_size))
+                .and_then(|n| n.checked_mul(c.vision.in_channels))
+                .ok_or_else(|| Error::Other("qwen_drive RGB input byte count overflow".into()))?;
+            let expected = if let Some(frames) = raw_resize {
+                if frames.len() != grids.len() || frames.len() > 65535 {
+                    return Err(Error::Other(
+                        "raw RGB resize frame count does not match grids".into(),
+                    ));
+                }
+                let mut total_final = 0usize;
+                let mut total_raw = 0usize;
+                for (frame, grid) in frames.iter().zip(grids) {
+                    if frame.source_width == 0
+                        || frame.source_height == 0
+                        || frame.stage_width == 0
+                        || frame.stage_height == 0
+                        || [
+                            frame.source_width,
+                            frame.source_height,
+                            frame.stage_width,
+                            frame.stage_height,
+                            frame.final_width,
+                            frame.final_height,
+                        ]
+                        .iter()
+                        .any(|&size| size > 8192)
+                        || [
+                            (frame.source_width, frame.source_height),
+                            (frame.stage_width, frame.stage_height),
+                            (frame.final_width, frame.final_height),
+                            (frame.stage_width, frame.source_height),
+                            (frame.final_width, frame.stage_height),
+                        ]
+                        .iter()
+                        .any(|&(w, h)| u64::from(w) * u64::from(h) > i32::MAX as u64)
+                        || frame.final_width
+                            != grid[2].checked_mul(c.vision.patch_size as u32).unwrap_or(0)
+                        || frame.final_height
+                            != grid[1].checked_mul(c.vision.patch_size as u32).unwrap_or(0)
+                    {
+                        return Err(Error::Other(
+                            "raw RGB resize geometry does not match final grid".into(),
+                        ));
+                    }
+                    total_final = total_final
+                        .checked_add(
+                            (frame.final_width as usize)
+                                .checked_mul(frame.final_height as usize)
+                                .and_then(|n| n.checked_mul(3))
+                                .ok_or_else(|| Error::Other("final RGB extent overflow".into()))?,
+                        )
+                        .ok_or_else(|| Error::Other("final RGB total overflow".into()))?;
+                    total_raw = total_raw
+                        .checked_add(
+                            (frame.source_width as usize)
+                                .checked_mul(frame.source_height as usize)
+                                .and_then(|n| n.checked_mul(3))
+                                .ok_or_else(|| Error::Other("raw RGB extent overflow".into()))?,
+                        )
+                        .ok_or_else(|| Error::Other("raw RGB total overflow".into()))?;
+                }
+                if total_final != final_expected
+                    || total_raw > 512 * 1024 * 1024
+                    || total_final > 256 * 1024 * 1024
+                {
+                    return Err(Error::Other(
+                        "raw RGB final extent does not match patches".into(),
+                    ));
+                }
+                total_raw
+            } else {
+                final_expected
+            };
+            if bytes.len() != expected {
+                return Err(Error::Other(
+                    "qwen_drive RGB byte count does not match image grids".into(),
+                ));
+            }
+            ValidatedVision::Rgb(bytes)
+        }
+    };
     if observation
         .token_ids
         .iter()
@@ -390,9 +656,13 @@ pub(super) fn validate<'a>(
     // Validate image-token runs before a malformed request can evict a plan.
     model.validate_layout(&observation.token_ids, grids)?;
     Ok(Validated {
-        pixels,
+        vision,
         grids,
+        rows,
+        width,
         cond,
         steps,
+        raw_resize,
+        prompt_len,
     })
 }

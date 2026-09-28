@@ -5,6 +5,49 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_split_batch_init(stream: cudaStream_t) -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_split_batch_forward(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        q2: *mut c_void,
+        partial: *mut c_void,
+        lse: *mut f32,
+        output: *mut c_void,
+        key_tokens: i32,
+        stream: cudaStream_t,
+    ) -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_d256_init() -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_d256_forward(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        stream: cudaStream_t,
+    ) -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_bf16_vfixed_init(stream: cudaStream_t) -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_bf16_vfixed_ready() -> i32;
+
+    #[cfg(apxinf_aot_sm110)]
+    pub fn apxinf_static_fa4_bf16_vfixed_forward(
+        q: *const c_void,
+        k: *const c_void,
+        v_strided: *const c_void,
+        output: *mut c_void,
+        stream: cudaStream_t,
+    ) -> i32;
+
     #[cfg(apxinf_fa2_f16_sm100)]
     pub fn apxinf_static_fa2_f16(
         q: *const c_void,
