@@ -10,7 +10,7 @@ measurement, whereas the PI0.5 README table measures CUDA Graph replay.
 
 | Measurement | Result |
 | --- | ---: |
-| Request P50 / P95 | 482.60 / 488.78 ms |
+| Request P50 / P95 | 482.45 / 488.95 ms |
 | Request throughput | 2.07 Hz |
 | Fixed NAVSIM scenes | 242 |
 | PDM score, 0–100 | 85.6786 |
@@ -36,17 +36,20 @@ establish a systematic quality improvement.
 Measured on Thor2 on 2026-09-28 with CPU min=max=2.601 GHz, GPU min=max=1.575 GHz,
 EMC min=max=4.266 GHz, MAXN and fan PWM 255 with automatic fan control disabled.
 The GPU lock covered the entire run; configuration was restored afterwards.
-The table uses the pooled 60 measured requests from both candidate arms.
+The table uses the pooled 60 measured requests from both candidate arms. This
+measurement uses the PR99-merged build (`ce5927e7`); each arm has ten warmups
+and thirty measured requests. CPU/GPU admission checks and both shared device
+locks precede the run, with continuous tegrastats telemetry during measurement.
 
 | ABBA arm | Request P50 | Request P95 |
 | --- | ---: | ---: |
-| Pre-review maintained version, first | 481.35 ms | 485.83 ms |
-| Final candidate, first | 482.67 ms | 486.40 ms |
-| Final candidate, second | 481.99 ms | 488.78 ms |
-| Pre-review maintained version, last | 485.08 ms | 490.65 ms |
+| Pre-merge accepted version, first | 480.29 ms | 485.07 ms |
+| Merged candidate, first | 481.10 ms | 485.22 ms |
+| Merged candidate, second | 483.68 ms | 488.95 ms |
+| Pre-merge accepted version, last | 484.46 ms | 488.20 ms |
 
-Reference pooled P50/P95 is 483.04/489.38 ms. The final implementation preserves
-performance within this run's variation. Its two arm medians average 482.33 ms;
+Reference pooled P50/P95 is 482.70/488.15 ms. The merged implementation preserves
+performance within this run's variation. Its two arm medians average 482.39 ms;
 the historical 482.98 ms result used that average-of-arm-medians convention.
 The table above reports the pooled P50 instead, retaining both conventions
 explicitly rather than conflating them.

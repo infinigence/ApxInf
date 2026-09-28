@@ -165,7 +165,7 @@ the end-to-end request from resident decoded images to the host trajectory.
 
 | Hardware | Precision | Latency | Throughput | PDM |
 |---|---|---:|---:|---:|
-| Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
+| Jetson AGX Thor SM110 | BF16 | 482.45 ms | 2.07 Hz | 85.6786 |
 
 [Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
 
