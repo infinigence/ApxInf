@@ -80,21 +80,11 @@ fn main() -> Result<()> {
     let runtime = source_path("runtime_archive")?;
     let runtime_relative = "lib/libcute_runtime.a";
     fs::copy(runtime, out.join(runtime_relative))?;
-    fs::create_dir(out.join("licenses"))?;
-    let mut licenses = Vec::new();
-    for entry in fs::read_dir(root.join("licenses"))? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let relative = PathBuf::from("licenses").join(entry.file_name());
-            fs::copy(entry.path(), out.join(&relative))?;
-            licenses.push(json!({"path":relative,"sha256":digest(&out.join(&relative))?}));
-        }
-    }
     let manifest = json!({"schema":1,"target":config["target"],"sm":config["sm"],
         "cuda":config["cuda"],"cutlass_dsl":config["cutlass_dsl"],"kernels":kernels,
         "runtime":{"path":runtime_relative,"sha256":digest(&out.join(runtime_relative))?,
             "project":"NVIDIA CUTLASS DSL runtime","version":"4.7.0",
-            "license":"NVIDIA Software License Agreement"},"licenses":licenses});
+            "license":"NVIDIA Software License Agreement"}});
     let destination = out.join("manifest.json");
     fs::write(&destination, serde_json::to_vec_pretty(&manifest)?)?;
     bundle::verify(&destination, "aarch64-unknown-linux-gnu", "sm_110", "13.2")?;

@@ -1,5 +1,5 @@
 //! Planning request validation, device input binding and mutable execution state.
-use super::direct::DirectPlan;
+use super::prepare::DirectPlan;
 use super::prepare::GdnGraphs;
 use crate::qwen_drive::{
     backend::{kernels, transfers, tuning, Context, DeviceBuffer},

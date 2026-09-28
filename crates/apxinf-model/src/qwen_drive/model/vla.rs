@@ -81,8 +81,8 @@ impl QwenDriveModel {
         grids: &[[u32; 3]],
         cond: ExpertConditioning,
         steps: usize,
-    ) -> Result<super::blocks::direct::DirectInputs> {
-        super::blocks::direct::DirectInputs::new(
+    ) -> Result<super::DirectInputs> {
+        super::DirectInputs::new(
             &self.backbone,
             &self.planner,
             state,
@@ -97,9 +97,9 @@ impl QwenDriveModel {
     }
     pub(crate) fn forward_direct(
         &self,
-        inputs: &super::blocks::direct::DirectInputs,
+        inputs: &super::DirectInputs,
         state: &mut PlanningState,
-        execution: &mut dyn super::blocks::direct::DirectExecution,
+        execution: &mut dyn super::DirectExecution,
     ) -> Result<Tensor> {
         inputs.forward(&self.backbone, &self.planner, state, execution)
     }

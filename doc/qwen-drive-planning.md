@@ -107,11 +107,11 @@ to the validation limits above.
 
 ## Direct execution ownership
 
-`model_runner/direct.rs` owns whole-model preparation, stable input binding,
-workspace allocation, capture and invalidation. `model/blocks/direct.rs` holds
-the model's direct input representation and execution callback; `bf16.rs` remains
-the single BF16 layer composition. The runner invokes model operations through
-these interfaces. The shared module-boundary check covers this layout.
+`model_runner/prepare.rs` owns whole-model preparation, stable input binding,
+workspace allocation, capture and invalidation. `model/blocks/bf16.rs` holds
+the direct input representation and the single BF16 layer composition.
+`model/blocks/mod.rs` declares the execution callback. The runner invokes model
+operations through these interfaces. The shared module-boundary check covers this layout.
 
 Direct requests use trailing zero-mask padding to 3387 tokens. The logical
 prefix length remains part of prepared-plan compatibility, and action attention

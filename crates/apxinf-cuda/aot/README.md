@@ -11,8 +11,6 @@ It does not import Python, Torch, FlashAttention, FlashInfer, or Quack at runtim
 - `bundle.rs`: artifact integrity, target, toolkit and header checks.
 - `link.rs`: Cargo integration and compatibility checks against the maintained recipes.
 - `exporters/`: Python entry points required to instantiate and compile CuTe DSL.
-- `patches/`: the small upstream interface change needed for split action attention.
-- `licenses/`: upstream notices. Source identity remains recorded in each bundle.
 
 The maintained C++ adapters are in `../adapters/`; safe Rust dispatch belongs in
 `../src/kernels/`. Model code calls these operators through the kernel facade.
@@ -47,13 +45,15 @@ cargo run -p apxinf-cuda --example build-aot -- \
 
 The bundle contains `manifest.json`, one directory per operator with its `.h`
 and `.o`, and `lib/libcute_runtime.a`. Logs and exporter metadata accompany the
-objects. Generated artifacts belong in an external artifact store or ignored
+objects. Upstream sources and their accompanying notices remain external build
+dependencies; keep those notices with any redistributed operator artifacts.
+Generated artifacts belong in an external artifact store or ignored
 `devlocal/`, never in the source diff.
 
 ## Consume a bundle
 
-Install the bundle under `aot/bundle/` for automatic discovery on SM110. This
-ignored directory holds build artifacts. An external bundle can also be selected:
+Pass the manifest of the actual exported artifact directory as a build input.
+There is no reserved bundle directory in the source tree:
 
 ```sh
 APXINF_CUDA_AOT_MANIFEST=/path/to/bundle/manifest.json \

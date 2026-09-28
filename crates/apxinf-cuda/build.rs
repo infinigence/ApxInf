@@ -318,15 +318,8 @@ fn main() {
             }
             let nvcc_arch = Some(selection.nvcc_arch);
             let cutlass_arch = Some(selection.cutlass_arch);
-            let default_aot_manifest =
-                std::path::Path::new(&manifest_dir).join("aot/bundle/manifest.json");
-            println!("cargo:rerun-if-changed={}", default_aot_manifest.display());
-            let aot_manifest = env::var_os("APXINF_CUDA_AOT_MANIFEST")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    (nvcc_arch.as_deref() == Some("sm_110") && default_aot_manifest.is_file())
-                        .then_some(default_aot_manifest)
-                });
+            let aot_manifest =
+                env::var_os("APXINF_CUDA_AOT_MANIFEST").map(std::path::PathBuf::from);
             if nvcc_arch.as_deref() == Some("sm_110") && aot_manifest.is_none() {
                 println!("cargo:warning=SM110 AOT bundle is absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
             }

@@ -6,7 +6,6 @@ Static-check imports no CUDA packages. Actual export requires a GPU flock.
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import site
@@ -19,12 +18,7 @@ from pathlib import Path
 REVISION = "d15f1531a460ba456f41b01a774f33ab2db8febf"
 OFFICIAL_SHA = "144a3dd6f72f955e43834500808c7d47b3b4a76fdcd0b7188f9b459d85007cab"
 GENERAL_SHA = "9d43194751128963a701f0d47b04f68cb6bfd2c8e87e4734d49b33a4cc24d1f2"
-OVERLAY_SHA = "a98db9434170a72277777eb1f1a8b20f7c2ba3a29b6d9fe3b9843f449202659a"
 SYMBOL = "apxinf_fa4_d256_a_splitbatch_sm110"
-
-
-class ExportComplete(Exception):
-    pass
 
 
 def sha256(path: Path) -> str:
@@ -42,16 +36,9 @@ def main() -> None:
     source = args.fa4_src.resolve()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    overlay = out / "interface_split_batch.py"
-    subprocess.run([
-        "patch", "--batch", "--output", str(overlay),
-        str(source / "flash_attn/cute/interface.py"),
-        str(Path(__file__).resolve().parents[1] / "patches" / "fa4-split-batch.patch"),
-    ], check=True)
     checks = {
         "official_interface": (source / "flash_attn/cute/interface.py", OFFICIAL_SHA),
         "general_sm100_forward": (source / "flash_attn/cute/flash_fwd_sm100.py", GENERAL_SHA),
-        "isolated_interface_overlay": (overlay, OVERLAY_SHA),
     }
     for label, (path, expected) in checks.items():
         actual = sha256(path)
@@ -82,7 +69,6 @@ def main() -> None:
         },
     }
     if args.static_check:
-        compile(overlay.read_text(), str(overlay), "exec")
         print(json.dumps({**metadata, "gate": "CPU source and syntax only"}, indent=2))
         return
 
@@ -106,86 +92,51 @@ def main() -> None:
 
     if torch.cuda.get_device_capability() != (11, 0):
         raise SystemExit("SM110 is required")
-    spec = importlib.util.spec_from_file_location("flash_attn.cute.interface_split_batch", overlay)
-    if spec is None or spec.loader is None:
-        raise SystemExit("cannot load isolated FA4 interface")
-    splitbatch = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = splitbatch
-    spec.loader.exec_module(splitbatch)
+    from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
-    original_compile = cute.compile
-    export_record = {}
+    # This is the maintained action configuration, constructed directly rather
+    # than selected through or patched into the upstream inference interface.
+    forward = FlashAttentionForwardSm100(
+        head_dim=256, head_dim_v=256, qhead_per_kvhead=4,
+        is_causal=False, is_local=False, is_split_kv=False, pack_gqa=True,
+        m_block_size=128, n_block_size=128, q_stage=1,
+        is_static_persistent=False,
+    )
 
-    def compile_and_export(*compile_args, **kwargs):
-        if not compile_args or not isinstance(compile_args[0], FlashAttentionForwardSm100):
-            return original_compile(*compile_args, **kwargs)
-        if export_record:
-            raise RuntimeError("more than one specialization requested")
-        original_options = kwargs.pop("options", "")
-        if original_options.strip() != "--enable-tvm-ffi":
-            raise RuntimeError(f"unexpected FA4 compile options: {original_options!r}")
-        forward = compile_args[0]
-        expected = (
-            forward.head_dim_padded == 256 and forward.head_dim_v_padded == 256
-            and forward.qhead_per_kvhead == 4 and forward.pack_gqa
-            and forward.q_stage == 1 and forward.m_block_size == 128
-            and forward.n_block_size == 128 and forward.cta_group_size == 1
-            and not forward.is_static_persistent and not forward.is_split_kv
-        )
-        if not expected:
-            raise RuntimeError("unexpected generic FA4 configuration")
+    @cute.jit
+    def native_forward(
+        q: cute.Tensor, k: cute.Tensor, v: cute.Tensor,
+        out_tensor: cute.Tensor, lse: cute.Tensor,
+        seqused_k: cute.Tensor, scale: cutlass.Float32,
+        stream: cuda.CUstream,
+    ):
+        forward(q, k, v, out_tensor, lse, scale, mSeqUsedK=seqused_k,
+                aux_data=AuxData(), stream=stream)
 
-        @cute.jit
-        def native_forward(
-            q: cute.Tensor, k: cute.Tensor, v: cute.Tensor,
-            out_tensor: cute.Tensor, lse: cute.Tensor,
-            seqused_k: cute.Tensor, scale: cutlass.Float32,
-            stream: cuda.CUstream,
-        ):
-            forward(q, k, v, out_tensor, lse, scale, mSeqUsedK=seqused_k,
-                    aux_data=AuxData(), stream=stream)
-
-        explicit_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        native_args = (
-            native_forward, compile_args[1], compile_args[2], compile_args[3],
-            compile_args[4], compile_args[5], compile_args[10],
-            compile_args[6], explicit_stream,
-        )
-        options = "--gpu-arch sm_110a --host-target linux-aarch64"
-        started = time.monotonic()
-        compiled = original_compile(*native_args, options=options, **kwargs)
-        compiled.export_to_c(file_path=str(out), file_name=SYMBOL, function_prefix=SYMBOL)
-        export_record.update({
-            "compile_options_original": original_options,
-            "compile_options_native": options,
-            "compile_seconds": time.monotonic() - started,
-            "header_sha256": sha256(out / f"{SYMBOL}.h"),
-            "object_sha256": sha256(out / f"{SYMBOL}.o"),
-        })
-        raise ExportComplete
-
-    cute.compile = compile_and_export
-    try:
-        q = torch.empty((2, 50, 16, 256), dtype=torch.bfloat16, device="cuda")
-        # Preserve the accepted compiler specialization. The generated ABI has
-        # dynamic extents/strides, so the adapter can pass 1720-row views with
-        # a 1718-row batch stride and seqused masks. Compiling an example with
-        # 1720 rows changes rounding on real action inputs despite matching
-        # random-input checks.
-        k = torch.empty((2, 1718, 4, 256), dtype=torch.bfloat16, device="cuda")
-        v = torch.empty_like(k)
-        seqused_k = torch.tensor([1718, 1717], dtype=torch.int32, device="cuda")
-        splitbatch.flash_attn_varlen_func(
-            q, k, v, seqused_k=seqused_k, max_seqlen_q=50,
-            max_seqlen_k=1718, softmax_scale=0.0625, causal=False,
-            num_splits=1, pack_gqa=True, return_lse=True,
-        )
-    except ExportComplete:
-        pass
-    finally:
-        cute.compile = original_compile
-    if not export_record:
-        raise RuntimeError("packed generic FA4 compile was not reached")
+    q = torch.empty((2, 50, 16, 256), dtype=torch.bfloat16, device="cuda")
+    # Preserve the accepted 1718-row compiler specialization. Runtime tensor
+    # descriptors admit 1720-row views with a 1718-row batch stride and masks.
+    k = torch.empty((2, 1718, 4, 256), dtype=torch.bfloat16, device="cuda")
+    v = torch.empty_like(k)
+    output = torch.empty_like(q)
+    lse = torch.empty((2, 16, 50), dtype=torch.float32, device="cuda")
+    seqused_k = torch.tensor([1718, 1717], dtype=torch.int32, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    options = "--gpu-arch sm_110a --host-target linux-aarch64"
+    started = time.monotonic()
+    compiled = cute.compile(
+        native_forward, *[to_cute_tensor(t) for t in (q, k, v, output)],
+        to_cute_tensor(lse, assumed_align=4),
+        to_cute_tensor(seqused_k, assumed_align=4, leading_dim=0),
+        0.0625, stream, options=options,
+    )
+    compiled.export_to_c(file_path=str(out), file_name=SYMBOL, function_prefix=SYMBOL)
+    export_record = {
+        "compile_options_native": options,
+        "compile_seconds": time.monotonic() - started,
+        "header_sha256": sha256(out / f"{SYMBOL}.h"),
+        "object_sha256": sha256(out / f"{SYMBOL}.o"),
+    }
     metadata.update(export_record)
     (out / "export-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(json.dumps(metadata, indent=2))
