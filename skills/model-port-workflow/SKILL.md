@@ -109,6 +109,10 @@ and historical GPU evidence do not prove a new family's acceptance.
    rejection, tuning-store replacement/generation, compatible run without
    capture/autotune, input/RNG rebinding and output/resource lifetime. Default
    `RuntimeManaged` status and unsupported policy methods are not readiness.
+   For cuda-new, verify GEMM and Attention cold-cache tuning, fresh-process recipe
+   reuse with autotune disabled, and the public `--autotune`/load-option wiring.
+   Run default-path tests from a task artifact directory to isolate generated
+   `configs/tuning/.../*.recipe` files; never depend on legacy JSON presence.
    Completion: registry loading, native contract, Python policy/public inference
    and family-specific GPU evidence agree in the same change.
 8. Verify operators, transformations, intermediate checkpoints, eager and

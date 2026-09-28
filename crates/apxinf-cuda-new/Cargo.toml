@@ -7,8 +7,7 @@ build = "build.rs"
 
 [features]
 default = []
-# Kept as an empty Cargo capability because the enclosing workspace maps its
-# top-level `cuda` feature to `apxinf-cuda/nvtx`.
+# Kept as an empty Cargo capability for cuda-new-specific profiling builds.
 nvtx = []
 
 [dependencies]

@@ -451,13 +451,7 @@ impl CudaBuffer {
             len: self.len,
             _prevent_leak: Some(Arc::new(self)),
         };
-        // SAFETY: `handle` retains the allocation through `_prevent_leak`, its
-        // CUDA device matches `device`, and callers only construct views after
-        // validating their byte size (see `as_tensor`). Internal kernel output
-        // paths allocate the exact shape/dtype byte count before calling here.
-        unsafe {
-            Tensor::from_raw_parts_unchecked(shape, dtype, device, Storage::Gpu { device, handle })
-        }
+        Tensor::from_raw_parts(shape, dtype, device, Storage::Gpu { device, handle })
     }
 
     /// Borrow this allocation as a tensor while retaining shared ownership.

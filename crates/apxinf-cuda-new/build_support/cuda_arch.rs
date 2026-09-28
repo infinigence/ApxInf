@@ -62,6 +62,7 @@ pub struct ArchSelection {
 pub const DEVICE_FEATURE_NATIVE_FP8: u64 = 1 << 0;
 pub const DEVICE_FEATURE_CUTLASS_SM100: u64 = 1 << 1;
 pub const DEVICE_FEATURE_FA2: u64 = 1 << 2;
+pub const DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU: u64 = 1 << 3;
 
 pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     matches!(
@@ -70,11 +71,14 @@ pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     )
 }
 
-pub fn has_native_fp8(arch: &str) -> bool {
+pub fn has_cublaslt_native_fp8(arch: &str) -> bool {
+    // This feature gates the cuBLASLt native-FP8 candidate, not the GPU's
+    // theoretical tensor-core capability.  Ada (SM89) exposes FP8 hardware,
+    // but the engine layout used by this provider has no executable
+    // cuBLASLt algorithm there.
     matches!(
         arch,
-        "sm_89"
-            | "sm_90"
+        "sm_90"
             | "sm_90a"
             | "sm_100"
             | "sm_100a"
@@ -89,7 +93,7 @@ pub fn has_native_fp8(arch: &str) -> bool {
 
 pub fn target_features(target: &ArchTarget) -> u64 {
     let mut features = 0;
-    if has_native_fp8(&target.nvcc_arch) {
+    if has_cublaslt_native_fp8(&target.nvcc_arch) {
         features |= DEVICE_FEATURE_NATIVE_FP8;
     }
     if is_cutlass_sm100_family(&target.cutlass_arch) {
@@ -97,6 +101,9 @@ pub fn target_features(target: &ArchTarget) -> u64 {
     }
     if target.sm() >= 80 {
         features |= DEVICE_FEATURE_FA2;
+    }
+    if target.cutlass_arch == "sm_89" {
+        features |= DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU;
     }
     features
 }
@@ -394,6 +401,10 @@ mod tests {
                 cutlass_arch: "sm_87".to_owned(),
             },
             ArchTarget {
+                nvcc_arch: "sm_89".to_owned(),
+                cutlass_arch: "sm_89".to_owned(),
+            },
+            ArchTarget {
                 nvcc_arch: "sm_110".to_owned(),
                 cutlass_arch: "sm_110a".to_owned(),
             },
@@ -403,10 +414,27 @@ mod tests {
         assert!(!supports_target(&targets, 87, DEVICE_FEATURE_NATIVE_FP8));
         assert!(supports_target(
             &targets,
+            89,
+            DEVICE_FEATURE_FA2 | DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU
+        ));
+        assert!(!supports_target(
+            &targets,
+            89,
+            DEVICE_FEATURE_CUTLASS_SM100
+        ));
+        assert!(supports_target(
+            &targets,
             110,
             DEVICE_FEATURE_NATIVE_FP8 | DEVICE_FEATURE_CUTLASS_SM100 | DEVICE_FEATURE_FA2
         ));
         assert!(!supports_target(&targets, 120, 0));
+    }
+
+    #[test]
+    fn cublaslt_native_fp8_excludes_sm89() {
+        assert!(!has_cublaslt_native_fp8("sm_89"));
+        assert!(has_cublaslt_native_fp8("sm_90"));
+        assert!(has_cublaslt_native_fp8("sm_110"));
     }
 
     #[test]

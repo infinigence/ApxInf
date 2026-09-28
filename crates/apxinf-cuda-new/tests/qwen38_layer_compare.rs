@@ -497,7 +497,7 @@ fn unfused_mlp(
     dump: &mut RefDump,
     names: (&str, &str, &str, &str, &str, &str),
 ) {
-    ops::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, names.0, &scratch.normalized, HIDDEN);
     ops::nvfp4_quantize_activation(
         ctx, &scratch.normalized, &scratch.nvfp4_activation, &scratch.nvfp4_scales,
@@ -614,7 +614,7 @@ fn gdn_reference_step(
     dump: &mut RefDump,
 ) {
     dump.push_bf16(ctx, "l0_00_hidden_in", &scratch.hidden, HIDDEN);
-    ops::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, "l0_01_input_layernorm", &scratch.normalized, HIDDEN);
 
     fp8_projection(ctx, &gdn.qkv, &scratch.normalized, &scratch.fp8_activation, &mut scratch.gdn_qkv);
@@ -684,7 +684,7 @@ fn attention_reference_step(
     dump: &mut RefDump,
 ) {
     dump.push_bf16(ctx, "l3_00_hidden_in", &scratch.hidden, HIDDEN);
-    ops::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, "l3_01_input_layernorm", &scratch.normalized, HIDDEN);
 
     fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);

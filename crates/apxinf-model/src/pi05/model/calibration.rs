@@ -2,23 +2,61 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Error, Result, Tensor};
-use apxinf_cuda::kernels::gemm::Bf16ActivationObserver;
+use apxinf_core::{Error, Result, Tensor};
 
-use crate::pi05::{backend::RuntimeBackend, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
+use crate::pi05::{backend::{self, Context}, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
 
 pub struct Pi05CalibrationObserver {
-    backend: Arc<RuntimeBackend>,
+    backend: Arc<Context>,
     sites: HashMap<usize, String>,
     plan: Pi05CalibrationPlan,
     records: RefCell<BTreeMap<String, f32>>,
 }
 
+thread_local! {
+    static BF16_OBSERVER: RefCell<Option<Rc<Pi05CalibrationObserver>>> =
+        const { RefCell::new(None) };
+}
+
+struct Bf16ObserverGuard;
+
+impl Drop for Bf16ObserverGuard {
+    fn drop(&mut self) {
+        BF16_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+fn install_bf16_observer(observer: Rc<Pi05CalibrationObserver>) -> Result<Bf16ObserverGuard> {
+    BF16_OBSERVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return Err(Error::Other(
+                "a PI0.5 BF16 activation observer is already installed".into(),
+            ));
+        }
+        *slot = Some(observer);
+        Ok(Bf16ObserverGuard)
+    })
+}
+
+pub(in crate::pi05::model) fn observe_bf16_activation(
+    activation: &Tensor,
+    weight: &Tensor,
+) -> Result<()> {
+    BF16_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.observe(activation, weight)?;
+        }
+        Ok(())
+    })
+}
+
 impl Pi05CalibrationObserver {
     pub fn new(
-        backend: Arc<RuntimeBackend>,
+        backend: Arc<Context>,
         config: &Pi05Config,
         weights: &Bf16Weights,
     ) -> Result<Self> {
@@ -121,7 +159,7 @@ impl Pi05CalibrationObserver {
     }
 }
 
-impl Bf16ActivationObserver for Pi05CalibrationObserver {
+impl Pi05CalibrationObserver {
     fn observe(&self, activation: &Tensor, weight: &Tensor) -> Result<()> {
         let pointer = weight
             .storage()
@@ -133,7 +171,7 @@ impl Bf16ActivationObserver for Pi05CalibrationObserver {
         };
         // The host vector is scoped to this reduction and dropped immediately;
         // the collector retains only one scalar per logical site.
-        let values = self.backend.to_cpu(activation)?.to_f32_vec()?;
+        let values = backend::to_cpu(activation)?.to_f32_vec()?;
         let amax = finite_amax(values, name)?;
         let mut records = self.records.borrow_mut();
         records
@@ -182,15 +220,14 @@ impl Pi05Model<Bf16Blocks> {
         noise: &Tensor,
         embeddings: &[Tensor],
     ) -> Result<std::collections::BTreeMap<String, f32>> {
-        use apxinf_core::Backend;
-        let observer = std::rc::Rc::new(Pi05CalibrationObserver::new(
+        let observer = Rc::new(Pi05CalibrationObserver::new(
             self.blocks.backend.clone(),
             &self.blocks.config,
             &self.blocks.weights,
         )?);
-        let _guard = crate::pi05::backend::kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard = install_bf16_observer(observer.clone())?;
         self.infer(patches, ids, count, noise, embeddings)?;
-        self.blocks.backend.synchronize()?;
+        backend::synchronize(&self.blocks.backend)?;
         observer.records()
     }
 }

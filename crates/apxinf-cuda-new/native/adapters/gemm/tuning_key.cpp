@@ -65,6 +65,7 @@ std::string common_key(const Spec& spec,
       << alignment_class(spec.a_alignment, 32) << '|'
       << alignment_class(spec.b_alignment, 32) << '|'
       << alignment_class(spec.bias_alignment, 32) << '|'
+      << alignment_class(spec.residual_alignment, 32) << '|'
       << alignment_class(spec.a_scales_alignment, 32) << '|'
       << alignment_class(spec.b_scales_alignment, 32) << '|'
       << alignment_class(spec.a_block_scales_alignment, 32) << '|'

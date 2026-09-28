@@ -18,6 +18,9 @@ serde_json = "1"
 [features]
 default = []
 cuda = ["dep:apxinf-cuda", "dep:apxinf-cuda-new"]
+# Focused migration/qualification build. Other model families remain excluded
+# until their executors call cuda-new L3 directly as PI0.5 now does.
+pi05-only = ["cuda"]
 
 [[example]]
 name = "pi05_bench"

@@ -48,7 +48,6 @@ pub const cudaHostAllocWriteCombined: u32 = 4;
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
-
     /// Allocate page-locked (pinned) host memory. With `cudaHostAllocMapped`
     /// the buffer is also directly accessible from the GPU via
     /// `cudaHostGetDevicePointer` — on unified-memory GPUs (Tegra/Thor) this
@@ -122,6 +121,7 @@ extern "C" {
     pub fn cudaStreamEndCapture(stream: cudaStream_t, pGraph: *mut *mut c_void) -> cudaError_t;
 
     pub fn cudaGetLastError() -> cudaError_t;
+    pub fn cudaPeekAtLastError() -> cudaError_t;
     pub fn cudaGetErrorString(error: cudaError_t) -> *const std::ffi::c_char;
 
     pub fn cudaSetDevice(device: i32) -> cudaError_t;

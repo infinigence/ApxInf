@@ -1,4 +1,4 @@
-//! Persistent graph memory and session-owned native executions.
+//! Persistent graph memory and session-owned prepared native executions.
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
@@ -108,8 +108,9 @@ impl ExecutionSessionInner {
     }
 }
 
-/// Owns reusable native executions for one eager/capture/replay session.
-/// Its typed cache is operator-independent.
+/// Owns reusable prepared resources for one eager/capture/replay session.
+/// Only operators with real prepare state (currently GEMM and Attention) use
+/// the typed cache and prepared sequence. Stateless operators launch directly.
 #[derive(Clone)]
 pub struct ExecutionSession {
     inner: Rc<ExecutionSessionInner>,
@@ -133,6 +134,23 @@ impl ExecutionSession {
 
     pub fn workspace(&self) -> &GraphWorkspace {
         &self.inner.workspace
+    }
+
+    /// Traverse the real execution once before graph capture.
+    ///
+    /// This allocates deterministic workspace slices, prepares native resources,
+    /// and records the order of prepared operators. Stateless operators execute
+    /// directly and do not enter the cache or sequence.
+    pub fn prepare<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        prepare_with_session(self, operation)
+    }
+
+    /// Execute a traversal using resources installed by [`Self::prepare`].
+    ///
+    /// During CUDA graph capture this rejects missing or reordered operator
+    /// executions instead of creating plans or tuning candidates in capture.
+    pub fn run<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        with_session(self, operation)
     }
 }
 
@@ -322,4 +340,25 @@ pub(crate) fn retain_resource<T: Any>(resource: &Rc<T>) {
             resources.push(resource);
         }
     });
+}
+
+/// Session-aware allocation for direct-launch operators. During an
+/// execution session it sub-allocates deterministically from the session
+/// arena; eager calls own a zeroed allocation directly.
+pub(crate) fn output_buffer(ctx: &crate::CudaContext, bytes: usize) -> Result<CudaBuffer> {
+    ACTIVE_SESSION.with(|active| {
+        let inner = active.get();
+        if inner.is_null() {
+            // The runtime stream is deliberately non-blocking, so a memset on
+            // the legacy default stream is not ordered before the operator
+            // that consumes this output. Keep initialization on the same
+            // stream to prevent a late memset from erasing kernel results.
+            CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream())
+                .map_err(Error::Cuda)
+        } else {
+            unsafe { &*inner }
+                .workspace
+                .allocate(bytes, ctx.device_id())
+        }
+    })
 }

@@ -308,6 +308,21 @@ suite.
 
 ## PI0.5 migration pilot
 
+`LoadOptions.autotune` controls cuda-new GEMM and Attention tuning on recipe misses;
+the standalone `pi05_bench --autotune` controls the same behavior through its
+context. Both default to cache reuse/fallback without benchmarking. With no
+explicit recipe directory, the backend uses the shared hardware/toolkit tuning
+directory alongside legacy `tactics.json`, but never reads that JSON. Directory
+selection is independent of the JSON's existence. See `configs/tuning/README.md`.
+
+Static-FP8 preparation preserves the legacy quantization sequence: compute one
+absmax scale on the original host values for each packed projection group,
+round those values to FP16, upload them, then call cuda-new's
+`FixedScaleE4m3` GPU operator. Do not replace it with direct host F32-to-FP8
+encoding: that changes the rounding contract. The model-owned regression
+`gpu_weight_quantization_matches_legacy_bytes` checks this boundary against
+the legacy GPU implementation; the legacy dependency is test-only here.
+
 PI0.5 uses one statically dispatched `Pi05Model` with bf16/fp8_static/int8_dynamic
 Blocks. `load.rs` selects model_variant and materializes fixed assets;
 `model_runner/runner.rs` owns private request state and plan validity;

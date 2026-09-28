@@ -52,6 +52,18 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
 | Reference test | `gemm_bias_all_candidates_match_torch` |
 
+<!-- l3-operator:gemm_bias_residual -->
+### `gemm_bias_residual`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_bias_residual(ctx, GemmBiasResidualArgs { gemm, bias, residual })` |
+| Inputs | `A=[M,K]`, `B=[K,N]`, optional `bias=[N]`, `residual=[M,N]`; supports `Fp8UnitScale` only |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = alpha * projection(A,B) + bias + residual`, with bias broadcast across M |
+| Constraints | Requires unit-scale FP8 inputs and F16 output; bias and residual dtypes match the projection dtype; the residual must not alias the output |
+| Reference test | `zero_weight_language_layer_is_residual_identity` (model-level; candidate parity is covered by the tuner's capture-replay output validation) |
+
 <!-- l3-operator:gemm_bias_gelu -->
 ### `gemm_bias_gelu`
 
@@ -74,7 +86,8 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = GELU_tanh(alpha*(A@B_gate)) * (alpha*(A@B_up)) / output_scale` |
 | Constraints | The second dimension of B is even; FP8 with row/channel scales and W8A8 are unsupported; candidate-specific packing may occur only internally |
-| Reference test | `gemm_geglu_all_candidates_match_torch` |
+| FP8 candidates | Vendor decomposition (FP16 projection for E4M3 output); dual-GeGLU at M522/M533; SM100-family split-GeGLU at M778, 2N32768, K2048; eligible decomposed candidates remain available to autotune |
+| Reference tests | `gemm_geglu_all_candidates_match_torch`, `gemm_geglu_three_view_all_candidates_match_torch` (unit/non-unit scales, eager/graph) |
 
 ## Shared Attention Contract
 

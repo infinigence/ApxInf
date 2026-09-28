@@ -14,7 +14,7 @@ inside that test instead of organizing tests by dtype.
 
 Resolve source and docs in the checkout being modified. This skill applies to
 `crates/apxinf-cuda-new/` L3 semantics and candidate tests. The current PI0.5
-`model`/Blocks and `model_runner` path uses `apxinf-cuda`; passing an L3 candidate
+`model`/Blocks and `model_runner` path uses `apxinf-cuda-new`; passing an L3 candidate
 test does not prove that a model calls it. For model integration, follow
 `doc/model-execution-wiring.md` and trace the actual safe call and backend.
 
