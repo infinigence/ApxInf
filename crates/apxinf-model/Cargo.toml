@@ -8,6 +8,7 @@ license = "Apache-2.0"
 apxinf-core = { path = "../apxinf-core" }
 apxinf-cuda = { path = "../apxinf-cuda", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
+apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
 thiserror = "1"
 once_cell = "1"
@@ -22,6 +23,9 @@ cuda-new = ["cuda", "dep:apxinf-cuda-new"]
 # Focused migration/qualification build. Other model families remain excluded
 # until their executors call cuda-new L3 directly as PI0.5 now does.
 pi05-only = ["cuda"]
+# AMD ROCm/HIP inference, independent of both CUDA features: either, both or
+# neither can be enabled.
+hip = ["dep:apxinf-hip"]
 
 [[example]]
 name = "pi05_bench"

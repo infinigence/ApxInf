@@ -73,6 +73,7 @@ version = "0.1.0"
 dependencies = [
  "apxinf-core",
  "apxinf-cuda",
+ "apxinf-hip",
  "apxinf-loader",
  "apxinf-model",
  "apxinf-tokenizer",
@@ -115,6 +116,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-hip"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+]
+
+[[package]]
 name = "apxinf-loader"
 version = "0.1.0"
 dependencies = [
@@ -136,6 +144,7 @@ dependencies = [
  "apxinf-core",
  "apxinf-cuda",
  "apxinf-cuda-new",
+ "apxinf-hip",
  "apxinf-loader",
  "half",
  "once_cell",

@@ -29,11 +29,18 @@ pub use tensor::Tensor;
 pub enum Device {
     Cpu,
     Cuda(usize),
+    /// An AMD GPU addressed through ROCm/HIP.
+    ///
+    /// Separate from `Cuda` so a tensor records which runtime owns its
+    /// allocation, and so both backends can exist in one process. The CUDA
+    /// crates reject it through the fallback arm they already have for
+    /// non-CUDA devices.
+    Hip(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_))
+        matches!(self, Device::Cuda(_) | Device::Hip(_))
     }
 }
 
@@ -42,6 +49,7 @@ impl std::fmt::Display for Device {
         match self {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
+            Device::Hip(id) => write!(f, "hip:{id}"),
         }
     }
 }

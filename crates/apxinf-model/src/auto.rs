@@ -333,8 +333,13 @@ impl AutoModel {
         if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
             configure_cuda_tuning(cuda, path, options)?;
         }
+        // Families may register a device-specific factory (`pi05-cuda`) and
+        // fall back to a generic one (`qwen3vl`). No `-hip` factory exists yet,
+        // so HIP resolves to the generic entry, which is what the models that
+        // compose through `dyn Backend` need.
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
+            Device::Hip(_) => Some("hip"),
             Device::Cpu => None,
         };
 

@@ -131,9 +131,10 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     };
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
+        "hip" => Ok(Device::Hip(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|cpu)"
         ))),
     }
 }
@@ -1756,6 +1757,7 @@ impl ModelRunner {
     fn device(&self) -> String {
         match self.device {
             Device::Cuda(index) => format!("cuda:{index}"),
+            Device::Hip(index) => format!("hip:{index}"),
             Device::Cpu => "cpu".to_string(),
         }
     }
@@ -1841,6 +1843,8 @@ mod tests {
     #[test]
     fn parses_device_forms() {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
+        assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
+        assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
         assert!(parse_device("tpu").is_err());
