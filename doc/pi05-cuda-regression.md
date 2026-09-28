@@ -79,114 +79,74 @@ Deterministically reconstruct 224 x 224 NHWC `uint8` images from the normalized 
 | 2 | Real LIBERO workload: base camera + wrist camera |
 | 3 | Three-camera production-shape workload; not an official LIBERO camera configuration |
 
-Run three-view performance tests only. Do not use three views for LIBERO task-suite accuracy evaluation.
+Use three views with LIBERO weights only for performance or numerical parity tests. Do not treat those runs as LIBERO task-suite accuracy results.
 
-### OpenPI model and policy parity suite
+### OpenPI parity suite
 
-`scripts/compare_pi05_openpi.py` checks PI0.5 outputs against the official
-OpenPI implementation with identical checkpoint bytes, observations, explicit
-flow noise, horizon, and flow-step count. The default `bare` mode compares all
-32 normalized action channels using the official PyTorch model, including with
-the LeRobot PI0.5 checkpoint. `--interface policy` instead compares deployed
-actions when the checkpoint is compatible with OpenPI's policy loader. Run the
-OpenPI and ApxInf stages in their own Python environments; they share saved
-inputs, not a GPU process. The default suite has seven cases: one baseline
-observation, a second scene or noise draw, a long instruction, dark images with
-zero noise, bright images with negated noise, float CHW images (with a non-square
-view in policy mode), and distinct per-view colors to catch camera ordering
-errors. Supply one or two real
-observation NPZ files for a representative regression. Each NPZ must contain
-the named image keys and state key. Bare mode requires already resized
-224 × 224 RGB images; policy mode accepts raw policy input images. Omitting
-real observations marks the report synthetic.
+`scripts/compare_pi05_openpi.py` checks the normalized `[H, 32]` PI0.5 output
+against official OpenPI PyTorch. Both engines read the same `model.safetensors`,
+saved images, token IDs, flow noise, horizon, and flow-step count. The seven
+bounded cases cover a second scene or noise draw, long language, dark and
+bright images, zero and negative noise, float CHW images, and camera ordering.
+A suite without `--source-npz` is marked synthetic.
 
 ```bash
 python scripts/compare_pi05_openpi.py prepare \
-  --suite-dir devlocal/pi05-openpi-parity/libero \
-  --source-npz /path/to/libero_observation.npz
-
-# Run from an environment with the official OpenPI source and dependencies.
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --image-keys base,left,right --horizon 10
 python scripts/compare_pi05_openpi.py openpi \
-  --suite-dir devlocal/pi05-openpi-parity/libero \
-  --checkpoint-dir /path/to/pi05_libero
-
-# Run from an environment with the ApxInf CUDA binding.
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --checkpoint-dir /path/to/pi05_base
 python scripts/compare_pi05_openpi.py apxinf \
-  --suite-dir devlocal/pi05-openpi-parity/libero \
-  --checkpoint-dir /path/to/pi05_libero --precision fp8
-
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --checkpoint-dir /path/to/pi05_base --precision bf16
 python scripts/compare_pi05_openpi.py compare \
-  --suite-dir devlocal/pi05-openpi-parity/libero
+  --suite-dir devlocal/pi05-openpi-parity/base-3view
 ```
 
-Bare mode requires the official OpenPI source on `PYTHONPATH`, PyTorch,
-`transformers==4.53.2`, `safetensors`, and the checkpoint's model dependencies.
-Policy mode additionally needs the OpenPI client package and the full OpenPI
-policy dependency set (including `tqdm-loggable`). Use OpenPI's pinned lockfile
-for that mode. ApxInf mode requires a CUDA-enabled `apxinf_py` build and its
-Python package. For FP8 when calibration is stored separately, add
-`--calibration /path/to/calibration.json` to the ApxInf stage; the report records
-its SHA256. The report gives per-case cosine, relative L2, and maximum absolute
-error. Its default FP8 gate starts at cosine >= 0.997 and relative L2 <= 0.10,
-using the existing model-level FP8 reference thresholds as an initial gate;
-calibrate tighter limits against known-good runs for each checkpoint. Use a
-separate suite per checkpoint/configuration; set `--image-keys`, `--state-key`, `--state-dim`,
-`--action-dim`, `--horizon`, and `--discrete-state` to match the selected mode.
-The LIBERO policy configuration expects two input cameras. Bare mode supports
-one to three active views up to the checkpoint's declared camera count; policy
-mode needs an OpenPI configuration that reads the corresponding cameras.
-Duplicating a LIBERO wrist image does not establish three-camera correctness.
-The script records the OpenPI checkout revision when available and rejects different checkpoint or
-input hashes. Generated suites and reports stay under ignored `devlocal/`.
+For real images, pass one or two `--source-npz` files to `prepare`; each needs
+arrays named by `--image-keys`, already resized to 224 × 224 RGB. Change only
+the image keys, checkpoint path, horizon, and precision for another configuration.
+The report checks input and weight hashes and gives cosine, relative L2, and
+maximum absolute error per case. Its initial gate is cosine >= 0.997 and
+relative L2 <= 0.10. Keep failed cases visible; a pass on synthetic inputs does
+not establish robot-task accuracy.
 
-For a **numerical-only** three-view check when only a two-camera checkpoint
-is available, create an ignored checkpoint overlay that reuses the original
-weights and declares a third visual input. This tests the implementation on
-three active views; it does not claim that the checkpoint was trained for a
-third camera. Use the overlay as `--checkpoint-dir` for both engines and prepare
-the suite with three `--image-keys`:
-
-```bash
-python - <<'PYTHON'
-import copy
-import json
-from pathlib import Path
-
-source = Path("/path/to/two-view-checkpoint").resolve()
-overlay = Path("devlocal/pi05-openpi-parity/three-view-overlay").resolve()
-overlay.mkdir(parents=True, exist_ok=True)
-for item in source.iterdir():
-    if item.name != "config.json" and not (overlay / item.name).exists():
-        (overlay / item.name).symlink_to(item)
-config = json.loads((source / "config.json").read_text())
-visual = next(value for value in config["input_features"].values()
-              if value["type"] == "VISUAL")
-config["input_features"]["observation.images.image3"] = copy.deepcopy(visual)
-config["num_views"] = 3
-config["empty_cameras"] = 0
-(overlay / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-PYTHON
-```
-
-A real three-camera candidate is
-[`lerobot/pi05_base`](https://huggingface.co/lerobot/pi05_base/blob/main/config.json):
-its config declares three `VISUAL` inputs and its PyTorch safetensors weights
-are a candidate for bare-mode testing; this checkpoint has not yet been run on Thor. The official OpenPI
+[`lerobot/pi05_base`](https://huggingface.co/lerobot/pi05_base/blob/main/config.json)
+is a real three-camera checkpoint with PyTorch safetensors. The official OpenPI
 [`pi05_base`](https://github.com/Physical-Intelligence/openpi/blob/main/README.md#base-models)
-is also available as a JAX checkpoint and needs conversion for this PyTorch
-comparison. The LeRobot base package does not include the PaliGemma
-SentencePiece file; set `APXINF_TOKENIZER` to the same tokenizer used for the
-other PI0.5 checkpoints. FP8 needs a calibration profile for these weights and
-three-view inputs.
+is JAX-format and needs conversion for this comparison. OpenPI mode needs the
+official source on `PYTHONPATH`, a compatible CUDA PyTorch build,
+`transformers==4.53.2` with OpenPI's `transformers_replace` files,
+`safetensors`, and the OpenPI import dependencies (including JAX/Flax,
+`augmax`, and `dm-tree`). ApxInf mode needs the CUDA-enabled `apxinf_py`
+binding. Run the two inference stages in separate environments. FP8 requires
+a calibration profile generated for the **same weights and view count**; pass
+its path with `--calibration`. ApxInf's random FP8 benchmark uses
+`uniform:1.0` to measure latency, but its internal synthetic weights cannot
+be compared to OpenPI.
 
-A random checkpoint is usable only if both implementations load the **same**
-valid tensors and configuration. ApxInf's `bench_pi05.py` random mode runs
-`fp8_static` with `uniform:1.0` as a synthetic scale, but that mode generates
-Rust-only weights and tests latency rather than
-OpenPI cosine parity. For a random-weight parity test, export one shared
-checkpoint in OpenPI's PyTorch format; compare BF16 first, then calibrate FP8
-against its own inputs. A two-view FP8 calibration profile is not evidence for
-a three-view result.
+Thor3 validation on 2026-09-28 used `lerobot/pi05_base` revision
+`b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba` (weight SHA256
+`0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f`),
+OpenPI revision `215abfb217dbac7d5f1273282331b9b1866c0479`, `H=10`, ten
+flow steps, and seven synthetic cases. The fixed gate was cosine >= 0.997
+and relative L2 <= 0.10.
+
+| Active views | ApxInf precision | Passed | Failed case (cosine / relative L2) |
+|---:|---|---:|---|
+| 1 | BF16 | 6/7 | Dark image + zero noise: 0.97222 / 0.30955 |
+| 2 | BF16 | 6/7 | View-order contrast: 0.99113 / 0.18798 |
+| 3 | BF16 | 7/7 | None; minimum cosine 0.99927 |
+| 3 | FP8 | 4/7 | Dark + zero noise: 0.99127 / 0.18822; bright + negative noise: 0.97100 / 0.42063; view-order contrast: 0.98706 / 0.22440 |
+
+The three-view FP8 profile used seven synthetic observations from the same
+suite, so its result diagnoses this calibration and implementation path; it
+does not establish production FP8 accuracy. A separate genuine two-view
+LIBERO checkpoint passed 7/7 BF16 cases on Thor2. The one- and two-view
+`pi05_base` runs reduce the active camera count of a three-camera checkpoint
+and should be read as camera-mask corner tests. Full reports and inputs are
+kept under ignored `devlocal/pi05-openpi-parity/`.
 
 ## 5. Execution paths
 
