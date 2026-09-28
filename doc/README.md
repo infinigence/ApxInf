@@ -25,6 +25,11 @@ Qwen-Drive follows the same `model/`, `model_runner/`, `weights/` separation as 
 planning-only VLA runtime. Its [benchmark and validation guide](qwen-drive-benchmark.md)
 records measured performance, accuracy, reproduction steps and runtime limits.
 
+Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
+`weights`/`model`/`model_runner` owners as single files. [Running real
+inference through the CLI, benchmarking and current limits](qwen38-nvfp4.md)
+cover Jetson Thor.
+
 ## Agent workflows
 
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.

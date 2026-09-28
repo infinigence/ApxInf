@@ -33,7 +33,9 @@ template <
     typename ElementAccumulator_,
     typename ElementCompute_,
     typename ElementwiseFunctor_,
-    bool UseMasking_ = false>
+    bool UseMasking_ = false,
+    bool RoundBeforeBias_ = false,
+    bool ApplyGelu_ = false>
 class EpilogueVisitorPerRowPerCol {
  public:
   using ThreadblockShape = ThreadblockShape_;
@@ -242,9 +244,30 @@ class EpilogueVisitorPerRowPerCol {
     }
 
     if (with_bias_) {
+      if constexpr (RoundBeforeBias_) {
+        // Match a materialized BF16 GEMM output followed by the standalone
+        // BF16 bias kernel. Preserve that materialization boundary when
+        // fusing the two operations.
+        NumericArrayConverter<ElementOutput, ElementCompute, kElementsPerAccess>
+            output_converter;
+        NumericArrayConverter<ElementCompute, ElementOutput, kElementsPerAccess>
+            compute_converter;
+        result = compute_converter(output_converter(result));
+      }
       NumericArrayConverter<ElementCompute, ElementOutput, kElementsPerAccess> bias_converter;
       OutputVector bias = reinterpret_cast<OutputVector*>(&fragment_C_)[column_idx];
       result = bias_accumulator_(result, bias_converter(bias));
+    }
+
+    if constexpr (ApplyGelu_) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < ComputeFragment::kElements; ++i) {
+        ElementCompute const x = result[i];
+        result[i] = ElementCompute(0.5f) * x *
+            (ElementCompute(1.0f) + tanhf(
+                ElementCompute(0.7978845608028654f) *
+                (x + ElementCompute(0.044715f) * x * x * x)));
+      }
     }
 
     // Convert to the output

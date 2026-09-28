@@ -6,6 +6,7 @@
 #define CUTLASS_ARCH_MMA_SM100A_ENABLED 1
 #endif
 
+#include <cuda_bf16.h>
 #include "fp8_operators_sm100.h"
 
 #include <cuda_runtime.h>
@@ -101,6 +102,176 @@ struct GeGluOperation : cutlass::epilogue::fusion::FusionOperation {
   static constexpr bool IsSourceSupported = true;
 };
 
+struct BiasGeluQuantArguments {
+  float alpha = 1.0f;
+  float inverse_scale = 1.0f;
+};
+
+template <class T>
+struct ProductionBiasGeluQuant;
+
+template <>
+struct ProductionBiasGeluQuant<float> {
+  using Arguments = BiasGeluQuantArguments;
+
+  CUTLASS_DEVICE float operator()(
+      float const& bias, float const& accumulator,
+      Arguments const& arguments) const {
+    // Match the shipped composed path: the GEMM projection is first rounded
+    // to BF16, GELU consumes the BF16 projection and bias, and GELU is rounded
+    // to BF16 before static E4M3 quantization.
+    const float projection = __bfloat162float(
+        __float2bfloat16_rn(accumulator * arguments.alpha));
+    const float value = projection + bias;
+    constexpr float kAlpha = 0.7978845608028654f;
+    const float gelu = 0.5f * value *
+        (1.0f + tanhf(kAlpha *
+            (value + 0.044715f * value * value * value)));
+    const float rounded_gelu =
+        __bfloat162float(__float2bfloat16_rn(gelu));
+    return rounded_gelu * arguments.inverse_scale;
+  }
+};
+
+template <class T, int N>
+struct ProductionBiasGeluQuant<cutlass::Array<T, N>> {
+  using Arguments = BiasGeluQuantArguments;
+
+  CUTLASS_DEVICE cutlass::Array<T, N> operator()(
+      cutlass::Array<T, N> const& bias,
+      cutlass::Array<T, N> const& accumulator,
+      Arguments const& arguments) const {
+    cutlass::Array<T, N> output;
+    CUTLASS_PRAGMA_UNROLL
+    for (int index = 0; index < N; ++index) {
+      const float projection = __bfloat162float(
+          __float2bfloat16_rn(accumulator[index] * arguments.alpha));
+      const float value = projection + bias[index];
+      constexpr float kAlpha = 0.7978845608028654f;
+      const float gelu = 0.5f * value *
+          (1.0f + tanhf(kAlpha *
+              (value + 0.044715f * value * value * value)));
+      const float rounded_gelu =
+          __bfloat162float(__float2bfloat16_rn(gelu));
+      output[index] = rounded_gelu * arguments.inverse_scale;
+    }
+    return output;
+  }
+};
+
+template <class TileShape>
+struct BiasGeluQuantEVT : cutlass::epilogue::fusion::Sm90EVT<
+    cutlass::epilogue::fusion::Sm90Compute<
+        ProductionBiasGeluQuant, cutlass::float_e4m3_t, float,
+        cutlass::FloatRoundStyle::round_to_nearest>,
+    cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, cutlass::bfloat16_t, float, Stride<_0, _1, _0>>,
+    cutlass::epilogue::fusion::Sm90AccFetch> {
+  using Base = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          ProductionBiasGeluQuant, cutlass::float_e4m3_t, float,
+          cutlass::FloatRoundStyle::round_to_nearest>,
+      cutlass::epilogue::fusion::Sm90RowBroadcast<
+          0, TileShape, cutlass::bfloat16_t, float, Stride<_0, _1, _0>>,
+      cutlass::epilogue::fusion::Sm90AccFetch>;
+  using Base::Base;
+};
+
+struct BiasGeluQuantOperation : cutlass::epilogue::fusion::FusionOperation {
+  using ElementOutput = cutlass::float_e4m3_t;
+  using ElementCompute = float;
+  using ElementSource = void;
+  static constexpr bool IsSourceSupported = false;
+};
+
+struct BiasThenResidualArguments {
+  float alpha = 1.0f;
+};
+
+template <class T>
+struct ProductionBiasThenResidual;
+
+template <>
+struct ProductionBiasThenResidual<float> {
+  using Arguments = BiasThenResidualArguments;
+
+  CUTLASS_DEVICE float operator()(
+      float const& accumulator, float const& bias, float const& residual,
+      Arguments const& arguments) const {
+    const __nv_bfloat16 projection =
+        __float2bfloat16_rn(accumulator * arguments.alpha);
+    const __nv_bfloat16 biased = __float2bfloat16_rn(
+        __bfloat162float(projection) + bias);
+    return __bfloat162float(biased) + residual;
+  }
+};
+
+template <class T, int N>
+struct ProductionBiasThenResidual<cutlass::Array<T, N>> {
+  using Arguments = BiasThenResidualArguments;
+
+  CUTLASS_DEVICE cutlass::Array<T, N> operator()(
+      cutlass::Array<T, N> const& accumulator,
+      cutlass::Array<T, N> const& bias,
+      cutlass::Array<T, N> const& residual,
+      Arguments const& arguments) const {
+    cutlass::NumericArrayConverter<
+        cutlass::bfloat16_t, T, N,
+        cutlass::FloatRoundStyle::round_to_nearest> to_bf16;
+    cutlass::NumericArrayConverter<
+        T, cutlass::bfloat16_t, N,
+        cutlass::FloatRoundStyle::round_to_nearest> to_compute;
+    cutlass::Array<T, N> projection;
+    CUTLASS_PRAGMA_UNROLL
+    for (int index = 0; index < N; ++index) {
+      projection[index] = accumulator[index] * arguments.alpha;
+    }
+    projection = to_compute(to_bf16(projection));
+    cutlass::Array<T, N> biased;
+    CUTLASS_PRAGMA_UNROLL
+    for (int index = 0; index < N; ++index) {
+      biased[index] = projection[index] + bias[index];
+    }
+    biased = to_compute(to_bf16(biased));
+    cutlass::Array<T, N> output;
+    CUTLASS_PRAGMA_UNROLL
+    for (int index = 0; index < N; ++index) {
+      output[index] = biased[index] + residual[index];
+    }
+    return output;
+  }
+};
+
+template <class TileShape>
+struct BiasThenResidualEVT : cutlass::epilogue::fusion::Sm90EVT<
+    cutlass::epilogue::fusion::Sm90Compute<
+        ProductionBiasThenResidual, cutlass::bfloat16_t, float,
+        cutlass::FloatRoundStyle::round_to_nearest>,
+    cutlass::epilogue::fusion::Sm90AccFetch,
+    cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0, TileShape, cutlass::bfloat16_t, cutlass::bfloat16_t,
+        Stride<_0, _1, _0>>,
+    cutlass::epilogue::fusion::Sm90SrcFetch<cutlass::bfloat16_t>> {
+  using Base = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          ProductionBiasThenResidual, cutlass::bfloat16_t, float,
+          cutlass::FloatRoundStyle::round_to_nearest>,
+      cutlass::epilogue::fusion::Sm90AccFetch,
+      cutlass::epilogue::fusion::Sm90RowBroadcast<
+          0, TileShape, cutlass::bfloat16_t, cutlass::bfloat16_t,
+          Stride<_0, _1, _0>>,
+      cutlass::epilogue::fusion::Sm90SrcFetch<cutlass::bfloat16_t>>;
+  using Base::Base;
+};
+
+struct BiasThenResidualOperation : cutlass::epilogue::fusion::FusionOperation {
+  using ElementOutput = cutlass::bfloat16_t;
+  using ElementCompute = float;
+  using ElementSource = cutlass::bfloat16_t;
+  static constexpr bool IsSourceSupported = true;
+  static constexpr bool IsResidualSupported = true;
+};
+
 }  // namespace apxinf_cuda_cutlass_detail
 
 namespace cutlass::epilogue::fusion {
@@ -112,6 +283,28 @@ struct FusionCallbacksTraits<apxinf_cuda_cutlass_detail::GeGluEVT> {
   using CtaTile_MNK = void;
   using EpilogueTile_MN = void;
   using ElementCompute = apxinf_cuda_cutlass_detail::ElementCompute;
+};
+template <class TileShape>
+struct FusionCallbacksTraits<
+    apxinf_cuda_cutlass_detail::BiasThenResidualEVT<TileShape>> {
+  using DispatchPolicy = void;
+  using Callbacks =
+      apxinf_cuda_cutlass_detail::BiasThenResidualEVT<TileShape>;
+  using Operation = apxinf_cuda_cutlass_detail::BiasThenResidualOperation;
+  using CtaTile_MNK = void;
+  using EpilogueTile_MN = void;
+  using ElementCompute = float;
+};
+template <class TileShape>
+struct FusionCallbacksTraits<
+    apxinf_cuda_cutlass_detail::BiasGeluQuantEVT<TileShape>> {
+  using DispatchPolicy = void;
+  using Callbacks =
+      apxinf_cuda_cutlass_detail::BiasGeluQuantEVT<TileShape>;
+  using Operation = apxinf_cuda_cutlass_detail::BiasGeluQuantOperation;
+  using CtaTile_MNK = void;
+  using EpilogueTile_MN = void;
+  using ElementCompute = float;
 };
 }  // namespace cutlass::epilogue::fusion
 
@@ -170,6 +363,118 @@ struct Fp8Gemm {
   using Kernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Device = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+// Private exact-shape GR00T DiT FC2 kernel. The fixed schedule is standalone
+// tactic 4: M64xN128xK128, cluster 1x1x1, three mainloop stages, and explicit
+// one-SM mainloop/epilogue schedules.
+struct Fp8GemmBiasThenResidualBf16M41 {
+  using TileShape = Shape<_64, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using ElementInput = cutlass::float_e4m3_t;
+  using ElementOutput = cutlass::bfloat16_t;
+  using ElementAccumulator = float;
+  using Layout = cutlass::layout::RowMajor;
+  static constexpr int AlignmentInput = 16;
+  static constexpr int AlignmentOutput = 8;
+
+  using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0, TileShape, ElementOutput, ElementOutput, Stride<_0, _1, _0>>;
+  using FusionOperation =
+      apxinf_cuda_cutlass_detail::BiasThenResidualEVT<TileShape>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100,
+      cutlass::arch::OpClassTensorOp,
+      TileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      float,
+      ElementOutput,
+      Layout,
+      AlignmentOutput,
+      ElementOutput,
+      Layout,
+      AlignmentOutput,
+      cutlass::epilogue::TmaWarpSpecialized1Sm,
+      FusionOperation>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100,
+      cutlass::arch::OpClassTensorOp,
+      ElementInput,
+      Layout,
+      AlignmentInput,
+      ElementInput,
+      Layout,
+      AlignmentInput,
+      ElementAccumulator,
+      TileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCount<3>,
+      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+  using Kernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  using Device = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+
+// Private exact-shape GR00T DiT FC1 candidate. This deliberately tests the
+// M64xN128 schedule that won for FC2; the previous FC1 screen did not include
+// this tile with explicit one-SM schedules and three mainloop stages.
+struct Fp8GemmBiasGeluQuantBf16M41 {
+  using TileShape = Shape<_64, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using ElementInput = cutlass::float_e4m3_t;
+  using ElementBias = cutlass::bfloat16_t;
+  using ElementOutput = cutlass::float_e4m3_t;
+  using ElementAccumulator = float;
+  using Layout = cutlass::layout::RowMajor;
+  static constexpr int AlignmentInput = 16;
+  static constexpr int AlignmentOutput = 16;
+
+  using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
+      0, TileShape, ElementBias, float, Stride<_0, _1, _0>>;
+  using FusionOperation =
+      apxinf_cuda_cutlass_detail::BiasGeluQuantEVT<TileShape>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100,
+      cutlass::arch::OpClassTensorOp,
+      TileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      float,
+      void,
+      Layout,
+      AlignmentOutput,
+      ElementOutput,
+      Layout,
+      AlignmentOutput,
+      cutlass::epilogue::TmaWarpSpecialized1Sm,
+      FusionOperation>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100,
+      cutlass::arch::OpClassTensorOp,
+      ElementInput,
+      Layout,
+      AlignmentInput,
+      ElementInput,
+      Layout,
+      AlignmentInput,
+      ElementAccumulator,
+      TileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCount<3>,
+      cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
+  using Kernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  using Device = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+
+  static typename FusionOperation::Arguments fusion_arguments(
+      const void* bias, float alpha, float inverse_scale) {
+    typename Bias::Arguments bias_args{
+        static_cast<const ElementBias*>(bias)};
+    return {bias_args, {}, {alpha, inverse_scale}};
+  }
 };
 
 template <
@@ -363,6 +668,110 @@ int launch(
   return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
 }
 
+int launch_bias_then_residual_bf16_m41(
+    const void* activation, const void* weight, const void* bias,
+    const void* residual, void* output, float alpha, cudaStream_t stream) {
+  using Gemm = Fp8GemmBiasThenResidualBf16M41;
+  using Device = typename Gemm::Device;
+  using Kernel = typename Gemm::Kernel;
+  using ElementInput = typename Gemm::ElementInput;
+  using ElementOutput = typename Gemm::ElementOutput;
+  using StrideA = typename Kernel::StrideA;
+  using StrideB = typename Kernel::StrideB;
+  using StrideC = typename Kernel::StrideC;
+  using StrideD = typename Kernel::StrideD;
+  constexpr int m = 41;
+  constexpr int n = 1536;
+  constexpr int k = 6144;
+
+  StrideA stride_a = cutlass::make_cute_packed_stride(
+      StrideA{}, cute::make_shape(m, k, 1));
+  StrideB stride_b = cutlass::make_cute_packed_stride(
+      StrideB{}, cute::make_shape(n, k, 1));
+  StrideC stride_c = cutlass::make_cute_packed_stride(
+      StrideC{}, cute::make_shape(m, n, 1));
+  StrideD stride_d = cutlass::make_cute_packed_stride(
+      StrideD{}, cute::make_shape(m, n, 1));
+  typename Kernel::MainloopArguments mainloop{
+      static_cast<const ElementInput*>(activation), stride_a,
+      static_cast<const ElementInput*>(weight), stride_b};
+  typename Gemm::Bias::Arguments bias_args{
+      static_cast<const ElementOutput*>(bias)};
+  typename Kernel::EpilogueArguments epilogue{
+      {{}, bias_args, {}, {alpha}},
+      static_cast<const ElementOutput*>(residual), stride_c,
+      static_cast<ElementOutput*>(output), stride_d};
+  cutlass::KernelHardwareInfo hardware;
+  cudaError_t cuda_status = cudaDeviceGetAttribute(
+      &hardware.sm_count, cudaDevAttrMultiProcessorCount, 0);
+  if (cuda_status != cudaSuccess) return -8;
+  typename Kernel::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1}, mainloop, epilogue, hardware, {}};
+
+  Device operation;
+  if (operation.can_implement(arguments) != cutlass::Status::kSuccess) return -1;
+  if (operation.get_workspace_size(arguments) != 0) return -4;
+  if (operation.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess)
+    return -2;
+  return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
+}
+
+int launch_bias_gelu_quant_bf16_m41(
+    const void* activation, const void* weight, const void* bias, void* output,
+    float alpha, float output_scale, cudaStream_t stream) {
+  using Gemm = Fp8GemmBiasGeluQuantBf16M41;
+  using Device = typename Gemm::Device;
+  using Kernel = typename Gemm::Kernel;
+  using ElementInput = typename Gemm::ElementInput;
+  using ElementOutput = typename Gemm::ElementOutput;
+  using StrideA = typename Kernel::StrideA;
+  using StrideB = typename Kernel::StrideB;
+  using StrideD = typename Kernel::StrideD;
+  constexpr int m = 41;
+  constexpr int n = 6144;
+  constexpr int k = 1536;
+
+  StrideA stride_a = cutlass::make_cute_packed_stride(
+      StrideA{}, cute::make_shape(m, k, 1));
+  StrideB stride_b = cutlass::make_cute_packed_stride(
+      StrideB{}, cute::make_shape(n, k, 1));
+  StrideD stride_d = cutlass::make_cute_packed_stride(
+      StrideD{}, cute::make_shape(m, n, 1));
+  typename Kernel::MainloopArguments mainloop{
+      static_cast<const ElementInput*>(activation), stride_a,
+      static_cast<const ElementInput*>(weight), stride_b};
+  typename Kernel::EpilogueArguments epilogue{
+      Gemm::fusion_arguments(bias, alpha, 1.0f / output_scale),
+      nullptr, stride_d, static_cast<ElementOutput*>(output), stride_d};
+  cutlass::KernelHardwareInfo hardware;
+  int device = 0;
+  cudaError_t cuda_status = cudaGetDevice(&device);
+  if (cuda_status != cudaSuccess) return -8;
+  int major = 0;
+  int minor = 0;
+  cuda_status = cudaDeviceGetAttribute(
+      &major, cudaDevAttrComputeCapabilityMajor, device);
+  if (cuda_status != cudaSuccess) return -8;
+  cuda_status = cudaDeviceGetAttribute(
+      &minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (cuda_status != cudaSuccess) return -8;
+  if (major != 11 || minor != 0) return -7;
+  cuda_status = cudaDeviceGetAttribute(
+      &hardware.sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (cuda_status != cudaSuccess) return -8;
+  typename Kernel::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, 1}, mainloop, epilogue, hardware, {}};
+
+  Device operation;
+  if (operation.can_implement(arguments) != cutlass::Status::kSuccess) return -1;
+  if (operation.get_workspace_size(arguments) != 0) return -4;
+  if (operation.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess)
+    return -2;
+  return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
+}
+
 template <typename Gemm>
 int launch_rowwise(
     const void* activation, const void* weight_nk,
@@ -533,6 +942,33 @@ int fp8_gemm_bf16(
     default:
       return -5;
   }
+}
+
+int fp8_gemm_bias_then_residual_bf16_m41(
+    const void* activation, const void* weight, const void* bias,
+    const void* residual, void* output, int m, int n, int k,
+    float alpha, cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || bias == nullptr ||
+      residual == nullptr || output == nullptr || m != 41 || n != 1536 ||
+      k != 6144 || !isfinite(alpha) || !(alpha > 0.0f)) {
+    return -6;
+  }
+  return launch_bias_then_residual_bf16_m41(
+      activation, weight, bias, residual, output, alpha, stream);
+}
+
+int fp8_gemm_bias_gelu_quant_e4m3_m41(
+    const void* activation, const void* weight, const void* bias, void* output,
+    int m, int n, int k, float alpha, float output_scale,
+    cudaStream_t stream) {
+  if (activation == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || m != 41 || n != 6144 || k != 1536 ||
+      !isfinite(alpha) || !(alpha > 0.0f) || !isfinite(output_scale) ||
+      !(output_scale > 0.0f)) {
+    return -6;
+  }
+  return launch_bias_gelu_quant_bf16_m41(
+      activation, weight, bias, output, alpha, output_scale, stream);
 }
 
 int fp8_rowwise_gemm_bf16(

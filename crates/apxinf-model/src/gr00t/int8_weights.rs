@@ -94,6 +94,15 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
     type ReusableInput = kernels::gemm::W8A8Activation;
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
+        if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
+            if let Some(output) = kernels::gemm::try_gemm_w8a8_m41_n6144_k1536(
+                backend.context(),
+                input,
+                self.as_kernel_view(),
+            )? {
+                return Ok(output);
+            }
+        }
         kernels::gemm::w8a8(backend.context(), input, self.as_kernel_view())
     }
 
@@ -116,12 +125,88 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         )?))
     }
 
+    fn quantize_bias_gelu_reusable_input(
+        &self,
+        input: &Tensor,
+        bias: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Self::ReusableInput>> {
+        Ok(Some(kernels::gemm::bias_gelu_quantize_w8a8_activation(
+            backend.context(),
+            input,
+            bias,
+        )?))
+    }
+
+    fn supports_fused_bias_gelu_quantization(&self) -> bool {
+        true
+    }
+
     fn forward_reusable_quantized(
         &self,
         input: &Self::ReusableInput,
         backend: &RuntimeBackend,
     ) -> Result<Tensor> {
+        // Production M41 FC1 normally uses the fused bias-GELU producer.
+        // Its decomposed/legacy path keeps the measured plain INT8 schedule
+        // through an explicit model choice, without changing generic tactics.
+        if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
+            if let Some(output) = kernels::gemm::try_gemm_quantized_w8a8_m41_n6144_k1536(
+                backend.context(),
+                input,
+                self.as_kernel_view(),
+            )? {
+                return Ok(output);
+            }
+        }
         kernels::gemm::gemm_quantized_w8a8(backend.context(), input, self.as_kernel_view())
+    }
+
+    fn forward_reusable_quantized_bias_gelu_quantized(
+        &self,
+        input: &Self::ReusableInput,
+        bias: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        if backend.context().caps().sm != 87 {
+            return Ok(None);
+        }
+        if !w8a8_fc1_producer_fusion_enabled(
+            std::env::var_os("APXINF_GR00T_W8A8_LEGACY_FC1_GELU_QUANT").is_some(),
+        ) {
+            return Ok(None);
+        }
+        kernels::gemm::try_gemm_quantized_w8a8_bias_gelu_quantized(
+            backend.context(),
+            input,
+            self.as_kernel_view(),
+            bias,
+        )
+    }
+
+    fn forward_reusable_quantized_with_bias(
+        &self,
+        input: &Self::ReusableInput,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        if backend.context().caps().sm != 87 {
+            return Ok(None);
+        }
+        let Some(bias) = self.bias.as_ref() else {
+            return Ok(None);
+        };
+        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_QKV_GEMM_BIAS").is_some()
+            || self.input_dim != 1536
+            || self.output_dim != 4608
+        {
+            return Ok(None);
+        }
+        kernels::gemm::try_gemm_quantized_w8a8_bias(
+            backend.context(),
+            input,
+            self.as_kernel_view(),
+            bias,
+        )
     }
 
     fn fused_silu_mul(
@@ -130,12 +215,41 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         up: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        let activation =
-            kernels::gemm::quantize_w8a8_silu_mul_activation(backend.context(), gate, up)?;
+        let activation = if backend.context().caps().sm == 87
+            && gate.shape().dims() == [156, 6144]
+            && std::env::var_os("APXINF_GR00T_W8A8_LEGACY_SILU_MUL_PACKED4").is_none()
+        {
+            kernels::gemm::quantize_w8a8_silu_mul_activation_packed4(backend.context(), gate, up)?
+        } else {
+            kernels::gemm::quantize_w8a8_silu_mul_activation(backend.context(), gate, up)?
+        };
         Ok(Some(kernels::gemm::gemm_quantized_w8a8(
             backend.context(),
             &activation,
             self.as_kernel_view(),
+        )?))
+    }
+
+    fn packed_bias_then_residual(
+        &self,
+        projection: &Tensor,
+        bias: Option<&Tensor>,
+        residual: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        if backend.context().caps().sm != 87 {
+            return Ok(None);
+        }
+        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_BIAS_RESIDUAL").is_some()
+            || self.output_dim % 4 != 0
+        {
+            return Ok(None);
+        }
+        Ok(Some(kernels::fused::bias_then_residual_bf16_packed4(
+            backend.context(),
+            projection,
+            bias,
+            residual,
         )?))
     }
 
@@ -146,10 +260,39 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        if backend.context().caps().sm != 87 {
+            return Ok(None);
+        }
         let (normalized, quantized) = kernels::gemm::adaptive_layer_norm_quantize_w8a8_activation(
             backend.context(),
             input,
             modulation,
+            eps,
+        )?;
+        Ok(Some((normalized, quantized)))
+    }
+
+    fn layer_norm_quantized(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        eps: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        if backend.context().caps().sm != 87 {
+            return Ok(None);
+        }
+        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_LAYER_NORM_QUANT").is_some()
+            || input.shape().dims() != [41, 1536]
+        {
+            return Ok(None);
+        }
+        let (normalized, quantized) = kernels::gemm::layer_norm_quantize_w8a8_activation(
+            backend.context(),
+            input,
+            weight,
+            bias,
             eps,
         )?;
         Ok(Some((normalized, quantized)))
@@ -162,6 +305,10 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
     fn uses_quantized_output(&self) -> bool {
         true
     }
+}
+
+fn w8a8_fc1_producer_fusion_enabled(legacy_requested: bool) -> bool {
+    !legacy_requested
 }
 
 fn quantize_output_channels(tensor: &Tensor) -> Result<(Vec<i8>, Vec<f32>, usize, usize)> {
@@ -208,5 +355,11 @@ mod tests {
         assert_eq!(values.len(), 6);
         assert_eq!(scales.len(), 3);
         assert!(scales.iter().all(|scale| scale.is_finite() && *scale > 0.0));
+    }
+
+    #[test]
+    fn legacy_fc1_producer_switch_disables_fusion() {
+        assert!(w8a8_fc1_producer_fusion_enabled(false));
+        assert!(!w8a8_fc1_producer_fusion_enabled(true));
     }
 }

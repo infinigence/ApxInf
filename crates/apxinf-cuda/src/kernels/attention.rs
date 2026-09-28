@@ -1194,6 +1194,315 @@ pub fn noncausal(
     ))
 }
 
+/// Whether the direct segmented FA2 output path covers this exact workload.
+///
+/// This intentionally stays narrower than [`noncausal`]: callers can opt in
+/// without changing the public/default attention dispatch for other models or
+/// shapes.
+pub(crate) fn segmented_noncausal_contiguous_output_bf16_shape_supported(
+    segment_lengths: &[usize],
+    n_heads: usize,
+    head_dim: usize,
+) -> bool {
+    segment_lengths == [256, 256] && n_heads == 16 && head_dim == 64
+}
+
+/// Run independent BF16 FA2 segments into disjoint rows of one contiguous
+/// output allocation. The launches share one LSE workspace because they are
+/// ordered on the same CUDA stream.
+///
+/// Returns `None` outside the exact measured shape or when the FA2 FFI is not
+/// compiled, allowing an opt-in caller to preserve its legacy path.
+pub fn segmented_noncausal_contiguous_output_bf16(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    segment_lengths: &[usize],
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !segmented_noncausal_contiguous_output_bf16_shape_supported(
+        segment_lengths,
+        n_heads,
+        head_dim,
+    ) {
+        return Ok(None);
+    }
+
+    let total_rows = 512usize;
+    let expected_shape = [total_rows, n_heads, head_dim];
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16 || tensor.shape().dims() != expected_shape)
+    {
+        return Err(Error::Other(format!(
+            "segmented direct BF16 FA2 expected matching {expected_shape:?} tensors"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        const SEGMENT_ROWS: usize = 256;
+        let row_bytes = checked_bytes(
+            DType::BF16,
+            &[n_heads, head_dim],
+            "segmented direct BF16 FA2 row",
+        )?;
+        let segment_bytes = SEGMENT_ROWS
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::Other("segmented direct BF16 FA2 byte size overflow".into()))?;
+        let output = output_buffer(ctx, q.size_in_bytes())?;
+        let softmax_lse = output_buffer(
+            ctx,
+            n_heads
+                .checked_mul(SEGMENT_ROWS)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| {
+                    Error::Other("segmented direct BF16 FA2 LSE size overflow".into())
+                })?,
+        )?;
+        let q_buffer = CudaBuffer::from_tensor(q).map_err(Error::Cuda)?;
+        let k_buffer = CudaBuffer::from_tensor(k).map_err(Error::Cuda)?;
+        let v_buffer = CudaBuffer::from_tensor(v).map_err(Error::Cuda)?;
+
+        for segment_index in 0..2 {
+            let byte_offset = segment_index * segment_bytes;
+            let q_segment = q_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let k_segment = k_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let v_segment = v_buffer
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            let output_segment = output
+                .view(byte_offset, segment_bytes)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                ffi::check_cuda(ffi::apxinf_static_fa2_bf16(
+                    q_segment.ptr(),
+                    k_segment.ptr(),
+                    v_segment.ptr(),
+                    output_segment.ptr(),
+                    softmax_lse.ptr(),
+                    1,
+                    SEGMENT_ROWS as i32,
+                    SEGMENT_ROWS as i32,
+                    n_heads as i32,
+                    n_heads as i32,
+                    head_dim as i32,
+                    (head_dim as f32).sqrt().recip(),
+                    ctx.stream().handle(),
+                ))
+                .map_err(Error::Cuda)?;
+            }
+        }
+
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![total_rows, n_heads * head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
+}
+
+/// Supported envelope of the explicit SM87/SM110 non-causal BF16 BM64 kernel:
+/// 41 queries, 28/41/128 keys, 32 heads and head dimension 48.
+/// Callers select this specialization; the default FA2 dispatch is unchanged.
+pub(crate) const fn noncausal_hdim96_bm64_shape_supported(
+    compute_major: u32,
+    compute_minor: u32,
+    query_tokens: usize,
+    key_tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> bool {
+    ((compute_major == 8 && compute_minor == 7) || (compute_major == 11 && compute_minor == 0))
+        && query_tokens == 41
+        && matches!(key_tokens, 28 | 41 | 128)
+        && heads == 32
+        && head_dim == 48
+}
+
+pub fn noncausal_hdim96_bm64(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    let q_dims = q.shape().dims();
+    let k_dims = k.shape().dims();
+    let supported_shape = k_dims.first().is_some_and(|&key_tokens| {
+        noncausal_hdim96_bm64_shape_supported(
+            ctx.caps().compute_major,
+            ctx.caps().compute_minor,
+            q_dims.first().copied().unwrap_or(0),
+            key_tokens,
+            n_heads,
+            head_dim,
+        )
+    });
+    if q_dims != [41, 32, 48]
+        || k_dims.len() != 3
+        || k_dims[1..] != [32, 48]
+        || v.shape() != k.shape()
+        || !supported_shape
+    {
+        return Ok(None);
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if [q, k, v]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::BF16 || tensor.device() != expected_device)
+    {
+        return Ok(None);
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = output_buffer(ctx, q.size_in_bytes())?;
+        let softmax_lse = output_buffer(ctx, 32 * 41 * std::mem::size_of::<f32>())?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_hdim96_bm64(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                41,
+                k_dims[0] as i32,
+                32,
+                32,
+                48,
+                (48.0f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![41, 32 * 48]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
+}
+
+/// Try multiple equal-length, contiguous non-causal attention segments.
+///
+/// Returns `None` when FA2 was not compiled so callers can use their existing
+/// per-segment path. Operand validation and execution errors from an available
+/// provider are propagated.
+#[allow(clippy::too_many_arguments)]
+pub fn try_noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !cfg!(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)) {
+        return Ok(None);
+    }
+    noncausal_batched_equal(ctx, q, k, v, batches, sequence_len, n_heads, head_dim).map(Some)
+}
+
+/// Explicit batched attention for multiple equal-length, contiguous segments.
+/// Each segment remains an independent FA2 batch; the public single-segment
+/// operator and its default dispatch are unchanged.
+pub fn noncausal_batched_equal(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batches: usize,
+    sequence_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if batches < 2 || sequence_len == 0 {
+        return Err(Error::Other(
+            "batched noncausal attention requires at least two non-empty segments".into(),
+        ));
+    }
+    let total_rows = batches
+        .checked_mul(sequence_len)
+        .ok_or_else(|| Error::Other("batched noncausal row count overflow".into()))?;
+    let shape = [total_rows, n_heads, head_dim];
+    if q.dtype() != DType::BF16
+        || k.dtype() != DType::BF16
+        || v.dtype() != DType::BF16
+        || q.shape().dims() != shape
+        || k.shape().dims() != shape
+        || v.shape().dims() != shape
+        || n_heads == 0
+        || head_dim == 0
+        || head_dim > 64
+        || head_dim % 2 != 0
+    {
+        return Err(Error::Other(format!(
+            "batched noncausal attention expected BF16 {shape:?}, got {} {:?}, {} {:?}, {} {:?}",
+            q.dtype(),
+            q.shape().dims(),
+            k.dtype(),
+            k.shape().dims(),
+            v.dtype(),
+            v.shape().dims()
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [q, k, v] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = fa2_attention(
+            ctx,
+            q,
+            k,
+            v,
+            batches,
+            sequence_len,
+            sequence_len,
+            n_heads,
+            n_heads,
+            head_dim,
+        )?;
+        return output.reshape(vec![total_rows, n_heads * head_dim]);
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Err(Error::Other(
+        "batched noncausal attention requires the FA2 provider".into(),
+    ))
+}
+
 pub fn noncausal_strided_qkv(
     ctx: &CudaContext,
     qkv: &Tensor,
@@ -1268,6 +1577,58 @@ pub fn noncausal_strided_qkv(
     Err(Error::Other(
         "strided QKV attention requires the in-tree BF16 FA2 backend".into(),
     ))
+}
+
+/// Strided-QKV companion to [`noncausal_hdim96_bm64`]. The ordinary strided
+/// FA2 entry remains the fallback for every other device or shape.
+pub fn noncausal_strided_qkv_hdim96_bm64(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Option<Tensor>> {
+    if !noncausal_hdim96_bm64_shape_supported(
+        ctx.caps().compute_major,
+        ctx.caps().compute_minor,
+        qkv.shape().dims().first().copied().unwrap_or(0),
+        qkv.shape().dims().first().copied().unwrap_or(0),
+        n_heads,
+        head_dim,
+    ) || qkv.dtype() != DType::BF16
+        || qkv.shape().dims() != [41, 3 * 32 * 48]
+        || qkv.device() != Device::Cuda(ctx.device_id())
+        || n_heads != 32
+        || head_dim != 48
+    {
+        return Ok(None);
+    }
+    #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
+    {
+        let output = output_buffer(ctx, 41 * 32 * 48 * DType::BF16.size_in_bytes())?;
+        let softmax_lse = output_buffer(ctx, 32 * 41 * std::mem::size_of::<f32>())?;
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_fa2_bf16_strided_qkv_hdim96_bm64(
+                gpu_ptr(qkv)?,
+                output.ptr(),
+                softmax_lse.ptr(),
+                1,
+                41,
+                32,
+                48,
+                (48.0f32).sqrt().recip(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)?;
+        }
+        return Ok(Some(make_gpu_tensor(
+            Shape::new(vec![41, 32 * 48]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        )));
+    }
+    #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
+    Ok(None)
 }
 
 /// Causal attention mask on CUDA. Dispatches on dtype.
@@ -3664,4 +4025,38 @@ pub fn mqa_f16_e4m3_522(
     Err(Error::Other(
         "FA2 direct E4M3 requires an SM100-family FA2 build".into(),
     ))
+}
+
+#[cfg(test)]
+mod segmented_output_tests {
+    use super::segmented_noncausal_contiguous_output_bf16_shape_supported;
+
+    #[test]
+    fn direct_segmented_bf16_output_gate_is_exact() {
+        assert!(segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[128, 128],
+            16,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            8,
+            64
+        ));
+        assert!(!segmented_noncausal_contiguous_output_bf16_shape_supported(
+            &[256, 256],
+            16,
+            128
+        ));
+    }
 }

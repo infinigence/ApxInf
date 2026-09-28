@@ -46,3 +46,7 @@ required-features = ["cuda"]
 [[example]]
 name = "vision_check"
 required-features = ["cuda"]
+
+[[example]]
+name = "qwen38_bench"
+required-features = ["cuda"]

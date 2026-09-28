@@ -11,7 +11,9 @@ namespace apxinf::gemm {
 namespace {
 
 struct CutlassGegluState {
+#ifdef APXINF_GEMM_CUTLASS
   apxinf::cuda_new::cutlass_ops::Nvfp4GemmExecution* nvfp4_execution = nullptr;
+#endif
   void* packed_weight = nullptr;
   size_t packed_weight_bytes = 0;
   const void* packed_weight_source = nullptr;
@@ -22,10 +24,12 @@ struct CutlassGegluState {
   ~CutlassGegluState() { release_resources(); }
 
   void release_resources() noexcept {
+#ifdef APXINF_GEMM_CUTLASS
     if (nvfp4_execution != nullptr) {
       apxinf::cuda_new::cutlass_ops::nvfp4_gemm_destroy(nvfp4_execution);
     }
     nvfp4_execution = nullptr;
+#endif
     if (packed_weight != nullptr) cudaFree(packed_weight);
     packed_weight = nullptr;
     packed_weight_source = nullptr;

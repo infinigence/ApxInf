@@ -61,6 +61,11 @@ impl Gr00tPrecisionExecution for Gr00tFp8Execution {
 
     const NAME: &'static str = "fp8";
     const SUPPORTS_CALIBRATION: bool = false;
+    const USE_HDIM96_BM64_ATTENTION: bool = true;
+    const USE_FUSED_QK_RMS_MROPE: bool = true;
+    const OPTIMIZED_SMS: &'static [u32] = &[110];
+    const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> =
+        Some("APXINF_GR00T_FP8_LEGACY_QK_RMS_MROPE");
 
     fn transfer_dense(
         &self,
@@ -168,4 +173,18 @@ pub(super) fn build(
         &backbone,
     )?;
     Gr00tExecutor::from_backend(config, backbone, weights, execution, backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fp8_explicitly_opts_into_qk_rms_mrope_fusion() {
+        assert!(Gr00tFp8Execution::USE_FUSED_QK_RMS_MROPE);
+        assert_eq!(
+            Gr00tFp8Execution::QK_RMS_MROPE_LEGACY_ENV,
+            Some("APXINF_GR00T_FP8_LEGACY_QK_RMS_MROPE")
+        );
+    }
 }

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -246,12 +246,10 @@ pub(super) fn load_registered(
             "GR00T does not recognize the named asset {name:?}; expected only {BACKBONE_ASSET:?}"
         )));
     }
-    let backbone_path = options.assets.get(BACKBONE_ASSET).cloned().ok_or_else(|| {
-        Error::Other(
-            "GR00T loading requires LoadOptions.assets[\"backbone\"] pointing to Cosmos-Reason2-2B"
-                .into(),
-        )
-    })?;
+    let backbone_path = super::assets::resolve_assets(
+        path,
+        options.assets.get(BACKBONE_ASSET).map(PathBuf::as_path),
+    )?;
     let backend: Arc<RuntimeBackend> = downcast_arc(backend)
         .ok_or_else(|| Error::Other("GR00T is only registered for CUDA".into()))?;
     let precision = resolve_precision(options.precision, backend.context().caps().sm)?;

@@ -6,6 +6,16 @@ use crate::context::CudaContext;
 use crate::kernels::gemm::{gemm_w8a8_with_preference, W8A8Layout, W8A8ScaleMode, W8A8WeightView};
 use crate::CudaBackend;
 
+fn bf16_bits(tensor: &Tensor) -> Vec<u16> {
+    let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0u8; tensor.size_in_bytes()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(2)
+        .map(|value| u16::from_ne_bytes([value[0], value[1]]))
+        .collect()
+}
+
 fn gemm_with_preference(
     ctx: &CudaContext,
     activation: &Tensor,
@@ -224,4 +234,185 @@ fn default_w8a8_handles_dimensions_without_cutlass_alignment() {
             vec![-2.0 * input_dim as f32; output_dim]
         );
     }
+}
+
+#[cfg(apxinf_cutlass_int8_sm80)]
+#[test]
+fn explicit_w8a8_producer_is_bitwise_exact_without_a_plain_gemm_plan() {
+    use crate::kernels::gemm::{
+        bias_gelu_quantize_w8a8_activation, quantize_w8a8_activation,
+        try_gemm_quantized_w8a8_bias_gelu_quantized, try_gemm_quantized_w8a8_m41_n6144_k1536,
+        w8a8_tuning_key_for_test,
+    };
+    use crate::tuning::{GemmTuningRecord, TacticBackend, TacticId, TacticStore, TuningSession};
+
+    const M: usize = 41;
+    const N: usize = 6144;
+    const K: usize = 1536;
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 87 {
+        return;
+    }
+    let activation_values = (0..M * K)
+        .map(|index| bf16::from_f32(((index * 17 + index / K * 5) % 31) as f32 / 19.0 - 0.8))
+        .collect::<Vec<_>>();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, K], &activation_values).unwrap())
+        .unwrap();
+    let quantized_input = quantize_w8a8_activation(backend.context(), &activation).unwrap();
+    let weight_values = (0..N * K)
+        .map(|index| (((index * 13 + index / K) % 15) as i8 - 7) as u8)
+        .collect::<Vec<_>>();
+    let weight = CudaBuffer::alloc(weight_values.len(), backend.context().device_id()).unwrap();
+    weight.copy_from_host(&weight_values).unwrap();
+    let scales = backend
+        .to_device(
+            &Tensor::from_f32(
+                vec![N],
+                &(0..N)
+                    .map(|column| (column % 11 + 1) as f32 * 0.00031)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let bias = backend
+        .to_device(
+            &Tensor::from_bf16(
+                vec![N],
+                &(0..N)
+                    .map(|column| bf16::from_f32((column % 17) as f32 * 0.003 - 0.02))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let view = || W8A8WeightView {
+        values_i8: &weight,
+        scales_f32: &scales,
+        input_dim: K,
+        output_dim: N,
+        scale_mode: W8A8ScaleMode::DynamicRowPerOutputChannel,
+        layout: W8A8Layout::OutputMajor,
+    };
+    let key = w8a8_tuning_key_for_test(backend.context(), M, N, K);
+    let install = |tactic: TacticId| {
+        let store = TacticStore::from_gemm_records([GemmTuningRecord {
+            key: key.clone(),
+            tactic,
+            implementation_version: Some(tactic.backend.implementation_version()),
+            milliseconds: Some(1.0),
+        }])
+        .unwrap();
+        backend
+            .context()
+            .install_tuning(TuningSession::inference(store))
+            .unwrap();
+    };
+    backend
+        .context()
+        .install_tuning(TuningSession::inference(TacticStore::default()))
+        .unwrap();
+    let projection =
+        try_gemm_quantized_w8a8_m41_n6144_k1536(backend.context(), &quantized_input, view())
+            .unwrap()
+            .expect("explicit SM87 shape schedule must work with an empty tactic store");
+    let reference_activated =
+        crate::kernels::activation::bias_gelu_bf16(backend.context(), &projection, Some(&bias))
+            .unwrap();
+    let reference_quantized =
+        bias_gelu_quantize_w8a8_activation(backend.context(), &projection, &bias).unwrap();
+    let (candidate_activated, candidate_quantized) = try_gemm_quantized_w8a8_bias_gelu_quantized(
+        backend.context(),
+        &quantized_input,
+        view(),
+        &bias,
+    )
+    .unwrap()
+    .expect("explicit SM87 producer fusion must work with an empty tactic store");
+    backend.context().synchronize().unwrap();
+    assert_eq!(
+        bf16_bits(&candidate_activated),
+        bf16_bits(&reference_activated)
+    );
+    assert_eq!(
+        candidate_quantized.row_scale_bits().unwrap(),
+        reference_quantized.row_scale_bits().unwrap()
+    );
+    assert_eq!(
+        candidate_quantized.quantized_bytes().unwrap(),
+        reference_quantized.quantized_bytes().unwrap()
+    );
+
+    // Persisted plain-GEMM choices cannot enable or disable an explicitly
+    // selected producer. In particular, the old external tactic six remains
+    // invalid for the generic provider even though the separate schedule exists.
+    for tactic in [
+        TacticId {
+            backend: TacticBackend::Cutlass,
+            value: 0,
+        },
+        TacticId {
+            backend: TacticBackend::Vendor,
+            value: 0,
+        },
+        TacticId {
+            backend: TacticBackend::Cutlass,
+            value: 5,
+        },
+        TacticId {
+            backend: TacticBackend::Cutlass,
+            value: 6,
+        },
+    ] {
+        install(tactic);
+        assert!(try_gemm_quantized_w8a8_bias_gelu_quantized(
+            backend.context(),
+            &quantized_input,
+            view(),
+            &bias,
+        )
+        .unwrap()
+        .is_some());
+        if tactic.backend == TacticBackend::Cutlass && tactic.value != 0 {
+            let default = TacticId {
+                backend: TacticBackend::Cutlass,
+                value: 0,
+            };
+            assert_eq!(
+                backend
+                    .context()
+                    .gemm_plans()
+                    .resolve(backend.context(), &key, default)
+                    .unwrap()
+                    .tactic,
+                default
+            );
+        }
+    }
+    backend.context().synchronize().unwrap();
+
+    let narrow_scales = backend
+        .to_device(&Tensor::from_f32(vec![8], &[1.0; 8]).unwrap())
+        .unwrap();
+    let narrow_weight = CudaBuffer::alloc(8 * K, backend.context().device_id()).unwrap();
+    narrow_weight.copy_from_host(&vec![1u8; 8 * K]).unwrap();
+    let narrow_bias = backend
+        .to_device(&Tensor::from_bf16(vec![8], &[bf16::from_f32(0.0); 8]).unwrap())
+        .unwrap();
+    assert!(try_gemm_quantized_w8a8_bias_gelu_quantized(
+        backend.context(),
+        &quantized_input,
+        W8A8WeightView {
+            values_i8: &narrow_weight,
+            scales_f32: &narrow_scales,
+            input_dim: K,
+            output_dim: 8,
+            scale_mode: W8A8ScaleMode::DynamicRowPerOutputChannel,
+            layout: W8A8Layout::OutputMajor,
+        },
+        &narrow_bias,
+    )
+    .unwrap()
+    .is_none());
 }

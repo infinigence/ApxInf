@@ -12,6 +12,62 @@ from apxinf.calibration import CalibrationContext, CalibrationRunner, ConsumerCo
 from apxinf.policies import available_policies, get_policy
 
 
+@pytest.mark.parametrize("precision", ["bf16", "int8", "fp8"])
+def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, precision):
+    import json
+    import sys
+    from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
+
+    model, source = tmp_path / "model", tmp_path / "source"
+    model.mkdir()
+    source.mkdir()
+    (model / "config.json").write_text('{"model_type":"Gr00tN1d7"}')
+    (model / "model.safetensors").write_bytes(b"primary-v1")
+    for name in ("config.json", "tokenizer_config.json", "preprocessor_config.json", "tokenizer.json"):
+        (source / name).write_bytes(b"{}\n")
+    bundle = Gr00tPolicy.prepare_assets(model, source)
+    identity = Gr00tPolicy.checkpoint_identity(model)
+    # Independently generated using hashlib, shared with the Rust unit fixture.
+    assert identity == "sha256:652d1192021049f00f97e3450a39f340271cbd5d97f3d37c10d91feffb0004d6"
+    assert identity == Gr00tPolicy.checkpoint_identity(model, bundle)
+    calls = []
+
+    def load_processor(path, *, backbone, **kwargs):
+        assert path == model
+        assert backbone == bundle
+        return _FakeProcessor()
+
+    def load_native(model_name, path, **kwargs):
+        assert model_name == "gr00t" and path == str(model)
+        assert kwargs["assets"] == {"backbone": str(bundle)}
+        calls.append(kwargs)
+        return _FakeModel()
+
+    monkeypatch.setattr(_NvidiaProcessorAdapter, "load", load_processor)
+    monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=load_native)))
+    calibration = model / "calibration.json"
+    calibration.write_text(json.dumps({"model": {"checkpoint": identity}}))
+    kwargs = {"calibration": calibration} if precision == "fp8" else {}
+    automatic = AutoPolicy.from_pretrained(model, precision=precision, **kwargs)
+    explicit = AutoPolicy.from_pretrained(model, backbone=bundle, precision=precision, **kwargs)
+    assert calls[0] == calls[1]
+    noise = np.zeros((1, 4, 6), dtype=np.float32)
+    left, right = automatic.infer({}, noise=noise), explicit.infer({}, noise=noise)
+    for key in ("actions", "normalized_actions", "noise"):
+        assert np.array_equal(left[key], right[key])
+
+
+def test_missing_default_resources_fail_before_native_or_processor_load(tmp_path, monkeypatch):
+    from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("processor must not load before default resource validation")
+
+    monkeypatch.setattr(_NvidiaProcessorAdapter, "load", unexpected)
+    with pytest.raises(FileNotFoundError, match="prepare_assets"):
+        Gr00tPolicy.from_pretrained(tmp_path)
+
+
 class _FakeModel:
     action_horizon = 4
     action_dim = 6

@@ -23,6 +23,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cmath>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
@@ -36,12 +38,18 @@
 
 namespace apxinf::cuda::cutlass_ops {
 
-template <typename ThreadblockShape, typename WarpShape, int NumStages>
+template <
+    typename ThreadblockShape,
+    typename WarpShape,
+    int NumStages,
+    bool RoundBeforeBias = false,
+    bool ApplyGelu = false>
 cudaError_t run_w8a8_bf16(
     int8_t* activation,
     int8_t* weight_output_major,
     float* row_scales,
     float* column_scales,
+    cutlass::bfloat16_t* bias,
     cutlass::bfloat16_t* output,
     int m,
     int n,
@@ -111,7 +119,10 @@ cudaError_t run_w8a8_bf16(
           typename DefaultGemmKernel::Epilogue::OutputTileIterator,
           ElementAccumulator,
           ElementCompute,
-          EpilogueOutputOp>;
+          EpilogueOutputOp,
+          false,
+          RoundBeforeBias,
+          ApplyGelu>;
 
   using Epilogue = typename cutlass::epilogue::threadblock::
       EpilogueWithVisitorFromExistingEpilogue<
@@ -131,7 +142,7 @@ cudaError_t run_w8a8_bf16(
       {weight_output_major, k},
       {column_scales, 0},
       {row_scales, 0},
-      {static_cast<ElementOutput*>(nullptr), 0},
+      {bias, 0},
       {output, n},
       visitor_args};
 
@@ -177,24 +188,120 @@ cudaError_t w8a8_gemm_bf16(
       const_cast<float*>(static_cast<const float*>(column_scales));
   auto* d = static_cast<cutlass::bfloat16_t*>(output);
 
-  // Orin-specific dispatch. Static inference uses the small-M branches for
-  // the denoiser and the medium-M branch for the vision/language prefix.
   if (m <= 64 && n <= 4096) {
     return run_w8a8_bf16<
         cutlass::gemm::GemmShape<64, 64, 128>,
         cutlass::gemm::GemmShape<32, 64, 64>,
-        5>(a, b, a_scales, b_scales, d, m, n, k, stream);
+        5>(a, b, a_scales, b_scales, nullptr, d, m, n, k, stream);
   }
   if (m <= 64) {
     return run_w8a8_bf16<
         cutlass::gemm::GemmShape<64, 128, 128>,
         cutlass::gemm::GemmShape<64, 64, 64>,
-        3>(a, b, a_scales, b_scales, d, m, n, k, stream);
+        3>(a, b, a_scales, b_scales, nullptr, d, m, n, k, stream);
   }
   return run_w8a8_bf16<
       cutlass::gemm::GemmShape<128, 128, 64>,
       cutlass::gemm::GemmShape<64, 64, 64>,
-      5>(a, b, a_scales, b_scales, d, m, n, k, stream);
+      5>(a, b, a_scales, b_scales, nullptr, d, m, n, k, stream);
+}
+
+// Explicit schedule retained by exact-shape callers. The generic operator
+// above keeps its original shape heuristic and C ABI.
+cudaError_t w8a8_gemm_bf16_m41_n6144_k1536(
+    const void* activation,
+    const void* weight_output_major,
+    const void* row_scales,
+    const void* column_scales,
+    void* output,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  if (activation == nullptr || weight_output_major == nullptr ||
+      row_scales == nullptr || column_scales == nullptr || output == nullptr ||
+      m != 41 || n != 6144 || k != 1536) {
+    return cudaErrorInvalidValue;
+  }
+  auto* a = const_cast<int8_t*>(static_cast<const int8_t*>(activation));
+  auto* b =
+      const_cast<int8_t*>(static_cast<const int8_t*>(weight_output_major));
+  auto* a_scales =
+      const_cast<float*>(static_cast<const float*>(row_scales));
+  auto* b_scales =
+      const_cast<float*>(static_cast<const float*>(column_scales));
+  auto* d = static_cast<cutlass::bfloat16_t*>(output);
+  return run_w8a8_bf16<
+      cutlass::gemm::GemmShape<64, 128, 128>,
+      cutlass::gemm::GemmShape<32, 64, 64>,
+      3>(a, b, a_scales, b_scales, nullptr, d, m, n, k, stream);
+}
+
+cudaError_t w8a8_gemm_bias_bf16_m41_n4608_k1536(
+    const void* activation,
+    const void* weight_output_major,
+    const void* row_scales,
+    const void* column_scales,
+    const void* bias,
+    void* output,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  if (activation == nullptr || weight_output_major == nullptr ||
+      row_scales == nullptr || column_scales == nullptr || bias == nullptr ||
+      output == nullptr || m != 41 || n != 4608 || k != 1536) {
+    return cudaErrorInvalidValue;
+  }
+  auto* a = const_cast<int8_t*>(static_cast<const int8_t*>(activation));
+  auto* b =
+      const_cast<int8_t*>(static_cast<const int8_t*>(weight_output_major));
+  auto* a_scales =
+      const_cast<float*>(static_cast<const float*>(row_scales));
+  auto* b_scales =
+      const_cast<float*>(static_cast<const float*>(column_scales));
+  auto* c = const_cast<cutlass::bfloat16_t*>(
+      static_cast<const cutlass::bfloat16_t*>(bias));
+  auto* d = static_cast<cutlass::bfloat16_t*>(output);
+  return run_w8a8_bf16<
+      cutlass::gemm::GemmShape<64, 128, 128>,
+      cutlass::gemm::GemmShape<64, 64, 64>,
+      3,
+      true>(a, b, a_scales, b_scales, c, d, m, n, k, stream);
+}
+
+cudaError_t w8a8_gemm_bias_gelu_bf16_m41_n6144_k1536(
+    const void* activation,
+    const void* weight_output_major,
+    const void* row_scales,
+    const void* column_scales,
+    const void* bias,
+    void* output,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  if (activation == nullptr || weight_output_major == nullptr ||
+      row_scales == nullptr || column_scales == nullptr || bias == nullptr ||
+      output == nullptr || m != 41 || n != 6144 || k != 1536) {
+    return cudaErrorInvalidValue;
+  }
+  auto* a = const_cast<int8_t*>(static_cast<const int8_t*>(activation));
+  auto* b =
+      const_cast<int8_t*>(static_cast<const int8_t*>(weight_output_major));
+  auto* a_scales =
+      const_cast<float*>(static_cast<const float*>(row_scales));
+  auto* b_scales =
+      const_cast<float*>(static_cast<const float*>(column_scales));
+  auto* c = const_cast<cutlass::bfloat16_t*>(
+      static_cast<const cutlass::bfloat16_t*>(bias));
+  auto* d = static_cast<cutlass::bfloat16_t*>(output);
+  return run_w8a8_bf16<
+      cutlass::gemm::GemmShape<64, 128, 64>,
+      cutlass::gemm::GemmShape<32, 64, 64>,
+      4,
+      true,
+      true>(a, b, a_scales, b_scales, c, d, m, n, k, stream);
 }
 
 }  // namespace apxinf::cuda::cutlass_ops

@@ -204,6 +204,16 @@ pub struct Fp8WeightView<'a> {
     pub dual_geglu_auto_interleaved: Option<&'a Tensor>,
 }
 
+/// Explicit cuBLASLt algorithm attributes for an opt-in FP8-to-BF16 GEMM.
+/// Callers must validate the configuration for their device and exact shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fp8Bf16CustomConfig {
+    pub tile_id: i32,
+    pub custom_option: i32,
+    pub stages_id: i32,
+    pub cluster_shape_id: i32,
+}
+
 #[derive(Clone, Copy)]
 pub struct DynamicFp8WeightView<'a> {
     /// Contiguous output-major physical `[N, K]` E4M3 matrix.
@@ -1791,7 +1801,9 @@ fn launch_tactic_fp8_bf16(
             key.n as i32,
             key.k as i32,
             alpha,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         ))
         .map_err(Error::Cuda)
@@ -2005,6 +2017,234 @@ pub fn gemm_fp8_bf16(
     Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
 }
 
+/// Opt-in FP8-to-BF16 GEMM using explicit cuBLASLt algorithm attributes.
+/// The ordinary tuned-plan path remains unchanged.
+pub fn gemm_fp8_bf16_custom(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+    config: Fp8Bf16CustomConfig,
+) -> Result<Tensor> {
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 expects E4M3 operands, got {} and {}",
+            activation.dtype(),
+            weight.values_e4m3.dtype()
+        )));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "FP8 dual GeGLU interleaved weight cannot be used by plain FP8 GEMM".into(),
+        ));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "FP8 GEMM scales must be finite and positive".into(),
+        ));
+    }
+    let a = activation.shape().dims();
+    let b = weight.values_e4m3.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "gemm_fp8_bf16 shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    if activation.device() != expected_device || weight.values_e4m3.device() != expected_device {
+        return Err(Error::DeviceMismatch {
+            expected: expected_device,
+            got: if activation.device() != expected_device {
+                activation.device()
+            } else {
+                weight.values_e4m3.device()
+            },
+        });
+    }
+    if !native_fp8_gemm_supported(ctx)? {
+        return Err(Error::Other(
+            "FP8-to-BF16 GEMM requires native E4M3 Tensor Core support".into(),
+        ));
+    }
+
+    let (m, k, n) = (a[0], a[1], b[1]);
+    let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+    let weight_buffer = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+    let alpha = activation_scale * weight.scale;
+    let output = crate::workspace::output_buffer(ctx, m * n * DType::BF16.size_in_bytes())?;
+
+    let status = unsafe {
+        ffi::apxinf_static_prepare_fp8_gemm_bf16_custom(
+            m as i32,
+            n as i32,
+            k as i32,
+            config.tile_id,
+            config.custom_option,
+            config.stages_id,
+            config.cluster_shape_id,
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    let scratch = fp8_weight_scratch(ctx, n, k)?;
+    let status = unsafe {
+        ffi::apxinf_static_fp8_gemm_bf16_custom(
+            activation.ptr(),
+            weight_buffer.ptr(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            config.tile_id,
+            config.custom_option,
+            config.stages_id,
+            config.cluster_shape_id,
+            ctx.stream().handle(),
+        )
+    };
+    ffi::check_cublas(status).map_err(Error::Cuda)?;
+    Ok(output.into_tensor(Shape::new(vec![m, n]), DType::BF16))
+}
+
+/// Try the fixed-shape FP8 GEMM with separately rounded BF16 bias and residual.
+///
+/// Returns `None` when the optional CUTLASS backend was not compiled. With the
+/// backend available, the strict SM110 M41 N1536 K6144 operand contract and all
+/// execution errors are preserved.
+#[allow(clippy::too_many_arguments)]
+pub fn try_fp8_bias_then_residual_bf16(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Option<Tensor>> {
+    if !cfg!(apxinf_cutlass_gemm) {
+        return Ok(None);
+    }
+    gemm_fp8_bias_then_residual_bf16_m41(ctx, activation, activation_scale, weight, bias, residual)
+        .map(Some)
+}
+
+/// Explicit SM110 M41 N1536 K6144 epilogue. This is intentionally separate
+/// from the public FP8 GEMM planner: it fuses bias and residual while retaining
+/// all three production BF16 rounding boundaries.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fp8_bias_then_residual_bf16_m41(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scale: f32,
+    weight: Fp8WeightView<'_>,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    const M: usize = 41;
+    const N: usize = 1536;
+    const K: usize = 6144;
+    if ctx.caps().sm != 110 {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion requires exact SM110 hardware".into(),
+        ));
+    }
+    if activation.dtype() != DType::F8E4M3 || weight.values_e4m3.dtype() != DType::F8E4M3 {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion requires E4M3 activation and weight".into(),
+        ));
+    }
+    if bias.dtype() != DType::BF16 || residual.dtype() != DType::BF16 {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion requires BF16 bias and residual".into(),
+        ));
+    }
+    if weight.dual_geglu_interleaved {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion does not accept interleaved GeGLU weights".into(),
+        ));
+    }
+    if activation.shape().dims() != [M, K]
+        || weight.values_e4m3.shape().dims() != [K, N]
+        || bias.shape().dims() != [N]
+        || residual.shape().dims() != [M, N]
+    {
+        return Err(Error::Other(format!(
+            "GR00T FP8 FC2 fusion requires [{M},{K}] @ [{K},{N}], bias [{N}], residual [{M},{N}]"
+        )));
+    }
+    if !activation_scale.is_finite()
+        || activation_scale <= 0.0
+        || !weight.scale.is_finite()
+        || weight.scale <= 0.0
+    {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion scales must be finite and positive".into(),
+        ));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [activation, weight.values_e4m3, bias, residual] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+
+    #[cfg(not(apxinf_cutlass_gemm))]
+    {
+        return Err(Error::Other(
+            "GR00T FP8 FC2 fusion requires the SM100-family CUTLASS backend".into(),
+        ));
+    }
+
+    #[cfg(apxinf_cutlass_gemm)]
+    {
+        let alpha = activation_scale * weight.scale;
+        if !alpha.is_finite() {
+            return Err(Error::Other(
+                "GR00T FP8 FC2 combined scale must be finite".into(),
+            ));
+        }
+        let output_bytes = M
+            .checked_mul(N)
+            .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+            .ok_or_else(|| Error::Other("GR00T FP8 FC2 output size overflow".into()))?;
+        let output = crate::workspace::output_buffer(ctx, output_bytes)?;
+        let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+        let weight = CudaBuffer::from_tensor(weight.values_e4m3).map_err(Error::Cuda)?;
+        let bias = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+        let residual = CudaBuffer::from_tensor(residual).map_err(Error::Cuda)?;
+        let status = unsafe {
+            ffi::apxinf_static_cutlass_fp8_gemm_bias_then_residual_bf16_m41(
+                activation.ptr(),
+                weight.ptr(),
+                bias.ptr(),
+                residual.ptr(),
+                output.ptr(),
+                M as i32,
+                N as i32,
+                K as i32,
+                alpha,
+                ctx.stream().handle(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "GR00T FP8 FC2 CUTLASS tactic4 launch failed ({status})"
+            )));
+        }
+        Ok(output.into_tensor(Shape::new(vec![M, N]), DType::BF16))
+    }
+}
+
 pub fn prepare_cublaslt_fp8_gemm_split(m: usize, n: usize, k: usize) -> Result<()> {
     let status =
         unsafe { ffi::apxinf_static_prepare_fp8_gemm_split_f16(m as i32, n as i32, k as i32) };
@@ -2017,7 +2257,8 @@ fn fp8_weight_scratch(ctx: &CudaContext, n: usize, k: usize) -> Result<Option<Cu
     if ctx.caps().arch_family == crate::CudaArchFamily::Sm100 {
         return Ok(None);
     }
-    let bytes = n.checked_mul(k)
+    let bytes = n
+        .checked_mul(k)
         .ok_or_else(|| Error::Other("FP8 weight staging size overflow".into()))?;
     crate::workspace::output_buffer(ctx, bytes).map(Some)
 }
@@ -2043,7 +2284,9 @@ pub fn cublaslt_fp8_gemm_f16(
             n as i32,
             k as i32,
             alpha,
-            scratch.as_ref().map_or(std::ptr::null_mut(), CudaBuffer::ptr),
+            scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), CudaBuffer::ptr),
             ctx.stream().handle(),
         )
     };

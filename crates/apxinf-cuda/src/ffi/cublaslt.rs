@@ -130,6 +130,15 @@ extern "C" {
     /// Install immutable cuBLASLt resources for one FP8 GEMM shape.
     pub fn apxinf_static_prepare_fp8_gemm_f16(m: i32, n: i32, k: i32) -> cublasStatus_t;
     pub fn apxinf_static_prepare_fp8_gemm_bf16(m: i32, n: i32, k: i32) -> cublasStatus_t;
+    pub fn apxinf_static_prepare_fp8_gemm_bf16_custom(
+        m: i32,
+        n: i32,
+        k: i32,
+        tile_id: i32,
+        custom_option: i32,
+        stages_id: i32,
+        cluster_shape_id: i32,
+    ) -> cublasStatus_t;
     pub fn apxinf_static_set_cublaslt_fp8_gemm_bf16_heuristic(
         m: i32,
         n: i32,
@@ -179,6 +188,21 @@ extern "C" {
         k: i32,
         alpha: f32,
         weight_scratch: *mut c_void,
+        stream: cudaStream_t,
+    ) -> cublasStatus_t;
+    pub fn apxinf_static_fp8_gemm_bf16_custom(
+        activation: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        weight_scratch: *mut c_void,
+        tile_id: i32,
+        custom_option: i32,
+        stages_id: i32,
+        cluster_shape_id: i32,
         stream: cudaStream_t,
     ) -> cublasStatus_t;
     pub fn apxinf_static_fp8_gemm_split_f16(

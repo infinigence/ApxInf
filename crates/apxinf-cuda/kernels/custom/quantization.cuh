@@ -43,6 +43,24 @@ __global__ void quantize_bf16_e4m3_kernel(
   }
 }
 
+__global__ void quantize_bf16_e4m3_packed8_kernel(
+    const Bf16Pack8* input, Fp8Pack8* output, int64_t vector_count,
+    float inverse_scale) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < vector_count; index += stride) {
+    const Bf16Pack8 values = input[index];
+    Fp8Pack8 quantized;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      float value = __bfloat162float(values.values[item]) * inverse_scale;
+      value = fminf(448.0f, fmaxf(-448.0f, value));
+      quantized.values[item] = static_cast<__nv_fp8_e4m3>(value);
+    }
+    output[index] = quantized;
+  }
+}
+
 __global__ void quantize_rows_bf16_e4m3_kernel(
     const __nv_bfloat16* input, __nv_fp8_e4m3* output, float* scales,
     int rows, int input_cols, int output_cols) {
@@ -457,6 +475,36 @@ __global__ void quantize_rows_bf16_int8_kernel(
   }
 }
 
+// Preserve the existing bias+GELU then dynamic-row-quantization numerical
+// contract while removing the materialized BF16 intermediate.  GELU is
+// rounded to BF16 before both the row absmax and the final INT8 conversion.
+__global__ void bias_gelu_quantize_rows_bf16_int8_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    int8_t* output, float* scales, int rows, int cols) {
+  extern __shared__ __nv_bfloat16 rounded[];
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float maximum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value = __bfloat162float(input[base + col]) +
+                        __bfloat162float(bias[col]);
+    const __nv_bfloat16 activated = __float2bfloat16(gelu_tanh(value));
+    rounded[col] = activated;
+    maximum = fmaxf(maximum, fabsf(__bfloat162float(activated)));
+  }
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = scale;
+  __syncthreads();
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float quantized = roundf(__bfloat162float(rounded[col]) / scale);
+    output[base + col] =
+        static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, quantized)));
+  }
+}
+
 // Produce adaptive LayerNorm's rounded BF16 output and the exact dynamic
 // per-row INT8 representation consumed by W8A8 GEMMs in one kernel.
 __global__ void adaptive_layer_norm_quantize_rows_bf16_int8_kernel(
@@ -499,6 +547,52 @@ __global__ void adaptive_layer_norm_quantize_rows_bf16_int8_kernel(
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const float value = roundf(__bfloat162float(output[base + col]) / row_scale);
     quantized[base + col] =
+        static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, value)));
+  }
+}
+
+// Produce LayerNorm's rounded BF16 output and the exact dynamic per-row INT8
+// representation consumed by W8A8 GEMMs. The affine result is rounded to BF16
+// before both absmax and quantization, matching the two-kernel contract.
+__global__ void layer_norm_quantize_rows_bf16_int8_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_bfloat16* output,
+    int8_t* quantized, float* scales, int rows, int cols, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * cols;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x)
+    sum += __bfloat162float(input[base + col]);
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered = __bfloat162float(input[base + col]) - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+  float maximum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = base + col;
+    const float value =
+        (__bfloat162float(input[index]) - mean) * inverse_std *
+            __bfloat162float(weight[col]) +
+        __bfloat162float(bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    output[index] = rounded;
+    maximum = fmaxf(maximum, fabsf(__bfloat162float(rounded)));
+  }
+  __syncthreads();
+  const float scale =
+      fmaxf(block_max_parallel_unsafe(maximum, scratch) / 127.0f, 1.0e-12f);
+  if (threadIdx.x == 0) scales[row] = scale;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = base + col;
+    const float value = roundf(__bfloat162float(output[index]) / scale);
+    quantized[index] =
         static_cast<int8_t>(fminf(127.0f, fmaxf(-128.0f, value)));
   }
 }

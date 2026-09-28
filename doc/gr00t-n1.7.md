@@ -40,12 +40,46 @@ uses W8A8 only for the validated FFN and eligible fused self-QKV matrices.
 
 ## Loading
 
+Load GR00T from one local `model_dir`. The checkpoint already packages the
+backbone and action-head weights together; all inference weight tensors come
+from that directory. Configuration and official processor resources live beside
+them in `model_dir/assets/cosmos/`.
+
+Prepare those resources once from a compatible local Cosmos-Reason2-2B snapshot:
+
+```python
+from apxinf import Gr00tPolicy
+
+Gr00tPolicy.prepare_assets(
+    "/models/GR00T-N1.7-LIBERO/libero_10",
+    "/models/nvidia/Cosmos-Reason2-2B",
+)
+```
+
+The method copies configuration, tokenizer, image/video processor and
+chat-template resources and writes an `apxinf_assets.json` manifest in the
+asset directory. It does not copy Cosmos weight shards or download files.
+After preparation, normal loads do not require the source snapshot path.
+
+| Location | Required local assets |
+| --- | --- |
+| `model_dir` | GR00T `config.json` and SafeTensors weights (including the index and referenced shards for a sharded checkpoint); NVIDIA `processor_config.json`, `statistics.json`, and `embodiment_id.json`. The processor files may be at the checkpoint root or together in its `processor/` subdirectory. |
+| `model_dir/assets/cosmos/` | Matching Cosmos-Reason2-2B `config.json`, Qwen3-VL tokenizer, chat template, image/video processor resources, and the generated `apxinf_assets.json` manifest. No Cosmos inference weights are needed here. |
+
+The Cosmos resources commonly include `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.json`, `preprocessor_config.json`, and
+`video_preprocessor_config.json`, together with the tokenizer's vocabulary and
+merges files. Rust reads the Cosmos architecture config; NVIDIA's processor
+loads its own resources from the same directory. Install the compatible
+Isaac-GR00T and Transformers environment before loading a policy. Processor
+loading uses `local_files_only=True`; the official processor and inference
+arithmetic are unchanged.
+
 ```python
 from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
-    backbone="/models/nvidia/Cosmos-Reason2-2B",
     precision="bf16",
 )
 
@@ -66,11 +100,29 @@ result = policy.infer({
 actions = result["actions"]
 ```
 
-The GR00T checkpoint is the primary `AutoModel` artifact. The complete
-Cosmos-Reason2-2B architecture/processor snapshot is passed as the named
-`backbone` asset; it is not discovered through an environment variable. FP8
-additionally requires an explicit calibration JSON. Device-specific tactics are
-also explicit load arguments.
+Python `AutoPolicy` and Rust `AutoModel` both resolve the prepared directory by
+default. Python's `backbone=` and Rust's `LoadOptions.assets["backbone"]` remain
+optional local overrides for existing scripts. Missing or invalid default
+resources produce an error with preparation instructions. Loading does not
+search environment variables, `/tmp/fakehub`, paths from checkpoint metadata,
+or the network. The checkpoint's `model_name` may refer to its training/export
+machine and is not used to guess a local snapshot.
+
+FP8 requires a calibration identity matching the selected resources. The new
+layout binds the GR00T weight shards and actual local resource hashes. A legacy
+calibration identity cannot be directly reused with this prepared directory.
+Legacy profiles remain supported with an explicit `backbone=` pointing to the
+complete original Cosmos snapshot, whose weight shards participate in the old
+identity check. Those Cosmos shards are not used as inference weights. Pass the
+calibration JSON explicitly with `calibration=` and a device-specific tactics
+database with `tactics=` when needed.
+
+The generic command-line example uses the same default resource directory:
+
+```bash
+python python/apxinf/examples/autopolicy_infer.py \
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16
+```
 
 For LIBERO, GR00T's official state contract has eight values: XYZ, axis-angle
 rotation, and both mirrored gripper joint positions. Do not pass the seven-value
@@ -102,7 +154,7 @@ plan = policy.calibration_plan()
 profile = CalibrationRunner(
     policy,
     plan,
-    checkpoint=Gr00tPolicy.checkpoint_identity(checkpoint, backbone),
+    checkpoint=Gr00tPolicy.checkpoint_identity(checkpoint),
     data_identity=representative_dataset_identity,
     source_revision=source_revision,
     device={"requested": "cuda:0", "host": host_identity},
@@ -111,13 +163,44 @@ profile = CalibrationRunner(
 ).run(public_observations)
 ```
 
-The identity covers both the GR00T action-head checkpoint and the separately
-supplied Cosmos backbone. The emitted artifact uses
+The default identity hashes the combined GR00T checkpoint weights and the
+actual prepared configuration and processor resources, as described under
+[Loading](#loading). Use a calibration for that identity; preparing assets does
+not automatically convert an existing profile. A legacy profile is validated
+with the legacy identity only when its original complete Cosmos snapshot is
+selected explicitly. The emitted artifact uses
 `apxinf.fp8-calibration.v1`. Runtime loading rejects
 the wrong model family, checkpoint identity, scale formula, missing or unknown
 consumer/site, incomplete provenance, and non-production data labels. The
 profile is an external deployment artifact passed through `calibration=`; it is
 not copied into the read-only checkpoint and is not committed to this tree.
+
+## Performance optimizations
+
+- Optimize Thor BF16/FP8 and Orin BF16/W8A8 inference.
+- Fuse quantization, normalization, RoPE, attention, and projection epilogues to reduce kernel launches and intermediate tensors.
+- GR00T explicitly selects optimized operations; shared default paths and interfaces remain compatible.
+
+## Best measured performance
+
+| Device | Precision | 1-view P50 | 2-view P50 |
+| --- | --- | ---: | ---: |
+| Thor | BF16 | 51.834 ms | 54.216 ms |
+| Thor | FP8 | 32.557 ms | 35.436 ms |
+| Orin | BF16 | 75.778 ms | 84.864 ms |
+| Orin | W8A8 | 56.711 ms | 64.924 ms |
+
+## LIBERO-10 task accuracy
+
+| Device | Precision | Episodes | Successes | Success rate |
+| --- | --- | ---: | ---: | ---: |
+| Thor | BF16 | 100 | 94 | 94.0% |
+| Thor | FP8 | 100 | 92 | 92.0% |
+| Orin | BF16 | 100 | 93 | 93.0% |
+| Orin | W8A8 | 100 | 93 | 93.0% |
+
+Two views, 10 episodes for each of the 10 tasks, a 720-step limit, and eight
+executed actions per chunk.
 
 ## Fixed-input benchmark
 
@@ -128,7 +211,7 @@ action D2H; it excludes simulator and raw-observation preprocessing time.
 ```bash
 python scripts/bench_gr00t.py \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/nvidia/Cosmos-Reason2-2B \
+  --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
   --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
   --precision bf16 \
   --warmup 10 \
@@ -151,7 +234,6 @@ leaving the existing OpenPI state wire format unchanged for other policies:
 python scripts/eval_libero.py \
   --backend in-process \
   --model-dir /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/nvidia/Cosmos-Reason2-2B \
   --precision bf16 \
   --suite libero_10 \
   --trials-per-task 10 \
@@ -166,6 +248,7 @@ python scripts/eval_libero.py \
 Correctness comparison uses the same official processor output, embodiment ID,
 and initial noise on both implementations. The native model-core output is
 `[40, 132]`; the processor decodes and trims the LIBERO action to `[16, 7]`.
+The closed-loop evaluator executes eight actions before replanning.
 
 Minimum release gates are:
 

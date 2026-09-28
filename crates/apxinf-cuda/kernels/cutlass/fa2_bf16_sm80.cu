@@ -29,6 +29,8 @@ void run_mha_fwd_hdim64_bf16_apx(
     FLASH_NAMESPACE::Flash_fwd_params& params, cudaStream_t stream);
 bool use_mha_fwd_hdim64_bf16_apx(
     const FLASH_NAMESPACE::Flash_fwd_params& params);
+void run_mha_fwd_hdim96_bm64_bf16_apx(
+    FLASH_NAMESPACE::Flash_fwd_params& params, cudaStream_t stream);
 
 }  // namespace apxinf::cuda::cutlass_ops
 
@@ -273,6 +275,52 @@ int fa2_bf16_strided_qkv(
   return fa2_strided_qkv<cutlass::bfloat16_t>(
       qkv, output, softmax_lse, batch, tokens, heads, head_dim,
       softmax_scale, stream);
+}
+
+int fa2_bf16_hdim96_bm64(
+    const void* q, const void* k, const void* v, void* output,
+    void* softmax_lse, int batch, int query_tokens, int key_tokens,
+    int query_heads, int kv_heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  const bool supported_key_tokens =
+      key_tokens == 28 || key_tokens == 41 || key_tokens == 128;
+  if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
+      softmax_lse == nullptr || batch != 1 || query_tokens != 41 ||
+      !supported_key_tokens || query_heads != 32 || kv_heads != 32 ||
+      head_dim != 48) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, true, q, k, v, output, softmax_lse, batch,
+              query_tokens, key_tokens, query_heads, kv_heads, head_dim,
+              softmax_scale);
+  run_mha_fwd_hdim96_bm64_bf16_apx(params, stream);
+  return static_cast<int>(cudaSuccess);
+}
+
+int fa2_bf16_strided_qkv_hdim96_bm64(
+    const void* qkv, void* output, void* softmax_lse, int batch,
+    int tokens, int heads, int head_dim, float softmax_scale,
+    cudaStream_t stream) {
+  if (qkv == nullptr || output == nullptr || softmax_lse == nullptr ||
+      batch != 1 || tokens != 41 || heads != 32 || head_dim != 48) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const int hidden = heads * head_dim;
+  const auto* base = static_cast<const cutlass::bfloat16_t*>(qkv);
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, true, base, base + hidden, base + 2 * hidden, output,
+              softmax_lse, batch, tokens, tokens, heads, heads, head_dim,
+              softmax_scale);
+  const int64_t row_stride = static_cast<int64_t>(3) * hidden;
+  params.q_batch_stride = static_cast<int64_t>(tokens) * row_stride;
+  params.k_batch_stride = params.q_batch_stride;
+  params.v_batch_stride = params.q_batch_stride;
+  params.q_row_stride = row_stride;
+  params.k_row_stride = row_stride;
+  params.v_row_stride = row_stride;
+  run_mha_fwd_hdim96_bm64_bf16_apx(params, stream);
+  return static_cast<int>(cudaSuccess);
 }
 
 #if defined(APXINF_FA2_SPLITKV)

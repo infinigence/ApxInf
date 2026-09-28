@@ -2,7 +2,7 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 
-use super::contracts::{gpu_ptr, make_gpu_tensor};
+use super::contracts::{gpu_ptr, make_gpu_tensor, matrix_shape};
 use crate::context::CudaContext;
 use crate::ffi;
 use crate::workspace::output_buffer;
@@ -66,6 +66,85 @@ pub fn quantize_bf16_e4m3(ctx: &CudaContext, input: &Tensor, scale: f32) -> Resu
     }
     Ok(make_gpu_tensor(
         input.shape().clone(),
+        DType::F8E4M3,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Quantize BF16 to calibrated E4M3 using vectorized eight-element transfers.
+///
+/// This is an explicit opt-in specialization. The stable scalar route remains
+/// unchanged for callers that do not select it.
+pub fn quantize_bf16_e4m3_packed8(ctx: &CudaContext, input: &Tensor, scale: f32) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 {
+        return Err(Error::DTypeMismatch {
+            expected: DType::BF16,
+            got: input.dtype(),
+        });
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other(format!("invalid FP8 scale {scale}")));
+    }
+    let output = output_buffer(ctx, input.numel())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_quantize_bf16_e4m3_packed8(
+            gpu_ptr(input)?,
+            output.ptr(),
+            input.numel() as i64,
+            scale,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::F8E4M3,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Concatenate two BF16 matrices by rows and quantize the result to calibrated
+/// E4M3 without materializing the concatenated BF16 tensor.
+pub fn concat_rows_quantize_bf16_e4m3(
+    ctx: &CudaContext,
+    first: &Tensor,
+    second: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let (first_rows, cols) = matrix_shape(first, "row concatenation quantization")?;
+    let (second_rows, second_cols) = matrix_shape(second, "row concatenation quantization")?;
+    if first.dtype() != DType::BF16 || second.dtype() != DType::BF16 || cols != second_cols {
+        return Err(Error::Other(
+            "BF16 row concatenation quantization requires matrices with equal widths".into(),
+        ));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other(format!("invalid FP8 scale {scale}")));
+    }
+    let rows = first_rows
+        .checked_add(second_rows)
+        .ok_or_else(|| Error::Other("row concatenation quantization size overflow".into()))?;
+    let elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| Error::Other("row concatenation quantization size overflow".into()))?;
+    let output = output_buffer(ctx, elements)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_concat_rows_quantize_bf16_e4m3(
+            gpu_ptr(first)?,
+            gpu_ptr(second)?,
+            output.ptr(),
+            first_rows as i32,
+            second_rows as i32,
+            cols as i32,
+            scale,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        apxinf_core::Shape::new(vec![rows, cols]),
         DType::F8E4M3,
         ctx.device_id(),
         output,

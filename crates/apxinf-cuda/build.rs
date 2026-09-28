@@ -504,6 +504,7 @@ fn main() {
             let fa2_compat = cutlass_root.join("fa2_compat");
             let fa2_operator = cutlass_root.join("fa2_bf16_sm80.cu");
             let fa2_hdim64_apx = cutlass_root.join("fa2_hdim64_bf16.cu");
+            let fa2_hdim96_apx = cutlass_root.join("fa2_hdim96_bf16.cu");
             let fa2_wrapper = std::path::Path::new(&adapters_dir).join("fa2_adapter.cu");
             let mut fa2_sources = Vec::new();
             let mut fa2_direct_e4m3_sources = Vec::new();
@@ -521,6 +522,7 @@ fn main() {
                 assert!(
                     fa2_operator.is_file()
                         && fa2_hdim64_apx.is_file()
+                        && fa2_hdim96_apx.is_file()
                         && fa2_wrapper.is_file()
                         && fa2_hdim96.is_file()
                         && fa2_hdim128.is_file()
@@ -534,6 +536,7 @@ fn main() {
                 fa2_sources.extend([
                     fa2_wrapper.clone(),
                     fa2_hdim64_apx,
+                    fa2_hdim96_apx,
                     fa2_hdim96,
                     fa2_hdim128,
                     fa2_hdim256,

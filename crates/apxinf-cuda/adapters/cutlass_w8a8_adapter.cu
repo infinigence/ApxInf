@@ -11,3 +11,30 @@ extern "C" cudaError_t apxinf_static_cutlass_int8_gemm_bf16(
       activation, weight_output_major, row_scales, column_scales, output,
       m, n, k, stream);
 }
+
+extern "C" cudaError_t apxinf_static_cutlass_int8_gemm_bf16_m41_n6144_k1536(
+    const void* activation, const void* weight_output_major,
+    const void* row_scales, const void* column_scales, void* output,
+    int m, int n, int k, cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::w8a8_gemm_bf16_m41_n6144_k1536(
+      activation, weight_output_major, row_scales, column_scales, output,
+      m, n, k, stream);
+}
+
+extern "C" cudaError_t apxinf_static_cutlass_int8_gemm_bias_bf16_m41_n4608_k1536(
+    const void* activation, const void* weight_output_major,
+    const void* row_scales, const void* column_scales, const void* bias,
+    void* output, int m, int n, int k, cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::w8a8_gemm_bias_bf16_m41_n4608_k1536(
+      activation, weight_output_major, row_scales, column_scales, bias, output,
+      m, n, k, stream);
+}
+
+extern "C" cudaError_t apxinf_static_cutlass_int8_gemm_bias_gelu_bf16_m41_n6144_k1536(
+    const void* activation, const void* weight_output_major,
+    const void* row_scales, const void* column_scales, const void* bias,
+    void* output, int m, int n, int k, cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::w8a8_gemm_bias_gelu_bf16_m41_n6144_k1536(
+      activation, weight_output_major, row_scales, column_scales, bias, output,
+      m, n, k, stream);
+}

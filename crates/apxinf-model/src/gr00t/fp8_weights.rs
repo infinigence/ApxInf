@@ -5,14 +5,15 @@
 //! artifact. It does not add another model-facing runtime interface.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use apxinf_core::{Backend, Error, Result, Tensor};
 use serde::Deserialize;
 
 use super::action_weights::Gr00tLinearWeights;
+use super::assets::checkpoint_identity;
+#[cfg(test)]
+use super::assets::LocalSha256;
 use super::backend::{kernels, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
@@ -280,6 +281,25 @@ pub(super) struct Gr00tFp8LinearWeights {
 }
 
 impl Gr00tFp8LinearWeights {
+    fn quantize_activation(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
+        if !thor_fp8_packed_static_quantization(
+            backend.context().caps().sm,
+            std::env::var_os("APXINF_GR00T_FP8_LEGACY_STATIC_QUANT").is_some(),
+        ) {
+            kernels::quantization::quantize_bf16_e4m3(
+                backend.context(),
+                input,
+                self.activation_scale,
+            )
+        } else {
+            kernels::quantization::quantize_bf16_e4m3_packed8(
+                backend.context(),
+                input,
+                self.activation_scale,
+            )
+        }
+    }
+
     pub(super) fn from_host(
         weights: Gr00tLinearWeights,
         activation_scale: f32,
@@ -338,11 +358,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
     type ReusableInput = Tensor;
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        let input = kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?;
+        let input = self.quantize_activation(input, backend)?;
         self.forward_quantized_tensor(&input, backend)
     }
 
@@ -363,11 +379,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?))
+        Ok(Some(self.quantize_activation(input, backend)?))
     }
 
     fn quantize_bias_gelu_reusable_input(
@@ -384,6 +396,62 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         )?))
     }
 
+    fn forward_reusable_quantized_bias_gelu(
+        &self,
+        input: &Self::ReusableInput,
+        output_scale: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Self::ReusableInput>> {
+        if std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC1_EPILOGUE").is_some()
+            || backend.context().caps().sm != 110
+            || input.shape().dims() != [41, 1536]
+            || self.weight.shape().dims() != [1536, 6144]
+        {
+            return Ok(None);
+        }
+        let Some(bias) = self.bias.as_ref() else {
+            return Ok(None);
+        };
+        if bias.shape().dims() != [6144] {
+            return Ok(None);
+        }
+        kernels::fused::try_fp8_bias_gelu_quant_e4m3_m41(
+            backend.context(),
+            input,
+            &self.weight,
+            bias,
+            self.activation_scale,
+            self.weight_scale,
+            output_scale,
+        )
+    }
+
+    fn residual_layer_norm_quantized(
+        &self,
+        projection: &Tensor,
+        residual: &Tensor,
+        norm_weight: &Tensor,
+        norm_bias: &Tensor,
+        eps: f32,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
+        let fused = kernels::fused::bias_residual_layer_quant_bf16_e4m3(
+            backend.context(),
+            projection,
+            None,
+            residual,
+            norm_weight,
+            norm_bias,
+            eps,
+            self.activation_scale,
+        )?;
+        Ok(Some((fused.hidden, fused.normalized)))
+    }
+
+    fn supports_fused_bias_gelu_quantization(&self) -> bool {
+        true
+    }
+
     fn forward_reusable_quantized(
         &self,
         input: &Self::ReusableInput,
@@ -392,30 +460,77 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         self.forward_quantized_tensor(input, backend)
     }
 
+    fn forward_reusable_quantized_bias_residual(
+        &self,
+        input: &Self::ReusableInput,
+        residual: &Tensor,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        let Some(bias) = self.bias.as_ref() else {
+            return Ok(None);
+        };
+        let use_thor_m41_fc2_epilogue = backend.context().caps().sm == 110
+            && input.shape().dims() == [41, 6144]
+            && self.weight.shape().dims() == [6144, 1536]
+            && bias.shape().dims() == [1536]
+            && residual.shape().dims() == [41, 1536]
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC2_EPILOGUE").is_none();
+        if !use_thor_m41_fc2_epilogue {
+            return Ok(None);
+        }
+        let weight = kernels::gemm::Fp8WeightView {
+            values_e4m3: &self.weight,
+            scale: self.weight_scale,
+            dual_geglu_interleaved: false,
+            dual_geglu_auto_interleaved: None,
+        };
+        kernels::gemm::try_fp8_bias_then_residual_bf16(
+            backend.context(),
+            input,
+            self.activation_scale,
+            weight,
+            bias,
+            residual,
+        )
+    }
+
     fn quantize_tensor_input(
         &self,
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        Ok(Some(kernels::quantization::quantize_bf16_e4m3(
-            backend.context(),
-            input,
-            self.activation_scale,
-        )?))
+        Ok(Some(self.quantize_activation(input, backend)?))
     }
 
     fn forward_quantized_tensor(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        kernels::gemm::fp8_bf16(
-            backend.context(),
-            input,
-            self.activation_scale,
-            kernels::gemm::Fp8WeightView {
-                values_e4m3: &self.weight,
-                scale: self.weight_scale,
-                dual_geglu_interleaved: false,
-                dual_geglu_auto_interleaved: None,
-            },
-        )
+        let weight = kernels::gemm::Fp8WeightView {
+            values_e4m3: &self.weight,
+            scale: self.weight_scale,
+            dual_geglu_interleaved: false,
+            dual_geglu_auto_interleaved: None,
+        };
+        let versions = backend.context().library_versions();
+        let use_thor_m41_ffn_down = backend.context().caps().sm == 110
+            && thor_m41_custom_tactic_versions_supported(&versions.cuda, &versions.cublas)
+            && input.shape().dims() == [41, 6144]
+            && self.weight.shape().dims() == [6144, 1536]
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FFN_DOWN").is_none();
+        if use_thor_m41_ffn_down {
+            kernels::gemm::fp8_bf16_custom(
+                backend.context(),
+                input,
+                self.activation_scale,
+                weight,
+                kernels::gemm::Fp8Bf16CustomConfig {
+                    tile_id: 409,
+                    custom_option: 3,
+                    stages_id: 36,
+                    cluster_shape_id: 3,
+                },
+            )
+        } else {
+            kernels::gemm::fp8_bf16(backend.context(), input, self.activation_scale, weight)
+        }
     }
 
     fn adaptive_layer_norm_quantized(
@@ -456,275 +571,51 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
     }
 }
 
-/// Content identity shared with the model-neutral Python calibration runner.
-///
-/// Only weight shards participate in the identity. Paths are canonicalized
-/// relative to the checkpoint root, sorted bytewise, and delimited before the
-/// file contents so Rust validates exactly the artifact Python generated.
-fn checkpoint_identity(checkpoint: &Path, backbone: &Path) -> Result<String> {
-    let primary = single_checkpoint_identity(checkpoint)?;
-    let backbone = single_checkpoint_identity(backbone)?;
-    let mut digest = LocalSha256::new();
-    for (name, identity) in [("primary", primary), ("backbone", backbone)] {
-        digest.update(name.as_bytes());
-        digest.update(&[0]);
-        digest.update(identity.as_bytes());
-        digest.update(&[0]);
-    }
-    Ok(format!("sha256:{}", digest.finish_hex()))
+/// The explicit cuBLASLt attributes were accepted with runtime 13000 and
+/// cuBLAS 130000, which CudaContext formats as "13.0". Even patch-version
+/// changes use the normal planner until this private tactic is revalidated.
+fn thor_m41_custom_tactic_versions_supported(cuda: &str, cublas: &str) -> bool {
+    cuda == "13.0" && cublas == "13.0"
 }
 
-fn single_checkpoint_identity(path: &Path) -> Result<String> {
-    let (root, files) = if path.is_dir() {
-        let index = path.join("model.safetensors.index.json");
-        let model = path.join("model.safetensors");
-        let files = if index.is_file() {
-            checkpoint_index_files(&index)?
-        } else if model.is_file() {
-            vec![model]
-        } else {
-            let mut files = Vec::new();
-            collect_safetensors(path, &mut files)?;
-            files
-        };
-        (path.to_path_buf(), files)
-    } else if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or(false, |name| name.ends_with(".index.json"))
-    {
-        (
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            checkpoint_index_files(path)?,
-        )
-    } else {
-        (
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf(),
-            vec![path.to_path_buf()],
-        )
-    };
-    if files.is_empty() || files.iter().any(|file| !file.is_file()) {
-        return Err(Error::Other(format!(
-            "cannot resolve GR00T checkpoint files from {}",
-            path.display()
-        )));
-    }
-    let mut canonical = files
-        .into_iter()
-        .map(|file| {
-            let relative = file.strip_prefix(&root).map_err(|_| {
-                Error::Other(format!(
-                    "GR00T checkpoint file {} is outside {}",
-                    file.display(),
-                    root.display()
-                ))
-            })?;
-            let relative = relative
-                .components()
-                .map(|part| {
-                    part.as_os_str().to_str().ok_or_else(|| {
-                        Error::Other(format!(
-                            "GR00T checkpoint path is not canonical UTF-8: {}",
-                            file.display()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-                .join("/");
-            Ok((relative, file))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    canonical.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-    let mut digest = LocalSha256::new();
-    for (relative, file) in canonical {
-        digest.update(relative.as_bytes());
-        digest.update(&[0]);
-        let mut handle = File::open(&file)
-            .map_err(|error| Error::Other(format!("read {}: {error}", file.display())))?;
-        let mut buffer = [0u8; 1024 * 1024];
-        loop {
-            let count = handle
-                .read(&mut buffer)
-                .map_err(|error| Error::Other(format!("read {}: {error}", file.display())))?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-        }
-    }
-    Ok(format!("sha256:{}", digest.finish_hex()))
-}
-
-fn checkpoint_index_files(index_path: &Path) -> Result<Vec<PathBuf>> {
-    let raw = std::fs::read_to_string(index_path)
-        .map_err(|error| Error::Other(format!("read {}: {error}", index_path.display())))?;
-    let index: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| Error::Other(format!("GR00T checkpoint index JSON: {error}")))?;
-    let weight_map = index
-        .get("weight_map")
-        .and_then(|value| value.as_object())
-        .ok_or_else(|| Error::Other("GR00T checkpoint index has no weight_map".into()))?;
-    let mut names = BTreeSet::new();
-    for value in weight_map.values() {
-        let name = value
-            .as_str()
-            .ok_or_else(|| Error::Other("GR00T checkpoint index has a non-string shard".into()))?;
-        let relative = Path::new(name);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-        {
-            return Err(Error::Other(format!(
-                "GR00T checkpoint index has an unsafe shard path: {name}"
-            )));
-        }
-        names.insert(name.to_owned());
-    }
-    let root = index_path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(names.into_iter().map(|name| root.join(name)).collect())
-}
-
-fn collect_safetensors(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(directory)
-        .map_err(|error| Error::Other(format!("read {}: {error}", directory.display())))?
-    {
-        let path = entry
-            .map_err(|error| Error::Other(error.to_string()))?
-            .path();
-        if path.is_dir() {
-            collect_safetensors(&path, files)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("safetensors") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-struct LocalSha256 {
-    state: [u32; 8],
-    buffer: Vec<u8>,
-    bytes: u64,
-}
-
-impl LocalSha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buffer: Vec::with_capacity(64),
-            bytes: 0,
-        }
-    }
-
-    fn update(&mut self, mut input: &[u8]) {
-        self.bytes += input.len() as u64;
-        if !self.buffer.is_empty() {
-            let needed = 64 - self.buffer.len();
-            let take = needed.min(input.len());
-            self.buffer.extend_from_slice(&input[..take]);
-            input = &input[take..];
-            if self.buffer.len() == 64 {
-                let block: [u8; 64] = self.buffer.as_slice().try_into().unwrap();
-                self.compress(&block);
-                self.buffer.clear();
-            }
-        }
-        while input.len() >= 64 {
-            let block: &[u8; 64] = input[..64].try_into().unwrap();
-            self.compress(block);
-            input = &input[64..];
-        }
-        self.buffer.extend_from_slice(input);
-    }
-
-    fn finish_hex(mut self) -> String {
-        let bit_len = self.bytes * 8;
-        self.buffer.push(0x80);
-        while self.buffer.len() % 64 != 56 {
-            self.buffer.push(0);
-        }
-        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
-        let blocks = std::mem::take(&mut self.buffer);
-        for chunk in blocks.chunks_exact(64) {
-            self.compress(chunk.try_into().unwrap());
-        }
-        self.state
-            .iter()
-            .map(|word| format!("{word:08x}"))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    fn compress(&mut self, block: &[u8; 64]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut words = [0u32; 64];
-        for (index, bytes) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(bytes.try_into().unwrap());
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choose = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(choose)
-                .wrapping_add(K[index])
-                .wrapping_add(words[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *state = state.wrapping_add(value);
-        }
-    }
+fn thor_fp8_packed_static_quantization(sm: u32, legacy_requested: bool) -> bool {
+    sm == 110 && !legacy_requested
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_identity, e4m3_weight_scale, Gr00tFp8Calibration, LocalSha256,
+        checkpoint_identity, e4m3_weight_scale, thor_fp8_packed_static_quantization,
+        thor_m41_custom_tactic_versions_supported, Gr00tFp8Calibration, LocalSha256,
         CALIBRATION_SCHEMA, E4M3_MAX,
     };
     use std::path::Path;
+
+    #[test]
+    fn packed_static_quantization_preserves_other_architectures_and_legacy_mode() {
+        assert!(thor_fp8_packed_static_quantization(110, false));
+        assert!(!thor_fp8_packed_static_quantization(110, true));
+        for sm in [0, 80, 87, 89, 90, 100, 103, 120] {
+            assert!(!thor_fp8_packed_static_quantization(sm, false));
+            assert!(!thor_fp8_packed_static_quantization(sm, true));
+        }
+    }
+
+    #[test]
+    fn explicit_m41_tactic_requires_the_accepted_library_versions() {
+        assert!(thor_m41_custom_tactic_versions_supported("13.0", "13.0"));
+        for (cuda, cublas) in [
+            ("13.2", "13.0"),
+            ("13.0", "13.4"),
+            ("13.0.1", "13.0"),
+            ("13.0", "13.0.1"),
+            ("13.0.0", "13.0"),
+            ("", "13.0"),
+            ("13.0", ""),
+        ] {
+            assert!(!thor_m41_custom_tactic_versions_supported(cuda, cublas));
+        }
+    }
 
     #[test]
     fn sha256_matches_the_standard_vector() {

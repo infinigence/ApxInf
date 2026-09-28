@@ -257,6 +257,174 @@ pub fn apply_mrope(
     ))
 }
 
+/// Apply per-head RMSNorm and multimodal RoPE to Q and K in one launch.
+/// The normalized values are rounded to BF16 before rotation, matching the
+/// decomposed RMSNorm-then-RoPE contract.
+/// Head dimensions above 512 require the decomposed path.
+/// Uses the default 256-thread launch independently of model environment.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_apply_mrope_qk(
+    ctx: &CudaContext,
+    query: &Tensor,
+    query_weight: &Tensor,
+    key: &Tensor,
+    key_weight: &Tensor,
+    seq_len: usize,
+    query_heads: usize,
+    key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &CudaBuffer,
+) -> Result<(Tensor, Tensor)> {
+    rms_norm_apply_mrope_qk_with_block_threads(
+        ctx,
+        query,
+        query_weight,
+        key,
+        key_weight,
+        seq_len,
+        query_heads,
+        key_heads,
+        head_dim,
+        eps,
+        theta,
+        sections,
+        pos_ids,
+        256,
+    )
+}
+
+/// The same RMSNorm + mRoPE contract with an explicit 128- or 256-thread launch.
+/// The caller selects the launch size; no model-specific environment is read.
+/// Each thread handles a rotary pair, so `head_dim / 2 <= block_threads` is required.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_apply_mrope_qk_with_block_threads(
+    ctx: &CudaContext,
+    query: &Tensor,
+    query_weight: &Tensor,
+    key: &Tensor,
+    key_weight: &Tensor,
+    seq_len: usize,
+    query_heads: usize,
+    key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &CudaBuffer,
+    block_threads: u32,
+) -> Result<(Tensor, Tensor)> {
+    if !matches!(block_threads, 128 | 256) || head_dim / 2 > block_threads as usize {
+        return Err(Error::Other(
+            "Q/K RMSNorm mRoPE requires 128 or 256 block threads and head_dim / 2 <= block_threads"
+                .into(),
+        ));
+    }
+    require_finite("Q/K RMSNorm mRoPE", &[eps, theta])?;
+    if query.dtype() != DType::BF16
+        || key.dtype() != DType::BF16
+        || query_weight.dtype() != DType::BF16
+        || key_weight.dtype() != DType::BF16
+        || query.shape().dims() != [seq_len * query_heads, head_dim]
+        || key.shape().dims() != [seq_len * key_heads, head_dim]
+        || query_weight.shape().dims() != [head_dim]
+        || key_weight.shape().dims() != [head_dim]
+        || seq_len == 0
+        || query_heads == 0
+        || key_heads == 0
+        || head_dim == 0
+        || head_dim > 512
+        || head_dim % 2 != 0
+        || eps <= 0.0
+        || theta <= 0.0
+    {
+        return Err(Error::Other(
+            "Q/K RMSNorm mRoPE shape, dtype, or scalar contract mismatch".into(),
+        ));
+    }
+    let query_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, query_heads, head_dim],
+        "Q RMSNorm mRoPE",
+    )?;
+    let key_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, key_heads, head_dim],
+        "K RMSNorm mRoPE",
+    )?;
+    let weight_bytes = checked_bytes(DType::BF16, &[head_dim], "Q/K RMSNorm weights")?;
+    let position_bytes = seq_len
+        .checked_mul(3)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("Q/K RMSNorm mRoPE position size overflow".into()))?;
+    let query_buffer = CudaBuffer::from_tensor(query).map_err(Error::Cuda)?;
+    let key_buffer = CudaBuffer::from_tensor(key).map_err(Error::Cuda)?;
+    let query_weight_buffer = CudaBuffer::from_tensor(query_weight).map_err(Error::Cuda)?;
+    let key_weight_buffer = CudaBuffer::from_tensor(key_weight).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "Q/K RMSNorm mRoPE",
+        &[
+            ("query", &query_buffer, query_bytes),
+            ("key", &key_buffer, key_bytes),
+            ("query weight", &query_weight_buffer, weight_bytes),
+            ("key weight", &key_weight_buffer, weight_bytes),
+        ],
+    )?;
+    require_address(
+        ctx,
+        "Q/K RMSNorm mRoPE",
+        "positions",
+        pos_ids.address(),
+        position_bytes,
+    )?;
+    let query_output = output_buffer(ctx, query_bytes)?;
+    let key_output = output_buffer(ctx, key_bytes)?;
+    check_cuda(unsafe {
+        ffi::apxinf_qk_rms_norm_mrope_bf16_with_threads(
+            query_buffer.ptr(),
+            query_weight_buffer.ptr(),
+            query_output.ptr(),
+            key_buffer.ptr(),
+            key_weight_buffer.ptr(),
+            key_output.ptr(),
+            u32::try_from(head_dim)
+                .map_err(|_| Error::Other("Q/K mRoPE head dimension exceeds u32".into()))?,
+            u32::try_from(query_heads)
+                .map_err(|_| Error::Other("Q mRoPE head count exceeds u32".into()))?,
+            u32::try_from(key_heads)
+                .map_err(|_| Error::Other("K mRoPE head count exceeds u32".into()))?,
+            u32::try_from(seq_len)
+                .map_err(|_| Error::Other("Q/K mRoPE sequence exceeds u32".into()))?,
+            eps,
+            theta,
+            pos_ids.ptr(),
+            u32::try_from(sections[1])
+                .map_err(|_| Error::Other("Q/K mRoPE H section exceeds u32".into()))?,
+            u32::try_from(sections[2])
+                .map_err(|_| Error::Other("Q/K mRoPE W section exceeds u32".into()))?,
+            block_threads,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok((
+        make_gpu_tensor(
+            Shape::new(vec![seq_len, query_heads, head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            query_output,
+        ),
+        make_gpu_tensor(
+            Shape::new(vec![seq_len, key_heads, head_dim]),
+            DType::BF16,
+            ctx.device_id(),
+            key_output,
+        ),
+    ))
+}
+
 /// Vision 2D-RoPE (bf16). `input` `[seq, heads, head_dim]`; `pos_ids` flat
 /// u32 slice of length `seq * 2` (h, w per token). head_dim=64 for Qwen3-VL.
 pub fn apply_vision_2d(
@@ -405,6 +573,97 @@ pub fn split_qkv_bias_apply_vision_2d(
     split_qkv_bias_apply_vision_2d_impl(ctx, qkv, bias, n_heads, head_dim, theta, pos_ids)
 }
 
+/// Build the reusable rotation table consumed by the opt-in precomputed
+/// vision QKV/RoPE operator. This does not change the default dynamic operator.
+pub fn prepare_vision_2d_rotation_table(
+    ctx: &CudaContext,
+    seq_len: usize,
+    head_dim: usize,
+    theta: f32,
+    pos_ids: &CudaBuffer,
+) -> Result<CudaBuffer> {
+    if seq_len == 0 || head_dim == 0 || head_dim % 2 != 0 || theta <= 0.0 {
+        return Err(Error::Other(
+            "vision rotation table requires a non-empty sequence, even head dimension, and positive theta"
+                .into(),
+        ));
+    }
+    require_finite("vision rotation table", &[theta])?;
+    let position_bytes = seq_len
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or_else(|| Error::Other("vision rotation position size overflow".into()))?;
+    let table_bytes = seq_len
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("vision rotation table size overflow".into()))?;
+    require_address(
+        ctx,
+        "vision rotation table",
+        "positions",
+        pos_ids.address(),
+        position_bytes,
+    )?;
+    let table = CudaBuffer::alloc_on(ctx, table_bytes).map_err(Error::Cuda)?;
+    check_cuda(unsafe {
+        ffi::apxinf_build_vision_rotation_table_f32(
+            pos_ids.ptr(),
+            table.ptr(),
+            u32::try_from(head_dim)
+                .map_err(|_| Error::Other("vision rotation head dimension exceeds u32".into()))?,
+            u32::try_from(seq_len)
+                .map_err(|_| Error::Other("vision rotation sequence exceeds u32".into()))?,
+            theta,
+            ctx.stream().handle(),
+        )
+    })?;
+    Ok(table)
+}
+
+/// Opt-in variant of the fused vision operator that consumes a prepared
+/// rotation table. The public dynamic-position entry remains unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_bias_apply_vision_2d_precomputed(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    rotation_table: &CudaBuffer,
+) -> Result<QkvTensors> {
+    split_qkv_bias_apply_vision_2d_precomputed_impl(
+        ctx,
+        qkv,
+        bias,
+        n_heads,
+        head_dim,
+        rotation_table,
+        false,
+    )
+}
+
+/// GR00T exact-shape opt-in using two RoPE pairs per thread. The public
+/// prepared-position entry above retains its existing launch geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_bias_apply_vision_2d_precomputed_vec2(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    rotation_table: &CudaBuffer,
+) -> Result<QkvTensors> {
+    split_qkv_bias_apply_vision_2d_precomputed_impl(
+        ctx,
+        qkv,
+        bias,
+        n_heads,
+        head_dim,
+        rotation_table,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn split_qkv_bias_apply_vision_2d_impl(
     ctx: &CudaContext,
@@ -479,6 +738,91 @@ fn split_qkv_bias_apply_vision_2d_impl(
                 .map_err(|_| Error::Other("vision fused QKV sequence exceeds u32".into()))?,
             theta,
             pos_ids.ptr(),
+            ctx.stream().handle(),
+        )
+    })?;
+    let shape = Shape::new(vec![seq_len, n_heads, head_dim]);
+    Ok(QkvTensors {
+        q: make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), q),
+        k: make_gpu_tensor(shape.clone(), DType::BF16, ctx.device_id(), k),
+        v: make_gpu_tensor(shape, DType::BF16, ctx.device_id(), v),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_bias_apply_vision_2d_precomputed_impl(
+    ctx: &CudaContext,
+    qkv: &Tensor,
+    bias: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    rotation_table: &CudaBuffer,
+    vec2: bool,
+) -> Result<QkvTensors> {
+    let (seq_len, width) = matrix_shape(qkv, "precomputed vision fused QKV 2D-RoPE")?;
+    let projection_width = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Other("precomputed vision fused QKV width overflow".into()))?;
+    if qkv.dtype() != DType::BF16
+        || width != 3 * projection_width
+        || bias.dtype() != DType::BF16
+        || bias.shape().dims() != [width]
+        || head_dim == 0
+        || head_dim % 2 != 0
+        || n_heads == 0
+    {
+        return Err(Error::Other(
+            "precomputed vision fused QKV 2D-RoPE shape or dtype mismatch".into(),
+        ));
+    }
+    let qkv_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, width],
+        "precomputed vision fused QKV",
+    )?;
+    let bias_bytes = checked_bytes(DType::BF16, &[width], "precomputed vision fused QKV bias")?;
+    let output_bytes = checked_bytes(
+        DType::BF16,
+        &[seq_len, n_heads, head_dim],
+        "precomputed vision fused QKV output",
+    )?;
+    let rotation_bytes = seq_len
+        .checked_mul(head_dim / 2)
+        .and_then(|count| count.checked_mul(2 * std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::Other("precomputed vision rotation size overflow".into()))?;
+    let qkv_buffer = CudaBuffer::from_tensor(qkv).map_err(Error::Cuda)?;
+    let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+    require_buffers(
+        ctx,
+        "precomputed vision fused QKV 2D-RoPE",
+        &[
+            ("qkv", &qkv_buffer, qkv_bytes),
+            ("bias", &bias_buffer, bias_bytes),
+            ("rotation table", rotation_table, rotation_bytes),
+        ],
+    )?;
+    let q = output_buffer(ctx, output_bytes)?;
+    let k = output_buffer(ctx, output_bytes)?;
+    let v = output_buffer(ctx, output_bytes)?;
+    check_cuda(unsafe {
+        let launch = if vec2 {
+            ffi::apxinf_qkv_split_bias_vision_rope_precomputed_vec2_bf16
+        } else {
+            ffi::apxinf_qkv_split_bias_vision_rope_precomputed_bf16
+        };
+        launch(
+            qkv_buffer.ptr(),
+            bias_buffer.ptr(),
+            q.ptr(),
+            k.ptr(),
+            v.ptr(),
+            u32::try_from(head_dim)
+                .map_err(|_| Error::Other("vision fused QKV head dimension exceeds u32".into()))?,
+            u32::try_from(n_heads)
+                .map_err(|_| Error::Other("vision fused QKV head count exceeds u32".into()))?,
+            u32::try_from(seq_len)
+                .map_err(|_| Error::Other("vision fused QKV sequence exceeds u32".into()))?,
+            rotation_table.ptr(),
             ctx.stream().handle(),
         )
     })?;

@@ -371,6 +371,74 @@ __global__ void bias_residual_bf16_kernel(
   }
 }
 
+// Preserve bias_residual_bf16_kernel's single-rounding arithmetic order lane
+// by lane while using aligned 8-byte loads and stores.
+__global__ void bias_residual_bf16_packed4_kernel(
+    const Bf16x4* projection, const Bf16x4* bias,
+    const Bf16x4* residual, Bf16x4* output,
+    int64_t packed_count, int packed_cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < packed_count; index += stride) {
+    const Bf16x4 projected = projection[index];
+    const Bf16x4 skipped = residual[index];
+    const Bf16x4 bias_value = bias[index % packed_cols];
+    const float2 projection_low = __bfloat1622float2(projected.low);
+    const float2 projection_high = __bfloat1622float2(projected.high);
+    const float2 residual_low = __bfloat1622float2(skipped.low);
+    const float2 residual_high = __bfloat1622float2(skipped.high);
+    const float2 bias_low = __bfloat1622float2(bias_value.low);
+    const float2 bias_high = __bfloat1622float2(bias_value.high);
+    output[index] = Bf16x4{
+        __floats2bfloat162_rn(
+            projection_low.x + residual_low.x + bias_low.x,
+            projection_low.y + residual_low.y + bias_low.y),
+        __floats2bfloat162_rn(
+            projection_high.x + residual_high.x + bias_high.x,
+            projection_high.y + residual_high.y + bias_high.y)};
+  }
+}
+
+// Preserve the scalar bias_then_residual contract lane by lane while using
+// aligned 8-byte loads/stores: projection+bias is rounded to BF16 before the
+// residual add and final BF16 rounding.
+__global__ void bias_then_residual_bf16_packed4_kernel(
+    const Bf16x4* projection, const Bf16x4* bias,
+    const Bf16x4* residual, Bf16x4* output,
+    int64_t packed_count, int packed_cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < packed_count; index += stride) {
+    const Bf16x4 projected = projection[index];
+    float2 projection_low = __bfloat1622float2(projected.low);
+    float2 projection_high = __bfloat1622float2(projected.high);
+    if (bias != nullptr) {
+      const Bf16x4 bias_value = bias[index % packed_cols];
+      const float2 bias_low = __bfloat1622float2(bias_value.low);
+      const float2 bias_high = __bfloat1622float2(bias_value.high);
+      projection_low.x += bias_low.x;
+      projection_low.y += bias_low.y;
+      projection_high.x += bias_high.x;
+      projection_high.y += bias_high.y;
+    }
+    const Bf16x4 biased{
+        __floats2bfloat162_rn(projection_low.x, projection_low.y),
+        __floats2bfloat162_rn(projection_high.x, projection_high.y)};
+    float2 biased_low = __bfloat1622float2(biased.low);
+    float2 biased_high = __bfloat1622float2(biased.high);
+    const Bf16x4 skipped = residual[index];
+    const float2 residual_low = __bfloat1622float2(skipped.low);
+    const float2 residual_high = __bfloat1622float2(skipped.high);
+    biased_low.x += residual_low.x;
+    biased_low.y += residual_low.y;
+    biased_high.x += residual_high.x;
+    biased_high.y += residual_high.y;
+    output[index] = Bf16x4{
+        __floats2bfloat162_rn(biased_low.x, biased_low.y),
+        __floats2bfloat162_rn(biased_high.x, biased_high.y)};
+  }
+}
+
 // Preserve a two-kernel `bias_bf16` then `add_bf16` contract in one launch:
 // the projection+bias sum is rounded to BF16 before adding the residual.
 __global__ void bias_then_residual_bf16_kernel(
@@ -817,6 +885,192 @@ __global__ __launch_bounds__(256) void bias_residual_layer_norm_bf16_carry_1024_
   }
 }
 
+
+// Opt-in BF16 residual LayerNorm that preserves the legacy two-kernel
+// LayerNorm -> FP8 quantization rounding contract.  Keep this separate from
+// bias_residual_layer_norm_bf16_kernel so existing callers retain their BF16
+// output and dispatch unchanged.
+__global__ void bias_residual_layer_norm_quant_bf16_e4m3_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_fp8_e4m3* normalized, int rows, int cols, float eps,
+    float inverse_scale) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float value = __bfloat162float(projection[index]) +
+                  __bfloat162float(residual[index]);
+    if (projection_bias != nullptr) value += __bfloat162float(projection_bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[index] = rounded;
+    sum += __bfloat162float(rounded);
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
+  float variance_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float centered =
+        __bfloat162float(hidden[static_cast<int64_t>(row) * cols + col]) - mean;
+    variance_sum += centered * centered;
+  }
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float value =
+        (__bfloat162float(hidden[index]) - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]);
+    // Match bias_residual_layer_norm_bf16 followed by quantize_bf16_e4m3.
+    value = __bfloat162float(__float2bfloat16(value));
+    value = fminf(448.0f, fmaxf(-448.0f, value * inverse_scale));
+    normalized[index] = static_cast<__nv_fp8_e4m3>(value);
+  }
+}
+
+// Exact-width companion for GR00T's DiT FFN-output boundary. The projection
+// bias and residual remain separately rounded to BF16 before applying the
+// following block's adaptive LayerNorm. The 256-thread ownership and
+// accumulation order match adaptive_layer_norm_bf16_kernel at width 1536.
+__global__ void
+bias_then_residual_adaptive_layer_norm_bf16_cached_1536_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* modulation,
+    __nv_bfloat16* hidden, __nv_bfloat16* normalized, int rows, float eps) {
+  __shared__ float scratch[16];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * 1536;
+  float cache[6];
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const __nv_bfloat16 biased = __float2bfloat16(
+        __bfloat162float(projection[base + col]) +
+        __bfloat162float(projection_bias[col]));
+    const __nv_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[base + col]));
+    hidden[base + col] = rounded;
+    cache[i] = __bfloat162float(rounded);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / 1536.0f;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / 1536.0f + eps);
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const float value = (cache[i] - mean) * inverse_std;
+    const float scale = __bfloat162float(modulation[col]);
+    const float shift = __bfloat162float(modulation[1536 + col]);
+    normalized[base + col] =
+        __float2bfloat16(value * (1.0f + scale) + shift);
+  }
+}
+
+// Exact-shape opt-in for the GR00T DiT attention-output boundary. Unlike the
+// generic fused residual path, this retains the legacy bias kernel's BF16
+// boundary before the residual add. Each of the 256 threads owns the same six
+// columns, in the same order, as layer_norm_bf16_kernel at width 1536.
+__global__ void bias_then_residual_layer_norm_bf16_cached_1536_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_bfloat16* normalized, int rows, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * 1536;
+  float cache[6];
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const __nv_bfloat16 biased = __float2bfloat16(
+        __bfloat162float(projection[base + col]) +
+        __bfloat162float(projection_bias[col]));
+    const __nv_bfloat16 rounded = __float2bfloat16(
+        __bfloat162float(biased) + __bfloat162float(residual[base + col]));
+    hidden[base + col] = rounded;
+    cache[i] = __bfloat162float(rounded);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / 1536.0f;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / 1536.0f + eps);
+#pragma unroll
+  for (int i = 0; i < 6; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    normalized[base + col] = __float2bfloat16(
+        (cache[i] - mean) * inverse_std *
+            __bfloat162float(norm_weight[col]) +
+        __bfloat162float(norm_bias[col]));
+  }
+}
+
+__global__ void bias_residual_layer_norm_bf16_cached_1024_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_bfloat16* normalized, int rows, float eps) {
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * 1024;
+  float cache[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    float value = __bfloat162float(projection[base + col]) +
+                  __bfloat162float(residual[base + col]);
+    if (projection_bias != nullptr)
+      value += __bfloat162float(projection_bias[col]);
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[base + col] = rounded;
+    cache[i] = __bfloat162float(rounded);
+  }
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) sum += cache[i];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / 1024.0f;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float centered = cache[i] - mean;
+    variance_sum += centered * centered;
+  }
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / 1024.0f + eps);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int col = threadIdx.x + i * static_cast<int>(blockDim.x);
+    const float value = (cache[i] - mean) * inverse_std *
+                            __bfloat162float(norm_weight[col]) +
+                        __bfloat162float(norm_bias[col]);
+    normalized[base + col] = __float2bfloat16(value);
+  }
+}
 
 __global__ void ada_gate_residual_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* residual,

@@ -39,6 +39,12 @@ class AutoPolicy:
 
         ``model_type`` overrides the value detected from the checkpoint. Extra
         ``kwargs`` pass through to the concrete policy's ``from_pretrained``.
+        GR00T uses prepared architecture and processor resources in
+        ``model_dir/assets/cosmos/`` by default; ``model_dir`` contains all
+        inference weights. Prepare resources once with
+        ``Gr00tPolicy.prepare_assets(model_dir, source)``. ``backbone=`` remains
+        an optional local override. Loading does not search or download missing
+        resources.
 
         Built-in policies register themselves when :mod:`apxinf.policies` is
         imported (which always happens before this method is reachable), so the

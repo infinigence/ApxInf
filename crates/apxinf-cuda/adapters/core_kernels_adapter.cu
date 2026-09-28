@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 #define BLOCK_SIZE 256
 
@@ -485,6 +486,54 @@ extern "C" cudaError_t apxinf_rope_mrope_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16_with_threads(
+    const void* query_input, const void* query_weight, void* query_output,
+    const void* key_input, const void* key_weight, void* key_output,
+    uint32_t head_dim, uint32_t query_heads, uint32_t key_heads,
+    uint32_t seq_len, float eps, float theta, const void* pos_ids,
+    uint32_t sec_h, uint32_t sec_w, uint32_t block_threads, void* stream)
+{
+    if ((block_threads != 128 && block_threads != 256) ||
+        query_input == nullptr || query_weight == nullptr ||
+        query_output == nullptr || key_input == nullptr ||
+        key_weight == nullptr || key_output == nullptr ||
+        pos_ids == nullptr || head_dim == 0 || (head_dim % 2) != 0 ||
+        query_heads == 0 || key_heads == 0 || seq_len == 0 ||
+        head_dim / 2 > block_threads ||
+        !(eps > 0.0f) || !(theta > 0.0f)) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(seq_len, query_heads + key_heads, 1);
+    dim3 block(block_threads, 1, 1);
+    qk_rms_norm_mrope_bf16_kernel<<<
+        grid, block, head_dim * sizeof(__nv_bfloat16),
+        static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(query_input),
+        static_cast<const __nv_bfloat16*>(query_weight),
+        static_cast<__nv_bfloat16*>(query_output),
+        static_cast<const __nv_bfloat16*>(key_input),
+        static_cast<const __nv_bfloat16*>(key_weight),
+        static_cast<__nv_bfloat16*>(key_output), head_dim, query_heads,
+        key_heads, seq_len, eps, theta, static_cast<const uint32_t*>(pos_ids),
+        sec_h, sec_w);
+    return cudaGetLastError();
+}
+
+// Default operator launch. Callers with a measured launch policy use the
+// explicit entry above; this shared entry does not read model environment.
+extern "C" cudaError_t apxinf_qk_rms_norm_mrope_bf16(
+    const void* query_input, const void* query_weight, void* query_output,
+    const void* key_input, const void* key_weight, void* key_output,
+    uint32_t head_dim, uint32_t query_heads, uint32_t key_heads,
+    uint32_t seq_len, float eps, float theta, const void* pos_ids,
+    uint32_t sec_h, uint32_t sec_w, void* stream)
+{
+    return apxinf_qk_rms_norm_mrope_bf16_with_threads(
+        query_input, query_weight, query_output, key_input, key_weight, key_output,
+        head_dim, query_heads, key_heads, seq_len, eps, theta, pos_ids,
+        sec_h, sec_w, BLOCK_SIZE, stream);
+}
+
 extern "C" cudaError_t apxinf_rope_mrope_decode_bf16(
     const void* input, void* output,
     uint32_t head_dim, uint32_t n_heads,
@@ -625,6 +674,66 @@ extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_build_vision_rotation_table_f32(
+    const void* pos_ids, void* rotation_table,
+    uint32_t head_dim, uint32_t seq_len, float theta, void* stream)
+{
+    if (pos_ids == nullptr || rotation_table == nullptr || head_dim == 0 ||
+        (head_dim % 2) != 0 || seq_len == 0 || !(theta > 0.0f)) {
+        return cudaErrorInvalidValue;
+    }
+    const uint64_t total = (uint64_t)seq_len * (head_dim / 2);
+    dim3 grid((uint32_t)((total + BLOCK_SIZE - 1) / BLOCK_SIZE), 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    build_vision_rotation_table_f32_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const uint32_t*)pos_ids, (float2*)rotation_table,
+        head_dim, seq_len, theta);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream)
+{
+    if (qkv == nullptr || bias == nullptr || q_out == nullptr || k_out == nullptr ||
+        v_out == nullptr || rotation_table == nullptr || head_dim == 0 ||
+        (head_dim % 2) != 0 || n_heads == 0 || seq_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    uint64_t total = (uint64_t)seq_len * n_heads * (head_dim / 2);
+    dim3 grid((uint32_t)((total + BLOCK_SIZE - 1) / BLOCK_SIZE), 1, 1);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    qkv_split_bias_vision_rope_bf16_kernel<true><<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)qkv, (const __nv_bfloat16*)bias,
+        (__nv_bfloat16*)q_out, (__nv_bfloat16*)k_out, (__nv_bfloat16*)v_out,
+        head_dim, n_heads, seq_len, 0.0f, nullptr,
+        (const float2*)rotation_table);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_vec2_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream) {
+  if (qkv == nullptr || bias == nullptr || q_out == nullptr || k_out == nullptr ||
+      v_out == nullptr || rotation_table == nullptr || head_dim == 0 ||
+      head_dim % 4 != 0 || n_heads == 0 || seq_len == 0)
+    return cudaErrorInvalidValue;
+  const uint64_t total =
+      static_cast<uint64_t>(seq_len) * n_heads * (head_dim / 4);
+  constexpr uint32_t threads = 128;
+  const dim3 grid(static_cast<uint32_t>((total + threads - 1) / threads), 1, 1);
+  qkv_split_bias_vision_rope_precomputed_bf16_vec2_kernel<<<
+      grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16*>(qkv),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_bfloat16*>(q_out),
+      static_cast<__nv_bfloat16*>(k_out),
+      static_cast<__nv_bfloat16*>(v_out), head_dim, n_heads, seq_len,
+      static_cast<const float2*>(rotation_table));
+  return cudaGetLastError();
+}
 extern "C" cudaError_t apxinf_vision_sdpa_bf16(
     const void* q, const void* k, const void* v, void* out,
     uint32_t seq_len, uint32_t n_heads, uint32_t head_dim, float scale, void* stream)

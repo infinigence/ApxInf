@@ -942,12 +942,20 @@ fn fp8_identity_gemm_runs_on_device() {
         );
         if crate::kernels::gemm::native_fp8_supported(backend.context()).unwrap() {
             let output = backend
-                .to_cpu(&bf16_output.unwrap()).unwrap().to_f32_vec().unwrap();
+                .to_cpu(&bf16_output.unwrap())
+                .unwrap()
+                .to_f32_vec()
+                .unwrap();
             for (actual, expected) in output.iter().zip(&activation) {
-                assert!((actual - expected).abs() < 0.04, "BF16 {actual} != {expected}");
+                assert!(
+                    (actual - expected).abs() < 0.04,
+                    "BF16 {actual} != {expected}"
+                );
             }
         } else {
-            assert!(bf16_output.unwrap_err().to_string()
+            assert!(bf16_output
+                .unwrap_err()
+                .to_string()
                 .contains("requires native E4M3 Tensor Core support"));
         }
     }
@@ -1019,7 +1027,8 @@ fn dynamic_fp8_row_channel_scales_match_bf16_reference() {
         let error = output_result.unwrap_err().to_string();
         assert!(
             error.contains("dynamic rowwise FP8 GEMM requires native FP8 Tensor Cores")
-                || error.contains("dynamic rowwise FP8 GEMM requires an SM100-family native backend"),
+                || error
+                    .contains("dynamic rowwise FP8 GEMM requires an SM100-family native backend"),
             "unsupported architecture must fail explicitly, got: {error}"
         );
         return;
@@ -1205,6 +1214,80 @@ fn dynamic_fp8_vla_fusions_match_composed_operators() {
         "SwiGLU quantization",
         &decode(&swiglu_fused),
         &decode(&swiglu_reference),
+    );
+}
+
+#[test]
+fn bias_residual_layer_norm_quant_bf16_matches_composed_production_shape() {
+    const ROWS: usize = 512;
+    const COLS: usize = 1024;
+    const SCALE: f32 = 0.03125;
+
+    let backend = CudaBackend::new(0).unwrap();
+    let matrix = |multiplier: usize, modulus: usize, center: f32, divisor: f32| {
+        (0..ROWS * COLS)
+            .map(|index| bf16::from_f32(((index * multiplier % modulus) as f32 - center) / divisor))
+            .collect::<Vec<_>>()
+    };
+    let vector = |multiplier: usize, modulus: usize, center: f32, divisor: f32| {
+        (0..COLS)
+            .map(|index| bf16::from_f32(((index * multiplier % modulus) as f32 - center) / divisor))
+            .collect::<Vec<_>>()
+    };
+    let projection = backend
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &matrix(17, 101, 50.0, 43.0)).unwrap())
+        .unwrap();
+    let residual = backend
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &matrix(11, 89, 44.0, 37.0)).unwrap())
+        .unwrap();
+    let projection_bias = backend
+        .to_device(&Tensor::from_bf16(vec![COLS], &vector(7, 67, 33.0, 127.0)).unwrap())
+        .unwrap();
+    let norm_weight = backend
+        .to_device(&Tensor::from_bf16(vec![COLS], &vector(5, 53, -79.5, 106.0)).unwrap())
+        .unwrap();
+    let norm_bias = backend
+        .to_device(&Tensor::from_bf16(vec![COLS], &vector(3, 47, 23.0, 193.0)).unwrap())
+        .unwrap();
+
+    let reference = bias_residual_layer_bf16(
+        backend.context(),
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+    )
+    .unwrap();
+    let reference_quantized =
+        quantize_bf16_e4m3(backend.context(), &reference.normalized, SCALE).unwrap();
+    let fused = bias_residual_layer_quant_bf16_e4m3(
+        backend.context(),
+        &projection,
+        Some(&projection_bias),
+        &residual,
+        &norm_weight,
+        &norm_bias,
+        1.0e-6,
+        SCALE,
+    )
+    .unwrap();
+    backend.synchronize().unwrap();
+
+    let reference_hidden = backend.to_cpu(&reference.hidden).unwrap();
+    let fused_hidden = backend.to_cpu(&fused.hidden).unwrap();
+    assert_eq!(
+        fused_hidden.as_bf16().unwrap(),
+        reference_hidden.as_bf16().unwrap(),
+        "fused residual LayerNorm hidden output changed"
+    );
+    let reference_quantized = backend.to_cpu(&reference_quantized).unwrap();
+    let fused_quantized = backend.to_cpu(&fused.normalized).unwrap();
+    assert_eq!(
+        fused_quantized.as_f8_e4m3().unwrap(),
+        reference_quantized.as_f8_e4m3().unwrap(),
+        "fused residual LayerNorm FP8 output changed"
     );
 }
 
@@ -2470,4 +2553,59 @@ fn cutlass_action_qkv_shape_runs_on_device() {
     let output = fp8_gemm_f16(backend.context(), &activation, &weight, 1.0, 1.0).unwrap();
     let output = backend.to_cpu(&output).unwrap();
     assert!(output.as_f16().unwrap().iter().all(|x| *x == f16::ZERO));
+}
+
+#[test]
+fn concat_rows_quantize_bf16_e4m3_matches_composed_production_shape() {
+    const ROWS: usize = 256;
+    const COLS: usize = 1024;
+    const SCALE: f32 = 0.03125;
+
+    let backend = CudaBackend::new(0).unwrap();
+    let values = |multiplier: usize, modulus: usize, center: f32, divisor: f32| {
+        (0..ROWS * COLS)
+            .map(|index| bf16::from_f32(((index * multiplier % modulus) as f32 - center) / divisor))
+            .collect::<Vec<_>>()
+    };
+    let first = backend
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &values(17, 101, 50.0, 7.0)).unwrap())
+        .unwrap();
+    let second = backend
+        .to_device(&Tensor::from_bf16(vec![ROWS, COLS], &values(29, 113, 56.0, 9.0)).unwrap())
+        .unwrap();
+
+    let joined = concat_rows_bf16(backend.context(), &first, &second).unwrap();
+    let reference = quantize_bf16_e4m3(backend.context(), &joined, SCALE).unwrap();
+    let fused = concat_rows_quantize_bf16_e4m3(backend.context(), &first, &second, SCALE).unwrap();
+    backend.synchronize().unwrap();
+
+    let reference = backend.to_cpu(&reference).unwrap();
+    let fused = backend.to_cpu(&fused).unwrap();
+    assert_eq!(fused.shape(), reference.shape());
+    assert_eq!(fused.as_f8_e4m3().unwrap(), reference.as_f8_e4m3().unwrap());
+}
+
+#[test]
+fn packed8_quantize_bf16_e4m3_matches_scalar_with_tail() {
+    const COUNT: usize = 41 * 1536 + 3;
+    const SCALE: f32 = 0.03125;
+
+    let backend = CudaBackend::new(0).unwrap();
+    let values = (0..COUNT)
+        .map(|index| bf16::from_f32(((index * 37 % 1009) as f32 - 504.0) / 11.0))
+        .collect::<Vec<_>>();
+    let input = backend
+        .to_device(&Tensor::from_bf16(vec![1, COUNT], &values).unwrap())
+        .unwrap();
+
+    let reference = quantize_bf16_e4m3(backend.context(), &input, SCALE).unwrap();
+    let packed = quantize_bf16_e4m3_packed8(backend.context(), &input, SCALE).unwrap();
+    backend.synchronize().unwrap();
+
+    let reference = backend.to_cpu(&reference).unwrap();
+    let packed = backend.to_cpu(&packed).unwrap();
+    assert_eq!(
+        packed.as_f8_e4m3().unwrap(),
+        reference.as_f8_e4m3().unwrap()
+    );
 }

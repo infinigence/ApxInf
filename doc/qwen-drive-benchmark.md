@@ -5,7 +5,7 @@
 Jetson AGX Thor SM110 (20 SMs), CUDA 13.2, BF16 `planner-sft`, direct
 planning, batch one and ten flow steps. Request latency includes policy
 preprocessing, native execution and the materialized `[50, 3]` host trajectory;
-images are already decoded and model loading is excluded. This is an L2 request
+images are already decoded and model loading is excluded. This is an end-to-end request latency
 measurement, whereas the PI0.5 README table measures CUDA Graph replay.
 
 | Measurement | Result |
