@@ -34,6 +34,23 @@ The Python policy continues to return actions shaped `[50, 3]`. Padding affects
 internal execution only. A changed logical prompt length invalidates prepared
 graph state because the action KV views and masks must be rebuilt.
 
+### Native integration acceptance (2026-09-28)
+
+All 242 fixed-profile NAVSIM trajectories match the accepted padded reference
+bit for bit. Fresh PDM scoring is 0.8567857859645779 with no changed discrete
+metrics. Against the unpadded optimized reference, 117 trajectories remain
+exact and 125 use the padded path; PDM changes from 0.8567232845223145 to
+0.8567857859645779 with no discrete metric flips.
+
+A contemporary Thor2 ABBA comparison, 10 warmups and 30 samples per arm,
+measured request p50 at 489.0/491.2 ms for the maintained implementation and
+487.6/493.0 ms for the accepted padded reference. This is the resident-image L2
+scope through materialized host actions, BF16, batch one and ten flow steps.
+GPU occupancy was checked before each arm. Complete CPU/fan verification was
+interrupted by connectivity loss, so these results are not a fan-locked latency
+guarantee. The historical 482.98 ms result is not a new measurement of this build.
+Evidence is retained under `devlocal/qwen-drive-performance/`.
+
 ## The fixed workload
 
 Four public VQA scenes from WOD_E2E, batch 1, BF16, exactly 64 generated
