@@ -9,8 +9,6 @@ use apxinf_core::{Error, Result};
 
 use crate::{buffer::CudaBuffer, context::CudaContext, ffi};
 
-pub const PILLOW_RESAMPLE_VERSION: &str = "12.3.0-rgb8-bicubic-int22";
-
 /// Dimensions selected by the caller. `stage` is the first uint8 image; the
 /// optional second PIL resize goes from `stage` to `final_size`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

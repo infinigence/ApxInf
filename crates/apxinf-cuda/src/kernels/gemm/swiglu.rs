@@ -8,6 +8,10 @@ use crate::{buffer::CudaBuffer, context::CudaContext, cublas::CublasTranspose};
 /// The first M rows are the logical result. An implementation may return
 /// additional zero rows for a following projection; callers must slice the
 /// projected result back to M before residual addition.
+/// The fixed SM110 AOT route returns 3584 physical rows for M=3387 and fuses
+/// activation into the GEMM epilogue. The generic route materializes a BF16
+/// projection first; their rounding boundaries differ, so cross-route outputs
+/// are not promised bit-identical.
 pub fn bf16_swiglu_checkpoint(
     ctx: &CudaContext,
     input: &Tensor,

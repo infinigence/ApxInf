@@ -1,6 +1,5 @@
 //! Planning request validation, device input binding and mutable execution state.
 use super::prepare::DirectPlan;
-use super::prepare::GdnGraphs;
 use crate::qwen_drive::{
     backend::{kernels, transfers, tuning, Context, DeviceBuffer},
     inputs::ExpertConditioning,
@@ -14,8 +13,6 @@ use apxinf_core::{Backend, DType, Device, Error, Result, SamplingBackend, Shape,
 use std::cell::RefCell;
 
 struct ExecutionState {
-    // Drop graphs before the buffers whose addresses they capture.
-    graphs: GdnGraphs,
     vision: std::rc::Rc<VisionState>,
     backbone: Option<PlanningState>,
 }
@@ -32,7 +29,6 @@ impl QwenDriveModelRunner {
             prepared: RefCell::new(None),
             last_mode: std::cell::Cell::new("eager"),
             state: RefCell::new(ExecutionState {
-                graphs: GdnGraphs::default(),
                 vision: Default::default(),
                 backbone: None,
             }),
@@ -139,19 +135,16 @@ impl QwenDriveModelRunner {
             .try_borrow_mut()
             .map_err(|_| Error::Other("qwen_drive runner is already executing".into()))?;
         // Keep cache addresses stable across requests, but reset all semantic
-        // state. Local decode captures retain their existing per-request policy.
-        execution.graphs = GdnGraphs::default();
+        // state. Reasoning decode uses ordinary eager execution.
         if let Some(backbone) = execution.backbone.as_mut() {
             self.model.reset_state(backbone)?;
         } else {
             execution.backbone = Some(self.model.new_state(execution.vision.clone())?);
         }
-        let ExecutionState {
-            graphs, backbone, ..
-        } = &mut *execution;
+        let backbone = &mut execution.backbone;
         let result = self
             .model
-            .infer(backbone.as_mut().expect("fresh backbone"), graphs, &input);
+            .infer(backbone.as_mut().expect("fresh backbone"), &input);
         // Eager RGB input is temporary; complete its stream consumers before
         // dropping the raw bytes and LUT. The direct graph uses stable buffers.
         if rgb_hold.is_some() {
@@ -190,19 +183,10 @@ impl VlaRuntime for QwenDriveModelRunner {
             .metadata
             .planning
             .and_then(|p| p.reasoning.as_ref())
-            .is_none()
-            && !matches!(
-                std::env::var("APXINF_QWEN_GRAPH").as_deref(),
-                Ok("0") | Ok("off")
-            );
+            .is_none();
         if !use_graph {
             let result = self.execute(request)?;
-            self.last_mode
-                .set(if std::env::var_os("APXINF_QWEN_DECODE_GRAPH").is_some() {
-                    "eager-with-opt-in-gdn-graphs"
-                } else {
-                    "eager"
-                });
+            self.last_mode.set("eager");
             return Ok(Action::new(result));
         }
         let valid = validate(&self.model, request)?;

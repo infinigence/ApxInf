@@ -11,26 +11,6 @@
 namespace FLASH_NAMESPACE {
 
 using Head64Traits = Flash_fwd_kernel_traits<64, 64, 256, 4, false, false, cutlass::bfloat16_t>;
-// The same kernel over a 128-wide key tile. The 256-wide tile costs 73.7 KB of
-// shared memory and 244 registers, and those cap residency at two blocks per SM
-// independently of each other -- the kernel sits at 16.67% theoretical
-// occupancy, eight of forty-eight warp slots, with nothing saturated. Halving
-// the tile halves both the KV staging and the score accumulator.
-//
-// This is not a drop-in. FlashAttention rescales its running maximum and sum
-// once per key tile, so a different tile width is a different summation order
-// and a different result. Gated on APXINF_FA2_HEAD64_NARROW=1, for measuring
-// what the trajectory change would buy.
-using Head64Narrow = Flash_fwd_kernel_traits<64, 64, 128, 4, false, false, cutlass::bfloat16_t>;
-
-static bool head64_narrow_tile() {
-  static const bool narrow = [] {
-    const char* value = getenv("APXINF_FA2_HEAD64_NARROW");
-    return value != nullptr && value[0] == '1' && value[1] == '\0';
-  }();
-  return narrow;
-}
-
 template<typename Traits, bool Split>
 cudaError_t launch_head64_traits(Flash_fwd_params& params, cudaStream_t stream) {
   auto kernel = &flash_fwd_splitkv_kernel<Traits, false, false, false, false, true, false, Split, false>;
@@ -49,9 +29,7 @@ cudaError_t launch_head64_traits(Flash_fwd_params& params, cudaStream_t stream) 
 
 template<bool Split>
 cudaError_t launch_head64(Flash_fwd_params& params, cudaStream_t stream) {
-  return head64_narrow_tile()
-      ? launch_head64_traits<Head64Narrow, Split>(params, stream)
-      : launch_head64_traits<Head64Traits, Split>(params, stream);
+  return launch_head64_traits<Head64Traits, Split>(params, stream);
 }
 
 int run_bf16_head64_splitkv(Flash_fwd_params& params, cudaStream_t stream) {

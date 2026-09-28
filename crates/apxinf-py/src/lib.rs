@@ -1704,6 +1704,11 @@ impl ModelRunner {
 
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "cuda")]
+    module.add(
+        "QWEN_DRIVE_FIXED_SCENE_TOKENS",
+        apxinf_model::qwen_drive::FIXED_SCENE_TOKENS,
+    )?;
     module.add_class::<ModelRunner>()?;
     module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;

@@ -324,8 +324,6 @@ impl BackboneDeviceWeights {
         // FIX (implement_r3 / synthesis_r3): confirmation-line accumulators for the A_log
         // bf16-grid rounding below; max_delta over the PRE-round values proves the fix
         // load-bearing (>0 expected). Permanent.
-        let mut a_log_max_delta = 0.0f32;
-        let mut a_log_layer0_first4: Vec<f32> = Vec::new();
         for index in 0..text.n_layers {
             let p = format!("model.language_model.layers.{index}");
             let input_norm = up(
@@ -412,17 +410,9 @@ impl BackboneDeviceWeights {
                         "qwen_drive: conv1d weight at layer {index} has shape {conv_dims:?}, expected [{conv_dim}, 1, {kernel}]"
                     )));
                 }
-                // FIX (implement_r3 / synthesis_r3): bf16-grid-round A_log at load (see
-                // bf16_grid_round_f32); the pre-round max-delta feeds the confirmation line.
+                // Round A_log to the BF16 grid at load (see bf16_grid_round_f32).
                 let a_log_raw =
                     widen_to_f32(&take(&mut language, &format!("{p}.linear_attn.A_log"))?)?;
-                let a_log_pre = a_log_raw.to_f32_vec()?;
-                a_log_max_delta = a_log_pre.iter().fold(a_log_max_delta, |m, &v| {
-                    m.max((v - half::bf16::from_f32(v).to_f32()).abs())
-                });
-                if index == 0 {
-                    a_log_layer0_first4 = a_log_pre[..a_log_pre.len().min(4)].to_vec();
-                }
                 let dt_bias = take(&mut language, &format!("{p}.linear_attn.dt_bias"))?;
                 layers.push(MixerWeights::Gdn(GdnLayerWeights {
                     input_norm,
@@ -455,13 +445,6 @@ impl BackboneDeviceWeights {
                 }));
             }
         }
-        // FIX (implement_r3 / synthesis_r3): load-time confirmation line for the A_log
-        // bf16-grid rounding (lands in the captured load section; expected max_delta>0).
-        qdiag!(
-            "[qwen_drive] a_log_bf16_round max_delta={:.6} layer0_first4={:?}",
-            a_log_max_delta,
-            a_log_layer0_first4
-        );
         let embed_tokens = up(
             backend,
             &take(&mut language, "model.language_model.embed_tokens.weight")?,

@@ -157,3 +157,94 @@ def test_native_planning_uses_shared_runner():
     assert hasattr(native.ModelRunner, "_infer_preprocessed")
     assert not hasattr(native.ModelRunner, "_infer_planning")
     assert not hasattr(native, "QwenDriveModel")
+
+
+@pytest.mark.parametrize("pillow_version,owned", [("12.3.0", False), ("12.3.0", True), ("13.0.0", False)])
+def test_rgb_bridge_and_pillow_gate(config, monkeypatch, pillow_version, owned):
+    import PIL
+    monkeypatch.setattr(PIL, "__version__", pillow_version)
+    config = dict(config, image_patch_size=16, history_image_pixels=1024,
+                  current_image_pixels=1024)
+    p = policy(config)
+    runner = p.model_runner
+    runner._infer_resized_rgb = runner._infer_preprocessed
+    if owned:
+        runner._pack_rgb_u8_frames = lambda frames: ("owned", np.concatenate(frames).copy())
+        runner._infer_resized_rgb_packed = runner._infer_preprocessed
+    result = p.infer(scene(), noise=np.zeros((3, 3), np.float32))
+    pixels, grids, _, _, _, options = runner.calls[0]
+    assert result["actions"].shape == (3, 3)
+    if pillow_version == "12.3.0":
+        assert options["raw_resize_frames"].shape == (1, 6)
+        np.testing.assert_array_equal(options["raw_resize_frames"][0, :2], [8, 8])
+        if owned:
+            assert pixels[0] == "owned"
+            assert pixels[1].dtype == np.uint8
+        else:
+            assert pixels.dtype == np.uint8 and pixels.size == 8 * 8 * 3
+    else:
+        assert "raw_resize_frames" not in options
+        assert pixels.dtype == np.uint8
+        assert pixels.size == int(np.prod(grids[0, 1:])) * 16 * 16 * 3
+
+
+@pytest.mark.parametrize("dimension", range(6))
+def test_raw_resize_dimension_limits_use_pillow(config, monkeypatch, dimension):
+    _check_raw_resize_fallback(config, monkeypatch, dimension=dimension)
+
+
+@pytest.mark.parametrize("limit", ["frames", "raw_bytes", "final_bytes"])
+def test_raw_resize_resource_limits_use_pillow(config, monkeypatch, limit):
+    _check_raw_resize_fallback(config, monkeypatch, limit=limit)
+
+
+def _check_raw_resize_fallback(config, monkeypatch, dimension=None, limit=None):
+    import PIL
+    monkeypatch.setattr(PIL, "__version__", "12.3.0")
+    p = policy(dict(config, image_patch_size=16))
+    p.model_runner._infer_resized_rgb = p.model_runner._infer_preprocessed
+    sizes = [32] * 6  # source, stage and final width/height
+    if dimension is not None:
+        sizes[dimension] = 8193
+    count = 1
+    if limit == "frames":
+        count = 65536
+    elif limit == "raw_bytes":
+        sizes[:2], count = [8192, 8192], 3
+    elif limit == "final_bytes":
+        sizes[4:], count = [8192, 8192], 2
+    # Model only geometry, so oversized-resource cases allocate no large arrays.
+    image = SimpleNamespace(ndim=3, shape=(sizes[1], sizes[0], 3),
+                            reshape=lambda *args: np.zeros(1, np.uint8))
+    contiguous = np.ascontiguousarray
+    monkeypatch.setattr(np, "ascontiguousarray", lambda x, *a, **k:
+                        image if x is image else contiguous(x, *a, **k))
+    monkeypatch.setattr(p, "_scene_frames", lambda views:
+                        [(image, tuple(sizes[2:4]), True)] * count)
+    monkeypatch.setattr(qwen_drive, "smart_resize", lambda *a: (sizes[5], sizes[4]))
+    fallback = []
+    def resize(jobs):
+        fallback.append(len(jobs))
+        return [(np.zeros(32 * 32 * 3, np.uint8), (2, 2))]
+    monkeypatch.setattr(p, "_resized_rgb_batch", resize)
+    p.infer(scene(), noise=np.zeros((3, 3), np.float32))
+    assert fallback == [count]
+    assert "raw_resize_frames" not in p.model_runner.calls[0][-1]
+
+
+def test_native_rgb_pack_rejects_invalid_inputs():
+    native = pytest.importorskip("apxinf_py")
+    pack = native.ModelRunner._pack_rgb_u8_frames
+    for frames in ([], [np.zeros(3, np.float32)], [np.zeros((1, 3), np.uint8)],
+                   [np.arange(6, dtype=np.uint8)[::2]], [np.zeros(0, np.uint8)],
+                   [np.zeros(1, np.uint8)] * 65536):
+        with pytest.raises(ValueError):
+            pack(frames)
+
+
+def test_production_action_shape(config, monkeypatch):
+    p = policy(dict(config, num_future_points=50))
+    monkeypatch.setattr(p.model_runner, "_infer_preprocessed",
+                        lambda *args, **kwargs: np.ones((50, 3), np.float32))
+    result = p.infer(scene(), noise=np.zeros((50, 3), np.float32))
+    assert result["actions"].shape == (50, 3)

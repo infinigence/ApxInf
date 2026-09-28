@@ -7,6 +7,7 @@ use super::cuda::{cudaError_t, cudaStream_t};
 extern "C" {
     #[cfg(apxinf_aot_sm110)]
     pub fn apxinf_static_fa4_split_batch_init(stream: cudaStream_t) -> i32;
+    pub fn apxinf_static_fa4_split_batch_ready() -> i32;
 
     #[cfg(apxinf_aot_sm110)]
     pub fn apxinf_static_fa4_split_batch_forward(

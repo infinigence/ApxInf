@@ -228,7 +228,6 @@ extern "C" {
         head_k_dim: i32,
         head_v_dim: i32,
         chunk_size: i32,
-        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]
@@ -271,7 +270,6 @@ extern "C" {
         chunk_size: i32,
         total_chunks: i32,
         out_row_width: i32,
-        policy: *const GdnLaunchPolicy,
         stream: cudaStream_t,
     ) -> cudaError_t;
     #[allow(clippy::too_many_arguments)]

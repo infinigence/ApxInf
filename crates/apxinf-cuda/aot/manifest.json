@@ -29,6 +29,12 @@
         "revision": "19f1a41e6b21f0c422d775e377b6fdf9a1fc9d23",
         "license": "Apache-2.0",
         "repository": "https://github.com/flashinfer-ai/flashinfer"
+      },
+      "exporter_sha256": "0cfee09d91d1892546ba186247f9abd5301e016bf6e97c0de980d706d76d2b52",
+      "specialization": {
+        "tokens": 3392,
+        "real_tokens": 3387,
+        "sm_count": 20
       }
     },
     {
@@ -62,6 +68,12 @@
         "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
         "license": "BSD-3-Clause",
         "repository": "https://github.com/Dao-AILab/flash-attention"
+      },
+      "exporter_sha256": "6cd23ed457c7dbac267fa5ff34267fd01bcca94a7686b53af49a6504006eb1e8",
+      "specialization": {
+        "q_tokens": 3387,
+        "kv_tokens": 3387,
+        "head_dim": 256
       }
     },
     {
@@ -109,7 +121,8 @@
           256
         ],
         "note": "Preserve the accepted compiler specialization; runtime views and masks support the larger padded extent."
-      }
+      },
+      "exporter_sha256": "038c54ccbd57fc0b2c5fd0ee64a62a7642908bd6c5abc9a436df33693d9ca9e6"
     },
     {
       "id": "gemm-swiglu-bf16",
@@ -145,6 +158,20 @@
         "revision": "0.6.5",
         "license": "Apache-2.0",
         "repository": "https://github.com/Dao-AILab/quack"
+      },
+      "exporter_sha256": "905b6b1e9af7f651d255cdc43fc0926a9d0ade6e0097f1bd8f9f3ee1823af263",
+      "specialization": {
+        "m": 3387,
+        "k": 2560,
+        "intermediate": 9216,
+        "tile": [
+          256,
+          256
+        ],
+        "cluster": [
+          2,
+          1
+        ]
       }
     },
     {
@@ -177,6 +204,12 @@
         "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
         "license": "BSD-3-Clause",
         "repository": "https://github.com/Dao-AILab/flash-attention"
+      },
+      "exporter_sha256": "c08d648f0dbbac914a4e78e483d885186ce002e5337081ec665b2d75d4833f38",
+      "specialization": {
+        "batch": 3,
+        "tokens": 624,
+        "head_dim": 64
       }
     },
     {
@@ -209,6 +242,12 @@
         "revision": "d15f1531a460ba456f41b01a774f33ab2db8febf",
         "license": "BSD-3-Clause",
         "repository": "https://github.com/Dao-AILab/flash-attention"
+      },
+      "exporter_sha256": "c08d648f0dbbac914a4e78e483d885186ce002e5337081ec665b2d75d4833f38",
+      "specialization": {
+        "batch": 3,
+        "tokens": 2200,
+        "head_dim": 64
       }
     }
   ]

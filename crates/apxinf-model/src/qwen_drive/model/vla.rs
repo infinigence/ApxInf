@@ -1,7 +1,6 @@
 //! Planning computation: multimodal prefix, optional reasoning, then flow sampling.
 //! The caller owns backbone state and chooses how GDN blocks execute.
 use super::blocks::bf16::{expert, upload_u32, BackboneBf16, BackboneState, PlannerBf16};
-use super::blocks::GdnExecution;
 use super::{PlanningState, VisionState};
 use crate::qwen_drive::backend::kernels::linear_attention;
 use crate::qwen_drive::inputs::ExpertConditioning;
@@ -104,14 +103,9 @@ impl QwenDriveModel {
         inputs.forward(&self.backbone, &self.planner, state, execution)
     }
 
-    pub fn infer(
-        &self,
-        state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
-        input: &PlanningInput<'_>,
-    ) -> Result<Tensor> {
+    pub fn infer(&self, state: &mut BackboneState, input: &PlanningInput<'_>) -> Result<Tensor> {
         let b = &self.backbone;
-        let hidden = b.prefill(state, execution, input.token_ids, input.pixels, input.grids)?;
+        let hidden = b.prefill(state, input.token_ids, input.pixels, input.grids)?;
         let anchor = if let Some(reasoning) = &input.reasoning {
             let mut generated = Vec::new();
             let mut sampler = b.cuda.create_token_sampler(TokenSamplingSpec {
@@ -127,7 +121,6 @@ impl QwenDriveModel {
             let prompt_anchor = state.last_position;
             let eos = upload_u32(b.ctx(), reasoning.terminator_ids)?;
             for step in 0..reasoning.max_new_tokens {
-                state.decode_step = Some(step);
                 if step < reasoning.min_new_tokens {
                     linear_attention::suppress_logits(
                         b.ctx(),
@@ -144,7 +137,7 @@ impl QwenDriveModel {
                 {
                     break;
                 }
-                let hidden = b.forward_tokens(state, execution, &[sample.token_id])?;
+                let hidden = b.forward_tokens(state, &[sample.token_id])?;
                 logits = b.next_logits(&hidden)?;
             }
             let mut closed = generated.clone();
@@ -157,7 +150,7 @@ impl QwenDriveModel {
             closed.extend_from_slice(reasoning.closing_ids);
             let cached = generated.len().saturating_sub(1);
             if cached < closed.len() {
-                b.forward_tokens(state, execution, &closed[cached..])?;
+                b.forward_tokens(state, &closed[cached..])?;
             }
             prompt_anchor + closed.len() as i64
         } else {

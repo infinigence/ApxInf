@@ -1799,13 +1799,12 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_tri_k_bf16_direct_v(
     const void* g_cum, void* vt_out, void* kcd_out,
     int seq, int seq_pad, int conv_dim, int v_offset, int num_v_heads,
     int head_k_dim, int head_v_dim, int chunk_size,
-    const ApxinfGdnPolicy* policy, cudaStream_t stream) {
-  if (!policy || !a || !conv_out || !k || !beta || !g_cum || !vt_out ||
+    cudaStream_t stream) {
+  if (!a || !conv_out || !k || !beta || !g_cum || !vt_out ||
       !kcd_out || seq <= 0 || seq_pad < seq || seq_pad % 64 ||
       num_v_heads <= 0 || head_k_dim != 128 || head_v_dim != 128 ||
       chunk_size != 64 || v_offset < 0 ||
-      static_cast<int64_t>(v_offset) + static_cast<int64_t>(num_v_heads) * 128 > conv_dim ||
-      policy->chunk_gemm_tile != 4) return cudaErrorInvalidValue;
+      static_cast<int64_t>(v_offset) + static_cast<int64_t>(num_v_heads) * 128 > conv_dim) return cudaErrorInvalidValue;
   constexpr size_t smem = 64 * 256 * sizeof(__nv_bfloat16) +
                           64 * 64 * sizeof(float);
   static thread_local int opted_device = -1;
@@ -1832,20 +1831,18 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_gemm_tri_k_bf16_direct_v(
   return cudaGetLastError();
 }
 
-// Experimental typed W/U accumulation reorder. The model's F1 inverse
-// producer puts A exactly on the BF16 grid; this route keeps the BF16 Q/K and
-// direct-V representation and is selected independently of legacy W/U WMMA.
+// Typed BF16 state scan with fixed 1024-thread launch geometry. It does not
+// consume the legacy float-input kernel policy.
 extern "C" cudaError_t apxinf_static_gdn_chunk_state_qk_bf16(
     const void* q, const void* k, const void* g_cum, const void* t_in,
     const void* vt_in, const void* kcd_in, void* state, void* out,
     int seq, int seq_pad, int num_v_heads, int head_k_dim, int head_v_dim,
     int chunk_size, int total_chunks, int out_row_width,
-    const ApxinfGdnPolicy* policy, cudaStream_t stream) {
-  if (!policy || !q || !k || !g_cum || !t_in || !vt_in || !kcd_in || !state ||
+    cudaStream_t stream) {
+  if (!q || !k || !g_cum || !t_in || !vt_in || !kcd_in || !state ||
       !out || seq <= 0 || seq_pad < seq || seq_pad != total_chunks * 64 ||
       num_v_heads <= 0 || head_k_dim != 128 || head_v_dim != 128 ||
-      chunk_size != 64 || out_row_width != num_v_heads * 128 ||
-      policy->chunk_state_wmma != APXINF_GDN_WMMA_LOSSY)
+      chunk_size != 64 || out_row_width != num_v_heads * 128)
     return cudaErrorInvalidValue;
   constexpr int KP = 136, VP = 136;
   constexpr size_t smem =
@@ -1899,6 +1896,7 @@ extern "C" cudaError_t apxinf_pillow_bicubic_u8_axis(
     int batch, bool horizontal, cudaStream_t stream) {
   if (!input || !output || !input_offsets || !output_offsets || !bounds || !weights ||
       ksize <= 0 || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0 ||
+      (horizontal ? out_h != in_h : out_w != in_w) ||
       batch <= 0 || batch > 65535 ||
       static_cast<int64_t>(out_w) * out_h > std::numeric_limits<int>::max())
     return cudaErrorInvalidValue;

@@ -1,4 +1,5 @@
-#include "quack_m256n256_adapter.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 #include "apxinf_quack_swiglu_bf16_m256n256_sm110.h"
 
 #include <atomic>

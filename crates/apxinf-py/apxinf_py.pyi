@@ -30,7 +30,7 @@ class _PackedRgbU8:
     """Owned contiguous RGB storage consumed by one inference call."""
     ...
 
-class Model:
+class ModelRunner:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
     @staticmethod
@@ -49,7 +49,7 @@ class Model:
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
         assets: dict[str, str] | None = ...,
-    ) -> "Model":
+    ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
@@ -194,3 +194,6 @@ class Model:
     def max_token_len(self) -> int: ...
     @property
     def accepts_rgb_u8(self) -> bool: ...
+
+# Exported by CUDA builds; shared fixed-profile geometry.
+QWEN_DRIVE_FIXED_SCENE_TOKENS: int

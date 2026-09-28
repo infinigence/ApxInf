@@ -1,4 +1,5 @@
-#include "fa4_fixed_groups_adapter.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 #include "apxinf_fa4_vfixed_b3_l624_sm110.h"
 #include "apxinf_fa4_vfixed_b3_l2200_sm110.h"
 

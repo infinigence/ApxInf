@@ -1,0 +1,25 @@
+name: Qwen-Drive contracts
+on:
+  pull_request:
+    paths:
+      - 'python/apxinf/**'
+      - 'crates/apxinf-model/**'
+      - 'scripts/check_model_family_boundaries.sh'
+      - '.github/workflows/qwen-drive-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e python/apxinf pytest
+      - run: >-
+          python -m pytest -q
+          python/apxinf/tests/test_qwen_drive_policy.py
+          python/apxinf/tests/test_qwen_drive_padding.py
+      - run: bash scripts/check_model_family_boundaries.sh

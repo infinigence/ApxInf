@@ -22,6 +22,16 @@ use crate::test_util::{
     upload_fp32_as_bf16,
 };
 
+fn bf16_buffer(ctx: &CudaContext, values: &[f32]) -> CudaBuffer {
+    CudaBuffer::from_tensor(&upload_fp32_as_bf16(ctx, values, vec![values.len()]).unwrap()).unwrap()
+}
+
+fn round_bf16(values: &mut [f32]) {
+    for value in values {
+        *value = half::bf16::from_f32(*value).to_f32();
+    }
+}
+
 fn silu_ref(x: f32) -> f32 {
     x / (1.0f32 + (-x).exp())
 }
@@ -734,7 +744,6 @@ fn vision_segmented_mha_error_against_fp64_oracle() {
 // double-precision reference of the same recurrence.
 //
 //   cargo test --release -p apxinf-cuda gdn_recurrent_decode -- --nocapture
-//   APXINF_GDN_RECURRENT_SPLIT=1 cargo test ...   (the scalar kernel)
 #[test]
 fn gdn_recurrent_decode_error_against_fp64_oracle() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
@@ -761,7 +770,8 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
         .enumerate()
         .map(|(i, x)| x * (2.0f32).powi(((i % kdim) as i32 - 64) / 8))
         .collect();
-    let v = draw(33, heads * vdim, 1.0);
+    let mut v = draw(33, heads * vdim, 1.0);
+    round_bf16(&mut v);
     let beta = draw(44, heads, 0.5);
     // g is a log-decay: keep it negative so exp(g) is a contraction.
     let g: Vec<f32> = draw(55, heads, 0.5).iter().map(|x| -x.abs()).collect();
@@ -783,7 +793,7 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
     let (qb, kb, vb, bb, gb) = (
         upload(&q),
         upload(&k),
-        upload(&v),
+        bf16_buffer(&ctx, &v),
         upload(&beta),
         upload(&g),
     );
@@ -839,7 +849,7 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
             worst = worst.max(delta_abs / acc.abs().max(1e-6));
         }
     }
-    let split = std::env::var("APXINF_GDN_RECURRENT_SPLIT").unwrap_or_else(|_| "default".into());
+    let split = crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps()).recurrent_split;
     println!(
         "gdn_recurrent_oracle split={split} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
         heads * vdim,
@@ -871,7 +881,19 @@ fn gdn_recurrent_decode_error_against_fp64_oracle() {
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_state_scan -- --nocapture
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn gdn_chunk_state_scan_error_against_fp64_oracle() {
+    chunk_state_fp64_oracle(false);
+}
+
+#[test]
+#[ignore = "requires CUDA with at least 144 KiB shared memory per block"]
+fn gdn_chunk_state_bf16_ptx_matches_fp64_oracle() {
+    chunk_state_fp64_oracle(true);
+}
+
+fn chunk_state_fp64_oracle(typed_bf16: bool) {
+    let _guard = super::gpu_smem_guard();
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
     let seq_pad = chunk * chunks;
@@ -888,11 +910,18 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
             })
             .collect()
     };
-    let q = draw(1, heads * seq_pad * kdim, 0.5);
-    let k = draw(2, heads * seq_pad * kdim, 0.5);
-    let t = draw(3, heads * chunks * chunk * chunk, 0.25);
-    let vt = draw(4, heads * chunks * chunk * vdim, 0.5);
-    let kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    let mut q = draw(1, heads * seq_pad * kdim, 0.5);
+    let mut k = draw(2, heads * seq_pad * kdim, 0.5);
+    let mut t = draw(3, heads * chunks * chunk * chunk, 0.25);
+    let mut vt = draw(4, heads * chunks * chunk * vdim, 0.5);
+    let mut kcd = draw(5, heads * chunks * chunk * kdim, 0.25);
+    for values in [&mut t, &mut vt, &mut kcd] {
+        round_bf16(values);
+    }
+    if typed_bf16 {
+        round_bf16(&mut q);
+        round_bf16(&mut k);
+    }
     let state0 = draw(6, heads * kdim * vdim, 0.2);
     // g_cum is a cumulative log-decay: non-increasing within a chunk.
     let mut g_cum = vec![0.0f32; heads * seq_pad];
@@ -919,20 +948,42 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         }
         buf
     };
+    let upload_operand = |data: &[f32]| -> CudaBuffer {
+        if !typed_bf16 {
+            return upload(data);
+        }
+        let values: Vec<half::bf16> = data.iter().map(|v| half::bf16::from_f32(*v)).collect();
+        let buf = CudaBuffer::alloc(values.len() * 2, 0).unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::cudaMemcpy(
+                buf.ptr(),
+                values.as_ptr().cast(),
+                values.len() * 2,
+                crate::ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ))
+            .unwrap();
+        }
+        buf
+    };
     let (qb, kb, gb, tb, vtb, kcdb) = (
-        upload(&q),
-        upload(&k),
+        upload_operand(&q),
+        upload_operand(&k),
         upload(&g_cum),
-        upload(&t),
-        upload(&vt),
-        upload(&kcd),
+        bf16_buffer(&ctx, &t),
+        bf16_buffer(&ctx, &vt),
+        bf16_buffer(&ctx, &kcd),
     );
     let sb = upload(&state0);
     let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
     let out_t = out
         .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
         .unwrap();
-    crate::kernels::linear_attention::gdn_chunk_state(
+    let launch = if typed_bf16 {
+        crate::kernels::linear_attention::gdn_chunk_state_qk_bf16
+    } else {
+        crate::kernels::linear_attention::gdn_chunk_state
+    };
+    launch(
         &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
     )
     .unwrap();
@@ -1013,15 +1064,15 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
         }
     }
     println!(
-        "gdn_chunk_state_oracle tile={} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
-        std::env::var("APXINF_GDN_CHUNK_TILE").unwrap_or_else(|_| "default".into()),
+        "gdn_chunk_state_oracle typed_bf16={} elements={} mean_abs={:.6e} rel_l1={:.6e} max_rel={:.6e}",
+        typed_bf16,
         seq * heads * vdim,
         sum_abs / (seq * heads * vdim) as f64,
         sum_abs / sum_ref,
         worst
     );
     assert!(
-        sum_abs / sum_ref < 0.05,
+        sum_abs / sum_ref < if typed_bf16 { 0.01 } else { 0.05 },
         "GDN chunk-state relative L1 {} against fp64",
         sum_abs / sum_ref
     );
@@ -1038,6 +1089,7 @@ fn gdn_chunk_state_scan_error_against_fp64_oracle() {
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_state_v_split -- --nocapture
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn gdn_chunk_state_v_split_is_bit_exact() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let (heads, kdim, vdim, chunk, chunks) = (4usize, 128usize, 128usize, 64usize, 3usize);
@@ -1096,17 +1148,38 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
 
     // The scan carries its state in the buffer it was given, so each run needs
     // its own copy of the initial state to start from.
-    let run = |split: &str| -> (Vec<f32>, Vec<f32>) {
-        std::env::set_var("APXINF_GDN_CHUNK_STATE_V_SPLIT", split);
+    let run = |split: i32| -> (Vec<f32>, Vec<f32>) {
+        let mut policy = crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps());
+        policy.chunk_state_wmma = crate::kernels::gdn_policy::wmma::OFF;
+        policy.chunk_state_v_split = split;
         let sb = upload(&state0);
         let out = CudaBuffer::alloc(seq * heads * vdim * 2, 0).unwrap();
         let out_t = out
             .as_tensor(Shape::new(vec![seq, heads * vdim]), DType::BF16)
             .unwrap();
-        crate::kernels::linear_attention::gdn_chunk_state(
-            &ctx, &qb, &kb, &gb, &tb, &vtb, &kcdb, &sb, &out_t, seq_pad, heads, kdim, vdim, chunk,
-        )
-        .unwrap();
+        unsafe {
+            crate::ffi::check_cuda(crate::ffi::apxinf_static_gdn_chunk_state_f32(
+                qb.ptr(),
+                kb.ptr(),
+                gb.ptr(),
+                tb.ptr(),
+                vtb.ptr(),
+                kcdb.ptr(),
+                sb.ptr(),
+                out.ptr(),
+                seq as i32,
+                seq_pad as i32,
+                heads as i32,
+                kdim as i32,
+                vdim as i32,
+                chunk as i32,
+                chunks as i32,
+                (heads * vdim) as i32,
+                &policy,
+                ctx.stream().handle(),
+            ))
+            .unwrap();
+        }
         let produced = download_bf16_as_fp32(&out_t).unwrap();
         let mut state = vec![0.0f32; heads * kdim * vdim];
         unsafe {
@@ -1121,8 +1194,8 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
         (produced, state)
     };
 
-    let (base_out, base_state) = run("1");
-    for split in ["2", "4"] {
+    let (base_out, base_state) = run(1);
+    for split in [2, 4] {
         let (split_out, split_state) = run(split);
         let out_diff = base_out
             .iter()
@@ -1144,7 +1217,6 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
             "value split {split} changed the carried state"
         );
     }
-    std::env::remove_var("APXINF_GDN_CHUNK_STATE_V_SPLIT");
 }
 
 // ── GDN chunk GEMM against an fp64 oracle ─────────────────────────
@@ -1156,7 +1228,6 @@ fn gdn_chunk_state_v_split_is_bit_exact() {
 // measured is only what the multiply does.
 //
 //   cargo test --release -p apxinf-cuda gdn_chunk_gemm_error -- --nocapture
-//   APXINF_GDN_CHUNK_STATE_WMMA=0 / lossy for the other two forms
 #[test]
 fn gdn_chunk_gemm_error_against_fp64_oracle() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
@@ -1174,7 +1245,8 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
             .collect()
     };
     let a = draw(7, heads * chunks * chunk * chunk, 0.3);
-    let v = draw(8, heads * seq_pad * vdim, 0.6);
+    let mut v = draw(8, heads * seq_pad * vdim, 0.6);
+    round_bf16(&mut v);
     let k = draw(9, heads * seq_pad * kdim, 0.6);
     let beta = draw(10, heads * seq_pad, 0.5);
     let mut g_cum = vec![0.0f32; heads * seq_pad];
@@ -1202,21 +1274,21 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     };
     let (ab, vb, kb, bb, gb) = (
         upload(&a),
-        upload(&v),
+        bf16_buffer(&ctx, &v),
         upload(&k),
         upload(&beta),
         upload(&g_cum),
     );
     let n_vt = heads * chunks * chunk * vdim;
     let n_kcd = heads * chunks * chunk * kdim;
-    let vt = CudaBuffer::alloc(n_vt * 4, 0).unwrap();
-    let kcd = CudaBuffer::alloc(n_kcd * 4, 0).unwrap();
+    let vt = CudaBuffer::alloc(n_vt * 2, 0).unwrap();
+    let kcd = CudaBuffer::alloc(n_kcd * 2, 0).unwrap();
     crate::kernels::linear_attention::gdn_chunk_gemm(
         &ctx, &ab, &vb, &kb, &bb, &gb, &vt, &kcd, seq_pad, heads, kdim, vdim, chunk,
     )
     .unwrap();
     let read = |b: &CudaBuffer, n: usize| -> Vec<f32> {
-        crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, n]), DType::F32).unwrap())
+        crate::transfers::to_cpu(&b.as_tensor(Shape::new(vec![1, n]), DType::BF16).unwrap())
             .unwrap()
             .to_f32_vec()
             .unwrap()
@@ -1262,7 +1334,7 @@ fn gdn_chunk_gemm_error_against_fp64_oracle() {
     }
     println!(
         "gdn_chunk_gemm_oracle mode={} elements={} rel_l1={:.6e}",
-        std::env::var("APXINF_GDN_CHUNK_STATE_WMMA").unwrap_or_else(|_| "default".into()),
+        crate::kernels::gdn_policy::GdnLaunchPolicy::for_device(ctx.caps()).chunk_state_wmma,
         2 * n_vt,
         sum_abs / sum_ref
     );
@@ -1979,6 +2051,7 @@ fn concat_2d_bf16_packs_gate_up_correctly() {
 /// The fused contract must retain all unit-offset and BF16 rounding boundaries,
 /// including the vector reduction used by planner-sized matrices.
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn weighted_adaln_residual_fusion_matches_composition() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     for (rows, cols) in [
@@ -2053,6 +2126,7 @@ fn weighted_adaln_residual_fusion_matches_composition() {
 // that carries its left context entirely in the cached state. The reference
 // below is the per-token form the kernel replaced, rounding where it rounded.
 #[test]
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
 fn causal_conv_tiling_matches_the_per_token_reference() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
     let draw = |salt: u64, n: usize, scale: f32| -> Vec<f32> {
@@ -2149,189 +2223,34 @@ fn causal_conv_tiling_matches_the_per_token_reference() {
     }
 }
 
-// The chunk-state scan runs one BF16 pass over each product rather than the
-// two the split form uses. That is only sound because every left operand it
-// reads -- q, k, the chunk transition and the key-decay product -- is written
-// through __float2bfloat16 by the kernel that produces it, so `x - bf16(x)` is
-// zero and the split's low pass accumulates nothing.
-//
-// Nothing in the type system holds the producers to that. This does: feed the
-// scan operands that are exactly BF16, run both forms, and require the outputs
-// to agree bit for bit. If a producer starts emitting a value BF16 cannot hold,
-// the two forms diverge here rather than silently in a trajectory.
-//
-//   cargo test --release -p apxinf-cuda chunk_state_split_is_dead -- --nocapture
 #[test]
-fn chunk_state_split_is_dead_when_operands_are_bf16() {
+#[ignore = "requires CUDA; run explicitly on the acceptance device"]
+fn pillow_axis_rejects_inconsistent_orthogonal_extent() {
     let ctx = CudaContext::new(0).expect("CUDA device required");
-    let (heads, kdim, vdim, chunk, chunks) = (2usize, 128usize, 128usize, 64usize, 2usize);
-    let seq_pad = chunk * chunks;
-    // Every value is round-tripped through BF16, exactly as the producers leave
-    // them. g_cum stays fp32: the scan reads it as a scalar, not as an operand.
-    let bf = |salt: u64, n: usize, scale: f32| -> Vec<f32> {
-        (0..n)
-            .map(|i| {
-                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ salt;
-                x ^= x >> 29;
-                x = x.wrapping_mul(0xBF58476D1CE4E5B9);
-                x ^= x >> 32;
-                half::bf16::from_f32(((x & 0xFFFF) as f32 / 32768.0 - 1.0) * scale).to_f32()
-            })
-            .collect()
-    };
-    let upload = |data: &[f32]| -> CudaBuffer {
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let buf = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
-        buf.copy_from_host(&bytes).unwrap();
-        buf
-    };
-    let q = upload(&bf(1, heads * seq_pad * kdim, 0.5));
-    let k = upload(&bf(2, heads * seq_pad * kdim, 0.5));
-    let t = upload(&bf(3, heads * chunks * chunk * chunk, 0.3));
-    let vt = upload(&bf(4, heads * seq_pad * vdim, 0.6));
-    let kcd = upload(&bf(5, heads * seq_pad * kdim, 0.4));
-    let mut g = vec![0.0f32; heads * seq_pad];
-    for (i, value) in g.iter_mut().enumerate() {
-        *value = -((i % chunk) as f32) * 0.01;
-    }
-    let g_cum = upload(&g);
-
-    let run = |mode: &str| -> Vec<f32> {
-        // SAFETY: single-threaded test; the policy reads this at launch.
-        unsafe { std::env::set_var("APXINF_GDN_CHUNK_STATE_WMMA", mode) };
-        let state = upload(&vec![0.0f32; heads * kdim * vdim]);
-        let out = upload_fp32_as_bf16(
-            &ctx,
-            &vec![0.0; seq_pad * heads * vdim],
-            vec![seq_pad, heads * vdim],
-        )
-        .unwrap();
-        crate::kernels::linear_attention::gdn_chunk_state(
-            &ctx, &q, &k, &g_cum, &t, &vt, &kcd, &state, &out, seq_pad, heads, kdim, vdim, chunk,
-        )
-        .unwrap();
-        ctx.synchronize().unwrap();
-        download_bf16_as_fp32(&out).unwrap()
-    };
-    let split = run("2");
-    let single = run("1");
-    unsafe { std::env::remove_var("APXINF_GDN_CHUNK_STATE_WMMA") };
-    assert_eq!(
-        split, single,
-        "a producer is emitting a value BF16 cannot hold; the chunk-state scan's \
-         single-pass default is no longer exact"
-    );
-}
-
-// Is the vendor's own pick the best one available?
-//
-// With no tuned tactic the BF16 path falls through to cublasGemmEx and takes
-// whatever heuristic cuBLAS chose. cuBLASLt exposes its candidate list ranked,
-// and rank 0 is not always the fastest -- the ordering is a prediction. This
-// walks the ranks for the shapes qwen_drive actually issues and prints what the
-// vendor default costs beside the best rank found, so the gap is a measurement
-// rather than an assumption.
-//
-// Note: as written this reports nothing. Every rank returns a non-zero
-// cuBLASLt status outside the normal call path -- the plan wants the context
-// state that `gemm::bf16` sets up around it, which a raw FFI call does not
-// carry. The supported way to get this comparison is the tuner itself, whose
-// report records vendor against winner per shape with an L2 evictor between
-// candidates; run it with APXINF_QWEN_GRAPH unset and `autotune=True` now that
-// the direct runner traverses once eagerly first. Kept for the record.
-//
-//   cargo test --release -p apxinf-cuda vendor_gemm_heuristic_sweep -- --nocapture --ignored
-#[test]
-#[ignore = "superseded by the tuner's own report; see the note above"]
-fn vendor_gemm_heuristic_sweep() {
-    let ctx = CudaContext::new(0).expect("CUDA device required");
-    // Dumped from a direct-planning request via APXINF_GEMM_DUMP_SHAPES.
-    let shapes: &[(usize, usize, usize, &str)] = &[
-        (3385, 18432, 2560, "L ffn gate/up"),
-        (3385, 12352, 2560, "L gdn zba"),
-        (3385, 10240, 2560, "L (10240)"),
-        (3385, 2560, 9216, "L ffn down"),
-        (3385, 2560, 4096, "L gdn out"),
-        (12216, 1024, 1536, "V patch/qkv"),
-        (50, 10240, 1024, "A ffn gate/up"),
-        (50, 7168, 1024, "A qkv"),
-        (50, 1024, 4096, "A ffn down"),
-        (50, 1024, 3584, "A out"),
-    ];
-    let iters = 20;
-    println!(
-        "{:<16}{:>7}{:>7}{:>7}{:>11}{:>11}{:>7}{:>8}",
-        "op", "m", "n", "k", "vendor ms", "best ms", "rank", "gain"
-    );
-    let mut total_vendor = 0.0f64;
-    let mut total_best = 0.0f64;
-    for &(m, n, k, label) in shapes {
-        let a = CudaBuffer::alloc(m * k * 2, ctx.device_id()).unwrap();
-        let b = CudaBuffer::alloc(k * n * 2, ctx.device_id()).unwrap();
-        let c = CudaBuffer::alloc(m * n * 2, ctx.device_id()).unwrap();
-        let time = |run: &dyn Fn()| -> f64 {
-            for _ in 0..3 {
-                run();
-            }
-            ctx.synchronize().unwrap();
-            let start = std::time::Instant::now();
-            for _ in 0..iters {
-                run();
-            }
-            ctx.synchronize().unwrap();
-            start.elapsed().as_secs_f64() * 1000.0 / iters as f64
-        };
-        let vendor = time(&|| {
-            ctx.cublas()
-                .gemm(DType::BF16, m, n, k, 1.0, &a, &b, 0.0, &c)
-                .unwrap();
-        });
-        let lt_status = || unsafe {
-            crate::ffi::apxinf_static_bf16_gemm(
-                a.ptr(),
-                b.ptr(),
-                c.ptr(),
-                m as i32,
-                n as i32,
-                k as i32,
-                1.0,
+    let buffer = CudaBuffer::alloc(64, 0).unwrap();
+    for (horizontal, out_w, out_h) in [(true, 2, 3), (false, 3, 2)] {
+        let status = unsafe {
+            crate::ffi::apxinf_pillow_bicubic_u8_axis(
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                buffer.ptr(),
+                1,
+                2,
+                2,
+                out_w,
+                out_h,
+                1,
+                horizontal,
                 ctx.stream().handle(),
             )
         };
-        let lt = || {
-            let status = lt_status();
-            assert_eq!(status, 0, "cuBLASLt BF16 gemm returned {status}");
-        };
-        let (mut best, mut best_rank) = (f64::INFINITY, -1i32);
-        for rank in 0..12i32 {
-            // A rank the library does not offer for this shape is skipped.
-            if unsafe {
-                crate::ffi::apxinf_static_set_cublaslt_bf16_gemm_heuristic(
-                    m as i32, n as i32, k as i32, rank,
-                )
-            } != 0
-            {
-                continue;
-            }
-            if lt_status() != 0 {
-                continue;
-            }
-            let ms = time(&lt);
-            if ms < best {
-                best = ms;
-                best_rank = rank;
-            }
-        }
-        total_vendor += vendor;
-        total_best += best.min(vendor);
-        println!(
-            "{label:<16}{m:>7}{n:>7}{k:>7}{vendor:>11.4}{best:>11.4}{best_rank:>7}{:>7.1}%",
-            (vendor - best) / vendor * 100.0
+        assert_eq!(
+            status, 1,
+            "geometry must be rejected before a kernel launch"
         );
     }
-    println!(
-        "\nsum over one call each: vendor {total_vendor:.3} ms, best-of {total_best:.3} ms, \
-         {:.1}% off the vendor pick",
-        (total_vendor - total_best) / total_vendor * 100.0
-    );
+    ctx.synchronize().unwrap();
 }

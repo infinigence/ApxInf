@@ -38,18 +38,38 @@ fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| format!("missing {field}").into())
 }
 
+/// Compare a bundle with the reviewed recipe, including the exporter that
+/// determines compiler specialization. Rehashing an edited exporter cannot
+/// silently bless a different kernel under the same tensor contract.
+pub fn verify_recipe(kernel: &Value, recipe: &Value) -> Result<()> {
+    for field in ["symbol", "contract", "specialization"] {
+        if kernel[field].is_null() || kernel[field] != recipe[field] {
+            return Err(format!("AOT {field} mismatch for {}", recipe["id"]).into());
+        }
+    }
+    if string(&kernel["source"], "exporter_sha256")? != string(recipe, "exporter_sha256")? {
+        return Err(format!("AOT exporter mismatch for {}", recipe["id"]).into());
+    }
+    for field in ["project", "revision", "license"] {
+        if kernel["source"][field] != recipe["source"][field] {
+            return Err(format!("AOT source {field} mismatch for {}", recipe["id"]).into());
+        }
+    }
+    Ok(())
+}
+
 pub fn verify(manifest: &Path, target: &str, sm: &str, cuda: &str) -> Result<Value> {
     let manifest = manifest.canonicalize()?;
     let data: Value = serde_json::from_slice(&fs::read(&manifest)?)?;
     if data["schema"] != 1 {
         return Err("unsupported AOT schema".into());
     }
-    if target != "aarch64-unknown-linux-gnu" || sm != "sm_110" {
+    if target != "aarch64-unknown-linux-gnu" || !matches!(sm, "sm_110" | "sm_110a") {
         return Err("AOT currently supports Linux AArch64 SM110".into());
     }
     for (field, expected) in [
         ("target", target),
-        ("sm", sm),
+        ("sm", "sm_110"),
         ("cuda", cuda),
         ("cutlass_dsl", "4.7.0"),
     ] {
@@ -106,13 +126,17 @@ pub fn verify(manifest: &Path, target: &str, sm: &str, cuda: &str) -> Result<Val
         {
             return Err("duplicate kernel identity or invalid symbol".into());
         }
-        for field in ["source", "contract"] {
+        for field in ["source", "contract", "specialization"] {
             if kernel[field].as_object().is_none_or(|v| v.is_empty()) {
                 return Err(format!("{id}: missing {field}").into());
             }
         }
         for field in ["project", "revision", "license", "exporter_sha256"] {
             string(&kernel["source"], field)?;
+        }
+        let exporter = string(&kernel["source"], "exporter_sha256")?;
+        if exporter.len() != 64 || !exporter.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{id}: invalid exporter SHA256").into());
         }
         let object = artifact(&kernel["object"], "object")?;
         let header = artifact(&kernel["header"], "header")?;
@@ -163,6 +187,7 @@ mod tests {
         let data = json!({"schema":1,"target":"aarch64-unknown-linux-gnu","sm":"sm_110",
             "cuda":"13.2","cutlass_dsl":"4.7.0","runtime":artifact("runtime.a"),
             "kernels":[{"id":"test","symbol":"test_kernel","contract":{"shape":[10,256]},
+                "specialization":{"shape":[10,256]},
                 "source":{"project":"test","revision":"pinned","license":"Apache-2.0","exporter_sha256":"a".repeat(64)},
                 "object":artifact("kernel.o"),"header":artifact("kernel.h")}]});
         (root, data)
@@ -171,6 +196,33 @@ mod tests {
         let path = root.join("manifest.json");
         fs::write(&path, serde_json::to_vec(data)?)?;
         verify(&path, "aarch64-unknown-linux-gnu", "sm_110", "13.2")
+    }
+    #[test]
+    fn edited_exporter_and_missing_specialization_are_rejected() {
+        let (root, mut data) = fixture();
+        let mut recipe = data["kernels"][0].clone();
+        recipe["exporter_sha256"] = recipe["source"]["exporter_sha256"].clone();
+        assert!(verify_recipe(&data["kernels"][0], &recipe).is_ok());
+        data["kernels"][0]["source"]["exporter_sha256"] = json!("b".repeat(64));
+        assert!(verify_recipe(&data["kernels"][0], &recipe).is_err());
+        data["kernels"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("specialization");
+        assert!(check(&root, &data).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn architecture_specific_sm110_accepts_the_same_bundle() {
+        let (root, data) = fixture();
+        check(&root, &data).unwrap();
+        assert!(verify(
+            &root.join("manifest.json"),
+            "aarch64-unknown-linux-gnu",
+            "sm_110a",
+            "13.2"
+        )
+        .is_ok());
     }
     #[test]
     fn identity_tracks_contract_and_all_inputs() {

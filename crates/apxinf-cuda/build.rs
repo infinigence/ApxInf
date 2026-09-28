@@ -320,7 +320,8 @@ fn main() {
             let cutlass_arch = Some(selection.cutlass_arch);
             let aot_manifest =
                 env::var_os("APXINF_CUDA_AOT_MANIFEST").map(std::path::PathBuf::from);
-            if nvcc_arch.as_deref() == Some("sm_110") && aot_manifest.is_none() {
+            if matches!(nvcc_arch.as_deref(), Some("sm_110" | "sm_110a")) && aot_manifest.is_none()
+            {
                 println!("cargo:warning=SM110 AOT bundle is absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
             }
             let aot_bundle = aot_manifest.map(|path| {
@@ -341,7 +342,11 @@ fn main() {
                 )
             });
             let kernel_build_id = match &aot_bundle {
-                Some(bundle) => format!("{kernel_build_id}-aot-{}", bundle.fingerprint),
+                Some(bundle) => {
+                    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+                    hash_bytes(&mut hash, bundle.fingerprint.as_bytes());
+                    format!("{kernel_build_id}-aot-{hash:032x}")
+                }
                 None => kernel_build_id,
             };
             emit_kernel_build_id(&kernel_build_id);

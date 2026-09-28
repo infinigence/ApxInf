@@ -1,37 +1,20 @@
 //! One BF16 Blocks implementation: vision, hybrid backbone and planning expert.
 //! Layer mathematics and physical state descriptions; no graph capture policy.
-use super::{DirectExecution, GdnExecution, GdnRequest};
+use super::DirectExecution;
 use crate::qwen_drive::backend::kernels::fixed_profile::FIXED_SCENE_TOKENS;
 use crate::qwen_drive::backend::{
     kernels, nvtx, transfers, Context, CublasTranspose, DeviceBuffer, RuntimeBackend,
 };
 use crate::qwen_drive::config::QwenDriveConfig;
-use crate::qwen_drive::diagnostics_enabled;
 use crate::qwen_drive::inputs::ExpertConditioning;
 use crate::qwen_drive::weights::bf16::{
     BackboneDeviceWeights, ExpertDeviceWeights, GdnInputSplitWeights, MixerWeights,
 };
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 use kernels::{attention, elementwise, embedding, gemm, linear_attention as la};
-use std::path::Path;
 use std::sync::Arc;
 const GDN_CHUNK: usize = 64;
-fn gdn_stage_mark(
-    ctx: &Context,
-    layer_idx: usize,
-    name: &str,
-    since: &mut std::time::Instant,
-) -> Result<()> {
-    ctx.synchronize().map_err(Error::Cuda)?;
-    qdiag!(
-        "[qwen_drive] gdn_stage layer={} {} ms={:.2}",
-        layer_idx,
-        name,
-        since.elapsed().as_secs_f64() * 1000.0
-    );
-    *since = std::time::Instant::now();
-    Ok(())
-}
+
 pub(crate) struct BackboneBf16 {
     pub config: QwenDriveConfig,
     pub cuda: Arc<RuntimeBackend>,
@@ -94,49 +77,8 @@ pub(crate) struct BackboneState {
     pub rope_delta: i64,
     pub max_seq_len: usize,
     pub last_position: i64,
-    pub decode_step: Option<usize>,
 }
-pub(crate) fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
-    let Some(root) = std::env::var_os("APXINF_QWEN_TRACE_DIR") else {
-        return Ok(());
-    };
-    let width = *tensor.shape().dims().last().unwrap();
-    let count = tensor.numel() / width;
-    // Four sampled rows cannot tell a layer that is itself nondeterministic
-    // from one that merely mixes in a neighbour's unsampled row, and every
-    // sequence mixer here does mix across positions. APXINF_QWEN_TRACE_FULL
-    // dumps the whole tensor so the first affected layer is the real one.
-    let full = std::env::var_os("APXINF_QWEN_TRACE_FULL").is_some();
-    let rows = if full || count < 4 {
-        (0..count).collect::<Vec<_>>()
-    } else {
-        vec![0, 1, 2, count - 1]
-    };
-    let buffer = DeviceBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
-    let mut bytes = Vec::new();
-    for row in rows {
-        let view = buffer
-            .view(
-                row * width * tensor.dtype().size_in_bytes(),
-                width * tensor.dtype().size_in_bytes(),
-            )
-            .map_err(Error::Cuda)?;
-        let t = view
-            .as_tensor(Shape::new(vec![1, width]), tensor.dtype())
-            .map_err(Error::Cuda)?;
-        let values = transfers::to_cpu(&t)?
-            .to_f32_vec()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    let root = Path::new(&root);
-    std::fs::create_dir_all(root).map_err(|e| Error::Other(e.to_string()))?;
-    std::fs::write(root.join(format!("{name}.f32")), bytes)
-        .map_err(|e| Error::Other(e.to_string()))?;
-    Ok(())
-}
+
 fn bf16_round(value: f32) -> f32 {
     half::bf16::from_f32(value).to_f32()
 }
@@ -442,18 +384,7 @@ impl BackboneBf16 {
             (dims[0], dims[1])
         };
         let vocab = self.config.text.vocab_size;
-        if m == 1 {
-            if let Some(file) = std::env::var_os("APXINF_QWEN_HEAD_INPUT") {
-                let values = transfers::to_cpu(x)?
-                    .to_f32_vec()
-                    .map_err(|error| Error::Other(error.to_string()))?;
-                let bytes: Vec<u8> = values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect();
-                std::fs::write(file, bytes).map_err(|error| Error::Other(error.to_string()))?;
-            }
-        }
+
         let out = device_tensor(ctx, &[m, vocab], DType::BF16)?;
         let a = DeviceBuffer::from_tensor(x).map_err(Error::Cuda)?;
         let b = DeviceBuffer::from_tensor(&self.weights.embed_tokens).map_err(Error::Cuda)?;
@@ -484,15 +415,12 @@ impl BackboneBf16 {
         post_norm: &Tensor,
         gate_up_w: &Tensor,
         down_w: &Tensor,
-        trace: bool,
         next_norm: Option<&Tensor>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let ctx = self.ctx();
         let eps = self.config.text.rms_norm_eps;
         let (x, normed) = la::add_rms_norm_plus1(ctx, x, delta, post_norm, eps)?;
-        if trace {
-            trace_rows("text0_residual", &x)?;
-        }
+
         let act = gemm::bf16_swiglu_checkpoint(ctx, &normed, gate_up_w)?;
         let down = gemm::bf16(ctx, &act, down_w)?;
         // The operator may return padded physical rows to accelerate the down
@@ -505,11 +433,7 @@ impl BackboneBf16 {
             .map_err(Error::Cuda)?
             .as_tensor(Shape::new(vec![rows, width]), DType::BF16)
             .map_err(Error::Cuda)?;
-        if trace {
-            trace_rows("text0_post_norm", &normed)?;
-            trace_rows("text0_swiglu", &act)?;
-            trace_rows("text0_down", &down)?;
-        }
+
         if let Some(weight) = next_norm {
             let (hidden, normalized) = la::add_rms_norm_plus1(ctx, &x, &down, weight, eps)?;
             Ok((hidden, Some(normalized)))
@@ -545,12 +469,7 @@ impl BackboneBf16 {
             None => la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?,
         };
         let fused = gemm::bf16(ctx, &normed, &w.qkv_w)?;
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_input_norm", &normed)?;
-            trace_rows("text3_fused_qkv", &fused)?;
-            trace_rows("text3_cos", cos)?;
-            trace_rows("text3_sin", sin)?;
-        }
+
         let q_out = device_tensor(ctx, &[seq, heads, head_dim], DType::BF16)?;
         let (k_cache, v_cache) = match &state.caches[layer_idx] {
             LayerCache::FullAttention { k, v } => (k.clone(), v.clone()),
@@ -581,37 +500,12 @@ impl BackboneBf16 {
             Some(output) => output,
             None => attention::causal_gqa_bf16(ctx, &q_out, &k_view, &v_view, kv_len)?,
         };
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_q", &q_out.reshape(vec![seq, heads * head_dim])?)?;
-            trace_rows(
-                "text3_k",
-                &k_view.reshape(vec![kv_len, kv_heads * head_dim])?,
-            )?;
-            trace_rows(
-                "text3_v",
-                &v_view.reshape(vec![kv_len, kv_heads * head_dim])?,
-            )?;
-            trace_rows(
-                "text3_attention",
-                &attn.reshape(vec![seq, heads * head_dim])?,
-            )?;
-        }
+
         let attn = attn.reshape(vec![seq, heads * head_dim])?;
         la::sigmoid_gate_mul(ctx, &attn, &fused, heads, head_dim)?;
         let proj = gemm::bf16(ctx, &attn, &w.o_w)?;
-        if layer_idx == 3 && seq > 1 {
-            trace_rows("text3_gated_attention", &attn)?;
-            trace_rows("text3_out_proj", &proj)?;
-        }
-        self.forward_mlp(
-            &x,
-            &proj,
-            &w.post_norm,
-            &w.gate_up_w,
-            &w.down_w,
-            false,
-            next_norm,
-        )
+
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, next_norm)
     }
     pub(crate) fn forward_gdn_eager(
         &self,
@@ -643,37 +537,26 @@ impl BackboneBf16 {
         let kernel = text.linear_conv_kernel_dim;
         let has_state = state.cache_len > 0;
 
-        // The scan is only part of a GDN layer; attribute what precedes it too.
-        let gdn_timed = seq > 1 && diagnostics_enabled();
-        let mut gdn_since = std::time::Instant::now();
         let normed = match normalized {
             Some(value) => value.clone(),
             None => la::rms_norm_plus1(ctx, &x, &w.input_norm, eps)?,
         };
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "pre_norm", &mut gdn_since)?;
-        }
+
         // One GEMM over the packed projection. Four separate ones read the same
         // weight bytes, but two were only [32, hidden] and dragged the group to
         // about 70GB/s where the MLP projections reach 172GB/s; the packed
         // weight also arrives in the layout the on-device pack used to build.
-        let zba = if let Some(split) = w.input_split.as_ref().filter(|_| {
-            normed.shape().dims() == [FIXED_SCENE_TOKENS, 2560]
-                && std::env::var_os("APXINF_QWEN_TRACE_DIR").is_none()
-        }) {
+        let zba = if let Some(split) = w
+            .input_split
+            .as_ref()
+            .filter(|_| normed.shape().dims() == [FIXED_SCENE_TOKENS, 2560])
+        {
             gdn_input_split(ctx, &normed, split)?
         } else {
             gemm::bf16(ctx, &normed, &w.zba_w)?
         }
         .reshape(vec![seq, conv_dim + value_dim + 2 * num_v_heads])?;
-        if gdn_timed {
-            gdn_stage_mark(ctx, layer_idx, "project", &mut gdn_since)?;
-        }
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_input", &x)?;
-            trace_rows("text0_input_norm", &normed)?;
-            trace_rows("text0_zba", &zba)?;
-        }
+
         let (state_current, state_next) = match &state.caches[layer_idx] {
             LayerCache::Gdn {
                 conv_state_a,
@@ -725,12 +608,6 @@ impl BackboneBf16 {
                 &state_next,
                 kernel,
             )?;
-            if layer_idx == 0 && seq > 1 {
-                trace_rows("text0_conv_silu", &conv_out)?;
-            }
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "conv_silu", &mut gdn_since)?;
-            }
 
             let recurrent_decode = has_state && seq == 1;
             let seq_pad = if recurrent_decode {
@@ -760,9 +637,7 @@ impl BackboneBf16 {
             };
             let beta_buf = scan(f32_bytes)?;
             let g_buf = scan(f32_bytes)?;
-            if gdn_timed {
-                gdn_stage_mark(ctx, layer_idx, "qkvbg_alloc", &mut gdn_since)?;
-            }
+
             if qk_bf16 {
                 la::gdn_qk_prep_qk_bf16(
                     ctx,
@@ -870,13 +745,9 @@ impl BackboneBf16 {
                 let kcd_buf = scan(head_k * bf16_bytes)?;
                 // Covers the q/k/v/beta/g preparation kernels and the scan's own
                 // zeroed allocations, which sit between conv_silu and cumsum.
-                if gdn_timed {
-                    gdn_stage_mark(ctx, layer_idx, "prep_alloc", &mut gdn_since)?;
-                }
+
                 la::gdn_cumsum(ctx, &g_buf, &g_cum, seq_pad, num_v_heads, GDN_CHUNK)?;
-                if gdn_timed {
-                    gdn_stage_mark(ctx, layer_idx, "cumsum", &mut gdn_since)?;
-                }
+
                 if qk_bf16 {
                     la::gdn_attn_raw_solve_f1_qk_bf16(
                         ctx,
@@ -891,9 +762,6 @@ impl BackboneBf16 {
                         head_k,
                         GDN_CHUNK,
                     )?;
-                    if gdn_timed {
-                        gdn_stage_mark(ctx, layer_idx, "attn_raw_solve_f1", &mut gdn_since)?;
-                    }
                 } else {
                     la::gdn_attn_raw(
                         ctx,
@@ -908,13 +776,8 @@ impl BackboneBf16 {
                         head_k,
                         GDN_CHUNK,
                     )?;
-                    if gdn_timed {
-                        gdn_stage_mark(ctx, layer_idx, "attn_raw", &mut gdn_since)?;
-                    }
+
                     la::gdn_tri_solve(ctx, &a_buf, num_v_heads * chunks, GDN_CHUNK)?;
-                    if gdn_timed {
-                        gdn_stage_mark(ctx, layer_idx, "tri_solve", &mut gdn_since)?;
-                    }
                 }
                 if qk_bf16 {
                     la::gdn_chunk_gemm_tri_k_bf16_direct_v(
@@ -952,9 +815,7 @@ impl BackboneBf16 {
                         GDN_CHUNK,
                     )?;
                 }
-                if gdn_timed {
-                    gdn_stage_mark(ctx, layer_idx, "chunk_gemm", &mut gdn_since)?;
-                }
+
                 if qk_bf16 {
                     la::gdn_chunk_state_qk_bf16(
                         ctx,
@@ -990,66 +851,10 @@ impl BackboneBf16 {
                         GDN_CHUNK,
                     )?;
                 }
-                if gdn_timed {
-                    gdn_stage_mark(ctx, layer_idx, "chunk_state", &mut gdn_since)?;
-                }
             }
-            if layer_idx == 0 && seq > 1 {
-                trace_rows("text0_core", &gdn_out)?;
-            }
+
             // Opt-in fingerprints of the first two recurrent outputs and convolution row.
-            if layer_idx == 0 && seq > 1 && diagnostics_enabled() {
-                let gbuf = DeviceBuffer::from_tensor(&gdn_out).map_err(Error::Cuda)?;
-                let gview = gbuf
-                    .view(0, 2 * value_dim * DType::BF16.size_in_bytes())
-                    .map_err(Error::Cuda)?;
-                let gt = gview
-                    .as_tensor(Shape::new(vec![2, value_dim]), DType::BF16)
-                    .map_err(Error::Cuda)?;
-                let gvals = transfers::to_cpu(&gt)?
-                    .to_f32_vec()
-                    .map_err(|e| Error::Other(format!("qwen_drive gdn_row: {e}")))?;
-                let gl2 = |r: usize| -> f64 {
-                    gvals[r * value_dim..(r + 1) * value_dim]
-                        .iter()
-                        .map(|&v| (v as f64) * (v as f64))
-                        .sum::<f64>()
-                        .sqrt()
-                };
-                let g_line0 = format!(
-                    "[qwen_drive] gdn_row0 l2={:.4} first4={:?}",
-                    gl2(0),
-                    &gvals[..gvals.len().min(4)]
-                );
-                let g_line1 = format!(
-                    "[qwen_drive] gdn_row1 l2={:.4} first4={:?}",
-                    gl2(1),
-                    &gvals[value_dim..value_dim + 4]
-                );
-                let cbuf = DeviceBuffer::from_tensor(&conv_out).map_err(Error::Cuda)?;
-                let cview = cbuf
-                    .view(0, conv_dim * DType::BF16.size_in_bytes())
-                    .map_err(Error::Cuda)?;
-                let ct = cview
-                    .as_tensor(Shape::new(vec![1, conv_dim]), DType::BF16)
-                    .map_err(Error::Cuda)?;
-                let cvals = transfers::to_cpu(&ct)?
-                    .to_f32_vec()
-                    .map_err(|e| Error::Other(format!("qwen_drive conv_row: {e}")))?;
-                let cl2: f64 = cvals
-                    .iter()
-                    .map(|&v| (v as f64) * (v as f64))
-                    .sum::<f64>()
-                    .sqrt();
-                let c_line = format!(
-                    "[qwen_drive] conv_row0 l2={:.4} first4={:?}",
-                    cl2,
-                    &cvals[..cvals.len().min(4)]
-                );
-                qdiag!("{}", g_line0);
-                qdiag!("{}", g_line1);
-                qdiag!("{}", c_line);
-            }
+
             gdn_out
         };
         if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer_idx] {
@@ -1066,19 +871,8 @@ impl BackboneBf16 {
         )?;
         let gated = gated.reshape(vec![seq, value_dim])?;
         let proj = gemm::bf16(ctx, &gated, &w.out_w)?;
-        if layer_idx == 0 && seq > 1 {
-            trace_rows("text0_gated_norm", &gated)?;
-            trace_rows("text0_out_proj", &proj)?;
-        }
-        self.forward_mlp(
-            &x,
-            &proj,
-            &w.post_norm,
-            &w.gate_up_w,
-            &w.down_w,
-            layer_idx == 0 && seq > 1,
-            next_norm,
-        )
+
+        self.forward_mlp(&x, &proj, &w.post_norm, &w.gate_up_w, &w.down_w, next_norm)
     }
     pub(crate) fn embed_tokens(&self, token_ids: &[u32]) -> Result<Tensor> {
         let ids = upload_u32(self.ctx(), token_ids)?;
@@ -1089,7 +883,7 @@ impl BackboneBf16 {
             &ids,
             token_ids.len(),
         )?;
-        trace_rows("model_language_model_embed_tokens", &output)?;
+
         Ok(output)
     }
     pub(crate) fn upload_pixels(&self, pixels: &Tensor) -> Result<Tensor> {
@@ -1135,7 +929,6 @@ impl BackboneBf16 {
             rope_delta: 0,
             max_seq_len,
             last_position: 0,
-            decode_step: None,
         })
     }
     pub(crate) fn reset_state(&self, state: &mut BackboneState) -> Result<()> {
@@ -1161,13 +954,11 @@ impl BackboneBf16 {
         state.cache_len = 0;
         state.rope_delta = 0;
         state.last_position = 0;
-        state.decode_step = None;
         Ok(())
     }
     pub(crate) fn run_text(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         x: Tensor,
         positions: &[[u32; 3]],
     ) -> Result<Tensor> {
@@ -1178,12 +969,11 @@ impl BackboneBf16 {
         let last = positions[seq - 1];
         state.last_position = last[0].max(last[1]).max(last[2]) as i64;
         let (cos, sin) = self.mrope_tables(positions)?;
-        self.run_text_device(state, execution, x, seq, &cos, &sin)
+        self.run_text_device(state, x, seq, &cos, &sin)
     }
     pub(crate) fn run_text_device(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         x: Tensor,
         seq: usize,
         cos: &Tensor,
@@ -1195,7 +985,7 @@ impl BackboneBf16 {
         for layer in 0..self.config.text.n_layers {
             let _block = nvtx::range(&format!("qwen_drive/language/block/{layer}"));
             // Prefill (including the whole direct graph) carries the fused norm.
-            // Decode's independently captured GDN blocks retain their single-tensor ABI.
+            // Decode computes its norm inside the eager GDN block.
             let next_norm = if seq > 1 {
                 self.weights.layers.get(layer + 1).map(|next| match next {
                     MixerWeights::FullAttention(w) => &w.input_norm,
@@ -1224,33 +1014,11 @@ impl BackboneBf16 {
                     next_norm,
                 )?,
                 MixerWeights::Gdn(_) => {
-                    let parity = match &state.caches[layer] {
-                        LayerCache::Gdn { flip, .. } => usize::from(*flip),
-                        _ => unreachable!(),
-                    };
-                    let request = GdnRequest {
-                        backend: &self.cuda,
-                        layer,
-                        layer_count: self.weights.layers.len(),
-                        parity,
-                        decode: seq == 1 && state.cache_len > 0,
-                        decode_step: state.decode_step.unwrap_or(0),
-                    };
-                    let (output, replayed) = execution.run(&request, hidden, &mut |x| {
-                        self.forward_gdn_eager(state, x, layer, seq, None, None)
-                            .map(|(hidden, _)| hidden)
-                    })?;
-                    if replayed {
-                        if let LayerCache::Gdn { flip, .. } = &mut state.caches[layer] {
-                            *flip = !*flip;
-                        }
-                    }
-                    (output, None)
+                    self.forward_gdn_eager(state, hidden, layer, seq, None, None)?
                 }
             };
             hidden = output;
             normalized = next_normalized;
-            trace_rows(&format!("backbone_layer_{layer}"), &hidden)?;
         }
         state.cache_len += seq;
         Ok(hidden)
@@ -1275,7 +1043,6 @@ impl BackboneBf16 {
     pub(crate) fn prefill(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         token_ids: &[u32],
         pixels: &Tensor,
         grids: &[[u32; 3]],
@@ -1325,12 +1092,11 @@ impl BackboneBf16 {
             .max()
             .unwrap_or(0) as i64;
         state.rope_delta = max_pos + 1 - token_ids.len() as i64;
-        self.run_text(state, execution, x, &positions)
+        self.run_text(state, x, &positions)
     }
     pub(crate) fn forward_tokens(
         &self,
         state: &mut BackboneState,
-        execution: &mut dyn GdnExecution,
         token_ids: &[u32],
     ) -> Result<Tensor> {
         if token_ids.is_empty() || token_ids.len() > state.max_seq_len - state.cache_len {
@@ -1345,7 +1111,7 @@ impl BackboneBf16 {
             })
             .collect();
         let x = self.embed_tokens(token_ids)?;
-        self.run_text(state, execution, x, &positions)
+        self.run_text(state, x, &positions)
     }
 }
 pub(super) mod vision {
@@ -1462,11 +1228,9 @@ pub(super) mod vision {
         let pos_ids_dev = &prepared.pos_ids_dev;
         let max_tokens = prepared.max_tokens;
         let _vision = nvtx::range("qwen_drive/vision/blocks");
-        let vis_t0 = std::time::Instant::now();
         // Patch embedding: [N, patch_vec] @ [patch_vec, hidden] + bias.
         let mut x = gemm::bf16(ctx, pixel_values, &weights.patch_w)?;
         x = elementwise::bias_bf16(ctx, &x, Some(&weights.patch_b))?;
-        super::trace_rows("model_visual_patch_embed", &x)?;
 
         // Bilinear-interpolated learned position embeddings (host canonicalization).
         x = elementwise::add(ctx, &x, &prepared.pos_embeds)?;
@@ -1475,24 +1239,15 @@ pub(super) mod vision {
         // 2D rope position ids in the merge-block-major patch order.
         for (block_idx, block) in weights.blocks.iter().enumerate() {
             let _block = nvtx::range(&format!("qwen_drive/vision/block/{block_idx}"));
-            qdiag!(
-                "[qwen_drive] vision_block k={} n={} ms={}",
-                block_idx,
-                weights.blocks.len(),
-                vis_t0.elapsed().as_millis()
-            );
+
             let normed = match normalized.take() {
                 Some(value) => value,
                 None => norm::layer_bf16(ctx, &x, &block.norm1_w, &block.norm1_b, eps)?,
             };
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_norm1", &normed)?;
-            }
+
             // nn.Linear adds bias before its final BF16 rounding.
             let qkv = gemm::bf16_bias(ctx, &normed, &block.qkv_w, &block.qkv_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_attn_qkv", &qkv)?;
-            }
+
             const FIXED_OFFSETS: [u32; 13] = [
                 0, 624, 1248, 1872, 4072, 4696, 5320, 5944, 8144, 8768, 9392, 10016, 12216,
             ];
@@ -1502,8 +1257,7 @@ pub(super) mod vision {
                 && heads == 16
                 && head_dim == 64
                 && prepared.segments == 12
-                && offsets.as_slice() == FIXED_OFFSETS.as_slice()
-                && std::env::var_os("APXINF_QWEN_TRACE_DIR").is_none();
+                && offsets.as_slice() == FIXED_OFFSETS.as_slice();
             let direct = if fixed_groups {
                 attention::try_vision_qkv_rope_segmented_fa4_skip_v(
                     ctx,
@@ -1545,9 +1299,7 @@ pub(super) mod vision {
             };
             let attn = attn.reshape(vec![total_patches, hidden])?;
             let proj = gemm::bf16_bias(ctx, &attn, &block.proj_w, &block.proj_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_attn", &proj)?;
-            }
+
             let residual_norm = fused::bias_residual_layer_bf16(
                 ctx,
                 &proj,
@@ -1559,26 +1311,18 @@ pub(super) mod vision {
             )?;
             x = residual_norm.hidden;
             let normed = residual_norm.normalized;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_norm2", &normed)?;
-            }
+
             let h = if ctx.caps().sm == 110 {
                 let h = gemm::bf16_bias_gelu_tanh(ctx, &normed, &block.fc1_w, &block.fc1_b)?;
-                if block_idx == 0 {
-                    super::trace_rows("model_visual_blocks_0_mlp_fc1_gelu", &h)?;
-                }
+
                 h
             } else {
                 let h = gemm::bf16_bias(ctx, &normed, &block.fc1_w, &block.fc1_b)?;
-                if block_idx == 0 {
-                    super::trace_rows("model_visual_blocks_0_mlp_linear_fc1", &h)?;
-                }
+
                 activation::gelu_tanh(ctx, &h)?
             };
             let h2 = gemm::bf16_bias(ctx, &h, &block.fc2_w, &block.fc2_b)?;
-            if block_idx == 0 {
-                super::trace_rows("model_visual_blocks_0_mlp", &h2)?;
-            }
+
             let (next_w, next_b) = weights
                 .blocks
                 .get(block_idx + 1)
@@ -1588,7 +1332,6 @@ pub(super) mod vision {
                 fused::bias_residual_layer_bf16(ctx, &h2, None, &x, next_w, next_b, eps)?;
             x = residual_norm.hidden;
             normalized = Some(residual_norm.normalized);
-            super::trace_rows(&format!("model_visual_blocks_{block_idx}"), &x)?;
         }
 
         // Merger: LayerNorm(1024) -> merge 4 rows -> fc1 -> exact erf GELU -> fc2.
@@ -1629,22 +1372,12 @@ pub(super) mod vision {
         ctx: &Context,
         grid_thw: &[[u32; 3]],
     ) -> Result<Tensor> {
-        let timed = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os("APXINF_QWEN_VISION_TIMING").is_some())
-        };
-        let started = std::time::Instant::now();
         {
             if let Ok(cache) = state.pos_embed_cache.lock() {
                 if let Some((_, tensor)) = cache.iter().find(|(key, _)| key.as_slice() == grid_thw)
                 {
                     let hit = tensor.clone();
-                    if timed {
-                        qdiag!(
-                            "[qwen_drive] pos_embed cache hit {:.2}ms",
-                            started.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
+
                     return Ok(hit);
                 }
             }
@@ -1666,7 +1399,6 @@ pub(super) mod vision {
             .get()
             .expect("pos_embed table is installed")
             .as_slice();
-        let after_readback = started.elapsed();
         if table.len() != grid_side * grid_side * hidden {
             return Err(Error::Other(
                 "qwen_drive vision: pos_embed table shape mismatch".into(),
@@ -1715,7 +1447,6 @@ pub(super) mod vision {
                 }
             }
         }
-        let after_interp = started.elapsed();
         let rounded: Vec<half::bf16> = out.iter().map(|&v| half::bf16::from_f32(v)).collect();
         let tensor = Tensor::from_bf16(vec![total, hidden], &rounded)?;
         let uploaded = transfers::to_cuda(&tensor, ctx.device_id());
@@ -1730,17 +1461,7 @@ pub(super) mod vision {
                 cache.push((grid_thw.to_vec(), value.clone()));
             }
         }
-        if timed {
-            qdiag!(
-            "[qwen_drive] pos_embed total={:.1}ms readback={:.1}ms interp={:.1}ms round+upload={:.1}ms tokens={} hidden={}",
-            started.elapsed().as_secs_f64() * 1e3,
-            after_readback.as_secs_f64() * 1e3,
-            (after_interp - after_readback).as_secs_f64() * 1e3,
-            (started.elapsed() - after_interp).as_secs_f64() * 1e3,
-            total,
-            hidden
-        );
-        }
+
         uploaded
     }
 
@@ -1783,12 +1504,6 @@ pub(crate) mod expert {
 
     // The expert has only one token per waypoint, so bounded opt-in diagnostics
     // can retain every row instead of sampling the much larger VLM sequence.
-    fn trace_rows(name: &str, tensor: &Tensor) -> Result<()> {
-        if std::env::var_os("APXINF_QWEN_TRACE_DIR").is_none() {
-            return Ok(());
-        }
-        super::trace_rows(name, &tensor.reshape(vec![1, tensor.numel()])?)
-    }
 
     /// bf16 rounding of one f32 value, returned as f32 (the value a bf16 tensor
     /// would hold). Mirrors the scaffold's semantic-rounding helper.
@@ -2061,8 +1776,6 @@ pub(crate) mod expert {
         cos_t: Tensor,
         sin_t: Tensor,
         waypoints: Tensor,
-        time_buffer: DeviceBuffer,
-        time_row_bytes: usize,
         batched_modulation: BatchedModulation,
         step_f64: f64,
     }
@@ -2284,15 +1997,6 @@ pub(crate) mod expert {
         let acceleration_q = mlp(ctx, &weights.history_acceleration_encoder, &acceleration_t)?;
         let nav_out = mlp(ctx, &weights.nav_mlp, &nav_t)?;
         let ego_out = mlp(ctx, &weights.ego_mlp, &ego_t)?;
-        for (name, value) in [
-            ("history_encoder", &pose_q),
-            ("history_velocity_encoder", &velocity_q),
-            ("history_acceleration_encoder", &acceleration_q),
-            ("nav_mlp", &nav_out),
-            ("ego_mlp", &ego_out),
-        ] {
-            trace_rows(&format!("expert_{name}"), value)?;
-        }
 
         let wp_idx = embedding::lookup(ctx, &weights.waypoint_embed, &prepared.ids_dev, length)?;
         let cos_t = prepared.cos_t.clone();
@@ -2311,8 +2015,6 @@ pub(crate) mod expert {
         let decay = ((10000.0f64).ln() / ((ec.time_embed_dim / 2).max(2) - 1) as f64) as f32;
         let time_embeddings =
             embedding::sinusoidal_bf16(ctx, &times, ec.time_embed_dim, ec.time_embed_scale, decay)?;
-        let time_buffer = DeviceBuffer::from_tensor(&time_embeddings).map_err(Error::Cuda)?;
-        let time_row_bytes = ec.time_embed_dim * DType::BF16.size_in_bytes();
         let batched_modulation = prepare_batched_modulation(
             ctx,
             weights,
@@ -2331,8 +2033,6 @@ pub(crate) mod expert {
             cos_t,
             sin_t,
             waypoints,
-            time_buffer,
-            time_row_bytes,
             batched_modulation,
             step_f64,
         })
@@ -2355,14 +2055,6 @@ pub(crate) mod expert {
         let head_dim = ec.head_dim;
         let rotary_dim = ec.rotary_dim();
         let eps = ec.rms_norm_eps;
-        let trace_layer = std::env::var("APXINF_QWEN_EXPERT_TRACE_LAYER")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let trace_step = std::env::var("APXINF_QWEN_EXPERT_TRACE_STEP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
         let pose_q = &state.pose_q;
         let velocity_q = &state.velocity_q;
         let acceleration_q = &state.acceleration_q;
@@ -2370,16 +2062,9 @@ pub(crate) mod expert {
         let cos_t = &state.cos_t;
         let sin_t = &state.sin_t;
         let waypoints = &state.waypoints;
-        let time_buffer = &state.time_buffer;
-        let time_row_bytes = state.time_row_bytes;
         let step_f64 = state.step_f64;
 
         let t_f64 = index as f64 * step_f64;
-        let t_emb_t = time_buffer
-            .view(index * time_row_bytes, time_row_bytes)
-            .map_err(Error::Cuda)?
-            .as_tensor(Shape::new(vec![1, ec.time_embed_dim]), DType::BF16)
-            .map_err(Error::Cuda)?;
         let time_condition = state
             .batched_modulation
             .time_conditions
@@ -2387,8 +2072,6 @@ pub(crate) mod expert {
             .ok_or_else(|| {
                 Error::Other("qwen_drive expert: modulation step index out of range".into())
             })?;
-        trace_rows(&format!("expert_time_embed_{index}"), &t_emb_t)?;
-        trace_rows(&format!("expert_time_condition_{index}"), &time_condition)?;
 
         let wp_bf16 = device_tensor(ctx, &[length, point_dim], DType::BF16)?;
         la::cast_f32_to_bf16(ctx, &waypoints, &wp_bf16)?;
@@ -2406,10 +2089,7 @@ pub(crate) mod expert {
             ec.fourier_num_features,
         )?;
         let fourier = mlp(ctx, &weights.fourier, &fourier_feat)?;
-        if index == trace_step {
-            trace_rows("expert_trajectory_proj", &traj)?;
-            trace_rows("expert_fourier_encoder", &fourier)?;
-        }
+
         // broadcast bits: time(2), pose(3), velocity(5), acceleration(6).
         let fused = la::concat7_cols(
             ctx,
@@ -2425,9 +2105,6 @@ pub(crate) mod expert {
             (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6),
         )?;
         let mut hidden = mlp(ctx, &weights.query_fusion, &fused)?;
-        if index == trace_step {
-            trace_rows("expert_query_fusion", &hidden)?;
-        }
 
         let modulations = state
             .batched_modulation
@@ -2459,11 +2136,7 @@ pub(crate) mod expert {
                 )?,
             };
             let qkv = gemm::bf16(ctx, &x, &layer.qkv_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_modulation", &modulation)?;
-                trace_rows("expert_adaln_input", &x)?;
-                trace_rows("expert_qkv", &qkv)?;
-            }
+
             let q_out = device_tensor(ctx, &[length, heads, head_dim], DType::BF16)?;
             let gate_out = device_tensor(ctx, &[length, heads, head_dim], DType::BF16)?;
             la::expert_qkv_prepare(
@@ -2503,19 +2176,11 @@ pub(crate) mod expert {
                     input.scene_len + length,
                 )?,
             };
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_q", &q_out.reshape(vec![length, heads * head_dim])?)?;
-                trace_rows(
-                    "expert_attention",
-                    &attn.reshape(vec![length, heads * head_dim])?,
-                )?;
-            }
+
             la::expert_sigmoid_gate_mul(ctx, &attn, &gate_out)?;
             let attn = attn.reshape(vec![length, heads * head_dim])?;
             let proj = gemm::bf16(ctx, &attn, &layer.o_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_o_proj", &proj)?;
-            }
+
             let residual_norm = fused::adaln_gate_residual_rms_bf16(
                 ctx,
                 &proj,
@@ -2531,11 +2196,7 @@ pub(crate) mod expert {
             let gu = gemm::bf16(ctx, &x2, &layer.gate_up_w)?;
             let act = activation::swiglu_bf16_rounded(ctx, &gu)?;
             let down = gemm::bf16(ctx, &act, &layer.down_w)?;
-            if index == trace_step && layer_index == trace_layer {
-                trace_rows("expert_adaln_ffn", &x2)?;
-                trace_rows("expert_gate_up", &gu)?;
-                trace_rows("expert_down", &down)?;
-            }
+
             if let Some(next) = weights.layers.get(layer_index + 1) {
                 let next_shift = row_col_slice(&modulations[layer_index + 1], 0, hidden_size)?;
                 let next_scale =
@@ -2555,29 +2216,18 @@ pub(crate) mod expert {
             } else {
                 hidden = la::adaln_gate_residual(ctx, &down, &hidden, &gate_ffn)?;
             }
-            if index == trace_step {
-                trace_rows(&format!("expert_layer_{layer_index}"), &hidden)?;
-            }
         }
 
         let final_normed = norm::rms_bf16(ctx, &hidden, &weights.final_norm, eps)?;
-        if index == trace_step {
-            trace_rows("expert_final_norm", &final_normed)?;
-        }
+
         let endpoint =
             gemm::bf16_bias(ctx, &final_normed, &weights.out_proj_w, &weights.out_proj_b)?;
         let endpoint_f32 = device_tensor(ctx, &[length, point_dim], DType::F32)?;
-        trace_rows(
-            &format!("expert_endpoint_{index}"),
-            &endpoint.reshape(vec![1, length * point_dim])?,
-        )?;
+
         la::cast_bf16_to_f32(ctx, &endpoint, &endpoint_f32)?;
         let remaining = (1.0f64 - t_f64).max(config.min_one_minus_t as f64) as f32;
         la::flow_update(ctx, &waypoints, &endpoint_f32, remaining, step_f64 as f32)?;
-        trace_rows(
-            &format!("expert_waypoints_{index}"),
-            &waypoints.reshape(vec![1, length * point_dim])?,
-        )?;
+
         Ok(())
     }
     pub(crate) fn output(state: ExpertState) -> Tensor {
@@ -2612,17 +2262,6 @@ pub(crate) struct RawRgbInput {
     pub resize: Option<kernels::pillow_bicubic::PillowBicubicRgbPlan>,
 }
 
-struct EagerGdn;
-impl GdnExecution for EagerGdn {
-    fn run(
-        &mut self,
-        _: &GdnRequest<'_>,
-        x: Tensor,
-        eager: &mut dyn FnMut(Tensor) -> Result<Tensor>,
-    ) -> Result<(Tensor, bool)> {
-        eager(x).map(|x| (x, false))
-    }
-}
 fn tensor(ctx: &Context, shape: &[usize], dtype: DType) -> Result<Tensor> {
     let bytes = shape
         .iter()
@@ -2786,14 +2425,7 @@ impl DirectInputs {
                 &self.visual_output,
                 &self.rows,
             )?;
-            b.run_text_device(
-                state,
-                &mut EagerGdn,
-                embedded,
-                self.token_count,
-                &self.cos,
-                &self.sin,
-            )?;
+            b.run_text_device(state, embedded, self.token_count, &self.cos, &self.sin)?;
             // Language-to-planner handoff is the persistent shared KV prefix.
             Ok(self.visual_output.clone())
         })?;

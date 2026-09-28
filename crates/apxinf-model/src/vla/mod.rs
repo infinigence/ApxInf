@@ -193,7 +193,10 @@ impl InferenceSpec {
     }
 }
 
-/// Model action output. The tensor stays on the runtime device unless the
+/// Model action output. A prepared runtime may reuse its output storage on
+/// the next run; clone the underlying data or transfer it to the host before
+/// retaining results across calls. Cloning `Action` alone shares the storage.
+/// The tensor stays on the runtime device unless the
 /// caller explicitly asks its backend-facing integration to transfer it, or
 /// uses [`VlaRuntime::infer_host_f32`] to get host values directly.
 #[derive(Clone, Debug)]

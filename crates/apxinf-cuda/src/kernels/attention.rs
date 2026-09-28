@@ -2444,14 +2444,16 @@ pub fn try_gqa_bf16_fa4_d256_splitbatch_sm110(
         if ((q_buf.ptr() as usize) | (k_buf.ptr() as usize) | (v_buf.ptr() as usize)) & 15 != 0 {
             return Ok(None);
         }
-        if crate::workspace::may_prepare_native_resources() {
-            unsafe {
-                let status = ffi::apxinf_static_fa4_split_batch_init(ctx.stream().handle());
-                if status == UNSUPPORTED_TOPOLOGY {
-                    return Ok(None);
-                }
-                check_fa4_d256_status(status)?;
+        unsafe {
+            let status = if crate::workspace::may_prepare_native_resources() {
+                ffi::apxinf_static_fa4_split_batch_init(ctx.stream().handle())
+            } else {
+                ffi::apxinf_static_fa4_split_batch_ready()
+            };
+            if status == UNSUPPORTED_TOPOLOGY {
+                return Ok(None);
             }
+            check_fa4_d256_status(status)?;
         }
         let q2 = output_buffer(ctx, q_bytes * 2)?;
         let partial = output_buffer(ctx, q_bytes * 2)?;

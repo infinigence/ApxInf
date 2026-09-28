@@ -808,8 +808,7 @@ pub fn gdn_chunk_gemm_tri_k_bf16_direct_v(
     chunk_size: usize,
     v_offset: usize,
 ) -> Result<()> {
-    let policy = GdnLaunchPolicy::for_device(ctx.caps());
-    if head_k_dim != 128 || head_v_dim != 128 || chunk_size != 64 || policy.chunk_gemm_tile != 4 {
+    if head_k_dim != 128 || head_v_dim != 128 || chunk_size != 64 {
         return Err(Error::Other("BF16 K direct-V W/U route mismatch".into()));
     }
     let (seq, conv_dim) = matrix_shape(conv_out, "GDN direct-V W/U")?;
@@ -881,7 +880,6 @@ pub fn gdn_chunk_gemm_tri_k_bf16_direct_v(
             head_k_dim_i32,
             head_v_dim_i32,
             chunk_size_i32,
-            &policy,
             ctx.stream().handle(),
         ))
     }
@@ -989,12 +987,7 @@ pub fn gdn_chunk_state_qk_bf16(
     head_v_dim: usize,
     chunk_size: usize,
 ) -> Result<()> {
-    let policy = GdnLaunchPolicy::for_device(ctx.caps());
-    if head_k_dim != 128
-        || head_v_dim != 128
-        || chunk_size != 64
-        || policy.chunk_state_wmma != wmma::LOSSY
-    {
+    if head_k_dim != 128 || head_v_dim != 128 || chunk_size != 64 {
         return Err(Error::Other("BF16 Q/K state route mismatch".into()));
     }
     let chunks = seq_pad.checked_div(chunk_size).unwrap_or(0);
@@ -1057,7 +1050,6 @@ pub fn gdn_chunk_state_qk_bf16(
             chunk_size as i32,
             chunks as i32,
             out_width as i32,
-            &policy,
             ctx.stream().handle(),
         ))
     }
@@ -1733,22 +1725,6 @@ pub fn gqa_bf16(
     }
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
-        // The planner calls this once per layer per flow step with 50 query
-        // rows against the whole scene prefix, which is one row tile times the
-        // head count -- 16 blocks on a 20-SM part, so four multiprocessors sit
-        // idle and the ones that work hold a single block each. Splitting the
-        // key range is what the FA2 planner exists to decide, and at this shape
-        // it picks five, filling two full waves.
-        //
-        // It is off by default because a split changes the arithmetic: each
-        // range runs its own online softmax and a combine kernel rescales and
-        // sums them, which is the same value in a different summation order.
-        // Set APXINF_JOINT_GQA_SPLITKV=1 to measure what that would buy.
-        if std::env::var("APXINF_JOINT_GQA_SPLITKV").as_deref() == Ok("1") {
-            return super::attention::fa2_attention_splitkv(
-                ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], k_shape[1], q_shape[2], false,
-            );
-        }
         let output = output_buffer(ctx, q.size_in_bytes())?;
         let lse_elements = q_shape[0]
             .checked_mul(q_shape[1])

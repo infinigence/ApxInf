@@ -1,4 +1,5 @@
-#include "fa4_d256_split_batch_adapter.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 #include "apxinf_fa4_d256_a_splitbatch_sm110.h"
 #include <atomic>
 #include <mutex>
@@ -8,6 +9,7 @@ extern "C" int32_t apxinf_split_batch_merge(const void*, const float*, void*, cu
 
 namespace {
 constexpr int kAotErrorBase = 0x10000;
+constexpr int APXINF_FA4_SPLIT_BATCH_UNSUPPORTED_TOPOLOGY = 0x20000;
 apxinf_fa4_d256_a_splitbatch_sm110_Kernel_Module_t module{};
 std::mutex init_mutex;
 std::atomic<bool> ready{false};
@@ -68,6 +70,16 @@ extern "C" int32_t apxinf_static_fa4_split_batch_init(cudaStream_t stream) {
   initialized_device.store(device, std::memory_order_relaxed);
   ready.store(true, std::memory_order_release);
   return 0;
+}
+
+extern "C" int32_t apxinf_static_fa4_split_batch_ready(void) {
+  if (!ready.load(std::memory_order_acquire))
+    return APXINF_FA4_SPLIT_BATCH_UNSUPPORTED_TOPOLOGY;
+  int device = -1;
+  const cudaError_t error = cudaGetDevice(&device);
+  if (error != cudaSuccess) return int32_t(error);
+  return device == initialized_device.load(std::memory_order_relaxed)
+             ? 0 : APXINF_FA4_SPLIT_BATCH_UNSUPPORTED_TOPOLOGY;
 }
 
 extern "C" int32_t apxinf_static_fa4_split_batch_forward(

@@ -1,5 +1,6 @@
 #include "fixed_profile.h"
-#include "fa4_d256_native_adapter.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 #include "apxinf_fa4_d256_l_sm110.h"
 
 #include <atomic>

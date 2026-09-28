@@ -62,15 +62,18 @@ APXINF_CUDA_AOT_MANIFEST=/path/to/bundle/manifest.json \
 
 This is a build input, not a runtime optimization switch. Cargo checks the
 checksums, AArch64 ELF type, CUDA/DSL versions, symbols and tensor contracts
-and compiler specialization before linking. A changed artifact invalidates the kernel build identity.
+and compiler specialization before linking. It also compares the bundle exporter
+SHA256 with the reviewed recipe and the committed exporter file. Editing an
+exporter and merely rehashing the bundle does not satisfy this check. A changed artifact invalidates the kernel build identity.
 The adapters own module initialization and stream-aware launches. Preparation
 happens before CUDA graph capture.
 
 The current bundle covers GDN prefill, language attention, split action
 attention, SwiGLU GEMM, and both fixed vision attention groups. Unsupported
 hardware and tensor shapes use the existing generic kernels. Direct planning
-pads short prompts to 3387 tokens; logical lengths 3383–3387 use masked split
-attention. Longer prompts are not truncated. Reasoning retains variable length
+pads only logical lengths 3383–3387 to 3387 tokens; this window uses masked
+split attention. Shorter prompts keep their original length and use the generic
+operators. Longer prompts are not truncated. Reasoning retains variable length
 execution.
 
 ## What an exporter contains
@@ -101,3 +104,26 @@ logical prompt lengths above. Keep these two shapes distinct: compiling a
 1720-row example changes BF16 rounding on real model inputs even when random
 input comparisons pass. The bundle records the compiler specialization separately
 from the runtime tensor contract and Cargo checks both before linking.
+
+## Verification and build scope
+
+Run `cargo test -p apxinf-cuda --test aot_bundle` for bundle corruption,
+exporter/specification mismatch and shared geometry checks. This is a normal
+integration-test target; testing the build script does not run these checks.
+`sm_110` and `sm_110a` both accept the same pinned SM110 bundle.
+
+AOT remains an optional build input because this CUDA crate also supports other
+models and generic operators. Absence on SM110 produces a build warning; it does
+not silently claim the qualified Qwen-Drive performance. The benchmark build
+must supply the manifest explicitly. Source content hashes in the exporters
+pin upstream files even when the upstream revision is a package version.
+
+Reuse one Cargo target directory and preserve unchanged source/artifact paths
+for incremental builds. NVCC objects are reused only when their command and
+all recorded dependencies are unchanged. Generated include directories currently
+enter all legacy NVCC commands, so relocating a bundle can trigger broad
+recompilation; reuse the validated artifacts during ordinary Rust changes.
+
+For GEMM heuristic comparisons, use the supported tuner through the safe GEMM
+API and its vendor-versus-winner report. Calling the raw cuBLASLt plan API from
+an isolated test omits required context setup and does not yield a valid sweep.

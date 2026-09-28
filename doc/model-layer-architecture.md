@@ -38,6 +38,13 @@ apxinf-core / apxinf-cuda
 
 Dependencies flow downward. Backend crates never import model concepts.
 
+Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
+private `src/ffi/` declarations. The C/C++ boundary in
+[`adapters/`](../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
+launches; device implementations belong in `kernels/`, and offline CuTe export
+belongs in `aot/`. These are backend implementation details, not additional
+model-layer interfaces.
+
 ## Runtime contracts
 
 `LlmTrait` is the shared autoregressive LLM/VLM process. A VLM extends prefill

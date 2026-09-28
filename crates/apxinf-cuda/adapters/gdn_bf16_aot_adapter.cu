@@ -5,7 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstdint>
-#include "gdn_fused_qkv.cuh"
+#include "../kernels/custom/gdn_fused_qkv.cuh"
 #include "flashinfer_gdn_bf16_t64_sm110_real3392.h"
 namespace {
 constexpr int H=16, HV=32, D=128, KEY=H*D, VALUE=HV*D;

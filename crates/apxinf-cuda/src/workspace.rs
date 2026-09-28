@@ -95,18 +95,8 @@ impl GraphWorkspace {
             .checked_add(WORKSPACE_ALIGNMENT - 1)
             .ok_or_else(|| Error::Other("static inference workspace offset overflow".into()))?
             & !(WORKSPACE_ALIGNMENT - 1);
-        // Diagnostic slack between arena allocations. The driver hands out
-        // separate, non-adjacent blocks, so a kernel that writes slightly past
-        // the end of its buffer lands in unused memory; the arena packs
-        // allocations back to back, where the same overrun clobbers the next
-        // one. If a slack makes a failure go away, that is the shape of it.
-        let slack: usize = std::env::var("APXINF_CUDA_WORKSPACE_SLACK")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
         let end = start
             .checked_add(bytes)
-            .and_then(|value| value.checked_add(slack))
             .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
         if end > self.storage.len() {
             return Err(Error::Other(format!(
@@ -244,39 +234,7 @@ pub(crate) fn is_preparing_workspace() -> bool {
     PREPARING.with(Cell::get)
 }
 
-/// Whether the workspace-less path may hand back an uncleared buffer.
-///
-/// The workspace path already makes the case: `GraphWorkspace::allocate`
-/// returns a reused view into its arena and never clears it, so every consumer
-/// of `output_buffer` already tolerates dirty memory. The fallback cleared
-/// anyway, and it is not cheap -- one Qwen-Drive VQA inference on Orin issued
-/// 33,545 memsets covering 41GB, 313ms of GPU time on top of 371ms of host API,
-/// with single prefill outputs reaching 114MB.
-///
-/// Opt-in through `APXINF_CUDA_SKIP_OUTPUT_ZERO` until the model families that
-/// have only ever taken the workspace-less path have been checked. Setting it
-/// to `poison` fills the buffer with 0xFF instead, which is NaN for every float
-/// width: that turns "nothing read uninitialized memory" from something a clean
-/// run merely fails to disprove into something a run actively convicts, because
-/// any such read propagates NaN into the output.
-#[derive(Clone, Copy, PartialEq)]
-enum OutputFill {
-    Zero,
-    Dirty,
-    Poison,
-}
-
-fn output_fill() -> OutputFill {
-    static FILL: std::sync::OnceLock<OutputFill> = std::sync::OnceLock::new();
-    *FILL.get_or_init(
-        || match std::env::var("APXINF_CUDA_SKIP_OUTPUT_ZERO").as_deref() {
-            Err(_) => OutputFill::Zero,
-            Ok("poison") => OutputFill::Poison,
-            Ok(_) => OutputFill::Dirty,
-        },
-    )
-}
-
+/// Allocate operator output storage; non-arena allocations start at zero.
 pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
@@ -287,13 +245,7 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
             // a recycled block is ordered behind whatever last used it. This
             // is the path the cache was measured on -- 43,811 malloc/free
             // pairs and 13.6 s of host time in one VQA inference.
-            match output_fill() {
-                OutputFill::Zero => CudaBuffer::alloc_zeros_on(ctx, bytes).map_err(Error::Cuda),
-                OutputFill::Dirty => CudaBuffer::alloc_on(ctx, bytes).map_err(Error::Cuda),
-                OutputFill::Poison => {
-                    CudaBuffer::alloc_filled_on(ctx, bytes, 0xFF).map_err(Error::Cuda)
-                }
-            }
+            CudaBuffer::alloc_zeros_on(ctx, bytes).map_err(Error::Cuda)
         } else {
             unsafe { &*workspace }.allocate(bytes, ctx.device_id())
         }
@@ -335,7 +287,9 @@ pub(crate) fn output_buffer_tail_zeroed(
     let bytes = groups
         .checked_mul(group_bytes)
         .ok_or_else(|| Error::Other("scratch extent overflow".into()))?;
-    let tail = group_bytes.saturating_sub(used_bytes);
+    let tail = group_bytes
+        .checked_sub(used_bytes)
+        .ok_or_else(|| Error::Other("scratch used bytes exceed group extent".into()))?;
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
         let buffer = if workspace.is_null() {

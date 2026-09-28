@@ -1,27 +1,8 @@
-// Tensor-core form of the GDN chunk-state scan, with the fp32 operand carried
-// as two BF16 terms.
-//
-// The scalar kernel beside this one is the largest single kernel in a VQA
-// scene -- 452.3 ms, 38% of prefill -- spending it on four GEMM-shaped inner
-// products in scalar fp32 on the CUDA cores, where this device delivers 5.43
-// TFLOP/s against 164-195 on its tensor cores.
-//
-// In all four products the right-hand operand is already on the BF16 grid: the
-// carried state is rounded to BF16 by the scalar kernel itself, and v_new is
-// rounded before both the intra term and the state update. Rounding the left
-// operand to BF16 as well was measured against an fp64 reference of the scan
-// and costs 3.5x -- relative L1 1.418808e-3 to 4.954247e-3 -- which is more
-// than the term already carries and more than this workload should pay.
-//
-// So the left operand is split instead: x = hi + lo with both BF16, and each
-// product runs as two tensor-core passes against the same right fragment.
-// Every partial product is then exact -- BF16 times BF16 into fp32 -- and the
-// only new error is the residual x - (hi + lo), about 2^-16 relative, below
-// the 2^-8 the right operand already contributes.
-//
-// APXINF_GDN_CHUNK_STATE_WMMA=1 selects the split form, =lossy the single-pass
-// one, unset the scalar kernel. All three on one binary, all three measurable
-// by tests::operators::gdn_chunk_state_scan_error_against_fp64_oracle.
+// Single-pass BF16 tensor-core GDN chunk-state scan.
+// The float-input instantiation rounds each MMA operand to BF16; the typed
+// instantiation consumes BF16 operands directly. There is no split high/low
+// implementation. Correctness is measured against the recurrence reference,
+// not inferred from a comparison between environment-selected modes.
 #pragma once
 
 // <mma.h> is pulled in by the adapter at global scope; this header is included

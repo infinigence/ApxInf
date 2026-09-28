@@ -51,14 +51,16 @@ impl Bundle {
                 .iter()
                 .find(|kernel| kernel["id"] == recipe["id"])
                 .unwrap_or_else(|| panic!("required AOT kernel {} is missing", recipe["id"]));
-            assert_eq!(kernel["symbol"], recipe["symbol"], "AOT symbol mismatch");
+            bundle::verify_recipe(kernel, recipe)
+                .unwrap_or_else(|error| panic!("AOT bundle rejected: {error}"));
+            let exporter = crate_root
+                .join("aot/exporters")
+                .join(recipe["exporter"].as_str().unwrap());
+            println!("cargo:rerun-if-changed={}", exporter.display());
             assert_eq!(
-                kernel["contract"], recipe["contract"],
-                "AOT tensor contract mismatch"
-            );
-            assert_eq!(
-                kernel["specialization"], recipe["specialization"],
-                "AOT compiler specialization mismatch"
+                bundle::digest(&exporter).expect("hash committed exporter"),
+                recipe["exporter_sha256"].as_str().expect("pinned exporter"),
+                "AOT exporter differs from reviewed recipe"
             );
         }
         for path in result["inputs"].as_array().expect("AOT input paths") {

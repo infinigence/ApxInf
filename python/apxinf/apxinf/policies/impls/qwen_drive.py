@@ -80,6 +80,10 @@ def _wrap_heading(trajectory: np.ndarray) -> np.ndarray:
     return np.concatenate([trajectory[..., :2], heading], axis=-1)
 
 
+FIXED_SCENE_TOKENS = 3387
+MIN_FIXED_SCENE_TOKENS = FIXED_SCENE_TOKENS - 4
+
+
 class _Tokenizer:
     """Uniform facade over the fast `tokenizers` backend or AutoTokenizer.
 
@@ -287,7 +291,7 @@ class QwenDrivePolicy:
             raise ValueError(
                 f"QwenDrivePolicy: expected an RGB uint8 image, got shape {array.shape}"
             )
-        pil = Image.fromarray(array, mode="RGB")
+        pil = Image.fromarray(array)
         max_pixels = budget
         if target_size is not None:
             width, height = int(target_size[0]), int(target_size[1])
@@ -340,7 +344,7 @@ class QwenDrivePolicy:
         array = np.ascontiguousarray(image, dtype=np.uint8)
         if array.ndim != 3 or array.shape[2] != 3:
             raise ValueError(f"QwenDrivePolicy: expected RGB uint8, got {array.shape}")
-        pil = Image.fromarray(array, mode="RGB")
+        pil = Image.fromarray(array)
         max_pixels = budget
         if target_size is not None:
             width, height = int(target_size[0]), int(target_size[1])
@@ -420,12 +424,6 @@ class QwenDrivePolicy:
         return packed, grids
 
     def _preproc_workers(self, frames: int) -> int:
-        override = os.environ.get("APXINF_QWEN_PREPROC_THREADS")
-        if override is not None:
-            try:
-                return max(0, int(override))
-            except ValueError:
-                pass
         # One worker per frame, bounded by the cores. Measured on all three
         # boards and all three want it: at twelve workers against eight, the
         # RTX 4090 is 4.36x against 3.36x, Orin 4.89x against 3.86x, Thor 4.25x
@@ -580,8 +578,7 @@ class QwenDrivePolicy:
         rgb_mode = (not with_reasoning and
                     self.patch_size == 16 and self.merge == 2 and self.temporal == 2 and
                     hasattr(self.model_runner, "_infer_resized_rgb"))
-        raw_mode = (rgb_mode and
-                    os.environ.get("APXINF_QWEN_TRACE_DIR") is None)
+        raw_mode = rgb_mode
         if raw_mode:
             from PIL import __version__ as pillow_version
             raw_mode = pillow_version == "12.3.0"
@@ -649,8 +646,8 @@ class QwenDrivePolicy:
         token_ids = self._build_scene_ids(observation, views, token_counts, with_reasoning)
         attention_mask = np.ones(len(token_ids), dtype=np.uint8)
         if not with_reasoning:
-            target = 3387
-            if len(token_ids) < target:
+            target = FIXED_SCENE_TOKENS
+            if MIN_FIXED_SCENE_TOKENS <= len(token_ids) < target:
                 attention_mask = np.pad(attention_mask, (0, target - len(token_ids)))
                 token_ids = [*token_ids, *([0] * (target - len(token_ids)))]
         history, velocity, acceleration, ego, nav_command = self._conditioning(observation)

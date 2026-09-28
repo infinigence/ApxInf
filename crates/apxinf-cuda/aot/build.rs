@@ -44,6 +44,10 @@ fn main() -> Result<()> {
         let exporter = root
             .join("exporters")
             .join(recipe["exporter"].as_str().ok_or("missing exporter")?);
+        let exporter_hash = digest(&exporter)?;
+        if recipe["exporter_sha256"].as_str() != Some(exporter_hash.as_str()) {
+            return Err(format!("{id}: exporter differs from reviewed recipe").into());
+        }
         let directory = out.join(id);
         let mut command = Command::new(python);
         command.arg(&exporter);
@@ -68,7 +72,7 @@ fn main() -> Result<()> {
             Ok(json!({"sha256":digest(&out.join(&relative))?,"path":relative}))
         };
         let mut source = recipe["source"].clone();
-        source["exporter_sha256"] = json!(digest(&exporter)?);
+        source["exporter_sha256"] = json!(exporter_hash);
         source["recipe_sha256"] = json!(digest(&root.join("manifest.json"))?);
         kernels.push(
             json!({"id":id,"symbol":symbol,"contract":recipe["contract"],

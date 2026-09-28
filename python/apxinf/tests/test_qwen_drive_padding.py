@@ -5,7 +5,7 @@ import test_qwen_drive_policy as f
 
 config = f.config
 
-@pytest.mark.parametrize('length',[3383,3384,3385,3386,3387,3388])
+@pytest.mark.parametrize('length',[19,3382,3383,3384,3385,3386,3387,3388])
 def test_padding_boundary(config,monkeypatch,length):
  p=f.policy(config)
  ids=list(range(1,length+1))
@@ -17,7 +17,7 @@ def test_padding_boundary(config,monkeypatch,length):
  monkeypatch.setattr(p.model_runner,'_infer_preprocessed',infer)
  p.infer(f.scene(),noise=np.zeros((3,3),np.float32))
  tokens,mask=seen[0]
- target=max(length,3387)
+ target=3387 if 3383 <= length <= 3387 else length
  assert len(tokens)==target and len(mask)==target
  np.testing.assert_array_equal(tokens[:length],ids)
  np.testing.assert_array_equal(mask[:length],1)
@@ -31,3 +31,8 @@ def test_reasoning_not_padded(config,monkeypatch):
  p=f.policy(config,'reasoning_planning')
  p.infer(f.scene(),noise=np.zeros((3,3),np.float32))
  assert len(p.model_runner.calls[0][2])<3387
+
+
+def test_native_and_policy_padding_geometry_agree():
+ native = pytest.importorskip('apxinf_py')
+ assert native.QWEN_DRIVE_FIXED_SCENE_TOKENS == f.qwen_drive.FIXED_SCENE_TOKENS

@@ -136,7 +136,7 @@ the L2 request from resident decoded images to the host trajectory.
 
 | Hardware | Precision | Request P50 | Throughput | Fixed-242 PDM |
 |---|---|---:|---:|---:|
-| Jetson AGX Thor SM110 | BF16 | 498.78 ms | 2.00 Hz | 85.6786 |
+| Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
 
 [Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
 
