@@ -5,21 +5,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
+use apxinf_cuda_new::{ops, CapturedGraph, CudaBuffer, CudaContext};
 use apxinf_loader::ModelConfig;
 
 use crate::accelerator::create_backend;
 use crate::llm_trait::LlmTrait;
 
-use super::config::{Qwen38Config, CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM,
+use super::config::{CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM,
     GDN_V_HEADS, HEAD_DIM, KV_HEADS, LAYERS, QKV_WIDTH, VOCAB};
 use super::{backend, model, model_runner, weights};
 
 /// Qwen3.8-27B-NVFP4. Batch 1, text only, BF16 KV cache.
 ///
-/// Execution policy is fixed at load: batched FlashInfer-GDN prefill and
-/// CUDA-graph decode (per-layer GDN graphs + per-layer MLP graphs) are the
-/// defaults; [`Qwen38Config`] only exposes the two genuine numeric choices.
+/// Execution policy is fixed: batched FlashInfer-GDN prefill, CUDA-graph
+/// decode (per-layer GDN graphs + per-layer MLP graphs) and split-KV FA2
+/// decode attention -- the validated configuration. The kernel harness keeps
+/// its own switches for A/B comparison.
 pub struct Qwen38 {
     ctx: CudaContext,
     backend: Arc<dyn Backend>,
@@ -29,8 +30,8 @@ pub struct Qwen38 {
     prefill_session: Option<ops::ExecutionSession>,
     gdn_states: Vec<model::GdnState>,
     kv_caches: Vec<model::KvCache>,
-    mlp_graphs: Option<Vec<PreparedPhase>>,
-    gdn_graphs: Option<Vec<Option<PreparedPhase>>>,
+    mlp_graphs: Option<Vec<CapturedGraph>>,
+    gdn_graphs: Option<Vec<Option<CapturedGraph>>>,
     position: usize,
     kv_capacity: usize,
 }
@@ -39,36 +40,15 @@ impl Qwen38 {
     /// Load from an already-read checkpoint tensor map.
     ///
     /// `kv_capacity` bounds prompt + generation length; caches are allocated
-    /// once at this size. `config` selects the numeric options.
-    pub fn with_config(
+    /// once at this size.
+    pub fn new(
         weights: HashMap<String, Tensor>,
         device: Device,
         kv_capacity: usize,
-        config: Qwen38Config,
     ) -> Result<Self> {
         let Device::Cuda(ordinal) = device else {
             return Err(Error::Other("qwen38 requires a CUDA device".into()));
         };
-        // Both numeric options are process-wide switches in the current
-        // backend: flashinfer_gdn is a module-level flag and split-KV is a
-        // getenv() read once by the FA2 launcher. A second instance with a
-        // different configuration would silently change the first instance's
-        // execution, so the first load pins the process configuration and a
-        // conflicting later load is refused explicitly.
-        // TODO(cuda-new): thread both through per-call arguments.
-        static PROCESS_CONFIG: std::sync::OnceLock<Qwen38Config> = std::sync::OnceLock::new();
-        let pinned = PROCESS_CONFIG.get_or_init(|| config);
-        if *pinned != config {
-            return Err(Error::Other(format!(
-                "qwen38 execution options are process-wide: an earlier instance \
-                 pinned {pinned:?}, and this load requested {config:?}"
-            )));
-        }
-        model::FLASHINFER_GDN.store(config.flashinfer_gdn, std::sync::atomic::Ordering::Relaxed);
-        std::env::set_var(
-            "APXINF_FA2_DECODE_SPLITKV",
-            if config.splitkv { "1" } else { "0" },
-        );
         // The remaining kernel-path selectors are getenv() switches inside the
         // cuda-new native code. They are part of this model's validated
         // execution (the acceptance md5 was produced with exactly these), so
@@ -94,7 +74,7 @@ impl Qwen38 {
             ("APXINF_FP8_NATIVE_PAIR", "1"),
             // Five-warp-group FlashInfer prepare reduction (report 11).
             ("APXINF_GDN_PREPARE_PARALLEL", "5"),
-            // Single split for FA2 decode when split-KV is off (report 47).
+            // Single split for the split-KV FA2 decode kernel (report 47).
             ("APXINF_FA2_DECODE_SPLITS", "1"),
         ] {
             if std::env::var_os(key).is_none() {
@@ -174,7 +154,7 @@ impl Qwen38 {
 impl LlmTrait for Qwen38 {
     fn load(config: ModelConfig, weights: HashMap<String, Tensor>, device: Device) -> Result<Self> {
         let capacity = config.max_seq_len.max(4096);
-        Self::with_config(weights, device, capacity, Qwen38Config::default())
+        Self::new(weights, device, capacity)
     }
 
     /// `start_pos == 0` with several tokens runs the batched prefill; a single

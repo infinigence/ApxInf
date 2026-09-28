@@ -2,14 +2,12 @@ pub mod buffer;
 pub mod context;
 mod ffi;
 mod graph;
-pub mod phase;
 pub mod stream;
 mod workspace;
 
 pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
 pub use context::CudaContext;
 pub use graph::{capture, CapturedGraph};
-pub use phase::PreparedPhase;
 pub use ops::{
     attention, kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask,
     AttentionPolicy, ExecutionSession, GraphWorkspace, KvCacheAttentionArgs, KvCacheDecodeMeta,

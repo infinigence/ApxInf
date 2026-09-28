@@ -2,9 +2,9 @@
 //!
 //! The shapes are properties of the Qwen3.8-27B-NVFP4 checkpoint (64 layers:
 //! 48 Gated DeltaNet + 16 full attention on every 4th layer); they are not
-//! tunable. The runtime options that survived the optimization rounds as
-//! genuine choices live in [`Qwen38Config`]; everything else that used to be
-//! an `APXINF_*` environment flag is now simply the default code path.
+//! tunable. Every execution choice that used to be an `APXINF_*`
+//! environment flag is now simply the validated default code path; the
+//! kernel-level test harness keeps its own switches for A/B comparison.
 
 pub(crate) const HIDDEN: usize = 5120;
 pub(crate) const INTERMEDIATE: usize = 17408;
@@ -34,26 +34,3 @@ pub(crate) fn is_full_attention(layer: usize) -> bool {
     (layer + 1) % FULL_ATTENTION_INTERVAL == 0
 }
 
-/// Runtime options. Both defaults are the validated fast paths; the
-/// alternatives exist for precision comparison, not for performance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Qwen38Config {
-    /// Split-KV FA2 decode attention. Changes the FA2 reduction order, which
-    /// since the quantizer fixes produces the same tokens as the non-split
-    /// path on the acceptance prompt; kept as an option because the reduction
-    /// order is still a numeric degree of freedom.
-    pub splitkv: bool,
-    /// FlashInfer Cake GDN prefill. `false` falls back to the reference
-    /// chunked scan (~75x slower prefill), which is the numeric baseline the
-    /// FlashInfer path is shadow-checked against.
-    pub flashinfer_gdn: bool,
-}
-
-impl Default for Qwen38Config {
-    fn default() -> Self {
-        Self {
-            splitkv: true,
-            flashinfer_gdn: true,
-        }
-    }
-}

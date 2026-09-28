@@ -4,7 +4,7 @@
 //! Calls the model computation in `super::model`; does not re-implement it.
 
 
-use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
+use apxinf_cuda_new::{capture, ops, CapturedGraph, CudaBuffer, CudaContext};
 
 use super::backend::{graph_tensor_bytes, zero_tensor};
 use super::config::*;
@@ -19,24 +19,28 @@ pub(crate) fn capture_gdn_graphs(
     model: &Model,
     scratch: &mut Scratch,
     states: &mut [GdnState],
-) -> Vec<Option<PreparedPhase>> {
+) -> Vec<Option<CapturedGraph>> {
     let mut graphs = (0..model.layers.len()).map(|_| None).collect::<Vec<_>>();
     let mut gdn_index = 0usize;
     for (layer_index, layer) in model.layers.iter().enumerate() {
         let Layer::Gdn(gdn) = layer else { continue };
         let state = &mut states[gdn_index];
         gdn_index += 1;
-        let phase = PreparedPhase::prepare_and_capture(
-            ctx,
-            ops::ExecutionSession::with_capacity(128 * 1024 * 1024, ctx.device_id()).unwrap(),
-            || {
+        let session = ops::ExecutionSession::with_capacity(128 * 1024 * 1024, ctx.device_id()).unwrap();
+        ops::prepare_with_session(&session, || {
+            gdn_decode_layer(ctx, gdn, scratch, state);
+            nvfp4_mlp(ctx, &gdn.gate_up, &gdn.down, &gdn.post_norm, scratch);
+            Ok(())
+        }).unwrap();
+        ctx.synchronize().unwrap();
+        let graph = ops::with_session(&session, || {
+            capture(ctx, || {
                 gdn_decode_layer(ctx, gdn, scratch, state);
                 nvfp4_mlp(ctx, &gdn.gate_up, &gdn.down, &gdn.post_norm, scratch);
                 Ok(())
-            },
-        )
-        .unwrap();
-        graphs[layer_index] = Some(phase);
+            })
+        }).unwrap();
+        graphs[layer_index] = Some(graph);
     }
     ctx.synchronize().unwrap();
     graphs
@@ -50,7 +54,7 @@ fn verify_gdn_graphs(
     model: &Model,
     scratch: &mut Scratch,
     states: &mut [GdnState],
-    graphs: &[Option<PreparedPhase>],
+    graphs: &[Option<CapturedGraph>],
 ) {
     let mut state_index = 0usize;
     let mut checked = 0usize;
@@ -114,8 +118,8 @@ pub(crate) fn decode_step_with_mlp_graphs(
     gdn_states: &mut [GdnState],
     kv_caches: &mut [KvCache],
     position: usize,
-    mlp_graphs: &[PreparedPhase],
-    gdn_graphs: Option<&[Option<PreparedPhase>]>,
+    mlp_graphs: &[CapturedGraph],
+    gdn_graphs: Option<&[Option<CapturedGraph>]>,
 ) {
     decode_step_inner(
         ctx,
@@ -133,23 +137,29 @@ pub(crate) fn capture_mlp_graphs(
     ctx: &CudaContext,
     model: &Model,
     scratch: &mut Scratch,
-) -> Vec<PreparedPhase> {
+) -> Vec<CapturedGraph> {
     let mut graphs = Vec::with_capacity(model.layers.len());
     for layer in &model.layers {
         let (gate_up, down, norm_weight) = match layer {
             Layer::Attention(layer) => (&layer.gate_up, &layer.down, &layer.post_norm),
             Layer::Gdn(layer) => (&layer.gate_up, &layer.down, &layer.post_norm),
         };
-        let phase = PreparedPhase::prepare_and_capture(
-            ctx,
-            ops::ExecutionSession::with_capacity(64 * 1024 * 1024, ctx.device_id()).unwrap(),
-            || {
+        let session = ops::ExecutionSession::with_capacity(64 * 1024 * 1024, ctx.device_id())
+            .unwrap();
+        ops::prepare_with_session(&session, || {
+            nvfp4_mlp(ctx, gate_up, down, norm_weight, scratch);
+            Ok(())
+        })
+        .unwrap();
+        ctx.synchronize().unwrap();
+        let graph = ops::with_session(&session, || {
+            capture(ctx, || {
                 nvfp4_mlp(ctx, gate_up, down, norm_weight, scratch);
                 Ok(())
-            },
-        )
+            })
+        })
         .unwrap();
-        graphs.push(phase);
+        graphs.push(graph);
     }
     ctx.synchronize().unwrap();
     graphs

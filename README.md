@@ -130,26 +130,20 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 
 ### Qwen3.8-27B-NVFP4
 
-Text LLM (48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8),
-batch 1, 2048-token prompt, 128 greedy tokens, BF16 KV cache. Steady state
-after one warm-up generation (autotune + CUDA-graph capture); byte-identical
-output across repeats. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md) for
-running real inference through the CLI.
+Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
+2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
+after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+for CLI inference.
 
 | Hardware | Precision | TTFT (2048) | Decode | Throughput |
 |---|---|---:|---:|---:|
 | Jetson AGX Thor | NVFP4/FP8 | 534 ms | 78.1 ms/token | 12.8 tok/s |
 
-For reference, vLLM v0.28 on the same device and checkpoint measures
-683 ms TTFT and 74.9 ms/token.
-
-Benchmark it with the dedicated example (JSON per repeat plus a summary;
-repeat 0 is the warm-up and excluded from the means):
-
 ```bash
 cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
     <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
 ```
+
 
 ### Qwen-Drive
 

@@ -2,7 +2,7 @@
 
 This document lists the model-independent L3 semantics currently exposed by `apxinf-cuda-new`. Model code must match the complete mathematical semantic and tensor contract, not only the operator name. If no interface matches completely, record an operator gap and follow [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md).
 
-This document describes only public contracts and does not promise a specific provider, candidate, or autotune winner. The tunable operators listed here support eager execution and `prepare_with_session` → capture → replay. Fixed model-building kernels are not required to own a session or a graph; the surrounding model/phase captures their direct stream enqueues.
+This document describes only public contracts and does not promise a specific provider, candidate, or autotune winner. Every operator supports eager execution and `prepare_with_session` → capture → replay.
 
 ## Shared Constraints
 

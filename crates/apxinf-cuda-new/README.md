@@ -2,8 +2,6 @@
 
 `apxinf-cuda-new` provides stable CUDA L3 semantic interfaces to the model layer and selects and prepares a provider kernel for the same semantic in the native layer. GEMM and Attention are the two operator families currently integrated, not the full set of types supported by the framework.
 
-Preparation and graph capture have different owners. GEMM and Attention may own persistent native executions because they select providers and configurations. Fixed operators enqueue directly on the active stream. A model or execution phase owns the CUDA Graph; use `PreparedPhase` when a phase contains both direct fixed operators and persistent GEMM/Attention executions.
-
 - Current public interfaces and mathematical semantics: [L3 operator catalog](cuda-operator.md)
 - Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
 
@@ -14,7 +12,7 @@ L0-L3 here describe only the CUDA operators inside `apxinf-cuda-new`, not the mo
 | Layer | Responsibility | Input → Output | Main Interfaces and Directories |
 | --- | --- | --- | --- |
 | L3 Semantic (Rust) | Define the complete model-visible mathematical semantic and tensor contract | `CudaContext + Args` → `Result<()>` | `ops::<semantic>`; `src/ops/<operator>/` |
-| L2 Execution (Rust) | Validate and normalize tunable L3 calls; manage persistent execution state when the operator needs it | L3 Args → `Spec + Policy + Bindings` → opaque native handle, or direct stream enqueue for fixed kernels | `normalize`, `prepare/execute`, Rust FFI declaration; `src/ops/`, `src/workspace.rs`, `src/graph.rs` |
+| L2 Execution (Rust) | Validate and normalize L3 calls; manage the execution cache, session, storage, and graph lifecycle | L3 Args → `Spec + Policy + Bindings` → opaque native handle | `normalize`, `prepare/execute`, Rust FFI declaration; `src/ops/`, `src/workspace.rs`, `src/graph.rs` |
 | L1 Native operator (C++) | Implement the C ABI; perform recipe lookup, kernel selection, autotune, fallback, candidate/provider prepare, and enqueue | `Spec + Policy + Bindings` → native `Execution` | `*_prepare/*_enqueue/*_destroy`, registry and candidate callbacks; `native/adapters/`, `native/framework/` |
 | L0 Kernel | Perform the actual GPU computation | provider launch arguments → GPU work | custom CUDA, FA2, CUTLASS, cuBLAS/cuBLASLt; `native/kernels/` or vendor API |
 
@@ -24,10 +22,6 @@ L3 Rust → L2 Rust │ C ABI │ L1 C++ → L0 CUDA
 L3: no provider       L2: no candidate selection
 L1: owns selection    L0: no recipe/fallback/model logic
 ```
-
-Not every GPU primitive is a public L3 semantic. Fixed model-building blocks
-may remain direct stream enqueues and are captured by the model/phase graph.
-Only operators with persistent native state use `ExecutionSession`.
 
 ## Call Chain
 

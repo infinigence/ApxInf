@@ -349,38 +349,6 @@ __device__ __forceinline__ void emit_nvfp4_block(
   }
 }
 
-// Load one 16-value scale block as two aligned 16-byte vectors and emit the
-// packed FP4 values with one 64-bit store. One thread still owns the complete
-// block, so amax, scale encoding, and element quantization retain the scalar
-// kernel's operation order.
-__global__ void quantize_activation_vector_kernel(
-    const __nv_bfloat16* __restrict__ src, uint8_t* __restrict__ packed,
-    uint8_t* __restrict__ scales, int rows, int k_blocks, float input_scale,
-    CanonicalSfConfig::LayoutSF layout, bool row_major) {
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index >= (long long)rows * k_blocks) return;
-  const int row = static_cast<int>(index / k_blocks);
-  const int block = static_cast<int>(index % k_blocks);
-  const uint4 first = reinterpret_cast<const uint4*>(src)[index * 2];
-  const uint4 second = reinterpret_cast<const uint4*>(src)[index * 2 + 1];
-  const auto* first_values =
-      reinterpret_cast<const __nv_bfloat16*>(&first);
-  const auto* second_values =
-      reinterpret_cast<const __nv_bfloat16*>(&second);
-  float values[16];
-#pragma unroll
-  for (int offset = 0; offset < 8; ++offset) {
-    values[offset] = __bfloat162float(first_values[offset]);
-    values[offset + 8] = __bfloat162float(second_values[offset]);
-  }
-  unsigned long long output;
-  uint8_t code;
-  emit_nvfp4_block(values, 16, input_scale,
-                   reinterpret_cast<uint8_t*>(&output), code);
-  reinterpret_cast<unsigned long long*>(packed)[index] = output;
-  store_block_scale(scales, layout, row_major, row, block, 16, k_blocks, code);
-}
-
 // One block per row: reduce for RMSNorm, then quantize that row in place
 // without ever materializing the normalized BF16 tensor.
 __global__ void quantize_rms_norm_kernel(
@@ -639,22 +607,6 @@ int nvfp4_quantize_activation(const void* src_bf16, void* dst_packed,
   const long long total = (long long)rows * k_blocks;
   const int threads = 256;
   const long long blocks = (total + threads - 1) / threads;
-  const char* vector_flag = std::getenv("APXINF_NVFP4_VECTOR_QUANT");
-  // The vector kernel halves prefill quantization time, but its fixed work is
-  // slower for a single decode row. Enable only the multi-row fast path by
-  // default and retain an explicit scalar escape hatch for A/B validation.
-  const bool vector_enabled =
-      vector_flag == nullptr || std::strcmp(vector_flag, "0") != 0;
-  if (rows > 1 && vector_enabled &&
-      reinterpret_cast<uintptr_t>(src_bf16) % 16 == 0 &&
-      reinterpret_cast<uintptr_t>(dst_packed) % 8 == 0) {
-    quantize_activation_vector_kernel<<<static_cast<int>(blocks), threads, 0,
-                                        stream>>>(
-        static_cast<const __nv_bfloat16*>(src_bf16),
-        static_cast<uint8_t*>(dst_packed), static_cast<uint8_t*>(dst_scales),
-        rows, k_blocks, input_scale, layout, row_major_scales != 0);
-    return cudaGetLastError() == cudaSuccess ? 0 : -21;
-  }
   quantize_activation_kernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(src_bf16),
       static_cast<uint8_t*>(dst_packed), static_cast<uint8_t*>(dst_scales),

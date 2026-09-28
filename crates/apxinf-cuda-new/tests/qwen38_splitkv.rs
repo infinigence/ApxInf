@@ -12,7 +12,6 @@ fn upload(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
 
 #[test]
 fn grouped_splitkv_matches_independent_fp64_attention() {
-    std::env::set_var("APXINF_FA2_DECODE_SPLITKV", "1");
     let ctx = CudaContext::new(0).unwrap();
     let mut random = 47_u32;
     for tokens in [17_usize, 128, 257, 2048, 2176] {

@@ -1,6 +1,4 @@
 #include "../internal.h"
-#include <cstdlib>
-#include <cstring>
 
 #if defined(APXINF_ATTENTION_FA2)
 
@@ -40,9 +38,7 @@ struct Fa2State {
 };
 
 bool use_decode_splitkv(const Spec& spec) {
-  const char* enabled = std::getenv("APXINF_FA2_DECODE_SPLITKV");
-  return enabled != nullptr && std::strcmp(enabled, "1") == 0 &&
-         spec.dtype == APXINF_DTYPE_BF16 &&
+  return spec.dtype == APXINF_DTYPE_BF16 &&
          spec.output_dtype == APXINF_DTYPE_BF16 && spec.batch == 1 &&
          spec.query_tokens == 1 && spec.query_heads == 24 &&
          spec.kv_heads == 4 && spec.head_dim == 256 &&

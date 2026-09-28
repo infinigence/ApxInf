@@ -4,7 +4,7 @@
 //! NVFP4/FP8/BF16 from a ModelOpt checkpoint. Module owners follow
 //! `doc/model-layer-architecture.md`:
 //!
-//! - [`config`] — shape constants and the two genuine numeric options;
+//! - [`config`] — checkpoint shape constants;
 //! - [`weights`] — checkpoint interpretation, packing and the device weight
 //!   tree;
 //! - [`model`] — prefill/decode dataflow and the scratch it binds;
@@ -31,6 +31,6 @@ mod model_runner;
 mod weights;
 
 #[cfg(feature = "cuda")]
-pub use config::{Qwen38Config, VOCAB};
+pub use config::VOCAB;
 #[cfg(feature = "cuda")]
 pub use llm::Qwen38;

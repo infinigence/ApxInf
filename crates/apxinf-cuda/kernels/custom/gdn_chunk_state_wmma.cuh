@@ -199,7 +199,7 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_wmma_kernel(
           s_state[(owner_row0 + 8 * i) * VP + owner_j] =
               __float2bfloat16(state_reg[i]);
       }
-    
+
     }
     for (int i = tid; i < C * K; i += nthreads) {
       const int r = i / K, m = i - r * K;
@@ -208,7 +208,7 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_wmma_kernel(
       const float q_v = gdn_qk_widen(q[(token_base + r) * K + m]);
       s_kcd_hi[p] = __float2bfloat16(kcd_v);
       s_q_hi[p] = __float2bfloat16(q_v);
-    
+
     }
     __syncthreads();
 
@@ -280,14 +280,14 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_wmma_kernel(
       const int p = r * CP + c;
       const float t_v = __bfloat162float(t_in[a_base + i]);
       s_t_hi[p] = __float2bfloat16(t_v);
-    
+
     }
     for (int i = tid; i < C * K; i += nthreads) {
       const int r = i / K, m = i - r * K;
       const int p = r * KP + m;
       const float k_v = gdn_qk_widen(k[(token_base + r) * K + m]);
       s_kt_hi[p] = __float2bfloat16(k_v);
-    
+
     }
     __syncthreads();
 
@@ -404,7 +404,7 @@ __global__ __launch_bounds__(1024) void gdn_chunk_state_wmma_kernel(
           state_reg[half * 8 + i] = updated;
           s_state[m * VP + owner_j] = __float2bfloat16(updated);
         }
-      
+
         __syncthreads();
       } else {
         const int lane = tid & 31;

@@ -35,6 +35,7 @@ fn deterministic_prompt(n: usize) -> Vec<u32> {
         })
         .collect()
 }
+
 fn arg_value(args: &[String], name: &str, default: usize) -> usize {
     args.iter()
         .position(|arg| arg == name)
@@ -106,3 +107,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+

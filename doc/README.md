@@ -26,9 +26,8 @@ planning-only VLA runtime. Its [benchmark and validation guide](qwen-drive-bench
 records measured performance, accuracy, reproduction steps and runtime limits.
 
 Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
-`weights`/`model`/`model_runner` owners as single files. [Running real
-inference through the CLI, benchmarking and current limits](qwen38-nvfp4.md)
-cover Jetson Thor.
+`weights`/`model`/`model_runner` owners as single files.
+[CLI inference, benchmarking and limits](qwen38-nvfp4.md) cover Jetson Thor.
 
 ## Agent workflows
 
