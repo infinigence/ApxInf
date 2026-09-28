@@ -139,6 +139,41 @@ Duplicating a LIBERO wrist image does not establish three-camera correctness.
 The script records the OpenPI checkout revision when available and rejects different checkpoint or
 input hashes. Generated suites and reports stay under ignored `devlocal/`.
 
+For a **numerical-only** three-view check when only a two-camera checkpoint
+is available, create an ignored checkpoint overlay that reuses the original
+weights and declares a third visual input. This tests the implementation on
+three active views; it does not claim that the checkpoint was trained for a
+third camera. Use the overlay as `--checkpoint-dir` for both engines and prepare
+the suite with three `--image-keys`:
+
+```bash
+python - <<'PYTHON'
+import copy
+import json
+from pathlib import Path
+
+source = Path("/path/to/two-view-checkpoint").resolve()
+overlay = Path("devlocal/pi05-openpi-parity/three-view-overlay").resolve()
+overlay.mkdir(parents=True, exist_ok=True)
+for item in source.iterdir():
+    if item.name != "config.json" and not (overlay / item.name).exists():
+        (overlay / item.name).symlink_to(item)
+config = json.loads((source / "config.json").read_text())
+visual = next(value for value in config["input_features"].values()
+              if value["type"] == "VISUAL")
+config["input_features"]["observation.images.image3"] = copy.deepcopy(visual)
+config["num_views"] = 3
+config["empty_cameras"] = 0
+(overlay / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+PYTHON
+```
+
+A random checkpoint is also usable if both implementations load the **same**
+valid weights and configuration. It is less representative of a trained model;
+for FP8, calibrate against the selected three-view inputs before interpreting
+cosine similarity. A two-view FP8 calibration profile is not evidence for a
+three-view result.
+
 ## 5. Execution paths
 
 | Device | Precision path | Purpose |
