@@ -86,6 +86,8 @@ actions = client.infer(observation)["actions"]
 
 ## Performance
 
+### PI0.5
+
 Two views, 224x224 NHWC `uint8`, 10 flow steps, `H=10`, batch 1. Latency is
 steady-state CUDA Graph replay P50.
 
@@ -114,6 +116,18 @@ is 92.4%.
 | Jetson AGX Thor | BF16 | 500 | 464 | 92.8% |
 | Jetson AGX Thor | FP8 | 500 | 461 | 92.2% |
 | Jetson AGX Orin | BF16 | 500 | 460 | 92.0% |
+
+
+### Qwen-Drive
+
+Direct planning, BF16, batch 1, 10 flow steps and 12 input frames. Latency covers
+the L2 request from resident decoded images to the host trajectory.
+
+| Hardware | Precision | Request P50 | Throughput | Fixed-242 PDM |
+|---|---|---:|---:|---:|
+| Jetson AGX Thor SM110 | BF16 | 498.78 ms | 2.00 Hz | 85.6786 |
+
+[Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
 
 
 ## Port a new model with an agent

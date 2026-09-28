@@ -13,7 +13,7 @@ and model coverage are recorded in the [migration tracker](migration.md).
 PI0.5 supports them for all three ModelVariantChoice choices. Qwen-Drive supports
 sample-based `prepare_for` for fixed-profile BF16 direct planning, with owning
 eager/whole-graph plans and a bounded implicit cache; its shape-only `prepare`
-still lacks the required geometry. See its [family contract](../qwen-drive-planning.md)
+still lacks the required geometry. See its [family contract](../qwen-drive-benchmark.md)
 for the exact scope, workspace and validation. Other VLA families retain their
 existing prepare path and return an unsupported error for the new policy methods;
 their default status is RuntimeManaged, never a fabricated Ready.
