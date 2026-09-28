@@ -168,11 +168,25 @@ config["empty_cameras"] = 0
 PYTHON
 ```
 
-A random checkpoint is also usable if both implementations load the **same**
-valid weights and configuration. It is less representative of a trained model;
-for FP8, calibrate against the selected three-view inputs before interpreting
-cosine similarity. A two-view FP8 calibration profile is not evidence for a
-three-view result.
+A real three-camera candidate is
+[`lerobot/pi05_base`](https://huggingface.co/lerobot/pi05_base/blob/main/config.json):
+its config declares three `VISUAL` inputs and its PyTorch safetensors weights
+are a candidate for bare-mode testing; this checkpoint has not yet been run on Thor. The official OpenPI
+[`pi05_base`](https://github.com/Physical-Intelligence/openpi/blob/main/README.md#base-models)
+is also available as a JAX checkpoint and needs conversion for this PyTorch
+comparison. The LeRobot base package does not include the PaliGemma
+SentencePiece file; set `APXINF_TOKENIZER` to the same tokenizer used for the
+other PI0.5 checkpoints. FP8 needs a calibration profile for these weights and
+three-view inputs.
+
+A random checkpoint is usable only if both implementations load the **same**
+valid tensors and configuration. ApxInf's `bench_pi05.py` random mode runs
+`fp8_static` with `uniform:1.0` as a synthetic scale, but that mode generates
+Rust-only weights and tests latency rather than
+OpenPI cosine parity. For a random-weight parity test, export one shared
+checkpoint in OpenPI's PyTorch format; compare BF16 first, then calibrate FP8
+against its own inputs. A two-view FP8 calibration profile is not evidence for
+a three-view result.
 
 ## 5. Execution paths
 
