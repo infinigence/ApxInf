@@ -126,8 +126,9 @@ its path with `--calibration`. ApxInf's random FP8 benchmark uses
 `uniform:1.0` to measure latency, but its internal synthetic weights cannot
 be compared to OpenPI.
 
-Thor3 validation on 2026-09-28 used `lerobot/pi05_base` revision
-`b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba` (weight SHA256
+Thor3 validation on 2026-09-28 used ApxInf based on `upstream/main`
+`c36cbbcdd2600240780c922fe8cd49fcc78a00a9` and `lerobot/pi05_base`
+revision `b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba` (weight SHA256
 `0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f`),
 OpenPI revision `215abfb217dbac7d5f1273282331b9b1866c0479`, `H=10`, ten
 flow steps, and seven synthetic cases. The fixed gate was cosine >= 0.997
