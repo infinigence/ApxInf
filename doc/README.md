@@ -26,6 +26,11 @@ planning-only VLA runtime. Its [loading, request and validation contract](qwen-d
 covers the supported modes and limits; [per-device kernel policy, tactic stores and the
 measurement protocol](qwen-drive-devices.md) cover Orin, Thor and the RTX 4090.
 
+Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
+`weights`/`model`/`model_runner` owners as single files. [Running real
+inference through the CLI, benchmarking and current limits](qwen38-nvfp4.md)
+cover Jetson Thor.
+
 ## Agent workflows
 
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.

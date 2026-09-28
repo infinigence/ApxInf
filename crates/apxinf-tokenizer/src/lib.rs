@@ -84,8 +84,17 @@ impl Tokenizer {
             TokenizerConfig::default()
         };
 
-        // Store chat template separately (we'll create env on demand)
-        let chat_template = config.chat_template.clone();
+        // Store chat template separately (we'll create env on demand).
+        // Newer HF checkpoints ship the template as a standalone
+        // chat_template.jinja next to tokenizer.json instead of a field in
+        // tokenizer_config.json; accept both, preferring the config field.
+        let chat_template = config.chat_template.clone().or_else(|| {
+            path_ref
+                .parent()
+                .map(|parent| parent.join("chat_template.jinja"))
+                .filter(|candidate| candidate.exists())
+                .and_then(|candidate| std::fs::read_to_string(candidate).ok())
+        });
 
         Ok(Self {
             inner,
@@ -193,6 +202,9 @@ impl Tokenizer {
 
         // Create environment and template on demand
         let mut env = Environment::new();
+        // HF chat templates are written for Jinja2 and freely use Python
+        // methods (str.startswith etc.); enable minijinja's pycompat shims.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_template("chat", template_str)
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 

@@ -128,6 +128,11 @@ impl CudaBuffer {
         }
     }
 
+    /// Zero-fill the buffer on device, without a host staging allocation.
+    pub fn zero(&self) -> Result<(), String> {
+        unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len)) }
+    }
+
     /// Raw device pointer for crate-internal launch code.
     pub(crate) fn ptr(&self) -> *mut c_void {
         self.ptr
