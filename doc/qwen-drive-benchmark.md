@@ -12,24 +12,44 @@ measurement, whereas the PI0.5 README table measures CUDA Graph replay.
 | --- | ---: |
 | Request P50 / P95 | 482.45 / 488.95 ms |
 | Request throughput | 2.07 Hz |
-| Fixed NAVSIM scenes | 242 |
-| PDM score, 0–100 | 85.6786 |
-| Trajectories identical to accepted padded implementation | 242 / 242 |
+| Full NAVSIM navtest scenes predicted / scored | 12,146 / 12,146 |
+| Full navtest PDM score, 0–100 | 82.9922 |
+| Regression subset PDM score, 0–100 | 85.6786 |
+| Regression trajectories identical to accepted padded implementation | 242 / 242 |
 
-The fixed subset's official-code SFT direct reference scores **84.6974**.
-The accepted unpadded optimized version scores **85.6723**. Padding changes 125
-of its trajectories and leaves 117 exact, without changing any discrete PDM
-component. The current implementation matches the accepted padded version
-exactly. The final review build repeats all 242 predictions with zero position
-or heading difference; its 85.6786 score is carried forward from the already
-scored identical trajectories, rather than a newly repeated scorer run.
+The 2026-09-28 full run predicts and freshly scores every official navtest token,
+with no missing, duplicate or excluded scenes. All trajectories are finite
+`[1, 50, 3]` arrays and all metric components are finite. Metric caching completes
+for all 12,146 scenes with zero failures. This run uses **2 Hz history interpolated
+to 10 Hz**; see [the full input protocol](#full-navtest-protocol) below.
 
-These are fixed-subset results, not the published full-navtest scores. The
-[official release](https://github.com/QwenLM/Qwen-Drive-1.0#planning) reports SFT/RL
-88.2/90.7, or 89.3/91.4 with best-of-six selection. Checkpoint, scene selection,
-image profile and sampling protocol must match before comparing scores. The
-local gain over official code includes three binary metric flips and does not
-establish a systematic quality improvement.
+The original 242-scene subset is included in the full run. Its new score remains
+**85.6786**, and all 242 trajectories match the accepted padded implementation
+exactly, with zero position or heading difference. The lower full-test mean
+reflects the expanded scene set; this subset comparison shows no implementation
+regression on those 242 scenes.
+
+For the historical subset, the official-code SFT direct reference scores
+**84.6974**, and the accepted unpadded optimized version scores **85.6723**.
+Padding changes 125 trajectories and leaves 117 exact, without changing any
+discrete PDM component. The subset's gain over official code includes three
+binary metric flips and does not establish a systematic quality improvement.
+
+The [official release](https://github.com/QwenLM/Qwen-Drive-1.0#planning) reports
+SFT/RL 88.2/90.7, or 89.3/91.4 with best-of-six selection. These use a different
+input/evaluation protocol. Raw history, checkpoint, image profile and sampling
+must match before comparing those published scores with this run.
+
+Full-test component means, scaled to 0–100:
+
+| Component | Mean |
+| --- | ---: |
+| No at-fault collisions | 96.7067 |
+| Drivable area compliance | 93.8334 |
+| Ego progress | 78.5397 |
+| Time to collision within bound | 90.0873 |
+| Comfort | 99.9918 |
+| Driving direction compliance | 98.1640 |
 
 ### Recorded timing conditions
 
@@ -147,6 +167,8 @@ under `devlocal/qwen-drive-performance/`; it is not part of the source distribut
 
 ## Accuracy procedure
 
+### Historical subset regression
+
 Use the frozen NAVSIM v1.1 242-scene subset, the same metric cache/maps, ten
 flow steps and one supplied initial-noise tensor per scene. The official arm
 uses `planner-sft`, BF16, `direct_planning`, one sample and seed 42; this seed's
@@ -166,6 +188,50 @@ predictions with the frozen PDM evaluator. Compare each safety/comfort component
 per scene; an unchanged aggregate score alone is insufficient. The
 [official evaluation guide](https://github.com/QwenLM/Qwen-Drive-1.0/blob/main/docs/evaluation.md)
 describes the NAVSIM trajectory conversion and scoring interfaces.
+
+### Full navtest protocol
+
+The full run covers all **12,146** official navtest tokens. Input coverage is
+53,616 unique camera images, with no missing images or excluded scenes. Sixty
+scenes have nonuniform metadata timestamps; history interpolation uses their
+actual timestamps rather than dropping them.
+
+This input adapter interpolates the available 2 Hz pose/velocity/acceleration
+history to 10 Hz. It does **not** reproduce the official Qwen-Drive history
+extracted from raw nuPlan at 10 Hz. A full-test score from this adapter therefore
+qualifies this input protocol and cannot be directly compared with the published
+raw-history result.
+
+Each scene uses three cameras and four frames per camera, with historical
+frames resized to 384 × 416 and the current frame to 720 × 799 (width × height).
+The checkpoint is `planner-sft`, BF16 direct planning, ten flow steps, one sample
+and the supplied seed-42 initial-noise tensor. The native library is the same
+PR99-merged build used for the latency result above; scoring runs on Thor3.
+The official NAVSIM v1.1 PDM evaluator uses trajectory poses `4:40:5` from the
+0.1-second model output, with the matching nuPlan v1.0 maps and metric caches.
+
+All 12,146 logical prompts fall within the maintained 3383–3387-token padding
+window: 3,571 / 478 / 4,664 / 2,616 / 817 scenes respectively. This establishes
+coverage for the image profile above, not arbitrary camera configurations.
+The complete converted scene file has SHA-256
+`9f6693d36fb29011752fd0795a876dd654e91d2265f7ae3b26e0838062a33271`.
+
+The full run uses native-library SHA-256
+`95a06e7771e0edb17f4b87a28e096a58dac3d8f7af00e977575062fdb228d598`.
+The saved prediction and score files have SHA-256 values:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| `predictions.jsonl` | `3f799b56b9cb71a34c550b2d3c98976a21d366fe7f773799d0d99fdf8be7bd3a` |
+| `scores.jsonl` | `1124d97f008b49936e1fd6094a7e1f02df5c3270f86496241e66c3efcc254843` |
+
+The full run, input manifests, scripts, source checksums and validation reports
+are retained under `devlocal/qwen-drive-performance/run-20260928-full-navtest/`.
+Prediction and scoring token sets must both equal the official navtest token
+set, with exactly one finite result per token. The 242-scene subset is compared
+against the accepted reference and freshly rescored as part of this full run.
+
+### Operator and model regression
 
 Additional regression covers four scenes, 1/4/10 steps, changed noise, repeated
 calls, invalid masks and logical-length switching. Portable checks:

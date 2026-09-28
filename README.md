@@ -162,10 +162,12 @@ cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
 
 Direct planning, BF16, batch 1, 10 flow steps and 12 input frames. Latency covers
 the end-to-end request from resident decoded images to the host trajectory.
+PDM covers all 12,146 NAVSIM navtest scenes using 2 Hz history interpolated to
+10 Hz; see the input protocol in the linked test document.
 
 | Hardware | Precision | Latency | Throughput | PDM |
 |---|---|---:|---:|---:|
-| Jetson AGX Thor SM110 | BF16 | 482.45 ms | 2.07 Hz | 85.6786 |
+| Jetson AGX Thor SM110 | BF16 | 482.45 ms | 2.07 Hz | 82.9922 |
 
 [Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
 
