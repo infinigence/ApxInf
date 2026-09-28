@@ -20,6 +20,10 @@ pub(crate) struct Spec {
     pub a_scales_alignment: u32,
     pub b_scales_alignment: u32,
     pub output_alignment: u32,
+    pub a_block_scales_alignment: u32,
+    pub b_block_scales_alignment: u32,
+    /// Elements per block scale along K; zero when the contract has none.
+    pub sf_vec_size: u32,
     pub m: i64,
     pub n: i64,
     pub k: i64,
@@ -38,6 +42,8 @@ pub(crate) struct Bindings {
     pub bias: *const c_void,
     pub a_scales: *const f32,
     pub b_scales: *const f32,
+    pub a_block_scales: *const c_void,
+    pub b_block_scales: *const c_void,
     pub output: *mut c_void,
     pub stream: CudaStream,
     pub alpha: f32,
@@ -56,6 +62,54 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
+    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
+        rows: i64,
+        k: i64,
+        sf_vec_size: u32,
+    ) -> u64;
+    pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
+        source_row_major: *const c_void,
+        destination: *mut c_void,
+        rows: i64,
+        k: i64,
+        sf_vec_size: u32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_nvfp4_quantize_rms_norm(
+        source_bf16: *const c_void,
+        norm_weight: *const c_void,
+        destination_packed: *mut c_void,
+        destination_scales: *mut c_void,
+        rows: i64,
+        k: i64,
+        sf_vec_size: u32,
+        epsilon: f32,
+        input_scale: f32,
+        row_major_scales: i32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_nvfp4_quantize_swiglu(
+        source_bf16: *const c_void,
+        destination_packed: *mut c_void,
+        destination_scales: *mut c_void,
+        rows: i64,
+        k: i64,
+        sf_vec_size: u32,
+        input_scale: f32,
+        row_major_scales: i32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_nvfp4_quantize_activation(
+        source_bf16: *const c_void,
+        destination_packed: *mut c_void,
+        destination_scales: *mut c_void,
+        rows: i64,
+        k: i64,
+        sf_vec_size: u32,
+        input_scale: f32,
+        row_major_scales: i32,
+        stream: CudaStream,
+    ) -> i32;
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_summary(execution: Execution) -> *const c_char;
     #[cfg(test)]

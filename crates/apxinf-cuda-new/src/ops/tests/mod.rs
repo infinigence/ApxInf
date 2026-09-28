@@ -11,6 +11,8 @@ use super::*;
 #[path = "backend_framework.rs"]
 mod framework;
 mod l3_behavior;
+#[path = "precision/nvfp4_precision.rs"]
+mod nvfp4_precision;
 mod operator_doc;
 #[path = "precision/precision.rs"]
 mod precision;

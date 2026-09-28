@@ -103,7 +103,8 @@ cudaError_t launch_custom(Execution& execution) {
         static_cast<int>(spec.query_heads), static_cast<int>(spec.kv_heads),
         static_cast<int>(spec.head_dim),
         spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
-        static_cast<int>(spec.query_start), bindings.scale, stream);
+        static_cast<int>(spec.query_start), bindings.decode_meta,
+        bindings.scale, stream);
   }
   return kernels::launch_attention<__nv_bfloat16>(
       bindings.query, bindings.key, bindings.value, bindings.output,
@@ -113,7 +114,8 @@ cudaError_t launch_custom(Execution& execution) {
       static_cast<int>(spec.query_heads), static_cast<int>(spec.kv_heads),
       static_cast<int>(spec.head_dim),
       spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
-      static_cast<int>(spec.query_start), bindings.scale, stream);
+      static_cast<int>(spec.query_start), bindings.decode_meta,
+      bindings.scale, stream);
 }
 
 void destroy_custom(Execution& execution) noexcept {

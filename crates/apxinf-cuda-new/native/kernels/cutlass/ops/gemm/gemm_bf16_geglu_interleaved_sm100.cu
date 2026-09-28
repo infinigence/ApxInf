@@ -39,7 +39,7 @@
 
 using namespace cute;
 
-namespace apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail {
+namespace apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail {
 
 constexpr int APXINF_DUAL_GEGLU_WIDE_PAIR_IMPLEMENTED = 1;
 constexpr int APXINF_DUAL_GEGLU_PAIRED_EPILOGUE_IMPLEMENTED = 1;
@@ -474,27 +474,27 @@ struct GeGluEVT : SelectedGeGluEVT {
 };
 
 struct GeGluOperation : cutlass::epilogue::fusion::FusionOperation {
-  using ElementOutput = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::ElementOutput;
-  using ElementCompute = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::ElementCompute;
-  using ElementSource = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::ElementSource;
+  using ElementOutput = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::ElementOutput;
+  using ElementCompute = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::ElementCompute;
+  using ElementSource = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::ElementSource;
   static constexpr bool IsSourceSupported = true;
 };
 
-}  // namespace apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail
+}  // namespace apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail
 
 namespace cutlass::epilogue::fusion {
 template <>
-struct FusionCallbacksTraits<apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::GeGluEVT> {
+struct FusionCallbacksTraits<apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::GeGluEVT> {
   using DispatchPolicy = void;
-  using Callbacks = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::GeGluEVT;
-  using Operation = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::GeGluOperation;
+  using Callbacks = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::GeGluEVT;
+  using Operation = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::GeGluOperation;
   using CtaTile_MNK = void;
   using EpilogueTile_MN = void;
-  using ElementCompute = apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail::ElementCompute;
+  using ElementCompute = apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::ElementCompute;
 };
 }  // namespace cutlass::epilogue::fusion
 
-namespace apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail {
+namespace apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail {
 
 template <class TileShape, class ClusterShape>
 struct FusedUpGeGlu {
@@ -955,4 +955,4 @@ int production_dual_geglu_bf16(
   return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
 }
 
-}  // namespace apxinf::cuda::cutlass_ops::bf16_dual_geglu_detail
+}  // namespace apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail

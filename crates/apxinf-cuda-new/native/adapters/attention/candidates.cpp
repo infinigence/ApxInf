@@ -43,7 +43,7 @@ bool supports_fa2(const Spec& spec) {
   const bool layout_supported =
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE ||
       (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
-       spec.key_capacity == spec.key_tokens &&
+       spec.dynamic_decode == 0 && spec.key_capacity == spec.key_tokens &&
        (spec.mask == APXINF_ATTENTION_MASK_NONE ||
         spec.query_start == spec.key_tokens - spec.query_tokens));
   const bool bf16_supported =

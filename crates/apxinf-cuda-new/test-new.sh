@@ -1,27 +1,14 @@
 #!/usr/bin/env bash
-# Run the complete apxinf-cuda-new test suite from the repository root:
-# bash crates/apxinf-cuda-new/test-new.sh \
-#   test -p apxinf-cuda -- --nocapture --test-threads=1
-
+# Run cargo against the apxinf-cuda-new crate:
+#   bash crates/apxinf-cuda-new/test-new.sh test -p apxinf-cuda-new -- --nocapture
+#
+# The crate now carries its real name and lives in the workspace, so this is
+# only a thin environment wrapper. The symlink swap that used to substitute
+# this crate for `apxinf-cuda` is gone; both crates build side by side.
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 cd "$repo_root"
-# Hold the original directory intact and restore it even when Cargo fails.
-exec 9>crates/.gemm-pilot-link.lock
-flock -n 9
-original=crates/apxinf-cuda
-saved=crates/apxinf-cuda.pilot-original
-[[ -d "$original" && ! -L "$original" && ! -e "$saved" ]]
-restore() {
- if [[ -L "$original" && "$(readlink "$original")" == apxinf-cuda-new ]]; then
-  unlink "$original"
-  mv "$saved" "$original"
- fi
-}
-trap restore EXIT HUP INT TERM
-mv "$original" "$saved"
-ln -s apxinf-cuda-new "$original"
 export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
 : "${CUDA_PATH:=/usr/local/cuda}"
 : "${APXINF_CUDA_ARCH:=sm_110}"

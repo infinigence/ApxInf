@@ -18,7 +18,7 @@
 #include "extensions/gemm/gemm_universal_base_compat.h"
 #include "extensions/gemm/gemm_with_epilogue_visitor.h"
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <
     typename ThreadblockShape_,
@@ -255,13 +255,13 @@ int interleaved_geglu(
     return static_cast<int>(cudaErrorInvalidValue);
   }
   if (n == 4096 && k == 1024) {
-    return static_cast<int>(::apxinf::cuda::cutlass_ops::run_interleaved_geglu<
+    return static_cast<int>(::apxinf::cuda_new::cutlass_ops::run_interleaved_geglu<
         cutlass::gemm::GemmShape<32, 64, 32>,
         cutlass::gemm::GemmShape<32, 32, 32>,
         3>(activation, interleaved_weight, output, m, n, k, stream));
   }
   if (n == 16384 && k == 2048) {
-    return static_cast<int>(::apxinf::cuda::cutlass_ops::run_interleaved_geglu<
+    return static_cast<int>(::apxinf::cuda_new::cutlass_ops::run_interleaved_geglu<
         cutlass::gemm::GemmShape<64, 128, 32>,
         cutlass::gemm::GemmShape<32, 64, 32>,
         3>(activation, interleaved_weight, output, m, n, k, stream));
@@ -270,4 +270,4 @@ int interleaved_geglu(
 }
 
 }  // namespace bf16_sm89_detail
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

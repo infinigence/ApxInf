@@ -3,7 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-namespace apxinf::cuda::custom {
+namespace apxinf::cuda_new::custom {
 __device__ inline float load(const void* p, int type, int64_t i) {
  if(type==4)return float(((const int8_t*)p)[i]);
  if(type==5)return float(((const int32_t*)p)[i]);

@@ -73,7 +73,7 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | --- | --- | --- |
 | `Spec` | Normalized problem description: semantic, shape, dtype, mask, layout, alignment class, and so on | No; equivalent calls can share it |
 | `Policy` | Constraints such as workspace, graph-safe, deterministic, and whether tune/fallback is allowed | Some fields affect selection or prepared state |
-| `Bindings` | Addresses, stream, and actual dynamic values for this call, such as `alpha` and attention scale | Yes |
+| `Bindings` | Addresses, stream, scalar launch parameters, and fixed pointers to runtime metadata such as the current decode length | Yes |
 
 ## Key Interfaces
 

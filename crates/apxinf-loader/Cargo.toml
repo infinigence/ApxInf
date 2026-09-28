@@ -5,7 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-apxinf-core = { path = "../apxinf-core" }
+# `quantized-dtypes` is required, not optional: a SafeTensors checkpoint can
+# contain packed FP4 weights, and the loader has to be able to name that dtype.
+apxinf-core = { path = "../apxinf-core", features = ["quantized-dtypes"] }
 thiserror = "1"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }

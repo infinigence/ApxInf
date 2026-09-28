@@ -94,6 +94,23 @@ pub enum GemmQuantization<'a> {
     /// FP8 inputs whose values already include the intended scaling.
     /// This supports existing FP8 kernels which do not consume scale tensors.
     Fp8UnitScale,
+    /// Pre-quantized NVFP4 inputs: both operands are packed E2M1 and carry one
+    /// unsigned-E4M3 scale per `block_size` elements along K.
+    ///
+    /// Any per-tensor scale a checkpoint stores alongside the block scales
+    /// (ModelOpt's `weight_scale_2` and `input_scale`) multiplies the whole
+    /// projection, so it belongs in `alpha` rather than in this contract:
+    /// `alpha = input_scale * weight_scale_2`. Keeping it out of the Spec is
+    /// also what lets one tuned recipe serve every layer.
+    ///
+    /// The scale tensors must already be in the layout the candidate expects,
+    /// which is not a plain `[rows, K/block_size]` array. Building them is a
+    /// load-time responsibility, not a per-call one.
+    Nvfp4 {
+        a_block_scales: &'a Tensor,
+        b_block_scales: &'a Tensor,
+        block_size: u32,
+    },
 }
 
 impl<'a> GemmArgs<'a> {
@@ -166,6 +183,35 @@ impl<'a> GemmArgs<'a> {
         self.weight_version = Some(version);
         self
     }
+
+    /// NVFP4 GEMM over packed E2M1 operands with per-block E4M3 scales.
+    ///
+    /// `alpha` carries the product of the per-tensor scales; pass 1.0 when the
+    /// operands are already absolutely scaled.
+    pub fn nvfp4(
+        a: &'a Tensor,
+        a_block_scales: &'a Tensor,
+        b: &'a Tensor,
+        b_block_scales: &'a Tensor,
+        block_size: u32,
+        alpha: f32,
+        out: &'a mut Tensor,
+    ) -> Self {
+        Self {
+            a,
+            b,
+            out,
+            quantization: GemmQuantization::Nvfp4 {
+                a_block_scales,
+                b_block_scales,
+                block_size,
+            },
+            alpha,
+            output_scale: 1.0,
+            policy: GemmPolicy::default(),
+            weight_version: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +265,7 @@ pub(crate) fn dtype(dtype: DType) -> Result<u32> {
         DType::F8E4M3 => Ok(3),
         DType::I8 => Ok(4),
         DType::I32 => Ok(5),
+        DType::E2M1Pair => Ok(6),
     }
 }
 
@@ -311,10 +358,25 @@ pub(crate) fn normalize<'a>(
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(invalid("GEMM requires rank-2 tensors"));
     }
+    let nvfp4 = matches!(args.quantization, GemmQuantization::Nvfp4 { .. });
     // Public storage is deliberately canonical and candidate-independent.
     // Candidates may transpose or pack internally while preparing an execution.
-    let (m, k) = (a_shape[0], a_shape[1]);
-    let (weight_k, n) = (b_shape[0], b_shape[1]);
+    //
+    // NVFP4 is the one contract whose canonical storage is not `A=[M,K]`,
+    // `B=[K,N]`: both operands are packed two-values-per-byte along K, and the
+    // weight is stored `[N, K/2]`. That is how the checkpoint already stores it
+    // and what the block-scaled kernel consumes, so demanding the usual [K,N]
+    // orientation would force a transpose that buys nothing.
+    let (m, k) = if nvfp4 {
+        (a_shape[0], a_shape[1] * 2)
+    } else {
+        (a_shape[0], a_shape[1])
+    };
+    let (weight_k, n) = if nvfp4 {
+        (b_shape[1] * 2, b_shape[0])
+    } else {
+        (b_shape[0], b_shape[1])
+    };
     if k != weight_k
         || m == 0
         || n == 0
@@ -375,6 +437,30 @@ pub(crate) fn normalize<'a>(
             }
             (3, Some(row_scales), Some(channel_scales))
         }
+        GemmQuantization::Nvfp4 {
+            a_block_scales,
+            b_block_scales,
+            block_size,
+        } => {
+            if args.a.dtype() != DType::E2M1Pair || args.b.dtype() != DType::E2M1Pair {
+                return Err(invalid("NVFP4 GEMM requires two packed E2M1 tensors"));
+            }
+            if a_block_scales.dtype() != DType::F8E4M3
+                || b_block_scales.dtype() != DType::F8E4M3
+            {
+                // The kernel reads these as unsigned E4M3. For the non-negative
+                // values a scale tensor holds, that encoding is bit-identical
+                // to signed E4M3, so the checkpoint bytes pass through as-is.
+                return Err(invalid("NVFP4 block scales must be E4M3"));
+            }
+            if block_size == 0 || k % block_size as usize != 0 {
+                return Err(invalid("NVFP4 K must be a multiple of the block size"));
+            }
+            if semantic != Semantic::Gemm {
+                return Err(invalid("NVFP4 is implemented only for plain GEMM"));
+            }
+            (4, None, None)
+        }
     };
     let has_row_channel_scales = matches!(quantization, 2 | 3);
     if semantic == Semantic::GemmGeglu && has_row_channel_scales {
@@ -414,11 +500,44 @@ pub(crate) fn normalize<'a>(
         bias: std::ptr::null(),
         a_scales: std::ptr::null(),
         b_scales: std::ptr::null(),
+        a_block_scales: std::ptr::null(),
+        b_block_scales: std::ptr::null(),
         output: output_buffer.ptr(),
         stream: ctx.stream().handle(),
         alpha: args.alpha,
         output_scale: args.output_scale,
     };
+
+    // Block-scale storage is validated by byte length rather than by shape:
+    // the candidate's atom layout pads the logical [rows, K/block] grid up to
+    // tile boundaries, so the caller-visible shape is an opaque buffer.
+    let mut sf_vec_size = 0u32;
+    if let GemmQuantization::Nvfp4 {
+        a_block_scales,
+        b_block_scales,
+        block_size,
+    } = args.quantization
+    {
+        sf_vec_size = block_size;
+        for (tensor, slot) in [(a_block_scales, 0), (b_block_scales, 1)] {
+            let dims = tensor.shape().dims().to_vec();
+            let buffer = tensor_storage(ctx, tensor, DType::F8E4M3, &dims)?;
+            let bytes = required_bytes(DType::F8E4M3, &dims)?;
+            reject_output_overlap(
+                &output_buffer,
+                output_bytes,
+                &buffer,
+                bytes,
+                if slot == 0 { "A block scale" } else { "B block scale" },
+            )?;
+            if slot == 0 {
+                bindings.a_block_scales = buffer.ptr();
+            } else {
+                bindings.b_block_scales = buffer.ptr();
+            }
+            storage.push(buffer);
+        }
+    }
 
     let projection_dtype = if has_row_channel_scales {
         args.out.dtype()
@@ -460,7 +579,7 @@ pub(crate) fn normalize<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 4,
+            version: 5,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -474,6 +593,9 @@ pub(crate) fn normalize<'a>(
             a_scales_alignment: alignment_class(bindings.a_scales.cast::<std::ffi::c_void>()),
             b_scales_alignment: alignment_class(bindings.b_scales.cast::<std::ffi::c_void>()),
             output_alignment: alignment_class(bindings.output.cast_const()),
+            a_block_scales_alignment: alignment_class(bindings.a_block_scales),
+            b_block_scales_alignment: alignment_class(bindings.b_block_scales),
+            sf_vec_size,
             m: m as i64,
             n: n as i64,
             k: k as i64,

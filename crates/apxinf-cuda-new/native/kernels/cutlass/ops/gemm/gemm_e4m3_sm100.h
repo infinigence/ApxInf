@@ -3,9 +3,16 @@
 
 #include <cuda_runtime_api.h>
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 int fp8_gemm_f16(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, int tactic, cudaStream_t stream);
+
+// Same kernel family as fp8_gemm_f16 with a BF16 epilogue conversion. The
+// ApxInf projection contract writes BF16, and routing that through F16 would
+// clip dot products this checkpoint actually produces.
+int fp8_gemm_bf16(
     const void* activation, const void* weight, void* output,
     int m, int n, int k, float alpha, int tactic, cudaStream_t stream);
 
@@ -28,4 +35,4 @@ int production_dual_geglu(
     cudaStream_t stream);
 
 }  // namespace fp8_dual_geglu_detail
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

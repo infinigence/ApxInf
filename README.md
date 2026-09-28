@@ -117,6 +117,17 @@ is 92.4%.
 | Jetson AGX Thor | FP8 | 500 | 461 | 92.2% |
 | Jetson AGX Orin | BF16 | 500 | 460 | 92.0% |
 
+### PI0-FAST
+
+Two views, 224x224 NHWC `uint8`, batch 1.
+
+| Hardware | Precision | Prefix | Per Token |
+|---|---|---:|---:|
+| Jetson AGX Thor | BF16 | 33.1 ms | 17.16 ms |
+| Jetson AGX Thor | FP8 | 31.0 ms | 9.68 ms |
+| Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
+| RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
+
 
 ### Qwen-Drive
 

@@ -45,7 +45,7 @@ impl Drop for Fixture {
 fn populated_fixture() -> Fixture {
     let fixture = Fixture::new();
     fixture.write("adapters/gemm/candidates.cpp", "candidate-v1");
-    fixture.write("include/apxinf_cuda/gemm.h", "gemm-abi-v1");
+    fixture.write("include/apxinf_cuda_new/gemm.h", "gemm-abi-v1");
     fixture.write("kernels/custom/gemm.cuh", "custom-kernel-v1");
     fixture.write("kernels/cutlass/include/cutlass/cutlass.h", "cutlass-v1");
     fixture.write("adapters/runtime.cpp", "unrelated-runtime-v1");
@@ -77,12 +77,12 @@ fn gemm_abi_kernel_target_and_architectures_change_the_build_id() {
     let fixture = populated_fixture();
     let original = fixture.fingerprint("x86_64-unknown-linux-gnu", "sm_100", "sm_100a");
 
-    fixture.write("include/apxinf_cuda/gemm.h", "gemm-abi-v2");
+    fixture.write("include/apxinf_cuda_new/gemm.h", "gemm-abi-v2");
     assert_ne!(
         original,
         fixture.fingerprint("x86_64-unknown-linux-gnu", "sm_100", "sm_100a")
     );
-    fixture.write("include/apxinf_cuda/gemm.h", "gemm-abi-v1");
+    fixture.write("include/apxinf_cuda_new/gemm.h", "gemm-abi-v1");
 
     fixture.write("kernels/custom/gemm.cuh", "custom-kernel-v2");
     assert_ne!(

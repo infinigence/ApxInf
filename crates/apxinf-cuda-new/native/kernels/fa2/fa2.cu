@@ -5,12 +5,16 @@
 #include <cutlass/numeric_types.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "flash_attn/flash.h"
 #include "flash_attn/namespace_config.h"
 
 namespace FLASH_NAMESPACE {
+
+void run_decode_splitkv_bf16_hdim256(Flash_fwd_params& params, cudaStream_t stream);
 
 template <typename Element, int HeadDim, bool IsCausal>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
@@ -76,7 +80,39 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
 
 }  // namespace
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
+
+int fa2_bf16_decode_splitkv(const void* q, const void* k, const void* v,
+                           void* output, void* workspace, int key_tokens,
+                           float softmax_scale, cudaStream_t stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
+      workspace == nullptr || key_tokens < 128) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  FLASH_NAMESPACE::Flash_fwd_params params;
+  fill_params(params, true, q, k, v, output, workspace, 1, 1, key_tokens,
+              24, 4, 256, softmax_scale);
+  params.h = 4;
+  params.h_h_k_ratio = 1;
+  params.seqlen_q = 6;
+  params.q_row_stride = 256;
+  params.o_row_stride = 256;
+  params.q_head_stride = 6 * 256;
+  params.o_head_stride = 6 * 256;
+  params.num_splits = 5;
+  const char* split_count = std::getenv("APXINF_FA2_DECODE_SPLITS");
+  if (split_count != nullptr) {
+    if (std::strcmp(split_count, "1") == 0) {
+      params.num_splits = 1;
+    } else if (std::strcmp(split_count, "5") != 0) {
+      return static_cast<int>(cudaErrorInvalidValue);
+    }
+  }
+  params.softmax_lseaccum_ptr = static_cast<float*>(workspace) + 24;
+  params.oaccum_ptr = static_cast<float*>(workspace) + 24 + 5 * 24;
+  FLASH_NAMESPACE::run_decode_splitkv_bf16_hdim256(params, stream);
+  return static_cast<int>(cudaSuccess);
+}
 
 template <typename Element>
 int fa2(
@@ -166,4 +202,4 @@ int fa2_f16(
       query_heads, kv_heads, head_dim, softmax_scale, stream);
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

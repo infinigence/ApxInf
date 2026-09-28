@@ -18,6 +18,7 @@ pub enum TuningDType {
     F8E4M3,
     I8,
     I32,
+    E2M1Pair,
 }
 
 impl From<DType> for TuningDType {
@@ -27,6 +28,9 @@ impl From<DType> for TuningDType {
             DType::F16 => Self::F16,
             DType::BF16 => Self::Bf16,
             DType::F8E4M3 => Self::F8E4M3,
+            DType::I8 => Self::I8,
+            DType::I32 => Self::I32,
+            DType::E2M1Pair => Self::E2M1Pair,
         }
     }
 }

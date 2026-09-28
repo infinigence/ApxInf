@@ -34,7 +34,7 @@
 #include "extensions/gemm/gemm_universal_base_compat.h"
 #include "extensions/gemm/gemm_with_epilogue_visitor.h"
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <typename ThreadblockShape, typename WarpShape, int NumStages>
 cudaError_t run_w8a8_bf16(
@@ -197,4 +197,4 @@ cudaError_t w8a8_gemm_bf16(
       5>(a, b, a_scales, b_scales, d, m, n, k, stream);
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

@@ -32,7 +32,7 @@ TuningKeys tuning_keys(const Spec& spec,
   // identity and the suffix captures the normalized operation and policy.
   // There is no compatible fallback key; a miss runs the full autotuner.
   std::ostringstream key;
-  key << "attention-recipe-v4|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
+  key << "attention-recipe-v5|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
@@ -42,8 +42,15 @@ TuningKeys tuning_keys(const Spec& spec,
       << spec.dtype << '|' << spec.output_dtype << '|' << spec.mask << '|'
       << spec.batch << '|' << spec.query_tokens << '|' << spec.key_tokens << '|'
       << spec.key_capacity << '|' << spec.query_heads << '|' << spec.kv_heads
-      << '|' << spec.head_dim << '|' << spec.query_start << '|'
-      << spec.segments << '|' << spec.max_segment_tokens << '|'
+      << '|' << spec.head_dim << '|';
+  key << spec.dynamic_decode << '|';
+  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
+      spec.dynamic_decode != 0) {
+    key << "decode-meta|";
+  } else {
+    key << spec.query_start << '|';
+  }
+  key << spec.segments << '|' << spec.max_segment_tokens << '|'
       << spec.scale_is_default << '|'
       << alignment_class(spec.q_alignment, 16) << '|'
       << alignment_class(spec.k_alignment, 16) << '|'

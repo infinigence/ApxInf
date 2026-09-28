@@ -160,18 +160,30 @@ headroom left is reading *fewer* bytes.
 ### Jetson AGX Thor
 
 Thor (sm_110, 20 SMs), the shipped `configs/tuning/nvidia/thor-sm110/tactics.json`,
-pruned LM head. Step numbers are a least-squares fit from
-`devlocal/pi0-fast/scripts/step_sweep.py` (2 frames x 3 repeats, terminator forced
+pruned LM head, 2 views / 224x224. Step numbers are a least-squares fit from
+`devlocal/pi0-fast/scripts/step_sweep.py` (3 frames x 3 repeats, terminator forced
 through the binding, `r2 = 1.0000`); the call numbers are
 `bench_pi0_fast.py --mode latency` over 10 synthetic frames at the full
-256-token budget, and the same policy inside a LIBERO-10 rollout.
+256-token budget. Re-measured 2026-09-27 on main `a3b5511` after a local
+autotune pass (24 new records: 14 FP8 + 10 BF16, covering the five decode
+GEMVs and the m=512/654 prefill shapes; 144 records total) from
+`devlocal/pi0-fast/results/rebench-main-a3b5511/`; FP8 uses the checkpoint's
+calibrated profile (`calibration.json`, 182 activation scales). Warm the GPU
+with one full-budget run before measuring short calls: the first step sweep
+after model load can sit on a lower DVFS point.
 
 | | BF16 | FP8 E4M3 |
 |---|---|---|
-| prefix (vision tower + prefill + first argmax) | 38.1 ms | 34.7 ms |
-| per autoregressive token | **18.7 ms** | **10.6 ms** |
-| full 256-token call, L1 p50 | 4860 ms | 3071 ms |
+| prefix (vision tower + prefill + first argmax) | 33.1 ms | 31.0 ms |
+| per autoregressive token | **17.16 ms** | **9.68 ms** |
+| full 256-token call, L1 p50 | 4432 ms | 2523 ms |
 | LIBERO-10 rollout, mean model time per call | 504 ms | 313 ms |
+
+The decode step is 1.77x faster in FP8 (103.3 vs 58.3 tokens/s); the prefix
+only gains ~6% because it is dominated by the vision tower and prompt prefill.
+The rollout row is the earlier 2026-09-20 measurement (one trial per task,
+seed 7) and was not re-run in the 09-27 pass; the new fitted split predicts a
+24-token call at 445 ms (BF16) / 263 ms (FP8).
 
 ## The decode GEMV: tuned cuBLASLt tactics
 

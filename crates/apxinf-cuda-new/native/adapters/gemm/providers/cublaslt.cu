@@ -13,6 +13,7 @@ struct CublasLtState {
   cublasLtMatrixLayout_t output_layout = nullptr;
   cublasLtMatmulAlgo_t algorithm{};
   bool has_algorithm = false;
+  bool native_fp4 = false;
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
 
@@ -51,16 +52,18 @@ size_t common_requirement(const Spec& spec, bool native_fp8) {
   return vendor::common_resource_requirements(spec, native_fp8);
 }
 
-void prepare_cublaslt_impl(Execution& state, bool native_fp8) {
+void prepare_cublaslt_impl(Execution& state, bool native_fp8,
+                          bool native_fp4 = false) {
   auto resources = std::make_unique<CublasLtState>();
   const auto& spec = state.spec;
+  resources->native_fp4 = native_fp4;
   resources->common.projection_dtype =
-      vendor::common_projection_dtype(spec);
-  const size_t fixed_bytes = common_requirement(spec, native_fp8);
+      native_fp4 ? APXINF_DTYPE_BF16 : vendor::common_projection_dtype(spec);
+  const size_t fixed_bytes = native_fp4 ? 0 : common_requirement(spec, native_fp8);
   const size_t available_workspace = state.resource_limit - fixed_bytes;
   const cudaDataType_t projection_type =
       projection_cuda_dtype(resources->common);
-  const cudaDataType_t input_type =
+  cudaDataType_t input_type =
       spec.a_dtype == APXINF_DTYPE_I8
           ? CUDA_R_8I
           : native_fp8 ? CUDA_R_8F_E4M3 : projection_type;
@@ -69,7 +72,14 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8) {
                                       : CUBLAS_COMPUTE_32F;
   const cudaDataType_t scale_type =
       spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_32I : CUDA_R_32F;
-  const cublasOperation_t transpose = CUBLAS_OP_N;
+  const cublasOperation_t transpose = native_fp4 ? CUBLAS_OP_T : CUBLAS_OP_N;
+#if CUDART_VERSION >= 12080
+  if (native_fp4) input_type = CUDA_R_4F_E2M1;
+#else
+  if (native_fp4) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED, "NVFP4 requires CUDA 12.8 or newer");
+  }
+#endif
 
   check_cublas(cublasLtCreate(&resources->handle));
   check_cublas(cublasLtMatmulDescCreate(&resources->operation, compute_type,
@@ -77,6 +87,24 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8) {
   check_cublas(cublasLtMatmulDescSetAttribute(
       resources->operation, CUBLASLT_MATMUL_DESC_TRANSA, &transpose,
       sizeof(transpose)));
+#if CUDART_VERSION >= 12080
+  if (native_fp4) {
+    const cublasLtMatmulMatrixScale_t scale_mode =
+        CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources->operation, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+        &scale_mode, sizeof(scale_mode)));
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources->operation, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+        &scale_mode, sizeof(scale_mode)));
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources->operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &state.bindings.b_block_scales, sizeof(state.bindings.b_block_scales)));
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources->operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &state.bindings.a_block_scales, sizeof(state.bindings.a_block_scales)));
+  }
+#endif
   check_cublas(cublasLtMatrixLayoutCreate(
       &resources->a_layout, input_type,
       transpose == CUBLAS_OP_T ? spec.k : spec.n,
@@ -123,7 +151,9 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8) {
   // Descriptor and heuristic queries do not allocate provider device
   // scratch. Allocate common buffers only after the full requirement is
   // known to fit the caller's policy.
-  vendor::allocate_common_resources(spec, resources->common, native_fp8);
+  if (!native_fp4) {
+    vendor::allocate_common_resources(spec, resources->common, native_fp8);
+  }
   if (resources->workspace_bytes != 0) {
     check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   }
@@ -150,6 +180,14 @@ void prepare_cublaslt_native_fp8(Execution& state) {
   prepare_cublaslt_impl(state, true);
 }
 
+size_t cublaslt_native_fp4_resource_requirements(const Spec&) {
+  return 0;
+}
+
+void prepare_cublaslt_native_fp4(Execution& state) {
+  prepare_cublaslt_impl(state, false, true);
+}
+
 void destroy_cublaslt(Execution& state) noexcept {
   delete static_cast<CublasLtState*>(state.provider_state);
   state.provider_state = nullptr;
@@ -160,14 +198,24 @@ cudaError_t launch_cublaslt(Execution& state) {
   const auto stream = static_cast<cudaStream_t>(bindings.stream);
   const auto& spec = state.spec;
   auto& resources = provider(state);
+#if CUDART_VERSION >= 12080
+  if (resources.native_fp4) {
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources.operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+        &bindings.b_block_scales, sizeof(bindings.b_block_scales)));
+    check_cublas(cublasLtMatmulDescSetAttribute(
+        resources.operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+        &bindings.a_block_scales, sizeof(bindings.a_block_scales)));
+  }
+#endif
   const void* activation = bindings.a;
   const void* weight = bindings.b;
   if (resources.common.unpack_a != nullptr) {
-    check_cuda(apxinf::cuda::custom::unpack_gemm(
+    check_cuda(apxinf::cuda_new::custom::unpack_gemm(
         activation, resources.common.unpack_a,
         resources.common.projection_dtype, spec.a_dtype,
         spec.m, spec.k, APXINF_GEMM_LAYOUT_KN, stream));
-    check_cuda(apxinf::cuda::custom::unpack_gemm(
+    check_cuda(apxinf::cuda_new::custom::unpack_gemm(
         weight, resources.common.unpack_b,
         resources.common.projection_dtype, spec.b_dtype, spec.k, spec.n,
         APXINF_GEMM_LAYOUT_KN, stream));

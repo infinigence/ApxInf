@@ -129,6 +129,12 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I8 | DType::I32 => {
+                Err("use gemm_int8_i32 for quantized integer operands".into())
+            }
+            DType::E2M1Pair => {
+                Err("packed FP4 operands need the cuda-new block-scaled GEMM".into())
+            }
         }
     }
 
@@ -223,6 +229,12 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I8 | DType::I32 => {
+                Err("use gemm_int8_i32 for quantized integer operands".into())
+            }
+            DType::E2M1Pair => {
+                Err("packed FP4 operands need the cuda-new block-scaled GEMM".into())
+            }
         }
     }
 
@@ -329,6 +341,12 @@ impl CublasHandle {
                 }
             }
             DType::F8E4M3 => Err("use kernels::gemm::fp8 for FP8 operands".into()),
+            DType::I8 | DType::I32 => {
+                Err("use gemm_int8_i32 for quantized integer operands".into())
+            }
+            DType::E2M1Pair => {
+                Err("packed FP4 operands need the cuda-new block-scaled GEMM".into())
+            }
         }
     }
 

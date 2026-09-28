@@ -100,20 +100,20 @@ cudaError_t launch_cublas(Execution& state) {
   const void* activation = bindings.a;
   const void* weight = bindings.b;
   if (needs_safe_dequantization(spec)) {
-    check_cuda(apxinf::cuda::custom::dequantize_i8_gemm(
+    check_cuda(apxinf::cuda_new::custom::dequantize_i8_gemm(
         activation, resources.dequant_a, bindings.a_scales, spec.m, spec.k,
         true, stream));
-    check_cuda(apxinf::cuda::custom::dequantize_i8_gemm(
+    check_cuda(apxinf::cuda_new::custom::dequantize_i8_gemm(
         weight, resources.dequant_b, bindings.b_scales, spec.k, spec.n, false,
         stream));
     activation = resources.dequant_a;
     weight = resources.dequant_b;
   } else if (resources.common.unpack_a != nullptr) {
-    check_cuda(apxinf::cuda::custom::unpack_gemm(
+    check_cuda(apxinf::cuda_new::custom::unpack_gemm(
         activation, resources.common.unpack_a,
         resources.common.projection_dtype, compute_spec.a_dtype, compute_spec.m,
         compute_spec.k, APXINF_GEMM_LAYOUT_KN, stream));
-    check_cuda(apxinf::cuda::custom::unpack_gemm(
+    check_cuda(apxinf::cuda_new::custom::unpack_gemm(
         weight, resources.common.unpack_b,
         resources.common.projection_dtype, compute_spec.b_dtype, compute_spec.k,
         compute_spec.n, APXINF_GEMM_LAYOUT_KN, stream));

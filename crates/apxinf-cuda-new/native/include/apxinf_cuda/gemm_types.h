@@ -13,6 +13,10 @@ typedef enum {
   APXINF_DTYPE_E4M3 = 3,
   APXINF_DTYPE_I8 = 4,
   APXINF_DTYPE_I32 = 5,
+  /* One byte holding two FP4 E2M1 values, low nibble first. Shapes describing
+     an operand of this dtype are physical, so the mathematical K of a GEMM is
+     twice the trailing extent of the stored tensor. */
+  APXINF_DTYPE_E2M1_PAIR = 6,
 } apxinf_dtype_t;
 
 typedef enum {
@@ -26,6 +30,11 @@ typedef enum {
   APXINF_GEMM_QUANT_FP8_UNIT_SCALE = 1,
   APXINF_GEMM_QUANT_FP8_ROW_CHANNEL = 2,
   APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL = 3,
+  /* NVFP4: both operands are packed E2M1 with one unsigned-E4M3 scale per
+     `sf_vec_size` elements along K. Any per-tensor scale the checkpoint
+     carries is folded into `alpha`, so the block scales are the only extra
+     bindings this contract needs. */
+  APXINF_GEMM_QUANT_NVFP4_BLOCK = 4,
 } apxinf_gemm_quantization_t;
 
 typedef enum {
@@ -52,6 +61,13 @@ typedef struct {
   uint32_t a_scales_alignment;
   uint32_t b_scales_alignment;
   uint32_t output_alignment;
+  /* Block-scale bindings, used only by APXINF_GEMM_QUANT_NVFP4_BLOCK. */
+  uint32_t a_block_scales_alignment;
+  uint32_t b_block_scales_alignment;
+  /* Elements per block scale along K. Zero when the quantization contract has
+     no block scales. This is part of the operand encoding, so it selects a
+     candidate and belongs in the Spec rather than the bindings. */
+  uint32_t sf_vec_size;
   int64_t m;
   int64_t n;
   int64_t k;
@@ -75,6 +91,10 @@ typedef struct {
   const void* bias;
   const float* a_scales;
   const float* b_scales;
+  /* Unsigned-E4M3 block scales laid out in the candidate's expected atom
+     order. Null unless the quantization contract is NVFP4. */
+  const void* a_block_scales;
+  const void* b_block_scales;
   void* output;
   apxinf_cuda_stream_t stream;
   /* Numeric scales are per-call data: they change the result but never which

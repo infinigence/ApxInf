@@ -29,7 +29,7 @@
 
 using namespace cute;
 
-namespace apxinf_cuda_cutlass_bf16_detail {
+namespace apxinf_cuda_new_cutlass_bf16_detail {
 
 struct GeGluArguments {};
 
@@ -93,27 +93,27 @@ struct GeGluEVT : GeGluEVTBase {
 };
 
 struct GeGluOperation : cutlass::epilogue::fusion::FusionOperation {
-  using ElementOutput = apxinf_cuda_cutlass_bf16_detail::ElementOutput;
-  using ElementCompute = apxinf_cuda_cutlass_bf16_detail::ElementCompute;
-  using ElementSource = apxinf_cuda_cutlass_bf16_detail::ElementSource;
+  using ElementOutput = apxinf_cuda_new_cutlass_bf16_detail::ElementOutput;
+  using ElementCompute = apxinf_cuda_new_cutlass_bf16_detail::ElementCompute;
+  using ElementSource = apxinf_cuda_new_cutlass_bf16_detail::ElementSource;
   static constexpr bool IsSourceSupported = true;
 };
 
-}  // namespace apxinf_cuda_cutlass_bf16_detail
+}  // namespace apxinf_cuda_new_cutlass_bf16_detail
 
 namespace cutlass::epilogue::fusion {
 template <>
-struct FusionCallbacksTraits<apxinf_cuda_cutlass_bf16_detail::GeGluEVT> {
+struct FusionCallbacksTraits<apxinf_cuda_new_cutlass_bf16_detail::GeGluEVT> {
   using DispatchPolicy = void;
-  using Callbacks = apxinf_cuda_cutlass_bf16_detail::GeGluEVT;
-  using Operation = apxinf_cuda_cutlass_bf16_detail::GeGluOperation;
+  using Callbacks = apxinf_cuda_new_cutlass_bf16_detail::GeGluEVT;
+  using Operation = apxinf_cuda_new_cutlass_bf16_detail::GeGluOperation;
   using CtaTile_MNK = void;
   using EpilogueTile_MN = void;
-  using ElementCompute = apxinf_cuda_cutlass_bf16_detail::ElementCompute;
+  using ElementCompute = apxinf_cuda_new_cutlass_bf16_detail::ElementCompute;
 };
 }  // namespace cutlass::epilogue::fusion
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 template <typename TileShape, typename ClusterShape,
           typename MainloopSchedule>
@@ -138,7 +138,7 @@ struct Bf16GemmGeGlu {
           ElementAccumulator, ElementCompute, ElementSource, LayoutC,
           AlignmentC, ElementOutput, LayoutD, AlignmentD,
           cutlass::epilogue::collective::EpilogueScheduleAuto,
-          apxinf_cuda_cutlass_bf16_detail::GeGluEVT>::CollectiveOp;
+          apxinf_cuda_new_cutlass_bf16_detail::GeGluEVT>::CollectiveOp;
   using CollectiveMainloop =
       typename cutlass::gemm::collective::CollectiveBuilder<
           cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
@@ -228,4 +228,4 @@ int bf16_gemm_geglu(
   }
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

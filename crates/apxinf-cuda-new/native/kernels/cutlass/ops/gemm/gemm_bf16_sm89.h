@@ -3,10 +3,10 @@
 
 #include <cuda_runtime_api.h>
 
-namespace apxinf::cuda::cutlass_ops::bf16_sm89_detail {
+namespace apxinf::cuda_new::cutlass_ops::bf16_sm89_detail {
 
 int interleaved_geglu(
     const void* activation, const void* interleaved_weight, void* output,
     int m, int n, int k, int full_n, int tactic, cudaStream_t stream);
 
-}  // namespace apxinf::cuda::cutlass_ops::bf16_sm89_detail
+}  // namespace apxinf::cuda_new::cutlass_ops::bf16_sm89_detail

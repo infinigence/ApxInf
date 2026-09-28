@@ -142,6 +142,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
         key: k.ptr(),
         value: v.ptr(),
         offsets: offsets.ptr(),
+        decode_meta: std::ptr::null(),
         output: out.ptr(),
         stream: ctx.stream().handle(),
         scale: args.scale,
@@ -171,10 +172,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
             max_segment_tokens: max_segment_tokens as i64,
             offsets_hash: offsets_hash(args.host_offsets),
             scale_is_default: u32::from(args.scale == default_scale),
+            dynamic_decode: 0,
         },
         policy: args.policy,
         bindings,
         storage: vec![q, k, v, offsets, out],
+        resources: Vec::new(),
     })
 }
 

@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace apxinf::fa2_compat {
+namespace apxinf::cuda_new_fa2_compat {
 
 inline void require_success(cudaError_t status, const char* expression,
                             const char* file, int line) {
@@ -31,12 +31,12 @@ inline void run_host_configuration(Operation operation, cudaStream_t stream,
   }
 }
 
-}  // namespace apxinf::fa2_compat
+}  // namespace apxinf::cuda_new_fa2_compat
 
 #define C10_CUDA_CHECK(expression)                                           \
-  ::apxinf::fa2_compat::run_host_configuration(                             \
+  ::apxinf::cuda_new_fa2_compat::run_host_configuration(                             \
       [&]() { return (expression); }, stream, #expression, __FILE__, __LINE__)
 
 #define C10_CUDA_KERNEL_LAUNCH_CHECK()                                      \
-  ::apxinf::fa2_compat::require_success(                                    \
+  ::apxinf::cuda_new_fa2_compat::require_success(                                    \
       cudaPeekAtLastError(), "CUDA kernel launch", __FILE__, __LINE__)

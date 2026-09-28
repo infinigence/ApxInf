@@ -304,6 +304,17 @@ fn parse_dtype(s: &str) -> Option<DType> {
         "F16" => Some(DType::F16),
         "BF16" => Some(DType::BF16),
         "F8_E4M3" => Some(DType::F8E4M3),
+        // SafeTensors has no sub-byte float dtype, so quantizers that emit
+        // packed FP4 store it as U8 with the trailing dimension halved.
+        // `E2M1Pair` means exactly that -- one byte holding two E2M1 values --
+        // so the mapping preserves both the byte layout and the element count.
+        //
+        // This assumes U8 tensors in a checkpoint are packed FP4. If a
+        // checkpoint ever stores genuine byte data under U8, the mismatch
+        // surfaces at the model layer as a dtype error rather than silently
+        // producing wrong numbers, because every consumer of `E2M1Pair`
+        // requires the NVFP4 quantization contract.
+        "U8" => Some(DType::E2M1Pair),
         _ => None,
     }
 }
@@ -326,6 +337,8 @@ mod tests {
                 DType::F16 => "F16",
                 DType::BF16 => "BF16",
                 DType::F8E4M3 => "F8_E4M3",
+                DType::E2M1Pair => "U8",
+                other => panic!("test fixture has no SafeTensors name for {other}"),
             };
             let shape_json: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             let end = data_offset + data.len();
@@ -449,6 +462,23 @@ mod tests {
         let result = load(tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unsupported dtype"));
+    }
+
+    #[test]
+    fn test_u8_loads_as_packed_fp4_preserving_bytes() {
+        // A quantizer writes packed FP4 as U8 with the trailing dimension
+        // halved: this [2, 3] U8 tensor encodes a [2, 6] FP4 operand.
+        let packed: [u8; 6] = [0x21, 0x43, 0x65, 0x07, 0x12, 0x34];
+        let file_bytes = make_safetensors(&[("w", DType::E2M1Pair, &[2, 3], &packed)]);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&file_bytes).unwrap();
+
+        let (tensors, _) = load_native(tmp.path()).unwrap();
+        let tensor = &tensors["w"];
+        assert_eq!(tensor.dtype(), DType::E2M1Pair);
+        // The shape stays physical; the caller derives logical K as 2 * 3.
+        assert_eq!(tensor.shape().dims(), &[2, 3]);
+        assert_eq!(tensor.as_e2m1_pairs().unwrap(), &packed);
     }
 
     #[test]

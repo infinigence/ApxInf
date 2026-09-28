@@ -5,7 +5,7 @@
 //! stream, or lifetime contract exposed to downstream crates.
 
 use apxinf_core::{DType, Shape, Tensor};
-use apxinf_cuda::{
+use apxinf_cuda_new::{
     capture,
     ops::{gemm, prepare_with_session, with_session, ExecutionSession, GemmArgs},
     CudaBuffer, CudaContext,

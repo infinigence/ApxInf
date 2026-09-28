@@ -38,6 +38,7 @@ typedef struct {
   int64_t max_segment_tokens;
   uint64_t offsets_hash;
   uint32_t scale_is_default;
+  uint32_t dynamic_decode;
 } apxinf_attention_spec_t;
 
 typedef apxinf_tuning_policy_t apxinf_attention_policy_t;
@@ -47,6 +48,7 @@ typedef struct {
   const void* key;
   const void* value;
   const void* offsets;
+  const uint32_t* decode_meta;
   void* output;
   apxinf_cuda_stream_t stream;
   float scale;

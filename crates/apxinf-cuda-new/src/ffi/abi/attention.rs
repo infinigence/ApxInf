@@ -3,7 +3,7 @@ use std::ffi::{c_char, c_void};
 pub(crate) use super::types::Policy;
 use super::types::{CudaStream, Runtime};
 
-pub(crate) const SPEC_VERSION: u32 = 3;
+pub(crate) const SPEC_VERSION: u32 = 4;
 pub(crate) const SEMANTIC_DENSE: u32 = 0;
 pub(crate) const SEMANTIC_KV_CACHE: u32 = 1;
 pub(crate) const SEMANTIC_SEGMENTED: u32 = 2;
@@ -33,6 +33,7 @@ pub(crate) struct Spec {
     pub max_segment_tokens: i64,
     pub offsets_hash: u64,
     pub scale_is_default: u32,
+    pub dynamic_decode: u32,
 }
 
 #[repr(C)]
@@ -42,6 +43,7 @@ pub(crate) struct Bindings {
     pub key: *const c_void,
     pub value: *const c_void,
     pub offsets: *const c_void,
+    pub decode_meta: *const u32,
     pub output: *mut c_void,
     pub stream: CudaStream,
     pub scale: f32,

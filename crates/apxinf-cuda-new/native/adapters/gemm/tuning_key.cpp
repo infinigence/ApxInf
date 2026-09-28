@@ -50,7 +50,7 @@ std::string common_key(const Spec& spec,
                        int driver_version,
                        const cudaDeviceProp& properties) {
   std::ostringstream key;
-  key << "gemm-recipe-v7|ns|" << APXINF_GEMM_BUILD_ID << '|'
+  key << "gemm-recipe-v8|ns|" << APXINF_GEMM_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
@@ -67,6 +67,9 @@ std::string common_key(const Spec& spec,
       << alignment_class(spec.bias_alignment, 32) << '|'
       << alignment_class(spec.a_scales_alignment, 32) << '|'
       << alignment_class(spec.b_scales_alignment, 32) << '|'
+      << alignment_class(spec.a_block_scales_alignment, 32) << '|'
+      << alignment_class(spec.b_block_scales_alignment, 32) << '|'
+      << spec.sf_vec_size << '|'
       << alignment_class(spec.output_alignment, 32);
 
   // Only the unit/non-unit predicates matter for selection. The scale values

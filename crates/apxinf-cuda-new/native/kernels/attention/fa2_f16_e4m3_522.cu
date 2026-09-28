@@ -77,7 +77,7 @@ void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, const void* q,
 
 }  // namespace
 
-namespace apxinf::cuda::cutlass_ops {
+namespace apxinf::cuda_new::cutlass_ops {
 
 int fa2_f16_direct_e4m3_522(
     const void* q, const void* k, const void* v, void* output,
@@ -99,4 +99,4 @@ int fa2_f16_direct_e4m3_522(
   return static_cast<int>(cudaSuccess);
 }
 
-}  // namespace apxinf::cuda::cutlass_ops
+}  // namespace apxinf::cuda_new::cutlass_ops

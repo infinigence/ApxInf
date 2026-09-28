@@ -2,6 +2,7 @@
 members = [
     "crates/apxinf-core",
     "crates/apxinf-cuda",
+    "crates/apxinf-cuda-new",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
