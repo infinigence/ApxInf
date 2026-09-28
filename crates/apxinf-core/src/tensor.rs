@@ -140,7 +140,6 @@ impl Tensor {
     }
 
     /// Create a tensor containing signed INT8 values.
-    #[cfg(feature = "quantized-dtypes")]
     pub fn from_i8(shape: impl Into<Shape>, data: &[i8]) -> Result<Self> {
         Self::from_raw(
             shape.into(),
@@ -154,13 +153,11 @@ impl Tensor {
     ///
     /// `shape` is physical: its trailing extent counts bytes, so the operand
     /// it encodes is twice as wide.
-    #[cfg(feature = "quantized-dtypes")]
     pub fn from_e2m1_pairs(shape: impl Into<Shape>, data: &[u8]) -> Result<Self> {
         Self::from_raw(shape.into(), DType::E2M1Pair, Device::Cpu, data.to_vec())
     }
 
     /// Create a tensor containing signed INT32 values.
-    #[cfg(feature = "quantized-dtypes")]
     pub fn from_i32(shape: impl Into<Shape>, data: &[i32]) -> Result<Self> {
         Self::from_raw(
             shape.into(),
@@ -243,7 +240,6 @@ impl Tensor {
         Ok(self.storage.as_cpu().unwrap())
     }
 
-    #[cfg(feature = "quantized-dtypes")]
     pub fn as_i8(&self) -> Result<&[i8]> {
         self.ensure_cpu()?;
         self.ensure_dtype(DType::I8)?;
@@ -251,14 +247,12 @@ impl Tensor {
     }
 
     /// Raw packed-FP4 bytes, two E2M1 values per byte, low nibble first.
-    #[cfg(feature = "quantized-dtypes")]
     pub fn as_e2m1_pairs(&self) -> Result<&[u8]> {
         self.ensure_cpu()?;
         self.ensure_dtype(DType::E2M1Pair)?;
         Ok(self.storage.as_cpu().unwrap())
     }
 
-    #[cfg(feature = "quantized-dtypes")]
     pub fn as_i32(&self) -> Result<&[i32]> {
         self.ensure_cpu()?;
         self.ensure_dtype(DType::I32)?;
@@ -275,13 +269,10 @@ impl Tensor {
             DType::F8E4M3 => Err(Error::Other(
                 "raw E4M3 conversion requires an explicit quantization scale".into(),
             )),
-            #[cfg(feature = "quantized-dtypes")]
             DType::I8 => Err(Error::Other(
                 "raw INT8 conversion requires an explicit quantization scale".into(),
             )),
-            #[cfg(feature = "quantized-dtypes")]
             DType::I32 => Ok(self.as_i32()?.iter().map(|&x| x as f32).collect()),
-            #[cfg(feature = "quantized-dtypes")]
             DType::E2M1Pair => Err(Error::Other(
                 "raw FP4 conversion requires explicit block scales".into(),
             )),

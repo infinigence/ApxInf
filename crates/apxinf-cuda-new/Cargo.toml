@@ -12,7 +12,7 @@ default = []
 nvtx = []
 
 [dependencies]
-apxinf-core = { path = "../apxinf-core", features = ["quantized-dtypes"] }
+apxinf-core = { path = "../apxinf-core" }
 
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }

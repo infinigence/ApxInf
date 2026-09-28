@@ -6,6 +6,10 @@
 //! crate and moves data through each crate's runtime. If their native
 //! symbol sets ever collide again, this binary fails to link — the failure
 //! mode is a build error, which is exactly where we want it.
+//!
+//! Both crates are optional dependencies, so this binary can only compile when
+//! the `cuda` feature pulls them in — the same gate `qwen_drive_loading.rs` uses.
+#![cfg(feature = "cuda")]
 
 #[test]
 #[ignore = "requires a CUDA device"]
