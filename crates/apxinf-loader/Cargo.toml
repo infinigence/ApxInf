@@ -5,9 +5,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-# A SafeTensors checkpoint can contain packed FP4 and INT8 weights, and the
-# loader has to be able to name those dtypes. They are unconditional in
-# `apxinf-core`, so no feature is needed to reach them.
 apxinf-core = { path = "../apxinf-core" }
 thiserror = "1"
 memmap2 = "0.9"
