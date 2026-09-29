@@ -119,23 +119,26 @@ is 92.4%.
 
 ### PI0-FAST
 
-Two views, 224x224 NHWC `uint8`, batch 1.
+Two views, 224x224 NHWC `uint8`, batch 1. Thor uses constructed inputs;
+Orin and RTX 4090 retain historical measurements pending a rerun.
 
 | Hardware | Precision | Prefix | Per Token |
 |---|---|---:|---:|
-| Jetson AGX Thor | BF16 | 33.1 ms | 17.16 ms |
-| Jetson AGX Thor | FP8 | 31.0 ms | 9.68 ms |
+| Jetson AGX Thor | BF16 | 29.24 ms | 17.39 ms |
+| Jetson AGX Thor | FP8 | 30.37 ms | 10.13 ms |
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+[Benchmark and evaluation commands](doc/pi0-fast-benchmark.md).
+
 ### GR00T N1.7
 
-One or two views, batch 1. Best recorded P50.
+One or two views, batch 1. Constructed-input P50 on Thor; historical Orin measurements.
 
 | Hardware | Precision | 1-view P50 | 2-view P50 |
 |---|---|---:|---:|
-| Jetson AGX Thor | BF16 | 51.834 ms | 54.216 ms |
-| Jetson AGX Thor | FP8 | 32.557 ms | 35.436 ms |
+| Jetson AGX Thor | BF16 | 51.39 ms | 53.77 ms |
+| Jetson AGX Thor | FP8 | 31.71 ms | 36.48 ms |
 | Jetson AGX Orin | BF16 | 75.778 ms | 84.864 ms |
 | Jetson AGX Orin | W8A8 | 56.711 ms | 64.924 ms |
 
@@ -165,7 +168,7 @@ the end-to-end request from resident decoded images to the host trajectory.
 
 | Hardware | Precision | Latency | Throughput | PDM |
 |---|---|---:|---:|---:|
-| Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
+| Jetson AGX Thor SM110 | BF16 | 487.60 ms | 2.05 Hz | Pending observed-history evaluation |
 
 [Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
 
