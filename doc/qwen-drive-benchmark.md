@@ -114,8 +114,10 @@ Before measuring, exclude other GPU tasks and CPU compilation/scoring. Save and
 lock CPU/GPU/EMC clocks and fan, verify readbacks, and restore settings afterwards.
 Warm up ten requests and measure thirty requests in each of two runs. Keep both
 reports and pool their raw samples. Record source/native-binary, checkpoint,
-AOT-manifest and any explicit tactic hashes. The default operator route needs
-no tactic database; using `--tactics` changes the run contract and must be recorded.
+AOT-manifest and any explicit tactic hashes. Without `--tactics`, the engine
+selects a compatible hardware/toolkit database under `configs/tuning` when one
+exists; otherwise it uses provider defaults. For a controlled comparison, pass
+an explicit `--tactics` path and record its hash and library versions.
 
 The table above retains the previously published recorded-input results. Use
 this maintained benchmark for new measurements.
