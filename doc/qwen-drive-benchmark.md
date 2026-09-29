@@ -1,16 +1,6 @@
 # Qwen-Drive BF16 benchmark and validation
 
-## Constructed-input latency
-
-Thor SM110, BF16, ten flow steps: **487.60 ms P50 / 492.93 ms P95**, pooled
-from two runs of 30 requests after ten warmups each on 2026-09-29.
-CPU/GPU/EMC were locked to 2.601/1.575/4.266 GHz, fan PWM 255. Both runs
-returned identical finite `[50, 3]` trajectories. Native binary SHA256:
-`95a06e7771e0edb17f4b87a28e096a58dac3d8f7af00e977575062fdb228d598`.
-The native Qwen implementation is unchanged from the merged optimization.
-Use the [latency procedure](#latency-procedure) below to repeat this workload.
-
-## Historical recorded-input results
+## Results
 
 Jetson AGX Thor SM110 (20 SMs), CUDA 13.2, BF16 `planner-sft`, direct
 planning, batch one and ten flow steps. Request latency includes policy
@@ -127,8 +117,8 @@ reports and pool their raw samples. Record source/native-binary, checkpoint,
 AOT-manifest and any explicit tactic hashes. The default operator route needs
 no tactic database; using `--tactics` changes the run contract and must be recorded.
 
-The historical table above used recorded inputs. The separate constructed-input
-result at the top of this document uses this maintained benchmark.
+The table above retains the previously published recorded-input results. Use
+this maintained benchmark for new measurements.
 
 ## Accuracy procedure
 

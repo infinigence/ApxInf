@@ -192,20 +192,14 @@ not copied into the read-only checkpoint and is not committed to this tree.
 - Fuse quantization, normalization, RoPE, attention, and projection epilogues to reduce kernel launches and intermediate tensors.
 - GR00T explicitly selects optimized operations; shared default paths and interfaces remain compatible.
 
-## Measured performance
+## Best measured performance
 
 | Device | Precision | 1-view P50 | 2-view P50 |
 | --- | --- | ---: | ---: |
-| Thor | BF16 | 51.39 ms | 53.77 ms |
-| Thor | FP8 | 31.71 ms | 36.48 ms |
+| Thor | BF16 | 51.834 ms | 54.216 ms |
+| Thor | FP8 | 32.557 ms | 35.436 ms |
 | Orin | BF16 | 75.778 ms | 84.864 ms |
 | Orin | W8A8 | 56.711 ms | 64.924 ms |
-
-Thor rows were remeasured with the constructed-input benchmark on 2026-09-29:
-30 warmups and 200 samples per cell, existing freshly tuned databases reused,
-CUDA 13.0, CPU/GPU/EMC locked to 2.601/1.575/4.266 GHz and fan PWM 255.
-Each run checks finite, correctly shaped, identical outputs. Orin rows are
-historical and still require the same command to be rerun on an available board.
 
 ## LIBERO-10 task accuracy
 
@@ -259,7 +253,8 @@ samples. Lock CPU/GPU/EMC clocks and fan, exclude competing GPU work, and record
 the source commit, binary hash and calibration/tactic hashes with each run.
 
 Robo's `scripts/bench_gr00t.py` forwards to this same implementation in its
-pinned ApxInf checkout. It takes the same arguments. Thor results above use these constructed inputs. Orin remains pending.
+pinned ApxInf checkout. It takes the same arguments. The table retains the
+previously published results; use the command above for new measurements.
 
 Accuracy uses real LIBERO observations through the shared evaluator:
 

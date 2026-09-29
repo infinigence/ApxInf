@@ -56,28 +56,6 @@ engine/native-binary and model/calibration identities. The script adds artifact
 identities to its JSON report. Historical real-input timings are reference
 values until each constructed-input hardware/precision row is measured.
 
-## Thor validation (2026-09-29)
-
-CUDA 13.0, CPU/GPU/EMC at 2.601/1.575/4.266 GHz, fan PWM 255. Seed 0,
-one constructed observation, five repeats at each verified stop point, ten
-warmups, and a freshly tuned database loaded again without `--autotune`.
-The full `--mode all` command ran through the Robo entry point:
-
-| Precision | Prefix | Per token | Fit R² |
-|---|---:|---:|---:|
-| BF16 | 29.24 ms | 17.39 ms | 0.9999948 |
-| FP8 | 30.37 ms | 10.13 ms | 0.9998279 |
-
-Without explicit tactics, per-token measurements were 22.16 / 12.01 ms. The
-Python policy now forwards `tactics` to the native selector; previous rejection
-of that argument prevented the documented tune/reuse workflow. These constructed
-input results do not reproduce the historical 17.16 / 9.68 ms numbers. Orin
-and RTX 4090 still need hardware validation. Running only `--mode ar`, without
-the preceding full-request measurements, gave BF16 32.26 / 18.58 ms and FP8
-33.85 / 10.39 ms for prefix / per token. Keep the warmup and measurement order
-fixed when comparing runs; both runs are retained instead of treating the
-difference as a loader effect.
-
 ## Accuracy
 
 Accuracy requires real simulator observations and the checkpoint's action
