@@ -5,7 +5,7 @@
 //! resource lifetime, binding rule, or capture behavior not already covered by
 //! the shared framework tests.
 
-use super::framework::{tensor, values};
+use super::framework::{tensor, values, zeros_tensor};
 use super::*;
 use crate::CudaContext;
 use half::bf16;
@@ -534,6 +534,57 @@ fn kv_cache_decode_meta_rejects_non_decode_queries() {
         KvCacheAttentionArgs::new(&query, &key, &value, &mut out).with_decode_meta(&decode_meta);
     let error = kv_cache_attention(&ctx, args).unwrap_err();
     assert!(error.to_string().contains("batch-1"), "{error}");
+}
+
+#[test]
+fn allocation_free_fa2_decode_matches_attention_contract() {
+    let ctx = CudaContext::new(0).unwrap();
+    let query_values: Vec<_> = (0..24 * 256)
+        .map(|index| ((index * 7 % 31) as f32 - 15.0) / 32.0)
+        .collect();
+    for key_tokens in [128, 2048, 2176] {
+        let cache_values = 4 * key_tokens * 256;
+        let key_values: Vec<_> = (0..cache_values)
+            .map(|index| ((index * 5 % 29) as f32 - 14.0) / 32.0)
+            .collect();
+        let value_values: Vec<_> = (0..cache_values)
+            .map(|index| ((index * 11 % 37) as f32 - 18.0) / 32.0)
+            .collect();
+        let query = tensor(0, vec![1, 1, 24, 256], &query_values);
+        let key = tensor(0, vec![1, key_tokens, 4, 256], &key_values);
+        let value = tensor(0, vec![1, key_tokens, 4, 256], &value_values);
+        let mut reference = tensor(0, vec![1, 1, 24, 256], &vec![0.0; 24 * 256]);
+        let direct = tensor(0, vec![1, 1, 24, 256], &vec![0.0; 24 * 256]);
+        let workspace = zeros_tensor(
+            0,
+            vec![fa2_bf16_decode_splitkv_workspace_bytes().div_ceil(4)],
+            apxinf_core::DType::F32,
+        );
+
+        let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut reference);
+        args.valid_key_tokens = key_tokens;
+        args.query_start = key_tokens - 1;
+        args.policy.online_tune = true;
+        args.policy.allow_fallback = false;
+        kv_cache_attention(&ctx, args).unwrap();
+        fa2_bf16_decode_splitkv(
+            &ctx,
+            &query,
+            &key,
+            &value,
+            &direct,
+            &workspace,
+            key_tokens,
+            1.0 / 256.0f32.sqrt(),
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            values(&direct),
+            values(&reference),
+            "key_tokens={key_tokens}"
+        );
+    }
 }
 
 #[test]

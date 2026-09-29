@@ -6,6 +6,14 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(APXINF_ATTENTION_FA2)
+namespace apxinf::cuda_new::cutlass_ops {
+int fa2_bf16_decode_splitkv(const void* q, const void* k, const void* v,
+                           void* output, void* workspace, int key_tokens,
+                           float softmax_scale, cudaStream_t stream);
+}
+#endif
+
 namespace {
 
 using apxinf::attention::Execution;
@@ -486,5 +494,38 @@ extern "C" apxinf_status_t apxinf_attention_test_validate_candidates(
       throw Failure(APXINF_STATUS_UNSUPPORTED,
                     "no registered Attention candidate applies to the validation Spec");
     }
+  });
+}
+
+extern "C" int64_t apxinf_fa2_bf16_decode_splitkv_workspace_bytes(void) {
+  // softmax_lse + five split accumulators for 24 heads x (lse + 256 values).
+  return static_cast<int64_t>((24 + 5 * 24 * (1 + 256)) * sizeof(float));
+}
+
+extern "C" apxinf_status_t apxinf_fa2_bf16_decode_splitkv(
+    apxinf_runtime_t runtime, const void* query, const void* key_cache,
+    const void* value_cache, void* output, void* workspace,
+    int64_t workspace_bytes, int64_t key_tokens, float scale,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::attention::abi_boundary([&] {
+    if (runtime == nullptr || query == nullptr || key_cache == nullptr ||
+        value_cache == nullptr || output == nullptr || workspace == nullptr ||
+        workspace_bytes < apxinf_fa2_bf16_decode_splitkv_workspace_bytes() ||
+        key_tokens < 128 || key_tokens > INT32_MAX || !std::isfinite(scale) ||
+        scale <= 0.0F || stream == nullptr) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid allocation-free FA2 decode arguments");
+    }
+#if defined(APXINF_ATTENTION_FA2)
+    apxinf::attention::check_cuda(cudaSetDevice(runtime->device));
+    apxinf::attention::check_cuda(static_cast<cudaError_t>(
+        apxinf::cuda_new::cutlass_ops::fa2_bf16_decode_splitkv(
+            query, key_cache, value_cache, output, workspace,
+            static_cast<int>(key_tokens), scale,
+            static_cast<cudaStream_t>(stream))));
+#else
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "allocation-free FA2 decode is not compiled");
+#endif
   });
 }

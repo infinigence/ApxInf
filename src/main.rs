@@ -299,7 +299,8 @@ fn run_generate(
     println!("Generating up to {effective_max_tokens} tokens...");
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut all_tokens = tokens.clone();
+    let mut decoder = tok.decode_stream();
+    let mut output_error = None;
 
     let generation_options = GenerationOptions {
         max_new_tokens: max_tokens,
@@ -328,18 +329,26 @@ fn run_generate(
     };
     let output = model
         .generate_streaming_with_options(input, &generation_options, |token| {
-            let token_id = token.token_id;
-            all_tokens.push(token_id);
-            if let Ok(text) = tok.decode(&all_tokens) {
-                let previous = tok
-                    .decode(&all_tokens[..all_tokens.len() - 1])
-                    .unwrap_or_default();
-                let delta = text.strip_prefix(&previous).unwrap_or(&text);
-                print!("{delta}");
-                out.flush().ok();
+            if output_error.is_some() {
+                return;
+            }
+            match decoder.step(token.token_id) {
+                Ok(Some(text)) => {
+                    if let Err(error) = out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
+                        output_error = Some(format!("Failed to write generated text: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    output_error = Some(format!("Failed to decode generated token: {error}"));
+                }
             }
         })
         .map_err(|error| format!("Generation failed: {error}"))?;
+
+    if let Some(error) = output_error {
+        return Err(error);
+    }
 
     println!();
     println!();

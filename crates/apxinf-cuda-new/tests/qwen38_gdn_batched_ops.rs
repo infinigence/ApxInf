@@ -27,6 +27,16 @@ fn upload_bf16(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
     buffer.as_tensor(Shape::new(dims), DType::BF16).unwrap()
 }
 
+fn upload_f16(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| half::f16::from_f32(*value).to_bits().to_le_bytes())
+        .collect();
+    let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
+    buffer.copy_from_host(&bytes).unwrap();
+    buffer.as_tensor(Shape::new(dims), DType::F16).unwrap()
+}
+
 fn upload_f32(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
     let bytes: Vec<u8> = values
         .iter()
@@ -62,6 +72,13 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
         .chunks_exact(4)
         .map(|raw| f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
         .collect()
+}
+
+fn read_bytes(tensor: &Tensor) -> Vec<u8> {
+    let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0u8; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
 }
 
 /// A tensor slice sharing another tensor's storage, offset by `elements`.
@@ -191,6 +208,122 @@ fn fused_fp16_gated_norm_matches_explicit_bf16_conversion() {
         assert_eq!(produced, read_bf16(&expected), "tokens={tokens}");
         let wrong_type = zeros(&ctx, vec![tokens, heads, head_dim], DType::F32);
         assert!(ops::gdn_gated_norm_seq(&ctx, &wrong_type, &gate, &weight, &actual, tokens, heads, head_dim, 1e-6).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn fused_gated_norm_quantize_matches_bf16_boundary() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (tokens, heads, head_dim) = (3usize, 48usize, 128usize);
+    let count = tokens * heads * head_dim;
+    let dims = vec![tokens, heads, head_dim];
+    let input_values: Vec<f32> = (0..count)
+        .map(|index| ((index * 7919 + 37) % 65536) as f32 / 4096.0 - 8.0)
+        .collect();
+    let gate_values: Vec<f32> = (0..count)
+        .map(|index| ((index * 3571 + 19) % 32768) as f32 / 4096.0 - 4.0)
+        .collect();
+    let weight_values: Vec<f32> = (0..head_dim)
+        .map(|index| 0.75 + (index as f32 * 0.03125).sin() * 0.25)
+        .collect();
+    let input = upload_bf16(&ctx, &input_values, dims.clone());
+    let input_f16 = upload_f16(&ctx, &input_values, dims.clone());
+    let gate = upload_bf16(&ctx, &gate_values, dims.clone());
+    let weight = upload_bf16(&ctx, &weight_values, vec![head_dim]);
+
+    for input_scale in [0.001953125f32, 0.03125, 0.5] {
+        let expected_bf16 = zeros(&ctx, dims.clone(), DType::BF16);
+        let actual_bf16 = zeros(&ctx, dims.clone(), DType::BF16);
+        let expected_fp8 = zeros(&ctx, dims.clone(), DType::F8E4M3);
+        let actual_fp8 = zeros(&ctx, dims.clone(), DType::F8E4M3);
+        let input_2d = slice_of(&input, 0, vec![tokens * heads, head_dim], DType::BF16);
+        let gate_2d = slice_of(&gate, 0, vec![tokens * heads, head_dim], DType::BF16);
+        let expected_2d = slice_of(
+            &expected_bf16,
+            0,
+            vec![tokens * heads, head_dim],
+            DType::BF16,
+        );
+        ops::gdn_gated_norm(
+            &ctx,
+            &input_2d,
+            &gate_2d,
+            &weight,
+            &expected_2d,
+            1e-6,
+        )
+        .unwrap();
+        ops::quantize_fp8_per_tensor(&ctx, &expected_bf16, &expected_fp8, input_scale)
+            .unwrap();
+        ops::gdn_gated_norm_quantize(
+            &ctx,
+            &input,
+            &gate,
+            &weight,
+            &actual_bf16,
+            &actual_fp8,
+            1e-6,
+            input_scale,
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            read_bytes(&actual_bf16),
+            read_bytes(&expected_bf16),
+            "BF16 boundary differs for input_scale={input_scale}",
+        );
+        assert_eq!(
+            read_bytes(&actual_fp8),
+            read_bytes(&expected_fp8),
+            "FP8 encoding differs for input_scale={input_scale}",
+        );
+
+        let expected_f16_bf16 = zeros(&ctx, dims.clone(), DType::BF16);
+        let actual_f16_bf16 = zeros(&ctx, dims.clone(), DType::BF16);
+        let expected_f16_fp8 = zeros(&ctx, dims.clone(), DType::F8E4M3);
+        let actual_f16_fp8 = zeros(&ctx, dims.clone(), DType::F8E4M3);
+        ops::gdn_gated_norm_seq(
+            &ctx,
+            &input_f16,
+            &gate,
+            &weight,
+            &expected_f16_bf16,
+            tokens,
+            heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        ops::quantize_fp8_per_tensor(
+            &ctx,
+            &expected_f16_bf16,
+            &expected_f16_fp8,
+            input_scale,
+        )
+        .unwrap();
+        ops::gdn_gated_norm_quantize(
+            &ctx,
+            &input_f16,
+            &gate,
+            &weight,
+            &actual_f16_bf16,
+            &actual_f16_fp8,
+            1e-6,
+            input_scale,
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            read_bytes(&actual_f16_bf16),
+            read_bytes(&expected_f16_bf16),
+            "F16-input BF16 boundary differs for input_scale={input_scale}",
+        );
+        assert_eq!(
+            read_bytes(&actual_f16_fp8),
+            read_bytes(&expected_f16_fp8),
+            "F16-input FP8 encoding differs for input_scale={input_scale}",
+        );
     }
 }
 

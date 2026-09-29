@@ -53,6 +53,19 @@ pub(crate) struct Bindings {
 pub(crate) type Execution = *mut c_void;
 
 unsafe extern "C" {
+    pub(crate) fn apxinf_fa2_bf16_decode_splitkv_workspace_bytes() -> i64;
+    pub(crate) fn apxinf_fa2_bf16_decode_splitkv(
+        runtime: Runtime,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        output: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        key_tokens: i64,
+        scale: f32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_attention_prepare(
         runtime: Runtime,
         spec: *const Spec,

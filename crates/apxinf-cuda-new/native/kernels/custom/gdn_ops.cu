@@ -23,6 +23,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -427,6 +428,45 @@ __global__ void gated_norm_seq_kernel(const Input* __restrict__ input,
     const float z = __bfloat162float(gate[base + index]);
     output[base + index] =
         __float2bfloat16(normalized * z / (1.0f + __expf(-z)));
+  }
+}
+
+// Fused fixed-head-dimension path used by Qwen3.8. It preserves the BF16
+// output boundary, then quantizes that rounded value for the following GEMV.
+template <typename Input>
+__global__ void gated_norm_quantize_kernel(
+    const Input* __restrict__ input,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output, uint8_t* __restrict__ quantized,
+    int rows, float epsilon, float inverse_scale) {
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * 4 + threadIdx.x / 32;
+  if (row >= rows) return;
+  const long long base = static_cast<long long>(row) * 128;
+  float values[4];
+  float total = 0.0f;
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const int column = lane + slot * 32;
+    values[slot] = norm_input(input, base + column);
+    total += values[slot] * values[slot];
+  }
+  for (int offset = 16; offset > 0; offset >>= 1)
+    total += __shfl_down_sync(0xffffffff, total, offset);
+  total = __shfl_sync(0xffffffff, total, 0);
+  const float scale = rsqrtf(total / 128.0f + epsilon);
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const int column = lane + slot * 32;
+    const float normalized = values[slot] * scale *
+                             __bfloat162float(weight[column]);
+    const float z = __bfloat162float(gate[base + column]);
+    const __nv_bfloat16 rounded =
+        __float2bfloat16(normalized * z / (1.0f + __expf(-z)));
+    output[base + column] = rounded;
+    quantized[base + column] = __nv_cvt_float_to_fp8(
+        __bfloat162float(rounded) * inverse_scale, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
@@ -882,6 +922,30 @@ int gdn_gated_norm_seq(const void* input, const void* gate, const void* weight,
       static_cast<const __nv_bfloat16*>(gate),
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<__nv_bfloat16*>(output), tokens, heads, head_dim, epsilon);
+  return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+int gdn_gated_norm_quantize(const void* input, const void* gate,
+                            const void* weight, void* output, void* quantized,
+                            int rows, bool fp16_input, float epsilon, float input_scale,
+                            cudaStream_t stream) {
+  if (rows <= 0 || !(epsilon > 0.0f) || !(input_scale > 0.0f)) return -1;
+  const int blocks = (rows + 3) / 4;
+  if (fp16_input) {
+    gated_norm_quantize_kernel<<<blocks, 128, 0, stream>>>(
+        static_cast<const __half*>(input),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(output),
+        static_cast<uint8_t*>(quantized), rows, epsilon, 1.0f / input_scale);
+  } else {
+    gated_norm_quantize_kernel<<<blocks, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(output),
+        static_cast<uint8_t*>(quantized), rows, epsilon, 1.0f / input_scale);
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 

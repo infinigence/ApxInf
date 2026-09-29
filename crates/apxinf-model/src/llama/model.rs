@@ -188,7 +188,7 @@ impl LlamaModel {
 
         let next_token = max_idx as u32;
         generated.push(next_token);
-        on_token(next_token);
+        profile.run_unprofiled(|| on_token(next_token));
 
         // Stop on EOS token
         if let Some(eos) = eos_token_id {
@@ -225,7 +225,7 @@ impl LlamaModel {
 
             current_token = max_idx as u32;
             generated.push(current_token);
-            on_token(current_token);
+            profile.run_unprofiled(|| on_token(current_token));
 
             // Stop on EOS token
             if let Some(eos) = eos_token_id {

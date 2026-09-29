@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../apxinf-cuda/aot/link.rs"]
+mod aot;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
 #[path = "build_support/cuda_arch.rs"]
@@ -14,6 +16,15 @@ use cuda_arch::{
     gencode_args, is_cutlass_sm100_family, select_cuda_arch, target_features, ArchSelection,
     ArchSource,
 };
+
+fn with_aot_fingerprint(id: String, fingerprint: &str) -> String {
+    let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+    for byte in fingerprint.bytes() {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+    }
+    format!("{id}-aot-{hash:032x}")
+}
 
 fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
     let path = out.join("apxinf_cuda_arches.h");
@@ -88,9 +99,7 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
             .unwrap_or_else(|error| panic!("remove {}: {error}", staged.display()));
     }
     copy_tree(&fa2_root.join("flash_attn"), &staged.join("flash_attn"));
-    let patch = native
-        .join("patches")
-        .join("fa2-direct-e4m3-output.patch");
+    let patch = native.join("patches").join("fa2-direct-e4m3-output.patch");
     let mut command = Command::new("patch");
     command
         .current_dir(&staged)
@@ -128,6 +137,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=APXINF_CUDA_AOT_MANIFEST");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
@@ -185,7 +195,25 @@ fn main() {
         .join(", ");
     println!("cargo:warning=GEMM targets: {target_summary}");
 
-    let id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
+    let aot_manifest = env::var_os("APXINF_CUDA_AOT_MANIFEST").map(PathBuf::from);
+    let qwen38_aot = if selection.targets.iter().any(|target| target.sm() == 110) {
+        aot_manifest.as_ref().and_then(|path| {
+            let aot_root = manifest.join("../apxinf-cuda/aot");
+            aot::Bundle::load_required(
+                &aot_root,
+                &aot_root.join("qwen38.json"),
+                path,
+                &["qwen38-dense-swiglu-nvfp4"],
+                &target,
+                "sm_110",
+                &bundled_nvcc,
+            )
+        })
+    } else {
+        None
+    };
+
+    let mut id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
         gemm_fingerprint::build_id(
             &native,
             &target,
@@ -195,6 +223,9 @@ fn main() {
                 .map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())),
         )
     });
+    if let Some(bundle) = &qwen38_aot {
+        id = with_aot_fingerprint(id, &bundle.fingerprint);
+    }
     let attention_id = attention_fingerprint::build_id(
         &native,
         &target,
@@ -263,12 +294,14 @@ fn main() {
             ]
             .map(|source| operators.join(source)),
         );
+        if qwen38_aot.is_some() {
+            cutlass_sources.push(operators.join("gemm_nvfp4_swiglu_aot_sm100.cu"));
+        }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources
-            .push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
     let mut fa2_sources = Vec::new();
@@ -299,8 +332,8 @@ fn main() {
                 .map(|source| attention_kernel_root.join(source)),
         );
     }
-    let patched_fa2_root = (!fa2_e4m3_sources.is_empty())
-        .then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let patched_fa2_root =
+        (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
     assert!(
         generic_sources
             .iter()
@@ -395,6 +428,20 @@ fn main() {
             command.arg("-DAPXINF_GEMM_CUTLASS=1");
             command.arg("-DAPXINF_ATTENTION_CUTLASS=1");
         }
+        if qwen38_aot.is_some() {
+            command.arg("-DAPXINF_QWEN38_DENSE_SWIGLU_AOT=1");
+            command.arg(format!(
+                "-I{}",
+                qwen38_aot
+                    .as_ref()
+                    .unwrap()
+                    .kernel("qwen38-dense-swiglu-nvfp4")
+                    .header
+                    .parent()
+                    .unwrap()
+                    .display()
+            ));
+        }
         if has_fa2 {
             command.arg("-DAPXINF_ATTENTION_FA2=1");
         }
@@ -460,6 +507,10 @@ fn main() {
         objects.push(object);
     }
 
+    if let Some(bundle) = &qwen38_aot {
+        objects.push(bundle.kernel("qwen38-dense-swiglu-nvfp4").object.clone());
+    }
+
     let archive = out.join("libapxinf_gemm_native.a");
     let _ = std::fs::remove_file(&archive);
     let mut ar = Command::new("ar");
@@ -468,6 +519,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    if let Some(bundle) = &qwen38_aot {
+        bundle.link_runtime(&out);
+    }
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

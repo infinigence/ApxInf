@@ -27,6 +27,12 @@ int gdn_gated_norm(const void* input, const void* gate, const void* weight,
                    void* output, int heads, int head_dim, float epsilon,
                    cudaStream_t stream);
 
+int gdn_gated_norm_quantize(const void* input, const void* gate,
+                            const void* weight, void* output, void* quantized,
+                            int rows, bool fp16_input, float epsilon,
+                            float input_scale,
+                            cudaStream_t stream);
+
 // Causal depthwise conv1d advanced by one token, then SiLU.
 //
 // `window` is [channels, kernel_width] f32 recurrent state holding the last

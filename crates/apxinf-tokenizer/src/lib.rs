@@ -6,7 +6,10 @@ use std::path::Path;
 use apxinf_core::{Error, Result};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
-use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
+use tokenizers::{
+    AddedToken, DecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper,
+    PostProcessorWrapper, PreTokenizerWrapper, Tokenizer as HfTokenizer,
+};
 
 #[cfg(feature = "sentencepiece")]
 use sentencepiece::SentencePieceProcessor;
@@ -59,6 +62,31 @@ pub struct Tokenizer {
     inner: HfTokenizer,
     config: TokenizerConfig,
     chat_template: Option<String>,
+}
+
+/// Incremental decoder for generated token IDs.
+///
+/// The underlying Hugging Face decoder retains the small amount of context
+/// needed for byte-fallback UTF-8 and whitespace cleanup. This avoids decoding
+/// the prompt and the complete generated sequence for every streamed token.
+pub struct TokenDecodeStream<'a> {
+    inner: DecodeStream<
+        'a,
+        ModelWrapper,
+        NormalizerWrapper,
+        PreTokenizerWrapper,
+        PostProcessorWrapper,
+        DecoderWrapper,
+    >,
+}
+
+impl TokenDecodeStream<'_> {
+    /// Decode one token, returning text only when a valid stable chunk is ready.
+    pub fn step(&mut self, token: u32) -> Result<Option<String>> {
+        self.inner
+            .step(token)
+            .map_err(|e| Error::Other(format!("tokenizer stream decode: {e}")))
+    }
 }
 
 impl Tokenizer {
@@ -132,6 +160,13 @@ impl Tokenizer {
         self.inner
             .decode(tokens, true)
             .map_err(|e| Error::Other(format!("tokenizer decode: {e}")))
+    }
+
+    /// Create an incremental decoder for generated tokens.
+    pub fn decode_stream(&self) -> TokenDecodeStream<'_> {
+        TokenDecodeStream {
+            inner: self.inner.decode_stream(true),
+        }
     }
 
     /// Get the vocabulary size.
@@ -362,5 +397,28 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
         assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
         assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn decode_stream_emits_only_new_text() {
+        let vocab = HashMap::from([
+            ("[UNK]".to_string(), 0),
+            ("Hello".to_string(), 1),
+            ("world".to_string(), 2),
+        ]);
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(model),
+            config: TokenizerConfig::default(),
+            chat_template: None,
+        };
+
+        let mut stream = tokenizer.decode_stream();
+        assert_eq!(stream.step(1).unwrap().as_deref(), Some("Hello"));
+        assert_eq!(stream.step(2).unwrap().as_deref(), Some(" world"));
     }
 }

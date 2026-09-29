@@ -1,12 +1,13 @@
 # Native CuTe operators
 
-This directory owns offline export and native integration for the SM110 BF16
+This directory owns offline export and native integration for SM110 CuTe DSL
 operators. The engine links AArch64 object files and the static CuTe runtime.
 It does not import Python, Torch, FlashAttention, FlashInfer, or Quack at runtime.
 
 ## Files
 
-- `manifest.json`: pinned upstream versions, exported symbols and tensor contracts.
+- `manifest.json`: pinned Qwen-Drive symbols and tensor contracts.
+- `qwen38.json`: pinned Qwen3.8 NVFP4 fused-FC1 recipe.
 - `build.rs`: Rust export driver. Runs the exporters and packages checksummed artifacts.
 - `bundle.rs`: artifact integrity, target, toolkit and header checks.
 - `link.rs`: Cargo integration and compatibility checks against the maintained recipes.
@@ -75,6 +76,24 @@ pads only logical lengths 3383–3387 to 3387 tokens; this window uses masked
 split attention. Shorter prompts keep their original length and use the generic
 operators. Longer prompts are not truncated. Reasoning retains variable length
 execution.
+
+The same manifest variable is also consumed by `apxinf-cuda-new`. A bundle may
+contain the Qwen-Drive recipes, the Qwen3.8 recipe, or both; each CUDA crate
+validates and links only the kernel IDs it owns. To export the Qwen3.8 fused
+NVFP4 FC1 bundle, add `tensorrt_edge_nvfp4_moe_source` to the input JSON and
+select its reviewed recipe:
+
+```sh
+cargo run -p apxinf-cuda --example build-aot -- \
+  --inputs /path/to/source-paths.json \
+  --recipes crates/apxinf-cuda/aot/qwen38.json \
+  --out /path/to/new-qwen38-bundle
+```
+
+The source value points to `kernelSrcs/nvfp4_moe_cutedsl` from the pinned
+TensorRT-Edge-LLM revision. The exporter applies the reviewed FP32 reciprocal
+and BF16 SwiGLU rounding-boundary fixes before native compilation; all upstream
+inputs and the exporter itself are hash-pinned.
 
 ## What an exporter contains
 

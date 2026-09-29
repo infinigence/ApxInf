@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::{ops, CapturedGraph, CudaBuffer, CudaContext};
+use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
 use crate::accelerator::create_backend;
@@ -30,8 +30,8 @@ pub struct Qwen38 {
     prefill_session: Option<ops::ExecutionSession>,
     gdn_states: Vec<model::GdnState>,
     kv_caches: Vec<model::KvCache>,
-    mlp_graphs: Option<Vec<CapturedGraph>>,
-    gdn_graphs: Option<Vec<Option<CapturedGraph>>>,
+    mlp_graphs: Option<Vec<PreparedPhase>>,
+    gdn_graphs: Option<Vec<Option<PreparedPhase>>>,
     position: usize,
     kv_capacity: usize,
 }

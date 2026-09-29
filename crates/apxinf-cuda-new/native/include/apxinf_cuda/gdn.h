@@ -31,6 +31,12 @@ apxinf_status_t apxinf_gdn_gated_norm(const void* input, const void* gate,
                                       float epsilon,
                                       apxinf_cuda_stream_t stream);
 
+apxinf_status_t apxinf_gdn_gated_norm_quantize(
+    const void* input, const void* gate, const void* weight, void* output,
+    void* quantized, int64_t rows, int32_t fp16_input, float epsilon,
+    float input_scale,
+    apxinf_cuda_stream_t stream);
+
 apxinf_status_t apxinf_gdn_causal_conv_step(void* window, const void* input,
                                             const void* weight, void* output,
                                             int64_t channels,

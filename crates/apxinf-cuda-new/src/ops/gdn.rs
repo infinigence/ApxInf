@@ -105,6 +105,61 @@ pub fn gdn_gated_norm(
     }
 }
 
+/// Qwen3.8's fixed-width gated RMSNorm and the following FP8 quantization.
+/// The BF16 output is retained so the fused path preserves the model boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_gated_norm_quantize(
+    ctx: &CudaContext,
+    input: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    output: &Tensor,
+    quantized: &Tensor,
+    epsilon: f32,
+    input_scale: f32,
+) -> Result<()> {
+    let dims = input.shape().dims().to_vec();
+    if dims.len() != 3 || dims[2] != 128 || dims[0] == 0 || dims[1] == 0 {
+        return Err(invalid(
+            "GDN norm quantization expects nonempty [tokens, heads, 128]",
+        ));
+    }
+    let rows = dims[0]
+        .checked_mul(dims[1])
+        .filter(|value| *value <= i32::MAX as usize)
+        .ok_or_else(|| invalid("GDN norm quantization row extent overflows i32"))?;
+    if !epsilon.is_finite()
+        || epsilon <= 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+        || !(1.0 / input_scale).is_finite()
+        || !matches!(input.dtype(), DType::F16 | DType::BF16)
+    {
+        return Err(invalid(
+            "GDN norm quantization requires positive finite epsilon and scale",
+        ));
+    }
+    let input_buffer = tensor_storage(ctx, input, input.dtype(), &dims)?;
+    let gate_buffer = tensor_storage(ctx, gate, DType::BF16, &dims)?;
+    let weight_buffer = tensor_storage(ctx, weight, DType::BF16, &[128])?;
+    let output_buffer = tensor_storage(ctx, output, DType::BF16, &dims)?;
+    let quantized_buffer = tensor_storage(ctx, quantized, DType::F8E4M3, &dims)?;
+    unsafe {
+        status::check(abi::apxinf_gdn_gated_norm_quantize(
+            input_buffer.ptr(),
+            gate_buffer.ptr(),
+            weight_buffer.ptr(),
+            output_buffer.ptr(),
+            quantized_buffer.ptr(),
+            rows as i64,
+            i32::from(input.dtype() == DType::F16),
+            epsilon,
+            input_scale,
+            ctx.stream().handle(),
+        ))
+    }
+}
+
 /// Advance the causal convolution by one token, then apply SiLU.
 ///
 /// `window` is `[channels, kernel_width]` f32 holding the last

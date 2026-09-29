@@ -11,18 +11,34 @@ use std::{
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 4 || args[0] != "--inputs" || args[2] != "--out" {
-        return Err("usage: build-aot --inputs <source-paths.json> --out <new-directory>".into());
+    let mut inputs = None;
+    let mut out = None;
+    let mut recipes = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = args.get(index + 1).ok_or("missing option value")?;
+        match args[index].as_str() {
+            "--inputs" => inputs = Some(PathBuf::from(value)),
+            "--out" => out = Some(PathBuf::from(value)),
+            "--recipes" => recipes = Some(PathBuf::from(value)),
+            option => return Err(format!("unknown option {option}").into()),
+        }
+        index += 2;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("aot");
-    let inputs = Path::new(&args[1]).canonicalize()?;
+    let inputs = inputs
+        .ok_or("usage: build-aot --inputs <source-paths.json> --out <new-directory> [--recipes <recipe-manifest.json>]")?
+        .canonicalize()?;
+    let out = out.ok_or("missing --out")?;
+    let recipes = recipes
+        .unwrap_or_else(|| root.join("manifest.json"))
+        .canonicalize()?;
     let paths: BTreeMap<String, String> = serde_json::from_slice(&fs::read(&inputs)?)?;
-    let config: Value = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
+    let config: Value = serde_json::from_slice(&fs::read(&recipes)?)?;
     let toolkit = Command::new("nvcc").arg("--version").output()?;
     if !toolkit.status.success() || !String::from_utf8(toolkit.stdout)?.contains("release 13.2,") {
         return Err("this operator bundle requires CUDA 13.2".into());
     }
-    let out = PathBuf::from(&args[3]);
     fs::create_dir(&out)?;
     let out = out.canonicalize()?;
     let source_path = |key: &str| -> Result<PathBuf> {
@@ -73,7 +89,7 @@ fn main() -> Result<()> {
         };
         let mut source = recipe["source"].clone();
         source["exporter_sha256"] = json!(exporter_hash);
-        source["recipe_sha256"] = json!(digest(&root.join("manifest.json"))?);
+        source["recipe_sha256"] = json!(digest(&recipes)?);
         kernels.push(
             json!({"id":id,"symbol":symbol,"contract":recipe["contract"],
             "specialization":recipe["specialization"],

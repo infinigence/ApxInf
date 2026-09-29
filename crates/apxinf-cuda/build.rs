@@ -320,19 +320,28 @@ fn main() {
             let cutlass_arch = Some(selection.cutlass_arch);
             let aot_manifest =
                 env::var_os("APXINF_CUDA_AOT_MANIFEST").map(std::path::PathBuf::from);
-            if matches!(nvcc_arch.as_deref(), Some("sm_110" | "sm_110a")) && aot_manifest.is_none()
-            {
-                println!("cargo:warning=SM110 AOT bundle is absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
-            }
-            let aot_bundle = aot_manifest.map(|path| {
-                aot::Bundle::load(
-                    std::path::Path::new(&manifest_dir),
-                    std::path::Path::new(&path),
+            let aot_bundle = aot_manifest.as_ref().and_then(|path| {
+                let aot_root = std::path::Path::new(&manifest_dir).join("aot");
+                aot::Bundle::load_required(
+                    &aot_root,
+                    &aot_root.join("manifest.json"),
+                    path,
+                    &[
+                        "gdn-prefill-bf16",
+                        "language-attention",
+                        "action-attention",
+                        "gemm-swiglu-bf16",
+                        "vision-attention-624",
+                        "vision-attention-2200",
+                    ],
                     &target,
                     nvcc_arch.as_deref().unwrap(),
                     std::path::Path::new(&nvcc),
                 )
             });
+            if matches!(nvcc_arch.as_deref(), Some("sm_110" | "sm_110a")) && aot_bundle.is_none() {
+                println!("cargo:warning=SM110 Qwen-Drive AOT recipes are absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
+            }
             let kernel_build_id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
                 computed_kernel_build_id(
                     std::path::Path::new(&manifest_dir),

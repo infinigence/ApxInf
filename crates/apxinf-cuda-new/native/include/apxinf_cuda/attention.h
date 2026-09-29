@@ -23,6 +23,15 @@ apxinf_status_t apxinf_attention_test_validate_candidates(
     const apxinf_attention_bindings_t* bindings,
     const float* expected_output, uint64_t expected_output_len);
 
+// Allocation-free Qwen3.8 decode fast path. The caller owns one reusable
+// workspace and may enqueue consecutive attention layers on the same stream.
+int64_t apxinf_fa2_bf16_decode_splitkv_workspace_bytes(void);
+apxinf_status_t apxinf_fa2_bf16_decode_splitkv(
+    apxinf_runtime_t runtime, const void* query, const void* key_cache,
+    const void* value_cache, void* output, void* workspace,
+    int64_t workspace_bytes, int64_t key_tokens, float scale,
+    apxinf_cuda_stream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

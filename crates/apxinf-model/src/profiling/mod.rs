@@ -8,7 +8,7 @@
 
 pub mod trace;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Timing profile for a single generation run.
 ///
@@ -18,6 +18,7 @@ pub struct GenerationProfile {
     start_time: Instant,
     first_token_time: Option<Instant>,
     end_time: Option<Instant>,
+    excluded_time: Duration,
     input_tokens: usize,
     output_tokens: usize,
 }
@@ -29,6 +30,7 @@ impl GenerationProfile {
             start_time: Instant::now(),
             first_token_time: None,
             end_time: None,
+            excluded_time: Duration::ZERO,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -48,6 +50,21 @@ impl GenerationProfile {
         self.output_tokens = output_tokens;
     }
 
+    /// Run application-side work without charging it to engine latency.
+    ///
+    /// Streaming callbacks commonly perform detokenization and terminal I/O;
+    /// neither is part of model execution and both can otherwise inflate TPOT.
+    pub(crate) fn run_unprofiled<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let output = f();
+        self.excluded_time += start.elapsed();
+        output
+    }
+
+    fn engine_duration(&self, start: Instant, end: Instant) -> Duration {
+        end.duration_since(start).saturating_sub(self.excluded_time)
+    }
+
     /// Time to first token (prefill duration) in milliseconds.
     pub fn ttft_ms(&self) -> Option<f64> {
         self.first_token_time.map(|ft| {
@@ -62,7 +79,11 @@ impl GenerationProfile {
         match (self.first_token_time, self.end_time, self.output_tokens) {
             (Some(ft), Some(et), n) if n > 1 => {
                 // Decode tokens = output_tokens - 1 (first token comes "free" from prefill)
-                Some((et - ft).as_nanos() as f64 / 1_000_000.0 / (n - 1) as f64)
+                Some(
+                    self.engine_duration(ft, et).as_nanos() as f64
+                        / 1_000_000.0
+                        / (n - 1) as f64,
+                )
             }
             _ => None,
         }
@@ -73,7 +94,7 @@ impl GenerationProfile {
         match (self.first_token_time, self.end_time, self.output_tokens) {
             (Some(ft), Some(et), n) if n > 1 => {
                 // Decode tokens = output_tokens - 1 (first token comes "free" from prefill)
-                let secs = (et - ft).as_nanos() as f64 / 1_000_000_000.0;
+                let secs = self.engine_duration(ft, et).as_nanos() as f64 / 1_000_000_000.0;
                 Some((n - 1) as f64 / secs)
             }
             _ => None,
@@ -83,7 +104,7 @@ impl GenerationProfile {
     /// Total generation latency in milliseconds.
     pub fn total_latency_ms(&self) -> Option<f64> {
         self.end_time.map(|et| {
-            (et - self.start_time).as_nanos() as f64 / 1_000_000.0
+            self.engine_duration(self.start_time, et).as_nanos() as f64 / 1_000_000.0
         })
     }
 
@@ -144,5 +165,27 @@ impl GenerationProfile {
 impl Default for GenerationProfile {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_time_is_excluded_from_engine_metrics() {
+        let start = Instant::now();
+        let profile = GenerationProfile {
+            start_time: start,
+            first_token_time: Some(start + Duration::from_millis(10)),
+            end_time: Some(start + Duration::from_millis(100)),
+            excluded_time: Duration::from_millis(20),
+            input_tokens: 8,
+            output_tokens: 3,
+        };
+
+        assert_eq!(profile.ttft_ms(), Some(10.0));
+        assert_eq!(profile.tpot_ms(), Some(35.0));
+        assert_eq!(profile.total_latency_ms(), Some(80.0));
     }
 }

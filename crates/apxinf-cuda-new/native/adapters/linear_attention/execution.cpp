@@ -10,6 +10,7 @@
 #include "../../kernels/custom/gdn_ops.h"
 #include "../../kernels/flashinfer_gdn/flashinfer_gdn.h"
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -66,6 +67,29 @@ extern "C" apxinf_status_t apxinf_gdn_gated_norm(
               static_cast<int>(head_dim), epsilon,
               static_cast<cudaStream_t>(stream)),
           "GDN gated norm");
+  });
+}
+
+extern "C" apxinf_status_t apxinf_gdn_gated_norm_quantize(
+    const void* input, const void* gate, const void* weight, void* output,
+    void* quantized, int64_t rows, int32_t fp16_input, float epsilon,
+    float input_scale,
+    apxinf_cuda_stream_t stream) {
+  return abi_boundary([&] {
+    if (input == nullptr || gate == nullptr || weight == nullptr ||
+        output == nullptr || quantized == nullptr || !extent(rows) ||
+        (fp16_input != 0 && fp16_input != 1) ||
+        !std::isfinite(epsilon) || epsilon <= 0.0F ||
+        !std::isfinite(input_scale) || input_scale <= 0.0F ||
+        !std::isfinite(1.0F / input_scale)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid GDN norm quantization arguments");
+    }
+    check(apxinf::cuda_new::gdn_ops::gdn_gated_norm_quantize(
+              input, gate, weight, output, quantized,
+              static_cast<int>(rows), fp16_input != 0, epsilon, input_scale,
+              static_cast<cudaStream_t>(stream)),
+          "GDN norm quantization");
   });
 }
 

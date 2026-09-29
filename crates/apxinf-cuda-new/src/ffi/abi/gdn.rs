@@ -42,6 +42,18 @@ unsafe extern "C" {
         epsilon: f32,
         stream: CudaStream,
     ) -> i32;
+    pub(crate) fn apxinf_gdn_gated_norm_quantize(
+        input: *const c_void,
+        gate: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        quantized: *mut c_void,
+        rows: i64,
+        fp16_input: i32,
+        epsilon: f32,
+        input_scale: f32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_gdn_causal_conv_step(
         window: *mut c_void,
         input: *const c_void,

@@ -21,15 +21,16 @@ pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use attention::{
-    attention, kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask,
-    AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
+    attention, fa2_bf16_decode_splitkv, fa2_bf16_decode_splitkv_workspace_bytes,
+    kv_cache_attention, segmented_attention, AttentionArgs, AttentionMask, AttentionPolicy,
+    KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
 };
 pub use attn_ops::{
     apply_output_gate, head_rms_norm, partial_rope, rotary_dim, split_query_and_gate,
 };
 pub use gdn::{
     gdn_causal_conv_forward, gdn_causal_conv_step, gdn_decay_and_beta,
-    gdn_decay_and_beta_seq, gdn_gated_norm, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
+    gdn_decay_and_beta_seq, gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
     flashinfer_gdn_prefill, flashinfer_gdn_workspace_bytes,
     convert_f16_to_bf16, gdn_prepare_flashinfer, gdn_conv_prepare_flashinfer,
     gdn_chunk_scan, gdn_chunk_scan_interleaved, gdn_l2_normalize_heads,
@@ -40,7 +41,7 @@ pub use mlp::{
     add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, rms_norm, swiglu,
 };
 pub use gemm::{
-    gemm, gemm_bias, gemm_bias_gelu, gemm_geglu, nvfp4_pack_block_scales,
+    gemm, gemm_bias, gemm_bias_gelu, gemm_geglu, nvfp4_dense_swiglu_aot, nvfp4_pack_block_scales,
     nvfp4_quantize_activation, nvfp4_quantize_rms_norm, nvfp4_quantize_swiglu,
     nvfp4_scale_buffer_bytes, ScaleLayout, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs, GemmGegluArgs,
     GemmPolicy, GemmQuantization, WeightVersion,
