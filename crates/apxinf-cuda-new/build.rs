@@ -9,6 +9,8 @@ mod attention_fingerprint;
 mod cuda_arch;
 #[path = "build_support/gemm_fingerprint.rs"]
 mod gemm_fingerprint;
+#[path = "build_support/nvcc_cache.rs"]
+mod nvcc_cache;
 
 use cuda_arch::{
     gencode_args, is_cutlass_sm100_family, select_cuda_arch, target_features, ArchSelection,
@@ -39,8 +41,10 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          }\n\
          }  // namespace apxinf::gemm\n",
     );
-    std::fs::write(&path, header)
-        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    if std::fs::read(&path).ok().as_deref() != Some(header.as_bytes()) {
+        std::fs::write(&path, header)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
     path
 }
 
@@ -132,9 +136,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
     println!("cargo:rerun-if-changed=build_support/gemm_fingerprint.rs");
+    println!("cargo:rerun-if-changed=build_support/nvcc_cache.rs");
+    for key in nvcc_cache::COMPILE_ENV {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let native = manifest.join("native");
+    println!("cargo:rerun-if-changed={}", native.display());
     rerun_tree(&native);
 
     let cuda = env::var("CUDA_PATH")
@@ -154,6 +163,7 @@ fn main() {
     for directory in &library_directories {
         println!("cargo:rustc-link-search=native={}", directory.display());
     }
+    println!("cargo:rerun-if-changed={}", bundled_nvcc.display());
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let host = env::var("HOST").unwrap_or_default();
@@ -345,6 +355,8 @@ fn main() {
             .map(|target| target.nvcc_arch.clone()),
     );
     let mut objects = Vec::new();
+    let (mut cache_hits, mut rebuilt) = (0, 0);
+    let mut cache = nvcc_cache::Cache::default();
     for (index, source) in generic_sources
         .drain(..)
         .map(|source| (source, false, false, false))
@@ -374,8 +386,6 @@ fn main() {
         command
             .arg("-c")
             .arg(&source)
-            .arg("-o")
-            .arg(&object)
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()))
@@ -434,14 +444,19 @@ fn main() {
             } else {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2"
             });
+            // Neither FA2 path exposes dropout, ALiBi, softcap, or local
+            // windows; ordinary causal attention remains enabled.
+            // Remove only these unreachable template axes, as in apxinf-cuda;
+            // otherwise a single SM87 FA2 translation unit can take hours.
+            // Keep uneven-K support: head dimensions can differ from the specialization.
+            command.args([
+                "-DFLASHATTENTION_DISABLE_DROPOUT",
+                "-DFLASHATTENTION_DISABLE_ALIBI",
+                "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                "-DFLASHATTENTION_DISABLE_LOCAL",
+            ]);
             if is_fa2_e4m3 {
-                command.args([
-                    "-DAPXINF_FA2_DIRECT_E4M3=1",
-                    "-DFLASHATTENTION_DISABLE_DROPOUT",
-                    "-DFLASHATTENTION_DISABLE_ALIBI",
-                    "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                    "-DFLASHATTENTION_DISABLE_LOCAL",
-                ]);
+                command.arg("-DAPXINF_FA2_DIRECT_E4M3=1");
             }
             command.arg(format!("-I{}", fa2_compat_root.display()));
             if is_fa2_e4m3 {
@@ -456,9 +471,16 @@ fn main() {
             command.arg(format!("-I{}", fa2_root.display()));
             command.arg(format!("-I{}", cutlass_root.join("include").display()));
         }
-        run(&mut command, &format!("compile {}", source.display()));
+        if cache.compile(&command, &source, &object)
+            .unwrap_or_else(|error| panic!("compile {}: {error}", source.display()))
+        {
+            cache_hits += 1;
+        } else {
+            rebuilt += 1;
+        }
         objects.push(object);
     }
+    println!("cargo:warning=cuda-new nvcc cache: {cache_hits} hit, {rebuilt} rebuilt");
 
     let archive = out.join("libapxinf_gemm_native.a");
     let _ = std::fs::remove_file(&archive);

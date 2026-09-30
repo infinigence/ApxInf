@@ -787,13 +787,20 @@ fn main() {
                     if nvcc_object_is_current(&obj, &deps, &stamp, &cmdline) {
                         continue;
                     }
+                    // Invalidate before nvcc can overwrite the object. A failed
+                    // or interrupted recompile must not retain the old stamp.
+                    if let Err(error) = std::fs::remove_file(&stamp) {
+                        assert_eq!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound,
+                            "remove stale nvcc stamp {stamp}: {error}"
+                        );
+                    }
                     cmd.arg("-MD").arg("-MF").arg(&deps);
                     let status = cmd.status().expect("failed to run nvcc");
 
                     assert!(status.success(), "nvcc failed for {}", entry.display());
-                    // Written only after nvcc succeeded, so an interrupted or
-                    // failed compile cannot leave a stamp that hides a stale
-                    // object from the next build.
+                    // Publish a new stamp only after nvcc succeeds.
                     std::fs::write(&stamp, &cmdline)
                         .unwrap_or_else(|error| panic!("write {stamp}: {error}"));
                 }
