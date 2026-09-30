@@ -101,6 +101,10 @@ impl LlamaModel {
                 self.cuda_kv_cache = None;
                 Ok(())
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -109,6 +113,10 @@ impl LlamaModel {
         match device {
             Device::Cpu => Ok(()),
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -495,6 +503,10 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -717,6 +729,10 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Tensor::from_f32(vec![seq_len, n_heads * head_dim], &attn_out)?,
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => return Err(Error::UnsupportedDevice(device)),
         };
 
         // Output projection
@@ -817,6 +833,10 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -883,6 +903,10 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -906,6 +930,10 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -929,6 +957,10 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 
@@ -945,6 +977,10 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            // This model dispatches on the device itself rather than through
+            // `Backend`, so it only knows CPU and CUDA. Reject anything else
+            // instead of silently computing on the host.
+            device => Err(Error::UnsupportedDevice(device)),
         }
     }
 }
