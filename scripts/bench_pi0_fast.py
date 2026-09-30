@@ -10,7 +10,7 @@ where ``fixed`` is the shape-determined prologue (vision tower + prompt prefill 
 the first argmax) and ``steps`` is how many tokens that frame needs. The decode
 ends at the ``|`` terminator, which lands at token 12–32 of the checkpoint's
 256-token budget on LIBERO frames, so ``steps`` varies per frame and a
-least-squares fit over frames with distinct step counts recovers both terms
+least-squares fit over verified stop points on the same input recovers both terms
 without touching the Rust build (``--mode ar``).
 
 Two layers, matching the serving stack's shells:
@@ -24,21 +24,12 @@ Two layers, matching the serving stack's shells:
 There is no L0 (π0-FAST exposes no patch-level entry point — the runtime takes
 RGB) and no L3 (the websocket server is the PI0.5 stack).
 
-Frames come from ``--frames`` — an ``.npz`` carrying ``base_<variant>`` /
-``wrist_<variant>`` / ``state`` / ``task``, as
-``devlocal/pi0-fast/scripts/collect_frames.py`` writes — or, when it is omitted,
-from deterministic synthetic frames sized by the checkpoint. Every dimension is
-the checkpoint's ``config.json``: π0-FAST has no synthetic weights and no shape
-overrides, so ``--model-dir`` is required.
+Inputs are deterministic synthetic images and state sized by the checkpoint.
+No recorded frame files are required or accepted.
 
-    # L1/L2 latency on synthetic frames
-    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \\
+    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \
         --state-key observation/state
 
-    # fixed cost vs per-step cost over real LIBERO frames
-    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \\
-        --state-key observation/state --mode ar \\
-        --frames devlocal/pi0-fast/results/raw/libero_frames.npz
 """
 
 from __future__ import annotations
@@ -52,6 +43,7 @@ import sys
 import time
 
 import numpy as np
+from _benchmark import provenance
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
@@ -119,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--precision",
         default="auto",
-        help="runtime precision; π0-FAST runs bf16, so `auto` is the normal value",
+        help="runtime precision: auto, bf16 or fp8 (requires calibration)",
     )
     p.add_argument(
         "--state-key",
@@ -134,20 +126,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action-dim", type=int, help="override the checkpoint's deploy action width")
     p.add_argument("--action-horizon", type=int, help="override the checkpoint's action horizon")
 
+    p.add_argument("--calibration", type=pathlib.Path, help="FP8 activation calibration")
+    p.add_argument("--tactics", type=pathlib.Path)
+    p.add_argument("--autotune", action="store_true")
     # Input workload.
     p.add_argument("--prompt", default=DEFAULT_PROMPT, help="task string (synthetic frames)")
-    p.add_argument(
-        "--frames",
-        type=pathlib.Path,
-        help="frames .npz (base_<variant>/wrist_<variant>/state/task); default synthetic",
-    )
-    p.add_argument(
-        "--frame-variant",
-        choices=("flipped", "raw"),
-        default="flipped",
-        help="which camera copies to drive when --frames carries both",
-    )
-    p.add_argument("--frames-limit", type=int, help="use only the first N frames")
     p.add_argument("--frames-count", type=int, default=10, help="synthetic frame count")
     p.add_argument("--seed", type=int, default=0, help="synthetic frame seed")
 
@@ -155,12 +138,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=("latency", "ar", "all"), default="latency")
     p.add_argument("--samples", type=int, default=30)
     p.add_argument("--warmup", type=int, default=10)
-    p.add_argument(
-        "--survey",
-        type=int,
-        default=20,
-        help="AR mode: frames surveyed (one timed call each) for distinct step counts",
-    )
     p.add_argument("--repeats", type=int, default=3, help="AR mode: timed repeats per step count")
     p.add_argument(
         "--full-decode",
@@ -168,41 +145,12 @@ def parse_args() -> argparse.Namespace:
         help="also time L1 with no stop token (the full max_action_tokens budget)",
     )
     p.add_argument("--out", type=pathlib.Path)
-    return p.parse_args()
-
-
-def _load_frames(path, variant: str, limit) -> list[dict]:
-    """Read the ``base_*/wrist_*/state/task`` frames ``collect_frames.py`` writes."""
-    data = np.load(path, allow_pickle=True)
-    keys = set(data.files)
-
-    def pick(prefix: str, *, per_frame_variant: bool) -> str:
-        names = (
-            (f"{prefix}_{variant}", f"{prefix}_raw", f"{prefix}_flipped")
-            if per_frame_variant
-            else (prefix, f"{prefix}_{variant}")
-        )
-        for name in names:
-            if name in keys:
-                return name
-        raise SystemExit(f"{path}: no {prefix!r} array (have {sorted(keys)})")
-
-    base = pick("base", per_frame_variant=True)
-    wrist = pick("wrist", per_frame_variant=True)
-    state = pick("state", per_frame_variant=False)
-    task = pick("task", per_frame_variant=False)
-    count = len(data[state])
-    if limit is not None:
-        count = min(count, int(limit))
-    return [
-        {
-            "image": np.ascontiguousarray(data[base][index]),
-            "wrist": np.ascontiguousarray(data[wrist][index]),
-            "state": np.ascontiguousarray(data[state][index], dtype=np.float32),
-            "task": str(data[task][index]),
-        }
-        for index in range(count)
-    ]
+    args = p.parse_args()
+    if args.frames_count < 1 or args.samples < 1 or args.warmup < 0 or args.repeats < 1:
+        p.error("frames-count, samples and repeats must be positive; warmup >= 0")
+    if args.autotune and args.tactics is None:
+        p.error("--autotune requires an explicit --tactics output path")
+    return args
 
 
 def _synthetic_frames(policy, count: int, seed: int) -> list[dict]:
@@ -250,8 +198,8 @@ def _prepare(policy, observation) -> tuple[np.ndarray, np.ndarray]:
 
 def _time_stream(fn, inputs, samples: int, warmup: int) -> tuple[list, list]:
     """Cycle frames, timing only ``fn`` — input preparation stays outside the clock."""
-    for index in range(min(warmup, len(inputs))):
-        fn(inputs[index])
+    for index in range(warmup):
+        fn(inputs[index % len(inputs)])
     ms, steps = [], []
     for index in range(samples):
         payload = inputs[index % len(inputs)]
@@ -278,42 +226,37 @@ def _fit(points) -> dict:
     }
 
 
-def _run_ar(call, observations, survey: int, repeats: int) -> dict:
-    """Survey frames, then time one representative per distinct step count."""
-    print(f"surveying {min(survey, len(observations))} frames for distinct step counts ...")
-    by_steps: dict[int, int] = {}
-    table = []
-    for index in range(min(survey, len(observations))):
-        started = time.perf_counter()
-        tokens = np.asarray(call(observations[index]), dtype=np.uint32)
-        ms = (time.perf_counter() - started) * 1000.0
-        steps = int(tokens.size)
-        table.append({"frame": index, "steps": steps, "ms": ms})
-        by_steps.setdefault(steps, index)
-        print(f"  frame {index:3d}: steps={steps:3d}  {ms:8.1f} ms")
-
-    points = []
-    for steps in sorted(by_steps):
-        index = by_steps[steps]
-        reps = []
-        for _ in range(repeats):
-            started = time.perf_counter()
-            call(observations[index])
-            reps.append((time.perf_counter() - started) * 1000.0)
-        median = statistics.median(reps)
-        points.append((steps, median))
-        print(
-            f"  steps={steps:3d} frame={index:3d} -> median {median:8.1f} ms "
-            f"of {[round(r, 1) for r in reps]}"
-        )
-
-    fit = _fit(points) if len(points) >= 2 else None
-    if fit is None:
-        print("only one distinct step count; the fixed/per-step split needs at least two")
-    return {"survey": table, "fit": fit}
+def _run_ar(call, observation, repeats: int, warmup: int = 10) -> dict:
+    """Fit fixed/per-token cost at verified stop points on one constructed input."""
+    full = np.asarray(call(observation, None), dtype=np.uint32)
+    first_positions = {}
+    for index, token in enumerate(full.tolist()):
+        first_positions.setdefault(token, index + 1)
+    # Bound diagnostic work while measuring the same prefix in every call.
+    candidates = sorted((length, token) for token, length in first_positions.items()
+                        if 2 <= length <= 64)
+    if len(candidates) < 2:
+        raise RuntimeError("decode has fewer than two distinct stop points; cannot establish prefix/per-token latency")
+    indices = np.unique(np.linspace(0, len(candidates)-1, min(5,len(candidates)), dtype=int))
+    selected = [candidates[i] for i in indices]
+    for index in range(warmup):
+        call(observation, selected[index % len(selected)][1])
+    samples = {length: [] for length, _ in selected}
+    # Alternate order to reduce drift bias across decode lengths.
+    for repeat in range(repeats):
+        for length, token in (selected if repeat % 2 == 0 else list(reversed(selected))):
+            start = time.perf_counter()
+            actual = np.asarray(call(observation, token), dtype=np.uint32)
+            elapsed = (time.perf_counter() - start) * 1000
+            if not np.array_equal(actual, full[:length]):
+                raise RuntimeError("stop-point replay changed the generated token prefix")
+            samples[length].append(elapsed)
+    points = [(length, statistics.median(values)) for length,values in samples.items()]
+    return {"method": "same-input verified stop points", "points": points,
+            "samples_ms": samples, "fit": _fit(points)}
 
 
-def main() -> None:
+def main(policy_loader=None) -> None:
     args = parse_args()
     layers = _parse_layers(args.layer)
     image_keys = (
@@ -326,6 +269,9 @@ def main() -> None:
 
     options = {
         "precision": args.precision,
+        "calibration": str(args.calibration) if args.calibration else None,
+        "tactics": str(args.tactics) if args.tactics else None,
+        "autotune": args.autotune,
         "device": args.device,
         "state_key": args.state_key,
         "prompt_key": args.prompt_key,
@@ -334,17 +280,15 @@ def main() -> None:
     }
     if image_keys is not None:
         options["image_keys"] = image_keys
-    policy = AutoPolicy.from_pretrained(
+    if args.autotune:
+        args.tactics.parent.mkdir(parents=True, exist_ok=True)
+    policy = (policy_loader or AutoPolicy.from_pretrained)(
         args.model_dir, **{name: value for name, value in options.items() if value is not None}
     )
     handle = policy.model
     stop_token = int(policy.tokenizer.pipe_token_id)
 
-    frames = (
-        _load_frames(args.frames, args.frame_variant, args.frames_limit)
-        if args.frames is not None
-        else _synthetic_frames(policy, args.frames_count, args.seed)
-    )
+    frames = _synthetic_frames(policy, args.frames_count, args.seed)
     observations = _observations(policy, frames, args.prompt)
     prepared = [_prepare(policy, observation) for observation in observations]
 
@@ -363,7 +307,9 @@ def main() -> None:
         "model_dir": str(args.model_dir),
         "layers": layers,
         "mode": args.mode,
-        "frames": str(args.frames) if args.frames is not None else "synthetic",
+        "input_source": "synthetic",
+        "seed": args.seed,
+        "warmup": args.warmup,
         "frame_count": len(observations),
         "workload": {
             "state_dim": int(policy.metadata["state_dim"]),
@@ -409,9 +355,12 @@ def main() -> None:
             result["full_decode_tokens"] = int(steps[0])
 
     if args.mode in ("ar", "all"):
-        ar_layer = "l1" if "l1" in layers else "l2"
-        call, stream = (l1, prepared) if ar_layer == "l1" else (l2, observations)
-        result["ar"] = {"layer": ar_layer, **_run_ar(call, stream, args.survey, args.repeats)}
+        if "l1" not in layers:
+            raise ValueError("prefix/per-token measurement requires --layer l1")
+        def stopped(payload, token):
+            rgb, token_ids = payload
+            return handle.infer_action_tokens_rgb(rgb, "nhwc", token_ids, stop_token=token)
+        result["ar"] = {"layer": "l1", **_run_ar(stopped, prepared[0], args.repeats, args.warmup)}
 
     print(
         f"\nin-process latency  |  {args.precision}  checkpoint  "
@@ -444,6 +393,7 @@ def main() -> None:
             f"r2={fit['r2']:.4f}"
         )
 
+    result["provenance"] = provenance(_REPO_ROOT, args.model_dir, calibration=args.calibration, tactics=args.tactics)
     policy.close()
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

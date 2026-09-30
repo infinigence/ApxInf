@@ -128,6 +128,8 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+[Benchmark and evaluation commands](doc/pi0-fast-benchmark.md).
+
 ### GR00T N1.7
 
 One or two views, batch 1. Best recorded P50.

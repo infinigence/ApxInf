@@ -71,7 +71,7 @@ APXINF_CUDA_AOT_MANIFEST=/path/to/artifacts/manifest.json \
 ```
 
 Install the resulting wheel and `python/apxinf` in the test environment. The
-checkpoint, planner, tokenizer and test fixtures are external assets.
+checkpoint, planner and tokenizer are external assets.
 
 ```python
 from pathlib import Path
@@ -92,105 +92,77 @@ VQA and BEV perception are not exposed by this planning runtime.
 
 ## Latency procedure
 
-1. Check the GPU process list, machine load and shared GPU lock. Do not benchmark
-   alongside other GPU work or CPU compilation/scoring.
-2. Save clock configuration with `sudo jetson_clocks --store <file>` and set
-   `sudo jetson_clocks --fan`. Read back CPU, GPU, EMC and fan settings; restore
-   the saved configuration after testing.
-3. Use the same checkpoint, decoded frames, target sizes, prompt and initial
-   noise in both arms. The primary fixture has three cameras and four frames
-   per camera, 3385 real prompt tokens padded to 3387.
-4. Warm up ten calls; measure thirty calls per arm. Alternate reference,
-   candidate, candidate, reference. Keep all arms and report P50/P95 plus spread.
+The maintained benchmark constructs all RGB images, ego history and initial
+noise in memory. There are three cameras and four frames per camera. Historical
+images use `(384, 416)` and current images `(720, 799)` target sizes. These
+explicit performance shapes differ from official default-resolution accuracy
+inputs. Model and planner weights remain real checkpoint weights.
 
-For the pinned fixture format (`scenes.json`, image `.npy` files and
-`initial-noise.npy`), the core loop is:
-
-```python
-import json
-import time
-import numpy as np
-
-fixtures = Path("/path/to/public-inputs")
-scene = json.loads((fixtures / "scenes.json").read_text())[0]
-observation = dict(scene)
-observation["views"] = {
-    camera: [
-        {"image": np.load(fixtures / frame["image"]),
-         "target_size": frame["target_size"]}
-        for frame in frames
-    ]
-    for camera, frames in scene["views"].items()
-}
-noise = np.load(fixtures / "initial-noise.npy")
-for _ in range(10):
-    policy.infer(observation, noise=noise)
-samples, actions = [], []
-for _ in range(30):
-    start = time.perf_counter()
-    result = policy.infer(observation, noise=noise)
-    samples.append((time.perf_counter() - start) * 1000)
-    actions.append(np.asarray(result["actions"]).copy())
-assert all(np.array_equal(actions[0], x) for x in actions)
-ordered = sorted(samples)
-print({"p50_ms": ordered[int(.50 * (len(ordered) - 1))],
-       "p95_ms": ordered[int(.95 * (len(ordered) - 1))]})
-policy.close()
+```sh
+python scripts/bench_qwen_drive.py \
+  --model-dir /models/Qwen-Drive-1.0-4B --precision bf16 \
+  --warmup 10 --samples 30 --seed 0 \
+  --out devlocal/qwen-drive-bench/results/latency.json
 ```
 
-Capture native-library, model, tokenizer, artifact-manifest, tactic-store and
-input hashes with raw timings and clock readbacks. Acceptance evidence stays
-under `devlocal/qwen-drive-performance/`; it is not part of the source distribution.
+The same command in APXinf-robo delegates to this script and uses Robo's
+`load_policy`. Neither entry reads saved input tensors. The report includes
+raw request timings, P50/P95, output shape/hash and input profile. Fixed-input
+repetitions must return identical finite `[50, 3]` trajectories.
+
+Before measuring, exclude other GPU tasks and CPU compilation/scoring. Save and
+lock CPU/GPU/EMC clocks and fan, verify readbacks, and restore settings afterwards.
+Warm up ten requests and measure thirty requests in each of two runs. Keep both
+reports and pool their raw samples. Record source/native-binary, checkpoint,
+AOT-manifest and any explicit tactic hashes. Without `--tactics`, the engine
+selects a compatible hardware/toolkit database under `configs/tuning` when one
+exists; otherwise it uses provider defaults. For a controlled comparison, pass
+an explicit `--tactics` path and record its hash and library versions.
+
+The table above retains the previously published recorded-input results. Use
+this maintained benchmark for new measurements.
 
 ## Accuracy procedure
 
-Use the frozen NAVSIM v1.1 242-scene subset, the same metric cache/maps, ten
-flow steps and one supplied initial-noise tensor per scene. The official arm
-uses `planner-sft`, BF16, `direct_planning`, one sample and seed 42; this seed's
-noise was checked against the native supplied tensor. Both arms use the released
-benchmark image target sizes. The subset without those targets is a different
-image profile and must not be substituted silently.
-
-| Pinned input | SHA-256 |
-| --- | --- |
-| `navtest-interp-242.jsonl` | `bf55f27e931664f9c81e870ab375cf7a0d05949b8877e41964f4f6abd5955ce5` |
-| Same scenes with benchmark target sizes | `1d86691ccbfa8df57eb28d2de204fd1c75d718dfc5b043d9d84461e5feb07930` |
-| Metric-cache `metadata/cache.csv` | `d7d80f11e0fdfc7856cf1e267593d6a9ce0d2d1c90f499c9201de3453275f99e` |
-
-Require 242 unique tokens and finite `[50, 3]` trajectories. Report position
-errors in metres separately from heading in radians, then score the new
-predictions with the frozen PDM evaluator. Compare each safety/comfort component
-per scene; an unchanged aggregate score alone is insufficient. The
-[official evaluation guide](https://github.com/QwenLM/Qwen-Drive-1.0/blob/main/docs/evaluation.md)
-describes the NAVSIM trajectory conversion and scoring interfaces.
-
-Additional regression covers four scenes, 1/4/10 steps, changed noise, repeated
-calls, invalid masks and logical-length switching. Portable checks:
+Accuracy evaluation belongs to APXinf-robo, just as LIBERO evaluation uses the
+robot/environment adapter around PI0.5. From the matching Robo checkout, run:
 
 ```sh
-PYTHONPATH=python/apxinf python -m pytest \
-  python/apxinf/tests/test_qwen_drive_policy.py \
-  python/apxinf/tests/test_qwen_drive_padding.py
-cargo test --release -p apxinf-cuda --test aot_bundle --test cuda_arch
-cargo test --release -p apxinf-model --features cuda --lib capture_rejects_changed_phase_extent_or_count
-bash scripts/check_model_family_boundaries.sh
+python scripts/eval_qwen_drive.py \
+  --model-dir /models/Qwen-Drive-1.0-4B \
+  --scenes /data/navsim/navtest-observed-history.jsonl \
+  --image-root /data/navsim/images --seed 42 \
+  --metric-cache /data/navsim/metric-cache/metadata/cache.csv --maps /data/nuplan/maps \
+  --results-jsonl devlocal/qwen-drive-eval/predictions.jsonl \
+  --summary-json devlocal/qwen-drive-eval/summary.json
 ```
 
-### Final review acceptance (2026-09-28)
+Prediction and scoring may use separate environments. Omit `--metric-cache`
+from the prediction command, then score its existing output in the NAVSIM
+Python environment without loading CUDA or model weights:
 
-- Python with the native extension: 33 passed; isolated CPU environment:
-  30 passed, 3 native-only checks skipped.
-- Cargo AOT bundle/geometry checks: 8 passed; architecture checks: 5 passed.
-- GDN policy/operator checks: 9 passed. BF16/PTX chunk-state relative L1 error
-  against the FP64 reference: 0.001419 (limit 0.01).
-- Convolution boundary, AdaLN fusion and Pillow axis rejection: all passed.
-- Owned RGB snapshot/consume-once tests: 2 passed.
-- Whole-model graph/eager, input replacement, RNG and lifetime test, plus arena
-  layout mismatch rejection: both passed on Thor3.
-- Native invalid-mask and alternating-length contracts passed. Four-scene,
-  twelve-case outputs and all 242 NAVSIM trajectories remain bit-identical.
-- Final release wheel built incrementally and was reused on Thor2 for the
-  locked-clock/fan ABBA measurement above.
+```sh
+python scripts/eval_qwen_drive.py --score-only \
+  --scenes /data/navsim/navtest-observed-history.jsonl \
+  --results-jsonl devlocal/qwen-drive-eval/predictions.jsonl \
+  --metric-cache /data/navsim/metric-cache/metadata/cache.csv --maps /data/nuplan/maps \
+  --summary-json devlocal/qwen-drive-eval/summary.json
+```
+
+This uses real scene JSONL records in Qwen-Drive's `messages`, `trajectory`,
+`meta_info` schema. Each scene has twelve image paths and sixteen observed
+history samples at 10 Hz; the evaluator never interpolates the history. Keep
+raw-data provenance: an array of length sixteen alone does not prove that it
+contains observations rather than upstream interpolations. Use the official
+NAVSIM/nuPlan evaluator, maps and trusted metric caches for all scene tokens.
+
+Pin the checkpoint, history construction/filtering, image sizes, CUDA noise
+seed, ten flow steps and scoring-cache versions together. The historical
+242-scene score above used interpolated history and cannot be compared directly
+with corrected observed-history evaluation. Exact official Qwen scene-generation
+and filtering details are not fully published; do not claim their published
+PDM has been reproduced until those input conditions are established.
+The latency benchmark's constructed observations are never scored as accuracy.
 
 ## Execution notes
 
@@ -237,24 +209,9 @@ with their current BF16 storage contracts. Their former FP32 test buffers
 produced invalid comparisons and have been corrected. Value-split coverage
 selects distinct legacy launch policies directly, without environment mutation.
 
-The whole-model test uses a checkpoint plus one canonical fixture directory:
-`meta.json` contains `grids` and `pixels_shape`; `tokens.bin` is u32,
-`attention_mask.bin` is u8, and `pixels.bin`, `conditioning.bin`, `noise.bin`
-contain f32 values in native little-endian order. The fixture retains the
-physical padded tokens and the real-prefix mask. Generate it from the same
-policy inputs as the benchmark, then run:
-
-```sh
-APXINF_QWEN_DRIVE_TEST_MODEL=/path/to/Qwen-Drive-1.0-4B \
-APXINF_QWEN_DRIVE_TEST_INPUTS=/path/to/canonical-fixture \
-  cargo test --release -p apxinf-model --features cuda --lib \
-  whole_direct_graph_rebinds_inputs_and_owns_its_lifetime -- --ignored
-```
-
-This checks explicit eager versus required-graph execution, changed image/text/
-conditioning/noise inputs, generated-noise keys, incompatible requests and
-resource lifetime after dropping the runner. `Action` may alias prepared output
-storage; transfer/copy its data before the next call when retaining results.
+Retained actions must be copied before the next inference because prepared
+output storage may be reused. The benchmark copies each returned trajectory
+before its repeatability comparison.
 
 ### Maintained runtime controls and ownership
 
@@ -262,8 +219,7 @@ Qwen-Drive has no production `APXINF_QWEN_*` or GDN experiment environment
 switches. Direct planning uses its maintained prepared path; reasoning retains
 eager execution. Diagnostic branches that changed fusion/capture were removed.
 `OnceLock` remains valid for immutable data caches such as the position table.
-The two checkpoint/fixture variables above are test inputs; the AOT manifest
-variable is a build input. Generic device/tactic infrastructure is shared with
+The AOT manifest variable is a build input. Generic device/tactic infrastructure is shared with
 other model families.
 
 Canonical conditioning packs, in order: flattened historical pose (excluding
