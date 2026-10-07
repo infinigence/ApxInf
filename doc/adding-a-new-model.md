@@ -44,6 +44,13 @@ VLMs use `LlmInput` and override `prefill` for processor output, image-token
 placement, multimodal positions, or other model-specific input semantics. They
 reuse the shared token generation and sampling pipeline.
 
+Keep `forward(token_ids, start_pos)` full: its result is
+`[seq_len, vocab_size]`. A generation-oriented `prefill(LlmInput)` may consume
+the complete prompt into state and return only `[1, vocab_size]`; the shared
+sampler takes the last row. Qwen3's native prefill evaluates cache-only chunks
+before its final token, and MiniCPM5 applies its head only to the final prompt
+row. Specialized speculative generation belongs to the request-level hook.
+
 A small model commonly starts with:
 
 ```text
@@ -56,6 +63,12 @@ A small model commonly starts with:
 
 Add files such as `vision.rs`, `vision_weights.rs`, or `decode_graph.rs` only
 when the architecture requires them.
+
+The native [Qwen3](../crates/apxinf-model/src/qwen3/README.md) and
+[MiniCPM5](../crates/apxinf-model/src/minicpm5/README.md) MLX families use their
+own `config`, `weights` and `model` modules, plus family-specific math/state
+files. They demonstrate family ownership and explicit state, not a license to import another family's
+model or to generalize its accepted hardware/geometry.
 
 ### VLA
 
@@ -143,6 +156,14 @@ specialized fast path may recover a concrete backend for capabilities that do
 not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
+For MLX, the concrete safe seam is `MlxBackend` with `Array`, `Stream` and
+`Compiled` from `apxinf-mlx`. Family code composes safe operations and explicit
+casts; only the backend handles native FFI and unsafe custom Metal calls.
+`MlxBackend::from_array` materializes public contiguous tensor boundaries;
+canonical `[in,out]` weights may retain backend-private strided views. A
+quantized representation is a separately prepared private artifact with an
+explicit selection rule, not a new meaning for canonical tensor dimensions.
+
 Do not begin coverage discovery from `dyn Backend` alone. First inspect the
 closest maintained model/Blocks implementation at the requested precision and the safe interfaces
 under `apxinf_cuda::kernels`, especially fused normalization/residual,
@@ -156,6 +177,21 @@ Separate model computation from execution state. A model runner owns or retains
 the model/weights, caches, workspaces, CUDA graphs and prepared profiles. A
 prepared object must bind every shape or condition that changes allocation,
 dispatch, or captured execution.
+
+MLX text families own their KV, position and fallible `prepare` methods. They
+prepare compiled local/block/step functions with explicit changing array
+inputs/outputs, then evaluate all required logits/state before committing a
+position change. Infallible `prewarm_decode` retains a preparation error for
+the next fallible call; it cannot pretend preparation succeeded. See
+[MLX execution](mlx-backend.md#prepared-compiled-execution) for bounded lazy
+allocations, thread ownership and the exact current compilation scopes.
+CUDA Graph capture requirements below retain their original meaning.
+
+Expose text readiness through `LlmTrait::preparation_status` with actual
+`TextPreparationStatus` scopes and admitted shapes. Report no successful
+compiled scopes for unprepared/invalidated states; do not infer readiness from
+the variant name or a non-null compiled handle. Keep that data interface
+separate from VLA `PreparedInference` and its execution policy.
 
 Preparation queries model/Blocks requirements, allocates stable resources,
 and warms up the real model computation until native plans/tactics are stable
@@ -190,6 +226,9 @@ Complete these steps in the new family's own code and the existing registries:
    `builtin::register_builtin_models`, with the correct feature gate and names.
    `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
    metadata; test both explicit selection and the supported detection path.
+   For Metal, the current `mlx` feature registers `qwen3-mlx` and
+   `minicpm5-mlx`; `AutoModel` resolves the device suffix. MiniCPM5 must be
+   explicitly named because its official checkpoint identifies as `llama`.
 2. For LLM/VLM, return `LoadedModel::text(Box<dyn LlmTrait>)` and exercise shared
    generation. For VLA, implement `VlaRuntime` on the family runner and return
    `LoadedModel::Vla(Box::new(runner))`. Required methods include `contract`,

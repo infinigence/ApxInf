@@ -101,6 +101,7 @@ impl LlamaModel {
                 self.cuda_kv_cache = None;
                 Ok(())
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -109,6 +110,7 @@ impl LlamaModel {
         match device {
             Device::Cpu => Ok(()),
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -169,7 +171,8 @@ impl LlamaModel {
         #[cfg(feature = "cuda")]
         let last_logits = match logits.device() {
             Device::Cuda(_) => cuda_ops::to_cpu(&logits)?,
-            _ => logits.clone(),
+            Device::Cpu => logits.clone(),
+            other => return Err(Error::UnsupportedDevice(other)),
         };
         #[cfg(not(feature = "cuda"))]
         let last_logits = logits.clone();
@@ -210,7 +213,8 @@ impl LlamaModel {
             #[cfg(feature = "cuda")]
             let logits_cpu = match decode_logits.device() {
                 Device::Cuda(_) => cuda_ops::to_cpu(&decode_logits)?,
-                _ => decode_logits.clone(),
+                Device::Cpu => decode_logits.clone(),
+                other => return Err(Error::UnsupportedDevice(other)),
             };
             #[cfg(not(feature = "cuda"))]
             let logits_cpu = decode_logits.clone();
@@ -462,6 +466,9 @@ impl LlamaModel {
     }
 
     fn embedding_lookup(&self, token_ids: &[u32], device: Device) -> Result<Tensor> {
+        if !matches!(device, Device::Cpu | Device::Cuda(_)) {
+            return Err(Error::UnsupportedDevice(device));
+        }
         let embed_dim = self.config.hidden_size;
         let seq_len = token_ids.len();
 
@@ -469,7 +476,8 @@ impl LlamaModel {
         #[cfg(feature = "cuda")]
         let table_cpu = match device {
             Device::Cuda(_) => cuda_ops::to_cpu(&self.weights.token_embedding)?,
-            _ => self.weights.token_embedding.clone(),
+            Device::Cpu => self.weights.token_embedding.clone(),
+            other => return Err(Error::UnsupportedDevice(other)),
         };
         #[cfg(not(feature = "cuda"))]
         let table_cpu = self.weights.token_embedding.clone();
@@ -495,6 +503,7 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -608,7 +617,8 @@ impl LlamaModel {
                 let v_cpu = cuda_ops::to_cpu(&v)?;
                 (q_cpu.as_f32()?.to_vec(), k_cpu.as_f32()?.to_vec(), v_cpu.as_f32()?.to_vec())
             }
-            _ => (q.as_f32()?.to_vec(), k.as_f32()?.to_vec(), v.as_f32()?.to_vec()),
+            Device::Cpu => (q.as_f32()?.to_vec(), k.as_f32()?.to_vec(), v.as_f32()?.to_vec()),
+            other => return Err(Error::UnsupportedDevice(other)),
         };
         #[cfg(not(feature = "cuda"))]
         let (q_data, k_data, v_data) = (q.as_f32()?.to_vec(), k.as_f32()?.to_vec(), v.as_f32()?.to_vec());
@@ -717,6 +727,7 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Tensor::from_f32(vec![seq_len, n_heads * head_dim], &attn_out)?,
+            other => return Err(Error::UnsupportedDevice(other)),
         };
 
         // Output projection
@@ -770,13 +781,17 @@ impl LlamaModel {
     fn tensor_to_cpu(&self, x: &Tensor) -> Result<Tensor> {
         match x.device() {
             Device::Cuda(_) => cuda_ops::to_cpu(x),
-            _ => Ok(x.clone()),
+            Device::Cpu => Ok(x.clone()),
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
     #[cfg(not(feature = "cuda"))]
     fn tensor_to_cpu(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(x.clone())
+        match x.device() {
+            Device::Cpu => Ok(x.clone()),
+            other => Err(Error::UnsupportedDevice(other)),
+        }
     }
 
     fn rms_norm(&self, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
@@ -817,6 +832,7 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -883,6 +899,7 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -906,6 +923,7 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -929,6 +947,7 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 
@@ -945,6 +964,7 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            other => Err(Error::UnsupportedDevice(other)),
         }
     }
 }
@@ -1157,6 +1177,14 @@ mod tests {
         );
 
         let mut model = LlamaModel::from_weights(config.clone(), tensors).unwrap();
+
+        // The legacy implementation must reject an unimplemented accelerator,
+        // leaving the CPU model usable rather than silently accepting a port.
+        assert!(matches!(
+            model.to_device(Device::Metal(0)),
+            Err(Error::UnsupportedDevice(Device::Metal(0)))
+        ));
+        assert_eq!(model.device(), Device::Cpu);
 
         // Forward pass for token 5 at position 0
         let mut debug: Option<&mut DebugCapture> = None;

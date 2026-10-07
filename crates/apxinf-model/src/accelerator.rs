@@ -3,12 +3,16 @@
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, Result};
-#[cfg(not(feature = "cuda"))]
+#[cfg(any(not(feature = "cuda"), not(feature = "mlx")))]
 use apxinf_core::Error;
 
 pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {
         Device::Cpu => Ok(Arc::new(apxinf_core::CpuBackend)),
+        #[cfg(feature = "mlx")]
+        Device::Metal(id) => Ok(Arc::new(apxinf_mlx::MlxBackend::new(id)?)),
+        #[cfg(not(feature = "mlx"))]
+        Device::Metal(_) => Err(Error::Other("MLX support not compiled in; enable the mlx feature".into())),
         #[cfg(feature = "cuda")]
         Device::Cuda(id) => cuda::create(id),
         #[cfg(not(feature = "cuda"))]

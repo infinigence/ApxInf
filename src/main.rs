@@ -3,13 +3,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
-    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
-    LoadOptions, SamplingMode,
+    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput, LoadOptions,
+    SamplingMode,
 };
-use apxinf_tokenizer::{Tokenizer, ChatMessage};
+use apxinf_tokenizer::{ChatMessage, Tokenizer};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -26,6 +26,27 @@ enum Commands {
         /// Path to HuggingFace model directory (contains model.safetensors and tokenizer.json)
         #[arg(short, long)]
         model: PathBuf,
+
+        /// Explicit registry family (e.g. minicpm5 when checkpoint model_type is llama)
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant; unsupported choices are rejected by its loader
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Auxiliary checkpoint asset as NAME=PATH (for example draft=/path/to/DSpark)
+        #[arg(long, value_parser = parse_asset)]
+        asset: Vec<(String, PathBuf)>,
+
+        /// JSON chat-template options, rendered with exact checkpoint whitespace
+        #[arg(long)]
+        chat_options: Option<String>,
+
+        /// Preserve semantic control tokens such as tool-call XML tags.
+        /// Also enabled automatically when chat options supply tools.
+        #[arg(long)]
+        keep_special_tokens: bool,
 
         /// Input prompt (treated as user message in chat mode, or raw text if no chat template)
         #[arg(short, long)]
@@ -93,7 +114,7 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cpu or cuda)
+        /// Device to run inference on (cpu, cuda[:N], or metal[:N]; mlx is an alias)
         #[arg(short, long, default_value = "cpu")]
         device: String,
 
@@ -113,6 +134,11 @@ fn main() {
     match cli.command {
         Commands::Generate {
             model,
+            model_name,
+            model_variant,
+            asset,
+            chat_options,
+            keep_special_tokens,
             prompt,
             image,
             max_tokens,
@@ -132,11 +158,22 @@ fn main() {
             device,
             dtype,
         } => {
-            let device = parse_device(&device);
+            let device = match parse_device(&device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
             // Report a failed generation through the exit status; a CLI that
             // printed an error and still exited 0 reads as success to any caller.
             if let Err(error) = run_generate(
                 &model,
+                model_name.as_deref(),
+                model_variant.as_deref(),
+                &asset,
+                chat_options.as_deref(),
+                keep_special_tokens,
                 &prompt,
                 image.as_ref(),
                 max_tokens,
@@ -166,19 +203,104 @@ fn main() {
     }
 }
 
-fn parse_device(s: &str) -> Device {
-    match s.to_lowercase().as_str() {
-        "cuda" | "gpu" => Device::Cuda(0),
-        "cpu" => Device::Cpu,
-        _ => {
-            eprintln!("Unknown device '{s}', defaulting to CPU. Use 'cpu' or 'cuda'.");
-            Device::Cpu
+fn parse_asset(value: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or("expected auxiliary asset NAME=PATH")?;
+    if name.is_empty() || path.is_empty() || name.chars().any(char::is_whitespace) {
+        return Err("expected nonempty asset name and path".into());
+    }
+    Ok((name.to_owned(), PathBuf::from(path)))
+}
+
+fn parse_device(spec: &str) -> Result<Device, String> {
+    let normalized = spec.to_ascii_lowercase();
+    let (kind, index) = match normalized.split_once(':') {
+        Some((kind, index)) => {
+            let index = index.parse::<usize>().map_err(|_| {
+                format!("Invalid device index in '{spec}'; use cpu, cuda:N, or metal:N")
+            })?;
+            (kind, index)
         }
+        None => (normalized.as_str(), 0),
+    };
+    match kind {
+        "cpu" if index == 0 => Ok(Device::Cpu),
+        "cuda" | "gpu" => Ok(Device::Cuda(index)),
+        "metal" | "mlx" => Ok(Device::Metal(index)),
+        _ => Err(format!(
+            "Unknown device '{spec}'; use cpu, cuda:N, or metal:N (mlx:N is an alias)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{parse_device, Cli, Commands};
+    use apxinf_core::Device;
+    use clap::Parser;
+
+    #[test]
+    fn parses_explicit_accelerator_devices() {
+        assert_eq!(parse_device("cpu").unwrap(), Device::Cpu);
+        assert_eq!(parse_device("gpu").unwrap(), Device::Cuda(0));
+        assert_eq!(parse_device("cuda:2").unwrap(), Device::Cuda(2));
+        assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
+        assert_eq!(parse_device("MLX:1").unwrap(), Device::Metal(1));
+    }
+
+    #[test]
+    fn malformed_devices_do_not_fall_back_to_cpu() {
+        for spec in [
+            "tpu",
+            "",
+            "metal:",
+            "mlx:-1",
+            "cuda:x",
+            "cpu:1",
+            "metal:0:1",
+        ] {
+            assert!(parse_device(spec).is_err(), "accepted {spec}");
+        }
+    }
+
+    #[test]
+    fn accepts_explicit_family_and_variant() {
+        let cli = Cli::try_parse_from([
+            "apxinf",
+            "generate",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "hello",
+            "--device",
+            "metal",
+            "--model-name",
+            "minicpm5",
+            "--model-variant",
+            "bf16-compiled",
+        ])
+        .unwrap();
+        let Commands::Generate {
+            model_name,
+            model_variant,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate command");
+        };
+        assert_eq!(model_name.as_deref(), Some("minicpm5"));
+        assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
     }
 }
 
 fn run_generate(
     model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    assets: &[(String, PathBuf)],
+    chat_options: Option<&str>,
+    keep_special_tokens: bool,
     prompt: &str,
     image_path: Option<&PathBuf>,
     max_tokens: Option<usize>,
@@ -201,8 +323,30 @@ fn run_generate(
     println!("apxinf — LLM/VLM inference engine");
     println!();
 
-    let model_name = AutoModel::detect_model_name(model_dir)
-        .map_err(|error| format!("Failed to detect model type: {error}"))?;
+    let mut asset_map = std::collections::BTreeMap::new();
+    for (name, path) in assets {
+        if asset_map.insert(name.clone(), path.clone()).is_some() {
+            return Err(format!("duplicate auxiliary asset: {name}"));
+        }
+    }
+    if image_path.is_some() && chat_options.is_some() {
+        return Err("--chat-options currently supports text prompts only".into());
+    }
+    let template_options = chat_options
+        .map(|raw| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+                .map_err(|e| format!("invalid --chat-options object: {e}"))
+        })
+        .transpose()?;
+    let skip_special_tokens = !(keep_special_tokens
+        || template_options
+            .as_ref()
+            .is_some_and(|options| options.contains_key("tools")));
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
     if image_path.is_some() && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl") {
         return Err(format!("Model `{model_name}` does not support image input"));
     }
@@ -235,7 +379,7 @@ fn run_generate(
             .map_err(|error| format!("Invalid processor output: {error}"))?;
         (tokens, Some((pixels, vec![grid])))
     } else {
-        let tokens = encode_prompt(&tok, prompt, system_prompt)
+        let tokens = encode_prompt(&tok, prompt, system_prompt, template_options.as_ref())
             .map_err(|error| format!("Failed to encode prompt: {error}"))?;
         (tokens, None)
     };
@@ -256,30 +400,31 @@ fn run_generate(
         .unwrap_or_default();
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        assets: asset_map,
         text_weight_dtype,
         generation_config: GenerationConfigSource::from_cli_value(generation_config),
         generation_overrides,
         ..LoadOptions::default()
     };
 
-    println!("Loading {model_name} from {:?}... (dtype: {dtype})", model_dir);
+    println!(
+        "Loading {model_name} from {:?}... (dtype: {dtype})",
+        model_dir
+    );
     let mut model = AutoModel::load_model(device, model_dir, &options)
         .map_err(|error| format!("Failed to load model: {error}"))?;
     if prepared_image.is_some() {
         match model.text_capabilities() {
             Ok(capabilities) if capabilities.image => {}
-            Ok(_) => {
-                return Err(format!("Model `{model_name}` does not support image input"))
-            }
+            Ok(_) => return Err(format!("Model `{model_name}` does not support image input")),
             Err(error) => return Err(format!("Cannot generate with this model: {error}")),
         }
     }
     println!("Model ready.");
 
     let input = match prepared_image.as_ref() {
-        Some((pixels, grids)) => {
-            LlmInput::with_image(&tokens, ImageInput::new(pixels, grids))
-        }
+        Some((pixels, grids)) => LlmInput::with_image(&tokens, ImageInput::new(pixels, grids)),
         None => LlmInput::text(&tokens),
     };
 
@@ -330,9 +475,9 @@ fn run_generate(
         .generate_streaming_with_options(input, &generation_options, |token| {
             let token_id = token.token_id;
             all_tokens.push(token_id);
-            if let Ok(text) = tok.decode(&all_tokens) {
+            if let Ok(text) = tok.decode_with_options(&all_tokens, skip_special_tokens) {
                 let previous = tok
-                    .decode(&all_tokens[..all_tokens.len() - 1])
+                    .decode_with_options(&all_tokens[..all_tokens.len() - 1], skip_special_tokens)
                     .unwrap_or_default();
                 let delta = text.strip_prefix(&previous).unwrap_or(&text);
                 print!("{delta}");
@@ -351,6 +496,7 @@ fn encode_prompt(
     tokenizer: &Tokenizer,
     prompt: &str,
     system_prompt: Option<&str>,
+    template_options: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<u32>, String> {
     if tokenizer.has_chat_template() {
         let mut messages = Vec::new();
@@ -358,7 +504,15 @@ fn encode_prompt(
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(prompt));
-        tokenizer.encode_chat(&messages).map_err(|error| error.to_string())
+        match template_options {
+            Some(options) => tokenizer
+                .apply_chat_template_with_options(&messages, options)
+                .and_then(|text| tokenizer.encode(&text))
+                .map_err(|error| error.to_string()),
+            None => tokenizer
+                .encode_chat(&messages)
+                .map_err(|error| error.to_string()),
+        }
     } else {
         tokenizer.encode(prompt).map_err(|error| error.to_string())
     }
@@ -375,10 +529,8 @@ fn preprocess_image(
     use std::process::Command;
 
     let suffix = std::process::id();
-    let pixel_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
-    let metadata_path =
-        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
+    let pixel_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
+    let metadata_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
     let script = r#"
 import json
 import sys
@@ -451,16 +603,13 @@ with open(metadata_path, "w") as output:
     let grid = [
         grid_values[0]
             .as_u64()
-            .ok_or_else(|| "processor grid T is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid T is not an integer".to_string())? as u32,
         grid_values[1]
             .as_u64()
-            .ok_or_else(|| "processor grid H is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid H is not an integer".to_string())? as u32,
         grid_values[2]
             .as_u64()
-            .ok_or_else(|| "processor grid W is not an integer".to_string())?
-            as u32,
+            .ok_or_else(|| "processor grid W is not an integer".to_string())? as u32,
     ];
     let tokens = metadata
         .get("tokens")
@@ -482,9 +631,7 @@ with open(metadata_path, "w") as output:
 }
 
 /// Read a NumPy v1 f32 array and convert it to bf16.
-fn read_npy_f32_to_bf16(
-    path: &std::path::Path,
-) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
+fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     use std::io::Read;
 
     let mut file =
@@ -525,9 +672,7 @@ fn read_npy_f32_to_bf16(
     }
     let data = raw
         .chunks_exact(4)
-        .map(|bytes| {
-            half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap()))
-        })
+        .map(|bytes| half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap())))
         .collect();
     Ok((shape, data))
 }
@@ -613,7 +758,10 @@ fn cuda_test() {
     let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
     let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0].iter().map(|x| x / (1.0 + (-x).exp())).collect();
+    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
+        .iter()
+        .map(|x| x / (1.0 + (-x).exp()))
+        .collect();
     println!("[CUDA] silu: {:?}", silu_data);
 
     // Add test
@@ -647,7 +795,8 @@ fn cuda_test() {
     println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
 
     // RoPE test
-    let rope_input = Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
+    let rope_input =
+        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
     let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
     let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
     let rope_cpu = transfers::to_cpu(&rope_out).unwrap();

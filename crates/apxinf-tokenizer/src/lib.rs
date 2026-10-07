@@ -8,6 +8,183 @@ use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
+/// Transformers overrides Jinja's HTML-oriented `tojson` with Python
+/// json.dumps: Unicode is preserved by default, HTML is not escaped, object
+/// insertion order is retained, and default separators include spaces.
+fn hf_tojson(
+    value: minijinja::Value,
+    arguments: minijinja::value::Rest<minijinja::Value>,
+) -> std::result::Result<String, minijinja::Error> {
+    use minijinja::{
+        value::{from_args, Kwargs, Value},
+        ErrorKind,
+    };
+    let invalid =
+        |message: &str| minijinja::Error::new(ErrorKind::InvalidOperation, message.to_owned());
+    let (args, kwargs) = from_args::<(&[Value], Kwargs)>(&arguments)?;
+    if args.len() > 4 {
+        return Err(invalid("tojson accepts at most four options"));
+    }
+    let get = |index: usize, name: &str| -> std::result::Result<Option<Value>, minijinja::Error> {
+        let keyword: Option<Value> = kwargs.get(name)?;
+        if args.get(index).is_some() && keyword.is_some() {
+            return Err(invalid("duplicate tojson option"));
+        }
+        Ok(args.get(index).cloned().or(keyword))
+    };
+    let ascii = get(0, "ensure_ascii")?.map_or(false, |v| v.is_true());
+    let indent = match get(1, "indent")? {
+        None => None,
+        Some(v) if v.is_none() => None,
+        Some(v) => Some(if let Some(s) = v.as_str() {
+            s.to_owned()
+        } else if v.kind() == minijinja::value::ValueKind::Bool {
+            if v.is_true() { " " } else { "" }.to_owned()
+        } else {
+            let n = i64::try_from(v)
+                .map_err(|_| invalid("tojson indent must be an integer, string, or none"))?;
+            " ".repeat(usize::try_from(n.max(0)).map_err(|_| invalid("indent exceeds usize"))?)
+        }),
+    };
+    let separators = match get(2, "separators")? {
+        None => None,
+        Some(v) if v.is_none() => None,
+        Some(v) => {
+            let items: Vec<String> = serde_json::from_value(
+                serde_json::to_value(v).map_err(|e| invalid(&e.to_string()))?,
+            )
+            .map_err(|_| invalid("tojson separators must be two strings"))?;
+            if items.len() != 2 {
+                return Err(invalid("tojson separators must be two strings"));
+            }
+            Some((items[0].clone(), items[1].clone()))
+        }
+    };
+    let sort_keys = get(3, "sort_keys")?.map_or(false, |v| v.is_true());
+    kwargs.assert_all_used()?;
+    let (item_separator, key_separator) = separators.unwrap_or_else(|| {
+        (
+            if indent.is_some() { "," } else { ", " }.to_owned(),
+            ": ".to_owned(),
+        )
+    });
+    let value = serde_json::to_value(value).map_err(|e| invalid(&e.to_string()))?;
+    fn string(value: &str, ascii: bool) -> String {
+        let escaped = serde_json::to_string(value).expect("strings serialize to JSON");
+        if !ascii {
+            return escaped;
+        }
+        let mut out = String::new();
+        for c in escaped.chars() {
+            if c <= '\u{7e}' {
+                out.push(c);
+            } else {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    use std::fmt::Write;
+                    write!(&mut out, "\\u{unit:04x}").unwrap();
+                }
+            }
+        }
+        out
+    }
+    fn render(
+        value: &serde_json::Value,
+        ascii: bool,
+        indent: Option<&str>,
+        item: &str,
+        key: &str,
+        sort: bool,
+        depth: usize,
+    ) -> String {
+        use serde_json::Value as J;
+        let (open, close, entries): (&str, &str, Vec<String>) = match value {
+            J::Array(values) => (
+                "[",
+                "]",
+                values
+                    .iter()
+                    .map(|v| render(v, ascii, indent, item, key, sort, depth + 1))
+                    .collect(),
+            ),
+            J::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                if sort {
+                    keys.sort();
+                }
+                (
+                    "{",
+                    "}",
+                    keys.into_iter()
+                        .map(|k| {
+                            format!(
+                                "{}{}{}",
+                                string(k, ascii),
+                                key,
+                                render(&values[k], ascii, indent, item, key, sort, depth + 1)
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            J::String(s) => return string(s, ascii),
+            J::Number(n) if n.is_f64() => {
+                // Python's repr uses scientific notation below 1e-4 or at
+                // 1e16, and pads exponent magnitudes to at least two digits.
+                let raw = n.to_string();
+                let sign = if raw.starts_with('-') { "-" } else { "" };
+                let unsigned = raw.trim_start_matches('-');
+                let (mantissa, exponent) = unsigned
+                    .split_once(['e', 'E'])
+                    .map_or((unsigned, 0), |(m, e)| (m, e.parse::<i32>().unwrap()));
+                let point = mantissa.find('.').unwrap_or(mantissa.len());
+                let digits = mantissa.replace('.', "");
+                if let Some(first) = digits.find(|c| c != '0') {
+                    let exponent = exponent + point as i32 - first as i32 - 1;
+                    if exponent < -4 || exponent >= 16 {
+                        let digits = digits[first..].trim_end_matches('0');
+                        let fraction = if digits.len() > 1 {
+                            format!(".{}", &digits[1..])
+                        } else {
+                            String::new()
+                        };
+                        return format!(
+                            "{sign}{}{fraction}e{}{:02}",
+                            &digits[..1],
+                            if exponent < 0 { '-' } else { '+' },
+                            exponent.unsigned_abs()
+                        );
+                    }
+                }
+                return raw;
+            }
+            _ => return value.to_string(),
+        };
+        if entries.is_empty() {
+            return format!("{open}{close}");
+        }
+        match indent {
+            None => format!("{open}{}{close}", entries.join(item)),
+            Some(unit) => {
+                let pad = unit.repeat(depth + 1);
+                format!(
+                    "{open}\n{pad}{}\n{}{close}",
+                    entries.join(&format!("{item}\n{pad}")),
+                    unit.repeat(depth)
+                )
+            }
+        }
+    }
+    Ok(render(
+        &value,
+        ascii,
+        indent.as_deref(),
+        &item_separator,
+        &key_separator,
+        sort_keys,
+        0,
+    ))
+}
+
 #[cfg(feature = "sentencepiece")]
 use sentencepiece::SentencePieceProcessor;
 
@@ -129,8 +306,14 @@ impl Tokenizer {
 
     /// Decode token IDs to text.
     pub fn decode(&self, tokens: &[u32]) -> Result<String> {
+        self.decode_with_options(tokens, true)
+    }
+
+    /// Decode with explicit special-token handling. Set `skip_special_tokens`
+    /// to false when protocol markers such as tool-call XML are meaningful.
+    pub fn decode_with_options(&self, tokens: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner
-            .decode(tokens, true)
+            .decode(tokens, skip_special_tokens)
             .map_err(|e| Error::Other(format!("tokenizer decode: {e}")))
     }
 
@@ -197,11 +380,67 @@ impl Tokenizer {
     /// Requires tokenizer_config.json with `chat_template` field.
     /// Uses minijinja to render the Jinja2 template.
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
+        let result = self.render_chat_template(messages, &serde_json::Map::new(), false)?;
+        // Retain historic normalization for legacy callers. Explicit template
+        // options use the exact rendered bytes instead.
+        let mut normalized = String::new();
+        let mut prev_was_newline = false;
+        for c in result.trim().chars() {
+            if c == '\n' {
+                if !prev_was_newline {
+                    normalized.push('\n');
+                    prev_was_newline = true;
+                }
+            } else {
+                normalized.push(c);
+                prev_was_newline = false;
+            }
+        }
+
+        // Ensure trailing newline (matching PyTorch behavior)
+        if !normalized.ends_with('\n') {
+            normalized.push('\n');
+        }
+
+        Ok(normalized)
+    }
+
+    /// Render the checkpoint template exactly, preserving all whitespace.
+    /// Options such as `enable_thinking` and `tools` are application inputs;
+    /// they cannot replace messages or reserved generation/template fields.
+    pub fn apply_chat_template_with_options(
+        &self,
+        messages: &[ChatMessage],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.render_chat_template(messages, options, true)
+    }
+
+    fn render_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &serde_json::Map<String, serde_json::Value>,
+        hf_whitespace: bool,
+    ) -> Result<String> {
         let template_str = self.chat_template.as_ref()
             .ok_or_else(|| Error::Other("no chat template available (missing tokenizer_config.json with chat_template field)".to_string()))?;
 
         // Create environment and template on demand
         let mut env = Environment::new();
+        if hf_whitespace {
+            env.set_trim_blocks(true);
+            env.set_lstrip_blocks(true);
+        }
+        env.add_filter("tojson", hf_tojson);
+        env.add_function(
+            "raise_exception",
+            |message: String| -> std::result::Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    message,
+                ))
+            },
+        );
         // HF chat templates are written for Jinja2 and freely use Python
         // methods (str.startswith etc.); enable minijinja's pycompat shims.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -240,39 +479,34 @@ impl Tokenizer {
             .unwrap_or_default();
 
         // Create context as serde Value (map)
-        let context = serde_json::json!({
+        let mut context = serde_json::json!({
             "messages": messages,
             "bos_token": bos,
             "eos_token": eos,
             "add_generation_prompt": true,
         });
 
+        for (key, value) in options {
+            if [
+                "messages",
+                "bos_token",
+                "eos_token",
+                "add_generation_prompt",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(Error::Other(format!(
+                    "reserved chat template option: {key}"
+                )));
+            }
+            context[key] = value.clone();
+        }
+
         let result = tmpl
             .render(context)
             .map_err(|e| Error::Other(format!("template render error: {e}")))?;
 
-        // Jinja2 in Python strips whitespace around control blocks, but minijinja doesn't.
-        // Normalize by collapsing all consecutive newlines to single newlines.
-        let mut normalized = String::new();
-        let mut prev_was_newline = false;
-        for c in result.trim().chars() {
-            if c == '\n' {
-                if !prev_was_newline {
-                    normalized.push('\n');
-                    prev_was_newline = true;
-                }
-            } else {
-                normalized.push(c);
-                prev_was_newline = false;
-            }
-        }
-
-        // Ensure trailing newline (matching PyTorch behavior)
-        if !normalized.ends_with('\n') {
-            normalized.push('\n');
-        }
-
-        Ok(normalized)
+        Ok(result)
     }
 
     /// Encode messages using chat template.
@@ -327,6 +561,100 @@ mod tests {
     use std::collections::HashMap;
     use tokenizers::models::wordlevel::WordLevel;
 
+    fn render_json_filter(template: &str) -> String {
+        let mut env = Environment::new();
+        env.add_filter("tojson", hf_tojson);
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"z":"中文<&'😀","a":{"b":true,"a":null},"v":[1,2.0,0.00001,1e20]}"#,
+        )
+        .unwrap();
+        env.render_str(template, serde_json::json!({"data":data}))
+            .unwrap()
+    }
+
+    #[test]
+    fn hf_json_unicode_order_and_spacing_match_python_defaults() {
+        assert_eq!(
+            render_json_filter("{{ data | tojson }}"),
+            r#"{"z": "中文<&'😀", "a": {"b": true, "a": null}, "v": [1, 2.0, 1e-05, 1e+20]}"#
+        );
+        assert_eq!(
+            render_json_filter("{{ data.z | tojson(ensure_ascii=True) }}"),
+            r#""\u4e2d\u6587<&'\ud83d\ude00""#
+        );
+        assert_eq!(
+            render_json_filter("{{ data.a | tojson(False, None, [',', ':'], True) }}"),
+            r#"{"a":null,"b":true}"#
+        );
+        assert_eq!(
+            render_json_filter("{{ data.a | tojson(indent=2, sort_keys=True) }}"),
+            "{\n  \"a\": null,\n  \"b\": true\n}"
+        );
+        assert_eq!(
+            render_json_filter("{{ data.a | tojson(indent='\t', separators=[',', ':']) }}"),
+            "{\n\t\"b\":true,\n\t\"a\":null\n}"
+        );
+        assert_eq!(
+            render_json_filter("{{ data.a | tojson(indent=-1) }}"),
+            "{\n\"b\": true,\n\"a\": null\n}"
+        );
+    }
+
+    #[test]
+    fn hf_json_rejects_unknown_or_duplicate_options() {
+        let mut env = Environment::new();
+        env.add_filter("tojson", hf_tojson);
+        for source in [
+            "{{ {}|tojson(unsupported=True) }}",
+            "{{ {}|tojson(True, ensure_ascii=False) }}",
+            "{{ {}|tojson(separators=[':']) }}",
+        ] {
+            assert!(env.render_str(source, ()).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_template_uses_hf_block_whitespace_without_changing_legacy() {
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some("before\n   {% if true %}\nafter\n   {% endif %}\nend".into()),
+        };
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap(),
+            "before\nafter\nend"
+        );
+        assert_eq!(
+            tokenizer.apply_chat_template(&[]).unwrap(),
+            "before\n   \nafter\n   \nend\n"
+        );
+    }
+
+    #[test]
+    fn explicit_template_options_preserve_exact_prompt_bytes() {
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ messages[0].content }}\n\n{% if enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}".into()),
+        };
+        let messages = [ChatMessage::user("hello")];
+        let mut options = serde_json::Map::new();
+        options.insert("enable_thinking".into(), false.into());
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&messages, &options)
+                .unwrap(),
+            "hello\n\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(tokenizer.apply_chat_template(&messages).unwrap(), "hello\n");
+        options.insert("messages".into(), serde_json::json!([]));
+        assert!(tokenizer
+            .apply_chat_template_with_options(&messages, &options)
+            .is_err());
+    }
+
     #[test]
     fn test_chat_message_constructors() {
         let user = ChatMessage::user("Hello");
@@ -362,5 +690,24 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
         assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
         assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn explicit_decode_keeps_tool_protocol_special_tokens() {
+        let mut tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: None,
+        };
+        tokenizer
+            .inner
+            .add_special_tokens(&[AddedToken::from("<function>", true)]);
+        let id = tokenizer.token_to_id("<function>").unwrap();
+        assert_eq!(tokenizer.decode(&[id]).unwrap(), "");
+        assert_eq!(tokenizer.decode_with_options(&[id], true).unwrap(), "");
+        assert_eq!(
+            tokenizer.decode_with_options(&[id], false).unwrap(),
+            "<function>"
+        );
     }
 }

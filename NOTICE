@@ -1,0 +1,44 @@
+The upstream ApxInf license remains Apache-2.0 (see LICENSE).
+
+Native MLX model and kernel adaptations retain the following notices.
+
+EngineTailor: https://github.com/qhy991/EngineTailor
+Copyright (c) 2026 Haiyan Qin. MIT License.
+
+The Qwen3 ordered BF16 normalization/RoPE and explicit-state decoder-block
+composition derive from target 6d60bf84c949a0f1310f58007f25d206266f41cd.
+The mixed W8 selection, scoped affine quantization, tied quantized table and
+Q/K normalization-to-RoPE kernel derive from EngineTailor source
+45664def85c5b108239a7ab0d69ba6da34916812, preserving the OMoE experiment lineage.
+MiniCPM5 ordered BF16 execution, packed residual RMSNorm and whole-step
+compilation derive from target 1dc682fcde3a80cd6917d0b06d124a79caa112aa.
+MiniCPM5 tapped verification, padded independent M1 projections and DSpark
+integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
+These revisions describe provenance, not qualification of the ApxInf port.
+
+The DSpark adaptation also derives from mlx-dspark, revision
+d6042f38f0aa7dd3e03a2a406111d725056d45a3.
+Copyright (c) 2026 erahim3. MIT License.
+mlx-dspark is an independent MLX port of DeepSeek/DeepSpec's DSpark inference
+algorithm. DSpark architecture/training belongs to DeepSpec's authors.
+Official model weights are separate Apache-2.0 artifacts and are not bundled.
+
+The following MIT terms apply to these adapted portions:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

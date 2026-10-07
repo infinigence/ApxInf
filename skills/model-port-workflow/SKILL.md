@@ -42,6 +42,7 @@ actual family-local owner for each responsibility:
 | Checkpoint config, implementation selection and construction | family `config`/`load`; existing Rust registry and `AutoModel` |
 | Forward order, modality connections and flow schedule | family `Model`; precision-specific composition in Blocks where needed |
 | Request binding, RNG, preparation, graph/cache lifetime | family `ModelRunner` implementing `VlaRuntime` for VLA |
+| Text KV/position, fallible preparation and full logits | family `LlmTrait`; generation `prefill` may return the final row after consuming the complete prompt |
 | Host mapping, packing, device weights, fixed calibration | family `weights` |
 | Public observation and action semantics | Python `<Family>Policy`, existing native `ModelRunner` binding |
 | Device operation or kernel gap | safe model-neutral backend API, then provider implementation |
@@ -64,6 +65,14 @@ unchanged. External engine and CPU paths are private references only. A required
 device/capture path is a blocker, not performance debt. Existing-family status
 and historical GPU evidence do not prove a new family's acceptance.
 
+For the implemented native MLX selections, Qwen3 `bf16-compiled`
+prepares local norm/RoPE and decoder blocks, while `mixed-w8` uses local
+functions, scoped W8 weights and the Q/K Metal fusion. MiniCPM5
+`bf16-compiled` prepares the complete decode step with packed residual/norm;
+its explicit `dspark` variant adds the compiled draft chain and target
+verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
+None of these is CUDA Graph replay or evidence for an unrelated model family.
+
 ## Workflow
 
 1. During preflight, reuse the task's confirmed inputs and execution mode; use
@@ -82,7 +91,7 @@ and historical GPU evidence do not prove a new family's acceptance.
    inputs.
 3. Inventory semantics and weight transformations. Completion: every required
    computation is understood independently of its framework operator name.
-4. Create an execution ledger from reference semantics through safe CUDA calls.
+4. Create an execution ledger from reference semantics through safe device calls.
    Inspect maintained model/Blocks implementations and fused interfaces before the
    portable backend trait. Account for tensor lifetime, reusable KV/state,
    workspace, host traffic, and graph eligibility. Define the intended whole
@@ -90,6 +99,10 @@ and historical GPU evidence do not prove a new family's acceptance.
    input-update mechanism, and capture blockers. Completion: every graph row
    resolves to an ApxInf-native implementation, a private scaffold with a
    named device exit criterion, or a concrete blocker.
+   For MLX, record local, decoder-block and whole-step compile scopes separately;
+   identify explicit dynamic state, prepared shapes and bounded lazy outputs.
+   Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
+   custom kernels there, without a universal model/runtime wrapper.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness
@@ -116,6 +129,14 @@ and historical GPU evidence do not prove a new family's acceptance.
    `RuntimeManaged` status and unsupported policy methods are not readiness.
    Completion: registry loading, native contract, Python policy/public inference
    and family-specific GPU evidence agree in the same change.
+   Keep `LlmTrait::forward` full `[seq_len,vocab_size]`. Use `prefill` for a
+   last-row generation optimization and the request hook for speculative
+   schedules. Test the checkpoint chat template and decoding semantics through
+   the public CLI: `--chat-options '{"enable_thinking":false}'` controls the
+   template; `--keep-special-tokens` preserves semantic special tags (also
+   automatic when chat options contain `tools`). Do not strip MiniCPM's
+   `<function>`/`<param>` tokens from tool XML. An experiment's `/no_think`
+   suffix is frozen replay data, not a universal user-prompt requirement.
 8. Verify operators, transformations, intermediate checkpoints, eager and
    captured inference, host-transfer audit, public serving/policy integration,
    and requested performance. Prove that tensor computation between public
@@ -127,6 +148,21 @@ and historical GPU evidence do not prove a new family's acceptance.
    with performance debt`, or `blocked`). Performance is best effort unless
    explicitly declared a release gate, but applicable existing optimized paths
    must be investigated.
+   For MLX, check compiled parity and explicit-state publication, rather than
+   treating fixed-address capture as its mechanism. Keep changed-input,
+   retained-output and load/reset/drop tests.
+   Use `Compiled::prepare` for admitted shapes and reject `MLX_DISABLE_COMPILE`
+   even when set to `0`; do not double-execute the runtime path. The second
+   prepared invocation must reuse its trace. Bridge upload/download counters
+   describe explicit host IO, trace counters describe Rust tracing, and MLX
+   allocator statistics are process-wide; none alone proves absence of all
+   native JIT, physical transfers or memory growth. Bind source, binary, weights,
+   original complete answers and every measured report; quantized variants need
+   both their precision-matched source comparison and the model-quality floor.
+   Check text `preparation_status()` state and its actual prepared lengths/scopes:
+   `RuntimeManaged` is not proof of readiness; invalidated/unprepared states must
+   not report successful compilation. Keep this pure-data text interface
+   independent of VLA preparation and the family-owned executable resources.
 9. Prepare a product-only diff. Store generated captures, reports, temporary
    adapters, replay scripts, generated plans, and agent state in the ignored
    `<project-root>/devlocal/<feat-name>/` directory according to `AGENTS.md`.

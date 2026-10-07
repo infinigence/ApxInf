@@ -30,11 +30,12 @@ pub use tensor::Tensor;
 pub enum Device {
     Cpu,
     Cuda(usize),
+    Metal(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_))
+        matches!(self, Device::Cuda(_) | Device::Metal(_))
     }
 }
 
@@ -43,6 +44,7 @@ impl std::fmt::Display for Device {
         match self {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
+            Device::Metal(id) => write!(f, "metal:{id}"),
         }
     }
 }

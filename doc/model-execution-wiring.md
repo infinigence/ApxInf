@@ -3,7 +3,7 @@
 Use this guide after model semantics are known and before composing the model
 and its runner. Use the [module ownership table](model-layer-architecture.md#current-module-names-and-responsibilities)
 for names and placement; this guide defines device execution and acceptance.
-It bridges the model equation and ApxInf's safe CUDA interfaces. The purpose is
+It bridges the model equation and ApxInf's safe device interfaces. The purpose is
 to design the maintained hot path, not merely to find an implementation that
 produces the right answer.
 
@@ -38,8 +38,12 @@ bounded warm resource use. Fixed VLA profiles require the complete action loop
 and a whole-model or justified prepared vision/language/action partition.
 Local fusion or an eager-only path does not satisfy completed acceleration.
 CUDA capture, allocation and fixed-address requirements above are unchanged.
-The MLX contract describes required future implementation and evidence; it
-does not establish current backend or model readiness.
+The native backend provides Qwen3 BF16 local functions
+plus decoder blocks, Qwen3 W8 local functions plus a Q/K Metal fusion,
+MiniCPM5 BF16 whole decode steps plus packed residual/norm, and MiniCPM5 DSpark
+compiled draft chains plus target verification. Their exact profiles and
+selection rules are in the [MLX table](mlx-backend.md#implemented-text-selections).
+The public variants are construction choices, not a new universal runtime class.
 
 These are new-port acceptance requirements, not a statement that every existing
 family has migrated. Record a missing device/capture path as a blocker. Once
@@ -79,6 +83,13 @@ CUDA path. A missing `dyn Backend` method does not establish a kernel gap.
 Model code may recover the concrete CUDA seam described in
 [Adding a New Model](adding-a-new-model.md), but must not call raw FFI.
 
+For Metal, inspect `apxinf-mlx` safe arrays and guarded fusions alongside the
+actual Qwen3/MiniCPM5 family composition. `Compiled` is a pure callable owner,
+not a model interpreter. Retain numerical differences explicitly: Qwen3
+multiplies its norm affine weight in FP32 before the BF16 cast; MiniCPM5 rounds
+the normalized value to BF16 first. Shared names do not make those fusions
+interchangeable.
+
 ## Select compositions before primitives
 
 Match sequences of semantics, not isolated framework nodes. Common candidates
@@ -113,6 +124,13 @@ output. The steady-state ledger must have:
   masking, positional encoding, or other layer mathematics;
 - no synchronization introduced only to inspect or transform an intermediate;
 - no per-layer or per-solver-step allocation that could have been prepared.
+
+For MLX, bounded temporary lazy array outputs are distinct from new persistent
+weights, kernels or callable caches. They require warm allocator and lifetime
+evidence; they are never described as allocation-free CUDA replay. For text,
+`forward` returns all `[seq_len,vocab_size]` rows, while generation `prefill`
+may return only the final row after committing every prompt position. Avoid
+materializing discarded prefix heads, but do not change the full-forward API.
 
 Host work is appropriate for checkpoint loading, one-time weight conversion,
 application/robot preprocessing outside the declared runtime contract,
@@ -169,6 +187,27 @@ configuration object is not execution preparation. If graph capture is
 unsupported for a required operation, record the exact operation and failure;
 an eager fallback is observable but does not satisfy a required capture gate. Compare eager
 and replayed outputs before relying on replay latency.
+
+On MLX, use the family's fallible `prepare` and explicit compiled state rather
+than CUDA `GraphWorkspace`. Qwen3 warms admitted prompt/chunk lengths and its
+decoder block; MiniCPM5 warms its whole-step function; DSpark additionally warms
+the draft-input and target-verification row counts. The caller must evaluate
+every new state array before publishing it. Verify actual unchanged-shape input
+rebinding, reset, invalidation and retained outputs. A zero trace-callback count
+observes Rust tracing only; qualify native compilation/resource stability and
+process-wide allocator peaks separately. The public replay example records
+these observations without claiming that a partial replay qualifies a model.
+
+Use `Compiled::prepare` for admitted callable shapes: it evaluates twice and
+requires zero new Rust trace callbacks on the second invocation. Runtime calls
+remain single executions. `MLX_DISABLE_COMPILE` must be absent, including a
+setting of `0`; the backend rejects that environment instead of reporting an
+eager callable as compiled readiness.
+
+Inspect `LlmTrait::preparation_status()` alongside those measurements. Its
+`TextPreparationStatus` identifies the current state, variant, successful
+compile scopes, prepared lengths, KV capacity and retained failure. It is an
+observable preparation snapshot, not an independent numerical or hardware gate.
 
 ## Wiring review
 

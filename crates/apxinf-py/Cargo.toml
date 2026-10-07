@@ -22,6 +22,7 @@ numpy = "0.22"
 
 [features]
 default = []
+mlx = ["apxinf-model/mlx"]
 # Enabled by maturin so the cdylib does not link libpython. Left off for
 # `cargo test`, which needs to link a Python interpreter for the harness.
 extension-module = ["pyo3/extension-module"]

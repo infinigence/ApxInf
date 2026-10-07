@@ -42,7 +42,8 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
+    /// variants are parsed by their family loader. Other families migrate separately.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -294,37 +295,46 @@ impl AutoModel {
             }
         };
 
-        if options.model_variant.is_some()
-            && !matches!(
-                model_name,
-                "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
-            )
-        {
+        if options.model_variant.is_some() && !supports_model_variant(model_name, device) {
             return Err(Error::Other(format!(
                 "model {model_name} does not yet support model_variant"
             )));
         }
         register_builtin_models();
+        let device_name = match device {
+            Device::Cuda(_) => Some("cuda"),
+            Device::Metal(_) => Some("mlx"),
+            Device::Cpu => None,
+        };
+
+        let specific_name = device_name.map(|suffix| format!("{model_name}-{suffix}"));
+        let factory = if matches!(device, Device::Metal(_)) {
+            // Registration is explicit Metal admission. Legacy generic models
+            // may contain CPU helpers or CUDA-only assumptions, so do not send
+            // them an MLX backend merely because their portable methods exist.
+            let name = if model_name.ends_with("-mlx") {
+                model_name
+            } else {
+                specific_name.as_deref().unwrap()
+            };
+            registry::get(name).ok_or(Error::UnsupportedDevice(device))?
+        } else {
+            specific_name
+                .as_deref()
+                .and_then(registry::get)
+                .or_else(|| registry::get(model_name))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "no model implementation for `{model_name}` on {device}"
+                    ))
+                })?
+        };
+        // Resolve admission before touching a device or loading checkpoint data.
         let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
         if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
             configure_cuda_tuning(cuda, path, options)?;
         }
-        let device_name = match device {
-            Device::Cuda(_) => Some("cuda"),
-            Device::Cpu => None,
-        };
-
-        let specific_name = device_name.map(|suffix| format!("{model_name}-{suffix}"));
-        let factory = specific_name
-            .as_deref()
-            .and_then(registry::get)
-            .or_else(|| registry::get(model_name))
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "no model implementation for `{model_name}` on {device}"
-                ))
-            })?;
         let mut loaded = factory(path, device, backend, options)?;
         if let LoadedModel::Text {
             generation_defaults,
@@ -340,6 +350,19 @@ impl AutoModel {
         }
         Ok(loaded)
     }
+}
+
+// Admission only: supported variant names and precision semantics are owned by
+// each family loader, not a second central implementation registry.
+fn supports_model_variant(model_name: &str, device: Device) -> bool {
+    matches!(
+        model_name,
+        "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+    ) || (matches!(device, Device::Metal(_))
+        && matches!(
+            model_name,
+            "qwen3" | "qwen3-mlx" | "minicpm5" | "minicpm5-mlx"
+        ))
 }
 
 #[cfg(feature = "cuda")]
@@ -407,6 +430,55 @@ fn select_cuda_tuning_database_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_rejects_legacy_registry_before_device_or_checkpoint_access() {
+        fn legacy_factory(
+            _path: &Path,
+            _device: Device,
+            _backend: std::sync::Arc<dyn apxinf_core::Backend>,
+            _options: &LoadOptions,
+        ) -> Result<LoadedModel> {
+            Err(Error::Contract("legacy test factory reached"))
+        }
+        registry::register("test_metal_admission_legacy", legacy_factory);
+        let path = Path::new("checkpoint-must-not-be-opened");
+        let options = LoadOptions {
+            model_name: Some("test_metal_admission_legacy".into()),
+            ..LoadOptions::default()
+        };
+        // The existing CPU generic-registry route remains callable.
+        assert!(matches!(
+            AutoModel::load_model(Device::Cpu, path, &options),
+            Err(Error::Contract("legacy test factory reached"))
+        ));
+        for name in ["test_metal_admission_legacy", "llama", "qwen3_vl"] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                matches!(
+                    AutoModel::load_model(Device::Metal(0), path, &options),
+                    Err(Error::UnsupportedDevice(Device::Metal(0)))
+                ),
+                "accepted {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_variant_admission_is_family_and_device_specific() {
+        for name in ["qwen3", "qwen3-mlx", "minicpm5", "minicpm5-mlx"] {
+            assert!(supports_model_variant(name, Device::Metal(0)));
+            assert!(!supports_model_variant(name, Device::Cpu));
+            assert!(!supports_model_variant(name, Device::Cuda(0)));
+        }
+        assert!(!supports_model_variant("llama", Device::Metal(0)));
+        assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
+        assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
+        assert!(supports_model_variant("qwen_drive", Device::Cpu));
+    }
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
