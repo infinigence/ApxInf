@@ -21,7 +21,7 @@ prepare static metadata, submit fixed control flow and receive results. CPU
 intermediate computation and D2H/H2D round trips remain private correctness
 scaffolds and must be replaced before port completion.
 
-Fixed profiles must support CUDA Graph acceleration. Prefer one graph from
+For CUDA targets, fixed profiles must support CUDA Graph acceleration. Prefer one graph from
 canonical device inputs to outputs. For a VLA where concrete blockers prevent
 one graph, the accepted fallback partition covers Vision, Language and Action
 with captured graphs, stable device buffers and device-only handoff. Capture
@@ -29,6 +29,17 @@ the entire fixed-step action/denoising loop in the Action graph. Intermediate
 readback, dynamic allocation and synchronization between segments are not a
 completed port. An eager path remains useful for parity and explicit fallback;
 it does not satisfy this capture gate by itself.
+
+For Apple Silicon MLX ports, use the separate [prepared compiled execution
+contract](mlx-backend.md#prepared-compiled-execution). Compiled functions are
+not CUDA Graphs: report their actual scope and mode, retain device-resident
+input/state/output handoff, verify changed inputs and all new state, and prove
+bounded warm resource use. Fixed VLA profiles require the complete action loop
+and a whole-model or justified prepared vision/language/action partition.
+Local fusion or an eager-only path does not satisfy completed acceleration.
+CUDA capture, allocation and fixed-address requirements above are unchanged.
+The MLX contract describes required future implementation and evidence; it
+does not establish current backend or model readiness.
 
 These are new-port acceptance requirements, not a statement that every existing
 family has migrated. Record a missing device/capture path as a blocker. Once

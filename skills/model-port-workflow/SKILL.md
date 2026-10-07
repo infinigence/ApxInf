@@ -22,7 +22,9 @@ then read the relevant documents from that same source revision:
 4. [`doc/model-execution-wiring.md`](../../doc/model-execution-wiring.md) before
    composing model/Blocks calls, preparing a runner, or deciding that optimized
    coverage is missing. Its accelerator acceptance section defines the native
-   GPU and required capture gates.
+   GPU and required capture gates. For Apple Silicon MLX, also read
+   [`doc/mlx-backend.md`](../../doc/mlx-backend.md) for the separate compiled
+   execution/storage contract; never report MLX compile as CUDA Graph replay.
 5. [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md) whenever
    operator, dtype, layout, shape, or hardware coverage is missing.
 
@@ -55,7 +57,10 @@ runner/capture types; keep concrete precision dispatch out of the runner.
 New accelerator ports must satisfy
 `doc/model-execution-wiring.md#accelerator-port-acceptance`: ApxInf-native GPU
 computation, explicit public transfers, and required fixed-profile capture.
-External engine and CPU paths are private references only. A required missing
+For an MLX target, the backend-specific compiled execution contract applies;
+its explicit IO, scope, warm-resource and eager/compiled checks replace neither
+numerical validation nor device residency. CUDA capture requirements remain
+unchanged. External engine and CPU paths are private references only. A required missing
 device/capture path is a blocker, not performance debt. Existing-family status
 and historical GPU evidence do not prove a new family's acceptance.
 

@@ -37,6 +37,9 @@ apxinf-core / apxinf-cuda
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
+The [MLX backend design](mlx-backend.md) applies these owners to Apple Silicon,
+including opaque lazy storage and a distinct compiled-function execution mode.
+It is an implementation contract, not a statement of current model support.
 
 Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
 private `src/ffi/` declarations. The C/C++ boundary in
