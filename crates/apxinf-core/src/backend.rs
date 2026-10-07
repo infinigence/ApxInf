@@ -1,6 +1,6 @@
 //! Backend abstraction trait and Graph trait for execution capture/replay.
 
-use crate::{Device, Result, SamplingBackend, Tensor};
+use crate::{contracts, Device, Error, Result, SamplingBackend, Tensor};
 use crate::kv_cache::KvCache;
 
 /// Backend-agnostic interface for tensor compute and device management.
@@ -12,6 +12,48 @@ use crate::kv_cache::KvCache;
 ///
 /// Object-safe so models can hold `dyn Backend`.
 pub trait Backend: SamplingBackend {
+    // Portable composition extensions. These are implementation hooks: callers use
+    // the validated `PortableOps` entry points, which check arguments and the
+    // returned shape before and after dispatch. Default errors preserve existing
+    // backend implementations while phase 2 adds device implementations.
+    // See `contracts` and doc/backend-contracts.md for the normative semantics.
+    //
+    // Implement `*_impl` and assume arguments are already structurally valid.
+    // Additive mask *values* are not checked here; see `validate_mask_values`.
+
+    /// Convert F32/F16/BF16 with round-to-nearest-even; preserve shape/device.
+    /// Output is functional, including a same-dtype cast. No FP8 reinterpretation.
+    fn cast_impl(&self, _input: &Tensor, _dtype: crate::DType) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("cast"))
+    }
+
+    /// Materialize a contiguous axis slice without mutating or aliasing inputs.
+    fn slice_axis_impl(&self, _input: &Tensor, _slice: contracts::AxisSlice) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("slice_axis"))
+    }
+
+    /// Concatenate on any axis. All inputs have identical dtype/device/rank.
+    fn concat_axis_impl(&self, _inputs: &[&Tensor], _axis: usize) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("concat_axis"))
+    }
+
+    /// Reorder axes and return contiguous storage; unlike reshape this moves data.
+    fn permute_impl(&self, _input: &Tensor, _axes: &[usize]) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("permute"))
+    }
+
+    /// Materialize right-aligned broadcasting, preserving dtype/device/bits.
+    fn broadcast_to_impl(&self, _input: &Tensor, _shape: &[usize]) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("broadcast_to"))
+    }
+
+    /// Stateless MHA/GQA/MQA with explicit masking and intermediate precision.
+    /// Q[B,Q,Hq,D], K/V[B,K,Hkv,D] -> output shaped like Q. No KV mutation.
+    fn attention_impl(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
+                      _options: &contracts::AttentionOptions<'_>) -> Result<Tensor> {
+        Err(Error::UnsupportedOp("attention"))
+    }
+
     // ── Primitive compute ops ────────────────────────────────────────
 
     /// RMS normalization: output = input * rsqrt(mean(input^2) + eps) * weight
@@ -50,7 +92,7 @@ pub trait Backend: SamplingBackend {
     fn rope_mrope(&self, input: &Tensor, _n_heads: usize, _head_dim: usize,
                   _theta: f32, _sections: [usize; 3], _pos_ids: &[u32]) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("rope_mrope: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("rope_mrope"))
     }
 
     /// LayerNorm with weight + bias (Qwen3-VL vision tower).
@@ -59,14 +101,14 @@ pub trait Backend: SamplingBackend {
     fn layer_norm(&self, input: &Tensor, _weight: &Tensor, _bias: &Tensor,
                   _eps: f32) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("layer_norm: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("layer_norm"))
     }
 
     /// GELU with tanh approximation (Qwen3-VL vision MLP).
     /// Default: `Err(Unsupported)`. CUDA overrides.
     fn gelu_tanh(&self, input: &Tensor) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("gelu_tanh: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("gelu_tanh"))
     }
 
     /// Broadcast-add a `[cols]` bias vector over rows of a `[rows, cols]`
@@ -74,7 +116,7 @@ pub trait Backend: SamplingBackend {
     /// Default: `Err(Unsupported)`. CUDA overrides.
     fn add_bias(&self, input: &Tensor, _bias: &Tensor) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("add_bias: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("add_bias"))
     }
 
     /// Vision 2D-RoPE for Qwen3-VL's ViT. `pos_ids` is a flat u32 slice of
@@ -84,7 +126,7 @@ pub trait Backend: SamplingBackend {
     fn rope_vision_2d(&self, input: &Tensor, _n_heads: usize, _head_dim: usize,
                       _theta: f32, _pos_ids: &[u32]) -> Result<Tensor> {
         let _ = input;
-        Err(crate::Error::Other("rope_vision_2d: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("rope_vision_2d"))
     }
 
     /// Concatenate 2D tensors along the column axis (dim 1).
@@ -93,7 +135,7 @@ pub trait Backend: SamplingBackend {
     /// QKV and Gate/Up weight matrices for the fused GEMM path.
     /// Default: `Err(Unsupported)`. CUDA overrides (D2D memcpy).
     fn concat_2d(&self, _tensors: &[&Tensor]) -> Result<Tensor> {
-        Err(crate::Error::Other("concat_2d: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("concat_2d"))
     }
 
     /// Non-causal full attention for the vision tower. Q/K/V each
@@ -101,7 +143,7 @@ pub trait Backend: SamplingBackend {
     /// Default: `Err(Unsupported)`. CUDA overrides.
     fn vision_sdpa(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor,
                    _seq_len: usize, _n_heads: usize, _head_dim: usize) -> Result<Tensor> {
-        Err(crate::Error::Other("vision_sdpa: not supported on this backend".into()))
+        Err(Error::UnsupportedOp("vision_sdpa"))
     }
 
     /// Embedding lookup: table[ids] -> output [seq_len, embed_dim]
@@ -192,4 +234,180 @@ impl RopeKind {
 pub trait Graph {
     /// Replay the captured graph. Inputs must already be updated in-place.
     fn replay(&self) -> Result<()>;
+}
+
+/// Validated entry points for the portable operators.
+///
+/// Blanket-implemented for every [`Backend`], including `dyn Backend`, so a
+/// backend cannot override or skip validation: it only implements the `*_impl`
+/// hooks. Each method validates arguments against [`contracts`], dispatches,
+/// then checks the returned shape against the contract before handing it back.
+///
+/// Import this trait to call the portable ops:
+/// `use apxinf_core::{Backend, PortableOps};`
+pub trait PortableOps {
+    fn cast(&self, input: &Tensor, dtype: crate::DType) -> Result<Tensor>;
+    fn slice_axis(&self, input: &Tensor, slice: contracts::AxisSlice) -> Result<Tensor>;
+    fn concat_axis(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor>;
+    fn permute(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor>;
+    fn broadcast_to(&self, input: &Tensor, shape: &[usize]) -> Result<Tensor>;
+    fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor,
+                 options: &contracts::AttentionOptions<'_>) -> Result<Tensor>;
+
+    /// Dispatch against a plan validated once at plan-build time. The per-call
+    /// cost is a fixed set of comparisons (device, shape, dtype, extent) instead
+    /// of a full structural validation. Prefer this on hot paths.
+    fn attention_planned(
+        &self,
+        plan: &contracts::AttentionPlan,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &contracts::AttentionOptions<'_>,
+    ) -> Result<Tensor>;
+}
+
+/// Confirm an implementation honoured the contract it was given: exact shape and
+/// dtype, the backend's own device, and storage large enough for the result it
+/// claims. Cheap (rank-sized) and kept in release builds so a backend bug surfaces
+/// as an error rather than as silently misinterpreted downstream data.
+///
+/// `expected` is an iterator so the caller never materializes the expected shape;
+/// a `Vec` is built only on the error path, to format the message.
+///
+/// Shape alone is not enough: a `cast` that returns its input unchanged preserves
+/// the shape while ignoring the requested dtype, and a short-storage result would
+/// be read out of bounds downstream.
+fn check_output<I>(
+    op: &'static str,
+    out: Tensor,
+    expected: I,
+    dtype: crate::DType,
+    device: Device,
+) -> Result<Tensor>
+where
+    I: ExactSizeIterator<Item = usize> + Clone,
+{
+    let dims = out.shape().dims();
+    if dims.len() != expected.len() || !dims.iter().copied().eq(expected.clone()) {
+        return Err(Error::ShapeMismatch {
+            expected: format!("{op} -> {:?}", expected.collect::<Vec<_>>()),
+            got: format!("{dims:?}"),
+        });
+    }
+    if out.dtype() != dtype {
+        return Err(Error::DTypeMismatch {
+            expected: dtype,
+            got: out.dtype(),
+        });
+    }
+    // Device residency plus storage extent for the shape/dtype just checked.
+    contracts::tensor_storage(&out, device)?;
+    Ok(out)
+}
+
+impl<B: Backend + ?Sized> PortableOps for B {
+    fn cast(&self, input: &Tensor, dtype: crate::DType) -> Result<Tensor> {
+        let device = self.device();
+        contracts::float_tensor(input, device)?;
+        if !dtype.is_float() {
+            return Err(Error::UnsupportedDType {
+                got: dtype,
+                allowed: "f32, f16, bf16",
+            });
+        }
+        // Output dtype may be wider than the input's, so re-check the byte extent.
+        contracts::checked_bytes(input.shape().dims(), dtype)?;
+        let out = self.cast_impl(input, dtype)?;
+        check_output("cast", out, input.shape().dims().iter().copied(), dtype, device)
+    }
+
+    fn slice_axis(&self, input: &Tensor, slice: contracts::AxisSlice) -> Result<Tensor> {
+        // Layout ops preserve bits, so any dtype is admissible.
+        let device = self.device();
+        let dims = input.shape().dims();
+        contracts::tensor_storage(input, device)?;
+        slice.validate(dims)?;
+        let expected = (0..dims.len()).map(|i| slice.output_dim(dims, i));
+        contracts::checked_bytes_iter(expected.clone(), input.dtype())?;
+        let out = self.slice_axis_impl(input, slice)?;
+        check_output("slice_axis", out, expected, input.dtype(), device)
+    }
+
+    fn concat_axis(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor> {
+        let device = self.device();
+        let first = *inputs
+            .first()
+            .ok_or(Error::Contract("concat requires at least one input"))?;
+        for t in inputs {
+            contracts::tensor_storage(t, device)?;
+            if t.dtype() != first.dtype() {
+                return Err(Error::DTypeMismatch {
+                    expected: first.dtype(),
+                    got: t.dtype(),
+                });
+            }
+        }
+        let dims: Vec<&[usize]> = inputs.iter().map(|t| t.shape().dims()).collect();
+        let total = contracts::validate_concat(&dims, axis)?;
+        let base = first.shape().dims();
+        let expected = (0..base.len()).map(|i| if i == axis { total } else { base[i] });
+        contracts::checked_bytes_iter(expected.clone(), first.dtype())?;
+        let out = self.concat_axis_impl(inputs, axis)?;
+        check_output("concat_axis", out, expected, first.dtype(), device)
+    }
+
+    fn permute(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor> {
+        let device = self.device();
+        let dims = input.shape().dims();
+        contracts::tensor_storage(input, device)?;
+        contracts::validate_permutation(dims, axes)?;
+        let expected = axes.iter().map(|&a| dims[a]);
+        // Same element count as the validated input, so no byte re-check needed.
+        let out = self.permute_impl(input, axes)?;
+        check_output("permute", out, expected, input.dtype(), device)
+    }
+
+    fn broadcast_to(&self, input: &Tensor, shape: &[usize]) -> Result<Tensor> {
+        let device = self.device();
+        contracts::tensor_storage(input, device)?;
+        contracts::broadcast_shape(input.shape().dims(), shape)?;
+        // Broadcasting expands the element count, so the byte extent can overflow
+        // even when the element count itself is representable.
+        contracts::checked_bytes(shape, input.dtype())?;
+        let out = self.broadcast_to_impl(input, shape)?;
+        check_output(
+            "broadcast_to",
+            out,
+            shape.iter().copied(),
+            input.dtype(),
+            device,
+        )
+    }
+
+    fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor,
+                 options: &contracts::AttentionOptions<'_>) -> Result<Tensor> {
+        let plan = contracts::AttentionPlan::new(self.device(), q, k, v, options)?;
+        self.attention_planned(&plan, q, k, v, options)
+    }
+
+    fn attention_planned(
+        &self,
+        plan: &contracts::AttentionPlan,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        options: &contracts::AttentionOptions<'_>,
+    ) -> Result<Tensor> {
+        let device = self.device();
+        plan.check_operands(device, q, k, v, options)?;
+        let out = self.attention_impl(q, k, v, options)?;
+        check_output(
+            "attention",
+            out,
+            plan.output_shape().iter().copied(),
+            plan.dtype(),
+            device,
+        )
+    }
 }
