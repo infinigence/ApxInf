@@ -68,6 +68,40 @@ impl Tensor {
         }
     }
 
+    /// Retain a thread-affine backend array without pretending it is a pointer.
+    ///
+    /// Validates the logical extent; the backend is responsible for downcasting
+    /// `owner` and validating its native dtype/device/extent before every use.
+    /// CPU data uses `from_raw` so CPU access never encounters an opaque owner.
+    #[cfg(feature = "opaque-storage")]
+    pub fn from_opaque_parts(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+        num_bytes: usize,
+        owner: std::rc::Rc<dyn std::any::Any>,
+    ) -> Result<Self> {
+        if !device.is_gpu() {
+            return Err(Error::UnsupportedDevice(device));
+        }
+        let expected = crate::contracts::checked_bytes(shape.dims(), dtype)?;
+        if num_bytes < expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                got: num_bytes,
+            });
+        }
+        Ok(Self {
+            shape,
+            dtype,
+            device,
+            storage: Storage::Opaque {
+                device,
+                handle: crate::storage::OpaqueStorageHandle::new(owner, num_bytes),
+            },
+        })
+    }
+
     /// Create a zero-filled tensor on CPU.
     pub fn zeros(shape: impl Into<Shape>, dtype: DType) -> Self {
         let shape = shape.into();
@@ -284,10 +318,18 @@ impl Tensor {
     /// Reshape the tensor (must preserve total element count).
     pub fn reshape(&self, new_shape: impl Into<Shape>) -> Result<Self> {
         let new_shape = new_shape.into();
-        if new_shape.numel() != self.shape.numel() {
+        let count = |shape: &Shape| {
+            shape.dims().iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d)
+                    .ok_or(Error::Contract("reshape element count overflow"))
+            })
+        };
+        let dst_numel = count(&new_shape)?;
+        let src_numel = count(&self.shape)?;
+        if dst_numel != src_numel {
             return Err(Error::ReshapeError {
-                src_numel: self.shape.numel(),
-                dst_numel: new_shape.numel(),
+                src_numel,
+                dst_numel,
             });
         }
         // For CPU tensors, share the data (clone the bytes).
@@ -304,6 +346,16 @@ impl Tensor {
                 dtype: self.dtype,
                 device: *device,
                 storage: Storage::Gpu {
+                    device: *device,
+                    handle: handle.clone(),
+                },
+            }),
+            #[cfg(feature = "opaque-storage")]
+            Storage::Opaque { device, handle } => Ok(Self {
+                shape: new_shape,
+                dtype: self.dtype,
+                device: *device,
+                storage: Storage::Opaque {
                     device: *device,
                     handle: handle.clone(),
                 },

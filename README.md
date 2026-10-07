@@ -8,7 +8,7 @@ ApxInf is a reimagined edge inference engine born of the agentic coding era,
 combining high performance, reliability, and energy efficiency across devices
 with an evolving agentic workflow that radically simplifies custom model development.
 
-- implemented with system language Rust with no other externel dependencies
+- implemented in Rust, with backend-specific native dependencies
 - embodied AI is highest priority, VLA/WAM models on Jetson/DriveOS Thor/Orin
 - Agentically optimized CUDA Kernels
 
@@ -19,6 +19,29 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
 ## Quick start
 
 Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf) for instructions.
+
+### Native Apple Silicon text inference
+
+The optional `mlx` feature runs Qwen3-0.6B and MiniCPM5-2B through native Rust
+models and the MLX 0.31.2 C++/Metal runtime. It does not run a Python model.
+Qwen3 offers BF16 and mixed W8 selections; MiniCPM5 offers BF16 and an explicit
+DSpark drafter selection. Existing CUDA VLA families retain their own support
+scope.
+
+```sh
+export MLX_ROOT=/path/to/mlx-0.31.2
+export DYLD_LIBRARY_PATH="$MLX_ROOT/lib"
+export CARGO_TARGET_DIR=devlocal/apxinf-mlx/cargo-target
+cargo build --release --features mlx
+"$CARGO_TARGET_DIR/release/apxinf" generate \
+  --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
+  --model-variant bf16-compiled --greedy --max-tokens 160 \
+  --chat-options '{"enable_thinking":false}' --prompt 'Explain gravity briefly.'
+```
+
+See the [MLX architecture and supported profiles](doc/mlx-backend.md) and
+[native SDK setup](crates/apxinf-mlx/README.md) for build requirements,
+MiniCPM/DSpark commands and supported options.
 
 ### Quickly benchmarking PI-0.5
 

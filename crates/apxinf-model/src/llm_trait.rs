@@ -6,6 +6,7 @@ use apxinf_core::{
     Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSamplingInit, TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
+use serde::Serialize;
 
 use crate::generation_config::{GenerationOptions, ResolvedGenerationOptions};
 use crate::profiling::GenerationProfile;
@@ -69,6 +70,70 @@ impl LlmCapabilities {
     pub const VISION: Self = Self { image: true };
 }
 
+/// Observable preparation state for text inference. This is separate from
+/// the VLA preparation contract and does not select or prepare an execution path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPreparationState {
+    /// The implementation does not expose explicit preparation. This is not
+    /// evidence that resources have been prepared or compilation has succeeded.
+    #[default]
+    RuntimeManaged,
+    Unprepared,
+    /// All required preparation has succeeded for the reported profiles.
+    Ready,
+    /// Preparation or execution failed and the reported error requires recovery.
+    Invalidated,
+}
+
+/// A compiled scope that the implementation has successfully prepared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextCompilationScope {
+    LocalSubgraphs,
+    DecoderBlock,
+    DecodeStep,
+    DraftProposal,
+}
+
+/// A snapshot of family-owned preparation, without owning runtime resources.
+///
+/// `compiled_scopes` lists only successfully prepared required scopes: execution
+/// of their admitted profiles must fail rather than silently fall back to an
+/// uncompiled path. A selected variant alone does not establish preparation.
+/// Empty scopes do not imply that an implementation has no optimized operations.
+/// The family defines the scope/profile relationship; these fields do not promise
+/// the absence of driver JIT, retracing, host transfers, or temporary allocations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TextPreparationStatus {
+    pub state: TextPreparationState,
+    pub implementation: &'static str,
+    pub variant: Option<&'static str>,
+    pub compiled_scopes: Vec<TextCompilationScope>,
+    pub prepared_prompt_tokens: Option<usize>,
+    /// The successfully admitted sequence lengths, in ascending order.
+    pub prepared_sequence_lengths: Vec<usize>,
+    pub kv_capacity: Option<usize>,
+    pub max_decode_rows: Option<usize>,
+    pub error: Option<String>,
+}
+
+impl Default for TextPreparationStatus {
+    fn default() -> Self {
+        Self {
+            state: TextPreparationState::RuntimeManaged,
+            implementation: "legacy",
+            variant: None,
+            compiled_scopes: Vec::new(),
+            prepared_prompt_tokens: None,
+            prepared_sequence_lengths: Vec::new(),
+            kv_capacity: None,
+            max_decode_rows: None,
+            error: None,
+        }
+    }
+}
+
 /// Complete prompt plus generation policy.
 #[derive(Clone, Copy, Debug)]
 pub struct GenerationRequest<'a> {
@@ -114,7 +179,17 @@ pub trait LlmTrait {
         LlmCapabilities::TEXT_ONLY
     }
 
+    /// Inspect family-owned preparation without performing compilation, changing
+    /// state, or selecting a runtime. Legacy implementations report
+    /// [`TextPreparationState::RuntimeManaged`], which is not an explicit Ready.
+    fn preparation_status(&self) -> TextPreparationStatus {
+        TextPreparationStatus::default()
+    }
+
     /// Process a complete prompt and return its logits.
+    /// A generation-oriented implementation may return only the final row
+    /// `[1, vocab_size]`, after consuming every prompt position into its state.
+    /// Call [`Self::forward`] when logits for every input position are needed.
     ///
     /// Text-only models inherit this implementation. It rejects image input
     /// explicitly instead of silently ignoring it. Vision-language models
