@@ -1,4 +1,4 @@
-"""Benchmark measurements must exercise real stop points and deterministic input."""
+"""Benchmark measurements preserve their recorded-frame and synthetic paths."""
 import importlib.util
 from pathlib import Path
 import sys
@@ -17,49 +17,47 @@ def load(name):
     return module
 
 
-def test_ar_fit_uses_identical_input_and_verified_prefixes(monkeypatch):
+def test_ar_fit_uses_distinct_observed_frame_lengths(monkeypatch):
     bench = load('bench_pi0_fast')
-    full = np.array([9, 1, 9, 2, 3, 4, 5, 6], dtype=np.uint32)
     clock = [0.0]
     observed = []
-    payload = object()
 
-    def call(observation, stop):
-        assert observation is payload
-        length = len(full) if stop is None else full.tolist().index(stop) + 1
-        observed.append(length)
-        clock[0] += (30 + 10 * length) / 1000
-        return full[:length]
+    def call(steps):
+        observed.append(steps)
+        clock[0] += (30 + 10 * steps) / 1000
+        return np.arange(steps, dtype=np.uint32)
 
     monkeypatch.setattr(bench.time, 'perf_counter', lambda: clock[0])
-    result = bench._run_ar(call, payload, repeats=3, warmup=2)
-    assert len(set(observed)) >= 2
+    result = bench._run_ar(call, [2, 4, 4], survey=3, repeats=3)
+    assert observed == [2, 4, 4, 2, 2, 2, 4, 4, 4]
     assert result['fit']['fixed_ms'] == pytest.approx(30)
     assert result['fit']['per_step_ms'] == pytest.approx(10)
-    assert all(len(samples) == 3 for samples in result['samples_ms'].values())
+    assert [point['steps'] for point in result['fit']['points']] == [2, 4]
 
 
-def test_ar_fit_rejects_a_changed_token_prefix():
+def test_ar_fit_with_one_decode_length_has_no_split():
     bench = load('bench_pi0_fast')
-
-    def call(_, stop):
-        return np.arange(8, dtype=np.uint32) if stop is None else np.array([99])
-
-    with pytest.raises(RuntimeError, match='changed the generated token prefix'):
-        bench._run_ar(call, None, repeats=1, warmup=0)
+    result = bench._run_ar(lambda _: np.ones(8, dtype=np.uint32), [0, 1], 2, 1)
+    assert result['fit'] is None
 
 
-def test_ar_fit_rejects_unidentifiable_per_token_cost():
+def test_recorded_frames_remain_optional(tmp_path):
     bench = load('bench_pi0_fast')
-    with pytest.raises(RuntimeError, match='fewer than two'):
-        bench._run_ar(lambda *_: np.ones(8, dtype=np.uint32), None, 1, 0)
+    path = tmp_path / 'frames.npz'
+    images = np.zeros((2, 2, 2, 3), dtype=np.uint8)
+    states = np.zeros((2, 8), dtype=np.float32)
+    np.savez(path, base_raw=images, wrist_raw=images, state=states, task=['a', 'b'])
+    frames = bench._load_frames(path, 'raw', 1)
+    assert len(frames) == 1
+    assert frames[0]['state'].shape == (8,)
+    assert frames[0]['task'] == 'a'
 
 
-def test_warmup_is_not_limited_by_input_count():
+def test_warmup_matches_original_input_count_limit():
     bench = load('bench_pi0_fast')
     calls = []
     bench._time_stream(lambda item: calls.append(item) or [1], ['a'], 3, 10)
-    assert calls == ['a'] * 13
+    assert calls == ['a'] * 4
 
 
 def test_drive_constructs_complete_deterministic_observation():
