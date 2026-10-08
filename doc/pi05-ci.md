@@ -137,6 +137,8 @@ CUDA toolchain, `nvpmodel`, `jetson_clocks`, Thor's `nvidia-smi` or Orin's
 with `scripts/requirements-pi05-ci.txt`. The wrapper builds `apxinf-py` with
 `cuda,extension-module` against that Python. CUDA builds need the repository's
 native-kernel dependencies and may take substantially longer than inference.
+The GPU job's 90-minute timeout is an operational cap, not a latency budget:
+the first SM87 build exceeded 40 minutes before the six model runs started.
 The candidate checkout retains ignored Cargo caches between runs; tracked or
 untracked source dirt is still rejected. The wrapper selects the extension from
 Cargo's successful artifact record rather than assuming a pre-existing filename.

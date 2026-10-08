@@ -50,7 +50,7 @@ jobs:
       matrix:
         board: [thor, orin]
     runs-on: [self-hosted, Linux, ARM64, '${{ matrix.board }}', pi05-ci]
-    timeout-minutes: 60
+    timeout-minutes: 90
     concurrency:
       group: pi05-board-${{ matrix.board }}
       cancel-in-progress: false
