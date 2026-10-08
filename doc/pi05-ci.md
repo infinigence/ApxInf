@@ -132,7 +132,8 @@ requires an explicit bank review and regeneration with pinned OpenPI.
 ## Offline board deployment
 
 Linux ARM64 runners need Git, Bash, flock, realpath, Rust/Cargo, the supported
-CUDA toolchain, `nvpmodel`, `jetson_clocks`, `tegrastats`, and a Python environment
+CUDA toolchain, `nvpmodel`, `jetson_clocks`, Thor's `nvidia-smi` or Orin's
+`tegrastats`/`stdbuf`, and a Python environment
 with `scripts/requirements-pi05-ci.txt`. The wrapper builds `apxinf-py` with
 `cuda,extension-module` against that Python. CUDA builds need the repository's
 native-kernel dependencies and may take substantially longer than inference.
@@ -151,6 +152,9 @@ Create an operator-owned environment JSON per board with `hardware`,
 `nvpmodel_sha256`, `clocks_sha256`, and `temperature_ceiling_c`. The digests are
 of stripped `nvpmodel -q` and `jetson_clocks --show` stdout. Configure stable
 clocks before collecting baseline; this script never changes power settings.
+On Jetson, the clocks query requires root. Give the runner narrowly scoped
+passwordless permission for `sudo -n /usr/bin/jetson_clocks --show`, not broad
+sudo access. The stock preflight uses that read-only command.
 The temperature ceiling must come from the approved performance envelope.
 Exact clock receipt checks intentionally reject a changed operating mode.
 
