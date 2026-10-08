@@ -75,3 +75,20 @@ Lock CPU/GPU/EMC clocks and fan and exclude other GPU work. Keep raw samples,
 engine/native-binary and model/calibration identities. The script adds artifact
 identities to its JSON report. Keep the historical table values as reference
 until their original frame workload and measurement setup are reproduced.
+
+## Real task evaluation
+
+LIBERO success rates require simulator observations and the checkpoint's action
+normalization. The shared evaluator uses the policy's declared state width, so
+PI0-FAST receives both mirrored finger joints in its eight-value state:
+
+```sh
+python scripts/eval_libero.py --backend in-process \
+  --model-dir /models/pi0fast-libero-v044 --precision bf16 \
+  --suite libero_10 --trials-per-task 10 --seed 7 \
+  --results-jsonl devlocal/pi0fast-eval/results.jsonl \
+  --summary-json devlocal/pi0fast-eval/summary.json
+```
+
+In APXinf-robo, use `apxinf-robo eval-libero` with the same model, suite and
+precision. Constructed benchmark inputs are not used for task scoring.

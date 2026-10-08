@@ -256,6 +256,21 @@ Robo's `scripts/bench_gr00t.py` forwards to this same implementation in its
 pinned ApxInf checkout. It takes the same arguments. The table retains the
 previously published results; use the command above for new measurements.
 
+Real LIBERO task evaluation uses simulator observations through the shared
+evaluator. It selects GR00T's named state and decoded-gripper adapter:
+
+```sh
+python scripts/eval_libero.py --backend in-process \
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16 \
+  --suite libero_10 --trials-per-task 10 --seed 7 \
+  --max-steps 720 --replan-steps 8 \
+  --results-jsonl devlocal/gr00t-eval/results.jsonl \
+  --summary-json devlocal/gr00t-eval/summary.json
+```
+
+Use the matching FP8 calibration or Orin INT8 precision for those campaigns.
+The constructed benchmark tensors are never scored as task observations.
+
 ## Validation contract
 
 Correctness comparison uses the same official processor output, embodiment ID,
