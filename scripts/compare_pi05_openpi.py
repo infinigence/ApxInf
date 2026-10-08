@@ -102,65 +102,57 @@ def prepare(args: argparse.Namespace) -> None:
         raise ValueError("--image-keys requires 1-3 distinct keys")
     if args.horizon < 1 or args.num_flow_steps < 1:
         raise ValueError("horizon and flow steps must be positive")
-    if args.case_npz:
-        cases = []
-        for path in args.case_npz:
-            with np.load(path, allow_pickle=False) as archive:
-                images = np.stack([image_to_uint8_hwc(image) for image in archive["images"]])
-                if len(images) < len(keys):
-                    raise ValueError("saved observation has too few cameras")
-                tokens = np.asarray(archive["token_ids"])
-                noise = np.asarray(archive["noise"])
-                if tokens.ndim != 1 or tokens.size == 0 or not np.issubdtype(tokens.dtype, np.integer):
-                    raise ValueError("token_ids must be a nonempty integer vector")
-                if tokens.min() < 0 or tokens.max() >= 257152:
-                    raise ValueError("token outside PI05 vocabulary")
-                if noise.shape != (args.horizon, 32) or not np.isfinite(noise).all():
-                    raise ValueError("noise must be finite with shape (horizon, 32)")
-                cases.append(save_case(root, path.stem, images[:len(keys)], tuple(tokens),
-                                       noise.astype(np.float32)))
-        write_json(root / "manifest.json", {
-            "schema": SCHEMA, "image_keys": keys, "horizon": args.horizon,
-            "num_flow_steps": args.num_flow_steps, "seed": args.seed,
-            "source_paths": [str(path.resolve()) for path in args.case_npz],
-            "input_kind": "frozen-model-inputs", "representative": False, "cases": cases,
-        }, force=args.force)
-        load_suite(root)
-        return
-    sources = [source_images(path, keys) for path in args.source_npz]
-    if not sources and not args.diagnostic:
-        raise ValueError("supply real --source-npz observations or explicitly use --diagnostic")
-    base = sources[0] if sources else synthetic_images(len(keys))
-    rng = np.random.default_rng(args.seed)
-    first = rng.standard_normal((args.horizon, 32)).astype(np.float32)
-    second = rng.standard_normal((args.horizon, 32)).astype(np.float32)
-    cases = [save_case(root, "typical", base, SHORT_TOKENS, first)]
-    for index, source in enumerate(sources[2:], 2):
-        cases.append(save_case(root, f"scene-{index}", source, SHORT_TOKENS, first))
-    cases.append(save_case(root, "second-scene" if len(sources) >= 2 else "second-noise",
-                           sources[1] if len(sources) >= 2 else base, SHORT_TOKENS, second))
-    cases.append(save_case(root, "long-language", base, LONG_TOKENS, first))
-    cases.append(save_case(root, "dark-zero-noise", np.zeros_like(base),
-                           SHORT_TOKENS, np.zeros_like(first)))
-    cases.append(save_case(root, "bright-negative-noise", np.full_like(base, 255),
-                           SHORT_TOKENS, -first))
-    chw = np.moveaxis(base.astype(np.float32) / 255, -1, 1)
-    cases.append(save_case(root, "float-chw", chw, SHORT_TOKENS, first))
-    contrast = np.stack([
-        np.full_like(base[0], (view * 83 + 17) % 256) for view in range(len(keys))
-    ])
-    cases.append(save_case(root, "view-order-contrast", contrast, SHORT_TOKENS, first))
+    if not (args.case_npz or args.source_npz or args.diagnostic):
+        raise ValueError("supply frozen --case-npz observations or explicitly use --diagnostic")
+    cases = []
+    for path in args.case_npz:
+        with np.load(path, allow_pickle=False) as archive:
+            images = np.stack([image_to_uint8_hwc(image) for image in archive["images"]])
+            if len(images) < len(keys):
+                raise ValueError("saved observation has too few cameras")
+            tokens, noise = np.asarray(archive["token_ids"]), np.asarray(archive["noise"])
+            if tokens.ndim != 1 or not tokens.size or not np.issubdtype(tokens.dtype, np.integer):
+                raise ValueError("token_ids must be a nonempty integer vector")
+            if tokens.min() < 0 or tokens.max() >= 257152:
+                raise ValueError("token outside PI05 vocabulary")
+            if noise.shape != (args.horizon, 32) or not np.isfinite(noise).all():
+                raise ValueError("noise must be finite with shape (horizon, 32)")
+            cases.append(save_case(root, path.stem, images[:len(keys)], tuple(tokens),
+                                   noise.astype(np.float32)))
+    if args.diagnostic or args.source_npz:
+        sources = [source_images(path, keys) for path in args.source_npz]
+        base = sources[0] if sources else synthetic_images(len(keys))
+        rng = np.random.default_rng(args.seed)
+        first = rng.standard_normal((args.horizon, 32)).astype(np.float32)
+        second = rng.standard_normal((args.horizon, 32)).astype(np.float32)
+        contrast = np.stack([np.full_like(base[0], (view * 83 + 17) % 256) for view in range(len(keys))])
+        diagnostic = [
+            ("typical", base, SHORT_TOKENS, first),
+            ("second-scene" if len(sources) >= 2 else "second-noise",
+             sources[1] if len(sources) >= 2 else base, SHORT_TOKENS, second),
+            ("long-language", base, LONG_TOKENS, first),
+            ("dark-zero-noise", np.zeros_like(base), SHORT_TOKENS, np.zeros_like(first)),
+            ("bright-negative-noise", np.full_like(base, 255), SHORT_TOKENS, -first),
+            ("float-chw", np.moveaxis(base.astype(np.float32) / 255, -1, 1), SHORT_TOKENS, first),
+            ("view-order-contrast", contrast, SHORT_TOKENS, first),
+        ]
+        diagnostic.extend((f"scene-{index}", source, SHORT_TOKENS, first)
+                          for index, source in enumerate(sources[2:], 2))
+        cases.extend(save_case(root, *case) for case in diagnostic)
     if args.force:
         for name in ("openpi.json", "apxinf.json", "report.json"):
             (root / name).unlink(missing_ok=True)
+    kind = "frozen-model-inputs" if args.case_npz else "image-replay" if args.source_npz else "diagnostic"
+    if args.case_npz and (args.source_npz or args.diagnostic):
+        kind = "mixed"
     write_json(root / "manifest.json", {
         "schema": SCHEMA, "image_keys": keys, "horizon": args.horizon,
         "num_flow_steps": args.num_flow_steps, "seed": args.seed,
-        "source_paths": [str(path.resolve()) for path in args.source_npz],
-        "input_kind": "image-replay" if sources else "diagnostic",
-        "representative": False, "cases": cases,
+        "source_paths": [str(path.resolve()) for path in args.case_npz + args.source_npz],
+        "input_kind": kind, "representative": False, "cases": cases,
     }, force=args.force)
-    print(f"Prepared {len(cases)} cases in {root} (diagnostic/image-replay, not representative)")
+    load_suite(root)
+    print(f"Prepared {len(cases)} cases in {root} (input_kind={kind}, representative=False)")
 
 
 def load_suite(root: Path) -> dict[str, Any]:
