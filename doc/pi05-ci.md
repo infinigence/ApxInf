@@ -186,6 +186,8 @@ measurement window. Save build/preflight logs, raw outputs and summary JSON.
    default branch. Board concurrency and the shared lock reserve hardware.
    Missing runners queue; busy/invalid environments fail and must be resubmitted.
 5. A GitHub-hosted publisher validates both complete reports and their bank/SHA,
+   verifies artifact input/golden hashes and recomputes accuracy/performance
+   from the raw actions and latency samples rather than trusting green summaries,
    then writes `pi05/gpu` on the **tested PR SHA**. Only this hosted job has
    status-write permission. A newer PR commit needs a new dispatch. Failure or
    stale/partial evidence produces failure, not a green partial matrix.

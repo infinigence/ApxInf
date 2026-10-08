@@ -85,6 +85,21 @@ class ReceiptTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parity.load_suite(self.root)
 
+    def test_replay_keeps_all_three_source_observations(self):
+        paths = []
+        for index in range(3):
+            path = self.root / f"source-{index}.npz"
+            np.savez(path, base=np.full((224, 224, 3), index, np.uint8))
+            paths.append(path)
+        suite = self.root / "replay"
+        args = parity.parse_args(["prepare", "--suite-dir", str(suite), "--image-keys", "base"])
+        args.source_npz = paths
+        parity.prepare(args)
+        manifest = parity.load_suite(suite)
+        values = {int(parity.load_case(suite, case)["images"].flat[0])
+                  for case in manifest["cases"] if case["name"] in ("typical", "second-scene", "scene-2")}
+        self.assertEqual(values, {0, 1, 2})
+
 
 class MatrixTest(unittest.TestCase):
     def setUp(self):
@@ -94,18 +109,45 @@ class MatrixTest(unittest.TestCase):
         self.bank = {"schema": ci.SCHEMA, "cells": [
             {"id": f"{board}-{precision}-{views}", "hardware": board, "precision": precision,
              "views": views, "samples": 2, "budget_reason": "test fixture only",
-             "reference_limits": LIMITS, "baseline_limits": LIMITS}
+             "reference_limits": LIMITS, "baseline_limits": LIMITS,
+             "performance_limits": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30}}
             for board, precisions in ci.PRECISIONS.items() for precision in precisions for views in (1, 2, 3)]}
+        for cell in self.bank["cells"]:
+            self.make_evidence(cell)
         self.path = self.root / "bank.json"
         self.save_bank()
         self.reports = []
         for board in ci.PRECISIONS:
-            path = self.root / f"{board}.json"
+            path = self.root / board / "summary.json"
             parity.write_json(path, {"schema": ci.SCHEMA, "revision": SHA, "hardware": board,
                                     "bank_sha256": self.digest, "passed": True,
                                     "cells": [{"id": cell["id"], "passed": True}
                                               for cell in self.bank["cells"] if cell["hardware"] == board]})
             self.reports.append(path)
+
+    def make_evidence(self, cell):
+        output = self.root / cell["hardware"]
+        suite = output / "evidence" / cell["id"]
+        entry = parity.save_case(suite, "one", np.zeros((cell["views"], 224, 224, 3), np.uint8),
+                                 (2, 108), np.zeros((2, 32), np.float32))
+        parity.write_json(suite / "manifest.json", {
+            "schema": parity.SCHEMA, "cases": [entry], "image_keys": list(range(cell["views"])),
+            "horizon": 2, "num_flow_steps": 10,
+        })
+        receipt = {"schema": parity.SCHEMA, "suite_sha256": parity.sha256(suite / "manifest.json"),
+                   "engine": "apxinf", "revision": SHA, "precision": cell["precision"],
+                   "hardware": cell["hardware"], "calibration_sha256": None,
+                   "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64,
+                   "revisit_max_abs": 0, "cases": [{"name": "one", "input_sha256": entry["sha256"],
+                   "actions": np.ones((2, 32)).tolist(), "repeat_max_abs": 0,
+                   "first_call_ms": 20, "latency_ms": [10, 11]}]}
+        parity.write_json(output / f"{cell['id']}.json", receipt)
+        parity.write_json(suite / "baseline.json", receipt)
+        parity.write_json(suite / "reference.json", dict(receipt, engine="openpi"))
+        for key, name in (("suite", "manifest.json"), ("reference", "reference.json"), ("baseline", "baseline.json")):
+            cell[key] = {"path": str(suite / name), "sha256": parity.sha256(suite / name)}
+        cell["checkpoint"] = {"path": "unused", "sha256": "b" * 64}
+        cell["config"] = {"path": "unused", "sha256": "c" * 64}
 
     def save_bank(self):
         parity.write_json(self.path, self.bank, force=True)
@@ -144,6 +186,14 @@ class MatrixTest(unittest.TestCase):
         report = ci.read_json(self.reports[0])
         report["cells"][0]["passed"] = False
         parity.write_json(self.reports[0], report, force=True)
+        self.assertEqual(ci.aggregate(self.args()), 1)
+
+    def test_raw_error_cannot_be_overridden_by_green_summary(self):
+        cell = self.bank["cells"][0]
+        path = self.root / cell["hardware"] / f"{cell['id']}.json"
+        actual = ci.read_json(path)
+        actual["cases"][0]["actions"][0][0] = 2
+        parity.write_json(path, actual, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
 
     def test_uncalibrated_performance_is_not_green(self):

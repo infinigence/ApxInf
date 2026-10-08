@@ -8,10 +8,11 @@ import json
 import math
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
-from compare_pi05_openpi import compare_results, sha256, write_json
+from compare_pi05_openpi import compare_results, load_suite, sha256, write_json
 
 
 SCHEMA = "apxinf.pi05.ci.v1"
@@ -46,6 +47,8 @@ def load_bank(path: Path, digest: str) -> dict:
                            (board, precision, views) for cell in bank["cells"]):
                     raise ValueError(f"missing required cell: {board}/{precision}/{views}view")
     for cell in bank["cells"]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", cell["id"]):
+            raise ValueError("cell id must be safe for artifact filenames")
         if cell["precision"] not in PRECISIONS[cell["hardware"]] or cell["views"] not in (1, 2, 3):
             raise ValueError("unsupported cell")
         for name in ("reference_limits", "baseline_limits"):
@@ -90,6 +93,8 @@ def performance(rows: list[dict], cell: dict) -> dict:
     samples = [sample for row in rows for sample in row["latency_ms"]]
     if not samples or not all(math.isfinite(sample) and sample > 0 for sample in samples):
         raise ValueError("invalid latency samples")
+    if not all(math.isfinite(row["first_call_ms"]) and row["first_call_ms"] > 0 for row in rows):
+        raise ValueError("invalid first-call latency")
     measured = {"p50_ms": float(np.percentile(samples, 50)),
                 "p95_ms": float(np.percentile(samples, 95)),
                 "first_call_ms": max(row["first_call_ms"] for row in rows)}
@@ -104,6 +109,42 @@ def performance(rows: list[dict], cell: dict) -> dict:
                  "first_call_ms": row["first_call_ms"]} for row in rows]
     passed = all(row[key] <= budgets[key] for row in per_case for key in budgets)
     return {"state": "pass" if passed else "fail", **measured, "cases": per_case}
+
+
+def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
+             actual: dict, revision: str) -> dict:
+    if len(load_suite(suite)["image_keys"]) != cell["views"]:
+        raise ValueError("suite/cell view count differs")
+    if any(len(row["latency_ms"]) != cell["samples"] for row in actual["cases"]):
+        raise ValueError("latency sample count differs from approved protocol")
+    if actual.get("revision") != revision:
+        raise ValueError("candidate revision receipt differs")
+    expected_calibration = cell["calibration"]["sha256"] if cell.get("calibration") else None
+    for record in (actual, baseline):
+        if record.get("engine") != "apxinf":
+            raise ValueError("unexpected implementation engine")
+        if (record.get("precision"), record.get("hardware"), record.get("calibration_sha256")) != (
+                cell["precision"], cell["hardware"], expected_calibration):
+            raise ValueError("baseline/candidate precision, hardware or calibration differs")
+        if record.get("checkpoint_sha256") != cell["checkpoint"]["sha256"]:
+            raise ValueError("checkpoint receipt mismatch")
+    if reference.get("engine") != "openpi" or not reference.get("revision"):
+        raise ValueError("official reference provenance missing")
+    for record in (actual, reference, baseline):
+        if record.get("config_sha256") != cell["config"]["sha256"]:
+            raise ValueError("configuration receipt differs")
+    if not re.fullmatch(r"[0-9a-f]{40}", baseline.get("revision", "")):
+        raise ValueError("approved baseline revision missing")
+    official = compare_results(suite, reference, actual, cell["reference_limits"])
+    regression = compare_results(suite, baseline, actual, cell["baseline_limits"])
+    perf = performance(actual["cases"], cell)
+    repeat_ok = all(row["repeat_max_abs"] <= cell["baseline_limits"]["max_abs"]
+                    for row in actual["cases"])
+    repeat_ok &= actual["revisit_max_abs"] <= cell["baseline_limits"]["max_abs"]
+    return dict(reference=official, baseline=regression, performance=perf,
+          repeat_passed=repeat_ok,
+          passed=all(row["passed"] for row in official + regression) and repeat_ok
+          and perf["state"] == "pass")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -137,32 +178,16 @@ def run(args: argparse.Namespace) -> int:
                 command.extend(("--calibration", str(calibration)))
             subprocess.run(command, check=True)
             actual = read_json(output)
-            if actual.get("revision") != args.revision:
-                raise ValueError("candidate revision receipt differs")
-            expected_calibration = cell["calibration"]["sha256"] if calibration else None
-            for record in (actual, baseline):
-                if (record.get("precision"), record.get("hardware"), record.get("calibration_sha256")) != (
-                        cell["precision"], args.hardware, expected_calibration):
-                    raise ValueError("baseline/candidate precision, hardware or calibration differs")
-                if record.get("checkpoint_sha256") != cell["checkpoint"]["sha256"]:
-                    raise ValueError("checkpoint receipt mismatch")
-            if reference.get("engine") != "openpi" or not reference.get("revision"):
-                raise ValueError("official reference provenance missing")
-            for record in (actual, reference, baseline):
-                if record.get("config_sha256") != cell["config"]["sha256"]:
-                    raise ValueError("configuration receipt differs")
-            if not re.fullmatch(r"[0-9a-f]{40}", baseline.get("revision", "")):
-                raise ValueError("approved baseline revision missing")
-            official = compare_results(suite, reference, actual, cell["reference_limits"])
-            regression = compare_results(suite, baseline, actual, cell["baseline_limits"])
-            perf = performance(actual["cases"], cell)
-            repeat_ok = all(row["repeat_max_abs"] <= cell["baseline_limits"]["max_abs"]
-                            for row in actual["cases"])
-            repeat_ok &= actual["revisit_max_abs"] <= cell["baseline_limits"]["max_abs"]
-            result.update(reference=official, baseline=regression, performance=perf,
-                          repeat_passed=repeat_ok,
-                          passed=all(row["passed"] for row in official + regression) and repeat_ok
-                          and perf["state"] == "pass")
+            result.update(evaluate(cell, suite, reference, baseline, actual, args.revision))
+            evidence = args.output_dir / "evidence" / cell["id"]
+            evidence.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(suite / "manifest.json", evidence / "manifest.json")
+            for entry in load_suite(suite)["cases"]:
+                destination = evidence / entry["path"]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(suite / entry["path"], destination)
+            for name in ("reference", "baseline"):
+                shutil.copyfile(asset(root, cell[name]), evidence / f"{name}.json")
         except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
             result["error"] = str(error)
         cells.append(result)
@@ -193,6 +218,19 @@ def aggregate(args: argparse.Namespace) -> int:
         if len(report["cells"]) != len(expected) or {cell["id"] for cell in report["cells"]} != expected:
             raise ValueError("board report has missing or unexpected cells")
         passed &= report["passed"] is True and all(cell["passed"] is True for cell in report["cells"])
+        for cell in bank["cells"]:
+            if cell["hardware"] != board:
+                continue
+            evidence = path.parent / "evidence" / cell["id"]
+            if sha256(evidence / "manifest.json") != cell["suite"]["sha256"]:
+                raise ValueError("artifact suite digest differs")
+            for name in ("reference", "baseline"):
+                if sha256(evidence / f"{name}.json") != cell[name]["sha256"]:
+                    raise ValueError("artifact golden output digest differs")
+            result = evaluate(cell, evidence, read_json(evidence / "reference.json"),
+                              read_json(evidence / "baseline.json"),
+                              read_json(path.parent / f"{cell['id']}.json"), args.revision)
+            passed &= result["passed"]
     return 0 if passed else 1
 
 

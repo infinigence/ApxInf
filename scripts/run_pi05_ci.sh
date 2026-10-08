@@ -32,7 +32,7 @@ mkdir -p "$output"
 [[ -z $(git -C "$candidate" status --porcelain) ]]
 cd "$candidate"
 PYO3_PYTHON="$APXINF_CI_PYTHON" cargo build --locked --release -p apxinf-py \
-  --features cuda,extension-module > "$output/build.log" 2>&1
+  --features cuda,extension-module --target-dir "$candidate/target" > "$output/build.log" 2>&1
 mkdir -p "$output/python"
 ln -sf "$candidate/target/release/libapxinf_py.so" "$output/python/apxinf_py.so"
 export PYTHONPATH="$output/python${PYTHONPATH:+:$PYTHONPATH}"

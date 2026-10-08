@@ -137,8 +137,8 @@ def prepare(args: argparse.Namespace) -> None:
     cases = [save_case(root, "typical", base, SHORT_TOKENS, first)]
     for index, source in enumerate(sources[2:], 2):
         cases.append(save_case(root, f"scene-{index}", source, SHORT_TOKENS, first))
-    cases.append(save_case(root, "second-scene" if len(sources) == 2 else "second-noise",
-                           sources[1] if len(sources) == 2 else base, SHORT_TOKENS, second))
+    cases.append(save_case(root, "second-scene" if len(sources) >= 2 else "second-noise",
+                           sources[1] if len(sources) >= 2 else base, SHORT_TOKENS, second))
     cases.append(save_case(root, "long-language", base, LONG_TOKENS, first))
     cases.append(save_case(root, "dark-zero-noise", np.zeros_like(base),
                            SHORT_TOKENS, np.zeros_like(first)))
@@ -160,7 +160,7 @@ def prepare(args: argparse.Namespace) -> None:
         "input_kind": "image-replay" if sources else "diagnostic",
         "representative": False, "cases": cases,
     }, force=args.force)
-    print(f"Prepared {len(cases)} cases in {root} (representative={bool(sources)})")
+    print(f"Prepared {len(cases)} cases in {root} (diagnostic/image-replay, not representative)")
 
 
 def load_suite(root: Path) -> dict[str, Any]:
@@ -332,6 +332,8 @@ def run_openpi(args: argparse.Namespace) -> None:
 
 
 def run_apxinf(args: argparse.Namespace) -> None:
+    import apxinf_py
+
     manifest = load_suite(args.suite_dir)
     model = ApxInfModel(args.checkpoint_dir, manifest, args.device,
                         args.precision, args.calibration)
@@ -341,6 +343,7 @@ def run_apxinf(args: argparse.Namespace) -> None:
         "checkpoint_sha256": checkpoint_hash(args.checkpoint_dir),
         "calibration_sha256": sha256(args.calibration) if args.calibration else None,
         "revision": args.revision, "hardware": args.hardware,
+        "extension_sha256": sha256(Path(apxinf_py.__file__)),
     }, force=args.force, output=args.output, repeats=args.repeats)
 
 
