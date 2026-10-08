@@ -58,6 +58,7 @@ ln -sf "$artifact" "$output/python/apxinf_py.so"
 reserve_gpu
 "$APXINF_CI_PREFLIGHT" "$board" > "$output/preflight.log" 2>&1
 export PYTHONPATH="$output/python${PYTHONPATH:+:$PYTHONPATH}"
+"$APXINF_CI_PYTHON" -c 'import apxinf_py'
 status=0
 "$APXINF_CI_PYTHON" "$trusted/pi05_ci.py" run \
   --bank "$APXINF_CI_BANK" --bank-sha256 "$APXINF_CI_BANK_SHA256" \
