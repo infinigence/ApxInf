@@ -256,21 +256,6 @@ Robo's `scripts/bench_gr00t.py` forwards to this same implementation in its
 pinned ApxInf checkout. It takes the same arguments. The table retains the
 previously published results; use the command above for new measurements.
 
-Accuracy uses real LIBERO observations through the shared evaluator:
-
-```sh
-python scripts/eval_libero.py --backend in-process \
-  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16 \
-  --suite libero_10 --trials-per-task 10 --seed 7 \
-  --max-steps 720 --replan-steps 8 \
-  --results-jsonl devlocal/gr00t-eval/results.jsonl \
-  --summary-json devlocal/gr00t-eval/summary.json
-```
-
-In Robo, replace `python scripts/eval_libero.py` with `apxinf-robo eval-libero`.
-Use the precision and calibration arguments from the matrix for all four rows.
-The benchmark's constructed tensors never enter accuracy evaluation.
-
 ## Validation contract
 
 Correctness comparison uses the same official processor output, embodiment ID,

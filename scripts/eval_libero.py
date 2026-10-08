@@ -36,6 +36,7 @@ observation conversion it uses is mirrored elsewhere; see
 
     # in-process GR00T (no server)
     python scripts/eval_libero.py --backend in-process --model-dir /path/ckpt \
+        --backbone /path/to/Cosmos-Reason2-2B \
         --precision bf16 --action-dim 7 --suite libero_10 \
         --results-jsonl r.jsonl --summary-json s.json
 """
@@ -467,7 +468,7 @@ class WebsocketBackend:
     def state_from_observation(self, observation) -> np.ndarray:
         # Preserve the established OpenPI wire contract. A GR00T websocket
         # server can expose its own adapter without changing this evaluator.
-        return libero_state(observation, finger_joints=state_finger_joints(self.metadata))
+        return libero_state(observation)
 
     def close(self) -> None:
         connection = getattr(self._client, "_ws", None)
@@ -491,6 +492,7 @@ class InProcessBackend:
 
         self._keys = keys
         options = {
+            "backbone": args.backbone,
             "checkpoint": args.checkpoint,
             "calibration": args.calibration,
             "tactics": args.tactics,
@@ -534,7 +536,7 @@ class InProcessBackend:
     def state_from_observation(self, observation):
         if self._is_gr00t:
             return libero_gr00t_state(observation)
-        return libero_state(observation, finger_joints=state_finger_joints(self.metadata))
+        return libero_state(observation)
 
     def infer(
         self, base, wrist, state, prompt, noise=None
@@ -584,6 +586,7 @@ def run_episode(
     warm_start_alpha: float,
     replan_steps: int = REPLAN_STEPS,
     settle_gripper: float = -1.0,
+    finger_joints: int = 1,
     max_steps: int = MAX_STEPS,
 ) -> dict:
     episode_started = time.perf_counter()
@@ -623,7 +626,7 @@ def run_episode(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
             )
-            state = backend.state_from_observation(observation)
+            state = libero_state(observation, finger_joints=finger_joints)
             preprocess_seconds += time.perf_counter() - preprocess_started
 
             noise = None
@@ -790,6 +793,11 @@ def parse_args() -> argparse.Namespace:
     in_process = parser.add_argument_group("in-process backend")
     in_process.add_argument("--model-dir", type=pathlib.Path)
     in_process.add_argument("--model-type", default=None, help="override config.json model type")
+    in_process.add_argument(
+        "--backbone",
+        type=pathlib.Path,
+        help="named backbone asset required by models such as GR00T N1.7",
+    )
     in_process.add_argument("--checkpoint", type=pathlib.Path)
     in_process.add_argument("--device", default="cuda:0")
     in_process.add_argument("--calibration", type=pathlib.Path)
@@ -971,6 +979,7 @@ def main() -> None:
 
     backend = build_backend(args)
     print(f"backend={args.backend} metadata={backend.metadata}", flush=True)
+    finger_joints = state_finger_joints(getattr(backend, "metadata", {}) or {})
     try:
         for name, suite in suites.items():
             for task_id in task_ids_by_suite[name]:
@@ -1005,6 +1014,7 @@ def main() -> None:
                                     args.warm_start_alpha,
                                     args.replan_steps,
                                     args.settle_gripper,
+                                    finger_joints,
                                     args.max_steps,
                                 )
                                 record["attempt"] = attempt

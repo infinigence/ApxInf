@@ -124,45 +124,53 @@ this maintained benchmark for new measurements.
 
 ## Accuracy procedure
 
-Accuracy evaluation belongs to APXinf-robo, just as LIBERO evaluation uses the
-robot/environment adapter around PI0.5. From the matching Robo checkout, run:
+Use the frozen NAVSIM v1.1 242-scene subset, the same metric cache/maps, ten
+flow steps and one supplied initial-noise tensor per scene. The official arm
+uses `planner-sft`, BF16, `direct_planning`, one sample and seed 42; this seed's
+noise was checked against the native supplied tensor. Both arms use the released
+benchmark image target sizes. The subset without those targets is a different
+image profile and must not be substituted silently.
+
+| Pinned input | SHA-256 |
+| --- | --- |
+| `navtest-interp-242.jsonl` | `bf55f27e931664f9c81e870ab375cf7a0d05949b8877e41964f4f6abd5955ce5` |
+| Same scenes with benchmark target sizes | `1d86691ccbfa8df57eb28d2de204fd1c75d718dfc5b043d9d84461e5feb07930` |
+| Metric-cache `metadata/cache.csv` | `d7d80f11e0fdfc7856cf1e267593d6a9ce0d2d1c90f499c9201de3453275f99e` |
+
+Require 242 unique tokens and finite `[50, 3]` trajectories. Report position
+errors in metres separately from heading in radians, then score the new
+predictions with the frozen PDM evaluator. Compare each safety/comfort component
+per scene; an unchanged aggregate score alone is insufficient. The
+[official evaluation guide](https://github.com/QwenLM/Qwen-Drive-1.0/blob/main/docs/evaluation.md)
+describes the NAVSIM trajectory conversion and scoring interfaces.
+
+Additional regression covers four scenes, 1/4/10 steps, changed noise, repeated
+calls, invalid masks and logical-length switching. Portable checks:
 
 ```sh
-python scripts/eval_qwen_drive.py \
-  --model-dir /models/Qwen-Drive-1.0-4B \
-  --scenes /data/navsim/navtest-observed-history.jsonl \
-  --image-root /data/navsim/images --seed 42 \
-  --metric-cache /data/navsim/metric-cache/metadata/cache.csv --maps /data/nuplan/maps \
-  --results-jsonl devlocal/qwen-drive-eval/predictions.jsonl \
-  --summary-json devlocal/qwen-drive-eval/summary.json
+PYTHONPATH=python/apxinf python -m pytest \
+  python/apxinf/tests/test_qwen_drive_policy.py \
+  python/apxinf/tests/test_qwen_drive_padding.py
+cargo test --release -p apxinf-cuda --test aot_bundle --test cuda_arch
+cargo test --release -p apxinf-model --features cuda --lib capture_rejects_changed_phase_extent_or_count
+bash scripts/check_model_family_boundaries.sh
 ```
 
-Prediction and scoring may use separate environments. Omit `--metric-cache`
-from the prediction command, then score its existing output in the NAVSIM
-Python environment without loading CUDA or model weights:
+### Final review acceptance (2026-09-28)
 
-```sh
-python scripts/eval_qwen_drive.py --score-only \
-  --scenes /data/navsim/navtest-observed-history.jsonl \
-  --results-jsonl devlocal/qwen-drive-eval/predictions.jsonl \
-  --metric-cache /data/navsim/metric-cache/metadata/cache.csv --maps /data/nuplan/maps \
-  --summary-json devlocal/qwen-drive-eval/summary.json
-```
-
-This uses real scene JSONL records in Qwen-Drive's `messages`, `trajectory`,
-`meta_info` schema. Each scene has twelve image paths and sixteen observed
-history samples at 10 Hz; the evaluator never interpolates the history. Keep
-raw-data provenance: an array of length sixteen alone does not prove that it
-contains observations rather than upstream interpolations. Use the official
-NAVSIM/nuPlan evaluator, maps and trusted metric caches for all scene tokens.
-
-Pin the checkpoint, history construction/filtering, image sizes, CUDA noise
-seed, ten flow steps and scoring-cache versions together. The historical
-242-scene score above used interpolated history and cannot be compared directly
-with corrected observed-history evaluation. Exact official Qwen scene-generation
-and filtering details are not fully published; do not claim their published
-PDM has been reproduced until those input conditions are established.
-The latency benchmark's constructed observations are never scored as accuracy.
+- Python with the native extension: 33 passed; isolated CPU environment:
+  30 passed, 3 native-only checks skipped.
+- Cargo AOT bundle/geometry checks: 8 passed; architecture checks: 5 passed.
+- GDN policy/operator checks: 9 passed. BF16/PTX chunk-state relative L1 error
+  against the FP64 reference: 0.001419 (limit 0.01).
+- Convolution boundary, AdaLN fusion and Pillow axis rejection: all passed.
+- Owned RGB snapshot/consume-once tests: 2 passed.
+- Whole-model graph/eager, input replacement, RNG and lifetime test, plus arena
+  layout mismatch rejection: both passed on Thor3.
+- Native invalid-mask and alternating-length contracts passed. Four-scene,
+  twelve-case outputs and all 242 NAVSIM trajectories remain bit-identical.
+- Final release wheel built incrementally and was reused on Thor2 for the
+  locked-clock/fan ABBA measurement above.
 
 ## Execution notes
 

@@ -1,4 +1,4 @@
-# PI0-FAST benchmark and evaluation
+# PI0-FAST benchmark
 
 Prepare the real LeRobot checkpoint, its normalization files, and local
 PaliGemma/FAST tokenizers. The policy discovers tokenizer directories under
@@ -75,21 +75,3 @@ Lock CPU/GPU/EMC clocks and fan and exclude other GPU work. Keep raw samples,
 engine/native-binary and model/calibration identities. The script adds artifact
 identities to its JSON report. Keep the historical table values as reference
 until their original frame workload and measurement setup are reproduced.
-
-## Accuracy
-
-Accuracy requires real simulator observations and the checkpoint's action
-normalization; constructed benchmark inputs are never used to compute success.
-
-```sh
-python scripts/eval_libero.py --backend in-process \
-  --model-dir /models/pi0fast-libero-v044 --precision bf16 \
-  --suite libero_10 --trials-per-task 10 --seed 7 \
-  --results-jsonl devlocal/model-bench-inputs/pi0fast/eval/results.jsonl \
-  --summary-json devlocal/model-bench-inputs/pi0fast/eval/summary.json
-```
-
-In APXinf-robo, use `apxinf-robo eval-libero` with the same arguments. Its
-`scripts/bench_pi0_fast.py` calls the pinned engine's benchmark and loads the
-policy through Robo. Both evaluators preserve the checkpoint's eight-value
-state, including both mirrored finger joints.

@@ -64,12 +64,12 @@ def test_libero_state_collapses_mirrored_gripper_joints():
 
 def test_libero_state_keeps_both_finger_joints_on_request():
     """LeRobot's own LIBERO env feeds both mirrored joints (8-dim state)."""
-    observation = {
+       observation = {
         "robot0_eef_pos": np.array([0.1, 0.2, 0.3]),
         "robot0_eef_quat": np.array([0.0, 0.0, 0.0, 1.0]),
         "robot0_gripper_qpos": np.array([0.04, -0.04]),
     }
-
+    
     state = libero_state(observation, finger_joints=2)
 
     np.testing.assert_array_equal(
@@ -78,15 +78,15 @@ def test_libero_state_keeps_both_finger_joints_on_request():
     )
     with pytest.raises(ValueError, match="finger_joints must be 1 or 2"):
         libero_state(observation, finger_joints=3)
-
-
+    
+    
 def test_libero_gr00t_state_preserves_named_two_joint_contract():
     observation = {
         "robot0_eef_pos": np.array([0.1, 0.2, 0.3]),
         "robot0_eef_quat": np.array([0.0, 0.0, 0.0, 1.0]),
         "robot0_gripper_qpos": np.array([0.04, -0.04]),
     }
-
+    
     state = libero_gr00t_state(observation)
 
     assert list(state) == ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]

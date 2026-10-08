@@ -58,7 +58,7 @@ def test_omitted_norm_stats_preserves_checkpoint_defaults(monkeypatch, tmp_path)
     assert "precision" not in options
 
 
-def test_gr00t_model_directory_and_two_joint_state_reach_policy(monkeypatch, tmp_path):
+def test_gr00t_backbone_and_two_joint_state_reach_policy(monkeypatch, tmp_path):
     options = {}
 
     def load(model_dir, **kwargs):
@@ -66,7 +66,8 @@ def test_gr00t_model_directory_and_two_joint_state_reach_policy(monkeypatch, tmp
         return SimpleNamespace(metadata={"model_type": "gr00t"})
 
     monkeypatch.setattr(AutoPolicy, "from_pretrained", load)
-    args = parse(monkeypatch, tmp_path, "--model-type", "gr00t")
+    backbone = tmp_path / "backbone"
+    args = parse(monkeypatch, tmp_path, "--model-type", "gr00t", "--backbone", str(backbone))
     backend = eval_libero.InProcessBackend(args, eval_libero.resolve_wire_keys(args))
     state = backend.state_from_observation(
         {
@@ -76,7 +77,7 @@ def test_gr00t_model_directory_and_two_joint_state_reach_policy(monkeypatch, tmp
         }
     )
 
-    assert "backbone" not in options
+    assert options["backbone"] == backbone
     np.testing.assert_array_equal(
         state["gripper"], np.array([0.04, -0.04], dtype=np.float32)
     )
