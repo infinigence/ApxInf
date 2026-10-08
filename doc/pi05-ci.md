@@ -175,7 +175,10 @@ tools. Run `bash /trusted/scripts/run_pi05_ci.sh thor SHA /candidate /candidate/
 The candidate must be a clean checkout at SHA. GPU reservation uses nonblocking
 flock; busy returns 75 and does not kill/preempt jobs. Developers must use the
 same lock. It also checks sampled GPU utilization and approved clocks/power/
-temperature before and after inference. These checks cannot prevent a developer
+temperature before and after inference. The wrapper releases the GPU reservation
+during CPU/CUDA compilation, then reacquires it and repeats preflight before
+inference; a developer who takes the GPU meanwhile causes exit 75.
+These checks cannot prevent a developer
 who bypasses the reservation from starting work mid-run; coordinate a quiet
 measurement window. Save build/preflight logs, raw outputs and summary JSON.
 

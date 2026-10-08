@@ -22,14 +22,18 @@ trusted=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Developers use this same lock for their GPU commands. Never kill their jobs.
 exec 9>"${APXINF_CI_GPU_LOCK:-/tmp/apxinf-${board}-gpu.lock}"
-if ! flock -n 9; then
-  echo 'GPU reserved; resubmit after the current development job finishes.' >&2
-  exit 75
-fi
+reserve_gpu() {
+  if ! flock -n 9; then
+    echo 'GPU reserved; resubmit after the current development job finishes.' >&2
+    exit 75
+  fi
+}
+reserve_gpu
 mkdir -p "$output"
 [[ $(sha256sum "$APXINF_CI_PREFLIGHT" | cut -d ' ' -f 1) == "$APXINF_CI_PREFLIGHT_SHA256" ]]
-"$APXINF_CI_PREFLIGHT" "$board" > "$output/preflight.log" 2>&1
+"$APXINF_CI_PREFLIGHT" "$board" > "$output/reservation-preflight.log" 2>&1
 [[ -z $(git -C "$candidate" status --porcelain) ]]
+flock -u 9
 cd "$candidate"
 PYO3_PYTHON="$APXINF_CI_PYTHON" cargo build --locked --release -p apxinf-py \
   --features cuda,extension-module --target-dir "$candidate/target" \
@@ -51,6 +55,8 @@ PY
 )
 mkdir -p "$output/python"
 ln -sf "$artifact" "$output/python/apxinf_py.so"
+reserve_gpu
+"$APXINF_CI_PREFLIGHT" "$board" > "$output/preflight.log" 2>&1
 export PYTHONPATH="$output/python${PYTHONPATH:+:$PYTHONPATH}"
 status=0
 "$APXINF_CI_PYTHON" "$trusted/pi05_ci.py" run \
