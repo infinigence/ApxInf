@@ -59,6 +59,8 @@ pub struct LoadOptions {
     /// Enable online GEMM autotuning from real inference requests. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,
+    /// Serve fewer camera views than the checkpoint declares.
+    pub num_views: Option<usize>,
     /// Explicit architecture config, overriding any on-disk `config.json`.
     pub config: Option<Pi05Config>,
     /// When set, load deterministic random weights instead of a checkpoint.
@@ -183,6 +185,14 @@ impl LoadedModel {
     /// callers that need host values without holding a backend handle.
     pub fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         self.vla()?.infer_host_f32(request)
+    }
+
+    /// Run a VLA inference with optional model-local phase timings.
+    pub fn infer_host_f32_profiled(
+        &self,
+        request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, f64>)> {
+        self.vla()?.infer_host_f32_profiled(request)
     }
 
     /// Discrete action-token output shape, for autoregressive token VLAs.
@@ -357,7 +367,7 @@ impl AutoModel {
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         model_name,
-        "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+        "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda" | "smolvla" | "smolvla_libero"
     ) || (matches!(device, Device::Metal(_))
         && matches!(
             model_name,

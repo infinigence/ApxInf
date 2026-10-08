@@ -99,6 +99,58 @@ __global__ void scale_bf16_kernel(
     output[gid] = __float2bfloat16(x);
 }
 
+__global__ void add_f16_kernel(
+    const half* a, const half* b, half* output, uint32_t count)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    output[gid] = __float2half(__half2float(a[gid]) + __half2float(b[gid]));
+}
+
+__global__ void add_f16_vec8_kernel(
+    const float4* __restrict__ a, const float4* __restrict__ b,
+    float4* __restrict__ output, uint32_t vec_count)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 pa = a[v];
+        float4 pb = b[v];
+        const half* la = reinterpret_cast<const half*>(&pa);
+        const half* lb = reinterpret_cast<const half*>(&pb);
+        float4 out;
+        half* lo = reinterpret_cast<half*>(&out);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lo[i] = __float2half(__half2float(la[i]) + __half2float(lb[i]));
+        }
+        output[v] = out;
+    }
+}
+
+__global__ void scale_f16_kernel(
+    const half* input, half* output, uint32_t count, float scale)
+{
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= count) return;
+    output[gid] = __float2half(__half2float(input[gid]) * scale);
+}
+
+__global__ void scale_f16_vec8_kernel(
+    const float4* __restrict__ input, float4* __restrict__ output,
+    uint32_t vec_count, float scale)
+{
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < vec_count;
+         v += gridDim.x * blockDim.x) {
+        float4 packed = input[v];
+        half* lane = reinterpret_cast<half*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            lane[i] = __float2half(__half2float(lane[i]) * scale);
+        }
+        output[v] = packed;
+    }
+}
+
 
 
 // ── Add-bias (bf16) — broadcast bias vector over rows ────────────────────

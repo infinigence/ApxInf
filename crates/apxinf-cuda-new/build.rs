@@ -3,6 +3,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../apxinf-cuda/build_support/nvcc_build.rs"]
+mod nvcc_build;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
 #[path = "build_support/cuda_arch.rs"]
@@ -39,8 +41,14 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          }\n\
          }  // namespace apxinf::gemm\n",
     );
-    std::fs::write(&path, header)
-        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    // Rewrite only when the content actually changed: every adapter that
+    // includes this header is a dependency in its `.d` file, so bumping the
+    // mtime on an unchanged header would force the object cache to rebuild all
+    // of them on every run.
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(header.as_str()) {
+        std::fs::write(&path, header)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
     path
 }
 
@@ -54,6 +62,20 @@ fn rerun_tree(root: &Path) {
             rerun_tree(&path);
         } else {
             println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn rerun_paths(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rerun_paths(&path, files);
+        } else {
+            files.push(path);
         }
     }
 }
@@ -83,20 +105,52 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     let staged = out.join("fa2-direct-e4m3-patched");
+    let patch = native
+        .join("patches")
+        .join("fa2-direct-e4m3-output.patch");
+    // Re-staging rewrites every file in the tree, which bumps the mtime of the
+    // patched sources the E4M3 translation units depend on. Skip it when the
+    // exact source tree and patch that produced the current staging are
+    // unchanged, so the object cache survives a rebuild that only touched Rust.
+    let stamp = out.join("fa2-direct-e4m3-patched.stamp");
+    let mut fingerprint = 0x6c62272e07bb014262b821756295c58du128;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            fingerprint ^= u128::from(*byte);
+            fingerprint = fingerprint.wrapping_mul(0x0000000001000000000000000000013b);
+        }
+    };
+    let mut files = Vec::new();
+    rerun_paths(&fa2_root.join("flash_attn"), &mut files);
+    files.sort_unstable();
+    for file in &files {
+        feed(file.to_string_lossy().as_bytes());
+        feed(&std::fs::read(file).unwrap_or_else(|error| {
+            panic!("read FA2 staging input {}: {error}", file.display())
+        }));
+    }
+    feed(&std::fs::read(&patch).unwrap_or_else(|error| {
+        panic!("read FA2 patch {}: {error}", patch.display())
+    }));
+    let key = format!("{fingerprint:032x}");
+    if staged.is_dir()
+        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str())
+    {
+        return staged;
+    }
     if staged.exists() {
         std::fs::remove_dir_all(&staged)
             .unwrap_or_else(|error| panic!("remove {}: {error}", staged.display()));
     }
     copy_tree(&fa2_root.join("flash_attn"), &staged.join("flash_attn"));
-    let patch = native
-        .join("patches")
-        .join("fa2-direct-e4m3-output.patch");
     let mut command = Command::new("patch");
     command
         .current_dir(&staged)
         .args(["--batch", "--forward", "-p0", "-i"])
         .arg(&patch);
     run(&mut command, "apply FA2 direct-E4M3 patch");
+    std::fs::write(&stamp, &key)
+        .unwrap_or_else(|error| panic!("write {}: {error}", stamp.display()));
     staged
 }
 
@@ -345,6 +399,8 @@ fn main() {
             .map(|target| target.nvcc_arch.clone()),
     );
     let mut objects = Vec::new();
+    let workers = nvcc_build::parallelism();
+    let mut jobs: Vec<nvcc_build::CompileJob> = Vec::new();
     for (index, source) in generic_sources
         .drain(..)
         .map(|source| (source, false, false, false))
@@ -378,9 +434,18 @@ fn main() {
             .arg(&object)
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
-            .arg(format!("-I{}", out.display()))
-            .arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""))
-            .arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
+            .arg(format!("-I{}", out.display()));
+        // The build IDs fold a whole-tree fingerprint, so they change on any
+        // kernel edit. Only the two tuning-key translation units read them;
+        // putting them on every command line would invalidate the whole object
+        // cache whenever one source file moves.
+        if source.file_name().is_some_and(|name| name == "tuning_key.cpp") {
+            if source.to_string_lossy().contains("/gemm/") {
+                command.arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""));
+            } else {
+                command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
+            }
+        }
         command.args(if is_cutlass || is_fa2_e4m3 {
             &cutlass_codegen
         } else if is_fa2 {
@@ -456,9 +521,27 @@ fn main() {
             command.arg(format!("-I{}", fa2_root.display()));
             command.arg(format!("-I{}", cutlass_root.join("include").display()));
         }
-        run(&mut command, &format!("compile {}", source.display()));
+        // Skip the compile when a previous run produced a current object: the
+        // recorded command line is identical and every dependency is older.
+        // The misses join the worker pool after the loop.
+        let stem = source.file_stem().unwrap().to_string_lossy().to_string();
+        let deps = out.join(format!("gemm-{index}-{stem}.d"));
+        let stamp = out.join(format!("gemm-{index}-{stem}.cmdline"));
+        let cmdline = nvcc_build::describe_command(&command);
+        if nvcc_build::object_is_current(&object, &deps, &stamp, &cmdline) {
+            objects.push(object);
+            continue;
+        }
+        command.arg("-MD").arg("-MF").arg(&deps);
+        jobs.push(nvcc_build::CompileJob {
+            command,
+            action: format!("compile {}", source.display()),
+            stamp,
+            cmdline,
+        });
         objects.push(object);
     }
+    nvcc_build::run_parallel(jobs, workers);
 
     let archive = out.join("libapxinf_gemm_native.a");
     let _ = std::fs::remove_file(&archive);

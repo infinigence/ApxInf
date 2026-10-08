@@ -22,12 +22,16 @@ pub fn register_builtin_models() {
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
     registry::register("qwen_drive", load_qwen_drive);
+    #[cfg(feature = "cuda-new")]
     registry::register("qwen38", load_qwen38);
+    #[cfg(feature = "cuda-new")]
     registry::register("qwen3_8", load_qwen38);
     // The NVFP4 checkpoint's config.json says model_type "qwen3_5" /
     // "qwen3_5_text"; register both so AutoModel's detection works on the
     // unmodified checkpoint directory.
+    #[cfg(feature = "cuda-new")]
     registry::register("qwen3_5", load_qwen38);
+    #[cfg(feature = "cuda-new")]
     registry::register("qwen3_5_text", load_qwen38);
 
     #[cfg(feature = "cuda")]
@@ -38,6 +42,8 @@ pub fn register_builtin_models() {
     crate::pi0fast::register_builtin();
     #[cfg(feature = "cuda")]
     crate::gr00t::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::smolvla::register_builtin();
 }
 fn load_llama(
     path: &Path,
@@ -122,7 +128,7 @@ fn load_qwen38(
     _backend: Arc<dyn Backend>,
     _options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-new")]
     {
         use crate::llm_trait::LlmTrait;
         let (tensors, metadata) = apxinf_loader::safetensors::load_native_path(path)
@@ -131,9 +137,9 @@ fn load_qwen38(
         let model = crate::qwen38::Qwen38::load(config, tensors, device)?;
         Ok(LoadedModel::text(Box::new(model)))
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "cuda-new"))]
     {
         let _ = (path, device);
-        Err(Error::Other("qwen38 requires the cuda feature".into()))
+        Err(Error::Other("qwen38 requires the cuda-new feature".into()))
     }
 }

@@ -3,8 +3,8 @@
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use super::contracts::{
-    bf16_output, check_cuda, checked_bytes, fp8_output, gpu_ptr, make_gpu_tensor, matrix_shape,
-    matrix_tensor, require_buffers, require_finite, unsupported_dtype,
+    bf16_output, check_cuda, checked_bytes, f16_output, fp8_output, gpu_ptr, make_gpu_tensor,
+    matrix_shape, matrix_tensor, require_buffers, require_finite, unsupported_dtype,
 };
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
@@ -397,6 +397,37 @@ pub fn rms_bf16(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) ->
     Ok(matrix_tensor(ctx, rows, cols, output))
 }
 
+pub fn rms_f16(ctx: &CudaContext, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "RMSNorm")?;
+    if input.dtype() != DType::F16
+        || weight.dtype() != DType::F16
+        || weight.shape().dims() != [cols]
+    {
+        return Err(Error::Other(
+            "static inference FP16 RMSNorm shape mismatch".into(),
+        ));
+    }
+    let output = f16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_rms_norm_f16(
+            gpu_ptr(input)?,
+            gpu_ptr(weight)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            eps,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// Fuse BF16 RMSNorm with dynamic per-row E4M3 quantization.
 pub fn rms_quantize_rows_bf16_e4m3(
     ctx: &CudaContext,
@@ -481,6 +512,46 @@ pub fn layer_bf16(
         .map_err(Error::Cuda)?;
     }
     Ok(matrix_tensor(ctx, rows, cols, output))
+}
+
+pub fn layer_f16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "LayerNorm")?;
+    if [input, weight, bias]
+        .into_iter()
+        .any(|tensor| tensor.dtype() != DType::F16)
+        || weight.shape().dims() != [cols]
+        || bias.shape().dims() != [cols]
+    {
+        return Err(Error::Other(
+            "static inference FP16 LayerNorm shape mismatch".into(),
+        ));
+    }
+    let output = f16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_layer_norm_f16(
+            gpu_ptr(input)?,
+            gpu_ptr(weight)?,
+            gpu_ptr(bias)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            eps,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
 }
 
 pub fn adaptive_rms_bf16(

@@ -1,6 +1,8 @@
 //! Persistent CUDA graph workspace and deterministic sub-allocation.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use apxinf_core::{DType, Error, Result};
 
@@ -13,8 +15,49 @@ const WORKSPACE_ALIGNMENT: usize = 256;
 /// Persistent device arena used by a fixed-shape CUDA graph.
 pub struct GraphWorkspace {
     storage: CudaBuffer,
-    offset: Cell<usize>,
+    state: Arc<Mutex<WorkspaceState>>,
     fp8_emulation: Option<Fp8EmulationWorkspace>,
+}
+
+#[derive(Default)]
+struct WorkspaceState {
+    generation: u64,
+    active_allocations: usize,
+    live_requested_bytes: usize,
+    peak_requested_bytes: usize,
+    high_water_bytes: usize,
+    free_blocks: BTreeMap<usize, usize>,
+}
+
+struct WorkspaceLease {
+    state: Arc<Mutex<WorkspaceState>>,
+    _storage: CudaBuffer,
+    start: usize,
+    extent: usize,
+    requested_bytes: usize,
+    generation: u64,
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.generation != self.generation || state.active_allocations == 0 {
+            return;
+        }
+        state.active_allocations -= 1;
+        state.live_requested_bytes = state
+            .live_requested_bytes
+            .saturating_sub(self.requested_bytes);
+        if self.extent != 0 {
+            state
+                .free_blocks
+                .entry(self.start)
+                .or_insert(self.extent);
+            merge_adjacent_free_blocks(&mut state.free_blocks);
+        }
+    }
 }
 
 struct Fp8EmulationWorkspace {
@@ -31,7 +74,10 @@ impl GraphWorkspace {
         }
         Ok(Self {
             storage: CudaBuffer::alloc(capacity_bytes, device).map_err(Error::Cuda)?,
-            offset: Cell::new(0),
+            state: Arc::new(Mutex::new(WorkspaceState {
+                free_blocks: BTreeMap::from([(0, capacity_bytes)]),
+                ..WorkspaceState::default()
+            })),
             fp8_emulation: None,
         })
     }
@@ -75,11 +121,31 @@ impl GraphWorkspace {
     }
 
     pub fn used(&self) -> usize {
-        self.offset.get()
+        self.lock_state()
+            .map(|state| state.high_water_bytes)
+            .unwrap_or(0)
     }
 
-    fn reset(&self) {
-        self.offset.set(0);
+    pub fn peak_used(&self) -> usize {
+        self.lock_state()
+            .map(|state| state.peak_requested_bytes)
+            .unwrap_or(0)
+    }
+
+    fn reset(&self) -> Result<()> {
+        let capacity = self.storage.len();
+        let mut state = self.lock_state()?;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("workspace generation overflow".into()))?;
+        state.active_allocations = 0;
+        state.live_requested_bytes = 0;
+        state.peak_requested_bytes = 0;
+        state.high_water_bytes = 0;
+        state.free_blocks.clear();
+        state.free_blocks.insert(0, capacity);
+        Ok(())
     }
 
     fn allocate(&self, bytes: usize, device: usize) -> Result<CudaBuffer> {
@@ -89,23 +155,49 @@ impl GraphWorkspace {
                 self.storage.device()
             )));
         }
-        let start = self
-            .offset
-            .get()
-            .checked_add(WORKSPACE_ALIGNMENT - 1)
-            .ok_or_else(|| Error::Other("static inference workspace offset overflow".into()))?
-            & !(WORKSPACE_ALIGNMENT - 1);
-        let end = start
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Other("static inference workspace size overflow".into()))?;
-        if end > self.storage.len() {
-            return Err(Error::Other(format!(
-                "static inference workspace exhausted: need {end} bytes, capacity is {} bytes",
+        let extent = align_extent(bytes)?;
+        let mut state = self.lock_state()?;
+        let start = take_free_block(&mut state.free_blocks, extent).ok_or_else(|| {
+            Error::Other(format!(
+                "static inference workspace exhausted: need {} contiguous bytes, capacity is {} bytes",
+                extent.max(bytes),
                 self.storage.len()
-            )));
-        }
-        self.offset.set(end);
-        self.storage.view(start, bytes).map_err(Error::Cuda)
+            ))
+        })?;
+        state.active_allocations = state
+            .active_allocations
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("workspace active allocation overflow".into()))?;
+        state.live_requested_bytes = state
+            .live_requested_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Other("workspace live byte overflow".into()))?;
+        let allocation_end = start
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Other("workspace high-water overflow".into()))?;
+        state.high_water_bytes = state.high_water_bytes.max(allocation_end);
+        state.peak_requested_bytes = state
+            .peak_requested_bytes
+            .max(state.live_requested_bytes);
+
+        let lease = Arc::new(WorkspaceLease {
+            state: Arc::clone(&self.state),
+            _storage: self.storage.clone(),
+            start,
+            extent,
+            requested_bytes: bytes,
+            generation: state.generation,
+        });
+        self.storage
+            .view(start, bytes)
+            .map(|buffer| buffer.with_owner(lease))
+            .map_err(Error::Cuda)
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkspaceState>> {
+        self.state
+            .lock()
+            .map_err(|_| Error::Other("static inference workspace state mutex is poisoned".into()))
     }
 
     fn uses_fp8_emulation(&self) -> bool {
@@ -172,7 +264,7 @@ fn with_workspace_phase<T>(
     eager: bool,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    workspace.reset();
+    workspace.reset()?;
     ACTIVE_WORKSPACE.with(|active| {
         if !active.get().is_null() {
             return Err(Error::Other(
@@ -189,6 +281,49 @@ fn with_workspace_phase<T>(
         };
         operation()
     })
+}
+
+fn align_extent(bytes: usize) -> Result<usize> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    bytes
+        .checked_add(WORKSPACE_ALIGNMENT - 1)
+        .map(|end| end & !(WORKSPACE_ALIGNMENT - 1))
+        .ok_or_else(|| Error::Other("static inference workspace extent overflow".into()))
+}
+
+fn take_free_block(free_blocks: &mut BTreeMap<usize, usize>, extent: usize) -> Option<usize> {
+    let mut selected = None;
+    for (start, block_extent) in free_blocks.iter() {
+        if *block_extent >= extent
+            && selected
+                .is_none_or(|(_, selected_extent)| *block_extent < selected_extent)
+        {
+            selected = Some((*start, *block_extent));
+        }
+    }
+    let (start, block_extent) = selected?;
+    free_blocks.remove(&start);
+    if block_extent > extent {
+        free_blocks.insert(start + extent, block_extent - extent);
+    }
+    Some(start)
+}
+
+fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
+    let mut merged = BTreeMap::new();
+    for (&start, &extent) in free_blocks.iter() {
+        if let Some((&last_start, &last_extent)) = merged.last_key_value() {
+            if last_start + last_extent == start {
+                *merged.get_mut(&last_start).expect("last key exists") =
+                    last_extent + extent;
+                continue;
+            }
+        }
+        merged.insert(start, extent);
+    }
+    *free_blocks = merged;
 }
 
 pub(crate) fn prepare_with_workspace<T>(
@@ -246,6 +381,24 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
             // is the path the cache was measured on -- 43,811 malloc/free
             // pairs and 13.6 s of host time in one VQA inference.
             CudaBuffer::alloc_zeros_on(ctx, bytes).map_err(Error::Cuda)
+        } else {
+            unsafe { &*workspace }.allocate(bytes, ctx.device_id())
+        }
+    })
+}
+
+/// Allocate operator output storage without clearing it.
+///
+/// GEMM writes every output element with `beta = 0`, so clearing a fresh
+/// allocation is avoidable host- and device-side work.
+pub(crate) fn output_buffer_uninitialized(
+    ctx: &CudaContext,
+    bytes: usize,
+) -> Result<CudaBuffer> {
+    ACTIVE_WORKSPACE.with(|active| {
+        let workspace = active.get();
+        if workspace.is_null() {
+            CudaBuffer::alloc_on(ctx, bytes).map_err(Error::Cuda)
         } else {
             unsafe { &*workspace }.allocate(bytes, ctx.device_id())
         }

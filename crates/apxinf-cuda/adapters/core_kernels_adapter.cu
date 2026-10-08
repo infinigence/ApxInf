@@ -9,6 +9,12 @@
 #include <cstdint>
 #include <cstdlib>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ float2 __bfloat1622float2(__nv_bfloat162 value) {
+    return make_float2(__bfloat162float(value.x), __bfloat162float(value.y));
+}
+#endif
+
 #define BLOCK_SIZE 256
 
 #include "../kernels/custom/math.cuh"
@@ -65,6 +71,32 @@ extern "C" cudaError_t apxinf_rope_f32(
     dim3 block(BLOCK_SIZE, 1, 1);
     rope_f32_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const float*)input, (float*)output,
+        head_dim, n_heads, seq_len, rope_theta, pos_offset);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rope_f16(
+    const void* input, void* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float rope_theta, uint32_t pos_offset, void* stream)
+{
+    dim3 grid((head_dim / 2 + BLOCK_SIZE - 1) / BLOCK_SIZE, n_heads, seq_len);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    rope_f16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const half*)input, (half*)output,
+        head_dim, n_heads, seq_len, rope_theta, pos_offset);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_rope_half_split_f16(
+    const void* input, void* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float rope_theta, uint32_t pos_offset, void* stream)
+{
+    dim3 grid((head_dim / 2 + BLOCK_SIZE - 1) / BLOCK_SIZE, n_heads, seq_len);
+    dim3 block(BLOCK_SIZE, 1, 1);
+    rope_half_split_f16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (const half*)input, (half*)output,
         head_dim, n_heads, seq_len, rope_theta, pos_offset);
     return cudaGetLastError();
 }
@@ -336,6 +368,26 @@ extern "C" cudaError_t apxinf_add_bf16(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_add_f16(
+    const void* a, const void* b, void* output, uint32_t count, void* stream)
+{
+    const uintptr_t aa = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t ba = reinterpret_cast<uintptr_t>(b);
+    const uintptr_t oa = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (aa % 16u) == 0u && (ba % 16u) == 0u &&
+        (oa % 16u) == 0u) {
+        add_f16_vec8_kernel<<<(count / 8 + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                              BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)a, (const float4*)b, (float4*)output, count / 8);
+    } else {
+        dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
+        dim3 block(BLOCK_SIZE, 1, 1);
+        add_f16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+            (const half*)a, (const half*)b, (half*)output, count);
+    }
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_mul_bf16(
     const void* a, const void* b, void* output, uint32_t count, void* stream)
 {
@@ -417,6 +469,25 @@ extern "C" cudaError_t apxinf_scale_bf16(
     dim3 block(BLOCK_SIZE, 1, 1);
     scale_bf16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         (const __nv_bfloat16*)input, (__nv_bfloat16*)output, count, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_scale_f16(
+    const void* input, void* output, uint32_t count, float scale, void* stream)
+{
+    const uintptr_t input_address = reinterpret_cast<uintptr_t>(input);
+    const uintptr_t output_address = reinterpret_cast<uintptr_t>(output);
+    if ((count % 8u) == 0u && (input_address % 16u) == 0u &&
+        (output_address % 16u) == 0u) {
+        scale_f16_vec8_kernel<<<(count / 8 + BLOCK_SIZE - 1) / BLOCK_SIZE,
+                                BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
+            (const float4*)input, (float4*)output, count / 8, scale);
+    } else {
+        dim3 grid((count + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
+        dim3 block(BLOCK_SIZE, 1, 1);
+        scale_f16_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+            (const half*)input, (half*)output, count, scale);
+    }
     return cudaGetLastError();
 }
 

@@ -2,6 +2,7 @@
 
 One module per model family (:mod:`~apxinf.policies.impls.pi05`,
 :mod:`~apxinf.policies.impls.pi0fast`, :mod:`~apxinf.policies.impls.qwen_drive`,
+:mod:`~apxinf.policies.impls.smolvla`,
 :mod:`~apxinf.policies.impls.walloss`, and future ``groot``, ...). The stable
 machinery — contracts, registry, dispatch — lives one level up in
 :mod:`apxinf.policies`; only this package grows as models are added.
@@ -23,6 +24,14 @@ from .gr00t import Gr00tPolicy
 from .pi05 import Pi05Policy
 from .pi0fast import Pi0FastPolicy
 from .qwen_drive import QwenDrivePolicy
+from .smolvla import SmolVlaPolicy
 from .walloss import WallossPolicy
 
-__all__ = ["Pi05Policy", "Pi0FastPolicy", "Gr00tPolicy", "QwenDrivePolicy", "WallossPolicy"]
+__all__ = [
+    "Pi05Policy",
+    "Pi0FastPolicy",
+    "Gr00tPolicy",
+    "QwenDrivePolicy",
+    "SmolVlaPolicy",
+    "WallossPolicy",
+]

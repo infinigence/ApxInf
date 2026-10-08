@@ -15,10 +15,13 @@ pub mod pi0fast;
 pub mod profiling;
 #[cfg(feature = "mlx")]
 pub mod qwen3;
+#[cfg(feature = "cuda-new")]
 pub mod qwen38;
 pub mod qwen3vl;
 pub mod qwen_drive;
 pub mod registry;
+#[cfg(feature = "cuda")]
+pub mod smolvla;
 pub mod vla;
 mod walloss;
 

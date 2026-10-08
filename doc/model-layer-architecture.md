@@ -135,6 +135,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |

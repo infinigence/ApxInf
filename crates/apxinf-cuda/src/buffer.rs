@@ -56,10 +56,11 @@ struct CudaAllocation {
 /// stream is never cached, which is why `CudaBuffer::alloc` does not consult
 /// this at all and `alloc_on` does.
 ///
-/// Opt-in through `APXINF_CUDA_ALLOC_CACHE` until it has been measured across
-/// the other model families. `APXINF_CUDA_ALLOC_CACHE_MB` caps retained bytes,
-/// default 4096, so a long-running process cannot grow without bound; past the
-/// cap a block is released to the driver as before.
+/// Enabled by default because per-layer operator outputs otherwise create
+/// thousands of blocking `cudaMalloc`/`cudaFree` pairs per inference. Set
+/// `APXINF_CUDA_ALLOC_CACHE=0` to opt out. `APXINF_CUDA_ALLOC_CACHE_MB` caps
+/// retained bytes, default 4096, so a long-running process cannot grow without
+/// bound; past the cap a block is released to the driver as before.
 struct AllocCache {
     /// Pointers held as `usize`; `*mut c_void` is not `Send`.
     blocks: std::collections::HashMap<(usize, usize, usize), Vec<usize>>,
@@ -72,7 +73,9 @@ fn alloc_cache() -> Option<&'static std::sync::Mutex<AllocCache>> {
         std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            std::env::var_os("APXINF_CUDA_ALLOC_CACHE")?;
+            if std::env::var("APXINF_CUDA_ALLOC_CACHE").is_ok_and(|value| value == "0") {
+                return None;
+            }
             let cap = std::env::var("APXINF_CUDA_ALLOC_CACHE_MB")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -490,6 +493,16 @@ impl CudaBuffer {
             device,
             owner,
         })
+    }
+
+    /// Rebind a view to an arena lease that owns its lifetime.
+    pub(crate) fn with_owner(&self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+            device: self.device,
+            owner,
+        }
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
