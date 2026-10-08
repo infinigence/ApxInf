@@ -136,6 +136,9 @@ CUDA toolchain, `nvpmodel`, `jetson_clocks`, `tegrastats`, and a Python environm
 with `scripts/requirements-pi05-ci.txt`. The wrapper builds `apxinf-py` with
 `cuda,extension-module` against that Python. CUDA builds need the repository's
 native-kernel dependencies and may take substantially longer than inference.
+The candidate checkout retains ignored Cargo caches between runs; tracked or
+untracked source dirt is still rejected. The wrapper selects the extension from
+Cargo's successful artifact record rather than assuming a pre-existing filename.
 
 Reference generation additionally needs pinned OpenPI, CUDA PyTorch,
 safetensors, Transformers 4.53.2 with OpenPI's replacement modules, and the

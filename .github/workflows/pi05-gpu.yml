@@ -64,6 +64,7 @@ jobs:
           ref: ${{ inputs.sha }}
           path: candidate
           persist-credentials: false
+          clean: false
       - name: Build and test with reviewed harness and frozen board assets
         env:
           TESTED_SHA: ${{ inputs.sha }}
