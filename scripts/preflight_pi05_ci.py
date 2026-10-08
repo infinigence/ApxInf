@@ -33,7 +33,9 @@ def main() -> None:
                "nvpmodel": command("nvpmodel", "-q"),
                "clocks": command("sudo", "-n", "/usr/bin/jetson_clocks", "--show")}
     for name in ("nvpmodel", "clocks"):
-        if hashlib.sha256(receipt[name].encode()).hexdigest() != approved[f"{name}_sha256"]:
+        value = "\n".join(line for line in receipt[name].splitlines()
+                          if not line.startswith("FAN Dynamic Speed Control="))
+        if hashlib.sha256(value.encode()).hexdigest() != approved[f"{name}_sha256"]:
             raise ValueError(f"{name} differs from calibrated environment")
     temperatures = {}
     for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):

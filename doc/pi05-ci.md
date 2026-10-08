@@ -150,7 +150,9 @@ the daily runtime.
 
 Create an operator-owned environment JSON per board with `hardware`,
 `nvpmodel_sha256`, `clocks_sha256`, and `temperature_ceiling_c`. The digests are
-of stripped `nvpmodel -q` and `jetson_clocks --show` stdout. Configure stable
+of stripped `nvpmodel -q` and `jetson_clocks --show` stdout, excluding lines
+starting with `FAN Dynamic Speed Control=` (the automatic fan PWM varies).
+Configure stable
 clocks before collecting baseline; this script never changes power settings.
 On Jetson, the clocks query requires root. Give the runner narrowly scoped
 passwordless permission for `sudo -n /usr/bin/jetson_clocks --show`, not broad
