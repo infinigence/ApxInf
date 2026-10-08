@@ -1,0 +1,2 @@
+# Daily GPU CI uses the board's release-built apxinf_py extension, not OpenPI.
+numpy>=1.24,<3

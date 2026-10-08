@@ -1,0 +1,102 @@
+{
+  "profiles": [
+    {
+      "id": "base",
+      "views": [
+        1,
+        2,
+        3
+      ],
+      "suite": "./{profile}-{views}view/manifest.json",
+      "checkpoint": "./checkpoints/{profile}/model.safetensors",
+      "config": "./checkpoints/{profile}/config.json",
+      "reference": "./{profile}-{views}view/openpi.json"
+    }
+  ],
+  "policies": [
+    {
+      "hardware": "thor",
+      "precision": "bf16",
+      "samples": 1,
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: replace limits, sample count and rationale with measured and reviewed budgets",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null
+    },
+    {
+      "hardware": "thor",
+      "precision": "fp8",
+      "samples": 1,
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: replace limits, sample count and rationale with measured and reviewed budgets",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": "./calibration/{hardware}-{precision}.json"
+    },
+    {
+      "hardware": "orin",
+      "precision": "bf16",
+      "samples": 1,
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: replace limits, sample count and rationale with measured and reviewed budgets",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null
+    },
+    {
+      "hardware": "orin",
+      "precision": "int8",
+      "samples": 1,
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: replace limits, sample count and rationale with measured and reviewed budgets",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null
+    }
+  ]
+}
