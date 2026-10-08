@@ -23,26 +23,31 @@ By default, the script constructs inputs deterministically from the checkpoint's
 image/state shapes; users do not need to create an input file. All timing
 excludes input construction. L1 measures prepared RGB and tokens through native
 token return; L2 includes policy preprocessing and action decoding. These
-boundaries match the PI0.5 benchmark's L1/L2 convention.
+boundaries match the PI0.5 benchmark's L1/L2 convention. PI0-FAST currently
+times its autoregressive native call; its runtime does not implement captured
+CUDA Graph replay.
 
 ```sh
 python scripts/bench_pi0_fast.py \
   --model-dir /models/pi0fast-libero-v044 --precision bf16 \
   --state-key observation/state --layer l1 --mode latency \
   --frames-count 10 --warmup 10 --samples 30 \
-  --tactics devlocal/pi0fast-bench/thor-bf16-tactics.json --autotune \
-  --out devlocal/pi0fast-bench/thor-bf16.json
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json --autotune \
+  --out devlocal/model-bench-inputs/pi0fast/thor-bf16.json
 ```
 
 This input-free command measures complete-request latency. It does not produce
 the README's Prefix and Per Token values. Run it on Thor, Orin and RTX 4090 for
 the corresponding latency check. For Thor FP8, use `--precision fp8
---calibration /path/to/matching-calibration.json` and separate output and tactic
-paths. `--tactics` reaches the native GEMV/GEMM selector; `--calibration`
-supplies FP8 activation scales. Generate tactics once with `--autotune`, then
-omit that flag and reuse the database for measurement. Use separate stores for
-each hardware/precision combination and preserve their CUDA/cuBLAS and kernel
-identity; never patch a stale store's identity.
+--calibration /path/to/matching-calibration.json` and a separate output path.
+`--calibration` supplies FP8 activation scales. `--tactics` reaches the native
+GEMV/GEMM selector. This command creates a device-specific database with
+`--autotune`; omit `--autotune` and reuse that database for subsequent
+measurements. Use separate stores for each hardware/precision combination and
+preserve their CUDA/cuBLAS and kernel identity; never patch a stale store's
+identity. To check the original script's default tactic path, omit both tactic
+flags. That baseline can be substantially slower and can generate different
+tokens, so record which path was used and compare like with like.
 
 To measure the original prefix/per-token fit, provide recorded LIBERO frames
 with `base_raw` or `base_flipped`, `wrist_raw` or `wrist_flipped`, `state`, and
@@ -54,8 +59,8 @@ python scripts/bench_pi0_fast.py \
   --state-key observation/state --layer l1 --mode ar \
   --frames /path/to/libero_frames.npz --frame-variant raw \
   --survey 20 --repeats 5 \
-  --tactics devlocal/pi0fast-bench/thor-bf16-tactics.json \
-  --out devlocal/pi0fast-bench/thor-bf16-ar.json
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json \
+  --out devlocal/model-bench-inputs/pi0fast/thor-bf16-ar.json
 ```
 
 The script surveys frames for distinct observed decode lengths and fits latency
@@ -80,8 +85,8 @@ normalization; constructed benchmark inputs are never used to compute success.
 python scripts/eval_libero.py --backend in-process \
   --model-dir /models/pi0fast-libero-v044 --precision bf16 \
   --suite libero_10 --trials-per-task 10 --seed 7 \
-  --results-jsonl devlocal/pi0fast-eval/results.jsonl \
-  --summary-json devlocal/pi0fast-eval/summary.json
+  --results-jsonl devlocal/model-bench-inputs/pi0fast/eval/results.jsonl \
+  --summary-json devlocal/model-bench-inputs/pi0fast/eval/summary.json
 ```
 
 In APXinf-robo, use `apxinf-robo eval-libero` with the same arguments. Its
