@@ -520,3 +520,32 @@ approximately 83/86ms product; bundled-library T10 is approximately 123ms.
 These exploratory 10-warmup/30-sample measurements reject promotion as-is;
 they are not paired performance qualification or an approved budget. Remaining
 prefix errors and the latency increase must both be repaired.
+
+
+### Complete two-view diagnostic parity
+
+A private native control now passes all 13 complete chunks and every action
+step at the historical BF16 comparison floors. Eleven chunks are bitwise
+OpenPI; T21 and T200 have cosine .99999165/.99999221 and relative L2
+.008466/.004432. Two independent repeat calls per input and the revisit phase
+have zero drift. Official outputs and thresholds are unchanged.
+
+The control combines actual BF16 RoPE buffers, OpenPI's TF32 auxiliary policy,
+physical masked attention columns, staged BF16 operator boundaries, the
+`UNFUSE_FMA` Flash softmax with precise division, reference RGB normalization,
+and F32 cuDNN patch convolution under the aligned runtime. Native parameters
+calling Torch's existing Flash binary were an isolation experiment; the
+complete control uses separately compiled native Flash and no Torch model.
+Convolution controls reproduce actual patch embeddings with cuDNN algorithms
+0/1/2; ordinary GEMM has different F32 reduction rounding. Replacing only
+remaining official vision output makes gradient+zero bitwise OpenPI, which
+isolates its remaining numerical failure to vision before the conv control.
+
+This is not a deployable repair. The private implementation has fixed-shape
+and process-lifetime diagnostic resources, and would need maintained operator
+contracts and explicit cuDNN/runtime prerequisites before adoption. Independent
+30-warmup/100-sample performance has T10 P50/P95 120.125/120.478ms and T200
+101.191/101.335ms, above the approximately 83/86ms product. Nsight graph-node
+traces identify slower GEMM schedules and decomposed GeGLU as major costs.
+Restoring fusion while preserving the observed reference rounding is pending;
+this arithmetic candidate is not promoted or described as accepted.
