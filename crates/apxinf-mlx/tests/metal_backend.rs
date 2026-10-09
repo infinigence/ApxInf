@@ -2,9 +2,8 @@
 //! Run only under the repository's shared Metal qualification lock. No test
 //! here runs as part of default cargo test; all require explicit --ignored.
 use apxinf_core::{
-    contracts::{AttentionMask, AttentionOptions, AxisSlice},
-    Backend, DType, Device, NextTokenLogits, PortableOps, Result, RngKey, SamplingBackend, Shape,
-    Tensor, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+    Backend, DType, Device, NextTokenLogits, Result, RngKey, SamplingBackend, Shape, Tensor,
+    TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
 };
 use apxinf_mlx::{Array, MlxBackend, MlxDType, Stream};
 use std::rc::Rc;
@@ -17,17 +16,11 @@ fn opaque_storage_reconciles_reshape_and_rejects_foreign_metadata() -> Result<()
     let reshaped = a.reshape(vec![3, 2])?;
     assert_eq!(b.array(&reshaped)?.shape(), [3, 2]);
     assert_eq!(
-        b.to_cpu(&b.permute(&reshaped, &[1, 0])?)?.to_f32_vec()?,
+        b.to_cpu(&b.from_array(b.array(&reshaped)?.transpose(&[1, 0])?)?)?
+            .to_f32_vec()?,
         [1., 3., 5., 2., 4., 6.]
     );
-    let slice = b.slice_axis(
-        &a,
-        AxisSlice {
-            axis: 1,
-            start: 1,
-            end: 3,
-        },
-    )?;
+    let slice = b.from_array(b.array(&a)?.slice_axis(1, 1, 3)?)?;
     assert_eq!(b.to_cpu(&slice)?.to_f32_vec()?, [2., 3., 5., 6.]);
     let foreign = Tensor::from_opaque_parts(
         Shape::new(vec![2, 3]),
@@ -49,52 +42,6 @@ fn opaque_storage_reconciles_reshape_and_rejects_foreign_metadata() -> Result<()
     let cpu = Array::from_f32(&Stream::cpu()?, &[2, 3], &[0.; 6])?;
     assert!(b.from_array(cpu).is_err());
     assert!(b.begin_capture().is_err());
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires shared Metal qualification lock"]
-fn portable_attention_obeys_grouping_causal_offsets_and_all_masked_rows() -> Result<()> {
-    let b = MlxBackend::new(0)?;
-    let q = b.to_device(&Tensor::from_f32(vec![1, 1, 2, 2], &[1., 0., 0., 1.])?)?;
-    let k = b.to_device(&Tensor::from_f32(vec![1, 2, 1, 2], &[1., 0., 0., 1.])?)?;
-    let v = b.to_device(&Tensor::from_f32(vec![1, 2, 1, 2], &[2., 4., 6., 8.])?)?;
-    let out = b.attention(&q, &k, &v, &AttentionOptions::full(1.))?;
-    let p = 1f32.exp() / (1f32.exp() + 1.);
-    let expected = [
-        2. * p + 6. * (1. - p),
-        4. * p + 8. * (1. - p),
-        2. * (1. - p) + 6. * p,
-        4. * (1. - p) + 8. * p,
-    ];
-    for (x, y) in b.to_cpu(&out)?.to_f32_vec()?.iter().zip(expected) {
-        assert!((x - y).abs() < 1e-5);
-    }
-    let mask = b.to_device(&Tensor::from_f32(
-        vec![1, 1, 1, 2],
-        &[f32::NEG_INFINITY; 2],
-    )?)?;
-    let masked = AttentionOptions {
-        scale: 1.,
-        mask: AttentionMask::Additive(&mask),
-        scores: DType::F32,
-        probabilities: DType::F32,
-    };
-    assert_eq!(
-        b.to_cpu(&b.attention(&q, &k, &v, &masked)?)?.to_f32_vec()?,
-        [0.; 4]
-    );
-    let causal = AttentionOptions {
-        mask: AttentionMask::Causal {
-            q_start: 0,
-            k_start: 0,
-        },
-        ..AttentionOptions::full(1.)
-    };
-    assert_eq!(
-        b.to_cpu(&b.attention(&q, &k, &v, &causal)?)?.to_f32_vec()?,
-        [2., 4., 2., 4.]
-    );
     Ok(())
 }
 
@@ -144,5 +91,37 @@ fn greedy_and_transactional_kv_respect_reset_and_capacity() -> Result<()> {
     // Owned outputs are independent from clearing the request state.
     assert_eq!(b.to_cpu(&y)?.to_f32_vec()?, [3., 7.]);
     assert_eq!(b.array(&v)?.dtype(), MlxDType::F32);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn cached_attention_preserves_grouping_and_prefill_decode_offsets() -> Result<()> {
+    let b = MlxBackend::new(0)?;
+    let q = b.to_device(&Tensor::from_f32(vec![2, 2, 2], &[0.; 8])?)?;
+    let k = b.to_device(&Tensor::from_f32(vec![2, 1, 2], &[0.; 4])?)?;
+    let v = b.to_device(&Tensor::from_f32(vec![2, 1, 2], &[2., 4., 6., 8.])?)?;
+    let mut cache = b.create_kv_cache(1, 1, 2, 4);
+    b.kv_append(&mut *cache, 0, &k, &v, 2)?;
+    let y = b.sdpa_prefill(&q, &mut *cache, 0, 2, 1, 2, 2, 4)?;
+    assert_eq!(
+        b.to_cpu(&y)?.to_f32_vec()?,
+        [2., 4., 2., 4., 4., 6., 4., 6.]
+    );
+    cache.advance(2);
+    let k = b.to_device(&Tensor::from_f32(vec![1, 1, 2], &[0.; 2])?)?;
+    let v = b.to_device(&Tensor::from_f32(vec![1, 1, 2], &[10., 12.])?)?;
+    let q = b.to_device(&Tensor::from_f32(vec![1, 2, 2], &[0.; 4])?)?;
+    b.kv_append(&mut *cache, 0, &k, &v, 1)?;
+    let y = b.sdpa_decode(&q, &mut *cache, 0, 2, 1, 2, 3, 4)?;
+    for (actual, expected) in b.to_cpu(&y)?.to_f32_vec()?.iter().zip([6., 8., 6., 8.]) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+    assert!(b.sdpa_decode(&q, &mut *cache, 0, 2, 1, 2, 2, 4).is_err());
+    let foreign = MlxBackend::new(0)?;
+    assert!(foreign.array(&q).is_err());
+    assert!(foreign
+        .sdpa_decode(&q, &mut *cache, 0, 2, 1, 2, 3, 4)
+        .is_err());
     Ok(())
 }

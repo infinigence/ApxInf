@@ -1,7 +1,7 @@
 # MiniCPM5 on native MLX
 
-This family owns the MiniCPM5-2B architecture and request KV state. It loads
-through `AutoModel` with `model_name = "minicpm5"` and `Device::Metal(0)`.
+This Metal-specific module owns the MiniCPM5-2B architecture and request KV state. It loads
+through `AutoModel` with `model_name = "metal_minicpm5"` and `Device::Metal(0)`.
 The official checkpoint identifies itself as `llama`; explicit family selection
 prevents another Llama checkpoint from being admitted accidentally.
 

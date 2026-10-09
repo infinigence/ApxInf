@@ -1,5 +1,4 @@
 mod backend;
-pub mod contracts;
 mod dtype;
 mod error;
 mod kv_cache;
@@ -10,7 +9,7 @@ mod shape;
 pub mod storage;
 mod tensor;
 
-pub use backend::{Backend, Graph, PortableOps, RopeKind};
+pub use backend::{Backend, Graph, RopeKind};
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use kv_cache::{CpuKVCache, KvCache};

@@ -10,9 +10,9 @@ pub enum Error {
     #[error("operator not implemented by this backend: {0}")]
     UnsupportedOp(&'static str),
 
-    /// A portable operator contract was violated by its arguments. The reason is
+    /// An operator or storage invariant was violated by its arguments. The reason is
     /// static so validation never allocates on the error path.
-    #[error("portable contract violation: {0}")]
+    #[error("invalid operator or storage input: {0}")]
     Contract(&'static str),
 
     /// A dtype falls outside the set an operator accepts.
@@ -51,15 +51,4 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
-}
-
-impl Error {
-    /// The operator name when this error means "backend lacks an implementation".
-    /// Lets a portable path log which op it fell back on without string matching.
-    pub fn unsupported_op(&self) -> Option<&'static str> {
-        match self {
-            Error::UnsupportedOp(name) => Some(name),
-            _ => None,
-        }
-    }
 }

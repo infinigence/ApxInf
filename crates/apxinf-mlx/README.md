@@ -1,7 +1,7 @@
 # Native MLX backend
 
 This crate adapts the MLX **0.31.2** C++ API to owned Rust arrays and the ApxInf
-backend contracts. It contains no Python interpreter or external model provider.
+public tensor/sampling boundary. Metal models use its native array API directly. It contains no Python interpreter or external model provider.
 The `native` feature requires Apple Silicon macOS; the default empty feature set
 does not discover or link an MLX SDK.
 
@@ -67,12 +67,13 @@ comparing release observations and run memory qualification in an isolated
 process. The ignored `metal_memory` integration executable checks repeated
 compiled-instance release and pool reuse when run under the shared Metal lock.
 
-Low-level array operations use MLX semantics, including normal broadcasting.
-The `MlxBackend` interface applies ApxInf portable precision contracts instead:
-F32 pointwise/norm calculations followed by the declared output cast and explicit
-attention intermediate rounding. Portable attention handles GQA, causal offsets,
-additive masks and all-masked rows. Family implementations may compose ordered
-low-level casts for a different documented checkpoint rounding recipe.
+Native `Array` operations use MLX semantics, including broadcasting. Metal
+models compose them directly and own their rounding, fusion and compilation
+recipes. `MlxBackend` is an adapter for the existing public `Backend`/sampling
+interface; it does not introduce a shared multi-backend operator contract.
+Its legacy pointwise/norm and cached-attention methods retain explicit F32
+intermediates and output casts. They are separate from the optimized models'
+native attention and fused kernels.
 
 `MlxBackend::array` checks storage owner, device, dtype, element extent and stream,
 then reconciles a public `Tensor::reshape` with the native array's geometry.

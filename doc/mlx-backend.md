@@ -10,18 +10,23 @@ The MLX backend supplies model-neutral array operations and prepared compiled
 execution on Metal. Python MLX/MLX-LM implementations are reference and migration
 tools; an external model provider is not the maintained inference path.
 
-## Relationship to backend contracts
+## Performance-first Metal scope
 
-MLX uses the core `PortableOps`, `AttentionPlan` and their validators for
-checked mathematical semantics, precision and layout. Backend-owned arrays,
-prepared weights and compiled resources remain below those shared contracts.
-Do not duplicate validators or substitute a different numerical contract.
+The cross-backend composition contract is still under construction. This Metal
+port does not depend on that proposal or require a shared model graph. The
+`metal_qwen3` and `metal_minicpm5` modules own their native MLX composition,
+precision choices, state and compilation boundaries. Optimize these concrete
+paths against their reference outputs and measured workload performance.
 
-The [CUDA operator layers](../crates/apxinf-cuda-new/README.md) remain unchanged.
-Their separation also guides MLX: model-visible semantics in safe Rust;
-validation/resource lifetime in the backend execution layer; native adaptation
-behind a C ABI; MLX/Metal kernels below it. MLX need not duplicate CUDA's
-candidate registry or autotuner when it has only one implementation.
+`MlxBackend` adapts the existing public `Tensor`, `Backend` and sampling APIs at
+the application boundary. It is not a per-layer dispatch requirement. Model
+layers call safe `Array`, `Compiled` and fused Metal operations directly;
+there is no provisional `PortableOps`/`AttentionPlan` prerequisite. A future
+multi-backend design can revisit this seam with evidence from working paths.
+
+The [CUDA operator layers](../crates/apxinf-cuda-new/README.md) retain their own
+APIs and execution design. The Metal implementation keeps native FFI, resource
+ownership and unsafe custom kernels behind the safe Rust MLX API.
 
 ## Module ownership and public integration
 
@@ -29,21 +34,21 @@ candidate registry or autotuner when it has only one implementation.
 Rust application / existing Python policy
   -> AutoModel / existing native ModelRunner
   -> family LlmTrait or VlaRuntime implementation
-  -> family model composition / selected Blocks
-  -> checked model-neutral MLX backend operations
+  -> metal_<family> native model composition
+  -> safe native Array / Compiled / fused Metal operations
   -> private C ABI / MLX arrays and compiled functions
   -> Metal
 ```
 
-`apxinf-mlx` is a sibling of the CUDA and future HIP crates. It depends on core
-contracts, not CUDA implementation details or a model-family module. A Cargo
+`apxinf-mlx` is a sibling of the CUDA and future HIP crates. It uses core
+tensor and sampling types, without CUDA implementation or model-family dependencies. A Cargo
 `mlx` feature selects its dependency closure without enabling CUDA. Builds
 without that feature do not require MLX or Python. Unsupported OS/device/feature
 combinations fail at construction with an explicit error.
 
 | Owner | Responsibility |
 | --- | --- |
-| `apxinf-core` | Device identity, public tensor/storage contracts, portable semantics and validation, sampling contracts |
+| `apxinf-core` | Device identity, public tensor/storage ownership and sampling interfaces |
 | `apxinf-mlx` safe Rust API | MLX array ownership, explicit transfers, supported operators, KV storage, prepared callable and stream lifetime |
 | `apxinf-mlx` native bridge | MLX C++ adaptation, status/error conversion, array/closure handles and custom Metal operator implementation |
 | Family `config`/`load`/`weights` | Checkpoint key mapping, canonical transformations, backend construction and immutable prepared weights |
@@ -74,15 +79,18 @@ placing a model-name switch in the backend. Reuse the existing registry,
 
 ### Implemented text selections
 
-The `mlx` Cargo feature registers `qwen3-mlx` and `minicpm5-mlx` with
-`AutoModel`. `Device::Metal(N)` selects the `-mlx` implementation; the CLI
+The `mlx` Cargo feature registers `metal_qwen3` and `metal_minicpm5` with
+`AutoModel`. `Device::Metal(N)` resolves a `metal_<family>` implementation; the CLI
 accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`. A missing feature,
 unsupported device or absent family implementation fails explicitly. Existing
 CPU/CUDA models do not silently execute a Metal request on CPU.
 
-Metal admission requires a registered `-mlx` factory and is resolved before
+Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
-unsuffixed model factory; CPU/CUDA registry fallback remains unchanged.
+generic model factory; CPU/CUDA registry fallback remains unchanged. Explicit
+`--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
+implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
+selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
@@ -94,11 +102,11 @@ unsuffixed model factory; CPU/CUDA registry fallback remains unchanged.
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 
 These rows describe implemented scopes, not qualified targets. The maintained
-owners are [Qwen3](../crates/apxinf-model/src/qwen3/README.md) and
-[MiniCPM5](../crates/apxinf-model/src/minicpm5/README.md), with model-neutral
+owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
+[MiniCPM5](../crates/apxinf-model/src/metal_minicpm5/README.md), with model-neutral
 arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
 Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
-official `model_type` is `llama`, so select `--model-name minicpm5` explicitly.
+official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
 
 ```sh
@@ -108,7 +116,7 @@ cargo run --features mlx -- generate --model /path/to/Qwen3-0.6B \
   --prompt 'Explain gravity briefly.'
 
 cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
-  --model-name minicpm5 --device metal --dtype bf16 --model-variant dspark \
+  --model-name metal_minicpm5 --device metal --dtype bf16 --model-variant dspark \
   --asset draft=/path/to/official-DSpark --greedy \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
   --prompt 'Explain gravity briefly.'
@@ -155,7 +163,7 @@ Repeated execution uses prepared block/step closures, avoiding per-token
 Rust-to-Python or subprocess calls. Custom Metal kernels are registered once
 during preparation and invoked through the same safe operator boundary.
 
-## Tensor storage and portable semantics
+## Tensor ownership and model-specific numerical semantics
 
 `Device::Metal(usize)` is the distinct Metal device identity. Physical device identity and backend
 implementation identity are separate: an MLX handle cannot be consumed by a
@@ -169,42 +177,22 @@ validate logical capacity/device/dtype without accessing array contents or
 forcing evaluation. The backend validates handle identity and physical
 representation. Foreign or forged metadata must not reach a native kernel.
 
-Public tensors remain dense, contiguous, row-major. MLX strided views are
-backend-private; public permutation, slice and broadcast results honor the
-portable contract and explicitly materialize a contiguous value when required.
-Reshape may share storage only under the established aliasing rules. The
-backend must reconcile a public reshape with the opaque array's own shape;
-changing only Tensor metadata cannot leave native operands with stale geometry. New
-functional operators cannot mutate inputs, including aliases. Cache updates
-and prepared input rebinding are separate explicit mutable operations.
+Public tensors remain dense, contiguous, row-major. `MlxBackend::from_array`
+materializes that boundary; internal `Array` views retain MLX layout semantics.
+The backend reconciles public reshape metadata with the native array geometry
+and checks owner, device, dtype and extent before accessing it. Native array
+operations do not require a public Tensor wrapper or an extra materialization.
 
-Retain the portable numerical contract:
+Each Metal model owns its checkpoint's numerical recipe: intermediate casts,
+normalization rounding, attention masking, weight packing and fused selection.
+For example, cast-before-affine and cast-after-affine norms cannot share a fused
+candidate just because both are called RMSNorm. The compatibility adapter's
+existing Backend methods do not define the native models' layer arithmetic.
 
-- F32/F16/BF16 support is declared per operation. No implicit dtype promotion;
-  unsupported dtype/device combinations fail explicitly.
-- Pointwise operations perform the declared F32 calculation and output cast;
-  normalization includes the declared F32 statistics/affine operation. A stock
-  MLX fused norm with different intermediate casts is not an equivalent default.
-- Matmul preserves canonical `[M,K] @ [K,N]` semantics and the declared
-  accumulation/output precision. Packed quantized weights are prepared backend
-  artifacts, not replacements for canonical weight meanings.
-- Attention uses the portable Q/K/V geometry, GQA head mapping, scale, causal
-  offsets, mask and intermediate-precision choices. Fully masked rows return
-  zero. A fused SDPA is eligible only where it satisfies that full contract;
-  otherwise use an explicit device composition or report unsupported.
-- CPU additive-mask content checks happen when the mask is built or updated,
-  before upload. Device masks require a guaranteed construction or explicit
-  device validation. Structural validation never downloads a tensor.
-
-Use the reconciled core `PortableOps` and `AttentionPlan` contracts.
-Keep immutable structural validation at preparation and device/shape/dtype/
-extent checks at invocation. `AttentionPlan` is a device-independent semantic
-plan; the MLX executable is device-bound. Do not turn the semantic plan into an
-MLX resource owner or add a redundant device field.
-
-Different family rounding recipes must be expressible by explicit casts and
-composition. For example, cast-before-affine and cast-after-affine norms cannot
-share a fused candidate just because both are called RMSNorm.
+Keep structural checks at preparation where possible, preserve safe operand and
+resource checks at invocation, and compare the actual compiled/fused path with
+its pinned reference. No implicit CPU fallback, reduced precision or changed
+masking is justified by a planned cross-backend abstraction.
 
 ## Prepared compiled execution
 

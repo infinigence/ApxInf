@@ -84,7 +84,13 @@ impl Tensor {
         if !device.is_gpu() {
             return Err(Error::UnsupportedDevice(device));
         }
-        let expected = crate::contracts::checked_bytes(shape.dims(), dtype)?;
+        let expected = shape.dims().iter().try_fold(dtype.size_in_bytes(), |n, &d| {
+            if d == 0 {
+                return Err(Error::Contract("opaque storage rejects empty dimensions"));
+            }
+            n.checked_mul(d)
+                .ok_or(Error::Contract("opaque storage byte size overflow"))
+        })?;
         if num_bytes < expected {
             return Err(Error::DataLengthMismatch {
                 expected,

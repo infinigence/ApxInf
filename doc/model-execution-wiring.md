@@ -78,6 +78,10 @@ Search for an implementation in this order:
 3. the portable `Backend` trait when the operation belongs in a portable path;
 4. a new safe, model-neutral operator when required semantics really are absent.
 
+Native Metal composition uses `metal_<family>` modules and the safe MLX array,
+compiled-callable and fusion APIs directly. The provisional multi-backend
+composition contract is not required for these performance-first paths.
+
 The portable trait is the capability floor, not a catalog of every optimized
 CUDA path. A missing `dyn Backend` method does not establish a kernel gap.
 Model code may recover the concrete CUDA seam described in
