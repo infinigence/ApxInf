@@ -5,6 +5,7 @@
 //! revision d6042f38f0aa7dd3e03a2a406111d725056d45a3 (MIT), Copyright 2026 erahim3.
 //! The full notices are retained in the repository's third-party notices.
 use super::{model::MiniCpm5, weights::Weights, CONTEXT_CAPACITY};
+use crate::generation_config::ResolvedGenerationOptions;
 use crate::{
     GeneratedToken, GenerationOutput, GenerationProfile, GenerationRequest, LlmInput, LlmTrait,
     TextCompilationScope, TextPreparationState, TextPreparationStatus,
@@ -548,14 +549,8 @@ impl DSpark {
         Ok(proposals)
     }
 
-    fn generate_inner(
-        &mut self,
-        request: GenerationRequest<'_>,
-        on_token: &mut dyn FnMut(GeneratedToken),
-    ) -> Result<GenerationOutput> {
-        if let Some(error) = &self.failure {
-            return Err(Error::Other(error.clone()));
-        }
+    // Admission is read-only. Caller mistakes cannot invalidate device/KV state.
+    fn validate_request(request: GenerationRequest<'_>) -> Result<ResolvedGenerationOptions> {
         if request.input.image.is_some() {
             return Err(Error::Contract("DSpark is text-only"));
         }
@@ -587,6 +582,15 @@ impl DSpark {
                 "unsupported DSpark B1 token/context/output bounds",
             ));
         }
+        Ok(options)
+    }
+
+    fn generate_inner(
+        &mut self,
+        ids: &[u32],
+        options: ResolvedGenerationOptions,
+        on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
         self.reset();
         if let Some(error) = &self.failure {
             return Err(Error::Other(error.clone()));
@@ -689,7 +693,12 @@ impl DSpark {
         request: GenerationRequest<'_>,
         on_token: &mut dyn FnMut(GeneratedToken),
     ) -> Result<GenerationOutput> {
-        match self.generate_inner(request, on_token) {
+        if let Some(error) = &self.failure {
+            return Err(Error::Other(error.clone()));
+        }
+        let options = Self::validate_request(request)?;
+        // Only errors after reset/preparation begins can poison the session.
+        match self.generate_inner(request.input.token_ids, options, on_token) {
             Ok(output) => Ok(output),
             Err(error) => {
                 self.failure = Some(error.to_string());
@@ -1000,6 +1009,99 @@ mod tests {
                 eager = records;
             }
         }
+        Ok(())
+    }
+
+    /// Real-model regression for a long-lived DSpark instance. Invalid input
+    /// must not poison a later valid request or teacher-forced forward call.
+    #[test]
+    #[ignore = "requires official target/draft checkpoints, real replay inputs and the shared Metal lock"]
+    fn rejected_requests_do_not_poison_generation_or_forward() -> Result<()> {
+        use super::super::config::{Config, Variant};
+        use crate::{GenerationOptions, SamplingMode};
+        use std::{env, path::PathBuf};
+        let path = |name| {
+            env::var_os(name)
+                .map(PathBuf::from)
+                .ok_or_else(|| Error::Other(format!("set {name} for this ignored test")))
+        };
+        let checkpoint = path("APXINF_MINICPM_CHECKPOINT")?;
+        let draft = path("APXINF_DSPARK_CHECKPOINT")?;
+        let inputs: ReplayInputs =
+            serde_json::from_slice(&std::fs::read(path("APXINF_DSPARK_REPLAY_INPUT")?)?)
+                .map_err(|e| Error::Other(format!("DSpark real replay inputs: {e}")))?;
+        let ids = &inputs
+            .cases
+            .first()
+            .ok_or(Error::Contract("real prompt required"))?
+            .prompt_token_ids;
+        let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+        let (map, _) =
+            apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+        let backend = apxinf_mlx::MlxBackend::new(0)?;
+        let weights = Weights::load(&config, backend.stream(), map)?;
+        let target = MiniCpm5::new(config, weights, backend, Variant::DSpark)?;
+        let mut model = DSpark::load(target, &draft)?;
+        let valid = GenerationOptions::greedy(4, None);
+        let request = GenerationRequest {
+            input: LlmInput::text(ids),
+            options: &valid,
+        };
+        let expected = model.generate(request, &mut |_| {})?.token_ids();
+        assert!(model.last_stats.proposal_calls > 0);
+        let mut bad_options = vec![GenerationOptions::greedy(257, None)];
+        let mut sampling = valid.clone();
+        sampling.sampling_mode = Some(SamplingMode::Random);
+        bad_options.push(sampling);
+        let mut penalties = valid.clone();
+        penalties.repetition_penalty = Some(1.1);
+        bad_options.push(penalties);
+        let mut logprob = valid.clone();
+        logprob.return_logprob = Some(true);
+        bad_options.push(logprob);
+        let mut invalid = valid.clone();
+        invalid.repetition_penalty = Some(-1.);
+        bad_options.push(invalid);
+        for options in &bad_options {
+            assert!(model
+                .generate(GenerationRequest { options, ..request }, &mut |_| panic!(
+                    "invalid request emitted a token"
+                ))
+                .is_err());
+            // No reset by the caller: this is the reported long-lived API path.
+            assert_eq!(model.generate(request, &mut |_| {})?.token_ids(), expected);
+        }
+        for bad_ids in [vec![], vec![VOCAB as u32], vec![1; CONTEXT_CAPACITY]] {
+            assert!(model
+                .generate(
+                    GenerationRequest {
+                        input: LlmInput::text(&bad_ids),
+                        options: &valid
+                    },
+                    &mut |_| panic!("invalid input emitted a token")
+                )
+                .is_err());
+            assert_eq!(model.generate(request, &mut |_| {})?.token_ids(), expected);
+        }
+        assert!(model
+            .generate(
+                GenerationRequest {
+                    options: &bad_options[0],
+                    ..request
+                },
+                &mut |_| {}
+            )
+            .is_err());
+        let next = [*expected.last().unwrap()];
+        let offset = model.target.offset as u32;
+        assert!(model.forward(&next, offset).is_ok());
+        // A latched execution failure must still block execution until reset.
+        model.failure = Some("injected execution failure".into());
+        assert!(model.generate(request, &mut |_| {}).is_err());
+        assert!(model.forward(&next, 0).is_err());
+        model.reset();
+        assert_eq!(model.generate(request, &mut |_| {})?.token_ids(), expected);
+        println!("DSPARK_ADMISSION_REGRESSION tokens={expected:?}");
         Ok(())
     }
 

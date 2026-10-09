@@ -513,7 +513,7 @@ mod tests {
             assert_eq!(metal_registry_name(family), expected);
             assert_eq!(metal_registry_name(&expected), expected);
             assert_eq!(metal_registry_name(&format!("{family}-mlx")), expected);
-            #[cfg(feature = "mlx")]
+            #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
             {
                 register_builtin_models();
                 assert!(registry::get(&expected).is_some());

@@ -73,7 +73,7 @@ impl Tensor {
     /// Validates the logical extent; the backend is responsible for downcasting
     /// `owner` and validating its native dtype/device/extent before every use.
     /// CPU data uses `from_raw` so CPU access never encounters an opaque owner.
-    #[cfg(feature = "opaque-storage")]
+    #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
     pub fn from_opaque_parts(
         shape: Shape,
         dtype: DType,
@@ -81,7 +81,7 @@ impl Tensor {
         num_bytes: usize,
         owner: std::rc::Rc<dyn std::any::Any>,
     ) -> Result<Self> {
-        if !device.is_gpu() {
+        if !matches!(device, Device::Metal(_)) {
             return Err(Error::UnsupportedDevice(device));
         }
         let expected = shape.dims().iter().try_fold(dtype.size_in_bytes(), |n, &d| {
@@ -356,7 +356,7 @@ impl Tensor {
                     handle: handle.clone(),
                 },
             }),
-            #[cfg(feature = "opaque-storage")]
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
             Storage::Opaque { device, handle } => Ok(Self {
                 shape: new_shape,
                 dtype: self.dtype,

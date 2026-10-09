@@ -1,4 +1,4 @@
-#![cfg(feature = "native")]
+#![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 //! Run only under the repository's shared Metal qualification lock. No test
 //! here runs as part of default cargo test; all require explicit --ignored.
 use apxinf_core::{

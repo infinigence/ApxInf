@@ -435,17 +435,17 @@ impl Tokenizer {
         if hf_whitespace {
             env.set_trim_blocks(true);
             env.set_lstrip_blocks(true);
+            env.add_filter("tojson", hf_tojson);
+            env.add_function(
+                "raise_exception",
+                |message: String| -> std::result::Result<String, minijinja::Error> {
+                    Err(minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        message,
+                    ))
+                },
+            );
         }
-        env.add_filter("tojson", hf_tojson);
-        env.add_function(
-            "raise_exception",
-            |message: String| -> std::result::Result<String, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    message,
-                ))
-            },
-        );
         // HF chat templates are written for Jinja2 and freely use Python
         // methods (str.startswith etc.); enable minijinja's pycompat shims.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -616,6 +616,38 @@ mod tests {
         ] {
             assert!(env.render_str(source, ()).is_err());
         }
+    }
+
+    #[test]
+    fn hf_helpers_are_only_registered_for_explicit_template_options() {
+        let mut tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ 'a<&' | tojson }}".into()),
+        };
+        // Compare the legacy path to the unmodified upstream environment,
+        // including builds that enable MiniJinja's optional builtin tojson.
+        let source = tokenizer.chat_template.as_ref().unwrap();
+        let upstream = Environment::new().render_str(source, ());
+        let legacy = tokenizer.apply_chat_template(&[]);
+        match upstream {
+            Ok(bytes) => assert_eq!(legacy.unwrap(), format!("{bytes}\n")),
+            Err(_) => assert!(legacy.is_err()),
+        }
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap(),
+            r#""a<&""#,
+        );
+        tokenizer.chat_template = Some("{{ raise_exception is defined }}".into());
+        assert_eq!(tokenizer.apply_chat_template(&[]).unwrap(), "False\n");
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap(),
+            "True",
+        );
     }
 
     #[test]

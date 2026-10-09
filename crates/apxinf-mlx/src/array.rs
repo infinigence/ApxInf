@@ -125,6 +125,9 @@ impl Stream {
         Self::create(false, 0)
     }
     pub fn metal(index: usize) -> Result<Self> {
+        if index != 0 {
+            return Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(index)));
+        }
         Self::create(true, index)
     }
     fn create(gpu: bool, index: usize) -> Result<Self> {

@@ -6,20 +6,18 @@ fn main() {
     if env::var_os("CARGO_FEATURE_NATIVE").is_none() {
         return;
     }
-    assert_eq!(
-        env::var("CARGO_CFG_TARGET_OS").unwrap(),
-        "macos",
-        "apxinf-mlx requires Apple Silicon macOS"
-    );
-    assert_eq!(
-        env::var("CARGO_CFG_TARGET_ARCH").unwrap(),
-        "aarch64",
-        "apxinf-mlx requires Apple Silicon"
-    );
+    // Feature unification on Linux/CUDA must not require an Apple SDK.
+    // Rust modules/registrations use the same platform guard.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64")
+    {
+        return;
+    }
     let root = PathBuf::from(
         env::var_os("MLX_ROOT")
             .expect("set MLX_ROOT to the MLX 0.31.2 C++ SDK root (include/ and lib/)"),
     );
+    println!("cargo:rerun-if-changed={}", root.join("include/mlx/version.h").display());
     let version = fs::read_to_string(root.join("include/mlx/version.h"))
         .expect("MLX_ROOT lacks include/mlx/version.h");
     let macro_value = |name: &str| {
@@ -53,6 +51,8 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=dylib=mlx");
     println!("cargo:rustc-link-lib=dylib=c++");
+    // This rpath applies only to this crate's tests/examples. Downstream
+    // executables still need DYLD_LIBRARY_PATH as documented in the README.
     println!(
         "cargo:rustc-link-arg=-Wl,-rpath,{}",
         root.join("lib").display()

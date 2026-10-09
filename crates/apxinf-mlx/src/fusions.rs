@@ -24,7 +24,10 @@ impl PackedResidualRmsNorm {
         Ok(Self {
             kernel: MetalKernel::new(
                 stream,
-                "apxinf_packed_residual_rmsnorm_2048_tg256",
+                &format!(
+                    "apxinf_packed_residual_rmsnorm_2048_tg256_eps_{:08x}",
+                    epsilon.to_bits()
+                ),
                 &["x", "delta", "weight"],
                 &["packed"],
                 &source,
