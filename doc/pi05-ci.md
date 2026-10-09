@@ -500,3 +500,23 @@ differ from the earlier F32-formula control. These findings supersede broad
 reference-equality claims from reconstructed high-precision/RoPE oracles.
 The corrected-buffer and TF32 interventions remain private pending complete
 output and performance qualification; no thresholds or goldens were changed.
+
+
+### TF32 action-path isolation and performance rejection
+
+With official full prefix KV and each official flow input injected, the staged
+BF16-buffer/physical-mask/checkpoint-layout/TF32 control produces all ten next
+flow states bitwise equal to actual OpenPI under its bundled CUDA libraries.
+The same control under system libraries still has final relative L2 .023268.
+This isolates reference policy and runtime contributions; injected states do
+not establish complete native inference correctness.
+
+The non-injected two-view candidate passes 9/13 diagnostic cases under either
+runtime. Under bundled libraries, gradient+zero remains .995106 cosine/.099584
+relative L2, black+zero .828698/.564806 and white .999138/.077142. Black with
+normal noise also fails per-timestep checks despite .999836/.018779 whole
+metrics. System-library warm T10/T200 P50 is 99.143/104.040ms versus the existing
+approximately 83/86ms product; bundled-library T10 is approximately 123ms.
+These exploratory 10-warmup/30-sample measurements reject promotion as-is;
+they are not paired performance qualification or an approved budget. Remaining
+prefix errors and the latency increase must both be repaired.
