@@ -559,7 +559,7 @@ activation kernel retains 13/13 whole-chunk/all-step passes and zero repeat /
 revisit drift. Independent w30/n100 T10 P50/P95 is 83.927/84.063ms; T200 is
 91.725/91.865ms. This recovers most of the initial 120/101ms cost, but has not
 yet demonstrated non-regression against the current approximately 83/86ms
-runtime; a counterbalanced same-library/current-library comparison is running.
+runtime. The completed counterbalanced comparison below rejects this version.
 
 The prior all-view diagnostic control passes 11/11 in 3 view, but only 11/13
 in 1 view: gradient+zero fails an action-step limit (whole cosine .999367,
@@ -570,3 +570,47 @@ and some inputs exhaust graph workspace and fall back to eager. It is rejected.
 A private mixed-cuBLAS-version auxiliary control exits with SIGSEGV before
 accuracy/performance results; it is rejected, with crash evidence retained.
 No private arithmetic or runtime recipe is promoted, and no limit is loosened.
+
+
+### Physical KV caching and cuBLAS workspace isolation
+
+Three blocks of fresh-process, counterbalanced runs (w30/n100, T10/T200,
+1,800 raw samples) compared the packed control against both the deployed
+runtime and the reference-aligned runtime. Packed P50 is 84.028/91.707ms;
+deployed product is 83.838/86.453ms. The T200 regression rejects adoption.
+Unrolling the fixed softmax reduction preserves every output and reduces
+T10/T200 P50 to 81.529/88.775ms. Removing physical masked columns is faster
+but fails three cases, so that control is rejected.
+
+Caching physical prefix KV padding once per layer, with an explicit active
+camera mask boundary, retains all 13 two-view whole-chunk/all-step passes,
+bitwise identical to the packed control, with zero repeat/revisit drift.
+Three further counterbalanced blocks (1,800 samples) give cached P50
+79.388/86.197ms versus deployed product 83.771/86.230ms. This is still not
+same-library non-regression: aligned product T200 is 84.473ms. The first
+cached-padding attempt exposed dummy cameras, failed all cases and is excluded.
+
+One-view white with official vision output first differs at the language
+layer-0 down projection: 3,890 BF16 elements. Shape padding alone is disproved
+by a standalone actual-tensor oracle. Identical `cublasGemmEx` arguments using
+a fresh handle differ; the prepared Torch handle matches. An owned explicit
+128KiB/1MiB/4MiB/8MiB workspace matches; default and 16/32/64MiB differ. This
+is evidence of workspace-dependent numerical scheduling, not a reason to
+allocate arbitrarily larger workspaces. [PyTorch 2.9.1](https://github.com/pytorch/pytorch/blob/v2.9.1/aten/src/ATen/cuda/CublasHandlePool.cpp)
+sets workspace after setting the stream; its non-SM90 default is 8MiB+128KiB.
+
+The private cached-prefix/checkpoint-TN/owned-8MiB control passes 13/13 in
+2 view (12 bitwise chunks) and 11/11 in 3 view (10 bitwise). One view remains
+11/13: black+zero fails step limits and white+normal cosine .993169 / relative
+L2 .121118 fails. Independent two-view w30/n100 P50/P95 is 79.799/80.022ms
+(T10) and 84.340/84.571ms (T200); the completed three-block counterbalanced regression (1,800 raw samples) gives
+candidate P50/P95 79.804/80.048ms T10 and 84.300/84.631ms T200, versus deployed
+83.785/84.077ms and 86.516/87.241ms. Same-library T200 product is
+84.376/84.597ms, with overlapping block medians (product 84.227–84.509,
+candidate 84.203–84.467ms). No reproducible warm regression is measured on
+these two inputs. Aligned product T10 107.872ms includes its graph-workspace
+fallback and is not evidence of a kernel-only speedup.
+This recipe is diagnostic: it adds checkpoint-layout weights and changes
+handle resources, and has no maintained operator/lifecycle contract yet.
+No numerical prototype is promoted, no threshold is loosened and GPU CI stays
+disabled until all required cells and performance budgets are qualified.
