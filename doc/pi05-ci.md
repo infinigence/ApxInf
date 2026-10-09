@@ -4,6 +4,37 @@ This PR prepares the CI tools and workflows. It does **not** register runners,
 enable GPU dispatch, or change branch protection. An incomplete board matrix,
 missing asset, uncalibrated performance budget, or failed preflight cannot pass.
 
+## Current repair qualification (2026-10-10)
+
+Private native BF16 controls now pass all 37 diagnostic chunks and every action
+step on both boards: 13/13 one view, 13/13 two views, 11/11 three views. Orin's
+combined separate-QKV, one-view language output projection and three-view
+visual projector control has 11/11 three-view chunks bitwise OpenPI; repeats
+and revisits have zero drift. These are native diagnostic controls, not
+maintained model repairs or a qualified representative bank.
+
+Performance remains a separate acceptance condition. Orin's combined three-view
+control measures T10/T200 P50 298.296/300.339ms against the same-library product
+232.837/256.025ms. A Thor one-view auto-fusion control's 1,800-sample alternating
+comparison measures T200 71.057ms against bracketing product 70.703/70.616ms;
+every block reproduces the increment. It is rejected. A later cluster change
+retains all 37 precision passes and pilots at 67.419/69.230, 74.507/77.441 and
+88.499/91.404ms for one/two/three views. One-view T200 improves, but two-view T10
+still exceeds the same-library product's 73.592–73.791ms block medians. These
+pilots do not establish paired non-regression.
+
+On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
+outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster
+padded Tensor Core recipes fail complete-chunk or per-step checks. Exact tiled
+and guarded-recompute controls also remain slower in operator measurements;
+none is promoted. A micro-oracle is not complete inference qualification.
+
+The maintained INT8 learned-norm packing repair retains its earlier
+27,000-sample paired qualification without reproducible performance regression.
+Private BF16 controls have not changed that implementation. FP8/base INT8
+failures, representative input provenance and performance-budget approval remain
+unresolved; GPU CI stays disabled and this PR remains unaccepted.
+
 ## Scope
 
 The required matrix is Thor BF16/FP8 and Orin BF16/INT8, each with 1, 2 and 3
