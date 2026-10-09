@@ -3,6 +3,7 @@ members = [
     "crates/apxinf-core",
     "crates/apxinf-cuda",
     "crates/apxinf-cuda-new",
+    "crates/apxinf-mlx",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
@@ -17,6 +18,8 @@ license = "Apache-2.0"
 
 [features]
 default = []
+# Native Apple Metal execution through an explicitly configured MLX C++ SDK.
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "apxinf-model/mlx"]
 # CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
 # build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
 # CUDA uses libnvToolsExt. Both are handled transparently — see
@@ -32,6 +35,7 @@ openblas = ["apxinf-core/openblas"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
+apxinf-mlx = { path = "crates/apxinf-mlx", optional = true }
 apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }

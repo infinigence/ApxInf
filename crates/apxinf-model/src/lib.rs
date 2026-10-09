@@ -8,9 +8,13 @@ mod generation_config;
 pub mod gr00t;
 pub mod llama;
 pub mod llm_trait;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_minicpm5;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen3;
 #[cfg(feature = "cuda-new")]
 pub mod qwen38;
 pub mod qwen3vl;
@@ -30,7 +34,8 @@ pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerW
 pub use llama::{GeneralLlama, KVCache, LlamaModel, LlamaWeights, TransformerLayer};
 pub use llm_trait::{
     generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationOutput,
-    GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait,
+    GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope,
+    TextPreparationState, TextPreparationStatus,
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;

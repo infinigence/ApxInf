@@ -122,7 +122,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -131,9 +131,10 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     };
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
+        "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|metal|mlx|cpu)"
         ))),
     }
 }
@@ -181,7 +182,7 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
 /// Python binding for a loaded VLA runner. Holds the runtime and its contract,
 /// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
-/// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
+/// The pi05 and MLX runtimes may own thread-bound `Rc`/`RefCell` resources;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
 pub struct ModelRunner {
@@ -790,7 +791,8 @@ impl ModelRunner {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
-    /// * `device` — `cuda:N` (default) or `cpu`.
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
     /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
     /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
     /// * `calibration` — optional FP8 calibration json.
@@ -903,7 +905,8 @@ impl ModelRunner {
     /// parameters, letting one call sweep 2/3-view, image size, horizon, etc.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
-    /// * `device` — `cuda:N` (default) or `cpu`.
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
     /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
@@ -1754,10 +1757,7 @@ impl ModelRunner {
     /// Device string, e.g. `"cuda:0"`.
     #[getter]
     fn device(&self) -> String {
-        match self.device {
-            Device::Cuda(index) => format!("cuda:{index}"),
-            Device::Cpu => "cpu".to_string(),
-        }
+        self.device.to_string()
     }
 
     /// Actual loaded implementation; `auto` is resolved during loading.
@@ -1843,6 +1843,11 @@ mod tests {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
+        assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
+        assert_eq!(parse_device("metal:1").unwrap(), Device::Metal(1));
+        assert_eq!(parse_device("mlx:0").unwrap(), Device::Metal(0));
+        assert!(parse_device("metal:").is_err());
+        assert!(parse_device("mlx:-1").is_err());
         assert!(parse_device("tpu").is_err());
         assert!(parse_device("cuda:x").is_err());
     }

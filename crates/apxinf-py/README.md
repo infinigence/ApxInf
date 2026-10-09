@@ -43,6 +43,13 @@ Compile-check only (no CUDA, no link):
 cargo check -p apxinf-py
 ```
 
+Device parsing also accepts `metal:N` and its `mlx:N` alias; the canonical
+reported name is `metal:N`. Parsing a device does not register an implementation:
+loading still requires the MLX feature and a family with a native MLX path.
+The existing CUDA-only VLA families do not gain Metal support through this alias.
+`ModelRunner` is thread-bound (`#[pyclass(unsendable)]`); use it from the Python
+thread that created it, including when its tensors own lazy MLX arrays.
+
 ## Usage
 
 ```python

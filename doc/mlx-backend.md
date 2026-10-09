@@ -1,0 +1,346 @@
+# MLX backend and Apple Silicon model migration
+
+The optional `mlx` backend supports native Apple Silicon macOS inference.
+See the [selection table](#implemented-text-selections) for supported model
+geometry, precision and compilation scopes. Other Metal platforms require
+a separate backend implementation.
+
+ApxInf owns model mathematics, checkpoint interpretation and request state.
+The MLX backend supplies model-neutral array operations and prepared compiled
+execution on Metal. Python MLX/MLX-LM implementations are reference and migration
+tools; an external model provider is not the maintained inference path.
+
+## Performance-first Metal scope
+
+The cross-backend composition contract is still under construction. This Metal
+port does not depend on that proposal or require a shared model graph. The
+`metal_qwen3` and `metal_minicpm5` modules own their native MLX composition,
+precision choices, state and compilation boundaries. Optimize these concrete
+paths against their reference outputs and measured workload performance.
+
+`MlxBackend` adapts the existing public `Tensor`, `Backend` and sampling APIs at
+the application boundary. It is not a per-layer dispatch requirement. Model
+layers call safe `Array`, `Compiled` and fused Metal operations directly;
+there is no provisional `PortableOps`/`AttentionPlan` prerequisite. A future
+multi-backend design can revisit this seam with evidence from working paths.
+
+The [CUDA operator layers](../crates/apxinf-cuda-new/README.md) retain their own
+APIs and execution design. The Metal implementation keeps native FFI, resource
+ownership and unsafe custom kernels behind the safe Rust MLX API.
+
+## Module ownership and public integration
+
+```text
+Rust application / existing Python policy
+  -> AutoModel / existing native ModelRunner
+  -> family LlmTrait or VlaRuntime implementation
+  -> metal_<family> native model composition
+  -> safe native Array / Compiled / fused Metal operations
+  -> private C ABI / MLX arrays and compiled functions
+  -> Metal
+```
+
+`apxinf-mlx` is a sibling of the CUDA and future HIP crates. It uses core
+tensor and sampling types, without CUDA implementation or model-family dependencies. A Cargo
+`mlx` feature selects its dependency closure without enabling CUDA. Builds
+without that feature do not require MLX or Python. Unsupported OS/device/feature
+combinations fail at construction with an explicit error.
+
+| Owner | Responsibility |
+| --- | --- |
+| `apxinf-core` | Device identity, public tensor/storage ownership and sampling interfaces |
+| `apxinf-mlx` safe Rust API | MLX array ownership, explicit transfers, supported operators, KV storage, prepared callable and stream lifetime |
+| `apxinf-mlx` native bridge | MLX C++ adaptation, status/error conversion, array/closure handles and custom Metal operator implementation |
+| Family `config`/`load`/`weights` | Checkpoint key mapping, canonical transformations, backend construction and immutable prepared weights |
+| Family model/Blocks | Forward order, rounding recipe, attention/position semantics and model-local fused composition |
+| Family runner/generation | Request state, preparation, supported profiles, cache invalidation, EOS or flow schedule |
+| Existing Python policy / binding | Observation mapping and public input/output conversion, without a second Python network |
+
+`LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
+The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
+and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
+most 512 followed by a final-token forward; MiniCPM5 projects only the final
+normalized prompt row. Call `forward` for every input row's logits. Ordinary
+generation uses the shared sampler/EOS loop; DSpark overrides the request-level
+generation schedule. The infallible `reset`/`prewarm_decode` hooks cannot
+swallow MLX failures: use a fallible family preparation method, or retain an
+invalidated error returned by the next fallible call.
+
+Keep `LlmTrait` and `VlaRuntime` distinct. A small text model may retain the
+existing `config.rs`, `weights.rs`, `general.rs` organization. A VLA uses its
+own Model and ModelRunner responsibilities. Do not import another family's
+model, config or cache merely because equations are similar.
+
+Backend selection is resolved during construction/preparation. Models call
+safe mathematical APIs, not raw MLX FFI. Provider/kernel choices stay below
+those APIs; family-specific compilation composes those operations rather than
+placing a model-name switch in the backend. Reuse the existing registry,
+`LoadedModel::text`/`LoadedModel::Vla` and public CLI/binding.
+
+### Implemented text selections
+
+The `mlx` Cargo feature registers `metal_qwen3` and `metal_minicpm5` with
+`AutoModel`. `Device::Metal(N)` resolves a `metal_<family>` implementation; the CLI
+accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`; native MLX currently
+accepts only index 0 and rejects other indices before creating a stream. A missing feature,
+unsupported device or absent family implementation fails explicitly. Existing
+CPU/CUDA models do not silently execute a Metal request on CPU.
+
+Metal admission requires a registered `metal_` factory and is resolved before
+device construction or checkpoint loading. It does not fall back to a legacy
+generic model factory; CPU/CUDA registry fallback remains unchanged. Explicit
+`--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
+implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
+selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
+
+| Family selection | Profile admitted by current code | Actual prepared execution |
+| --- | --- | --- |
+| Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 2048 positions | Ordered device composition; source public SwiGLU remains locally compiled |
+| Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
+| Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
+| MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 4096 positions | Ordered device composition; source public SwiGLU remains locally compiled |
+| MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
+| MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
+
+These rows describe implemented scopes, not qualified targets. The maintained
+owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
+[MiniCPM5](../crates/apxinf-model/src/metal_minicpm5/README.md), with model-neutral
+arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
+Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
+official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
+DSpark requires the named `draft` asset and is never selected by default.
+
+```sh
+cargo run --features mlx -- generate --model /path/to/Qwen3-0.6B \
+  --device metal --dtype bf16 --model-variant bf16-compiled --greedy \
+  --chat-options '{"enable_thinking":false}' --max-tokens 80 \
+  --prompt 'Explain gravity briefly.'
+
+cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
+  --model-name metal_minicpm5 --device metal --dtype bf16 --model-variant dspark \
+  --asset draft=/path/to/official-DSpark --greedy \
+  --chat-options '{"enable_thinking":false}' --max-tokens 80 \
+  --prompt 'Explain gravity briefly.'
+```
+
+The CLI renders the checkpoint chat template with the supplied options.
+Use `--keep-special-tokens` when special-token text carries application meaning;
+chat options containing `tools` enable this behavior automatically. MiniCPM's
+`<function>`/`<param>` tags must survive decoding for valid tool XML.
+
+## Native dependency and ABI
+
+The implemented bridge wraps the **MLX 0.31.2** C++ SDK with a small C ABI.
+`MLX_ROOT` identifies the matching `include/mlx/` and `lib/` distribution;
+headers are checked at build time and the linked version at stream construction.
+Do not combine arbitrary system headers with another wheel's library. A wheel
+may supply native SDK assets without embedding Python in the inference process.
+Native execution requires Apple Silicon macOS. On other targets the feature
+is inert: no SDK is linked and no Metal factory is registered. This keeps
+Linux builds with unified CUDA/MLX features independent of the Apple SDK;
+it does not provide Metal execution on Linux. See the backend README for
+SDK and library-search configuration. No `mlx-c` dependency is currently used.
+
+Opaque handles own MLX arrays, streams and compiled closures. The bridge uses
+fixed-width ABI fields, checked shape conversion and status/error returns;
+C++ exceptions and Rust panics cannot cross the ABI. RAII covers partial
+construction, callback ownership, asynchronous completion and teardown.
+Thread ownership is explicit; do not add `Send`/`Sync` to an opaque handle
+without proving the linked MLX runtime and wrapper permit it. Adding a
+non-`Send` opaque variant changes the automatic thread traits of every
+`Tensor`, including CPU/CUDA tensors; that public compatibility effect requires
+an explicit strategy and compilation coverage, not only an MLX-handle test.
+The implemented strategy is core's opt-in `opaque-storage` feature, enabled by
+the native backend: its owner is `Rc<dyn Any>`, making `Tensor` thread-affine
+on Apple Silicon macOS in that feature combination (including CPU tensors).
+Default CPU/CUDA builds and all non-Apple targets retain `Send + Sync`, even
+when Cargo unifies `opaque-storage` into a Linux build. The core compile test
+covers the latter property on supported CI hosts.
+The existing Python `ModelRunner` stays `#[pyclass(unsendable)]`; no wrapper
+introduces an unsafe thread-transfer guarantee.
+
+Because `Backend` also implements `SamplingBackend`, the MLX backend must
+provide the supported categorical sampler on device. A greedy initial profile
+may read back only the selected token scalar; unsupported penalties, random
+sampling or normal generation must fail rather than run a hidden CPU path.
+
+Ordinary same-process Rust calls may construct a lazy MLX expression. They must
+not convert intermediate arrays to host values or evaluate each primitive.
+Repeated execution uses prepared block/step closures, avoiding per-token
+Rust-to-Python or subprocess calls. Custom Metal kernels are registered once
+during preparation and invoked through the same safe operator boundary.
+
+## Tensor ownership and model-specific numerical semantics
+
+`Device::Metal(usize)` is the distinct Metal device identity. Physical device identity and backend
+implementation identity are separate: an MLX handle cannot be consumed by a
+different Metal implementation solely because both report `metal:0`.
+
+The current `GpuStorageHandle::from_raw_parts` requires a live device allocation
+at `ptr..ptr+len`. A lazy MLX array is not that pointer. `Storage::Opaque` and
+`Tensor::from_opaque_parts` retain a tagged owner with checked logical extent;
+existing CPU/CUDA storage and its safety contract remain intact. Core may
+validate logical capacity/device/dtype without accessing array contents or
+forcing evaluation. The backend validates handle identity and physical
+representation. Foreign or forged metadata must not reach a native kernel.
+
+Public tensors remain dense, contiguous, row-major. `MlxBackend::from_array`
+materializes that boundary; internal `Array` views retain MLX layout semantics.
+The backend reconciles public reshape metadata with the native array geometry
+and checks owner, device, dtype and extent before accessing it. Native array
+operations do not require a public Tensor wrapper or an extra materialization.
+
+Each Metal model owns its checkpoint's numerical recipe: intermediate casts,
+normalization rounding, attention masking, weight packing and fused selection.
+For example, cast-before-affine and cast-after-affine norms cannot share a fused
+candidate just because both are called RMSNorm. The compatibility adapter's
+existing Backend methods do not define the native models' layer arithmetic.
+
+Keep structural checks at preparation where possible, preserve safe operand and
+resource checks at invocation, and compare the actual compiled/fused path with
+its pinned reference. No implicit CPU fallback, reduced precision or changed
+masking is justified by a planned cross-backend abstraction.
+
+## Prepared compiled execution
+
+MLX compilation and CUDA Graph replay are different execution mechanisms.
+The existing `Graph`, `RequireGraph` and `ExecutionMode::Graph` retain their
+capture/replay meaning; MLX must return unsupported from a requested CUDA-style
+capture instead of fabricating a no-op graph.
+
+The current text implementations select compiled execution through explicit
+family variants and fallible family `prepare` methods. `Compiled` owns the pure
+Rust callback; `call` is lazy and `call_and_eval` completes all returned arrays.
+Preparation uses `Compiled::prepare`, which evaluates twice and rejects any
+Rust trace callback on the second invocation. Callable construction rejects
+the presence of `MLX_DISABLE_COMPILE`, even when its value is `0`; that MLX
+setting otherwise disables compilation silently. The reuse check observes
+Rust tracing, not all native shader compilation.
+
+`LlmTrait::preparation_status()` returns a pure-data `TextPreparationStatus`:
+`RuntimeManaged`, `Unprepared`, `Ready` or `Invalidated`, implementation/variant,
+successfully prepared compilation scopes and sequence lengths, optional prompt
+profile, KV capacity, maximum decode rows and a retained error. Qwen3 reports
+its actual sorted set of prepared lengths rather than inventing one prompt
+profile. Invalidated/unprepared states do not advertise successful scopes.
+The default legacy status is `RuntimeManaged`, which proves no preparation.
+`TextCompilationScope` distinguishes local subgraphs, decoder block, decode step
+and draft proposal; readiness never substitutes for hardware qualification.
+The VLA preparation contract remains independent. No universal runtime class
+or generic `ExecutionMode::Compiled` is introduced. A future generic
+prefer/require interface must extend the existing owner, with explicit profile
+and fallback reporting; a required compiled path cannot silently become eager.
+
+For an MLX target, report each applicable scope independently: local subgraph,
+complete decoder block, complete decode/solver step and fixed rollout. A local
+norm/RoPE kernel is not proof that full-step compilation was assessed.
+
+| Phase | Required behavior |
+| --- | --- |
+| Construct | Bind device/runtime identity, weights, public semantics and supported profiles |
+| Prepare | Validate structural contracts; materialize immutable weights; create kernels/closures; trace/compile/warm supported profiles; establish memory bounds |
+| Run | Check live operands; bind explicit state; call the prepared closure; enqueue device work without retracing, retuning or creating persistent resources |
+| Complete | Evaluate required outputs and new state on the correct stream; publish state only after successful completion |
+| Reset / invalidate | Make old request state unreachable; preserve retained resources or invalidate dependents before replacing them |
+| Release | Retain resources until dependent asynchronous work is complete; release partial preparations on failure |
+
+Compilation keys include callable/build/runtime identity, captured immutable
+weights and constants, semantic precision, mask/position rules and all shape
+facts that affect tracing. Executable identity also binds the device/stream.
+Changing mask kind or fixed causal offsets rebuilds the semantic plan. Dynamic
+position/length values are array inputs only where the traced computation
+actually consumes them dynamically; otherwise they are specialization facts.
+
+Use exact keys. A documented shape bucket represents an explicitly padded
+problem with validity masks, not an approximate recipe hit. `shapeless` is not
+proof that a closure is independent of its first observed shape or control flow.
+Persistent selection recipes, if later introduced, use implementation/version/
+configuration identities and full exact keys; they never store live pointers or
+streams. Keep runtime-bound executable caches separate from recipe caches.
+
+CUDA enqueue's allocation-free capture contract is unchanged. MLX compiled
+execution may produce temporary array values through its allocator; it must
+not be labelled fixed-address or allocation-free replay. Its qualification must
+establish bounded transient residency, stable warm memory behavior and no new
+long-lived resources, retracing or JIT compilation in the measured hot path.
+A latency result does not waive retained-memory growth or stale-state errors.
+
+`Stream::counters` records explicit bridge upload/download bytes and Rust trace
+callbacks. It does not count every internal MLX pipeline compilation or physical
+DMA. `memory_stats` is the process-wide MLX allocator, not process RSS.
+Synchronize before reading allocator statistics, and measure preparation
+separately from warm requests. Keep numerical, semantic and performance
+validation independent of these diagnostic counters.
+
+## State and output lifetime
+
+Weights and constants belong to the loaded model. A prepared object retains
+every model/closure/stream resource it uses, even if the original runner is
+released. Request state belongs to one request/session; cache eviction,
+request reset and model unload are distinct operations.
+
+LLM state includes KV, position, sampling history and any recurrent state.
+Append does not independently advance global sequence length in each layer;
+the model commits position once after all required layer outputs are complete.
+Compiled functions take changing arrays as explicit inputs and return the new
+arrays. Failure before completion must discard tentative state or invalidate
+the session, never silently reuse a partially updated cache.
+
+VLA state includes observation prefix, latent/noise, conditioning and solver
+position. Reuse an observation encoding within its valid request lifetime;
+equal shape alone cannot justify reusing it for a new camera frame. Prefix
+branching and speculative rollback are explicit capabilities, not consequences
+of having a KV container.
+
+Public results state whether they own their data or borrow storage overwritten
+by a later call. `Tensor::clone` is not assumed to deep-copy. Tests cover two
+live engines, repeated reset/load/unload, retained outputs, cancellation/error
+cleanup and capacity exhaustion. Unified memory does not remove ownership,
+copy, device-residency or synchronization obligations.
+
+## Migration sequence and acceptance
+
+Follow the [porting workflow](porting-workflow.md) for source/checkpoint
+identity, independent numerical and complete-answer checks, public integration
+and performance validation. Keep references and captures in `devlocal/`.
+
+MLX ports additionally check explicit-state eager/compiled parity, changed-input
+propagation, reset and shape invalidation, retained outputs, failure cleanup and
+bounded warm memory. Quantized selections need a precision-matched reference
+and the declared model-quality floor. Speculative modes require their own
+proposal, verification, stopping and rollback checks.
+
+For fixed VLA profiles, compiled coverage includes the complete action loop and
+device handoff from vision/language, through a whole-model callable or a
+justified prepared stage partition. Measure construction/compilation separately
+from warm inference, evaluate actual outputs and state at the timing boundary,
+and avoid per-layer host synchronization introduced only for measurement.
+
+## Required review evidence
+
+| Boundary | Evidence |
+| --- | --- |
+| Core compatibility | Existing CPU tests and feature builds; CUDA/HIP regressions when their shared contract changes |
+| Storage/ABI | Invalid extent/device/dtype rejection, alias/lifetime checks, failure cleanup and thread policy |
+| Operators | Independent references for every advertised shape/precision/mask domain, including all-masked attention |
+| Prepared execution | No hot retrace/tune; input rebinding; eager/compiled parity; shape invalidation and bounded memory |
+| Model | Exact checkpoint load, important intermediate tensors, full real-input gate and state regressions |
+| Public path | Registry/CLI or existing binding invocation, real decoded outputs and supported options |
+| Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
+
+Temporary references, captures and reports stay in ignored `devlocal/` per
+[AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
+docs and dependency/license provenance belong in their corresponding PRs.
+
+## Shared tokenizer compatibility
+
+`apply_chat_template` retains the upstream environment and normalization.
+Only `apply_chat_template_with_options` installs the Transformers-compatible
+`tojson` and `raise_exception` helpers and exact HF whitespace policy.
+The tokenizer still enables `serde_json/preserve_order` and MiniJinja's
+`preserve_order` to retain tool-schema key order. Cargo unifies these features:
+other JSON maps in the same build also retain insertion order rather than
+sorting keys. Consumers must compare JSON values, not serialized map order.
+CUDA tuning records are explicitly sorted after parsing; CUDA hardware
+regressions remain to be run on a CUDA host. This PR does not claim those
+hardware checks from Metal-only testing.

@@ -6,6 +6,10 @@ license = "Apache-2.0"
 
 [features]
 default = []
+# Lazy backend arrays retain thread-affine owners instead of device pointers.
+# Opt in explicitly: on Apple Silicon macOS this makes Tensor !Send/!Sync.
+# Inert on other targets, including unified Linux CUDA + MLX feature builds.
+opaque-storage = []
 # BLAS backends — enable one at a time. If none is enabled, a naive
 # Rust fallback is used.
 accelerate = ["cblas", "libc"]   # Apple Accelerate framework (macOS)

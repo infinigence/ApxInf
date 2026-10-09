@@ -1,11 +1,13 @@
 use std::sync::Arc;
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+use std::{any::Any, rc::Rc};
 
 use crate::Device;
 
 /// Raw data backing for a tensor.
 ///
-/// CPU storage is a byte buffer. CUDA storage holds an opaque
-/// handle that the backend crate interprets.
+/// CPU storage is a byte buffer. Pointer-backed GPU storage retains its owning
+/// allocation. Optional opaque storage retains a lazy, thread-affine backend array.
 #[derive(Debug, Clone)]
 pub enum Storage {
     /// CPU-side contiguous byte buffer.
@@ -14,6 +16,12 @@ pub enum Storage {
     Gpu {
         device: Device,
         handle: GpuStorageHandle,
+    },
+    /// Thread-affine backend storage. This is an array owner, never a raw pointer.
+    #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+    Opaque {
+        device: Device,
+        handle: OpaqueStorageHandle,
     },
 }
 
@@ -92,6 +100,8 @@ impl Storage {
         match self {
             Storage::Cpu(v) => v.len(),
             Storage::Gpu { handle, .. } => handle.len,
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+            Storage::Opaque { handle, .. } => handle.len(),
         }
     }
 
@@ -105,6 +115,8 @@ impl Storage {
         match self {
             Storage::Cpu(v) => Some(v),
             Storage::Gpu { .. } => None,
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+            Storage::Opaque { .. } => None,
         }
     }
 
@@ -113,6 +125,8 @@ impl Storage {
         match self {
             Storage::Cpu(v) => Some(v),
             Storage::Gpu { .. } => None,
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+            Storage::Opaque { .. } => None,
         }
     }
 
@@ -121,6 +135,47 @@ impl Storage {
         match self {
             Storage::Cpu(_) => None,
             Storage::Gpu { handle, .. } => Some(handle),
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+            Storage::Opaque { .. } => None,
         }
+    }
+}
+
+/// A retained backend-specific lazy array with a checked logical byte extent.
+///
+/// The owning backend must downcast and validate its actual dtype, device, and
+/// element count before use. Core never dereferences this owner. It deliberately
+/// uses Rc: enabling opaque storage makes Tensor thread-affine without imposing
+/// unproven Send/Sync guarantees on a native runtime.
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub struct OpaqueStorageHandle {
+    owner: Rc<dyn Any>,
+    len: usize,
+}
+
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+impl OpaqueStorageHandle {
+    pub(crate) fn new(owner: Rc<dyn Any>, len: usize) -> Self {
+        Self { owner, len }
+    }
+
+    pub fn owner(&self) -> &Rc<dyn Any> {
+        &self.owner
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for OpaqueStorageHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpaqueStorageHandle")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
     }
 }

@@ -1,0 +1,26 @@
+name: MLX shared-path compatibility
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'crates/apxinf-core/**'
+      - 'crates/apxinf-mlx/**'
+      - 'crates/apxinf-model/**'
+      - 'crates/apxinf-tokenizer/**'
+      - '.github/workflows/mlx-compatibility.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-feature-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No MLX_ROOT or Apple SDK: unified features must stay inert on Linux.
+      - run: cargo check --locked --features mlx
+      - run: cargo test --locked -p apxinf-core --features opaque-storage --test opaque_storage
+      - run: cargo test --locked -p apxinf-tokenizer --lib
+      - run: cargo test --locked -p apxinf-tokenizer --features minijinja/json --lib

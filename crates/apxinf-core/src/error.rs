@@ -6,6 +6,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    /// A valid operator contract has no implementation in the selected backend.
+    #[error("operator not implemented by this backend: {0}")]
+    UnsupportedOp(&'static str),
+
+    /// An operator or storage invariant was violated by its arguments. The reason is
+    /// static so validation never allocates on the error path.
+    #[error("invalid operator or storage input: {0}")]
+    Contract(&'static str),
+
+    /// A dtype falls outside the set an operator accepts.
+    #[error("unsupported dtype {got}: expected one of {allowed}")]
+    UnsupportedDType { got: DType, allowed: &'static str },
+
     #[error("shape mismatch: expected {expected}, got {got}")]
     ShapeMismatch { expected: String, got: String },
 
