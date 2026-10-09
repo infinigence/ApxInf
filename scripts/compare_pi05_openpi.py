@@ -344,6 +344,9 @@ def run_openpi(args: argparse.Namespace) -> None:
         raise ValueError("reference source lacks Git metadata; supply --openpi-revision")
     collect(args.suite_dir, manifest, model, "openpi", {
         "revision": revision,
+        "float32_matmul_precision": model.torch.get_float32_matmul_precision(),
+        "matmul_allow_tf32": model.torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": model.torch.backends.cudnn.allow_tf32,
         "config_sha256": sha256(args.checkpoint_dir / "config.json"),
         "checkpoint_sha256": checkpoint_hash(args.checkpoint_dir),
     }, force=args.force, output=args.output, stability_repeats=args.stability_repeats)

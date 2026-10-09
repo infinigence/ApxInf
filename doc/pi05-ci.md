@@ -485,3 +485,18 @@ These whole metrics improve, but per-action-timestep checks still fail.
 Single-step discrepancies remain and accumulate. The official capture
 reproduces both tested original goldens bitwise. Injected/trace runs disable
 capture and have no product performance meaning.
+
+
+### Actual reference precision policy
+
+The pinned OpenPI constructor sets float32 matmul precision to `high`. Reference
+receipts now record the resulting matmul policy and CUDA/cuDNN TF32 switches.
+A reconstructed `highest`-precision F32 oracle does not reproduce this policy.
+On ten actual action-input operands, `high` reproduces the observed reference
+BF16 embeddings exactly; full F32 GEMM differs in up to 5,706 BF16 elements,
+and cuBLAS TF32 mode reproduces every observed embedding. Both actual language
+and expert `inv_freq` buffers are BF16 after model conversion; 127/128 values
+differ from the earlier F32-formula control. These findings supersede broad
+reference-equality claims from reconstructed high-precision/RoPE oracles.
+The corrected-buffer and TF32 interventions remain private pending complete
+output and performance qualification; no thresholds or goldens were changed.
