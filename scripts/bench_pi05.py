@@ -274,7 +274,7 @@ def _run_l3(host, port, model_variant, prompt, warmup, samples):
 
 def benchmark_suite(args):
     """Use the existing warmup/time-loop/statistics protocol on frozen L1 inputs."""
-    from compare_pi05_openpi import ApxInfModel, load_case, load_suite, sha256, write_json
+    from compare_pi05_openpi import ApxInfModel, cuda_runtime_libraries, load_case, load_suite, sha256, write_json
     import apxinf_py
 
     if args.model_dir is None or args.layer != "l1" or args.out is None:
@@ -307,6 +307,7 @@ def benchmark_suite(args):
         "config_sha256": sha256(args.model_dir / "config.json"),
         "calibration_sha256": sha256(pathlib.Path(args.calibration)) if args.calibration else None,
         "extension_sha256": sha256(pathlib.Path(apxinf_py.__file__)),
+        "runtime_libraries": cuda_runtime_libraries(),
         "warmup": args.warmup, "samples": args.samples, "cases": rows,
     }, force=True)
 

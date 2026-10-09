@@ -116,12 +116,30 @@ def performance(rows: list[dict], cell: dict) -> dict:
     return {"state": "pass" if passed else "fail", **measured, "cases": per_case}
 
 
+def runtime_fingerprint(receipt: dict) -> dict[str, str]:
+    libraries = receipt.get("runtime_libraries", {})
+    required = {"libcuda", "libcudart", "libcublas", "libcublasLt"}
+    if not isinstance(libraries, dict) or set(libraries) != required or any(
+            not isinstance(record, dict) for record in libraries.values()):
+        raise ValueError("loaded CUDA runtime provenance missing")
+    fingerprint = {name: record.get("sha256", "") for name, record in libraries.items()}
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in fingerprint.values()):
+        raise ValueError("invalid CUDA runtime digest")
+    return fingerprint
+
+
 def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
              actual: dict, revision: str, latency: dict) -> dict:
     if len(load_suite(suite)["image_keys"]) != cell["views"]:
         raise ValueError("suite/cell view count differs")
     if latency.get("schema") != "apxinf.pi05.performance.v1" or latency.get("layer") != "l1":
         raise ValueError("invalid performance receipt")
+    candidate_runtime = runtime_fingerprint(actual)
+    runtime_fingerprint(reference)
+    if runtime_fingerprint(baseline) != candidate_runtime:
+        raise ValueError("candidate CUDA runtime differs from approved baseline")
+    if runtime_fingerprint(latency) != candidate_runtime:
+        raise ValueError("performance CUDA runtime differs from accuracy receipt")
     protocol = cell["performance_protocol"]
     if any(latency.get(key) != value for key, value in protocol.items()):
         raise ValueError("performance protocol differs")

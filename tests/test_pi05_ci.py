@@ -199,6 +199,8 @@ class MatrixTest(unittest.TestCase):
                    "hardware": cell["hardware"], "calibration_sha256": None,
                    "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64,
                    "extension_sha256": "d" * 64,
+                   "runtime_libraries": {name: {"path": f"/fixture/{name}.so", "sha256": "e" * 64}
+                                         for name in ("libcuda", "libcudart", "libcublas", "libcublasLt")},
                    "stability": {"repeats": 2, "revisit_max_abs": 0,
                                  "cases": [{"name": "one", "repeat_max_abs": 0}]},
                    "cases": [{"name": "one", "input_sha256": entry["sha256"],
@@ -275,6 +277,26 @@ class MatrixTest(unittest.TestCase):
         changed["cases"][0]["latency_ms"] = [100, 100]
         parity.write_json(path, changed, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
+
+    def test_runtime_drift_and_missing_provenance_cannot_pass(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        candidate = json.loads((self.root / cell["hardware"] / f"{cell['id']}.json").read_text())
+        reference = json.loads((suite / "reference.json").read_text())
+        baseline = json.loads((suite / "baseline.json").read_text())
+        latency = json.loads((self.root / cell["hardware"] / f"{cell['id']}.performance.json").read_text())
+        latency["runtime_libraries"]["libcublas"]["path"] = "/relocated/libcublas.so"
+        self.assertTrue(ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)["passed"])
+        latency["runtime_libraries"]["libcublas"]["sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "performance CUDA runtime"):
+            ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+        latency["runtime_libraries"] = candidate["runtime_libraries"]
+        baseline["runtime_libraries"]["libcublas"]["sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "approved baseline"):
+            ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+        reference.pop("runtime_libraries")
+        with self.assertRaisesRegex(ValueError, "provenance missing"):
+            ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
 
     def test_uncalibrated_performance_is_not_green(self):
         rows = [{"name": "case", "latency_ms": [10, 11], "first_call_ms": 20}]

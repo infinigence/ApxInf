@@ -38,6 +38,22 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def cuda_runtime_libraries() -> dict[str, dict[str, str]]:
+    """Record the loaded DSOs, rather than infer them from the installed toolkit."""
+    maps = Path("/proc/self/maps")
+    if not maps.exists():
+        return {}
+    paths = {line.split()[-1] for line in maps.read_text().splitlines()}
+    libraries = {}
+    for name in ("libcuda", "libcudart", "libcublas", "libcublasLt"):
+        loaded = [Path(path) for path in paths if Path(path).name.startswith(name + ".so")]
+        if len(loaded) > 1:
+            raise ValueError(f"multiple loaded {name} libraries")
+        if loaded:
+            libraries[name] = {"path": str(loaded[0]), "sha256": sha256(loaded[0])}
+    return libraries
+
+
 def write_json(path: Path, value: dict[str, Any], *, force: bool = False) -> None:
     if path.exists() and not force:
         raise FileExistsError(f"{path} exists; use --force or a new suite directory")
@@ -312,7 +328,7 @@ def collect(root: Path, manifest: dict[str, Any], model: Any,
         print(f"{engine}: {entry['name']} {actions.shape}", flush=True)
     write_json(output or root / f"{engine}.json", {
         "schema": SCHEMA, "engine": engine, "suite_sha256": sha256(root / "manifest.json"),
-        **metadata, "cases": rows,
+        **metadata, "runtime_libraries": cuda_runtime_libraries(), "cases": rows,
         "stability": stability(model, root, manifest, rows, stability_repeats),
     }, force=force)
 

@@ -143,7 +143,13 @@ reuses that benchmark's timer loop and empirical order-statistic P50/P95
 statistics per frozen input. Each board/precision/view cell has its own protocol
 and budget; pooling cannot hide a slow input. Accuracy results contain no
 latency samples. Both receipts must agree on input, extension, checkpoint,
-configuration, calibration, hardware and exact source SHA.
+configuration, calibration, hardware and exact source SHA. Accuracy and performance
+also record paths and SHA256 of the **loaded** CUDA driver, runtime, cuBLAS and
+cuBLASLt libraries. The aggregator compares their digests against each other
+and the approved ApxInf baseline; paths can differ after relocation. The
+OpenPI reference must record its own library provenance, but may use a
+different approved runtime. Installed toolkit version alone is insufficient.
+Old receipts without these fields must be rerun before gate acceptance.
 
 Calibrate sample and warmup counts using repeated independent runs: verify
 warmup convergence, estimate per-case variation and tail behavior, and test
@@ -397,3 +403,44 @@ measured process variation on the selected inputs. They do not prove identical
 latency or supply an approved performance budget.
 Longest text is not necessarily slowest: Orin 2-view BF16 T10 is slower than
 T200. These two inputs do not constitute worst-case performance coverage.
+
+
+## Further numerical controls (2026-10-09)
+
+All following controls are private experiments, with unchanged official
+goldens and historical limits. No candidate below has been promoted.
+
+| Thor BF16 control | Full chunk and all-step passes | T10 warm P50 ms |
+| --- | --- | --- |
+| Complete staged arithmetic, 2 views | 8/13 | 90.100 |
+| Complete staged arithmetic, 3 views | 10/11 | 100.945 |
+| 2-view prefix row padding alone | 8/13 | 95.964 |
+| 2-view precise attention softmax | 8/13 | 93.299 |
+| 2-view explicit masked attention columns | 8/13 | about 99 |
+
+These are exploratory separate benchmark runs (10 warmups, 30 retained
+samples/input), not the controlled A/B/A repair qualification above. Their
+latency increases and remaining numerical failures prevent promotion.
+The three-view staged control passes black+zero but still fails distinct
+camera gray on timestep checks. Success on three views does not establish
+why a different two-view input fails.
+
+Reference-only controls distinguish several causes. Batching camera encoding
+changes none of ten selected official outputs. Removing masked image tokens
+changes output despite identical valid images/tokens/noise: white-input whole
+relative L2 reaches .133. The official golden is retained. Native row padding
+alone does not reproduce masked attention or cure black+zero.
+
+Replacing official vision output restores white and distinct-gray all-step
+checks in the complete staged two-view control. Replacing all official KV
+still leaves black+zero and gradient+zero red. The numerical differences
+span prefix and action paths; no single successful local operator comparison
+proves a repaired complete chunk. Precise MQA and RoPE controls on 24 matched
+action sites are bitwise equal to Torch, but their full chunks remain red.
+
+Loaded-library inspection finds system CUDA 13.2/cuBLAS 13.4 in standalone
+ApxInf and bundled CUDA 13.0 libraries in OpenPI. Live cuBLAS operator probes
+inside a Torch process inherit those bundled libraries; this does not
+automatically establish their standalone behavior. Comparisons against saved
+standalone native operator outputs remain separate evidence. Runtime alignment
+is being measured, not adopted as an untested repair or a relaxed threshold.
