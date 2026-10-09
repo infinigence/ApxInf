@@ -1,5 +1,5 @@
 //! Lifecycle tests for lazy backend storage. No native runtime is needed.
-#[cfg(feature = "opaque-storage")]
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 mod opaque {
     use apxinf_core::{DType, Device, Shape, Storage, Tensor};
     use std::{cell::Cell, rc::Rc};
@@ -41,13 +41,14 @@ mod opaque {
     }
 
     #[test]
-    fn invalid_extents_and_cpu_opaque_owners_are_rejected() {
+    fn invalid_extents_and_non_metal_opaque_owners_are_rejected() {
         for (shape, device, bytes) in [
             (vec![2, 3], Device::Metal(0), 23),
             (vec![usize::MAX, 2], Device::Metal(0), usize::MAX),
             (vec![usize::MAX], Device::Metal(0), usize::MAX),
             (vec![0, 2], Device::Metal(0), 0),
             (vec![1], Device::Cpu, 4),
+            (vec![1], Device::Cuda(0), 4),
         ] {
             assert!(Tensor::from_opaque_parts(
                 Shape::new(shape),
@@ -71,7 +72,7 @@ mod opaque {
     }
 }
 
-#[cfg(not(feature = "opaque-storage"))]
+#[cfg(not(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn default_storage_keeps_cpu_cuda_thread_traits() {
     fn send_sync<T: Send + Sync>() {}

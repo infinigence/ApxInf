@@ -1,4 +1,4 @@
-#![cfg(feature = "native")]
+#![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::Result;
 use apxinf_mlx::{clear_cache, memory_stats, reset_peak_memory, Array, Compiled, Stream};
 

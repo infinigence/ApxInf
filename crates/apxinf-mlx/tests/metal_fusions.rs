@@ -1,4 +1,4 @@
-#![cfg(feature = "native")]
+#![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::Result;
 use apxinf_mlx::fusions::{PackedResidualRmsNorm, QkNormRope};
 use apxinf_mlx::{Array, MlxDType as D, Stream};
@@ -50,5 +50,21 @@ fn packed_residual_norm_returns_both_owned_bf16_consumers() -> Result<()> {
     assert_eq!(norm.to_f32_vec()?, vec![2.; 2048]);
     assert_eq!(x.to_f32_vec()?, vec![1.; 2048]);
     assert!(PackedResidualRmsNorm::new(&s, f32::NAN).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn packed_residual_norm_keeps_epsilon_per_kernel_instance() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let x = Array::from_f32(&s, &[1, 1, 2048], &vec![0.5; 2048])?.cast(D::BF16)?;
+    let weight = Array::from_f32(&s, &[2048], &vec![1.; 2048])?.cast(D::BF16)?;
+    let small = PackedResidualRmsNorm::new(&s, 1e-6)?;
+    let large = PackedResidualRmsNorm::new(&s, 3.)?;
+    for (kernel, expected) in [(&small, 1.), (&large, 0.5), (&small, 1.)] {
+        let (sum, norm) = kernel.call(&x, &x, &weight)?;
+        assert_eq!(sum.to_f32_vec()?, vec![1.; 2048]);
+        assert_eq!(norm.to_f32_vec()?, vec![expected; 2048]);
+    }
     Ok(())
 }

@@ -32,6 +32,9 @@ table used for both embedding gather/dequantization and output projection;
 compiled local norm/RoPE functions; and the fixed TG256 Q/K norm-to-RoPE Metal
 fusion for B1/L1, 16 query heads, 8 key heads and width 128. The BF16 tied table
 and separate gate/up halves are released after packing. Norm weights stay FP32.
+BF16 prefill projections remain resident alongside their W8 decode copies.
+This is a decode-performance selection, not a guaranteed memory-saving mode;
+its resident weight memory can exceed BF16.
 This variant does not select the BF16 decoder-block callable: its inherited
 compilation boundary and valid-length attention remain explicit.
 

@@ -43,7 +43,7 @@ Source adaptations and MIT notices are recorded in the repository `NOTICE`.
 Select the target and drafter explicitly through the public CLI:
 
 ```sh
-apxinf generate --model /path/to/MiniCPM5-2B --model-name minicpm5 \
+apxinf generate --model /path/to/MiniCPM5-2B --model-name metal_minicpm5 \
   --device metal --dtype bf16 --model-variant dspark \
   --asset draft=/path/to/official-DSpark --greedy --max-tokens 256 \
   --chat-options '{"enable_thinking":false}' --prompt 'Explain binary search.'
@@ -52,3 +52,19 @@ apxinf generate --model /path/to/MiniCPM5-2B --model-name minicpm5 \
 Use `--model-variant bf16-compiled` without a draft asset for ordinary decoding.
 Tool definitions can be supplied in `--chat-options`; the CLI preserves the
 special `<function>` and `<param>` tags in generated tool calls.
+
+Request admission is read-only: unsupported bounds or sampling settings return
+an error without poisoning later generation or `forward` calls. A device/KV
+execution error invalidates the instance until an explicit `reset`.
+
+The ignored `rejected_requests_do_not_poison_generation_or_forward` regression
+loads the official checkpoints once, rejects several invalid requests, and
+checks subsequent valid generation on the same instance without caller resets.
+Set `APXINF_MINICPM_CHECKPOINT`, `APXINF_DSPARK_CHECKPOINT` and
+`APXINF_DSPARK_REPLAY_INPUT` (the existing real-prompt replay JSON schema), then
+run under the host's shared Metal lock:
+
+```sh
+cargo test -p apxinf-model --features mlx --release \
+  rejected_requests_do_not_poison_generation_or_forward -- --ignored --test-threads=1
+```

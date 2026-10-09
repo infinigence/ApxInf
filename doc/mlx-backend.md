@@ -81,7 +81,8 @@ placing a model-name switch in the backend. Reuse the existing registry,
 
 The `mlx` Cargo feature registers `metal_qwen3` and `metal_minicpm5` with
 `AutoModel`. `Device::Metal(N)` resolves a `metal_<family>` implementation; the CLI
-accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`. A missing feature,
+accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`; native MLX currently
+accepts only index 0 and rejects other indices before creating a stream. A missing feature,
 unsupported device or absent family implementation fails explicitly. Existing
 CPU/CUDA models do not silently execute a Metal request on CPU.
 
@@ -134,7 +135,10 @@ The implemented bridge wraps the **MLX 0.31.2** C++ SDK with a small C ABI.
 headers are checked at build time and the linked version at stream construction.
 Do not combine arbitrary system headers with another wheel's library. A wheel
 may supply native SDK assets without embedding Python in the inference process.
-The native feature requires Apple Silicon macOS; see the backend README for
+Native execution requires Apple Silicon macOS. On other targets the feature
+is inert: no SDK is linked and no Metal factory is registered. This keeps
+Linux builds with unified CUDA/MLX features independent of the Apple SDK;
+it does not provide Metal execution on Linux. See the backend README for
 SDK and library-search configuration. No `mlx-c` dependency is currently used.
 
 Opaque handles own MLX arrays, streams and compiled closures. The bridge uses
@@ -148,7 +152,10 @@ non-`Send` opaque variant changes the automatic thread traits of every
 an explicit strategy and compilation coverage, not only an MLX-handle test.
 The implemented strategy is core's opt-in `opaque-storage` feature, enabled by
 the native backend: its owner is `Rc<dyn Any>`, making `Tensor` thread-affine
-in that feature combination. Default CPU/CUDA builds retain `Send + Sync`.
+on Apple Silicon macOS in that feature combination (including CPU tensors).
+Default CPU/CUDA builds and all non-Apple targets retain `Send + Sync`, even
+when Cargo unifies `opaque-storage` into a Linux build. The core compile test
+covers the latter property on supported CI hosts.
 The existing Python `ModelRunner` stays `#[pyclass(unsendable)]`; no wrapper
 introduces an unsafe thread-transfer guarantee.
 
@@ -324,3 +331,16 @@ and avoid per-layer host synchronization introduced only for measurement.
 Temporary references, captures and reports stay in ignored `devlocal/` per
 [AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
 docs and dependency/license provenance belong in their corresponding PRs.
+
+## Shared tokenizer compatibility
+
+`apply_chat_template` retains the upstream environment and normalization.
+Only `apply_chat_template_with_options` installs the Transformers-compatible
+`tojson` and `raise_exception` helpers and exact HF whitespace policy.
+The tokenizer still enables `serde_json/preserve_order` and MiniJinja's
+`preserve_order` to retain tool-schema key order. Cargo unifies these features:
+other JSON maps in the same build also retain insertion order rather than
+sorting keys. Consumers must compare JSON values, not serialized map order.
+CUDA tuning records are explicitly sorted after parsing; CUDA hardware
+regressions remain to be run on a CUDA host. This PR does not claim those
+hardware checks from Metal-only testing.

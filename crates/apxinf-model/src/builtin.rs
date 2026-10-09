@@ -14,9 +14,9 @@ use crate::registry;
 /// Register every implementation shipped in this crate. Re-registering is
 /// harmless and keeps `AutoModel::load_model` self-contained for users.
 pub fn register_builtin_models() {
-    #[cfg(feature = "mlx")]
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
-    #[cfg(feature = "mlx")]
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_qwen3", crate::metal_qwen3::load);
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);

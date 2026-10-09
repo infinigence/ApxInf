@@ -1,4 +1,4 @@
-#![cfg(feature = "native")]
+#![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, Compiled, MlxDType as D, Stream};
 use std::{cell::Cell, rc::Rc};
@@ -233,4 +233,18 @@ fn quantized_matmul_and_array_math() -> Result<()> {
     );
     assert_eq!(pos.argmax(-1)?.to_u32_scalar()?, 3);
     Ok(())
+}
+
+#[test]
+fn unsupported_metal_index_is_rejected_before_native_access() {
+    for index in [1, usize::MAX] {
+        assert!(matches!(
+            Stream::metal(index),
+            Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(id))) if id == index
+        ));
+        assert!(matches!(
+            apxinf_mlx::MlxBackend::new(index),
+            Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(id))) if id == index
+        ));
+    }
 }

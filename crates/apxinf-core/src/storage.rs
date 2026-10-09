@@ -1,5 +1,5 @@
 use std::sync::Arc;
-#[cfg(feature = "opaque-storage")]
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 use std::{any::Any, rc::Rc};
 
 use crate::Device;
@@ -18,7 +18,7 @@ pub enum Storage {
         handle: GpuStorageHandle,
     },
     /// Thread-affine backend storage. This is an array owner, never a raw pointer.
-    #[cfg(feature = "opaque-storage")]
+    #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
     Opaque {
         device: Device,
         handle: OpaqueStorageHandle,
@@ -100,7 +100,7 @@ impl Storage {
         match self {
             Storage::Cpu(v) => v.len(),
             Storage::Gpu { handle, .. } => handle.len,
-            #[cfg(feature = "opaque-storage")]
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
             Storage::Opaque { handle, .. } => handle.len(),
         }
     }
@@ -115,7 +115,7 @@ impl Storage {
         match self {
             Storage::Cpu(v) => Some(v),
             Storage::Gpu { .. } => None,
-            #[cfg(feature = "opaque-storage")]
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
             Storage::Opaque { .. } => None,
         }
     }
@@ -125,7 +125,7 @@ impl Storage {
         match self {
             Storage::Cpu(v) => Some(v),
             Storage::Gpu { .. } => None,
-            #[cfg(feature = "opaque-storage")]
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
             Storage::Opaque { .. } => None,
         }
     }
@@ -135,7 +135,7 @@ impl Storage {
         match self {
             Storage::Cpu(_) => None,
             Storage::Gpu { handle, .. } => Some(handle),
-            #[cfg(feature = "opaque-storage")]
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
             Storage::Opaque { .. } => None,
         }
     }
@@ -147,14 +147,14 @@ impl Storage {
 /// element count before use. Core never dereferences this owner. It deliberately
 /// uses Rc: enabling opaque storage makes Tensor thread-affine without imposing
 /// unproven Send/Sync guarantees on a native runtime.
-#[cfg(feature = "opaque-storage")]
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone)]
 pub struct OpaqueStorageHandle {
     owner: Rc<dyn Any>,
     len: usize,
 }
 
-#[cfg(feature = "opaque-storage")]
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 impl OpaqueStorageHandle {
     pub(crate) fn new(owner: Rc<dyn Any>, len: usize) -> Self {
         Self { owner, len }
@@ -171,7 +171,7 @@ impl OpaqueStorageHandle {
     }
 }
 
-#[cfg(feature = "opaque-storage")]
+#[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 impl std::fmt::Debug for OpaqueStorageHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpaqueStorageHandle")
