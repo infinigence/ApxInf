@@ -922,3 +922,34 @@ dimensions therefore matters for this diagnostic. Selecting the default
 zero-workspace vision FC2 recipe passes all 37 chunk cases but still measures
 69.093/72.254, 75.262/79.210 and 88.193/93.731ms. The unresolved same-environment
 latency regression prevents promotion of this control as well.
+
+
+### Same-library latency attribution and vision boundary controls
+
+A fresh fixed-product Orin pilot under the candidate's bundled CUDA libraries
+measures T10/T200 P50 170.457/149.806, 258.658/202.283 and
+232.837/256.025ms for 1/2/3 views. All three runtime fingerprints match the
+private affine candidate's performance receipts. Both library selection and
+code changes contribute to the deployed-system comparison; the candidate also
+remains slower than this same-library product. These pilots are not paired
+qualification or approved performance budgets.
+
+For three-view black+zero, replacing only the projected visual embedding with
+the saved official embedding yields a bitwise official complete action chunk.
+Returning to the original embedding reproduces the original failing chunk
+bitwise. The same intervention has no effect on one-view black+zero. Fresh
+three-view captures reconstruct every vision layer's first-camera operators
+bitwise. All three synthetic cameras' residuals match at every one of the 27
+layers. The remaining black+zero visual divergence is therefore after that
+trunk, at its final normalization or multimodal projection boundary.
+
+For one-view black+zero, the first language normalization is bitwise equal;
+Q/K/V projections differ in 113,551/38/41 values. PyTorch using the compact
+266-row operand has those same differences, while inserting the missing-camera
+rows to use the official 778-row shape makes all three projections bitwise
+exact. Some compact cuBLASLt plans also reproduce that operand. A private
+compact-plan control passes 11/13, 13/13 and 9/11 chunk cases: one-view
+black+zero and gradient+zero now pass, but white still fails and negative noise
+introduces an action-timestep failure. Two/three-view outputs remain bitwise
+equal to the preceding affine control. It is rejected, rather than promoting
+a plan on the basis of a single matching operand.
