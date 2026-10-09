@@ -547,5 +547,26 @@ contracts and explicit cuDNN/runtime prerequisites before adoption. Independent
 30-warmup/100-sample performance has T10 P50/P95 120.125/120.478ms and T200
 101.191/101.335ms, above the approximately 83/86ms product. Nsight graph-node
 traces identify slower GEMM schedules and decomposed GeGLU as major costs.
-Restoring fusion while preserving the observed reference rounding is pending;
-this arithmetic candidate is not promoted or described as accepted.
+The initial unfused arithmetic candidate was rejected on performance.
+Subsequent fusion controls below remain private and unaccepted.
+
+
+### Fusion recovery and one-to-three-view isolation
+
+A private rounded language GeGLU fusion preserves every element of the full
+2-view conv control. Extending its tested shape range and packing the staged
+activation kernel retains 13/13 whole-chunk/all-step passes and zero repeat /
+revisit drift. Independent w30/n100 T10 P50/P95 is 83.927/84.063ms; T200 is
+91.725/91.865ms. This recovers most of the initial 120/101ms cost, but has not
+yet demonstrated non-regression against the current approximately 83/86ms
+runtime; a counterbalanced same-library/current-library comparison is running.
+
+The prior all-view diagnostic control passes 11/11 in 3 view, but only 11/13
+in 1 view: gradient+zero fails an action-step limit (whole cosine .999367,
+relative L2 .036021); white+normal has cosine .998721 / L2 .050575. Disabling
+the rounded fusion reproduces every 1-view output exactly, excluding that
+fusion as their cause. Padding prefix query rows does not repair them (10/13),
+and some inputs exhaust graph workspace and fall back to eager. It is rejected.
+A private mixed-cuBLAS-version auxiliary control exits with SIGSEGV before
+accuracy/performance results; it is rejected, with crash evidence retained.
+No private arithmetic or runtime recipe is promoted, and no limit is loosened.
