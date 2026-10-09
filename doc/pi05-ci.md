@@ -344,3 +344,56 @@ can still damage same-user assets and forge same-host results. Do not enable
 automatic fork PR execution; use disposable isolated workers for that threat
 model. Host hardening, read-only mounts and resource ownership remain operator
 responsibilities. See [GitHub's self-hosted runner security guidance](https://docs.github.com/en/actions/reference/security/secure-use).
+
+
+## Repair performance regression (2026-10-09)
+
+The learned-RMSNorm INT8 packing repair was rerun on Orin with separate fresh
+processes in **before -> after -> before** order. Only one model is resident at
+once. Each checkpoint/view profile uses two fixed inputs, three timing blocks
+per input per process, 30 warmups and 100 measured samples per block. The
+maintained `bench_pi05.py` timer and empirical P50/P95 definitions are reused;
+all 7,200 raw INT8 samples are retained without tail filtering. This is a repair
+regression experiment, not an approved merge-gate sample count or budget.
+
+| Orin INT8 profile/input | Before P50/P95 ms | After P50/P95 ms | P50/P95 change |
+| --- | --- | --- | --- |
+| LIBERO 2-view state | 130.244 / 130.639 | 129.747 / 129.995 | -0.382% / -0.493% |
+| LIBERO 2-view text | 127.871 / 128.085 | 127.717 / 127.876 | -0.120% / -0.163% |
+| Base 1-view T10 | 87.921 / 88.190 | 87.944 / 88.146 | +0.026% / -0.050% |
+| Base 1-view T200 | 105.014 / 105.296 | 105.087 / 105.354 | +0.069% / +0.055% |
+| Base 2-view T10 | 127.839 / 128.215 | 127.866 / 128.335 | +0.021% / +0.093% |
+| Base 2-view T200 | 145.007 / 145.398 | 144.987 / 145.321 | -0.014% / -0.052% |
+| Base 3-view T10 | 167.107 / 167.532 | 166.972 / 167.511 | -0.081% / -0.012% |
+| Base 3-view T200 | 184.264 / 184.656 | 184.198 / 184.575 | -0.036% / -0.044% |
+
+The comparison shows no performance regression distinguishable from measured
+run variation on these inputs. Every block reports zero major page faults and
+zero process swap; rebuilding the original model reproduces identical actions.
+The independent LIBERO accuracy replay also reproduces the improved cosine,
+relative L2 and all-timestep verdicts stated above. This does not certify every
+input or a zero-cost repair. An earlier two-model-resident attempt experienced
+swap and a worker exit; it is preserved as invalid evidence and excluded.
+
+Further BF16 experiments explicitly reproduce the official weight casts,
+normalization, intermediate BF16 GeGLU/gated-residual/RoPE rounding and FP32
+auxiliary projections/flow state. Ordinary inputs improve, but complete
+whole-chunk plus timestep checks still fail. These private candidates are not
+product changes. An initial auxiliary projection lost graph capture and was
+rejected for its latency increase; a workspace-based version restored capture.
+Remaining candidates must establish precision and controlled performance
+before promotion. The gate remains unaccepted and offline.
+
+The same A/B/A protocol also completed 10,800 Thor BF16/FP8 samples and 5,400
+Orin BF16 samples, covering base 1–3 views at T10 and T200. All paired actions
+are bitwise identical; all blocks report zero major faults and zero process swap.
+Orin BF16 P50/P95 deltas range from -0.370% to +0.384%. Thor BF16/FP8 deltas
+range from -0.286% to +0.469%. Two Thor FP8 input profiles initially had non-overlapping block intervals.
+A further 3,600-sample **after -> before -> after** run on FP8 2/3 views
+produces overlapping block intervals throughout; 3-view T10 changes sign.
+Fixed/original P50/P95 differences in that run range from -0.064% to +0.180%.
+Together, 27,000 retained paired samples show no reproducible regression beyond
+measured process variation on the selected inputs. They do not prove identical
+latency or supply an approved performance budget.
+Longest text is not necessarily slowest: Orin 2-view BF16 T10 is slower than
+T200. These two inputs do not constitute worst-case performance coverage.
