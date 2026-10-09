@@ -443,4 +443,31 @@ ApxInf and bundled CUDA 13.0 libraries in OpenPI. Live cuBLAS operator probes
 inside a Torch process inherit those bundled libraries; this does not
 automatically establish their standalone behavior. Comparisons against saved
 standalone native operator outputs remain separate evidence. Runtime alignment
-is being measured, not adopted as an untested repair or a relaxed threshold.
+does not repair the full two-view chunks: product BF16 retains 6/13 passes
+and the masked-attention diagnostic retains 8/13. It is not adopted as a
+repair or a relaxed threshold.
+
+
+### Continued auxiliary and receipt regressions
+
+Matched F32 auxiliary tests cover 83 actual linear operands and 20 time-MLP
+SiLU operands. Checkpoint-layout weights remove 29 BF16 rounding differences
+under Torch's bundled cuBLAS; system cuBLAS still has 19 differences. Precise
+SiLU is bitwise equal to Torch on those operands; fast math has small F32
+changes despite equal BF16-rounded outputs. These local controls do not certify
+a complete model. The checkpoint-layout two-view candidate retains 8/13 passes
+and T10/T200 warm P50 89.834/94.679ms; it is not promoted.
+
+The loaded-library receipt change is tested separately from the 27,000-sample
+INT8 repair qualification. New Thor BF16 and Orin INT8 two-view receipts have
+13 first outputs, zero repeat/revisit drift and matching accuracy/performance
+DSO hashes. Each board has two opposite-order three-process sweeps (30 warmups,
+100 retained samples/input, T10/T200). Thor additionally has six alternating
+processes, with 1,200 retained samples and board telemetry. An initial Thor
+T200 P50/P95 increase of 1.298%/1.454% shrinks in reverse order and changes
+sign in the alternating run: T10 -0.043%/-0.108%, T200 -0.015%/-0.249%.
+Orin reverse-order differences are T10 +0.031%/+0.052%, T200 +0.103%/+0.083%.
+The evidence does not reproduce a systematic warm regression. Raw tails and
+initial asymmetric results are retained; no acceptance budget was loosened.
+These selected-input repair experiments do not approve the full deployment
+matrix or replace the pending representative bank and measured budgets.
