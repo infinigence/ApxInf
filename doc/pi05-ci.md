@@ -821,8 +821,9 @@ batched attention, flattened QK, softmax and PV each reproduce the saved
 attention bitwise. With system cuBLAS 13.4, the same reconstruction has exactly
 714 differing output values, matching the private native trace. This identifies
 a library-recipe difference for this operator/input; it does not certify the
-whole model. Separate full references are being generated under the actual
-system libraries without replacing the older experiment outputs.
+whole model. Separate full references have been collected under the actual system
+libraries for all three view counts, without replacing the older experiment
+outputs. Their loaded CUDA fingerprints match the system-library candidate.
 
 The gate now requires official-reference and candidate CUDA runtime fingerprints
 to match, in addition to their hardware families. Loaded DSO content hashes
@@ -833,3 +834,48 @@ loaded-library receipt. The receipt also records the actual cuDNN version.
 A toolkit version label or requested library path is insufficient. CPU coverage
 rejects a same-board reference with a changed cuBLAS digest. Cross-runtime
 comparisons remain diagnostics, and cannot qualify a merge gate.
+
+
+### Action projection isolation and performance rejection
+
+Under aligned bundled libraries, the separate-language-QKV Orin control passes
+10/13, 12/13 and 9/11 cases for 1/2/3 views. Two-view black+zero now passes;
+the remaining two-view failure is gradient+zero (cosine .996606, relative
+L2 .083833). Black+zero's first 17 language residuals and first action-layer
+operators are all bitwise equal. This cannot establish later-step equality.
+The bundled control's T10/T200 P50 pilots are 216.932/191.364,
+313.198/247.845 and 301.636/303.425ms. This library switch and control are
+rejected as a performance solution.
+
+A fresh trace of the failing two-view gradient+zero case verifies the reference
+and candidate final chunks against their unchanged stored outputs. Across the
+first five flow iterations, the first divergence is action layer 1 of flow
+iteration 0: input, modulation and normalization are bitwise equal, but packed
+QKV has 50 differing values (relative L2 .00009677, maximum difference .03125).
+Subsequent attention and residual differences grow. Using these same operands,
+separate PyTorch Q/K/V projections are bitwise equal to the official result;
+packed PyTorch projection has the same 50 differences. Some packed cuBLASLt
+recipes reproduce this operand exactly. This identifies a shape-dependent
+projection rounding source, not a complete repair or an approved algorithm
+selection rule. Any replacement must pass the whole input matrix and latency
+regression before promotion.
+
+Disabling diagnostic TF32 in three targeted system-library cases does not
+resolve acceptance. Two-view black+zero worsens from relative L2 .036366 to
+.065647; three-view black+zero improves in whole-chunk metrics but still has
+an action-timestep relative L2 of .050280 above the unchanged .05 floor.
+Repeated outputs are bitwise stable. A flag change is therefore not a fix.
+
+Thor action-only compact attention also fails acceptance: 12/13, 12/13 and
+11/11 cases, with gradient+zero failing in one and two views. Its two-view
+T10 pilot is 76.680ms. The precision failure and remaining latency debt reject
+this candidate. It is not included in maintained model code.
+
+A separate same-library, default-auto-fusion two-view T10 profile compares the
+fixed implementation with the previously accuracy-preserving refined-division
+control. Profiled total GPU kernel time is 74.165/76.143ms per call. The summed
+CUTLASS SM80 GEMM kernels account for 7.156/8.550ms; masked softmax for
+1.108/1.306ms and adaptive gate for 2.105/2.362ms. These categories identify
+measured contributors; they are not performance budgets or a justification to
+accept the regression. Profiling and independent latency sampling remain
+separate from precision comparison.
