@@ -879,3 +879,46 @@ CUTLASS SM80 GEMM kernels account for 7.156/8.550ms; masked softmax for
 measured contributors; they are not performance budgets or a justification to
 accept the regression. Profiling and independent latency sampling remain
 separate from precision comparison.
+
+
+### Flow-boundary rounding and remaining view failures
+
+A 90-layer control of the failing Orin two-view gradient+zero input checks the
+first five of ten flow iterations. Packed PyTorch action QKV differs from the
+official separate projections in 89/90 layers; Q plus a packed KV projection,
+and three separate projections, reproduce all 90 saved operands bitwise.
+Selecting a packed recipe that matches the first failing operand makes the
+first flow iteration bitwise equal, but does not qualify the complete chunk.
+The next divergence occurs at the FP32 action-output/Euler boundary: 1,444
+values differ by at most 1.49e-8. This crosses later BF16 rounding boundaries.
+A reference-reconstructing FP32 cuBLASLt output projection reduces the next
+input divergence to one BF16 value. Reconstructing the FP32 input projection
+with the same explicit recipe family removes that additional boundary source.
+These are measured recipe differences, rather than a reason to loosen floors.
+The saved chunk horizon is 50; the number of flow iterations is 10.
+
+The private input/output-affine control passes 10/13, 13/13 and 9/11 cases under
+aligned bundled libraries. Two views pass every unchanged whole-chunk and
+action-timestep floor, including gradient+zero. Remaining one-view failures
+are gradient+zero, black+zero and white; three-view failures are black+zero and
+white. Some failures pass whole-chunk metrics but fail individual timesteps.
+Independent T10/T200 P50 pilots are 217.510/191.910, 313.708/247.905 and
+300.379/302.053ms. This candidate is rejected as a performance repair.
+
+Fresh black+zero traces assert that instrumentation preserves each previously
+saved chunk. One-view prefix embedding is bitwise equal, but the first language
+residual has relative L2 .002119. Three-view embedding already has relative
+L2 .001736 before the language layers. These identify different diagnostic
+boundaries; they do not yet identify all remaining operators or constitute
+acceptance. The maintained INT8 norm-packing repair retains its previously
+reported paired performance regression result. No new private BF16 candidate
+has been promoted, and the draft gate remains offline and unaccepted.
+
+Thor full physical attention controls reconstruct all 90 saved gradient+zero
+attention operands bitwise. All tested QK recipes match, while two tested PV
+recipes differ in eight output values across the trace. Compact PV had failed
+in 51/90 or 53/90 layers in the earlier control. Preserving physical reduction
+dimensions therefore matters for this diagnostic. Selecting the default
+zero-workspace vision FC2 recipe passes all 37 chunk cases but still measures
+69.093/72.254, 75.262/79.210 and 88.193/93.731ms. The unresolved same-environment
+latency regression prevents promotion of this control as well.
