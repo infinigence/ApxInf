@@ -199,6 +199,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--samples", type=int, default=30)
     p.add_argument("--out", type=pathlib.Path)
+    p.add_argument("--suite-dir", type=pathlib.Path, help="frozen PI05 input suite; real-checkpoint L1 only")
+    p.add_argument("--revision", help="full source SHA for a frozen CI measurement")
+    p.add_argument("--hardware", choices=("thor", "orin"))
     return p.parse_args()
 
 
@@ -269,8 +272,50 @@ def _run_l3(host, port, model_variant, prompt, warmup, samples):
     return metadata, segments
 
 
+def benchmark_suite(args):
+    """Use the existing warmup/time-loop/statistics protocol on frozen L1 inputs."""
+    from compare_pi05_openpi import ApxInfModel, load_case, load_suite, sha256, write_json
+    import apxinf_py
+
+    if args.model_dir is None or args.layer != "l1" or args.out is None:
+        raise SystemExit("--suite-dir requires --model-dir, --layer l1 and --out")
+    if args.warmup < 0 or args.samples < 1:
+        raise SystemExit("warmup must be nonnegative and samples positive")
+    manifest = load_suite(args.suite_dir)
+    precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}[args.model_variant]
+    model = ApxInfModel(args.model_dir, manifest, args.device, precision,
+                        pathlib.Path(args.calibration) if args.calibration else None)
+    rows = []
+    for entry in manifest["cases"]:
+        case = load_case(args.suite_dir, entry)
+        shape = (manifest["horizon"], 32)
+        call = lambda: model.infer(case)
+        started = time.perf_counter()
+        actions = np.asarray(call())
+        first_ms = (time.perf_counter() - started) * 1000
+        if actions.shape != shape or not np.isfinite(actions).all():
+            raise ValueError("invalid benchmark output")
+        samples = _time_loop(call, args.warmup, args.samples)
+        rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
+                     "first_call_ms": first_ms, "latency_ms": samples, "statistics": _stats(samples)})
+        print(f"L1 {entry['name']}: {_stats(samples)}", flush=True)
+    write_json(args.out, {
+        "schema": "apxinf.pi05.performance.v1", "engine": "apxinf", "layer": "l1",
+        "revision": args.revision, "hardware": args.hardware, "precision": precision,
+        "suite_sha256": sha256(args.suite_dir / "manifest.json"),
+        "checkpoint_sha256": sha256(args.model_dir / "model.safetensors"),
+        "config_sha256": sha256(args.model_dir / "config.json"),
+        "calibration_sha256": sha256(pathlib.Path(args.calibration)) if args.calibration else None,
+        "extension_sha256": sha256(pathlib.Path(apxinf_py.__file__)),
+        "warmup": args.warmup, "samples": args.samples, "cases": rows,
+    }, force=True)
+
+
 def main() -> None:
     args = parse_args()
+    if args.suite_dir is not None:
+        benchmark_suite(args)
+        return
 
     # Resolve the weights source and the default layer set (minimal-surprise):
     #   --model-dir      -> checkpoint; default layers = all (native config, e.g. H50)

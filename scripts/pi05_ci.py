@@ -15,7 +15,7 @@ import sys
 from compare_pi05_openpi import compare_results, load_suite, sha256, write_json
 
 
-SCHEMA = "apxinf.pi05.ci.v1"
+SCHEMA = "apxinf.pi05.ci.v2"
 PRECISIONS = {"thor": ("bf16", "fp8"), "orin": ("bf16", "int8")}
 LIMIT_KEYS = {"min_cosine", "max_relative_l2", "max_abs", "zero_max_abs"}
 
@@ -57,8 +57,13 @@ def load_bank(path: Path, digest: str) -> dict:
                 raise ValueError("limits must be explicit and finite")
             if not -1 <= limits["min_cosine"] <= 1 or any(limits[k] < 0 for k in LIMIT_KEYS - {"min_cosine"}):
                 raise ValueError("invalid limits")
-        if cell["samples"] < 1 or not isinstance(cell["samples"], int):
-            raise ValueError("samples must be a positive integer")
+        protocol = cell["performance_protocol"]
+        if set(protocol) != {"warmup", "samples"} or any(type(v) is not int for v in protocol.values()):
+            raise ValueError("performance warmup/samples must be explicit integers")
+        if protocol["warmup"] < 0 or protocol["samples"] < 1:
+            raise ValueError("invalid performance protocol")
+        if type(cell["stability_repeats"]) is not int or cell["stability_repeats"] < 1:
+            raise ValueError("stability repeats must be explicitly positive")
         if not cell.get("budget_reason"):
             raise ValueError("record the evidence/approval for each cell's budgets")
     return bank
@@ -95,8 +100,8 @@ def performance(rows: list[dict], cell: dict) -> dict:
         raise ValueError("invalid latency samples")
     if not all(math.isfinite(row["first_call_ms"]) and row["first_call_ms"] > 0 for row in rows):
         raise ValueError("invalid first-call latency")
-    measured = {"p50_ms": float(np.percentile(samples, 50)),
-                "p95_ms": float(np.percentile(samples, 95)),
+    measured = {"p50_ms": float(np.percentile(samples, 50, method="lower")),
+                "p95_ms": float(np.percentile(samples, 95, method="lower")),
                 "first_call_ms": max(row["first_call_ms"] for row in rows)}
     budgets = cell.get("performance_limits")
     if budgets is None:
@@ -104,18 +109,32 @@ def performance(rows: list[dict], cell: dict) -> dict:
     if set(budgets) != set(measured) or not all(math.isfinite(v) and v > 0 for v in budgets.values()):
         raise ValueError("invalid performance budgets")
     # A pooled distribution alone can hide a regression of a slow case.
-    per_case = [{"name": row["name"], "p50_ms": float(np.percentile(row["latency_ms"], 50)),
-                 "p95_ms": float(np.percentile(row["latency_ms"], 95)),
+    per_case = [{"name": row["name"], "p50_ms": float(np.percentile(row["latency_ms"], 50, method="lower")),
+                 "p95_ms": float(np.percentile(row["latency_ms"], 95, method="lower")),
                  "first_call_ms": row["first_call_ms"]} for row in rows]
     passed = all(row[key] <= budgets[key] for row in per_case for key in budgets)
     return {"state": "pass" if passed else "fail", **measured, "cases": per_case}
 
 
 def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
-             actual: dict, revision: str) -> dict:
+             actual: dict, revision: str, latency: dict) -> dict:
     if len(load_suite(suite)["image_keys"]) != cell["views"]:
         raise ValueError("suite/cell view count differs")
-    if any(len(row["latency_ms"]) != cell["samples"] for row in actual["cases"]):
+    if latency.get("schema") != "apxinf.pi05.performance.v1" or latency.get("layer") != "l1":
+        raise ValueError("invalid performance receipt")
+    protocol = cell["performance_protocol"]
+    if any(latency.get(key) != value for key, value in protocol.items()):
+        raise ValueError("performance protocol differs")
+    if latency.get("suite_sha256") != actual.get("suite_sha256"):
+        raise ValueError("performance suite differs")
+    for key in ("revision", "hardware", "precision", "checkpoint_sha256", "config_sha256",
+                "calibration_sha256", "extension_sha256"):
+        if latency.get(key) != actual.get(key):
+            raise ValueError(f"performance {key} differs from accuracy receipt")
+    if [(row["name"], row["input_sha256"]) for row in latency["cases"]] != [
+            (row["name"], row["input_sha256"]) for row in actual["cases"]]:
+        raise ValueError("performance cases differ")
+    if any(len(row["latency_ms"]) != protocol["samples"] for row in latency["cases"]):
         raise ValueError("latency sample count differs from approved protocol")
     if actual.get("revision") != revision:
         raise ValueError("candidate revision receipt differs")
@@ -137,10 +156,16 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
         raise ValueError("approved baseline revision missing")
     official = compare_results(suite, reference, actual, cell["reference_limits"])
     regression = compare_results(suite, baseline, actual, cell["baseline_limits"])
-    perf = performance(actual["cases"], cell)
-    repeat_ok = all(row["repeat_max_abs"] <= cell["baseline_limits"]["max_abs"]
-                    for row in actual["cases"])
-    repeat_ok &= actual["revisit_max_abs"] <= cell["baseline_limits"]["max_abs"]
+    perf = performance(latency["cases"], cell)
+    stability = actual["stability"]
+    if stability is None or stability["repeats"] != cell["stability_repeats"]:
+        raise ValueError("stability protocol missing or differs")
+    if [row["name"] for row in stability["cases"]] != [row["name"] for row in actual["cases"]]:
+        raise ValueError("stability cases differ")
+    drifts = [row["repeat_max_abs"] for row in stability["cases"]] + [stability["revisit_max_abs"]]
+    if not all(math.isfinite(value) and value >= 0 for value in drifts):
+        raise ValueError("invalid stability drift")
+    repeat_ok = all(value <= cell["baseline_limits"]["max_abs"] for value in drifts)
     return dict(reference=official, baseline=regression, performance=perf,
           repeat_passed=repeat_ok,
           passed=all(row["passed"] for row in official + regression) and repeat_ok
@@ -172,13 +197,25 @@ def run(args: argparse.Namespace) -> int:
             command = [str(args.python), str(Path(__file__).with_name("compare_pi05_openpi.py")),
                        "apxinf", "--suite-dir", str(suite), "--checkpoint-dir", str(checkpoint),
                        "--precision", cell["precision"], "--hardware", args.hardware,
-                       "--revision", args.revision, "--repeats", str(cell["samples"]),
+                       "--revision", args.revision, "--stability-repeats", str(cell["stability_repeats"]),
                        "--output", str(output), "--force"]
             if calibration:
                 command.extend(("--calibration", str(calibration)))
             subprocess.run(command, check=True)
             actual = read_json(output)
-            result.update(evaluate(cell, suite, reference, baseline, actual, args.revision))
+            latency_output = args.output_dir / f"{cell['id']}.performance.json"
+            protocol = cell["performance_protocol"]
+            benchmark = [str(args.python), str(Path(__file__).with_name("bench_pi05.py")),
+                         "--suite-dir", str(suite), "--model-dir", str(checkpoint), "--layer", "l1",
+                         "--model-variant", {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[cell["precision"]],
+                         "--revision", args.revision, "--hardware", args.hardware,
+                         "--warmup", str(protocol["warmup"]), "--samples", str(protocol["samples"]),
+                         "--out", str(latency_output)]
+            if calibration:
+                benchmark.extend(("--calibration", str(calibration)))
+            subprocess.run(benchmark, check=True)
+            result.update(evaluate(cell, suite, reference, baseline, actual, args.revision,
+                                   read_json(latency_output)))
             evidence = args.output_dir / "evidence" / cell["id"]
             evidence.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(suite / "manifest.json", evidence / "manifest.json")
@@ -229,7 +266,8 @@ def aggregate(args: argparse.Namespace) -> int:
                     raise ValueError("artifact golden output digest differs")
             result = evaluate(cell, evidence, read_json(evidence / "reference.json"),
                               read_json(evidence / "baseline.json"),
-                              read_json(path.parent / f"{cell['id']}.json"), args.revision)
+                              read_json(path.parent / f"{cell['id']}.json"), args.revision,
+                              read_json(path.parent / f"{cell['id']}.performance.json"))
             passed &= result["passed"]
     return 0 if passed else 1
 

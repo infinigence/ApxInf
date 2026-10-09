@@ -48,7 +48,7 @@ JAX_PLATFORMS=cpu python scripts/compare_pi05_openpi.py openpi \
 python scripts/compare_pi05_openpi.py apxinf \
   --suite-dir devlocal/pi05-ci-gate/bank/base-3view \
   --checkpoint-dir /existing/pi05-base --hardware thor --precision bf16 \
-  --revision FULL_APPROVED_APXINF_SHA --repeats MEASURED_SAMPLE_COUNT \
+  --revision FULL_APPROVED_APXINF_SHA --stability-repeats MEASURED_STABILITY_COUNT \
   --output devlocal/pi05-ci-gate/bank/base-3view/thor-bf16-approved.json
 ```
 
@@ -59,13 +59,35 @@ must be separate. Record the source episode/frame and coverage in the bank's
 review notes. The implementation accepts any number of frozen observations;
 there is no arbitrary 48-case target or claim of statistical task coverage.
 
-`--diagnostic` retains seven synthetic cases: gradient/short prompt, second
-Gaussian noise, longer prompt, black/zero noise, white/negative noise,
-float CHW equivalent, and camera-order contrast. `--source-npz` replaces the
-gradient images with saved RGB observations but retains canned tokens; it is
-image replay only. Neither mode is labelled representative. Float CHW tests the
-shared harness conversion, not independent policy preprocessing. Prefer the
-frozen model input mode for deployment regression.
+`--diagnostic` is an implementation diagnosis set, not the merge-gate input
+bank. It contains eleven explicitly constructed cases: gradient/T10, a second
+noise draw, T21, the configured token-length boundary, black image only, zero
+noise only, black+zero together, white image only, negative noise only,
+white+negative together, and distinct constant gray levels per camera. The
+last case does **not** swap camera order. T21 is a concrete workload, not a
+length boundary; `--max-token-len` must match the checkpoint's
+`tokenizer_max_length`/`max_token_len` (200 for the tested checkpoints).
+The boundary uses repeated valid tokens and tests shape handling, not natural
+language quality. Float CHW conversion has CPU coverage and adds no GPU case.
+
+`--source-npz` replays every supplied RGB observation with canned T10 tokens and
+fixed noise; it is image replay only. `--case-npz` preserves actual tokens and
+noise and is preferred for a formal bank. Neither mode is automatically labelled
+representative. Record task, trial, trajectory frame/time, camera ordering,
+preprocessing/source revision and original asset digest for every real
+observation. Different token modes on the same image are one observed scene.
+`--provenance-json` accepts a case-stem-to-metadata mapping and freezes it
+inside the suite manifest. Use a common `observation_id` for token variants of
+one frame. Unknown frame/time metadata must remain unknown; do not invent provenance.
+Three-camera real coverage requires a source containing three actual cameras;
+adding a synthetic/duplicated third camera is a separately labelled diagnostic.
+
+Select a small held-out bank by input differences that can affect execution:
+actual camera count, deployed token lengths/state-token mode, visual diversity,
+small reference action magnitudes, and minimized historical failures. Retain
+which case covers each difference, and remove cases with identical canonical
+model input. Determine the resulting count from measured runtime and coverage;
+synthetic diagnostic counts do not prescribe the formal bank count.
 
 The official adapter uses OpenPI PyTorch PI0.5 with compilation disabled,
 selected BF16 parameters, zero direct state, explicit prompt tokens/masks and
@@ -100,13 +122,39 @@ application's allowable error and latency. `budget_reason` records that evidence
 An uncalibrated cell fails the aggregate even when its numerical comparison
 passes. No fabricated 5%/10% latency allowance is supplied.
 
-The first inference for each input is reported separately from repeated calls;
-shape switches can include graph creation. Each saved input is repeated with
-the same noise, and repeat drift is checked. Repeated-call P50/P95 and raw
-samples are recorded; performance budgets apply to each case, so pooling cannot
-hide a slow input. A fixed sample count is a measurement protocol, not a
-confidence guarantee for P95. Calibrate counts from observed variability and
-the desired detection power. Choose cold/switch and warm budgets separately.
+Accuracy uses exactly one finite complete action chunk per saved observation
+from each engine, with identical images, tokens and FP32 source noise. It saves
+that first valid output; later calls cannot replace it. This is fixed-observation
+chunk agreement, not a multi-chunk closed-loop rollout or LIBERO success-rate
+evaluation. Official selected-BF16 is mixed precision; do not describe it as
+all operations being BF16.
+
+Stability is a separate phase enabled by `--stability-repeats`: compare repeated
+calls against the saved accuracy output, then explicitly run A -> other suite
+inputs -> A. Its drifts are separate from accuracy outputs and latency. Daily
+bank policies require an explicit positive stability count, chosen after
+same-input and rebuilt-extension measurements; the example's one repetition is
+an unapproved placeholder, not an established protocol.
+
+Performance runs in a separate process through `bench_pi05.py --suite-dir ...
+--model-dir ... --layer l1`, with independent `--warmup` and `--samples`. This
+reuses that benchmark's timer loop and empirical order-statistic P50/P95
+(no interpolated quantiles). It records first-call time, warm samples and their
+statistics per frozen input. Each board/precision/view cell has its own protocol
+and budget; pooling cannot hide a slow input. Accuracy results contain no
+latency samples. Both receipts must agree on input, extension, checkpoint,
+configuration, calibration, hardware and exact source SHA.
+
+Calibrate sample and warmup counts using repeated independent runs: verify
+warmup convergence, estimate per-case variation and tail behavior, and test
+whether the intended regression is reliably distinguishable. Ten repetitions
+are not an approved P95 protocol. Keep first/cold/shape-switch and warm budgets
+separate. The example's zero warmups/one sample is deliberately unqualified and
+cannot establish a deployable performance baseline. Missing budgets still fail.
+
+The v4 parity and v2 bank schemas require regeneration; old mixed-purpose
+receipts are historical evidence and cannot be silently promoted into the new
+protocol.
 
 ## Freeze the approved bank
 

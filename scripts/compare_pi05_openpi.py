@@ -15,13 +15,12 @@ import math
 import os
 from pathlib import Path
 import subprocess
-import time
 from typing import Any
 
 import numpy as np
 
 
-SCHEMA = "apxinf.pi05.openpi-parity.v3"
+SCHEMA = "apxinf.pi05.openpi-parity.v4"
 DEFAULT_DIR = Path(__file__).resolve().parents[1] / "devlocal/pi05-ci-gate/default"
 SHORT_TOKENS = (2, 1065, 2145, 705, 1161, 37801, 611, 573, 37932, 108)
 LONG_TOKENS = (
@@ -100,11 +99,12 @@ def prepare(args: argparse.Namespace) -> None:
     keys = [key.strip() for key in args.image_keys.split(",") if key.strip()]
     if not 1 <= len(keys) <= 3 or len(set(keys)) != len(keys):
         raise ValueError("--image-keys requires 1-3 distinct keys")
-    if args.horizon < 1 or args.num_flow_steps < 1:
+    if args.horizon < 1 or args.num_flow_steps < 1 or args.max_token_len < 1:
         raise ValueError("horizon and flow steps must be positive")
     if not (args.case_npz or args.source_npz or args.diagnostic):
         raise ValueError("supply frozen --case-npz observations or explicitly use --diagnostic")
     cases = []
+    provenance = json.loads(args.provenance_json.read_text()) if args.provenance_json else {}
     for path in args.case_npz:
         with np.load(path, allow_pickle=False) as archive:
             images = np.stack([image_to_uint8_hwc(image) for image in archive["images"]])
@@ -117,27 +117,36 @@ def prepare(args: argparse.Namespace) -> None:
                 raise ValueError("token outside PI05 vocabulary")
             if noise.shape != (args.horizon, 32) or not np.isfinite(noise).all():
                 raise ValueError("noise must be finite with shape (horizon, 32)")
-            cases.append(save_case(root, path.stem, images[:len(keys)], tuple(tokens),
-                                   noise.astype(np.float32)))
-    if args.diagnostic or args.source_npz:
-        sources = [source_images(path, keys) for path in args.source_npz]
-        base = sources[0] if sources else synthetic_images(len(keys))
-        rng = np.random.default_rng(args.seed)
-        first = rng.standard_normal((args.horizon, 32)).astype(np.float32)
+            entry = save_case(root, path.stem, images[:len(keys)], tuple(tokens), noise.astype(np.float32))
+            if args.provenance_json:
+                entry["provenance"] = provenance[path.stem]
+            cases.append(entry)
+    sources = [source_images(path, keys) for path in args.source_npz]
+    rng = np.random.default_rng(args.seed)
+    first = rng.standard_normal((args.horizon, 32)).astype(np.float32)
+    for index, source in enumerate(sources):
+        cases.append(save_case(root, f"replay-observation-{index}", source, SHORT_TOKENS, first))
+    if args.diagnostic:
+        base = synthetic_images(len(keys))
         second = rng.standard_normal((args.horizon, 32)).astype(np.float32)
-        contrast = np.stack([np.full_like(base[0], (view * 83 + 17) % 256) for view in range(len(keys))])
+        zeros = np.zeros_like(first)
+        black, white = np.zeros_like(base), np.full_like(base, 255)
+        contrast = np.stack([np.full_like(base[0], (view * 83 + 17) % 256)
+                             for view in range(len(keys))])
+        boundary_tokens = tuple((SHORT_TOKENS * ((args.max_token_len + 9) // 10))[:args.max_token_len])
         diagnostic = [
-            ("typical", base, SHORT_TOKENS, first),
-            ("second-scene" if len(sources) >= 2 else "second-noise",
-             sources[1] if len(sources) >= 2 else base, SHORT_TOKENS, second),
-            ("long-language", base, LONG_TOKENS, first),
-            ("dark-zero-noise", np.zeros_like(base), SHORT_TOKENS, np.zeros_like(first)),
-            ("bright-negative-noise", np.full_like(base, 255), SHORT_TOKENS, -first),
-            ("float-chw", np.moveaxis(base.astype(np.float32) / 255, -1, 1), SHORT_TOKENS, first),
-            ("view-order-contrast", contrast, SHORT_TOKENS, first),
+            ("gradient-t10-normal-noise", base, SHORT_TOKENS, first),
+            ("gradient-t10-second-noise", base, SHORT_TOKENS, second),
+            ("gradient-t21-normal-noise", base, LONG_TOKENS, first),
+            (f"gradient-t{args.max_token_len}-boundary", base, boundary_tokens, first),
+            ("black-normal-noise", black, SHORT_TOKENS, first),
+            ("gradient-zero-noise", base, SHORT_TOKENS, zeros),
+            ("black-zero-noise-combined", black, SHORT_TOKENS, zeros),
+            ("white-normal-noise", white, SHORT_TOKENS, first),
+            ("gradient-negative-noise", base, SHORT_TOKENS, -first),
+            ("white-negative-noise-combined", white, SHORT_TOKENS, -first),
+            ("camera-distinct-gray", contrast, SHORT_TOKENS, first),
         ]
-        diagnostic.extend((f"scene-{index}", source, SHORT_TOKENS, first)
-                          for index, source in enumerate(sources[2:], 2))
         cases.extend(save_case(root, *case) for case in diagnostic)
     if args.force:
         for name in ("openpi.json", "apxinf.json", "report.json"):
@@ -264,47 +273,48 @@ class ApxInfModel:
         noise = np.asarray(case["noise"], dtype=np.float32)
         return self.model.infer_rgb(images, "nhwc", tokens, noise)
 
+def checked_infer(model: Any, case: dict[str, np.ndarray], shape: tuple[int, int]) -> np.ndarray:
+    actions = np.asarray(model.infer(case), dtype=np.float32)
+    if actions.shape != shape or not np.isfinite(actions).all():
+        raise ValueError(f"invalid output {actions.shape}, expected finite {shape}")
+    return actions.copy()
+
+
+def stability(model: Any, root: Path, manifest: dict[str, Any], rows: list[dict],
+              repeats: int) -> dict[str, Any] | None:
+    """Separate phase: repeated inputs and A -> all other inputs -> A."""
+    if repeats == 0:
+        return None
+    shape = (manifest["horizon"], 32)
+    results = []
+    for entry, row in zip(manifest["cases"], rows, strict=True):
+        original = np.asarray(row["actions"], dtype=np.float32)
+        case = load_case(root, entry)
+        drift = max(float(np.abs(checked_infer(model, case, shape) - original).max())
+                    for _ in range(repeats))
+        results.append({"name": entry["name"], "repeat_max_abs": drift})
+    checked_infer(model, load_case(root, manifest["cases"][0]), shape)
+    for entry in manifest["cases"][1:]:
+        checked_infer(model, load_case(root, entry), shape)
+    revisited = checked_infer(model, load_case(root, manifest["cases"][0]), shape)
+    return {"repeats": repeats, "cases": results,
+            "revisit_max_abs": float(np.abs(revisited - np.asarray(rows[0]["actions"])).max())}
+
+
 def collect(root: Path, manifest: dict[str, Any], model: Any,
             engine: str, metadata: dict[str, Any], *, force: bool,
-            output: Path | None = None, repeats: int = 1) -> None:
+            output: Path | None = None, stability_repeats: int = 0) -> None:
     rows = []
-    expected = (manifest["horizon"], 32)
     for entry in manifest["cases"]:
-        case = load_case(root, entry)
-        start = time.perf_counter()
-        actions = np.asarray(model.infer(case), dtype=np.float32)
-        cold_ms = (time.perf_counter() - start) * 1000
-        samples = []
-        if actions.shape != expected or not np.isfinite(actions).all():
-            raise ValueError(f"{engine}/{entry['name']}: invalid first output")
-        first_actions = actions.copy()
-        repeat_max_abs = 0.0
-        for _ in range(repeats):
-            start = time.perf_counter()
-            actions = np.asarray(model.infer(case), dtype=np.float32)
-            samples.append((time.perf_counter() - start) * 1000)
-            if actions.shape != expected or not np.isfinite(actions).all():
-                raise ValueError(f"{engine}/{entry['name']}: invalid repeated output")
-            repeat_max_abs = max(repeat_max_abs, float(np.abs(actions - first_actions).max()))
-        if actions.shape != expected or not np.isfinite(actions).all():
-            raise ValueError(f"{engine}/{entry['name']}: invalid output {actions.shape}, expected {expected}")
+        actions = checked_infer(model, load_case(root, entry), (manifest["horizon"], 32))
         rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
-                     "actions": actions.tolist(), "first_call_ms": cold_ms,
-                     "latency_ms": samples, "repeat_max_abs": repeat_max_abs})
+                     "actions": actions.tolist()})
         print(f"{engine}: {entry['name']} {actions.shape}", flush=True)
     write_json(output or root / f"{engine}.json", {
         "schema": SCHEMA, "engine": engine, "suite_sha256": sha256(root / "manifest.json"),
-        **metadata, "cases": rows, "revisit_max_abs": revisit(model, root, manifest, rows),
+        **metadata, "cases": rows,
+        "stability": stability(model, root, manifest, rows, stability_repeats),
     }, force=force)
-
-
-def revisit(model: Any, root: Path, manifest: dict[str, Any], rows: list[dict]) -> float:
-    """A -> other inputs -> A detects stale graph buffers after input/shape updates."""
-    actions = np.asarray(model.infer(load_case(root, manifest["cases"][0])), dtype=np.float32)
-    original = np.asarray(rows[0]["actions"], dtype=np.float32)
-    if actions.shape != original.shape or not np.isfinite(actions).all():
-        raise ValueError("invalid revisited output")
-    return float(np.abs(actions - original).max())
 
 
 def run_openpi(args: argparse.Namespace) -> None:
@@ -320,7 +330,7 @@ def run_openpi(args: argparse.Namespace) -> None:
         "revision": revision,
         "config_sha256": sha256(args.checkpoint_dir / "config.json"),
         "checkpoint_sha256": checkpoint_hash(args.checkpoint_dir),
-    }, force=args.force, output=args.output, repeats=args.repeats)
+    }, force=args.force, output=args.output, stability_repeats=args.stability_repeats)
 
 
 def run_apxinf(args: argparse.Namespace) -> None:
@@ -336,7 +346,7 @@ def run_apxinf(args: argparse.Namespace) -> None:
         "calibration_sha256": sha256(args.calibration) if args.calibration else None,
         "revision": args.revision, "hardware": args.hardware,
         "extension_sha256": sha256(Path(apxinf_py.__file__)),
-    }, force=args.force, output=args.output, repeats=args.repeats)
+    }, force=args.force, output=args.output, stability_repeats=args.stability_repeats)
 
 
 def metrics(reference: np.ndarray, actual: np.ndarray) -> dict[str, float | None]:
@@ -423,15 +433,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if name in ("openpi", "apxinf"):
             command.add_argument("--checkpoint-dir", type=Path, required=True)
             command.add_argument("--device", default="cuda:0")
-            command.add_argument("--repeats", type=int, default=1)
+            command.add_argument("--stability-repeats", type=int, default=0,
+                                 help="separate stability phase; zero disables it, never a latency sample count")
         if name == "prepare":
             command.add_argument("--image-keys", default="observation/image,observation/wrist_image")
             command.add_argument("--source-npz", type=Path, action="append", default=[])
             command.add_argument("--case-npz", type=Path, action="append", default=[])
             command.add_argument("--diagnostic", action="store_true")
+            command.add_argument("--provenance-json", type=Path,
+                                 help="case stem -> task/trial/frame/camera/source metadata; frozen in manifest")
             command.add_argument("--horizon", type=int, default=50)
             command.add_argument("--num-flow-steps", type=int, default=10)
             command.add_argument("--seed", type=int, default=7)
+            command.add_argument("--max-token-len", type=int, default=200,
+                                 help="diagnostic boundary from checkpoint tokenizer_max_length/max_token_len")
         elif name == "openpi":
             command.add_argument("--openpi-revision")
         elif name == "apxinf":
@@ -451,8 +466,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if getattr(args, "repeats", 1) < 1:
-        raise ValueError("repeats must be positive")
+    if getattr(args, "stability_repeats", 0) < 0:
+        raise ValueError("stability repeats must be nonnegative")
     if args.command == "prepare":
         prepare(args)
     elif args.command == "openpi":

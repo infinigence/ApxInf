@@ -97,8 +97,42 @@ class ReceiptTest(unittest.TestCase):
         parity.prepare(args)
         manifest = parity.load_suite(suite)
         values = {int(parity.load_case(suite, case)["images"].flat[0])
-                  for case in manifest["cases"] if case["name"] in ("typical", "second-scene", "scene-2")}
+                  for case in manifest["cases"] if case["name"] in ("replay-observation-0", "replay-observation-1", "replay-observation-2")}
         self.assertEqual(values, {0, 1, 2})
+
+    def test_float_conversion_is_cpu_coverage(self):
+        image = np.arange(224 * 224 * 3, dtype=np.uint32).reshape(224, 224, 3).astype(np.uint8)
+        chw = np.moveaxis(image.astype(np.float32) / 255, -1, 0)
+        np.testing.assert_array_equal(parity.image_to_uint8_hwc(chw), image)
+        with self.assertRaises(TypeError):
+            parity.image_to_uint8_hwc(image.astype(np.int32))
+
+    def test_accuracy_keeps_first_output_and_stability_is_separate(self):
+        class ChangingModel:
+            calls = 0
+            def infer(self, case):
+                self.calls += 1
+                return np.full((2, 32), self.calls, np.float32)
+        model = ChangingModel()
+        manifest = parity.load_suite(self.root)
+        parity.collect(self.root, manifest, model, "fake", {}, force=False, stability_repeats=2)
+        result = json.loads((self.root / "fake.json").read_text())
+        self.assertEqual(result["cases"][0]["actions"][0][0], 1)
+        self.assertNotIn("latency_ms", result["cases"][0])
+        self.assertEqual(result["stability"]["repeats"], 2)
+        self.assertEqual(result["stability"]["cases"][0]["repeat_max_abs"], 2)
+
+    def test_diagnostics_separate_factors_and_cover_configured_token_boundary(self):
+        suite = self.root / "diagnostic"
+        args = parity.parse_args(["prepare", "--suite-dir", str(suite), "--diagnostic",
+                                  "--image-keys", "base,wrist", "--max-token-len", "200"])
+        parity.prepare(args)
+        cases = {e["name"]: parity.load_case(suite, e) for e in parity.load_suite(suite)["cases"]}
+        self.assertFalse(any("float-chw" in name or "typical" in name for name in cases))
+        base = cases["gradient-t10-normal-noise"]
+        np.testing.assert_array_equal(cases["black-normal-noise"]["noise"], base["noise"])
+        np.testing.assert_array_equal(cases["gradient-zero-noise"]["images"], base["images"])
+        self.assertEqual(len(cases["gradient-t200-boundary"]["token_ids"]), 200)
 
 
 class MatrixTest(unittest.TestCase):
@@ -108,7 +142,8 @@ class MatrixTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bank = {"schema": ci.SCHEMA, "cells": [
             {"id": f"{board}-{precision}-{views}", "hardware": board, "precision": precision,
-             "views": views, "samples": 2, "budget_reason": "test fixture only",
+             "views": views, "stability_repeats": 2,
+             "performance_protocol": {"warmup": 1, "samples": 2}, "budget_reason": "test fixture only",
              "reference_limits": LIMITS, "baseline_limits": LIMITS,
              "performance_limits": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30}}
             for board, precisions in ci.PRECISIONS.items() for precision in precisions for views in (1, 2, 3)]}
@@ -138,10 +173,16 @@ class MatrixTest(unittest.TestCase):
                    "engine": "apxinf", "revision": SHA, "precision": cell["precision"],
                    "hardware": cell["hardware"], "calibration_sha256": None,
                    "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64,
-                   "revisit_max_abs": 0, "cases": [{"name": "one", "input_sha256": entry["sha256"],
-                   "actions": np.ones((2, 32)).tolist(), "repeat_max_abs": 0,
-                   "first_call_ms": 20, "latency_ms": [10, 11]}]}
+                   "extension_sha256": "d" * 64,
+                   "stability": {"repeats": 2, "revisit_max_abs": 0,
+                                 "cases": [{"name": "one", "repeat_max_abs": 0}]},
+                   "cases": [{"name": "one", "input_sha256": entry["sha256"],
+                              "actions": np.ones((2, 32)).tolist()}]}
         parity.write_json(output / f"{cell['id']}.json", receipt)
+        parity.write_json(output / f"{cell['id']}.performance.json", dict(receipt,
+            schema="apxinf.pi05.performance.v1", layer="l1", warmup=1, samples=2,
+            cases=[{"name": "one", "input_sha256": entry["sha256"],
+                    "first_call_ms": 20, "latency_ms": [10, 11]}]))
         parity.write_json(suite / "baseline.json", receipt)
         parity.write_json(suite / "reference.json", dict(receipt, engine="openpi"))
         for key, name in (("suite", "manifest.json"), ("reference", "reference.json"), ("baseline", "baseline.json")):
@@ -196,10 +237,24 @@ class MatrixTest(unittest.TestCase):
         parity.write_json(path, actual, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
 
+    def test_performance_protocol_and_raw_latency_cannot_be_forged(self):
+        cell = self.bank["cells"][0]
+        path = self.root / cell["hardware"] / f"{cell['id']}.performance.json"
+        original = ci.read_json(path)
+        changed = copy.deepcopy(original)
+        changed["warmup"] = 2
+        parity.write_json(path, changed, force=True)
+        with self.assertRaises(ValueError):
+            ci.aggregate(self.args())
+        changed = copy.deepcopy(original)
+        changed["cases"][0]["latency_ms"] = [100, 100]
+        parity.write_json(path, changed, force=True)
+        self.assertEqual(ci.aggregate(self.args()), 1)
+
     def test_uncalibrated_performance_is_not_green(self):
         rows = [{"name": "case", "latency_ms": [10, 11], "first_call_ms": 20}]
         self.assertEqual(ci.performance(rows, {})["state"], "uncalibrated")
-        budgets = {"performance_limits": {"p50_ms": 10, "p95_ms": 12, "first_call_ms": 30}}
+        budgets = {"performance_limits": {"p50_ms": 9.9, "p95_ms": 12, "first_call_ms": 30}}
         self.assertEqual(ci.performance(rows, budgets)["state"], "fail")
 
 
