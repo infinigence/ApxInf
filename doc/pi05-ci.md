@@ -614,3 +614,40 @@ This recipe is diagnostic: it adds checkpoint-layout weights and changes
 handle resources, and has no maintained operator/lifecycle contract yet.
 No numerical prototype is promoted, no threshold is loosened and GPU CI stays
 disabled until all required cells and performance budgets are qualified.
+
+
+### One-view vision recipe and per-view performance rejection
+
+Actual one-view hooks reproduce all three diagnostic goldens unchanged.
+Gradient/black/white first differ at vision layer-0 biased FC2 (685/752/809
+BF16 elements); all earlier operators in that layer are bitwise. Replacing
+official vision makes each complete chunk bitwise. Actual-operand cuBLASLt
+BIAS oracles on both NN/TN layouts find all first eight recipes bitwise with
+0/128KiB/1MiB limits, but the first recipe at 4–16MiB produces the 809 white
+mismatches. The existing native preparation uses a 32MiB preference. A private
+zero-workspace FC2 control restores one-view **13/13**, twelve bitwise chunks;
+T21 cosine .99997503 / relative L2 .017476. This remains a numerical prototype.
+
+Other-view A/B/A w30/n100 (1,200 raw samples) finds clear warm regressions
+before enabling actual all-view fusion: one-view T10/T200 74.460/78.225ms
+versus repeated product 69.322/70.546ms; three-view 96.413/106.736ms versus
+92.848/96.008ms. Neither a two-view speedup nor an all-view numerical pass
+justifies accepting this global recipe. FC2 repair alone lowers one-view to
+73.530/77.296ms, still above product.
+
+The first fusion toggle experiment did not cover real fusion in one/three
+view: `language_dual_geglu_shape_possible` only prepares M522/533 weights.
+Both switch positions therefore executed the same path. A subsequent private
+BF16 loading control prepares the already tested M<=1024 rounded fusion for
+all views; complete one/three-view outputs remain bitwise the FC2 control.
+Independent w30/n100 P50 T10/T200 is 71.750/75.753ms (one view),
+79.563/84.164ms (two), and 92.873/98.658ms (three). One-view and three-view
+T200 still have measurable performance debt. No prototype is promoted.
+
+The same candidate under deployed CUDA/cuBLAS passes 12/13, 11/13, 11/11
+for one/two/three view. Remaining failures are gradient+zero action steps in
+one/two view, plus black+zero in two view (cosine .998798 / L2 .059593).
+Aligned-library results cannot certify the deployed-library contract. The
+first independently compiled SM87 Orin candidate fails all thirteen one-view
+cases despite matching checkpoint/config/input hashes; its cross-architecture
+recipe requires additional diagnosis. It is not an accepted Orin repair.
