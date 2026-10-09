@@ -966,7 +966,9 @@ control makes all 11 three-view diagnostic chunks, including every action
 step, bitwise equal to the aligned OpenPI reference. This is diagnostic
 coverage of synthetic three-camera inputs, not real three-camera rollout
 validation. The full candidate still requires performance qualification and
-operator-contract integration before promotion.
+operator-contract integration before promotion. Its T10/T200 pilots measure
+301.188/303.716ms, versus 232.837/256.025ms for the same-library fixed product;
+whole-candidate performance therefore remains unqualified.
 
 A corrected one-view white capture matches all 270 recorded vision operator
 boundaries. Its first language norm, Q/K/V and attention output also match
@@ -984,6 +986,18 @@ profile totals identify the principal code cost; they are not benchmark
 budgets. A full-physical cuBLASLt replay matches all 90 saved QK and PV operands
 bitwise, with average timings .092ms and .096ms respectively. Full chunk,
 stability and performance regressions are required independently of that
-operator replay. The maintained INT8 packing repair retains its earlier
-27,000-sample paired regression result; none of these private BF16 probes has
-changed the maintained model implementation or enabled the CI gate.
+operator replay. The full-Lt control subsequently passes 10/13, 13/13 and
+9/11 cases, with pilots 215.259/190.860, 314.076/247.761 and
+303.516/306.826ms. All actual library hashes match the corresponding fixed
+baselines. This replacement does not cure the full-model latency increase.
+Aligning storage strides alone also matches all 90 operands but does not
+materially improve their timings. Adding masked zero reduction entries exposes
+faster recipes with numerical differences; they require separate complete
+chunk checks.
+
+A Thor action-down zero-workspace control passes 12/13, 12/13 and 11/11 cases.
+The one-view gradient+zero chunk fails; the two-view chunk passes whole-vector
+limits but fails action-timestep limits. Its faster pilots do not qualify it.
+The maintained INT8 packing repair retains its earlier 27,000-sample paired
+regression result; none of these private BF16 probes has changed the maintained
+model implementation or enabled the CI gate.
