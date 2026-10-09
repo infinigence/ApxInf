@@ -471,3 +471,17 @@ The evidence does not reproduce a systematic warm regression. Raw tails and
 initial asymmetric results are retained; no acceptance budget was loosened.
 These selected-input repair experiments do not approve the full deployment
 matrix or replace the pending representative bank and measured budgets.
+
+
+The precise-SiLU full intervention yields 13 bitwise-equal chunks to the
+checkpoint-layout candidate; it remains 8/13 and is not promoted. With the
+auxiliary-layout candidate, replacing all official KV makes black+zero pass
+every action timestep (.999628 cosine/.029057 relative L2), while gradient+zero
+still fails (.993072/.122654). Official vision replacement restores white and
+gray. These controls identify contributions, not a product repair. Replacing
+each flow input with the official state reduces gradient+zero final relative
+L2 to .037334; resetting only flow step 3/6/9 gives .085689/.037853/.037334.
+These whole metrics improve, but per-action-timestep checks still fail.
+Single-step discrepancies remain and accumulate. The official capture
+reproduces both tested original goldens bitwise. Injected/trace runs disable
+capture and have no product performance meaning.
