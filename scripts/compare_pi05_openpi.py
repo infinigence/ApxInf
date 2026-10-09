@@ -352,6 +352,7 @@ def run_openpi(args: argparse.Namespace) -> None:
     collect(args.suite_dir, manifest, model, "openpi", {
         "revision": revision, "hardware": hardware, "device": device,
         "torch_version": str(model.torch.__version__), "torch_cuda_version": model.torch.version.cuda,
+        "torch_cudnn_version": model.torch.backends.cudnn.version(),
         "float32_matmul_precision": model.torch.get_float32_matmul_precision(),
         "matmul_allow_tf32": model.torch.backends.cuda.matmul.allow_tf32,
         "matmul_allow_bf16_reduced_precision_reduction": model.torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,

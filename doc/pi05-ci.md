@@ -811,3 +811,25 @@ rejected. Skipping masked exp/div work preserves all 37 prior candidate outputs
 bitwise but measures 70.685/74.450, 76.824/81.173 and 89.252/95.551ms for
 T10/T200: this is also rejected as a performance repair. No numerical control
 from these experiments has been promoted.
+
+
+### CUDA library alignment is required for reference qualification
+
+A controlled Orin first-language-layer reconstruction keeps Q/K/V after RoPE
+bitwise equal. With the reference's bundled cuBLAS 13.0 libraries, padded
+batched attention, flattened QK, softmax and PV each reproduce the saved
+attention bitwise. With system cuBLAS 13.4, the same reconstruction has exactly
+714 differing output values, matching the private native trace. This identifies
+a library-recipe difference for this operator/input; it does not certify the
+whole model. Separate full references are being generated under the actual
+system libraries without replacing the older experiment outputs.
+
+The gate now requires official-reference and candidate CUDA runtime fingerprints
+to match, in addition to their hardware families. Loaded DSO content hashes
+identify the environment; changing an installation path alone does not fail.
+Reference collection must use the board's reviewed CUDA libraries explicitly
+when PyTorch would otherwise prefer bundled copies, then inspect the actual
+loaded-library receipt. The receipt also records the actual cuDNN version.
+A toolkit version label or requested library path is insufficient. CPU coverage
+rejects a same-board reference with a changed cuBLAS digest. Cross-runtime
+comparisons remain diagnostics, and cannot qualify a merge gate.

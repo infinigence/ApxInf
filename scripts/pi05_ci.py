@@ -135,7 +135,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
     if latency.get("schema") != "apxinf.pi05.performance.v1" or latency.get("layer") != "l1":
         raise ValueError("invalid performance receipt")
     candidate_runtime = runtime_fingerprint(actual)
-    runtime_fingerprint(reference)
+    if runtime_fingerprint(reference) != candidate_runtime:
+        raise ValueError("official reference CUDA runtime differs from candidate")
     if runtime_fingerprint(baseline) != candidate_runtime:
         raise ValueError("candidate CUDA runtime differs from approved baseline")
     if runtime_fingerprint(latency) != candidate_runtime:
