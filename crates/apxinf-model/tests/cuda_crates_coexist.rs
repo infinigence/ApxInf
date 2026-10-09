@@ -7,9 +7,12 @@
 //! symbol sets ever collide again, this binary fails to link — the failure
 //! mode is a build error, which is exactly where we want it.
 //!
-//! Both crates are optional dependencies, so this binary can only compile when
-//! the `cuda` feature pulls them in — the same gate `qwen_drive_loading.rs` uses.
-#![cfg(feature = "cuda")]
+//! Both crates are optional dependencies and are gated separately: `cuda` pulls
+//! in `apxinf-cuda`, `cuda-new` pulls in `apxinf-cuda-new` on top of it. This
+//! binary needs both, so it must require both — gating on `cuda` alone compiles
+//! the test in a build that never links `apxinf-cuda-new`, and the first
+//! reference to it fails as an unresolved crate.
+#![cfg(all(feature = "cuda", feature = "cuda-new"))]
 
 #[test]
 #[ignore = "requires a CUDA device"]
