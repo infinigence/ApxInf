@@ -294,6 +294,11 @@ class MatrixTest(unittest.TestCase):
         baseline["runtime_libraries"]["libcublas"]["sha256"] = "f" * 64
         with self.assertRaisesRegex(ValueError, "approved baseline"):
             ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+        baseline["runtime_libraries"] = candidate["runtime_libraries"]
+        reference["hardware"] = "orin" if cell["hardware"] == "thor" else "thor"
+        with self.assertRaisesRegex(ValueError, "reference hardware"):
+            ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+        reference["hardware"] = cell["hardware"]
         reference.pop("runtime_libraries")
         with self.assertRaisesRegex(ValueError, "provenance missing"):
             ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)

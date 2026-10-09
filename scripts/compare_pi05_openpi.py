@@ -342,8 +342,16 @@ def run_openpi(args: argparse.Namespace) -> None:
     revision = args.openpi_revision or openpi_revision(openpi)
     if not revision:
         raise ValueError("reference source lacks Git metadata; supply --openpi-revision")
+    device = {"type": model.device.type}
+    hardware = model.device.type
+    if model.device.type == "cuda":
+        properties = model.torch.cuda.get_device_properties(model.device)
+        capability = (properties.major, properties.minor)
+        hardware = {(11, 0): "thor", (8, 7): "orin"}.get(capability, f"sm{properties.major}{properties.minor}")
+        device.update(name=properties.name, compute_capability=list(capability))
     collect(args.suite_dir, manifest, model, "openpi", {
-        "revision": revision,
+        "revision": revision, "hardware": hardware, "device": device,
+        "torch_version": str(model.torch.__version__), "torch_cuda_version": model.torch.version.cuda,
         "float32_matmul_precision": model.torch.get_float32_matmul_precision(),
         "matmul_allow_tf32": model.torch.backends.cuda.matmul.allow_tf32,
         "cudnn_allow_tf32": model.torch.backends.cudnn.allow_tf32,

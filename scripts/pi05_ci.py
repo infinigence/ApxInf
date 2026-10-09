@@ -167,6 +167,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
             raise ValueError("checkpoint receipt mismatch")
     if reference.get("engine") != "openpi" or not reference.get("revision"):
         raise ValueError("official reference provenance missing")
+    if reference.get("hardware") != cell["hardware"]:
+        raise ValueError("official reference hardware differs from candidate")
     for record in (actual, reference, baseline):
         if record.get("config_sha256") != cell["config"]["sha256"]:
             raise ValueError("configuration receipt differs")

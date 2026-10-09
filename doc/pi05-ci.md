@@ -147,8 +147,13 @@ configuration, calibration, hardware and exact source SHA. Accuracy and performa
 also record paths and SHA256 of the **loaded** CUDA driver, runtime, cuBLAS and
 cuBLASLt libraries. The aggregator compares their digests against each other
 and the approved ApxInf baseline; paths can differ after relocation. The
-OpenPI reference must record its own library provenance, but may use a
-different approved runtime. Installed toolkit version alone is insufficient.
+OpenPI reference must be generated on the same hardware family as its cell,
+recording GPU name/capability, PyTorch/CUDA build, actual math flags and loaded
+library digests. A Thor reference cannot qualify an Orin cell: identical OpenPI
+source/weights/inputs already produced failures against each other on these
+boards (see the diagnosis below). Different approved reference/runtime recipes
+remain explicit per-board bank assets; never silently replace a golden.
+Installed toolkit version alone is insufficient.
 Old receipts without these fields must be rerun before gate acceptance.
 
 Calibrate sample and warmup counts using repeated independent runs: verify
@@ -674,3 +679,44 @@ whole-model profiles instead expose additional physical attention and precise
 RoPE work. A four-warp softmax scheduling control preserves all 37 chunks
 bitwise but yields 71.796/75.683ms, 79.776/84.230ms and 93.187/98.458ms:
 it does not remove the remaining one/three-view performance debt.
+
+
+### Same-board references and lower-overhead controls (2026-10-10)
+
+A private Thor BF16 control retains the repaired FC2 recipe, staged rounding,
+checkpoint-layout prefix projection and physical masked KV layout. It prepares
+BF16 RoPE sine/cosine tables once and uses matched-operand cuBLASLt recipes for
+50-row action QK/PV (zero workspace, heuristic indices 4/1). All 37 diagnostic
+chunks pass the unchanged whole-chunk and all-timestep floors under the bundled
+CUDA 13.0 runtime: 13/13, 13/13, 11/11 for 1/2/3 views. Of these, 34 chunks are
+bitwise equal to OpenPI; the three T21 chunks are not bitwise equal.
+
+Separate 30-warmup/100-sample pilots measure T10/T200 P50 of
+69.399/73.023, 77.079/81.314 and 90.020/95.485 ms. Two/three-view pilots improve
+on the deployed implementation; one-view T200 remains about 3.5% slower than
+its deployed 70.546 ms pilot. These are not a new paired qualification.
+The same control with system CUDA libraries retains only 12/13, 11/13, 11/11
+passes; gradient+zero and two-view black+zero remain failures. Reducing the
+fusion pipeline from three stages to two preserves all 37 numerical verdicts
+but slows the measured profiles. None of these private controls is promoted.
+
+Orin now also has a separately saved OpenPI reference generated on SM87 with
+PyTorch 2.9.1+cu130, the same pinned OpenPI source, checkpoint and exact input
+hashes. The existing Thor OpenPI outputs pass only 9/13, 9/13 and 9/11 against
+this Orin reference at the unchanged BF16 floors. Two-view black+zero has
+cosine .986077 and relative L2 .220721 between the two official executions.
+The comparison is evidence of architecture/runtime recipe sensitivity, not
+proof that either port is correct, and does not replace either golden.
+
+Against the same-board Orin reference, the shipped BF16 outputs pass
+7/13, 6/13 and 7/11; the private explicitly masked candidate passes
+9/13, 9/13 and 9/11. For two-view black+zero, shipped/private cosine is
+.865164/.978608 and relative L2 is .501508/.279529. The private candidate also
+has a measured latency increase, so it remains rejected. Explicit TF32 operand
+rounding and compact FA2 controls do not cure the full matrix.
+
+The maintained reference collector now records the actual GPU name/capability,
+PyTorch/CUDA build and hardware family. The gate rejects a reference from a
+different board family; CPU tests cover that rejection. Existing references
+without hardware provenance cannot qualify and must be regenerated rather than
+edited to claim a board. Cross-board comparisons remain useful diagnostics.
