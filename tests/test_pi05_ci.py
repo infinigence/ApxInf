@@ -26,6 +26,11 @@ class MetricsTest(unittest.TestCase):
         self.assertAlmostEqual(result["cosine"], 1)
         self.assertFalse(parity.meets_limits(result, LIMITS))
 
+    def test_identical_nonzero_vectors_pass_exact_equality_budget(self):
+        values = np.array([.123, .456, .789])
+        exact = {"min_cosine": 1, "max_relative_l2": 0, "max_abs": 0, "zero_max_abs": 0}
+        self.assertTrue(parity.meets_limits(parity.metrics(values, values.copy()), exact))
+
     def test_zero_is_absolute_only(self):
         values = np.zeros((2, 32))
         self.assertIsNone(parity.metrics(values, values)["cosine"])
@@ -121,6 +126,26 @@ class ReceiptTest(unittest.TestCase):
         self.assertNotIn("latency_ms", result["cases"][0])
         self.assertEqual(result["stability"]["repeats"], 2)
         self.assertEqual(result["stability"]["cases"][0]["repeat_max_abs"], 2)
+
+    def test_revisit_detects_drift_separately_from_same_input_repeats(self):
+        second = parity.save_case(self.root, "two", np.zeros((1, 224, 224, 3), np.uint8),
+                                  (3, 108), np.zeros((2, 32), np.float32))
+        manifest = parity.load_suite(self.root)
+        manifest["cases"].append(second)
+        parity.write_json(self.root / "manifest.json", manifest, force=True)
+        class LeakyModel:
+            other_calls = 0
+            def infer(self, case):
+                if case["token_ids"][0] == 3:
+                    self.other_calls += 1
+                value = 2 if self.other_calls >= 3 else 1
+                return np.full((2, 32), value, np.float32)
+        parity.collect(self.root, manifest, LeakyModel(), "fake", {},
+                       force=False, stability_repeats=1)
+        result = json.loads((self.root / "fake.json").read_text())
+        self.assertEqual([r["repeat_max_abs"] for r in result["stability"]["cases"]], [0, 0])
+        self.assertEqual(result["stability"]["revisit_max_abs"], 1)
+        self.assertEqual(result["cases"][0]["actions"][0][0], 1)
 
     def test_diagnostics_separate_factors_and_cover_configured_token_boundary(self):
         suite = self.root / "diagnostic"

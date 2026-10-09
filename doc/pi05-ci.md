@@ -156,6 +156,45 @@ The v4 parity and v2 bank schemas require regeneration; old mixed-purpose
 receipts are historical evidence and cannot be silently promoted into the new
 protocol.
 
+## Qualification snapshot (2026-10-09)
+
+Product math at `5c7ac664` completed the twelve board/precision/view cells with
+148 first accuracy outputs and 4,440 independent warm samples. Two stability
+repeats and an A -> other inputs -> A revisit measured zero drift throughout.
+These pilot counts are exploratory, not an approved protocol. Twenty-one CPU
+contract tests and the focused Rust weight-folding regression pass.
+
+The real LIBERO 2-view INT8 failure was traced to folding learned language
+RMSNorm into projections before per-output-channel weight quantization. Keeping
+raw weights and explicit normalization improves state cosine .926409 -> .999824
+(relative L2 .383409 -> .018752) and text .901550 -> .999696
+(.439377 -> .024661). Both complete chunks and every action timestep meet the
+historical INT8 comparison floors. BF16/FP8 retain folding in their own packing
+paths; all nine corresponding board/view cells are bitwise unchanged on the
+historical overlapping inputs. Random unit-normalization weights would miss
+this learned-checkpoint failure.
+
+This does not qualify the entire model: base BF16 still fails black+zero,
+white+normal, zero-noise and some real token-mode comparisons. Base FP8 and
+INT8 also fail ordinary gradient/noise and real-input cases. Official prefix
+KV substitution improves several failures but leaves action-side error.
+Layer/flow traces measure iterative amplification. Separate GeGLU gives the
+same output; split normalization or an FP32 patch projection does not repair
+all cases. FP8 group ablations identify strong action-activation sensitivity
+on gradient+zero and vision/language sensitivity on other inputs. Increasing
+the old H10 calibration margin is insufficient. A per-site H50 recalibration
+also improves some inputs and worsens others; it is a diagnosis experiment with
+overlapping calibration/test inputs, not a production profile. No numerical
+limit was relaxed.
+
+The full v4/v2 raw receipt matrix was revalidated through the maintained
+aggregator. Exact same-build comparisons and stability pass, while missing
+performance budgets correctly prevent acceptance. A representative held-out
+bank, genuine three-camera observations, rebuilt variability and performance
+qualification remain outstanding. The system is **not accepted and not online**.
+Fixed-observation chunk agreement is not closed-loop or LIBERO task-success
+certification.
+
 ## Freeze the approved bank
 
 Copy `configs/pi05/ci-bank.example.json` into the ignored bank directory and

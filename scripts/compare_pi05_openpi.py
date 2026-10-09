@@ -355,7 +355,10 @@ def metrics(reference: np.ndarray, actual: np.ndarray) -> dict[str, float | None
     left, right = reference.astype(np.float64).ravel(), actual.astype(np.float64).ravel()
     delta = right - left
     left_norm, right_norm = np.linalg.norm(left), np.linalg.norm(right)
-    cosine = float(np.dot(left, right) / (left_norm * right_norm)) if left_norm and right_norm else None
+    # Equal nonzero vectors have cosine exactly one; avoid a one-ULP false failure.
+    cosine = None
+    if left_norm and right_norm:
+        cosine = 1.0 if not np.any(delta) else float(np.dot(left, right) / (left_norm * right_norm))
     relative_l2 = (float(np.linalg.norm(delta) / left_norm) if left_norm else
                    None)
     return {"cosine": max(-1.0, min(1.0, cosine)) if cosine is not None else None,
