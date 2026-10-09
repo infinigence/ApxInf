@@ -648,6 +648,29 @@ The same candidate under deployed CUDA/cuBLAS passes 12/13, 11/13, 11/11
 for one/two/three view. Remaining failures are gradient+zero action steps in
 one/two view, plus black+zero in two view (cosine .998798 / L2 .059593).
 Aligned-library results cannot certify the deployed-library contract. The
-first independently compiled SM87 Orin candidate fails all thirteen one-view
-cases despite matching checkpoint/config/input hashes; its cross-architecture
-recipe requires additional diagnosis. It is not an accepted Orin repair.
+first independently compiled SM87 Orin candidate passes 0/13, 0/13, 10/11
+for one/two/three view despite matching checkpoint/config/input hashes.
+Actual one-view OpenPI hooks reproduce the unchanged white golden. First
+native action input relative L2 is .001067 and modulation about 1e-7, but
+first attention L2 is .31912. Official vision/all-prefix-KV replacements do
+not remove the large error. A targeted adapter dump then finds that SM87
+selects FA2 and bypasses the private paired mask/cache adapter, exposing dummy
+camera positions. This is an experimental adaptation error, not a regression
+in the shipped INT8 fix. Correct private dispatch recovers **11/13, 9/13,
+10/11**. Remaining failures include one-view task text/gradient-zero step
+limits; two-view gradient-zero, black-zero, white and distinct camera gray;
+three-view white step limits. These candidates are not accepted repairs.
+
+Corrected SM87 dispatch w30/n100 P50 T10/T200 is 173.428/197.961ms,
+255.797/263.143ms and 293.998/327.525ms for one/two/three view. Prior fixed
+product paired medians are 134.507/150.185ms, 213.449/203.234ms and
+231.341/256.228ms. The pilot candidate is clearly slower; it does not meet the
+performance requirement. It is not promoted or used as a CI baseline.
+
+Actual-operand FC2 CUDA-event microbench (w10/n100 per heuristic) finds the
+exact NN zero-workspace recipe about .0225ms versus .0436–.0439ms for the
+inexact first 4–16MiB recipe. The FC2 repair itself is faster. One-view T200
+whole-model profiles instead expose additional physical attention and precise
+RoPE work. A four-warp softmax scheduling control preserves all 37 chunks
+bitwise but yields 71.796/75.683ms, 79.776/84.230ms and 93.187/98.458ms:
+it does not remove the remaining one/three-view performance debt.
