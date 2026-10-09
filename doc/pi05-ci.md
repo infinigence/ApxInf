@@ -720,3 +720,67 @@ PyTorch/CUDA build and hardware family. The gate rejects a reference from a
 different board family; CPU tests cover that rejection. Existing references
 without hardware provenance cannot qualify and must be regenerated rather than
 edited to claim a board. Cross-board comparisons remain useful diagnostics.
+
+### Continued precision isolation and paired performance checks (2026-10-10)
+
+All candidates in this section are private diagnostic controls. The maintained
+INT8 learned-norm packing repair keeps its previously recorded 27,000-sample
+qualification; none of the following BF16 recipes replaces that implementation,
+changes a golden, relaxes a floor, or supplies an approved performance budget.
+
+On Orin, actual first-layer operands distinguish vision projection rounding
+from activation math. GELU is bitwise equal to PyTorch when fed the same FC1
+output. Default two-camera packed QKV and FC1 projections differ from the
+same-board reference in 403,368 and 204,372 values respectively (including both
+repeated camera operands in the microcontrol). The vendor algorithm reports
+`splitK=2`, `reduction=INPLACE` for both default recipes. Restricting cuBLASLt's
+reduction preference to compute-type partial sums removes those differences
+in the tested operands, as do selected non-split recipes. Repeated operands
+establish a matrix-shape control, not three distinct real camera observations.
+A numerically correct recipe's first heuristic rank is not necessarily fastest;
+local projection equality is also insufficient for full-model acceptance.
+
+A private candidate with exact vision QKV/FC1/FC2 recipes and an NN-layout
+language down projection passes 10/13, 8/13 and 11/11 same-board tests for
+1/2/3 views. Two-camera black+zero still fails badly (cosine .552661, relative
+L2 .909827). Instrumentation verifies that its final output is unchanged.
+For this input, the vision embedding and first language normalization are
+bitwise equal, but the first language QKV projection has 221,994 differing
+values; later layer residual errors accumulate. This separates the remaining
+language/action error from the repaired first vision projection. It does not
+excuse the failure or certify the remaining vision cases.
+
+This candidate's 30-warmup/100-sample T10/T200 latency pilots are
+146.104/164.854, 224.381/220.752 and 244.078/271.777ms on Orin. Corresponding
+deployed BF16 pilots are 134.507/150.185, 213.449/203.234 and
+231.341/256.228ms. These unpaired pilots reject the candidate as a performance
+solution; they are not evidence that a maintained fix regressed.
+
+Thor has an additional 5,400 raw samples across three interleaved blocks,
+three views and two token lengths, using one resident model per process,
+30 warmups and 100 measured calls per input. The fixed two-view implementation
+in that experiment deliberately has dual GeGLU disabled and is a fusion-off
+control. A separate 1,800-sample, three-block two-view run preserves its default
+`auto` fusion selection. In that default run, candidate T10 P50 is
+76.462–76.627ms versus 73.592–73.791ms for the fixed implementation under the
+same bundled libraries. T200 improves (80.619–80.747ms versus
+84.296–84.469ms), but that does not cancel the short-token regression.
+Fixed system-library measurements are 83.703–83.770ms and
+86.253–87.054ms; changing the library environment cannot be used to hide the
+same-environment short-token debt.
+
+One-view candidate T200 P50 is 73.860/73.881/70.802ms across the first
+three blocks, against fixed system 70.446/70.573/70.652ms. The faster candidate
+process cannot be averaged with the slower ones to claim qualification. Removing
+an unused transposed weight copy preserves all 37 outputs bitwise but still
+measures 73.946ms T200 in a fresh process. Four additional candidate profiles
+all capture the slow process; they do not identify the occasional fast-process
+cause. A subsequent same-input baseline/candidate profile measures total GPU
+kernel time of 71.097/74.691ms per call. Masked softmax accounts for
+1.068/2.827ms respectively; it is a measured contributor, not the whole cause.
+Profiling overhead means these numbers are diagnostic, not latency budgets.
+
+Uniform reduction-policy and isolated softmax controls are being evaluated
+with the same whole-chunk, every-timestep and independent latency protocols.
+No candidate is accepted until the remaining precision and performance debts
+are resolved. The PR remains draft and GPU CI remains disabled.
