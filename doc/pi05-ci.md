@@ -195,6 +195,47 @@ qualification remain outstanding. The system is **not accepted and not online**.
 Fixed-observation chunk agreement is not closed-loop or LIBERO task-success
 certification.
 
+## Matched-operand operator diagnosis
+
+Further native instrumentation at product math `5c7ac664` captures operands,
+quantized codes/scales and outputs, then recomputes them independently with
+PyTorch. Instrumented complete action outputs are bitwise identical to the
+product receipts on the tested inputs. This controls for changes introduced by
+the probes. No new product arithmetic change follows from these experiments.
+
+| Path | Matched-operand evidence | Interpretation and scope |
+| --- | --- | --- |
+| BF16 language | QKV/output/down GEMM and residual sums match exactly on three inputs across all 18 layers; a complete layer recomputed from its input has relative L2 at most .000652 under the native recipe, versus .003526 under the selected official recipe. | Explicit versus folded RMSNorm, FP32 RoPE and GeGLU intermediates introduce different rounding boundaries. Sampled GEMM is not the source of that difference. |
+| BF16 vision | Layers 0/13/26, three inputs: sampled GEMM, fused residual and FP32 GELU match; native attention agrees with SDPA within .000022 relative L2. | Official sequential BF16 bias/residual or activation rounding differs by roughly .001–.003 locally. FP32 patch embedding is another measured contributor, but changing it alone does not repair all chunks. |
+| BF16 action | Layers 0/8/16 at first and last flow steps, three inputs: GEMM, fused gate/residual and native GeGLU match exactly; adaptive norm relative L2 is at most .000061. | Official separate BF16 gate multiplication/residual addition and activation rounding differ by roughly .002–.004 locally. |
+| FP8 prefix/action | Independent E4M3 code/scale reconstruction agrees with sampled native GEMM to relative L2 at most .000066; GeGLU quantization differences are at most about .0002. | Quantization and iterative amplification remain causes of quality loss; these probes do not establish an FP8 GEMM defect. |
+| Orin INT8 | 108 sampled GEMMs: 36 prefix and 72 action, three inputs, layers 0/8/16 and first/last action flow steps; actual integer codes/scales produce bitwise identical outputs. Activation codes, sampled weight codes and weight-scale bits also match. Native gate/residual and GeGLU match; norm differences are at most .000037. | The confirmed learned-norm packing bug was repaired separately. No integer GEMM/quantizer defect is found in these samples; quantization recipe and BF16 rounding remain contributors to base-model failures. |
+
+The actual official `sample_actions` path forces **eager language/action
+attention**, despite the constructor's SDPA config. Eager-only interventions
+leave the output unchanged and are not evidence for an attention-backend fix.
+Full-chunk single-factor reference changes have mixed effects: black+zero
+cosine .865597 becomes .938741 with prefix FP32 GeGLU, .888755 with prefix FP32
+RoPE, and .921981 with combined prefix/action changes. Other cases can worsen.
+Intermediate rounding differences and their amplification are measured; no
+single cast or fusion rewrite has been proved to repair every failure.
+
+FP8 action layer 0 MLP norm at the first flow step clips about .2% of values on
+black+zero and gradient+zero. Its local quantization relative L2 is about .176
+and .178, versus about .026–.029 at typical unclipped sampled sites. A controlled
+scale change at only that site changes gradient+zero cosine .464966 -> .361706
+(relative L2 3.767167 -> 6.754926); also changing layer 16 yields .362401 /
+6.707144. All three profiles still fail all 13 two-view diagnostic inputs under
+historical whole-chunk plus timestep floors. Full per-site H50 recalibration
+has different mixed results, documented above. Eliminating clipping is
+insufficient: changing static range also changes resolution and the iterative
+trajectory. These overlapping calibration/test probes are not production
+profiles and are not a reason to relax limits.
+
+These operator samples narrow the causes; they do not exhaust every layer,
+token, checkpoint, view or board, prove complete port correctness, or certify
+remaining failed cases as acceptable. The OpenPI disagreement stays red.
+
 ## Freeze the approved bank
 
 Copy `configs/pi05/ci-bank.example.json` into the ignored bank directory and
