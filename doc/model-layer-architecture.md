@@ -96,7 +96,7 @@ not a port requirement.
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
 | `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
-| `apxinf-mlx` | Owned thread-affine arrays/streams, portable operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
+| `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
 `ModelVariantChoice` is a configuration choice; `ModelVariant` is a loaded private
@@ -140,8 +140,8 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
-| Qwen3 / `LlmTrait`, MLX | Independent `qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
-| MiniCPM5 / `LlmTrait`, MLX | Independent `minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -161,7 +161,8 @@ in that family and its loader; use existing named assets where applicable and
 extend a shared option only for a demonstrated contract, not by copying
 `Pi05Config` or adding unrelated fields to it.
 
-With the `mlx` feature, Metal selection resolves `qwen3-mlx` or `minicpm5-mlx`.
+Metal model composition is performance-first and independent of the provisional
+cross-backend design. With the `mlx` feature, Metal selection resolves `metal_qwen3` or `metal_minicpm5`.
 Qwen3 checkpoint detection uses `model_type=qwen3`; MiniCPM5 requires explicit
 family selection because its official metadata says `llama`. Unsupported
 families fail instead of silently moving work to CPU. See the

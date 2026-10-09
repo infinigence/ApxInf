@@ -1,6 +1,8 @@
+//! Compatibility adapter for the existing public Tensor/Backend and sampler APIs.
+//! Metal models execute through native Array/Compiled operations; they do not
+//! route their layers through a portable operator contract.
 use crate::{Array, MlxDType, Stream};
 use apxinf_core::{
-    contracts::{self, AttentionMask, AttentionOptions, AxisSlice},
     Backend, DType, Device, Error, Graph, KvCache, NextTokenLogits, NormalGenerator, Result,
     SamplingBackend, Shape, Storage, Tensor, TokenPenalties, TokenSample, TokenSampler,
     TokenSamplingInit, TokenSamplingSpec, TokenSelection,
@@ -35,6 +37,16 @@ fn core_dtype(d: MlxDType) -> Result<DType> {
 }
 /// A concrete, thread-confined Metal backend. CPU-stream arrays are an explicit
 /// low-level diagnostic facility, never an implicit fallback for this backend.
+fn checked_bytes(shape: &[usize], dtype: DType) -> Result<usize> {
+    shape.iter().try_fold(dtype.size_in_bytes(), |n, &d| {
+        if d == 0 {
+            return Err(err("empty tensor dimensions are unsupported"));
+        }
+        n.checked_mul(d)
+            .ok_or_else(|| err("tensor byte size overflow"))
+    })
+}
+
 #[derive(Clone)]
 pub struct MlxBackend {
     stream: Stream,
@@ -57,11 +69,23 @@ impl MlxBackend {
         let dtype = core_dtype(array.dtype())?;
         let array = array.contiguous()?;
         let shape = Shape::new(array.shape().to_vec());
-        let bytes = contracts::checked_bytes(array.shape(), dtype)?;
+        let bytes = checked_bytes(array.shape(), dtype)?;
         Tensor::from_opaque_parts(shape, dtype, self.device(), bytes, Rc::new(array))
     }
     pub fn array(&self, t: &Tensor) -> Result<Array> {
-        contracts::tensor_storage(t, self.device())?;
+        if t.device() != self.device() {
+            return Err(Error::DeviceMismatch {
+                expected: self.device(),
+                got: t.device(),
+            });
+        }
+        let bytes = checked_bytes(t.shape().dims(), t.dtype())?;
+        if t.storage().len() < bytes {
+            return Err(Error::DataLengthMismatch {
+                expected: bytes,
+                got: t.storage().len(),
+            });
+        }
         let Storage::Opaque { device, handle } = t.storage() else {
             return Err(err("Tensor is not backed by an MLX array"));
         };
@@ -83,7 +107,7 @@ impl MlxBackend {
         a.reshape(t.shape().dims())
     }
     fn float_array(&self, t: &Tensor) -> Result<Array> {
-        contracts::float_tensor(t, self.device())?;
+        mlx_dtype(t.dtype())?;
         self.array(t)
     }
     fn same_float(&self, a: &Tensor, b: &Tensor) -> Result<(Array, Array)> {
@@ -140,55 +164,29 @@ impl MlxBackend {
         let qt = self.from_array(self.array(q)?.reshape(&[1, rows, heads, dim])?)?;
         let kt = self.from_array(pair.0.clone())?;
         let vt = self.from_array(pair.1.clone())?;
-        let options = AttentionOptions {
-            scale: (dim as f32).sqrt().recip(),
-            mask: AttentionMask::Causal {
-                q_start: kv_len - rows,
-                k_start: 0,
-            },
-            scores: DType::F32,
-            probabilities: DType::F32,
-        };
-        let out = self.attention_impl(&qt, &kt, &vt, &options)?;
+        let out = self.causal_attention(&qt, &kt, &vt, kv_len - rows)?;
         self.from_array(self.array(&out)?.reshape(&[rows, heads * dim])?)
     }
-}
-impl Backend for MlxBackend {
-    fn cast_impl(&self, t: &Tensor, d: DType) -> Result<Tensor> {
-        let cast = self.array(t)?.cast(mlx_dtype(d)?)?;
-        // MLX astype is allowed to return its input for equal dtype; the public
-        // portable contract promises an independent functional result.
-        self.from_array(if t.dtype() == d { cast.copy()? } else { cast })
-    }
-    fn slice_axis_impl(&self, t: &Tensor, s: AxisSlice) -> Result<Tensor> {
-        s.validate(t.shape().dims())?;
-        self.from_array(self.array(t)?.slice_axis(s.axis, s.start, s.end)?.copy()?)
-    }
-    fn concat_axis_impl(&self, t: &[&Tensor], axis: usize) -> Result<Tensor> {
-        let a = t
-            .iter()
-            .map(|t| self.array(t))
-            .collect::<Result<Vec<_>>>()?;
-        self.from_array(Array::concat(&a.iter().collect::<Vec<_>>(), axis)?)
-    }
-    fn permute_impl(&self, t: &Tensor, axes: &[usize]) -> Result<Tensor> {
-        self.from_array(self.array(t)?.transpose(axes)?.copy()?)
-    }
-    fn broadcast_to_impl(&self, t: &Tensor, shape: &[usize]) -> Result<Tensor> {
-        self.from_array(self.array(t)?.broadcast_to(shape)?.copy()?)
-    }
-    fn attention_impl(
+    fn causal_attention(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        o: &AttentionOptions<'_>,
+        q_start: usize,
     ) -> Result<Tensor> {
-        o.validate(self.device(), q, k, v)?;
+        if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
+            return Err(err("cached attention dtype mismatch"));
+        }
+        mlx_dtype(q.dtype())?;
         let qs = q.shape().dims();
         let ks = k.shape().dims();
         let (batch, qlen, heads, dim) = (qs[0], qs[1], qs[2], qs[3]);
         let (klen, kh) = (ks[1], ks[2]);
+        if kh == 0 || heads == 0 || heads % kh != 0 || v.shape() != k.shape() {
+            return Err(err(
+                "cached attention head grouping or value shape mismatch",
+            ));
+        }
         let qa = self
             .array(q)?
             .cast(MlxDType::F32)?
@@ -203,51 +201,35 @@ impl Backend for MlxBackend {
         };
         let ka = expand(k)?;
         let va = expand(v)?;
-        let mut scores = qa
+        let scores = qa
             .matmul(&ka.transpose(&[0, 1, 3, 2])?)?
-            .mul(&Array::scalar(&self.stream, o.scale, MlxDType::F32)?)?;
-        match o.mask {
-            AttentionMask::Full => {}
-            AttentionMask::Additive(t) => {
-                scores = scores.add(&self.array(t)?)?;
-            }
-            AttentionMask::Causal { q_start, k_start } => {
-                // arange's ABI is float-valued; reject positions that lose exact integers.
-                if q_start.checked_add(qlen).is_none_or(|n| n > 16_777_216)
-                    || k_start.checked_add(klen).is_none_or(|n| n > 16_777_216)
-                {
-                    return Err(err("causal positions exceed exact MLX arange domain"));
-                }
-                let qp = Array::arange(
-                    &self.stream,
-                    q_start as f32,
-                    (q_start + qlen) as f32,
-                    1.,
-                    MlxDType::I32,
-                )?
-                .reshape(&[qlen, 1])?;
-                let kp = Array::arange(
-                    &self.stream,
-                    k_start as f32,
-                    (k_start + klen) as f32,
-                    1.,
-                    MlxDType::I32,
-                )?
-                .reshape(&[1, klen])?;
-                scores = kp.less_equal(&qp)?.where_select(
-                    &scores,
-                    &Array::scalar(&self.stream, f32::NEG_INFINITY, MlxDType::F32)?,
-                )?;
-            }
+            .mul(&Array::scalar(
+                &self.stream,
+                (dim as f32).sqrt().recip(),
+                MlxDType::F32,
+            )?)?;
+        // MLX arange's float-valued ABI must represent positions exactly.
+        if q_start.checked_add(qlen).is_none_or(|n| n > 16_777_216) || klen > 16_777_216 {
+            return Err(err("causal positions exceed exact MLX arange domain"));
         }
-        scores = scores.cast(mlx_dtype(o.scores)?)?.cast(MlxDType::F32)?;
+        let qp = Array::arange(
+            &self.stream,
+            q_start as f32,
+            (q_start + qlen) as f32,
+            1.,
+            MlxDType::I32,
+        )?
+        .reshape(&[qlen, 1])?;
+        let kp =
+            Array::arange(&self.stream, 0., klen as f32, 1., MlxDType::I32)?.reshape(&[1, klen])?;
+        let scores = kp.less_equal(&qp)?.where_select(
+            &scores,
+            &Array::scalar(&self.stream, f32::NEG_INFINITY, MlxDType::F32)?,
+        )?;
         let valid = scores.max(-1)?.isfinite()?;
         let zero = Array::scalar(&self.stream, 0., MlxDType::F32)?;
         let probabilities = valid.where_select(&scores, &zero)?.softmax(-1)?;
-        let probabilities = valid
-            .where_select(&probabilities, &zero)?
-            .cast(mlx_dtype(o.probabilities)?)?
-            .cast(MlxDType::F32)?;
+        let probabilities = valid.where_select(&probabilities, &zero)?;
         self.from_array(
             probabilities
                 .matmul(&va)?
@@ -255,6 +237,8 @@ impl Backend for MlxBackend {
                 .transpose(&[0, 2, 1, 3])?,
         )
     }
+}
+impl Backend for MlxBackend {
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
         if !eps.is_finite()
             || eps <= 0.
@@ -286,7 +270,7 @@ impl Backend for MlxBackend {
     }
     fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         if a.shape() != b.shape() {
-            return Err(err("portable add requires equal shapes"));
+            return Err(err("MLX adapter add requires equal shapes"));
         }
         let (x, y) = self.same_float(a, b)?;
         self.from_array(
@@ -297,7 +281,7 @@ impl Backend for MlxBackend {
     }
     fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         if a.shape() != b.shape() {
-            return Err(err("portable mul requires equal shapes"));
+            return Err(err("MLX adapter mul requires equal shapes"));
         }
         let (x, y) = self.same_float(a, b)?;
         self.from_array(

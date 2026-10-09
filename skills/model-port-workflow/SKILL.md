@@ -102,7 +102,10 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    For MLX, record local, decoder-block and whole-step compile scopes separately;
    identify explicit dynamic state, prepared shapes and bounded lazy outputs.
    Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
-   custom kernels there, without a universal model/runtime wrapper.
+   custom kernels there, without a universal model/runtime wrapper. Use
+   `metal_<family>` for native Metal composition and registration. The evolving
+   cross-backend contract is not a prerequisite: preserve the model's numerical
+   recipe and measured performance without introducing per-op trait wrappers.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness

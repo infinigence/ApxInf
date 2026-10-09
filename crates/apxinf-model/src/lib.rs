@@ -9,12 +9,12 @@ pub mod gr00t;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(feature = "mlx")]
-pub mod minicpm5;
+pub mod metal_minicpm5;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
 #[cfg(feature = "mlx")]
-pub mod qwen3;
+pub mod metal_qwen3;
 #[cfg(feature = "cuda-new")]
 pub mod qwen38;
 pub mod qwen3vl;

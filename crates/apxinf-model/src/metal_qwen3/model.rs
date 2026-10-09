@@ -657,7 +657,7 @@ impl LlmTrait for Qwen3Model {
         }
         TextPreparationStatus {
             state,
-            implementation: "qwen3-mlx",
+            implementation: "metal_qwen3",
             variant: Some(self.variant.name()),
             compiled_scopes: scopes,
             prepared_prompt_tokens: None,

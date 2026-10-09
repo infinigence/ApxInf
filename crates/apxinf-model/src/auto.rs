@@ -256,7 +256,7 @@ impl LoadedModel {
 }
 
 /// Stateless unified frontend. It creates one shared backend, loads weights,
-/// and dispatches by model name plus device-specific registry suffix.
+/// and dispatches by model name with an explicit Metal prefix or CUDA suffix.
 pub struct AutoModel;
 
 impl AutoModel {
@@ -313,21 +313,15 @@ impl AutoModel {
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
-            Device::Metal(_) => Some("mlx"),
-            Device::Cpu => None,
+            Device::Metal(_) | Device::Cpu => None,
         };
 
         let specific_name = device_name.map(|suffix| format!("{model_name}-{suffix}"));
         let factory = if matches!(device, Device::Metal(_)) {
-            // Registration is explicit Metal admission. Legacy generic models
-            // may contain CPU helpers or CUDA-only assumptions, so do not send
-            // them an MLX backend merely because their portable methods exist.
-            let name = if model_name.ends_with("-mlx") {
-                model_name
-            } else {
-                specific_name.as_deref().unwrap()
-            };
-            registry::get(name).ok_or(Error::UnsupportedDevice(device))?
+            // Only a Metal-owned factory can admit this device. Resolve once
+            // during loading; model execution remains concrete native MLX.
+            registry::get(&metal_registry_name(model_name))
+                .ok_or(Error::UnsupportedDevice(device))?
         } else {
             specific_name
                 .as_deref()
@@ -362,6 +356,19 @@ impl AutoModel {
     }
 }
 
+// Canonical Metal registration is explicit and independent of future backend
+// composition APIs. Preserve selectors used by the initial MLX preview.
+fn metal_registry_name(model_name: &str) -> String {
+    if model_name.starts_with("metal_") {
+        model_name.to_owned()
+    } else {
+        format!(
+            "metal_{}",
+            model_name.strip_suffix("-mlx").unwrap_or(model_name)
+        )
+    }
+}
+
 // Admission only: supported variant names and precision semantics are owned by
 // each family loader, not a second central implementation registry.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
@@ -371,7 +378,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
     ) || (matches!(device, Device::Metal(_))
         && matches!(
             model_name,
-            "qwen3" | "qwen3-mlx" | "minicpm5" | "minicpm5-mlx"
+            "qwen3" | "metal_qwen3" | "qwen3-mlx" | "minicpm5" | "metal_minicpm5" | "minicpm5-mlx"
         ))
 }
 
@@ -479,7 +486,14 @@ mod tests {
 
     #[test]
     fn metal_variant_admission_is_family_and_device_specific() {
-        for name in ["qwen3", "qwen3-mlx", "minicpm5", "minicpm5-mlx"] {
+        for name in [
+            "qwen3",
+            "metal_qwen3",
+            "qwen3-mlx",
+            "minicpm5",
+            "metal_minicpm5",
+            "minicpm5-mlx",
+        ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
@@ -488,6 +502,24 @@ mod tests {
         assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
+        assert!(supports_model_variant("smolvla", Device::Cuda(0)));
+        assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+    }
+
+    #[test]
+    fn metal_names_resolve_without_double_prefixes() {
+        for family in ["qwen3", "minicpm5"] {
+            let expected = format!("metal_{family}");
+            assert_eq!(metal_registry_name(family), expected);
+            assert_eq!(metal_registry_name(&expected), expected);
+            assert_eq!(metal_registry_name(&format!("{family}-mlx")), expected);
+            #[cfg(feature = "mlx")]
+            {
+                register_builtin_models();
+                assert!(registry::get(&expected).is_some());
+            }
+        }
+        assert_eq!(metal_registry_name("llama"), "metal_llama");
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

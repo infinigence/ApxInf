@@ -23,7 +23,9 @@ Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf)
 ### Native Apple Silicon text inference
 
 The optional `mlx` feature runs Qwen3-0.6B and MiniCPM5-2B through native Rust
-models and the MLX 0.31.2 C++/Metal runtime. It does not run a Python model.
+models and the MLX 0.31.2 C++/Metal runtime. Native model composition lives in
+`metal_qwen3` and `metal_minicpm5`, independent of the evolving multi-backend
+contract. It does not run a Python model.
 Qwen3 offers BF16 and mixed W8 selections; MiniCPM5 offers BF16 and an explicit
 DSpark drafter selection. Existing CUDA VLA families retain their own support
 scope.
@@ -34,7 +36,7 @@ export DYLD_LIBRARY_PATH="$MLX_ROOT/lib"
 export CARGO_TARGET_DIR=devlocal/apxinf-mlx/cargo-target
 cargo build --release --features mlx
 "$CARGO_TARGET_DIR/release/apxinf" generate \
-  --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
+  --model /path/to/Qwen3-0.6B --model-name metal_qwen3 --device metal --dtype bf16 \
   --model-variant bf16-compiled --greedy --max-tokens 160 \
   --chat-options '{"enable_thinking":false}' --prompt 'Explain gravity briefly.'
 ```

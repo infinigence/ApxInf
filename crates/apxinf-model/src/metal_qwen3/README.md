@@ -1,6 +1,6 @@
 # Native Qwen3 on MLX
 
-This family owns checkpoint interpretation, ordered forward computation and
+This Metal-specific module owns checkpoint interpretation, ordered forward computation and
 request KV state. It calls safe `apxinf-mlx` array operations, without Python or
 an external model provider. Initial target: Qwen/Qwen3-0.6B revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, original BF16 weights, batch one,
@@ -56,7 +56,7 @@ token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
 
-Load through `AutoModel` with `model_name=qwen3` (or checkpoint detection),
+Load through `AutoModel` with `model_name=metal_qwen3` (or checkpoint detection),
 `Device::Metal(0)`, BF16, and the desired `model_variant`. The native CLI uses:
 
 ```sh
@@ -80,7 +80,7 @@ and [LICENSE.engine-tailor](LICENSE.engine-tailor).
 Metal lifecycle/parity tests are explicit opt-in tests:
 
 ```sh
-cargo test -p apxinf-model --features mlx qwen3::model::tests -- --ignored --test-threads=1
+cargo test -p apxinf-model --features mlx metal_qwen3::model::tests -- --ignored --test-threads=1
 ```
 
 These small synthetic tests verify API/state behavior; they do not replace the
