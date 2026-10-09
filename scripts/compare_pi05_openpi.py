@@ -354,6 +354,8 @@ def run_openpi(args: argparse.Namespace) -> None:
         "torch_version": str(model.torch.__version__), "torch_cuda_version": model.torch.version.cuda,
         "float32_matmul_precision": model.torch.get_float32_matmul_precision(),
         "matmul_allow_tf32": model.torch.backends.cuda.matmul.allow_tf32,
+        "matmul_allow_bf16_reduced_precision_reduction": model.torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        "matmul_allow_fp16_reduced_precision_reduction": model.torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
         "cudnn_allow_tf32": model.torch.backends.cudnn.allow_tf32,
         "config_sha256": sha256(args.checkpoint_dir / "config.json"),
         "checkpoint_sha256": checkpoint_hash(args.checkpoint_dir),

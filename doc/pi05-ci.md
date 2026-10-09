@@ -784,3 +784,30 @@ Uniform reduction-policy and isolated softmax controls are being evaluated
 with the same whole-chunk, every-timestep and independent latency protocols.
 No candidate is accepted until the remaining precision and performance debts
 are resolved. The PR remains draft and GPU CI remains disabled.
+
+
+### Reference reduction-mode provenance
+
+Actual Orin language operands isolate a distinct source of reference sensitivity.
+With the saved first-layer normalized input, separate PyTorch Q, K and V
+projections each reproduce the saved official result bitwise for both compact
+522-row and padded 778-row matrices. Disabling PyTorch's BF16 reduced-precision
+reduction changes 221,994 Q values but leaves K/V bitwise equal to their saved
+outputs. A single packed QKV `F.linear` also differs in 221,994 values. Thus
+matching FP32 accumulation everywhere does not reproduce this reference's
+shape-dependent Q reduction. This is evidence about this layer/input; it is
+not a justification for passing an end-to-end failure.
+
+The OpenPI receipt now additionally records the actual BF16 and FP16
+reduced-precision reduction flags. These flags are recorded without changing
+the reference computation. Their receipt is covered by the reviewed reference
+file digest. A diagnostic alternative reduction mode must be saved separately;
+it must not silently replace the approved reference. The separate-language-QKV
+candidate is undergoing whole-chunk and independent performance regression.
+
+The softmax reciprocal-multiply control speeds up the Thor one-view T200
+pilot to 72.369ms but fails the unchanged floors (11/13, 11/13, 10/11), so it is
+rejected. Skipping masked exp/div work preserves all 37 prior candidate outputs
+bitwise but measures 70.685/74.450, 76.824/81.173 and 89.252/95.551ms for
+T10/T200: this is also rejected as a performance repair. No numerical control
+from these experiments has been promoted.
