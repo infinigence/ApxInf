@@ -17,11 +17,18 @@ Performance remains a separate acceptance condition. Orin's combined three-view
 control measures T10/T200 P50 298.296/300.339ms against the same-library product
 232.837/256.025ms. A Thor one-view auto-fusion control's 1,800-sample alternating
 comparison measures T200 71.057ms against bracketing product 70.703/70.616ms;
-every block reproduces the increment. It is rejected. A later cluster change
-retains all 37 precision passes and pilots at 67.419/69.230, 74.507/77.441 and
-88.499/91.404ms for one/two/three views. One-view T200 improves, but two-view T10
-still exceeds the same-library product's 73.592–73.791ms block medians. These
-pilots do not establish paired non-regression.
+every block reproduces the increment. It is rejected. A later cluster2x1,
+stage4 control retains all 37 precision passes. Its 5,400-sample comparison
+(one/two/three views, T10/T200, three product → candidate → product blocks)
+places every candidate P50 and P95 below both bracketing same-library controls.
+Candidate P50 ranges are 67.338–67.458/69.141–69.267ms, 73.461–73.497/
+77.319–77.356ms and 87.845–88.024/90.701–91.042ms for the three view counts.
+All receipts have the same four actual CUDA-library hashes and matching
+checkpoint, config and input hashes. This qualifies the measured warm controls,
+not a maintained repair. T10 first inference still increases by about 64–77ms
+on each view-count profile; one-view T200 also increases. Here `first_call_ms`
+is each shape's first inference in the resident model, not total process/model
+startup. First-call attribution and repair remain open.
 
 On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
 outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster
