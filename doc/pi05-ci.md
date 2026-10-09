@@ -953,3 +953,37 @@ black+zero and gradient+zero now pass, but white still fails and negative noise
 introduces an action-timestep failure. Two/three-view outputs remain bitwise
 equal to the preceding affine control. It is rejected, rather than promoting
 a plan on the basis of a single matching operand.
+
+
+### Orin projection isolation and attention latency source
+
+The three-view black+zero projector replay now reconstructs the official final
+vision normalization bitwise. The default biased projection (M768/N2048/K1152)
+reproduces all 359,046 differing native embedding values. A zero-workspace
+alternative matches the official embedding and measures .123ms versus .151ms
+for that operand. Replacing only this projector recipe in the private affine
+control makes all 11 three-view diagnostic chunks, including every action
+step, bitwise equal to the aligned OpenPI reference. This is diagnostic
+coverage of synthetic three-camera inputs, not real three-camera rollout
+validation. The full candidate still requires performance qualification and
+operator-contract integration before promotion.
+
+A corrected one-view white capture matches all 270 recorded vision operator
+boundaries. Its first language norm, Q/K/V and attention output also match
+bitwise. The following attention output projection is the first recorded
+mismatch (113,075 differing BF16 values, relative L2 .001444); its residual,
+post-attention norm and MLP then diverge. This explains why repairing the first
+Q/K/V projection alone did not qualify that input. It does not yet identify
+all downstream failures or establish a general projection repair.
+
+Same-library CUDA profiles of three two-view short-text calls attribute
+182.661ms in total, or 60.887ms/chunk, to the private control's classic QK/PV
+`magma_sgemmEx` kernels. The fixed product's attention kernels take about
+7.817ms/chunk in this capture. Norm/gate differences are much smaller. These
+profile totals identify the principal code cost; they are not benchmark
+budgets. A full-physical cuBLASLt replay matches all 90 saved QK and PV operands
+bitwise, with average timings .092ms and .096ms respectively. Full chunk,
+stability and performance regressions are required independently of that
+operator replay. The maintained INT8 packing repair retains its earlier
+27,000-sample paired regression result; none of these private BF16 probes has
+changed the maintained model implementation or enabled the CI gate.
