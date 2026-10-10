@@ -583,5 +583,54 @@ as capacity qualification. A separate layout/algorithm ablation passes a fully
 aligned128×1024×1024 control eagerly and in graph replay for both layouts and
 all three algorithms, but the sampled actual multirow shapes still return15.
 Neither a general M%4 explanation nor a library-wide lack of INT8 support is
-established. Fallback support diagnosis remains open; the bound explicitly
+established. A production call trace identifies the vendor patch projection as
+768×1152×588; all thirteen three-view outputs remain bitwise unchanged.
+Independent C++ eager/graph calls and a later ctypes control both execute this
+patch shape successfully. This contradicts the initial ctypes patch failure;
+initialization alone is not established as its cause. The tested language/action
+shapes still return15. Forced full-vendor support remains unqualified; the bound
 reserves every vendor accumulator and does not depend on CUTLASS selection.
+
+## Additional real-image diagnostics
+
+One official [DROID debug shard](https://github.com/droid-dataset/droid/blob/main/docs/the-droid-dataset.md)
+contains two different tasks and 404 synchronized three-camera observations.
+Per episode, the fixed selection is the initial frame, maximum observed gripper
+position, largest one-step gripper-position decrease, and final frame. These
+select eight distinct observations; the number follows the selected differences,
+not a target case count. Source JPEG/object hashes and episode/frame identities
+are retained with the frozen NPZ inputs.
+
+| Task | Episode identity | Frame indices |
+| --- | --- | --- |
+| Put the marker in the pot | RAIL / 2023-04-17 / Mon_Apr_17_14:48:05_2023 | 0, 70, 137, 165 |
+| Put the candy bar on the left side of the first shelf | RPL / 2023-06-05 / Mon_Jun__5_20:15:38_2023 | 0, 169, 179, 237 |
+
+The camera order is exterior 1, wrist, exterior 2. The third exterior camera maps
+to the canonical third model slot for shape coverage; this is not an official
+three-camera DROID policy configuration. Pinned OpenPI CPU uint8 bilinear
+resize/padding produces 224×224 RGB. Cached official SentencePiece weights and
+the unchanged text-only tokenizer method produce 8/14 valid tokens. There are
+no DROID normalization assets in the selected checkpoint: these are real-image,
+text-only direct-model fixtures, not full normalized robot observations.
+Gaussian noise is frozen per observation with seeds 5105–5112, horizon 50 and
+flow steps 10. One/two-view inputs select the first cameras of these same eight
+observations, not additional independent scenes. No held-out-from-pretraining
+or task-success claim is made.
+
+Orin's BF16 product passes 7/8, 8/8, 8/8 at one/two/three views. The one-view marker
+initial frame passes whole-chunk cosine/L2 (.999230/.045073), but fails step
+floors: worst cosine .997329, relative L2 .075504. The existing combined precision
+control is bitwise OpenPI on all 24 projections, with zero repeat/revisit drift.
+Fresh references recording Torch 2.9.1+cu130, high precision and TF32 settings are
+bitwise unchanged from initial collection. This strengthens diagnosis only:
+the control's established long-token/three-view performance regressions still
+prevent promotion, and this bank has not been approved as the production gate.
+
+A public staged GeGLU integration probe confirms another resource risk: ten
+executions sharing one action weight each retain a 16 MiB prepack (160 MiB total);
+two language executions each retain 128 MiB (256 MiB total). All outputs are exact
+and the GPU test passes. A runtime-scoped weak resource-sharing prototype is
+under lifecycle/identity validation; it is not a maintained model repair or
+whole-model performance qualification. Preparation and graph creation remain
+inside the inference timer during acceptance measurements.
