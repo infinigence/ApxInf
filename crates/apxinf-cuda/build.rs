@@ -289,14 +289,24 @@ fn main() {
             {
                 println!("cargo:warning=SM110 AOT bundle is absent; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md");
             }
-            let aot_bundle = aot_manifest.map(|path| {
-                aot::Bundle::load(
+            // A bundle may be exported for another crate's recipes: one
+            // `APXINF_CUDA_AOT_MANIFEST` feeds both CUDA crates. Carrying none
+            // of this crate's kernels means "no bundle", not a build error.
+            let aot_bundle = aot_manifest.and_then(|path| {
+                let bundle = aot::Bundle::load(
                     std::path::Path::new(&manifest_dir),
                     std::path::Path::new(&path),
                     &target,
                     nvcc_arch.as_deref().unwrap(),
                     std::path::Path::new(&nvcc),
-                )
+                );
+                if bundle.is_none() {
+                    println!(
+                        "cargo:warning=AOT bundle {} carries none of this crate's reviewed kernels; fixed BF16 operators are unavailable. See crates/apxinf-cuda/aot/README.md",
+                        path.display()
+                    );
+                }
+                bundle
             });
             let kernel_build_id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
                 computed_kernel_build_id(

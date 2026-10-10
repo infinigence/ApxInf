@@ -7,12 +7,11 @@
 //! symbol sets ever collide again, this binary fails to link — the failure
 //! mode is a build error, which is exactly where we want it.
 //!
-//! Both crates are optional dependencies and are gated separately: `cuda` pulls
-//! in `apxinf-cuda`, `cuda-new` pulls in `apxinf-cuda-new` on top of it. This
-//! binary needs both, so it must require both — gating on `cuda` alone compiles
-//! the test in a build that never links `apxinf-cuda-new`, and the first
-//! reference to it fails as an unresolved crate.
-#![cfg(all(feature = "cuda", feature = "cuda-new"))]
+//! Both crates are optional dependencies that `cuda` enables together, so
+//! gating on `cuda` is enough to have both in the link. If they are ever split
+//! back apart, the first reference here fails as an unresolved crate — again a
+//! build error, which is where we want it.
+#![cfg(feature = "cuda")]
 
 #[test]
 #[ignore = "requires a CUDA device"]

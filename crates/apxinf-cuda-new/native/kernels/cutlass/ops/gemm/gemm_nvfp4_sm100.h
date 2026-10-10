@@ -100,4 +100,14 @@ int nvfp4_quantize_swiglu(const void* src_bf16, void* dst_packed,
                           float input_scale, int row_major_scales,
                           cudaStream_t stream);
 
+// Shape-specialized CuTe DSL FC1 epilogue: NVFP4 GEMM + BF16-rounded SwiGLU
+// + NVFP4 quantization. The current AOT supports M=2048, K=5120 and
+// N(output)=17408. Inputs and metadata are device pointers.
+int nvfp4_dense_swiglu_aot(
+    const void* a, const void* b, const void* a_sf, const void* b_sf,
+    void* c, void* c_sf, const void* alpha, const void* input_global_scale,
+    const void* down_inverse_global_scale, const void* tile_groups,
+    const void* tile_limits, const void* token_map, const void* tile_count,
+    int rows, int n, int k, cudaStream_t stream);
+
 }  // namespace apxinf::cuda_new::cutlass_ops

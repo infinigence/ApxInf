@@ -13,6 +13,9 @@ nvtx = []
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 
+[build-dependencies]
+serde_json = "1"
+
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }
 # Integration tests read a real checkpoint to prove the on-disk bytes are

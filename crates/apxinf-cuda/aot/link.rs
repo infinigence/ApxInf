@@ -18,7 +18,83 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    pub fn load(crate_root: &Path, manifest: &Path, target: &str, sm: &str, nvcc: &Path) -> Self {
+    /// Load every kernel this crate reviewed from the artifact manifest.
+    ///
+    /// The required set is the full recipe list in
+    /// `<crate_root>/aot/manifest.json`, so adding a reviewed recipe cannot
+    /// silently stop linking its object.
+    ///
+    /// Returns `None` when the bundle carries none of them. One bundle may
+    /// serve several model crates, so a bundle exported for another crate's
+    /// recipes is "no bundle" here rather than an error; a bundle holding only
+    /// some of them is still rejected by `load_required`.
+    // `link.rs` is shared by two build scripts; only apxinf-cuda wants the
+    // whole-recipe form, apxinf-cuda-new requests a single kernel by id.
+    #[allow(dead_code)]
+    pub fn load(
+        crate_root: &Path,
+        manifest: &Path,
+        target: &str,
+        sm: &str,
+        nvcc: &Path,
+    ) -> Option<Self> {
+        let aot_root = crate_root.join("aot");
+        let recipes = aot_root.join("manifest.json");
+        let reviewed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&recipes).expect("read reviewed AOT recipes"))
+                .expect("parse reviewed AOT recipes");
+        let ids = reviewed["kernels"]
+            .as_array()
+            .expect("reviewed AOT kernels must be an array")
+            .iter()
+            .map(|kernel| {
+                kernel["id"]
+                    .as_str()
+                    .expect("reviewed AOT kernel id")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let required = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        Self::load_required(&aot_root, &recipes, manifest, &required, target, sm, nvcc)
+    }
+
+    /// Load the requested kernels from a shared artifact manifest.
+    ///
+    /// One AOT manifest may carry operators for several model crates.  If none
+    /// of `required` is present this consumer simply has no AOT bundle; if a
+    /// subset is present, the incomplete bundle is rejected.  Only requested
+    /// objects are returned and linked.
+    pub fn load_required(
+        aot_root: &Path,
+        recipes: &Path,
+        manifest: &Path,
+        required: &[&str],
+        target: &str,
+        sm: &str,
+        nvcc: &Path,
+    ) -> Option<Self> {
+        assert!(!required.is_empty(), "AOT required kernel list is empty");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifest).expect("read AOT manifest"))
+                .expect("parse AOT manifest");
+        let actual_kernels = actual["kernels"]
+            .as_array()
+            .expect("AOT manifest kernels must be an array");
+        let present = required
+            .iter()
+            .filter(|id| actual_kernels.iter().any(|kernel| kernel["id"] == **id))
+            .count();
+        if present == 0 {
+            return None;
+        }
+        assert_eq!(
+            present,
+            required.len(),
+            "AOT bundle contains only {present}/{} required kernels: {}",
+            required.len(),
+            required.join(", ")
+        );
         let version = Command::new(nvcc)
             .arg("--version")
             .output()
@@ -32,19 +108,23 @@ impl Bundle {
             .expect("nvcc release version");
         println!(
             "cargo:rerun-if-changed={}",
-            crate_root.join("aot/bundle.rs").display()
+            aot_root.join("bundle.rs").display()
         );
-        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rerun-if-changed={}", recipes.display());
         let result = bundle::verify(manifest, target, sm, cuda)
             .unwrap_or_else(|error| panic!("AOT bundle rejected: {error}"));
         // A valid checksum does not establish compatibility with our adapters.
         // Require the exact exported symbols and tensor contracts they consume.
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("manifest.json")).expect("AOT recipes");
-        let actual: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(manifest).expect("read AOT manifest"))
-                .expect("parse AOT manifest");
-        for recipe in expected["kernels"].as_array().unwrap() {
+            serde_json::from_slice(&std::fs::read(recipes).expect("read reviewed AOT recipes"))
+                .expect("parse reviewed AOT recipes");
+        for id in required {
+            let recipe = expected["kernels"]
+                .as_array()
+                .expect("reviewed AOT kernels must be an array")
+                .iter()
+                .find(|kernel| kernel["id"] == *id)
+                .unwrap_or_else(|| panic!("required AOT recipe {id} is missing"));
             let kernel = actual["kernels"]
                 .as_array()
                 .unwrap()
@@ -53,8 +133,8 @@ impl Bundle {
                 .unwrap_or_else(|| panic!("required AOT kernel {} is missing", recipe["id"]));
             bundle::verify_recipe(kernel, recipe)
                 .unwrap_or_else(|error| panic!("AOT bundle rejected: {error}"));
-            let exporter = crate_root
-                .join("aot/exporters")
+            let exporter = aot_root
+                .join("exporters")
                 .join(recipe["exporter"].as_str().unwrap());
             println!("cargo:rerun-if-changed={}", exporter.display());
             assert_eq!(
@@ -73,6 +153,7 @@ impl Bundle {
             .as_array()
             .expect("AOT kernels")
             .iter()
+            .filter(|kernel| required.iter().any(|id| kernel["id"].as_str() == Some(*id)))
             .map(|kernel| {
                 (
                     kernel["id"].as_str().unwrap().to_owned(),
@@ -83,11 +164,11 @@ impl Bundle {
                 )
             })
             .collect();
-        Self {
+        Some(Self {
             kernels,
             runtime: PathBuf::from(result["runtime"].as_str().unwrap()),
             fingerprint: result["fingerprint"].as_str().unwrap().to_owned(),
-        }
+        })
     }
 
     pub fn kernel(&self, id: &str) -> &Kernel {

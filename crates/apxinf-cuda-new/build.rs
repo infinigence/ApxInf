@@ -5,6 +5,8 @@ use std::process::Command;
 
 #[path = "../apxinf-cuda/build_support/nvcc_build.rs"]
 mod nvcc_build;
+#[path = "../apxinf-cuda/aot/link.rs"]
+mod aot;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
 #[path = "build_support/cuda_arch.rs"]
@@ -179,11 +181,18 @@ fn run(command: &mut Command, action: &str) {
 }
 
 fn main() {
+    // Whether the shape-specialized Qwen3.8 NVFP4 dense SwiGLU AOT object was
+    // linked into this build. Selection code reads it through
+    // `apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT`; a cfg would not cross the
+    // crate boundary, so the capability is a `pub const` instead.
+    println!("cargo:rustc-check-cfg=cfg(apxinf_qwen38_dense_swiglu_aot)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_decode)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=APXINF_CUDA_AOT_MANIFEST");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
@@ -241,7 +250,29 @@ fn main() {
         .join(", ");
     println!("cargo:warning=GEMM targets: {target_summary}");
 
-    let id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
+    let aot_manifest = env::var_os("APXINF_CUDA_AOT_MANIFEST").map(PathBuf::from);
+    let qwen38_aot = if selection.targets.iter().any(|target| target.sm() == 110) {
+        aot_manifest.as_ref().and_then(|path| {
+            let aot_root = manifest.join("../apxinf-cuda/aot");
+            aot::Bundle::load_required(
+                &aot_root,
+                &aot_root.join("qwen38.json"),
+                path,
+                &["qwen38-dense-swiglu-nvfp4"],
+                &target,
+                "sm_110",
+                &bundled_nvcc,
+            )
+        })
+    } else {
+        None
+    };
+    // Surface the capability so runtime selection is a compile-time constant.
+    if qwen38_aot.is_some() {
+        println!("cargo:rustc-cfg=apxinf_qwen38_dense_swiglu_aot");
+    }
+
+    let mut id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
         gemm_fingerprint::build_id(
             &native,
             &target,
@@ -251,6 +282,22 @@ fn main() {
                 .map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())),
         )
     });
+    // The AOT object is an external artifact: swapping bundles leaves the
+    // sources, arch and toolkit untouched, so its fingerprint has to enter the
+    // build id or the object cache serves the previously linked `.o`.
+    //
+    // `Bundle::fingerprint` is a serialized JSON document, so it carries quotes
+    // and cannot go into the build id verbatim -- the assert below rejects
+    // them. Fold it into a digest, the way `apxinf-cuda` does with the same
+    // field.
+    if let Some(bundle) = &qwen38_aot {
+        let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+        for byte in bundle.fingerprint.as_bytes() {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+        }
+        id = format!("{id}-aot-{hash:032x}");
+    }
     let attention_id = attention_fingerprint::build_id(
         &native,
         &target,
@@ -345,14 +392,22 @@ fn main() {
             ]
             .map(|source| operators.join(source)),
         );
+        if qwen38_aot.is_some() {
+            cutlass_sources.push(operators.join("gemm_nvfp4_swiglu_aot_sm100.cu"));
+        }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources
-            .push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
+    // The allocation-free FA2 decode ABI is a stub that returns
+    // APXINF_STATUS_UNSUPPORTED unless FA2 was compiled in; surface that so a
+    // dependent crate can select the fallback without a runtime failure path.
+    if has_fa2 {
+        println!("cargo:rustc-cfg=apxinf_fa2_decode");
+    }
     let mut fa2_sources = Vec::new();
     if has_fa2 {
         generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
@@ -527,6 +582,20 @@ fn main() {
             command.arg("-DAPXINF_GEMM_CUTLASS=1");
             command.arg("-DAPXINF_ATTENTION_CUTLASS=1");
         }
+        if qwen38_aot.is_some() {
+            command.arg("-DAPXINF_QWEN38_DENSE_SWIGLU_AOT=1");
+            command.arg(format!(
+                "-I{}",
+                qwen38_aot
+                    .as_ref()
+                    .unwrap()
+                    .kernel("qwen38-dense-swiglu-nvfp4")
+                    .header
+                    .parent()
+                    .unwrap()
+                    .display()
+            ));
+        }
         if has_cutlass_sm89 {
             command.arg("-DAPXINF_GEMM_CUTLASS_SM89=1");
         }
@@ -616,6 +685,10 @@ fn main() {
     }
     nvcc_build::run_parallel(jobs, workers);
 
+    if let Some(bundle) = &qwen38_aot {
+        objects.push(bundle.kernel("qwen38-dense-swiglu-nvfp4").object.clone());
+    }
+
     let archive = out.join("libapxinf_gemm_native.a");
     let _ = std::fs::remove_file(&archive);
     let mut ar = Command::new("ar");
@@ -624,6 +697,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    if let Some(bundle) = &qwen38_aot {
+        bundle.link_runtime(&out);
+    }
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

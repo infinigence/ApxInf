@@ -113,6 +113,7 @@ dependencies = [
  "apxinf-loader",
  "apxinf-tokenizer",
  "half",
+ "serde_json",
 ]
 
 [[package]]

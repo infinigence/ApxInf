@@ -262,7 +262,7 @@ where
         logprob: first.logprob,
     };
     generated.push(current);
-    on_token(current);
+    profile.run_unprofiled(|| on_token(current));
 
     for index in 1..options.max_new_tokens {
         if options.eos_token_ids.contains(&current.token_id) {
@@ -280,7 +280,7 @@ where
             logprob: sample.logprob,
         };
         generated.push(current);
-        on_token(current);
+        profile.run_unprofiled(|| on_token(current));
     }
 
     profile.finalize(prompt_tokens.len(), generated.len());
