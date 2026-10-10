@@ -1,0 +1,14 @@
+[
+  {"case_id":"boundary-p254-g1-r0","input_tokens":254,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p255-g1-r0","input_tokens":255,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p255-g2-r0","input_tokens":255,"max_tokens":2,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p256-g1-r0","input_tokens":256,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p257-g1-r0","input_tokens":257,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p258-g1-r0","input_tokens":258,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p255-g32-r0","input_tokens":255,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p256-g32-r0","input_tokens":256,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p257-g32-r0","input_tokens":257,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p511-g32-r0","input_tokens":511,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p512-g32-r0","input_tokens":512,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"boundary-p513-g32-r0","input_tokens":513,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0}
+]
