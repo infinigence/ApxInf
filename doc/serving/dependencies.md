@@ -64,6 +64,26 @@ The adapter uses the existing first-party helper `_pinned_toolchain_versions` in
 This helper is an ApxInf internal dependency, not a public upstream API.
 The manifest includes its file digest.
 
+The script comes from the existing ApxInf implementation branch.
+It is first-party project code, not an imported serving engine or a new external library.
+The worker imports its version check and strict JSON parser without invoking the script's generation command.
+The parser checks the local model configuration before model loading.
+The [startup guide](local-service-v0.1.md#build-and-start) creates the required environment and checks its pins.
+
+| Checked Python package | Exact version |
+| --- | --- |
+| `huggingface-hub` | `1.28.0` |
+| `mlx` | `0.32.1` |
+| `mlx-lm` | `0.31.3` |
+| `mlx-metal` | `0.32.1` |
+| `numpy` | `2.5.2` |
+| `safetensors` | `0.8.0` |
+| `tokenizers` | `0.22.2` |
+| `transformers` | `5.15.1` |
+
+These checks do not constitute a complete lock of transitive dependencies.
+Experiment records retain the installed package list separately from these required pins.
+
 The manifest records each model artifact path, byte count, and SHA-256 digest.
 It also records runtime versions, adapter revision, adapter digest, Python digest, and validator digest.
 The execution record includes provider, precision, prefill chunk size, output batch size, and memory limit.

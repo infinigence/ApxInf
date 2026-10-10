@@ -191,6 +191,38 @@ The [memory coverage profile](memory-coverage-v0.1.md) defines offline evidence 
 It distinguishes completed runs from reached shapes and retains missing input and output intervals.
 Neither complete planned cases nor complete shape enumeration establishes a universal memory bound.
 
+### Planned long-context support
+
+Long-context serving is a future capability goal.
+This plan does not enable a larger context profile or change an interface limit.
+The current deployment defaults to 16384 context tokens and 2048 output tokens.
+These limits do not establish measured memory coverage for every permitted request.
+The protocol ceiling does not establish a supported inference length.
+
+First complete measurements within the current deployment profile.
+Then evaluate larger context profiles against explicit quality, latency, and memory criteria.
+Each profile must retain its model, runtime, input, and observation identities.
+Exact sessions, batching, and snapshots retain their separate acceptance gates.
+
+Long-context exit checks:
+
+- Check prepared input plus reserved output below, at, and above the effective context limit.
+- Check KV capacity growth and additional prefill calls at their actual execution boundaries.
+- Exercise long input, maximum output allowance, late stopping, and context-edge requests.
+- Compare fresh-process requests with repeated requests in one process.
+- Keep early EOS targets unresolved instead of suppressing EOS to reach an allowance.
+- Check cancellation, deadlines, backpressure, settlement, and process recovery during long requests.
+- Measure production HTTP execution without additional device synchronization for memory sampling.
+- Freeze estimator scope and margins before independent input validation.
+- Check model quality and client context metadata before publishing a larger capability profile.
+- Check mixed short and long workloads when a future batch adapter passes its own correctness gate.
+
+The [memory evidence plan](memory-evidence-plan-20261010.md) defines the current measurement sequence.
+The [production validation profile](production-memory-validation-v0.1.md) defines the separate production evidence boundary.
+Neither document approves a memory budget or promises a larger supported context size.
+
+### Remaining P1 checks
+
 P1b exit checks:
 
 - Define the exact append profile before implementation.

@@ -66,6 +66,78 @@ Loss counters exclude unread stderr bytes and records without final accounting w
 
 ## Build and start
 
+Run the following commands from the repository root on an Apple Silicon Mac.
+The worker requires the exact interpreter and package versions below.
+The `.apxinf/toolchains/` environment is a local dependency directory, not a checked-in runtime.
+Create it before using the startup command.
+
+1. Install Python 3.14.3 with the macOS installer from the [official release page](https://www.python.org/downloads/release/python-3143/).
+2. Set `APXINF_PYTHON` to that installation's Python executable.
+3. Check its version before creating the environment.
+
+```sh
+APXINF_PYTHON=/absolute/path/to/python3.14
+"$APXINF_PYTHON" - <<'PY'
+import platform
+import sys
+
+if platform.python_version() != "3.14.3" or platform.machine() != "arm64":
+    sys.exit("Use Python 3.14.3 running as arm64.")
+PY
+```
+
+Create the environment with copied interpreter files:
+
+```sh
+mkdir -p .apxinf/toolchains
+"$APXINF_PYTHON" -m venv --copies .apxinf/toolchains/mlx-lm-0.31.3-copies
+```
+
+Install all eight package pins in that environment:
+
+```sh
+.apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python -m pip install \
+  huggingface-hub==1.28.0 \
+  mlx==0.32.1 \
+  mlx-lm==0.31.3 \
+  mlx-metal==0.32.1 \
+  numpy==2.5.2 \
+  safetensors==0.8.0 \
+  tokenizers==0.22.2 \
+  transformers==5.15.1
+.apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python -m pip check
+```
+
+Check the versions with the same first-party helper that the worker uses:
+
+```sh
+.apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python - <<'PY'
+import importlib.util
+import json
+
+spec = importlib.util.spec_from_file_location("apxinf_runtime_pins", "scripts/apxinf_mlx_generate.py")
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+print(json.dumps(helper._pinned_toolchain_versions(), indent=2, sort_keys=True))
+PY
+```
+
+This check reads package metadata without loading a model.
+The [dependency record](dependencies.md#python-worker) describes the helper and public runtime APIs.
+These eight pins do not lock every transitive dependency.
+Retain an installed-package record with each experiment.
+
+Store task logs and benchmark results under `devlocal/serving-upstream/`.
+Use a new subdirectory for each run to preserve earlier evidence.
+Keep the managed Python environment in `.apxinf/toolchains/`.
+
+```sh
+mkdir -p devlocal/serving-upstream
+APXINF_RUN_DIR="$(mktemp -d "$PWD/devlocal/serving-upstream/run-XXXXXX")"
+.apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python -m pip freeze \
+  > "$APXINF_RUN_DIR/python-packages.txt"
+```
+
 Build the new binary:
 
 ```sh
