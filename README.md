@@ -38,6 +38,21 @@ python scripts/bench_pi05.py --random-weights --model-variant fp8_static --layer
 Reported latency is P50 over 30 samples after 10 warm-up iterations
 (`--warmup` / `--samples`).
 
+### Local HTTP serving on macOS
+
+The separate `apxinf-serve` binary exposes local text generation through
+Anthropic Messages and OpenAI Chat Completions.
+It supports SSE output, client tools, cancellation, a bounded queue, and metrics.
+One MLX worker executes one request at a time.
+
+Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
+environment, deployment limits, and supported API fields.
+Read the [validation report](doc/serving/serving-validation-20261009.md) for
+Qwen3.5-2B measurements and actual Claude Code tasks.
+The [system design](doc/serving-system-design-20261009.md) defines the broader
+framework and staged extensions.
+This HTTP profile does not expose images, sessions, prefix reuse, or continuous batching.
+
 ### Run a policy through Python API
 
 ```python
