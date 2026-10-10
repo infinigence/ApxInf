@@ -4,6 +4,8 @@
 
 本方案以 Mac 本地 LLM／VLM 与编程 Agent 为优先场景，保留 CUDA／Jetson 和 PI0.5 的扩展边界。初始审计基线为 ApxInf `df5c55a06140107b24964d9e4abbefd9fa2a4733`。现状表描述该基线；外部机制依据官方文档与源码；后文的架构、阶段和验收条件属于设计建议。后续首个实现子集、已有本地模型实测和 Claude Code 结果见[实现与验证报告](serving/serving-validation-20261009.md)，不将这些结果扩展到尚未实现的路线。
 
+该审计基线属于 `qhy991/ApxInf` 的历史 fork，不代表本次 PR 所基于的上游能力。旧 MLX 服务、会话缓存和原生 Qwen3.5 状态文件没有随本次 Serving 变更移植；相关依据链接固定到保存这些文件的历史提交 `7cee272c0d3d6c70af63d3376be0713c7c565e31`。
+
 2026-10-09 补充约束：允许参考其他仓库，但新增实现、测试和 fixtures 必须独立手写。不得复制、翻译、移植或改名套用外部代码。现有依赖的公开 API 调用可以保留，并记录依赖边界。已安装的 ASD-STE100 技能属于个人文档工具，不进入 ApxInf 运行时。
 
 后续设计以[设计入口](serving/README.md)、[英文接口规范](serving/contracts-v0.1.md)和[实施计划](serving/implementation-plan.md)为配套文档。接口规范使用 ASD-STE100 Issue 9 的写作原则，并作为新 serving 接口的语义依据。本文件用于中文说明和调研，不声称符合 STE 英文标准。接口示意如与规范冲突，以规范为准。先确定完整框架与首个接口子集，再逐步编写实现，不一次性生成全部模块骨架。
@@ -14,7 +16,7 @@ Serving 的目标应是：编程 Agent 连续多轮运行时，首 token 等待�
 
 ## 一 现状与真正需要补齐的能力
 
-| 领域 | ApxInf 当前已实现 | Serving 缺口 |
+| 领域 | 审计基线已实现 | Serving 缺口 |
 | --- | --- | --- |
 | 模型加载 | `AutoModel`、注册表、`LoadedModel::Text/Vla` | 部署模型目录、别名、版本、驻留生命周期和资源预算 |
 | 原生文本生成 | `LlmTrait` 同步 greedy 生成、token callback、CUDA graph 路径及显式 Metal 实验路径 | 请求状态与权重分离、协作取消、多请求执行接口 |
@@ -28,8 +30,8 @@ Serving 的目标应是：编程 Agent 连续多轮运行时，首 token 等待�
 主要代码证据：
 
 - [统一模型入口](../crates/apxinf-model/src/auto.rs)、[模型注册](../crates/apxinf-model/src/builtin.rs)、[生成接口](../crates/apxinf-model/src/llm_trait.rs)。原生 Qwen3.5 loader 仍限定 CPU/Accelerate，并提供显式 Metal W8 路径，不能将其描述为通用全模型 Metal backend。
-- [MLX Rust 进程边界](../src/mlx_service.rs)、[JSONL CLI](../src/mlx_service_cli.rs)、[Python worker](../scripts/apxinf_mlx_serve.py)。`mlx-serve` 明确不监听网络，worker 完成整段生成后才返回结果。
-- [会话缓存契约](20260823-qwen35-macos-bringup/mlx-session-prefix-cache-20260824.md)、[混合状态](../crates/apxinf-model/src/qwen35/state.rs)、[基础 KV 接口](../crates/apxinf-core/src/kv_cache.rs)。现有 KV 接口没有通用 snapshot／fork／restore。
+- [MLX Rust 进程边界](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/src/mlx_service.rs)、[JSONL CLI](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/src/mlx_service_cli.rs)、[Python worker](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/scripts/apxinf_mlx_serve.py)。`mlx-serve` 明确不监听网络，worker 完成整段生成后才返回结果。
+- [会话缓存契约](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/doc/20260823-qwen35-macos-bringup/mlx-session-prefix-cache-20260824.md)、[混合状态](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/crates/apxinf-model/src/qwen35/state.rs)、[基础 KV 接口](../crates/apxinf-core/src/kv_cache.rs)。现有 KV 接口没有通用 snapshot／fork／restore。
 - [Tokenizer](../crates/apxinf-tokenizer/src/lib.rs) 的消息类型只有 `role` 与字符串 `content`；[OpenPI transport](../python/apxinf/apxinf/serving/websocket.py) 已直接调用 policy，不是旧 TODO 中的逐请求 binary subprocess。
 
 有四项现状会决定设计顺序。
@@ -63,7 +65,7 @@ oMLX 将 API、模型驻留、每模型执行、缓存和内存治理串成一�
 
 oMLX 的分块缓存管理也不能直接等同于 vLLM 的 kernel-native PagedAttention。所查普通 prefix restore 路径会从 hot／SSD 读取 blocks、拼接张量，再重建 MLX cache 对象。持久化／前缀索引的 block、执行时张量布局和 attention kernel 的分页寻址是三个接口；block 元数据共享不保证执行期间 KV 零拷贝共享。ApxInf 可以先获得前两项收益，后续再决定是否改原生 attention 内核。参考 [cache 重建](https://github.com/jundot/omlx/blob/cc1fdc9a24053224521a8dc6e1350d64e8ec16f4/omlx/cache/prefix_cache.py#L3162)。
 
-当前所查 oMLX commit 的 `pyproject.toml` 要求 Python `<3.14`、MLX `0.32.3`，并固定另一个 MLX-LM git revision；ApxInf 边界则固定 Python `3.14.3`、MLX `0.32.1`、MLX-LM `0.31.3`。因此借鉴机制，并通过公开 API 调用现有依赖，不复制其实现；任何运行时升级都单独走版本和模型质量验证。参考 [oMLX 依赖](https://github.com/jundot/omlx/blob/cc1fdc9a24053224521a8dc6e1350d64e8ec16f4/pyproject.toml) 与 [ApxInf 固定版本](../src/mlx_service.rs)。
+当前所查 oMLX commit 的 `pyproject.toml` 要求 Python `<3.14`、MLX `0.32.3`，并固定另一个 MLX-LM git revision；ApxInf 边界则固定 Python `3.14.3`、MLX `0.32.1`、MLX-LM `0.31.3`。因此借鉴机制，并通过公开 API 调用现有依赖，不复制其实现；任何运行时升级都单独走版本和模型质量验证。参考 [oMLX 依赖](https://github.com/jundot/omlx/blob/cc1fdc9a24053224521a8dc6e1350d64e8ec16f4/pyproject.toml) 与 [ApxInf 历史固定版本](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/src/mlx_service.rs)。
 
 ### MLX 批处理应从已锁定版本核对
 
@@ -266,7 +268,7 @@ batch 相容性至少涉及同一模型实例、执行精度、cache 类型以�
 
 ### Qwen3.5 的特殊约束
 
-当前 0.8B 路径同时包含 6 层 full-attention KV，以及 18 层线性注意力的 convolution history 和 Gated DeltaNet recurrent matrix。可复用前缀长度必须是**所有状态组件共同可恢复的位置**。[本地状态定义](../crates/apxinf-model/src/qwen35/state.rs)
+审计基线的 0.8B 路径同时包含 6 层 full-attention KV，以及 18 层线性注意力的 convolution history 和 Gated DeltaNet recurrent matrix。可复用前缀长度必须是**所有状态组件共同可恢复的位置**。[历史状态定义](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/crates/apxinf-model/src/qwen35/state.rs)
 
 oMLX 对 `ArraysCache` 使用非切片状态处理，并在不存在精确 recurrent checkpoint 时回退到更早的有效边界。特别是结束位置 1030、块边界 1024 的情况，不能把结束时的 live GDN state 标记为 1024 快照。MLX-LM v0.31.3 某些状态对象的 `size()` 也不能代表已消费 token 数，逻辑位置应由 adapter 的 checkpoint metadata 维护。参考 [oMLX 状态处理](https://github.com/jundot/omlx/blob/cc1fdc9a24053224521a8dc6e1350d64e8ec16f4/omlx/cache/type_handlers.py#L845)、[精确边界约束](https://github.com/jundot/omlx/blob/cc1fdc9a24053224521a8dc6e1350d64e8ec16f4/omlx/cache/prefix_cache.py#L2371)、[固定版本 cache](https://github.com/ml-explore/mlx-lm/blob/ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd/mlx_lm/models/cache.py#L146)。
 
@@ -278,7 +280,7 @@ oMLX 对 `ArraysCache` 使用非切片状态处理，并在不存在精确 recur
 
 ### 已输出 token 不等于已消费 token
 
-现有原生循环输出 N 个 token 后，通常只消费了 `prompt_len + N - 1` 个输入，最后输出 token 尚待下一次 forward；现有固定 MLX `generate_step` 路径在 yield 前已消费该 token，同步后状态达到 `prompt_len + N`。将两者统一成一个“cache token count”会引入重复消费或漏消费。[原生循环](../crates/apxinf-model/src/llm_trait.rs)、[MLX 位置契约](20260823-qwen35-macos-bringup/mlx-session-prefix-cache-20260824.md)
+现有原生循环输出 N 个 token 后，通常只消费了 `prompt_len + N - 1` 个输入，最后输出 token 尚待下一次 forward；现有固定 MLX `generate_step` 路径在 yield 前已消费该 token，同步后状态达到 `prompt_len + N`。将两者统一成一个“cache token count”会引入重复消费或漏消费。[原生循环](../crates/apxinf-model/src/llm_trait.rs)、[MLX 历史位置契约](https://github.com/qhy991/ApxInf/blob/7cee272c0d3d6c70af63d3376be0713c7c565e31/doc/20260823-qwen35-macos-bringup/mlx-session-prefix-cache-20260824.md)
 
 每个 adapter 必须拥有 opaque `ResumeCapsule`，对外至少报告：已消费位置、完整历史身份、schema、兼容 profile、内存大小；内部保存 pending input／next logits 或可重建它们的办法、cache tensors、RNG 和必要控制状态。只有完成相应设备同步的 capsule 才可提交为可恢复状态。
 
