@@ -627,10 +627,36 @@ bitwise unchanged from initial collection. This strengthens diagnosis only:
 the control's established long-token/three-view performance regressions still
 prevent promotion, and this bank has not been approved as the production gate.
 
-A public staged GeGLU integration probe confirms another resource risk: ten
-executions sharing one action weight each retain a 16 MiB prepack (160 MiB total);
-two language executions each retain 128 MiB (256 MiB total). All outputs are exact
-and the GPU test passes. A runtime-scoped weak resource-sharing prototype is
-under lifecycle/identity validation; it is not a maintained model repair or
-whole-model performance qualification. Preparation and graph creation remain
-inside the inference timer during acceptance measurements.
+Fresh same-board Thor references add the following results on those eight
+observations projected to each view count. The unchanged limits apply to the
+complete chunk and every action step; passing the chunk average alone is not
+sufficient.
+
+| Board and precision | 1 view | 2 views | 3 views |
+| --- | --- | --- | --- |
+| Thor product BF16 | 6/8 | 8/8 | 8/8 |
+| Thor private BF16 control | 8/8 | 8/8 | 8/8 |
+| Thor product FP8, existing calibration | 0/8 | 4/8 | 4/8 |
+| Orin product BF16 | 7/8 | 8/8 | 8/8 |
+| Orin private BF16 control | 8/8 | 8/8 | 8/8 |
+| Orin maintained INT8 reservation repair | 0/8 | 6/8 | 4/8 |
+
+Both private BF16 controls are bitwise official on all 24 projections.
+All measured repeat/revisit drifts are zero. Quantized failures remain red:
+these results do not isolate quantization from every other arithmetic boundary,
+justify a threshold change, or qualify performance on the new observations.
+The Orin BF16 control remains rejected for its established performance regression.
+
+A public staged GeGLU probe measures a resource risk: ten executions sharing one
+action weight separately allocate ten 16 MiB prepacks (160 MiB); two language
+executions allocate two 128 MiB prepacks (256 MiB). A runtime-scoped weak sharing
+prototype reduces these physical allocations to one 16 MiB and one 128 MiB pack,
+respectively. The same immutable test binary passes three numerical/graph tests
+and two resource/identity tests, including changed versions, distinct sources,
+owner release and reprepare. Summing each execution's referenced bytes after
+sharing would double-count the shared allocation.
+
+This remains a private operator prototype. Public full-model integration and
+paired first-call/warm measurements are pending on both boards; operator tests
+and prepare timings do not qualify model performance. Preparation and graph
+creation remain inside the inference timer during acceptance measurements.
