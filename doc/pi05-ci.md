@@ -74,6 +74,28 @@ one/two/three views. Against the same-library product 170.457/149.806,
 258.658/202.283 and 232.837/256.025ms, long-token and three-view cases still
 regress. These controls are rejected as complete performance repairs.
 
+A later Orin GeGLU scheduling control (128x256x64, three stages, CTA
+swizzle one) retains the Q workspace correction and compact ordered attention.
+Fresh same-board official references yield all 43 chunk/step passes: 15/15,
+15/15, 13/13; 35 outputs are bitwise official, repeats/revisits have zero drift.
+T10/T200 warm P50 pilots are 137.485/166.423, 213.560/230.665,
+291.934/293.732ms. First calls are 896.637/973.946, 1222.294/1301.447,
+1591.092/1705.064ms. Long-token and three-view regressions remain against the
+products above. The operator improvement does not qualify the complete repair.
+
+A Thor native-reduction auxiliary control reproduces 80 actual GEMV operands
+and 11 SM100 FP32 Tensor Core projections bitwise. All 43 chunk/step checks
+pass, with zero repeat/revisit drift. Its 5,400 paired warm samples have every
+P50/P95 below both bracketing products, but 11/18 shape-first groups exceed
+both controls. This candidate remains unaccepted.
+
+A following bias/SiLU fusion reproduces 111 actual auxiliary operands bitwise
+and leaves all 43 complete outputs bitwise unchanged from that control. All
+43 chunk/step checks pass. Warm P50 pilots T10/T200 are 67.085/68.736,
+73.194/77.193, 87.342/90.370ms; first calls are 268.869/276.102,
+295.920/333.587, 335.984/429.250ms. A new paired run is in progress; these
+pilots do not establish first-call acceptance or a maintained repair.
+
 On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
 outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster
 padded Tensor Core recipes fail complete-chunk or per-step checks. Exact tiled
@@ -486,8 +508,33 @@ range from -0.286% to +0.469%. Two Thor FP8 input profiles initially had non-ove
 A further 3,600-sample **after -> before -> after** run on FP8 2/3 views
 produces overlapping block intervals throughout; 3-view T10 changes sign.
 Fixed/original P50/P95 differences in that run range from -0.064% to +0.180%.
-Together, 27,000 retained paired samples show no reproducible regression beyond
+Together, 27,000 retained paired **warm** samples show no reproducible regression beyond
 measured process variation on the selected inputs. They do not prove identical
 latency or supply an approved performance budget.
 Longest text is not necessarily slowest: Orin 2-view BF16 T10 is slower than
 T200. These two inputs do not constitute worst-case performance coverage.
+
+The prior INT8 regression receipt did not separately retain first-call latency.
+A targeted cold comparison completed: real LIBERO 2-view state/text and
+base 1/2/3-view T10/T200, three independent before -> after -> before blocks,
+36 fresh model processes and 72 shape-first measurements. It reuses the same
+frozen inputs, checkpoints, bundled libraries and `bench_pi05.py` timer. Zero
+warmups and one subsequent sample are used here; that single sample is not
+warm-performance qualification. All input/checkpoint/configuration and loaded-library digests match across
+paired blocks. First-call acceptance remains pending because timing concerns
+require further causal controls.
+
+The cold run reproduces a base 2-view T10 concern in all three
+independent blocks: before/after/before first calls are 1216.89/1273.10/1229.94ms
+1015.93/1245.23/980.34ms and 1018.86/1161.21/972.57ms. Do not extend the warm-performance conclusion
+to cold inference. Before/after extension `.nv_fatbin` contents have identical
+SHA256 and byte size; no differing CUDA kernel body is established by this
+binary comparison. A same-runtime first-call profile measures 1202.034ms before and 1253.163ms
+after. Both have 1566 allocations, 1191 frees and 7632 kernel launches. About
+36.8ms of the 51.1ms wall-time gap occurs in one allocation; graph instance
+creation differs by about .25ms. Memory tracing identifies the reservation as
+8,304,121,344 bytes in both builds. A reversed profiled pair changes the sign
+of its allocation-time difference (742.3ms after versus 768.6ms before), so the
+profile does not establish a repair-specific allocation cost. Reversed
+unprofiled controls and actual arena-usage measurement are still required.
+This remains an open repair/performance qualification item.
