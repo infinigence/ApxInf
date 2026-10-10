@@ -87,7 +87,17 @@ pi05/
 
 Create the new model's own directory and equivalent responsibilities. Do not
 place its state encoder, action decoder, denoising schedule, embodiment logic,
-or workspace inside `pi05/`. Inspect or copy PI0.5's model/Blocks and runner
+or workspace inside `pi05/`.
+
+SmolVLA is the current compact BF16-default example of that split (with an
+optional FP16 GEMM variant for Xavier tensor cores):
+`crates/apxinf-model/src/smolvla/` owns the SigLIP/VLM/expert forward path and
+flow schedule; `python/apxinf/apxinf/policies/impls/smolvla.py` owns the native
+HF tokenizer, state/action normalization, two-camera resize-with-padding, and
+action unnormalization. Its maintained latency and LIBERO entry points are
+`scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
+
+Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
 forward order. A family with one implementation needs neither `ModelVariant`

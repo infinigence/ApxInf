@@ -105,9 +105,14 @@ impl Tokenizer {
 
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        self.encode_with_special_tokens(text, false)
+    }
+
+    /// Encode text, optionally applying the tokenizer's post-processor.
+    pub fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode(text, add_special_tokens)
             .map_err(|e| Error::Other(format!("tokenizer encode: {e}")))?;
         Ok(encoding.get_ids().to_vec())
     }

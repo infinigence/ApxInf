@@ -5,10 +5,35 @@
 //! resource lifetime, binding rule, or capture behavior not already covered by
 //! the shared framework tests.
 
-use super::framework::{tensor, values};
+use super::framework::{f16_tensor, tensor, values};
 use super::*;
 use crate::CudaContext;
 use half::bf16;
+
+#[test]
+fn quantization_rejects_packed_fp4_input() {
+    use super::framework::zeros_tensor;
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let input = zeros_tensor(0, vec![1, 16], DType::E2M1Pair);
+    for (semantic, dtype) in [
+        (QuantizationSemantic::FixedScaleE4m3, DType::F8E4M3),
+        (QuantizationSemantic::RowwiseE4m3, DType::F8E4M3),
+        (QuantizationSemantic::CastF16ToBf16, DType::BF16),
+        (QuantizationSemantic::SliceColumnsBf16, DType::BF16),
+        (QuantizationSemantic::RowwiseI8, DType::I8),
+    ] {
+        let mut output = zeros_tensor(0, vec![1, 16], dtype);
+        let error = quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("requires F16 or BF16")
+                || error.to_string().contains("dtype disagrees"),
+            "{semantic:?}: {error}"
+        );
+    }
+}
 
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
@@ -240,6 +265,80 @@ fn gemm_bias_has_its_own_semantic_api() {
     let expected = [3.5, 2.5, 4.0, 2.0, 3.5, 2.5, 4.0, 2.0];
     for (actual, expected) in values(&out).iter().zip(expected) {
         assert!((*actual - expected).abs() < 0.01);
+    }
+}
+
+#[test]
+fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, tokens, heads, head_dim) = (2, 256, 16, 72);
+    let elements = batch * tokens * heads * head_dim;
+    let mut packed_values = Vec::with_capacity(3 * elements);
+    let mut expected = Vec::with_capacity(elements);
+    for batch_index in 0..batch {
+        for token in 0..tokens {
+            for plane in 0..3 {
+                for head in 0..heads {
+                    for dimension in 0..head_dim {
+                        packed_values.push(match plane {
+                            0 => 0.25,
+                            1 => 0.5,
+                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32
+                                / 32.0,
+                        });
+                    }
+                }
+            }
+            for head in 0..heads {
+                for dimension in 0..head_dim {
+                    expected.push(
+                        ((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0,
+                    );
+                }
+            }
+        }
+    }
+    let qkv = f16_tensor(0, vec![batch, tokens, 3, heads, head_dim], &packed_values);
+    let mut out = f16_tensor(0, vec![batch, tokens, heads, head_dim], &vec![0.0; elements]);
+    let normalized = super::attention_contracts::normalize_packed_qkv(
+        &ctx,
+        PackedQkvAttentionArgs::new(&qkv, &mut out),
+    )
+    .unwrap();
+    assert!(normalized.bindings.decode_meta.is_null());
+    assert_eq!(normalized.spec.dynamic_decode, 0);
+    assert!(normalized.resources.is_empty());
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    prepare_with_session(&session, || {
+        let mut args = PackedQkvAttentionArgs::new(&qkv, &mut out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        packed_qkv_attention(&ctx, args)
+    })
+    .unwrap();
+    let eager = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+    for (actual, reference) in eager.iter().zip(&expected) {
+        assert!((actual - reference).abs() < 0.002, "{actual} != {reference}");
+    }
+    let graph = crate::capture(&ctx, || {
+        with_session(&session, || {
+            let mut args = PackedQkvAttentionArgs::new(&qkv, &mut out);
+            args.policy.online_tune = false;
+            args.policy.cache_dir = Some(String::new());
+            packed_qkv_attention(&ctx, args)
+        })
+    })
+    .unwrap();
+    let sentinel: Vec<_> = (0..elements)
+        .flat_map(|_| half::f16::from_f32(-123.0).to_bits().to_ne_bytes())
+        .collect();
+    let output = crate::CudaBuffer::from_tensor(&out).unwrap();
+    for _ in 0..2 {
+        output.copy_from_host(&sentinel).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let replayed = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+        assert_eq!(replayed, eager);
     }
 }
 

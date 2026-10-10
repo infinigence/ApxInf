@@ -13,6 +13,16 @@
 #include <cstring>
 #include <limits>
 
+// CUDA 11.8 on pre-Ampere boards does not provide this BF16 conversion helper.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ float2 __bfloat1622float2(__nv_bfloat162 value) {
+    return make_float2(__bfloat162float(value.x), __bfloat162float(value.y));
+}
+// The only use in this translation unit constructs the bit pattern for zero.
+#define __ushort_as_bfloat16(value) \
+    __float2bfloat16(static_cast<float>(value))
+#endif
+
 // BF16 SiLU intermediate rounding matches unfused activation-then-multiply.
 
 namespace {
@@ -32,7 +42,9 @@ namespace {
 #include "../kernels/custom/cache.cuh"
 #include "../kernels/custom/linear_attention.cuh"
 #include "../kernels/custom/gdn_raw_inverse_f1.cuh"
+#ifndef APXINF_GDN_WMMA_UNSUPPORTED
 #include "../kernels/custom/gdn_chunk_state_wmma.cuh"
+#endif
 #include "../kernels/custom/gdn_chunk_gemm_tri.cuh"
 }  // namespace
 
@@ -423,16 +435,85 @@ __global__ void row_softmax_f32_bf16_kernel(
   }
 }
 
+__global__ void row_softmax_f32_bf16_rows2_kernel(
+    const float* input, __nv_bfloat16* output, uint32_t cols, uint32_t rows);
+
 extern "C" cudaError_t apxinf_static_row_softmax_f32_bf16(
     const void* input, void* output, uint32_t cols, uint32_t rows,
     cudaStream_t stream) {
   if (input == nullptr || output == nullptr || cols == 0 || rows == 0) {
     return cudaErrorInvalidValue;
   }
+  if (cols == 1024 && rows % 2 == 0) {
+    row_softmax_f32_bf16_rows2_kernel<<<rows / 2, 512, 0, stream>>>(
+        static_cast<const float*>(input),
+        static_cast<__nv_bfloat16*>(output), cols, rows);
+    return cudaGetLastError();
+  }
   row_softmax_f32_bf16_kernel<<<rows, 256, 0, stream>>>(
       static_cast<const float*>(input), static_cast<__nv_bfloat16*>(output),
       cols, rows);
   return cudaGetLastError();
+}
+
+__global__ void row_softmax_f32_bf16_rows2_kernel(
+    const float* input, __nv_bfloat16* output, uint32_t cols,
+    uint32_t rows) {
+  constexpr uint32_t row_threads = 256;
+  constexpr uint32_t rows_per_block = 2;
+  const uint32_t group = threadIdx.x / row_threads;
+  const uint32_t row = blockIdx.x * rows_per_block + group;
+  if (row >= rows) return;
+  const uint32_t tid = threadIdx.x % row_threads;
+  const uint32_t lane = tid & 31;
+  const uint32_t warp = tid >> 5;
+  const float* x = input + static_cast<size_t>(row) * cols;
+  __shared__ float scratch[rows_per_block][32];
+
+  float values[4];
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    values[j] = __ldg(&x[tid + j * row_threads]);
+  }
+
+  float local = -INFINITY;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    local = fmaxf(local, values[j]);
+  }
+  local = warp_max(local);
+  if (lane == 0) scratch[group][warp] = local;
+  __syncthreads();
+  if (warp == 0) {
+    local = lane < row_threads / 32 ? scratch[group][lane] : -INFINITY;
+    local = warp_max(local);
+    if (lane == 0) scratch[group][0] = local;
+  }
+  __syncthreads();
+  const float max_val = scratch[group][0];
+
+  float partial = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    partial += expf(values[j] - max_val);
+  }
+  partial = warp_sum(partial);
+  if (lane == 0) scratch[group][warp] = partial;
+  __syncthreads();
+  if (warp == 0) {
+    partial = lane < row_threads / 32 ? scratch[group][lane] : 0.0f;
+    partial = warp_sum(partial);
+    if (lane == 0) scratch[group][0] = partial;
+  }
+  __syncthreads();
+  const float sum = scratch[group][0];
+
+  __nv_bfloat16* y = output + static_cast<size_t>(row) * cols;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    y[tid + j * row_threads] =
+        __float2bfloat16(expf(values[j] - max_val) / sum);
+  }
 }
 
 // FIX (implement_final_r20): Option A budget repair for the composed hdim256 text
@@ -488,11 +569,39 @@ extern "C" cudaError_t apxinf_static_cast_f16_bf16(
     const void* input, void* output, int64_t count, cudaStream_t stream) {
   if (input == nullptr || output == nullptr || count <= 0)
     return cudaErrorInvalidValue;
-  int blocks = static_cast<int>((count + 255) / 256);
+  const bool vectorized =
+      (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
+      (reinterpret_cast<uintptr_t>(output) & 15) == 0;
+  const int64_t elements_per_thread = vectorized ? 8 : 1;
+  int blocks = static_cast<int>(
+      (count + elements_per_thread * 256 - 1) /
+      (elements_per_thread * 256));
   blocks = blocks > 4096 ? 4096 : blocks;
-  cast_f16_bf16_kernel<<<blocks, 256, 0, stream>>>(
+  auto kernel = vectorized ? cast_f16_bf16_vec8_kernel
+                            : cast_f16_bf16_kernel;
+  kernel<<<blocks, 256, 0, stream>>>(
       static_cast<const half*>(input),
       static_cast<__nv_bfloat16*>(output), count);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_cast_bf16_f16(
+    const void* input, void* output, int64_t count, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || count <= 0)
+    return cudaErrorInvalidValue;
+  const bool vectorized =
+      (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
+      (reinterpret_cast<uintptr_t>(output) & 15) == 0;
+  const int64_t elements_per_thread = vectorized ? 8 : 1;
+  int blocks = static_cast<int>(
+      (count + elements_per_thread * 256 - 1) /
+      (elements_per_thread * 256));
+  blocks = blocks > 4096 ? 4096 : blocks;
+  auto kernel = vectorized ? cast_bf16_f16_vec8_kernel
+                            : cast_bf16_f16_kernel;
+  kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<half*>(output), count);
   return cudaGetLastError();
 }
 
@@ -1352,6 +1461,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
   // scan on the prefill path was already rounded to BF16 by its producer, so
   // the one pass is exact here; on Thor it takes the fixed cost from 1.4623 to
   // 1.1909 s.
+#ifndef APXINF_GDN_WMMA_UNSUPPORTED
   if (policy->chunk_state_wmma != APXINF_GDN_WMMA_OFF && head_k_dim == 128 &&
       head_v_dim == 128 && chunk_size == 64) {
     // Leading dimensions are padded by 8 elements so the sixteen rows of a wmma
@@ -1390,6 +1500,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_f32(
             seq_pad, total_chunks, out_row_width, chunk_scale);
     return cudaGetLastError();
   }
+#endif
 
   const int tile = policy->chunk_state_tile;
   cudaError_t launched = cudaErrorInvalidValue;
@@ -1900,6 +2011,9 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_qk_bf16(
       num_v_heads <= 0 || head_k_dim != 128 || head_v_dim != 128 ||
       chunk_size != 64 || out_row_width != num_v_heads * 128)
     return cudaErrorInvalidValue;
+#ifdef APXINF_GDN_WMMA_UNSUPPORTED
+  return cudaErrorNotSupported;
+#else
   constexpr int KP = 136, VP = 136;
   constexpr size_t smem =
       static_cast<size_t>(128 * VP + 2 * 64 * KP + 64 * VP) *
@@ -1930,6 +2044,7 @@ extern "C" cudaError_t apxinf_static_gdn_chunk_state_qk_bf16(
           static_cast<float*>(state), static_cast<__nv_bfloat16*>(out),
           seq, seq_pad, total_chunks, out_row_width, scale);
   return cudaGetLastError();
+#endif
 }
 
 extern "C" cudaError_t apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(

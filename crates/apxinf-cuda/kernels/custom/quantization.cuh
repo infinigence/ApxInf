@@ -416,6 +416,60 @@ __global__ void cast_f16_bf16_kernel(
   }
 }
 
+__global__ void cast_f16_bf16_vec8_kernel(
+    const half* input, __nv_bfloat16* output, int64_t count) {
+  const int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+  const int64_t stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x * 8;
+  for (int64_t offset = base; offset + 8 <= count; offset += stride) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(input + offset);
+    const half2* pairs = reinterpret_cast<const half2*>(&packed);
+    __nv_bfloat162 converted[4];
+    for (int index = 0; index < 4; ++index) {
+      converted[index] = __floats2bfloat162_rn(
+          __low2float(pairs[index]), __high2float(pairs[index]));
+    }
+    *reinterpret_cast<uint4*>(output + offset) =
+        *reinterpret_cast<const uint4*>(converted);
+  }
+  for (int64_t index = base; index < count; index += stride) {
+    output[index] = __float2bfloat16(__half2float(input[index]));
+  }
+}
+
+__global__ void cast_bf16_f16_kernel(
+    const __nv_bfloat16* input, half* output, int64_t count) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    output[index] = __float2half(__bfloat162float(input[index]));
+  }
+}
+
+__global__ void cast_bf16_f16_vec8_kernel(
+    const __nv_bfloat16* input, half* output, int64_t count) {
+  const int64_t base =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 8;
+  const int64_t stride =
+      static_cast<int64_t>(blockDim.x) * gridDim.x * 8;
+  for (int64_t offset = base; offset + 8 <= count; offset += stride) {
+    const uint4 packed = *reinterpret_cast<const uint4*>(input + offset);
+    const __nv_bfloat162* pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&packed);
+    half2 converted[4];
+    for (int index = 0; index < 4; ++index) {
+      converted[index] = __floats2half2_rn(
+          __low2float(pairs[index]), __high2float(pairs[index]));
+    }
+    *reinterpret_cast<uint4*>(output + offset) =
+        *reinterpret_cast<const uint4*>(converted);
+  }
+  for (int64_t index = base; index < count; index += stride) {
+    output[index] = __float2half(__bfloat162float(input[index]));
+  }
+}
+
 // Four values per thread with one half2 pair per load and one uint32 store.
 // The scalar kernel above remains the fallback for unaligned buffers and the
 // final 0..3 values.

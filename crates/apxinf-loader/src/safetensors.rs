@@ -338,7 +338,8 @@ mod tests {
                 DType::BF16 => "BF16",
                 DType::F8E4M3 => "F8_E4M3",
                 DType::E2M1Pair => "U8",
-                other => panic!("test fixture has no SafeTensors name for {other}"),
+                #[allow(unreachable_patterns)]
+                other => panic!("fixture does not support dtype {other}"),
             };
             let shape_json: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
             let end = data_offset + data.len();

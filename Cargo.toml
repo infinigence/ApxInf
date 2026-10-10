@@ -25,6 +25,9 @@ cuda = ["dep:apxinf-cuda", "apxinf-cuda/nvtx", "apxinf-model/cuda"]
 # Same as `cuda` but with NVTX compiled out entirely (no-op stubs). Use
 # when the target has no NVTX library installed at all.
 cuda-no-nvtx = ["dep:apxinf-cuda", "apxinf-model/cuda"]
+# Adds the second CUDA crate on top of `cuda`, mirroring the model-level split.
+# Required by any target that links both CUDA runtimes in one binary.
+cuda-new = ["cuda", "apxinf-model/cuda-new"]
 # CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
 # if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
 # libopenblas — leave this off on Thor.

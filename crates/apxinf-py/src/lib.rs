@@ -66,6 +66,13 @@ impl HfTokenizer {
         self.inner.encode(text).map_err(runtime_err)
     }
 
+    #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
+    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+        self.inner
+            .encode_with_special_tokens(text, add_special_tokens)
+            .map_err(runtime_err)
+    }
+
     fn decode(&self, token_ids: Vec<u32>) -> PyResult<String> {
         self.inner.decode(&token_ids).map_err(runtime_err)
     }
@@ -317,6 +324,16 @@ impl ModelRunner {
             PyValueError::new_err("apxinf_py.infer: action_mask must be C-contiguous float32")
         })?;
         Tensor::from_f32(Shape::new(expected.to_vec()), data).map_err(runtime_err)
+    }
+
+    fn state_tensor(&self, state: PyReadonlyArray1<'_, f32>) -> PyResult<Tensor> {
+        let data = state
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("state must be C-contiguous float32"))?;
+        if data.is_empty() {
+            return Err(PyValueError::new_err("state must not be empty"));
+        }
+        Tensor::from_f32(Shape::new(vec![data.len()]), data).map_err(runtime_err)
     }
 
     fn action_array<'py>(
@@ -735,6 +752,36 @@ impl ModelRunner {
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
+
+    fn run_profiled_provided<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        latent: Tensor,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let request = VlaRequest::provided(&observation, &latent);
+        let (flat, profile) = self
+            .model
+            .infer_host_f32_profiled(&request)
+            .map_err(runtime_err)?;
+        let actions = self.action_array(py, flat)?;
+        Ok((actions, profile))
+    }
+
+    fn run_profiled_generated<'py>(
+        &self,
+        py: Python<'py>,
+        observation: Observation,
+        rng: RngKey,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let request = VlaRequest::generated(&observation, rng);
+        let (flat, profile) = self
+            .model
+            .infer_host_f32_profiled(&request)
+            .map_err(runtime_err)?;
+        let actions = self.action_array(py, flat)?;
+        Ok((actions, profile))
+    }
 }
 
 #[pymethods]
@@ -830,6 +877,7 @@ impl ModelRunner {
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
             autotune,
+            num_views,
             config,
             ..LoadOptions::default()
         };
@@ -1313,7 +1361,7 @@ impl ModelRunner {
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
-    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None))]
+    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None))]
     fn infer_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -1322,6 +1370,7 @@ impl ModelRunner {
         token_ids: PyReadonlyArray1<'py, u32>,
         noise: Option<PyReadonlyArray2<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
+        state: Option<PyReadonlyArray1<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let contract = self.require_rgb_contract("infer_rgb")?;
         let layout = parse_layout(layout)?;
@@ -1349,7 +1398,7 @@ impl ModelRunner {
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
-        let observation = Observation {
+        let mut observation = Observation {
             vision: VisionObservation::RgbU8 { bytes, layout },
             token_ids: tokens,
             state: None,
@@ -1357,12 +1406,80 @@ impl ModelRunner {
                 .map(|value| self.action_mask_tensor(value))
                 .transpose()?,
         };
+        if let Some(state) = state {
+            observation.state = Some(self.state_tensor(state)?);
+        }
         match noise {
             Some(noise) => {
                 let noise_tensor = self.noise_tensor(noise)?;
                 self.run_provided(py, observation, noise_tensor)
             }
             None => self.run_generated(py, observation, self.next_sampling_rng()?),
+        }
+    }
+
+    /// Diagnostic variant of [`ModelRunner::infer_rgb`] with model-local phase
+    /// timings. Currently only SmolVLA implements the profile.
+    #[pyo3(name = "infer_rgb_profiled", signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_rgb_profiled<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
+        state: Option<PyReadonlyArray1<'py, f32>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
+        let contract = self.require_rgb_contract("infer_rgb_profiled")?;
+        let layout = parse_layout(layout)?;
+        let expected_bytes = contract.num_views * contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_profiled: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.len() != expected_bytes {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_profiled: rgb_u8 expected {} bytes ({} views x {}x{}x3), got {}",
+                expected_bytes,
+                contract.num_views,
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_profiled: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let mut observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: None,
+            action_mask: action_mask
+                .map(|value| self.action_mask_tensor(value))
+                .transpose()?,
+        };
+        if let Some(state) = state {
+            observation.state = Some(self.state_tensor(state)?);
+        }
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                self.run_profiled_provided(py, observation, noise_tensor)
+            }
+            None => self
+                .run_profiled_generated(py, observation, self.next_sampling_rng()?),
         }
     }
 

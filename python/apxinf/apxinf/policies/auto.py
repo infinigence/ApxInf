@@ -59,6 +59,10 @@ class AutoPolicy:
 def _read_model_type(model_dir: Path) -> str:
     config_path = model_dir / "config.json"
     if not config_path.is_file():
+        sidecar = model_dir / "smolvla_libero" / "config.json"
+        if sidecar.is_file():
+            config_path = sidecar
+    if not config_path.is_file():
         # OpenPI PyTorch exports declare their model type in metadata.pt.
         try:
             layout = detect_checkpoint(model_dir)

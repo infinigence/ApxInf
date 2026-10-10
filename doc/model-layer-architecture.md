@@ -118,6 +118,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
@@ -314,6 +315,21 @@ cannot determine why an existing family was modified. The
 suite.
 
 ## PI0.5 migration pilot
+
+`LoadOptions.autotune` controls cuda-new GEMM and Attention tuning on recipe misses;
+the standalone `pi05_bench --autotune` controls the same behavior through its
+context. Both default to cache reuse/fallback without benchmarking. With no
+explicit recipe directory, the backend uses the shared hardware/toolkit tuning
+directory alongside legacy `tactics.json`, but never reads that JSON. Directory
+selection is independent of the JSON's existence. See `configs/tuning/README.md`.
+
+Static-FP8 preparation preserves the legacy quantization sequence: compute one
+absmax scale on the original host values for each packed projection group,
+round those values to FP16, upload them, then call cuda-new's
+`FixedScaleE4m3` GPU operator. Do not replace it with direct host F32-to-FP8
+encoding: that changes the rounding contract. The model-owned regression
+`gpu_weight_quantization_matches_legacy_bytes` checks this boundary against
+the legacy GPU implementation; the legacy dependency is test-only here.
 
 PI0.5 uses one statically dispatched `Pi05Model` with bf16/fp8_static/int8_dynamic
 Blocks. `load.rs` selects model_variant and materializes fixed assets;

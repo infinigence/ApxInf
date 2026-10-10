@@ -24,6 +24,7 @@ pub(crate) mod cuda {
 
     pub(crate) use apxinf_cuda::kernels;
     pub(crate) use apxinf_cuda::nvtx;
+    pub(crate) use apxinf_cuda::profiler::CudaEventTimer;
     pub(crate) use apxinf_cuda::transfers;
     pub(crate) use apxinf_cuda::tuning;
     pub(crate) use apxinf_cuda::{

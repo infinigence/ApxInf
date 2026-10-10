@@ -30,7 +30,8 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 5 || spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+  if (spec.version != 6 ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
@@ -44,6 +45,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   }
   for (uint32_t alignment : {
            spec.a_alignment, spec.b_alignment, spec.bias_alignment,
+           spec.residual_alignment,
            spec.a_scales_alignment, spec.b_scales_alignment,
            spec.a_block_scales_alignment, spec.b_block_scales_alignment,
            spec.output_alignment}) {
@@ -115,6 +117,13 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "rowwise GEMM+GeGLU is not implemented");
   }
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
+      (spec.quantization != APXINF_GEMM_QUANT_FP8_UNIT_SCALE ||
+       spec.output_dtype != APXINF_DTYPE_F16)) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "GEMM+bias+residual requires unit-scale FP8 inputs "
+                  "and F16 output");
+  }
   constexpr int64_t kMaximumElementBytes = 4;
   if (spec.m > INT64_MAX / spec.n / kMaximumElementBytes ||
       spec.m > INT64_MAX / spec.k / kMaximumElementBytes ||
@@ -136,12 +145,18 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
   const bool needs_bias =
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
+  const bool allows_bias =
+      needs_bias ||
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL;
+  const bool needs_residual =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL;
   const bool needs_scales =
       apxinf::gemm::has_row_channel_scales(spec);
   const bool needs_block_scales = apxinf::gemm::has_block_scales(spec);
   if (bindings.a == nullptr || bindings.b == nullptr ||
       (require_output && bindings.output == nullptr) ||
       (needs_bias && bindings.bias == nullptr) ||
+      (needs_residual && bindings.residual == nullptr) ||
       (needs_scales &&
        (bindings.a_scales == nullptr || bindings.b_scales == nullptr)) ||
       (needs_block_scales && (bindings.a_block_scales == nullptr ||
@@ -154,8 +169,12 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "unexpected GEMM block scales");
   }
-  if (!needs_bias && bindings.bias != nullptr) {
+  if (!allows_bias && bindings.bias != nullptr) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "unexpected GEMM bias");
+  }
+  if (!needs_residual && bindings.residual != nullptr) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "unexpected GEMM residual");
   }
   if (!std::isfinite(bindings.alpha) ||
       !std::isfinite(bindings.output_scale) ||
@@ -180,6 +199,8 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
   validate_recorded_alignment(bindings.b, spec.b_alignment, "GEMM B binding");
   validate_recorded_alignment(bindings.bias, spec.bias_alignment,
                               "GEMM bias binding");
+  validate_recorded_alignment(bindings.residual, spec.residual_alignment,
+                              "GEMM residual binding");
   validate_recorded_alignment(bindings.a_scales, spec.a_scales_alignment,
                               "GEMM A scales binding");
   validate_recorded_alignment(bindings.b_scales, spec.b_scales_alignment,
@@ -279,6 +300,8 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
         apxinf::gemm::tuning_keys(normalized_spec, *policy, runtime->device);
     const std::string& key = keys.key;
     std::lock_guard<std::mutex> lock(runtime->gemm_mutex);
+    const std::string cache_dir = policy->cache_dir != nullptr
+        ? policy->cache_dir : runtime->default_cache_dir;
 
     Recipe recipe{};
     bool recipe_found = false;
@@ -290,7 +313,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
       source = "memory-recipe";
     } else {
       const std::string serialized = apxinf::gemm::read_recipe(
-          policy->cache_dir != nullptr ? policy->cache_dir : "", key);
+          cache_dir, key);
       std::istringstream input(serialized);
     recipe_found = static_cast<bool>(
         input >> recipe.provider_id >> recipe.implementation_id >>
@@ -321,7 +344,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
 
     bool persist_recipe = false;
     if (execution == nullptr) {
-      if (policy->online_tune) {
+      if (runtime->allow_online_tune && policy->online_tune) {
         const Recipe tuned_recipe = apxinf::gemm::tune(
             normalized_spec, *policy, *bindings, runtime->device,
             source);
@@ -369,8 +392,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
                    << ' ' << recipe.implementation_version << ' '
                    << recipe.configuration;
         apxinf::gemm::write_recipe(
-            policy->cache_dir != nullptr ? policy->cache_dir : "", key,
-            serialized.str());
+            cache_dir, key, serialized.str());
       }
     }
 

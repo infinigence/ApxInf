@@ -2609,3 +2609,27 @@ fn packed8_quantize_bf16_e4m3_matches_scalar_with_tail() {
         reference.as_f8_e4m3().unwrap()
     );
 }
+
+#[test]
+fn workspace_recycles_non_overlapping_lifetimes() {
+    let ctx = CudaContext::new(0).expect("CUDA device required");
+    let workspace = GraphWorkspace::new(4096, 0).unwrap();
+
+    let (retained, replacement, released_ptr) = with_workspace(&workspace, || {
+        let released = crate::workspace::output_buffer(&ctx, 512).unwrap();
+        let released_ptr = released.ptr();
+        let retained = crate::workspace::output_buffer(&ctx, 512).unwrap();
+        drop(released);
+        let replacement = crate::workspace::output_buffer(&ctx, 512).unwrap();
+        assert_ne!(retained.ptr(), released_ptr);
+        Ok((retained, replacement, released_ptr))
+    })
+    .unwrap();
+    assert_eq!(replacement.ptr(), released_ptr);
+    assert_eq!(workspace.used(), 1024);
+
+    with_workspace(&workspace, || Ok(())).unwrap();
+    drop((retained, replacement));
+
+    with_workspace(&workspace, || Ok(())).unwrap();
+}

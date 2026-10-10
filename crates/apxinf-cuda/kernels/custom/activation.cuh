@@ -159,6 +159,29 @@ __device__ __forceinline__ __nv_bfloat16 gelu_tanh_bf16_one(__nv_bfloat16 value)
     return __float2bfloat16(y);
 }
 
+__device__ __forceinline__ half gelu_tanh_f16_one(half value)
+{
+    float x = __half2float(value);
+    const float kBeta  = 0.7978845608028654f;
+    const float kAlpha = 0.044715f;
+    float inner = kBeta * (x + kAlpha * x * x * x);
+    float y = 0.5f * x * (1.0f + tanhf(inner));
+    return __float2half(y);
+}
+
+__global__ void bias_gelu_f16_kernel(
+    const half* input, const half* bias, half* output,
+    int rows, int cols) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int col = static_cast<int>(index % cols);
+    output[index] = gelu_tanh_f16_one(
+        __float2half(__half2float(input[index]) + __half2float(bias[col])));
+  }
+}
+
 __global__ void gelu_tanh_bf16_kernel(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t count)
 {
@@ -693,6 +716,21 @@ __global__ void swiglu_bf16_kernel(
     float silu = gate / (1.0f + expf(-gate));
     if (RoundSilu) silu = __bfloat162float(__float2bfloat16(silu));
     output[index] = __float2bfloat16(silu * up);
+  }
+}
+
+__global__ void swiglu_f16_kernel(
+    const half* gate_up, half* output, int rows, int inner) {
+  const int64_t count = static_cast<int64_t>(rows) * inner;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / inner);
+    const int col = static_cast<int>(index % inner);
+    const float gate = __half2float(gate_up[static_cast<int64_t>(row) * 2 * inner + col]);
+    const float up = __half2float(gate_up[static_cast<int64_t>(row) * 2 * inner + inner + col]);
+    const float silu = gate / (1.0f + expf(-gate));
+    output[index] = __float2half(silu * up);
   }
 }
 

@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 const FNV1A_128_OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV1A_128_PRIME: u128 = 0x0000000001000000000000000000013b;
 
+pub const FA2_FIXED_FEATURE_DEFINES: &[&str] = &[
+    "-DFLASHATTENTION_DISABLE_DROPOUT",
+    "-DFLASHATTENTION_DISABLE_ALIBI",
+    "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    "-DFLASHATTENTION_DISABLE_LOCAL",
+];
+
 const INPUT_TREES: &[&str] = &[
     "adapters/attention",
     "framework",
@@ -54,8 +61,16 @@ pub fn build_id<'a>(
     architectures: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
     let mut hash = FNV1A_128_OFFSET;
-    for value in ["apxinf-attention-v1", env!("CARGO_PKG_VERSION"), target] {
+    for value in [
+        "apxinf-attention-v2-fixed-fa2-feature-axes",
+        env!("CARGO_PKG_VERSION"),
+        target,
+    ] {
         hash_bytes(&mut hash, value.as_bytes());
+        hash_bytes(&mut hash, &[0]);
+    }
+    for define in FA2_FIXED_FEATURE_DEFINES {
+        hash_bytes(&mut hash, define.as_bytes());
         hash_bytes(&mut hash, &[0]);
     }
     for (nvcc_arch, cutlass_arch) in architectures {

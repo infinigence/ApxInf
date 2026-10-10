@@ -134,6 +134,103 @@ __global__ void rgb_u8_to_patches_bf16_kernel(
   }
 }
 
+__global__ void pixel_shuffle_4_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input, __nv_bfloat16* __restrict__ output,
+    int views, int tokens_per_view, int width) {
+  const int input_side = static_cast<int>(sqrt(static_cast<float>(tokens_per_view)));
+  const int output_side = input_side / 4;
+  const int output_channels = width * 16;
+  const int64_t output_count =
+      static_cast<int64_t>(views) * output_side * output_side * output_channels;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < output_count; index += stride) {
+    const int channel = static_cast<int>(index % output_channels);
+    const int64_t output_token64 = index / output_channels;
+    const int view = static_cast<int>(output_token64 / (output_side * output_side));
+    const int output_token =
+        static_cast<int>(output_token64 - view * output_side * output_side);
+    const int output_y = output_token / output_side;
+    const int output_x = output_token - output_y * output_side;
+    const int group = channel / width;
+    const int input_channel = channel - group * width;
+    const int group_y = group / 4;
+    const int group_x = group - group_y * 4;
+    const int input_y = output_y * 4 + group_y;
+    const int input_x = output_x * 4 + group_x;
+    const int input_token = input_y * input_side + input_x;
+    output[index] =
+        input[static_cast<int64_t>(view) * tokens_per_view * width +
+              static_cast<int64_t>(input_token) * width + input_channel];
+  }
+}
+
+template <bool kNhwc>
+__global__ void rgb_u8_to_patches_f16_kernel(
+    const uint8_t* images, half* patches, int views,
+    int image_size, int patch_size) {
+  const int patches_per_side = image_size / patch_size;
+  const int patches_per_view = patches_per_side * patches_per_side;
+  const int patch_area = patch_size * patch_size;
+  const int patch_width = 3 * patch_size * patch_size;
+  const int64_t count =
+      static_cast<int64_t>(views) * patches_per_view * patch_width;
+  int64_t output_index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; output_index < count; output_index += stride) {
+    const int patch_element = static_cast<int>(output_index % patch_width);
+    const int patch_index = static_cast<int>(output_index / patch_width);
+    const int view = patch_index / patches_per_view;
+    const int patch_in_view = patch_index - view * patches_per_view;
+    const int patch_y = patch_in_view / patches_per_side;
+    const int patch_x = patch_in_view - patch_y * patches_per_side;
+    const int channel = patch_element / patch_area;
+    const int pixel_in_patch = patch_element - channel * patch_area;
+    const int dy = pixel_in_patch / patch_size;
+    const int dx = pixel_in_patch - dy * patch_size;
+    const int y = patch_y * patch_size + dy;
+    const int x = patch_x * patch_size + dx;
+    const int64_t input_index = kNhwc
+        ? ((static_cast<int64_t>(view) * image_size + y) * image_size + x) * 3 + channel
+        : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) * image_size + x;
+    const float normalized =
+        (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+    patches[output_index] = __float2half(normalized);
+  }
+}
+
+__global__ void pixel_shuffle_4_f16_kernel(
+    const half* __restrict__ input, half* __restrict__ output,
+    int views, int tokens_per_view, int width) {
+  const int input_side = static_cast<int>(sqrt(static_cast<float>(tokens_per_view)));
+  const int output_side = input_side / 4;
+  const int output_channels = width * 16;
+  const int64_t output_count =
+      static_cast<int64_t>(views) * output_side * output_side * output_channels;
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < output_count; index += stride) {
+    const int channel = static_cast<int>(index % output_channels);
+    const int64_t output_token64 = index / output_channels;
+    const int view = static_cast<int>(output_token64 / (output_side * output_side));
+    const int output_token =
+        static_cast<int>(output_token64 - view * output_side * output_side);
+    const int output_y = output_token / output_side;
+    const int output_x = output_token - output_y * output_side;
+    const int group = channel / width;
+    const int input_channel = channel - group * width;
+    const int group_y = group / 4;
+    const int group_x = group - group_y * 4;
+    const int input_y = output_y * 4 + group_y;
+    const int input_x = output_x * 4 + group_x;
+    const int input_token = input_y * input_side + input_x;
+    output[index] =
+        input[static_cast<int64_t>(view) * tokens_per_view * width +
+              static_cast<int64_t>(input_token) * width + input_channel];
+  }
+}
+
 
 template <bool kNhwc>
 __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(

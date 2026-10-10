@@ -322,6 +322,39 @@ pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>)
     bias_activation(ctx, input, value, 1)
 }
 
+pub fn bias_gelu_f16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    value: Option<&Tensor>,
+) -> Result<Tensor> {
+    let (rows, cols) = matrix_shape(input, "bias GELU")?;
+    if input.dtype() != DType::F16
+        || value.is_some_and(|bias| bias.dtype() != DType::F16 || bias.shape().dims() != [cols])
+    {
+        return Err(Error::Other(
+            "static inference FP16 bias GELU has incompatible dtype or shape".into(),
+        ));
+    }
+    let output = f16_output(ctx, rows, cols)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_bias_gelu_f16(
+            gpu_ptr(input)?,
+            optional_ptr(value)?,
+            output.ptr(),
+            rows as i32,
+            cols as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 pub fn bias_gelu_bf16_packed8(ctx: &CudaContext, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let (rows, cols) = matrix_shape(input, "packed8 bias GELU")?;
     if input.dtype() != DType::BF16
@@ -417,6 +450,33 @@ pub fn swiglu_bf16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
         .map_err(Error::Cuda)?;
     }
     Ok(matrix_tensor(ctx, rows, inner, output))
+}
+
+pub fn swiglu_f16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
+    let (rows, twice_inner) = matrix_shape(gate_up, "SwiGLU")?;
+    if gate_up.dtype() != DType::F16 || twice_inner % 2 != 0 {
+        return Err(Error::Other(
+            "static inference FP16 SwiGLU expects [rows,2*inner]".into(),
+        ));
+    }
+    let inner = twice_inner / 2;
+    let output = f16_output(ctx, rows, inner)?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_swiglu_f16(
+            gpu_ptr(gate_up)?,
+            output.ptr(),
+            rows as i32,
+            inner as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, inner]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
 }
 
 /// BF16 SwiGLU preserving the BF16 rounding boundary after SiLU.

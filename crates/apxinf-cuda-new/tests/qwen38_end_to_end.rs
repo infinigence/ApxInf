@@ -673,7 +673,7 @@ fn gdn_decode_layer(
     scratch: &mut Scratch,
     state: &mut GdnState,
 ) {
-    ops::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
     fp8_projection(
         ctx,
         &gdn.qkv,
@@ -1016,7 +1016,7 @@ fn decode_step_inner(
                 let cache = &mut kv_caches[attention_index];
                 attention_index += 1;
 
-                ops::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+                ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
                 fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);
                 let fused_heads = view(&scratch.qkv_fused, vec![1, HEADS, 2 * HEAD_DIM], DType::BF16);
                 ops::split_query_and_gate(ctx, &fused_heads, &scratch.query, &scratch.query_gate).unwrap();
@@ -1119,7 +1119,7 @@ fn decode_step_inner(
         );
     }
 
-    ops::rms_norm(ctx, &scratch.hidden, &model.final_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &model.final_norm, &scratch.normalized, EPSILON).unwrap();
     ops::nvfp4_quantize_activation(ctx, &scratch.normalized, &scratch.nvfp4_activation, &scratch.nvfp4_scales, model.lm_head.input_scale, BLOCK, ops::ScaleLayout::GemmAtom).unwrap();
     nvfp4_decode_gemm(
         ctx,
@@ -1245,7 +1245,7 @@ fn run_one_layer(
         Layer::Attention(attention) => {
             let cache = &mut kv_caches[*attention_index];
             *attention_index += 1;
-            ops::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+            ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
             fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);
             let fused_heads = view(&scratch.qkv_fused, vec![1, HEADS, 2 * HEAD_DIM], DType::BF16);
             ops::split_query_and_gate(ctx, &fused_heads, &scratch.query, &scratch.query_gate).unwrap();
@@ -1288,7 +1288,7 @@ fn run_one_layer(
         Layer::Gdn(gdn) => {
             let state = &mut gdn_states[*gdn_index];
             *gdn_index += 1;
-            ops::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+            ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
             fp8_projection(ctx, &gdn.qkv, &scratch.normalized, &scratch.fp8_activation, &mut scratch.gdn_qkv);
                 if reuse_fp8_enabled() && gdn.z.input_scale == gdn.qkv.input_scale {
                     fp8_projection_reuse_quantized(ctx, &gdn.z, &scratch.fp8_activation, &mut scratch.gdn_z);
@@ -1709,7 +1709,7 @@ fn prefill_step(
 
                 let hidden = prefix(&scratch.hidden, vec![tokens, HIDDEN], DType::BF16);
                 let normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
-                ops::rms_norm(ctx, &hidden, &attention.input_norm, &normalized, EPSILON).unwrap();
+                ops::mlp::rms_norm(ctx, &hidden, &attention.input_norm, &normalized, EPSILON).unwrap();
 
                 if reuse_fp8_enabled() {
                     // q, k and v read the same post-norm activation, so it is
@@ -1826,7 +1826,7 @@ fn prefill_step(
 
                 let hidden = prefix(&scratch.hidden, vec![tokens, HIDDEN], DType::BF16);
                 let normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
-                ops::rms_norm(ctx, &hidden, &gdn.input_norm, &normalized, EPSILON).unwrap();
+                ops::mlp::rms_norm(ctx, &hidden, &gdn.input_norm, &normalized, EPSILON).unwrap();
 
                 if reuse_fp8_enabled() {
                     // qkv and z read the same post-norm activation, so it is
@@ -2109,7 +2109,7 @@ fn prefill_logits(
     tokens: usize,
 ) {
     let last = view_row(&prefill.hidden, tokens - 1, HIDDEN, DType::BF16);
-    ops::rms_norm(ctx, &last, &model.final_norm, &decode.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &last, &model.final_norm, &decode.normalized, EPSILON).unwrap();
     ops::nvfp4_quantize_activation(
         ctx,
         &decode.normalized,
@@ -2528,7 +2528,7 @@ fn unfused_mlp(
     dump: &mut RefDump,
     names: (&str, &str, &str, &str, &str),
 ) {
-    ops::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, names.0, &scratch.normalized, HIDDEN);
     ops::nvfp4_quantize_activation(
         ctx,
@@ -2598,7 +2598,7 @@ fn gdn_reference_step(
     dump: &mut RefDump,
 ) {
     dump.push_bf16(ctx, "l0_00_hidden_in", &scratch.hidden, HIDDEN);
-    ops::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, "l0_01_input_layernorm", &scratch.normalized, HIDDEN);
 
     fp8_projection(ctx, &gdn.qkv, &scratch.normalized, &scratch.fp8_activation, &mut scratch.gdn_qkv);
@@ -2711,7 +2711,7 @@ fn attention_reference_step(
     dump: &mut RefDump,
 ) {
     dump.push_bf16(ctx, "l3_00_hidden_in", &scratch.hidden, HIDDEN);
-    ops::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
     dump.push_bf16(ctx, "l3_01_input_layernorm", &scratch.normalized, HIDDEN);
 
     fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);
@@ -2894,7 +2894,7 @@ fn unfused_mlp_quiet(
     scratch: &mut Scratch,
     swiglu_out: &Tensor,
 ) {
-    ops::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, norm_weight, &scratch.normalized, EPSILON).unwrap();
     ops::nvfp4_quantize_activation(
         ctx, &scratch.normalized, &scratch.nvfp4_activation, &scratch.nvfp4_scales,
         gate_up.input_scale, BLOCK, ops::ScaleLayout::GemmAtom,
@@ -2936,7 +2936,7 @@ fn tf_run_layer(
         Layer::Attention(attention) => {
             let cache = &mut kv_caches[*attention_index];
             *attention_index += 1;
-            ops::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+            ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
             fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);
             let fused_heads = view(&scratch.qkv_fused, vec![1, HEADS, 2 * HEAD_DIM], DType::BF16);
             ops::split_query_and_gate(ctx, &fused_heads, &scratch.query, &scratch.query_gate).unwrap();
@@ -2979,7 +2979,7 @@ fn tf_run_layer(
         Layer::Gdn(gdn) => {
             let state = &mut gdn_states[*gdn_index];
             *gdn_index += 1;
-            ops::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+            ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
             fp8_projection(ctx, &gdn.qkv, &scratch.normalized, &scratch.fp8_activation, &mut scratch.gdn_qkv);
             fp8_projection(ctx, &gdn.z, &scratch.normalized, &scratch.fp8_activation, &mut scratch.gdn_z);
             let qkv_flat = view(&scratch.gdn_qkv, vec![QKV_WIDTH], DType::BF16);
@@ -3037,7 +3037,7 @@ fn tf_decode_step(
             taps[layer_index].extend(f);
         }
     }
-    ops::rms_norm(ctx, &scratch.hidden, &model.final_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::mlp::rms_norm(ctx, &scratch.hidden, &model.final_norm, &scratch.normalized, EPSILON).unwrap();
     // Fused vs unfused only differs in whether the normalized BF16 is
     // materialized; the lm_head GEMM is identical. decode_step uses the fused
     // rms_norm+quantize; here rms_norm already ran, so both modes quantize the

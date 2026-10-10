@@ -5,6 +5,14 @@
 - Current public interfaces and mathematical semantics: [L3 operator catalog](cuda-operator.md)
 - Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
 
+The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
+The BF16 MLP helper remains available as
+`ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
+signature and is used by the Qwen integration tests.
+GEMM Spec version 6 combines NVFP4 block-scale bindings with the
+`GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
+across these incompatible layouts.
+
 ## Operator Layers: L3 to L0
 
 L0-L3 here describe only the CUDA operators inside `apxinf-cuda-new`, not the model, policy, and serving layers in the repository root documentation.
@@ -73,7 +81,7 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | --- | --- | --- |
 | `Spec` | Normalized problem description: semantic, shape, dtype, mask, layout, alignment class, and so on | No; equivalent calls can share it |
 | `Policy` | Constraints such as workspace, graph-safe, deterministic, and whether tune/fallback is allowed | Some fields affect selection or prepared state |
-| `Bindings` | Addresses, stream, scalar launch parameters, and fixed pointers to runtime metadata such as the current decode length | Yes |
+| `Bindings` | Addresses, stream, and actual dynamic values for this call, such as `alpha` and attention scale | Yes |
 
 ## Key Interfaces
 
@@ -139,10 +147,29 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | --- | --- |
 | Key mode | Exact key only; no compatible/bucket key |
 | hit and identity, supports, configuration, policy, and prepare are all valid | Create the execution directly without benchmarking |
-| miss, corruption, or failed validation after a hit, with `online_tune=true` | Fully benchmark every legal candidate/configuration |
+| miss, corruption, or failed validation after a hit, with context tuning enabled and `online_tune=true` | Fully benchmark every legal candidate/configuration |
 | no usable recipe and fallback allowed | Use the baseline explicitly marked for the semantic; do not persist it as a tuned winner |
 | no usable recipe and both tune/fallback unavailable | Return cache miss/unsupported |
 | Persistence condition | Real prepare of the tune winner succeeds |
+
+### Default Persistence and Autotune
+
+GEMM and Attention resolve `Policy.cache_dir=None` to
+`configs/tuning/nvidia/<device-family>-sm<version>/cuda<major.minor>-cublas<major.minor>/`,
+relative to the working directory. This is the legacy hardware/toolkit directory:
+new `.recipe` files coexist with `tactics.json`, but do not read, convert, or depend
+on that file. Explicit directories override the default; `Some("")` disables disk
+persistence. Recipe writes remain best-effort, so the directory must be writable
+for reuse across processes.
+
+`CudaContext::new` continues to allow per-operator online tuning.
+`CudaContext::new_with_autotune(device, false)` disables benchmarking for the entire
+context, even when individual operator policies allow it; valid recipes still load.
+PI05 production uses `LoadOptions.autotune` (Python `autotune=True`), and
+`pi05_bench --autotune` enables the same miss-triggered tuning. Both production and
+benchmark default to cache-only/fallback, not tuning. Tuning occurs at first eager
+execution or prepare, never inside graph capture or steady-state replay. A warm
+cache does not retune just because `--autotune` is present.
 
 ## Session / CUDA Graph State Machine
 
@@ -179,3 +206,29 @@ The graph retains the executions and storage used during capture. The recipe key
 | Change candidate behavior/performance | implementation version or a build fingerprint covering the change; regression tests | recipe schema/key version | continue reusing old recipes that are no longer equivalent |
 
 Every candidate must be tested on the inputs it claims to support, not only when it becomes the final autotune winner. See [Adding New Kernels](../../doc/adding-new-kernels.md) for complete testing and acceptance steps.
+
+### FP8 GeGLU migration coverage
+
+For `GemmGeglu`, public weights remain row-major `[K, 2N]` (gate, then up).
+The SM100-family registry includes the legacy three-view shape
+`M=778, 2N=32768, K=2048`: `cublasLt+cutlass-split-geglu` first writes
+the FP16 gate projection with a **32768-element row stride**, then invokes the
+existing CUTLASS up-projection/GeGLU/E4M3 epilogue. Its recipe identity is
+`(3, 5, 1)`; configuration `3 * heuristic_rank + schedule` combines eight
+cuBLASLt heuristic ranks and the three legacy CUTLASS schedules. The gate
+allocation is `M * 2N * sizeof(F16)` plus any cuBLASLt workspace.
+The split candidate requires positive alpha; prepare rejects non-positive
+alpha so the normal recipe/fallback policy can select another implementation.
+
+The native FP8 GEMM plus standalone GeGLU candidate remains in the same
+competition; the model does not force a fused provider. E4M3-output vendor
+GeGLU uses the legacy FP16 projection rounding and packed epilogue, including
+the non-tuned cuBLAS fallback. This also keeps the M778 fallback within the
+default 256 MiB resource budget. M522/M533 retain their dual-GeGLU candidate;
+M789 has no legacy split candidate and PI0.5 retains its decomposed route.
+
+`gemm_geglu_three_view_all_candidates_match_torch` covers eager and graph
+outputs with unit and non-unit scales. The framework regression covers recipe
+restoration, all three split schedules, resource rejection, and unsupported
+M789/configuration rejection. Changing these adapter sources invalidates old
+recipes through the normal operator build fingerprint.

@@ -50,14 +50,19 @@ pub struct LoadOptions {
     /// (except CPU backends, which currently require f32).
     pub text_weight_dtype: Option<DType>,
     pub calibration_path: Option<PathBuf>,
+    /// For cuda-new, override the recipe directory. None uses the shared
+    /// hardware/toolkit tuning directory; legacy JSON records are not loaded.
     pub tuning_path: Option<PathBuf>,
     /// Additional named model artifacts that are not embedded in the primary
     /// checkpoint. Model loaders must reject missing or unknown required
     /// assets instead of discovering them through process-global state.
     pub assets: BTreeMap<String, PathBuf>,
-    /// Enable online GEMM autotuning from real inference requests. When false,
+    /// Enable online operator autotuning (GEMM and, on cuda-new, Attention)
+    /// on recipe misses during preparation or first execution. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,
+    /// Serve fewer camera views than the checkpoint declares.
+    pub num_views: Option<usize>,
     /// Explicit architecture config, overriding any on-disk `config.json`.
     pub config: Option<Pi05Config>,
     /// When set, load deterministic random weights instead of a checkpoint.
@@ -184,6 +189,14 @@ impl LoadedModel {
         self.vla()?.infer_host_f32(request)
     }
 
+    /// Run a VLA inference with optional model-local phase timings.
+    pub fn infer_host_f32_profiled(
+        &self,
+        request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, f64>)> {
+        self.vla()?.infer_host_f32_profiled(request)
+    }
+
     /// Discrete action-token output shape, for autoregressive token VLAs.
     ///
     /// `None` means the loaded runtime emits continuous actions only.
@@ -298,12 +311,22 @@ impl AutoModel {
             && !matches!(
                 model_name,
                 "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+                    | "smolvla" | "smolvla_libero"
             )
         {
             return Err(Error::Other(format!(
                 "model {model_name} does not yet support model_variant"
             )));
         }
+
+        if matches!(model_name, "pi05" | "pi05-cuda") {
+            #[cfg(feature = "cuda")]
+            return crate::pi05::load_with_cuda_new(path, device, options);
+
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
@@ -339,6 +362,50 @@ impl AutoModel {
             *generation_defaults = defaults;
         }
         Ok(loaded)
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CudaRecipeOptions {
+    pub cache_dir: Option<String>,
+    pub online_tune: bool,
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOptions> {
+    let cache_dir = options
+        .tuning_path
+        .as_deref()
+        .map(exact_recipe_directory)
+        .map(|path| {
+            path.to_str().map(str::to_owned).ok_or_else(|| {
+                Error::Other(format!(
+                    "exact recipe cache path is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(CudaRecipeOptions {
+        cache_dir,
+        online_tune: options.autotune,
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn exact_recipe_directory(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+    let legacy_json_name = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if path.is_file() || legacy_json_name {
+        path.with_extension("recipes")
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -407,6 +474,22 @@ fn select_cuda_tuning_database_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_recipe_tuning_is_explicit_and_independent_of_directory() {
+        let mut options = LoadOptions::default();
+        let recipe = cuda_recipe_options(&options).unwrap();
+        assert_eq!(recipe.cache_dir, None);
+        assert!(!recipe.online_tune);
+        options.autotune = true;
+        assert!(cuda_recipe_options(&options).unwrap().online_tune);
+        options.tuning_path = Some(PathBuf::from("custom-recipes"));
+        let recipe = cuda_recipe_options(&options).unwrap();
+        assert_eq!(recipe.cache_dir.as_deref(), Some("custom-recipes"));
+        assert!(recipe.online_tune);
+        options.autotune = false;
+        assert!(!cuda_recipe_options(&options).unwrap().online_tune);
+    }
 
     fn temporary_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
