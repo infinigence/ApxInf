@@ -59,9 +59,10 @@ pub fn object_is_current(
     any
 }
 
-/// One pending nvcc invocation. The stamp is written only after nvcc
-/// succeeded, so an interrupted or failed compile cannot leave a stamp that
-/// hides a stale object from the next build.
+/// One pending nvcc invocation. Any previous stamp is removed before nvcc
+/// runs and the new one is written only after it succeeded, so an interrupted
+/// or failed compile cannot leave a stamp that hides a stale object from the
+/// next build.
 pub struct CompileJob {
     pub command: Command,
     pub action: String,
@@ -100,6 +101,17 @@ pub fn run_parallel(jobs: Vec<CompileJob>, workers: usize) {
                 let Some(mut job) = queue.lock().unwrap().next() else {
                     break;
                 };
+                // Invalidate before nvcc can overwrite the object. A failed
+                // or interrupted recompile must not retain the old stamp,
+                // which would still match and hide the partial object.
+                if let Err(error) = std::fs::remove_file(&job.stamp) {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "remove stale nvcc stamp {}: {error}",
+                        job.stamp.display()
+                    );
+                }
                 let status = job
                     .command
                     .status()

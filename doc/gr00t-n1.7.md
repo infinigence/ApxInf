@@ -215,44 +215,61 @@ executed actions per chunk.
 
 ## Fixed-input benchmark
 
-The maintained runner uses tensors produced by the official NVIDIA processor.
-Its timing boundary starts at those host tensors and ends after model-core
-action D2H; it excludes simulator and raw-observation preprocessing time.
+The benchmark constructs deterministic tensors in memory. No dataset, saved
+input tensors, processor installation, or separate backbone path is needed.
+Use a prepared checkpoint containing `assets/cosmos`; see [Loading](#loading).
+The workload has 256 patches per view, 90/156 tokens for one/two views,
+LIBERO embodiment 2, and zero diffusion noise. It measures host tensors through
+CUDA Graph execution and action D2H, excluding raw-observation preprocessing.
+Synthetic outputs are used only for timing, not accuracy evaluation.
 
-```bash
+Build the example once; later runs reuse it:
+
+```sh
+cargo build --release -p apxinf-model --features cuda --example gr00t_bench
 python scripts/bench_gr00t.py \
-  --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
-  --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
-  --precision bf16 \
-  --warmup 10 \
-  --iterations 50
-```
-
-Use `--calibration` for FP8, `--tactics` for an explicit tactic database, and
-`--reference` for a numerical parity gate. When the installed CUDA/cuBLAS or
-kernel implementation version does not match a stored database, pass an
-explicit new `--tactics` path together with `--autotune`; never rewrite the
-bundled database merely to bypass provenance validation. The report records
-P50/P95 and the complete normalized model-core output. Generated fixtures,
-reference dumps, logs, tactic databases, and result JSON belong under
-`devlocal/gr00t-n1d7/` and are not committed.
-
-The repository's shared LIBERO evaluator selects the GR00T state adapter while
-leaving the existing OpenPI state wire format unchanged for other policies:
-
-```bash
-python scripts/eval_libero.py \
-  --backend in-process \
   --model-dir /models/GR00T-N1.7-LIBERO/libero_10 \
-  --precision bf16 \
-  --suite libero_10 \
-  --trials-per-task 10 \
-  --max-steps 720 \
-  --replan-steps 8 \
-  --results-jsonl devlocal/gr00t-n1d7/results/libero-bf16.jsonl \
-  --summary-json devlocal/gr00t-n1d7/results/libero-bf16-summary.json
+  --precision bf16 --views 2 --warmup 30 --samples 200 \
+  --tactics devlocal/gr00t-bench/thor-bf16-2v.json --autotune \
+  --binary target/release/examples/gr00t_bench \
+  --out devlocal/gr00t-bench/thor-bf16-2v-results.json
 ```
+
+Run `--views 1` and `--views 2` for every supported table row:
+
+| Hardware | `--precision` | Additional input |
+|---|---|---|
+| Thor | `bf16` | None |
+| Thor | `fp8` | `--calibration /path/to/matching-calibration.json` |
+| Orin | `bf16` | None |
+| Orin | `int8` | None |
+
+Give each hardware/precision/view combination its own tactic and output path.
+The first run uses `--autotune`; repeat with the same `--tactics` and omit
+`--autotune` to measure reuse. A database must match the actual CUDA/cuBLAS,
+GPU and kernel build; do not edit its identity to force compatibility.
+The report must say `cuda-graph`, contain finite actions, and preserve all raw
+samples. Lock CPU/GPU/EMC clocks and fan, exclude competing GPU work, and record
+the source commit, binary hash and calibration/tactic hashes with each run.
+
+Robo's `scripts/bench_gr00t.py` forwards to this same implementation in its
+pinned ApxInf checkout. It takes the same arguments. The table retains the
+previously published results; use the command above for new measurements.
+
+Real LIBERO task evaluation uses simulator observations through the shared
+evaluator. It selects GR00T's named state and decoded-gripper adapter:
+
+```sh
+python scripts/eval_libero.py --backend in-process \
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16 \
+  --suite libero_10 --trials-per-task 10 --seed 7 \
+  --max-steps 720 --replan-steps 8 \
+  --results-jsonl devlocal/gr00t-eval/results.jsonl \
+  --summary-json devlocal/gr00t-eval/summary.json
+```
+
+Use the matching FP8 calibration or Orin INT8 precision for those campaigns.
+The constructed benchmark tensors are never scored as task observations.
 
 ## Validation contract
 
@@ -268,8 +285,8 @@ Minimum release gates are:
 - INT8: cosine similarity at least `0.995`, relative L2 at most `0.10`.
 - Every output must be finite and have the exact expected shape.
 
-One-view fixtures are used only for fixed-input numerical accuracy and
-performance; they are never used for LIBERO closed-loop task evaluation. The
+One-view constructed inputs are used for performance; they are never used
+for LIBERO closed-loop task evaluation. The
 two-view release campaign uses 10 episodes for each of the 10 LIBERO-10 tasks
 and each supported platform/precision pair. GR00T LIBERO rollouts explicitly
 use the NVIDIA N1.7 evaluation protocol of 720 maximum simulator steps and 8
