@@ -3,6 +3,10 @@ name = "apxinf-hip"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+build = "build.rs"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
+
+[dev-dependencies]
+half = { version = "2", features = ["bytemuck"] }
