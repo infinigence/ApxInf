@@ -1,0 +1,118 @@
+{
+  "profiles": [
+    {
+      "id": "base",
+      "views": [
+        1,
+        2,
+        3
+      ],
+      "suite": "./{profile}-{views}view/manifest.json",
+      "checkpoint": "./checkpoints/{profile}/model.safetensors",
+      "config": "./checkpoints/{profile}/config.json",
+      "reference": "./{profile}-{views}view/openpi.json"
+    }
+  ],
+  "policies": [
+    {
+      "hardware": "thor",
+      "precision": "bf16",
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: diagnostic protocol placeholders only; replace budgets and independent stability/performance counts with measured reviewed values",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null,
+      "stability_repeats": 1,
+      "performance_protocol": {
+        "warmup": 0,
+        "samples": 1
+      }
+    },
+    {
+      "hardware": "thor",
+      "precision": "fp8",
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: diagnostic protocol placeholders only; replace budgets and independent stability/performance counts with measured reviewed values",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": "./calibration/{hardware}-{precision}.json",
+      "stability_repeats": 1,
+      "performance_protocol": {
+        "warmup": 0,
+        "samples": 1
+      }
+    },
+    {
+      "hardware": "orin",
+      "precision": "bf16",
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: diagnostic protocol placeholders only; replace budgets and independent stability/performance counts with measured reviewed values",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null,
+      "stability_repeats": 1,
+      "performance_protocol": {
+        "warmup": 0,
+        "samples": 1
+      }
+    },
+    {
+      "hardware": "orin",
+      "precision": "int8",
+      "reference_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "baseline_limits": {
+        "min_cosine": 1.0,
+        "max_relative_l2": 0.0,
+        "max_abs": 0.0,
+        "zero_max_abs": 0.0
+      },
+      "performance_limits": null,
+      "budget_reason": "UNAPPROVED template: diagnostic protocol placeholders only; replace budgets and independent stability/performance counts with measured reviewed values",
+      "baseline": "./{profile}-{views}view/{hardware}-{precision}-approved.json",
+      "calibration": null,
+      "stability_repeats": 1,
+      "performance_protocol": {
+        "warmup": 0,
+        "samples": 1
+      }
+    }
+  ]
+}

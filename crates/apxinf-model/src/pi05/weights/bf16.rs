@@ -456,6 +456,7 @@ impl Bf16DeviceLanguageLayer {
         backend: &dyn Backend,
         allow_dual_layout: bool,
     ) -> Result<Self> {
+        let weights = weights.folded()?;
         Ok(Self {
             input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(

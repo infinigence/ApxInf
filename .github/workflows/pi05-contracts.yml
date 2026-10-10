@@ -1,0 +1,24 @@
+name: PI05 contracts
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'python/apxinf/**'
+      - 'scripts/*pi05*'
+      - 'tests/*pi05*'
+      - '.github/workflows/pi05-*.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r scripts/requirements-pi05-ci.txt
+      - run: python -m unittest discover -s tests -p test_pi05_ci.py -v
+      - run: bash -n scripts/run_pi05_ci.sh
+      - run: python scripts/check_pi05_module_boundaries.py
