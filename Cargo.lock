@@ -120,6 +120,7 @@ name = "apxinf-hip"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "half",
 ]
 
 [[package]]

@@ -11,184 +11,224 @@
 //! CUDA ABI and still reports `cuda:0`. That build stays as it is; this crate
 //! is a real backend with its own device identity, `Device::Hip`.
 //!
-//! # Status
+//! # What is implemented
 //!
-//! Skeleton. Every operator reports which operator is missing, so running a
-//! model against it names the next thing to implement rather than failing with
-//! a generic message. The runtime, memory and kernels arrive next; the model
-//! path that reaches them is already wired, so that work is purely additive.
+//! Every method `Backend` requires, plus sampling: the elementwise operators,
+//! RMSNorm, half-split RoPE, embedding, GEMM (hipBLAS, F32 accumulation),
+//! cached causal attention, a KV cache, transfers and synchronization. F32 and
+//! BF16 storage, F32 arithmetic, one rounding at the store — the numerics of
+//! apxinf-cuda, which models already run against. Device code lives in
+//! `kernels/apxinf_hip.hip`; see `build.rs` for how it is built and what
+//! happens on a host without ROCm.
+//!
+//! Not yet: the seven defaulted methods only Qwen3VL calls (`layer_norm`,
+//! `gelu_tanh`, `add_bias`, `rope_mrope`, `rope_vision_2d`, `vision_sdpa`,
+//! `concat_2d`) and graph capture. Nothing is fused or tuned; this milestone is
+//! about correctness, and the performance work comes after a model runs.
 //!
 //! Reachable models are those that compose through `dyn Backend` — Qwen3VL and
-//! llama. PI0.5, pi0-fast, GR00T and Qwen-Drive downcast to the concrete
-//! `CudaBackend` and call its kernels directly, so they cannot reach any
-//! non-CUDA backend until they are composed through the trait.
+//! llama. PI0.5, pi0-fast, GR00T and Qwen-Drive downcast to a concrete CUDA
+//! backend and call its kernels directly, so they cannot reach any non-CUDA
+//! backend until they are composed through the trait.
+
+mod ffi;
+mod kv_cache;
+mod ops;
+mod runtime;
+mod sampling;
 
 use std::any::Any;
+use std::sync::Arc;
 
 use apxinf_core::{
     Backend, Device, Error, Graph, KvCache, NormalGenerator, Result, SamplingBackend, Tensor,
     TokenSampler, TokenSamplingSpec,
 };
 
-/// Report a not-yet-implemented operator by name.
-///
-/// `apxinf_core::Error` has no dedicated variant for this on the current trait,
-/// and adding one would change a shared type for every backend. The operator
-/// name is what a caller needs, so it goes in the message.
-fn pending<T>(op: &'static str) -> Result<T> {
-    Err(Error::Other(format!(
-        "apxinf-hip: `{op}` is not implemented yet"
-    )))
-}
+pub use kv_cache::HipKVCache;
+pub use runtime::{HipContext, HipDeviceCaps};
 
-/// A HIP device.
-///
-/// Construction does not yet touch the HIP runtime, so it cannot report a
-/// missing device or a bad ordinal. Once the runtime lands, `new` validates the
-/// ordinal and queries capabilities, and this note goes away.
+/// A HIP device as an `apxinf_core::Backend`.
 pub struct HipBackend {
-    device_id: usize,
+    ctx: Arc<HipContext>,
 }
 
 impl HipBackend {
+    /// Open device `hip:{device_id}`. Fails if the crate was built without
+    /// ROCm, the device does not exist, or its architecture differs from the
+    /// one the kernels were compiled for.
     pub fn new(device_id: usize) -> Result<Self> {
-        Ok(Self { device_id })
+        Ok(Self { ctx: Arc::new(HipContext::new(device_id)?) })
     }
 
     pub fn device_id(&self) -> usize {
-        self.device_id
+        self.ctx.device_id()
+    }
+
+    pub fn caps(&self) -> &HipDeviceCaps {
+        self.ctx.caps()
+    }
+
+    pub fn context(&self) -> &Arc<HipContext> {
+        &self.ctx
+    }
+
+    fn cache<'a>(&self, kv: &'a mut dyn KvCache) -> Result<&'a mut HipKVCache> {
+        kv.as_any_mut()
+            .downcast_mut::<HipKVCache>()
+            .ok_or_else(|| Error::Other("apxinf-hip: expected a KV cache created by HipBackend".into()))
     }
 }
 
 impl SamplingBackend for HipBackend {
-    fn create_token_sampler(&self, _spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
-        pending("create_token_sampler")
+    fn create_token_sampler(&self, spec: TokenSamplingSpec) -> Result<Box<dyn TokenSampler>> {
+        Ok(Box::new(sampling::HipTokenSampler::new(Arc::clone(&self.ctx), spec)?))
     }
 
-    fn create_normal_generator(&self, _output: Tensor) -> Result<Box<dyn NormalGenerator>> {
-        pending("create_normal_generator")
+    fn create_normal_generator(&self, output: Tensor) -> Result<Box<dyn NormalGenerator>> {
+        Ok(Box::new(sampling::HipNormalGenerator::new(Arc::clone(&self.ctx), output)?))
     }
 }
 
 impl Backend for HipBackend {
-    fn rms_norm(&self, _input: &Tensor, _weight: &Tensor, _eps: f32) -> Result<Tensor> {
-        pending("rms_norm")
+    fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+        ops::rms_norm(&self.ctx, input, weight, eps)
     }
 
-    fn silu(&self, _input: &Tensor) -> Result<Tensor> {
-        pending("silu")
+    fn silu(&self, input: &Tensor) -> Result<Tensor> {
+        ops::silu(&self.ctx, input)
     }
 
-    fn add(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
-        pending("add")
+    fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        ops::binary(&self.ctx, "add", 0, a, b)
     }
 
-    fn mul(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
-        pending("mul")
+    fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        ops::binary(&self.ctx, "mul", 1, a, b)
     }
 
-    fn scale(&self, _input: &Tensor, _factor: f32) -> Result<Tensor> {
-        pending("scale")
+    fn scale(&self, input: &Tensor, factor: f32) -> Result<Tensor> {
+        ops::scale(&self.ctx, input, factor)
     }
 
-    fn matmul(&self, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
-        pending("matmul")
+    fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        ops::matmul(&self.ctx, a, b)
     }
 
     fn rope(
         &self,
-        _input: &Tensor,
-        _n_heads: usize,
-        _head_dim: usize,
-        _theta: f32,
-        _pos_offset: u32,
+        input: &Tensor,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        pos_offset: u32,
     ) -> Result<Tensor> {
-        pending("rope")
+        ops::rope(&self.ctx, input, n_heads, head_dim, theta, pos_offset)
     }
 
-    fn embedding(&self, _table: &Tensor, _ids: &[u32]) -> Result<Tensor> {
-        pending("embedding")
+    fn embedding(&self, table: &Tensor, ids: &[u32]) -> Result<Tensor> {
+        ops::embedding(&self.ctx, table, ids)
     }
 
+    /// One query token sees every cached position.
     #[allow(clippy::too_many_arguments)]
     fn sdpa_decode(
         &self,
-        _q: &Tensor,
-        _kv: &mut dyn KvCache,
-        _layer_idx: usize,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _kv_len: usize,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
         _max_seq_len: usize,
     ) -> Result<Tensor> {
-        pending("sdpa_decode")
+        let kv_offset = kv_len.checked_sub(1).ok_or_else(|| {
+            Error::Other("apxinf-hip: decode attention over an empty cache".into())
+        })?;
+        self.cache(kv)?
+            .attention(q, layer_idx, n_heads, n_kv_heads, head_dim, kv_len, kv_offset)
     }
 
+    /// Query row `i` of `q_len` sees positions `[0, kv_len - q_len + i]`.
     #[allow(clippy::too_many_arguments)]
     fn sdpa_prefill(
         &self,
-        _q: &Tensor,
-        _kv: &mut dyn KvCache,
-        _layer_idx: usize,
-        _n_heads: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _kv_len: usize,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
         _max_seq_len: usize,
     ) -> Result<Tensor> {
-        pending("sdpa_prefill")
+        let q_len = q.shape().dims().first().copied().unwrap_or(0);
+        let kv_offset = kv_len.checked_sub(q_len).ok_or_else(|| {
+            Error::Other(format!(
+                "apxinf-hip: prefill of {q_len} tokens cannot attend over {kv_len} positions"
+            ))
+        })?;
+        self.cache(kv)?
+            .attention(q, layer_idx, n_heads, n_kv_heads, head_dim, kv_len, kv_offset)
     }
 
-    /// Returns a placeholder cache.
-    ///
-    /// The trait returns `Box<dyn KvCache>` rather than a `Result`, so this
-    /// cannot report the missing implementation here. [`PendingKvCache`] fails
-    /// on first use instead, which is the earliest point an error can be
-    /// returned.
+    /// The cache allocates on its first append, once it knows the dtype; that
+    /// is also where an allocation failure can be reported, since this method
+    /// cannot return one.
     fn create_kv_cache(
         &self,
-        _n_layers: usize,
-        _n_kv_heads: usize,
-        _head_dim: usize,
-        _max_seq_len: usize,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
     ) -> Box<dyn KvCache> {
-        Box::new(PendingKvCache)
+        Box::new(HipKVCache::new(
+            Arc::clone(&self.ctx),
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+        ))
     }
 
     fn kv_append(
         &self,
-        _kv: &mut dyn KvCache,
-        _layer_idx: usize,
-        _k: &Tensor,
-        _v: &Tensor,
-        _append_len: usize,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        k: &Tensor,
+        v: &Tensor,
+        append_len: usize,
     ) -> Result<()> {
-        pending("kv_append")
+        self.cache(kv)?.append(layer_idx, k, v, append_len)
     }
 
     fn synchronize(&self) -> Result<()> {
-        pending("synchronize")
+        self.ctx.synchronize()
     }
 
     fn begin_capture(&self) -> Result<()> {
-        pending("begin_capture")
+        Err(Error::Other(
+            "apxinf-hip: graph capture is not implemented yet; run eagerly".into(),
+        ))
     }
 
     fn end_capture(&self) -> Result<Box<dyn Graph>> {
-        pending("end_capture")
+        Err(Error::Other(
+            "apxinf-hip: graph capture is not implemented yet; run eagerly".into(),
+        ))
     }
 
     fn device(&self) -> Device {
-        Device::Hip(self.device_id)
+        self.ctx.device()
     }
 
-    fn to_device(&self, _tensor: &Tensor) -> Result<Tensor> {
-        pending("to_device")
+    fn to_device(&self, tensor: &Tensor) -> Result<Tensor> {
+        self.ctx.to_device(tensor)
     }
 
-    fn to_cpu(&self, _tensor: &Tensor) -> Result<Tensor> {
-        pending("to_cpu")
+    fn to_cpu(&self, tensor: &Tensor) -> Result<Tensor> {
+        self.ctx.to_cpu(tensor)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -196,77 +236,20 @@ impl Backend for HipBackend {
     }
 }
 
-/// Placeholder KV cache, so `create_kv_cache` has something to hand back until
-/// a real one exists. Every fallible method reports the missing backing store;
-/// the infallible ones describe an empty cache.
-struct PendingKvCache;
-
-impl KvCache for PendingKvCache {
-    fn append(
-        &mut self,
-        _layer_idx: usize,
-        _k: &Tensor,
-        _v: &Tensor,
-        _append_len: usize,
-    ) -> Result<()> {
-        pending("KvCache::append")
-    }
-
-    fn advance(&mut self, _n: usize) {}
-
-    fn seq_len(&self) -> usize {
-        0
-    }
-
-    fn clear(&mut self) -> Result<()> {
-        pending("KvCache::clear")
-    }
-
-    fn n_layers(&self) -> usize {
-        0
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-#[cfg(test)]
+/// Device behaviour is tested on hardware in `tests/ops.rs`; this covers the
+/// one thing a host without ROCm can check.
+#[cfg(all(test, not(apxinf_hip_runtime)))]
 mod tests {
     use super::*;
 
-    /// The backend must be object-safe and report its own device: model code
-    /// holds `Arc<dyn Backend>` and routes tensors by what `device()` returns.
+    /// Without ROCm the backend must refuse to start and say why, rather than
+    /// fail to link or hand out a backend that errors on every call.
     #[test]
-    fn reports_its_own_hip_device_through_the_trait() {
-        let backend: Box<dyn Backend> = Box::new(HipBackend::new(1).unwrap());
-        assert_eq!(backend.device(), Device::Hip(1));
-        assert!(backend.device().is_gpu());
-    }
-
-    /// A missing operator names itself, so a model run points at the next thing
-    /// to implement rather than reporting a generic failure.
-    #[test]
-    fn unimplemented_operators_name_themselves() {
-        let backend = HipBackend::new(0).unwrap();
-        let x = Tensor::zeros(vec![2, 2], apxinf_core::DType::F32);
-        let message = backend.silu(&x).unwrap_err().to_string();
-        assert!(message.contains("silu"), "unexpected message: {message}");
-        assert!(message.contains("apxinf-hip"), "unexpected message: {message}");
-    }
-
-    /// `create_kv_cache` cannot fail in the trait, so the failure has to land on
-    /// first use rather than being swallowed.
-    #[test]
-    fn placeholder_kv_cache_fails_on_use_not_on_creation() {
-        let backend = HipBackend::new(0).unwrap();
-        let mut cache = backend.create_kv_cache(2, 1, 4, 8);
-        let t = Tensor::zeros(vec![1, 1, 4], apxinf_core::DType::F32);
-        assert!(cache.append(0, &t, &t, 1).is_err());
-        assert!(cache.clear().is_err());
+    fn without_rocm_the_backend_reports_why_it_cannot_start() {
+        let message = match HipBackend::new(0) {
+            Ok(_) => panic!("a stub build must not construct a backend"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("built without ROCm"), "unexpected: {message}");
     }
 }
