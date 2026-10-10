@@ -420,17 +420,89 @@ impl Pi05Config {
             .ok_or_else(|| Error::Other("pi05 BF16 CUDA workspace exceeds address space".into()))
     }
 
-    /// Conservative reservation for the first W8A8 implementation.
+    /// Reserve the BF16 intermediate schedule plus each W8A8 linear's
+    /// quantized activation, row scales and INT32 vendor accumulator.
     ///
-    /// Each linear stores a one-byte quantized activation and a two-byte BF16
-    /// output. Aligned SM80-family GEMMs scale directly into BF16; the
-    /// unaligned patch projection additionally stores one INT32 accumulator.
-    /// Twice the BF16 arena remains a simple conservative upper bound and also
-    /// leaves room for the optional dual-backend correctness verifier.
+    /// The accumulator is included even when CUTLASS writes BF16 directly:
+    /// preparation may select or fall back to the vendor implementation.
+    /// BF16 split-KV scratch is also included. Fixed timestep modulation is
+    /// prepared outside the capture arena.
     pub fn cuda_graph_workspace_bytes_int8_dynamic(&self, token_count: usize) -> Result<usize> {
-        self.cuda_graph_workspace_bytes_bf16(token_count)?
-            .checked_mul(2)
-            .ok_or_else(|| Error::Other("pi05 INT8 CUDA workspace exceeds address space".into()))
+        const ALIGNMENT: u128 = 256;
+        let mut total = self.cuda_graph_workspace_bytes_bf16(token_count)? as u128;
+        let mut linear = |rows: usize, input: usize, output: usize| {
+            for bytes in [
+                rows as u128 * input as u128,
+                rows as u128 * std::mem::size_of::<f32>() as u128,
+                rows as u128 * output as u128 * std::mem::size_of::<i32>() as u128,
+            ] {
+                total = (total + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+                total += bytes;
+            }
+        };
+
+        let patches = self.num_views * self.patches_per_view();
+        let vision = self.vision_width;
+        linear(patches, 3 * self.patch_size * self.patch_size, vision);
+        for _ in 0..self.vision_depth {
+            linear(patches, vision, 3 * vision);
+            linear(patches, vision, vision);
+            linear(patches, vision, self.vision_mlp_dim);
+            linear(patches, self.vision_mlp_dim, vision);
+        }
+        linear(patches, vision, self.language.width);
+
+        let prefix = patches + token_count;
+        let language_q = self.language.num_heads * self.language.head_dim;
+        let language_kv = self.language.num_kv_heads * self.language.head_dim;
+        for index in 0..self.language.depth {
+            linear(prefix, self.language.width, language_q + 2 * language_kv);
+            if index + 1 < self.language.depth {
+                linear(prefix, language_q, self.language.width);
+                linear(prefix, self.language.width, 2 * self.language.mlp_dim);
+                linear(prefix, self.language.mlp_dim, self.language.width);
+            }
+        }
+
+        let horizon = self.action_horizon;
+        let action = self.action_expert.width;
+        let action_q = self.action_expert.num_heads * self.action_expert.head_dim;
+        let action_kv = self.action_expert.num_kv_heads * self.action_expert.head_dim;
+        for _ in 0..self.num_flow_steps {
+            linear(horizon, self.action_dim, action);
+            for _ in 0..self.action_expert.depth {
+                linear(horizon, action, action_q + 2 * action_kv);
+                linear(horizon, action_q, action);
+                linear(horizon, action, 2 * self.action_expert.mlp_dim);
+                linear(horizon, self.action_expert.mlp_dim, action);
+            }
+            linear(horizon, action, self.action_dim);
+        }
+
+        // BF16 MQA can use split-KV for the short action queries. Reserve
+        // its maximum scratch even when the current target does not use it.
+        let heads = self.action_expert.num_heads;
+        let dim = self.action_expert.head_dim;
+        if horizon <= 64 && heads > self.action_expert.num_kv_heads && matches!(dim, 128 | 256) {
+            let block_n = if dim <= 128 { 128 } else { 64 };
+            let splits = (prefix + horizon).div_ceil(block_n).min(128);
+            let rows = horizon as u128 * heads as u128;
+            for _ in 0..self.num_flow_steps {
+                for _ in 0..self.action_expert.depth {
+                    for elements in [
+                        rows,
+                        splits as u128 * rows,
+                        splits as u128 * rows * dim as u128,
+                    ] {
+                        total = (total + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+                        total += elements * std::mem::size_of::<f32>() as u128;
+                    }
+                }
+            }
+        }
+
+        usize::try_from(total)
+            .map_err(|_| Error::Other("pi05 INT8 CUDA workspace exceeds address space".into()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -617,6 +689,40 @@ mod tests {
             .unwrap();
         assert!(bytes > 1_800_000_000);
         assert!(bytes < 2_500_000_000);
+    }
+
+    #[test]
+    fn int8_arena_covers_recorded_orin_captures() {
+        // Full H50/10-flow captures, real pi05_base-b211f3d checkpoint.
+        // Independent allocator observations, not a copy of the size formula.
+        for (views, tokens, used) in [
+            (1, 10, 2_019_261_056),
+            (1, 200, 2_765_572_224),
+            (2, 10, 3_406_411_392),
+            (2, 200, 4_152_722_560),
+            (3, 10, 4_793_561_728),
+            (3, 200, 5_539_872_896),
+        ] {
+            let config = Pi05Config {
+                num_views: views,
+                ..Pi05Config::default()
+            };
+            let bytes = config
+                .cuda_graph_workspace_bytes_int8_dynamic(tokens)
+                .unwrap();
+            assert!(bytes >= used, "{views} views, {tokens} tokens");
+            let previous = 2 * config.cuda_graph_workspace_bytes_bf16(tokens).unwrap();
+            assert!(
+                bytes < previous,
+                "reservation must improve the measured profiles"
+            );
+        }
+        assert!(Pi05Config::default()
+            .cuda_graph_workspace_bytes_int8_dynamic(0)
+            .is_err());
+        assert!(Pi05Config::default()
+            .cuda_graph_workspace_bytes_int8_dynamic(201)
+            .is_err());
     }
 
     #[test]

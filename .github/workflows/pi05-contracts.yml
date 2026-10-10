@@ -22,3 +22,4 @@ jobs:
       - run: python -m unittest discover -s tests -p test_pi05_ci.py -v
       - run: bash -n scripts/run_pi05_ci.sh
       - run: python scripts/check_pi05_module_boundaries.py
+      - run: cargo test --locked -p apxinf-model pi05::config::tests

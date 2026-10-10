@@ -93,8 +93,17 @@ A following bias/SiLU fusion reproduces 111 actual auxiliary operands bitwise
 and leaves all 43 complete outputs bitwise unchanged from that control. All
 43 chunk/step checks pass. Warm P50 pilots T10/T200 are 67.085/68.736,
 73.194/77.193, 87.342/90.370ms; first calls are 268.869/276.102,
-295.920/333.587, 335.984/429.250ms. A new paired run is in progress; these
-pilots do not establish first-call acceptance or a maintained repair.
+295.920/333.587, 335.984/429.250ms. The 5,400-sample paired run completed;
+16 groups are uncontaminated and all their P50/P95 values fall below both
+controls. An external GPU benchmark invalidated one two-view block; subsequent
+rechecks also captured external CPU compilation and are preserved as invalid.
+A final two-view A/B/A recheck has 58/57/58 continuous process samples with no
+foreign GPU client or compiler. T10 first calls are 297.638/295.932/297.641ms
+and P50 is 73.771/73.476/73.875ms; T200 first calls are
+352.788/331.417/350.400ms and P50 is 84.390/77.314/84.478ms. Every recheck
+P50/P95 and first call is below both controls. This qualifies this private
+candidate on the selected inputs; formal operator integration still requires
+its own precision and performance regression.
 
 On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
 outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster
@@ -536,5 +545,43 @@ creation differs by about .25ms. Memory tracing identifies the reservation as
 8,304,121,344 bytes in both builds. A reversed profiled pair changes the sign
 of its allocation-time difference (742.3ms after versus 768.6ms before), so the
 profile does not establish a repair-specific allocation cost. Reversed
-unprofiled controls and actual arena-usage measurement are still required.
-This remains an open repair/performance qualification item.
+unprofiled controls completed another nine fresh processes and 18 first calls.
+The base two-view T10 difference changes direction in two of three reversed
+blocks; this does not establish a repair-specific cold cost or an approved
+first-call budget.
+
+Six independent native arena observations measure 2.019/2.766GB,
+3.406/4.153GB and 4.794/5.540GB for one/two/three views at T10/T200,
+about 40–42.2% of the old reservation. An ignored half-capacity causal probe
+preserves all 43 outputs bitwise and lowers first-call pilots, but an empirical
+fraction is not a safe production bound. The maintained reservation candidate
+instead adds each captured W8A8 linear's aligned quantized input, FP32 row
+scales and vendor INT32 accumulator to the BF16 bound, plus maximum split-KV
+scratch. It reduces the selected reservations by about 6.5–9%, without changing
+kernels, arithmetic or the inference timer. Nine CPU configuration tests pass;
+Orin base 43 inputs and both LIBERO token modes are bitwise unchanged, including
+repeat/revisit checks. Three product → candidate → product blocks per base
+view count and LIBERO profile retain 7,200 warm samples and 72 shape-first
+calls. P50 changes span −.385% to +.301%; P95 spans −.668% to +.280%.
+One-view T200 initially has a small, same-sign mean P50 increment of +.125%.
+A further 1,800-sample, 18-first-call candidate → product → candidate comparison
+reverses the increment in two of three blocks: mean P50/P95 changes are
++.0027%/−.0060%, while mean first-call change is −5.04% (T10: −8.03%).
+No reproducible warm regression is detected in this counterbalanced check;
+this is not a claim of identical latency or an approved CI budget. The native
+CUDA fatbin is identical between the product and reservation candidate.
+
+The matrix's read-only resource observer begins during block0, leaving the
+first five phases unobserved; observed phases have no foreign GPU clients or
+compiler processes. The counterbalanced follow-up has 353 continuous samples
+with neither interference. Some matrix processes incur major page faults;
+those samples cover model loading too, so the receipt cannot assert fault-free
+inference. All raw timings remain included.
+
+A forced full-vendor pressure probe fails with cuBLAS status15; it cannot count
+as capacity qualification. A separate layout/algorithm ablation passes a fully
+aligned128×1024×1024 control eagerly and in graph replay for both layouts and
+all three algorithms, but the sampled actual multirow shapes still return15.
+Neither a general M%4 explanation nor a library-wide lack of INT8 support is
+established. Fallback support diagnosis remains open; the bound explicitly
+reserves every vendor accumulator and does not depend on CUTLASS selection.
