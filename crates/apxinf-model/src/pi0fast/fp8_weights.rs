@@ -37,10 +37,6 @@ impl Fp8LinearWeights {
         kernels::gemm::Fp8WeightView {
             values_e4m3: &self.weight,
             scale: self.weight_scale,
-            // π0-FAST packs gate/up plainly, so the interleaved dual-GeGLU
-            // layouts the π0.5 runtime uses never apply here.
-            dual_geglu_interleaved: false,
-            dual_geglu_auto_interleaved: None,
         }
     }
 

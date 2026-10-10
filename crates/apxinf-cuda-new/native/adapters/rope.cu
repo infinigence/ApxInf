@@ -209,3 +209,90 @@ extern "C" apxinf_status_t apxinf_rope_launch(
     apxinf::framework::check_cuda(status);
   });
 }
+
+namespace {
+
+bool valid_batched_rope(uint32_t head_dim, uint32_t n_heads, int32_t seq_len) {
+  return head_dim != 0 && head_dim % 2 == 0 && head_dim <= 2048 &&
+         n_heads != 0 && seq_len > 0;
+}
+
+}  // namespace
+
+extern "C" apxinf_status_t apxinf_rope_apply_batched_bf16(
+    const void* input, void* output, int32_t n_heads, int32_t head_dim,
+    int32_t seq_len, float theta, int32_t pos_offset,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (input == nullptr || output == nullptr || n_heads <= 0 || head_dim <= 0 ||
+        seq_len <= 0 || pos_offset < 0 ||
+        !valid_batched_rope(static_cast<uint32_t>(head_dim),
+                            static_cast<uint32_t>(n_heads), seq_len)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid batched RoPE arguments");
+    }
+    const dim3 block(kDecodeThreads, 1, 1);
+    const dim3 grid((static_cast<uint32_t>(head_dim) / 2 + kDecodeThreads - 1) /
+                        kDecodeThreads,
+                    static_cast<uint32_t>(n_heads),
+                    static_cast<uint32_t>(seq_len));
+    rope_batched_bf16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_bfloat16*>(output), static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(n_heads), static_cast<uint32_t>(seq_len), theta,
+        static_cast<uint32_t>(pos_offset));
+    apxinf::framework::check_cuda(cudaGetLastError());
+  });
+}
+
+extern "C" apxinf_status_t apxinf_rope_apply_mrope_bf16(
+    const void* input, void* output, int32_t n_heads, int32_t head_dim,
+    int32_t seq_len, float theta, const void* pos_ids, int32_t sec_h,
+    int32_t sec_w, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (input == nullptr || output == nullptr || pos_ids == nullptr ||
+        n_heads <= 0 || head_dim <= 0 || seq_len <= 0 || sec_h < 0 ||
+        sec_w < 0 ||
+        !valid_batched_rope(static_cast<uint32_t>(head_dim),
+                            static_cast<uint32_t>(n_heads), seq_len)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid mRoPE arguments");
+    }
+    const dim3 block(kDecodeThreads, 1, 1);
+    const dim3 grid((static_cast<uint32_t>(head_dim) / 2 + kDecodeThreads - 1) /
+                        kDecodeThreads,
+                    static_cast<uint32_t>(n_heads),
+                    static_cast<uint32_t>(seq_len));
+    rope_mrope_bf16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_bfloat16*>(output), static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(n_heads), static_cast<uint32_t>(seq_len), theta,
+        static_cast<const uint32_t*>(pos_ids), static_cast<uint32_t>(sec_h),
+        static_cast<uint32_t>(sec_w));
+    apxinf::framework::check_cuda(cudaGetLastError());
+  });
+}
+
+extern "C" apxinf_status_t apxinf_rope_apply_vision_2d_bf16(
+    const void* input, void* output, int32_t n_heads, int32_t head_dim,
+    int32_t seq_len, float theta, const void* pos_ids,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (input == nullptr || output == nullptr || pos_ids == nullptr ||
+        n_heads <= 0 || head_dim <= 0 || seq_len <= 0 ||
+        !valid_batched_rope(static_cast<uint32_t>(head_dim),
+                            static_cast<uint32_t>(n_heads), seq_len)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid vision 2D RoPE arguments");
+    }
+    const dim3 block(kDecodeThreads, 1, 1);
+    const dim3 grid((static_cast<uint32_t>(head_dim) / 2 + kDecodeThreads - 1) /
+                        kDecodeThreads,
+                    static_cast<uint32_t>(n_heads),
+                    static_cast<uint32_t>(seq_len));
+    rope_vision_2d_bf16_kernel<<<grid, block, 0,
+                                 static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_bfloat16*>(output), static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(n_heads), static_cast<uint32_t>(seq_len), theta,
+        static_cast<const uint32_t*>(pos_ids));
+    apxinf::framework::check_cuda(cudaGetLastError());
+  });
+}

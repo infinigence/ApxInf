@@ -179,6 +179,10 @@ fn run(command: &mut Command, action: &str) {
 }
 
 fn main() {
+    // The sm110 AOT fast paths are not vendored into cuda-new; the cfg is
+    // declared so their `cfg!` guards compile and always take the generic
+    // route.
+    println!("cargo:rustc-check-cfg=cfg(apxinf_aot_sm110)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -286,6 +290,12 @@ fn main() {
         "attention/execution.cpp",
         "attention/providers/custom.cu",
         "elementwise/execution.cpp",
+        "elementwise/ops.cpp",
+        "cache/ops.cpp",
+        "quant_fused/ops.cpp",
+        "vla_attn/ops.cpp",
+        "vla_la/ops.cu",
+        "preprocess/ops.cpp",
         "linear_attention/execution.cpp",
         "attn_helpers/execution.cpp",
         "reduction/execution.cpp",
@@ -299,6 +309,11 @@ fn main() {
     .map(|source| adapters.join(source))
     .to_vec();
     generic_sources.push(native.join("kernels/custom/mlp_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/elementwise_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/cache_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/quant_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/vla_attn_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/preprocess_ops.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
     generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
     generic_sources.push(native.join("kernels/custom/attn_ops.cu"));

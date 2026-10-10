@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use apxinf_cuda::kernels::gemm::Bf16ActivationObserver;
+use apxinf_cuda_new::kernels::gemm::Bf16ActivationObserver;
 use apxinf_core::{Backend, Error, Result, Tensor};
 
 use super::backend::RuntimeBackend;

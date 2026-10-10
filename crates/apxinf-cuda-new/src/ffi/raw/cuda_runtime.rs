@@ -93,6 +93,14 @@ extern "C" {
         count: usize,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn cudaMemset2DAsync(
+        devPtr: *mut c_void,
+        pitch: usize,
+        value: i32,
+        width: usize,
+        height: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError_t;
     pub fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: u32) -> cudaError_t;

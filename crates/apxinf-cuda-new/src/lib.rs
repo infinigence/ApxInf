@@ -1,15 +1,22 @@
+pub mod backend;
 pub mod buffer;
 pub mod context;
+pub mod cublas;
+pub mod nvtx;
+pub mod tuning;
 pub mod device_caps;
 mod ffi;
 mod graph;
+pub mod kernels;
 pub mod sampling;
 pub mod stream;
 pub mod transfers;
 mod workspace;
 
+pub use backend::{CudaKvCache, CudaNewBackend};
 pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
 pub use context::CudaContext;
+pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use graph::{capture, CapturedGraph};
 pub use ops::{

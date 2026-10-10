@@ -136,6 +136,17 @@ impl ExecutionSession {
         &self.inner.workspace
     }
 
+    /// Arena capacity in bytes. Convenience passthrough for callers that
+    /// treat the session as the legacy `GraphWorkspace`.
+    pub fn capacity(&self) -> usize {
+        self.inner.workspace.capacity()
+    }
+
+    /// Bytes handed out by the arena so far.
+    pub fn used(&self) -> usize {
+        self.inner.workspace.used()
+    }
+
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic workspace slices, prepares native resources,
@@ -360,5 +371,54 @@ pub(crate) fn output_buffer(ctx: &crate::CudaContext, bytes: usize) -> Result<Cu
                 .workspace
                 .allocate(bytes, ctx.device_id())
         }
+    })
+}
+
+/// Like [`output_buffer`], but cleared even when the session arena hands back
+/// a reused view.
+pub(crate) fn output_buffer_zeroed(ctx: &crate::CudaContext, bytes: usize) -> Result<CudaBuffer> {
+    ACTIVE_SESSION.with(|active| {
+        let inner = active.get();
+        if inner.is_null() {
+            CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream()).map_err(Error::Cuda)
+        } else {
+            let buffer = unsafe { &*inner }.workspace.allocate(bytes, ctx.device_id())?;
+            buffer
+                .memset_async(0, bytes, ctx.stream())
+                .map_err(Error::Cuda)?;
+            Ok(buffer)
+        }
+    })
+}
+
+/// As [`output_buffer_zeroed`], but only the trailing rows of each group:
+/// `group_bytes - used_bytes` trailing bytes in each of `groups` groups.
+pub(crate) fn output_buffer_tail_zeroed(
+    ctx: &crate::CudaContext,
+    groups: usize,
+    group_bytes: usize,
+    used_bytes: usize,
+) -> Result<CudaBuffer> {
+    let bytes = groups
+        .checked_mul(group_bytes)
+        .ok_or_else(|| Error::Other("scratch extent overflow".into()))?;
+    let tail = group_bytes
+        .checked_sub(used_bytes)
+        .ok_or_else(|| Error::Other("scratch used bytes exceed group extent".into()))?;
+    ACTIVE_SESSION.with(|active| {
+        let inner = active.get();
+        let buffer = if inner.is_null() {
+            // A fresh driver allocation still has to establish the tail, but
+            // it is not a reused arena, so the payload rows need no clearing.
+            CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?
+        } else {
+            unsafe { &*inner }.workspace.allocate(bytes, ctx.device_id())?
+        };
+        if tail > 0 && groups > 0 {
+            buffer
+                .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
+                .map_err(Error::Cuda)?;
+        }
+        Ok(buffer)
     })
 }

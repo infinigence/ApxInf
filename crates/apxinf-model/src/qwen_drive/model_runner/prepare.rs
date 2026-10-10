@@ -174,9 +174,9 @@ impl DirectPlan {
         // One arena is reused sequentially for Vision, Language and Action inside
         // the same graph. Only persistent visual features and shared KV cross phases.
         let bytes = 32usize * (1 << 30);
-        let workspace = kernels::GraphWorkspace::new(bytes, ctx.device_id())?;
+        let workspace = kernels::GraphWorkspace::with_capacity(bytes, ctx.device_id())?;
         let noise_workspace =
-            kernels::GraphWorkspace::new(inputs.noise.numel() * 4 + 256, ctx.device_id())?;
+            kernels::GraphWorkspace::with_capacity(inputs.noise.numel() * 4 + 256, ctx.device_id())?;
         let spec = sample.observation.inference_spec();
         let image_positions = sample
             .observation
@@ -400,7 +400,7 @@ impl PreparedInference for DirectPlan {
 mod tests {
     use super::*;
     use crate::{
-        qwen_drive::backend::RuntimeBackend,
+        qwen_drive::backend::{Context, RuntimeBackend},
         vla::{Observation, PlanningOptions, VisionObservation, VlaMetadata},
         LoadOptions, LoadedModel,
     };
@@ -478,7 +478,7 @@ mod tests {
             ..Default::default()
         };
         let request = VlaRequest::provided_with_metadata(&original, &noise, metadata);
-        let backend = Arc::new(RuntimeBackend::new(0).unwrap());
+        let backend = Arc::new(RuntimeBackend::new(Arc::new(Context::new(0).unwrap())));
         let loaded = crate::qwen_drive::load::load_registered(
             Path::new(&checkpoint),
             Device::Cuda(0),

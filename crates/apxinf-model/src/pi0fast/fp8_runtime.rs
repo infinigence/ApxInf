@@ -149,7 +149,7 @@ impl Pi0FastFp8Runtime {
             .as_ref()
             .is_none_or(|workspace| workspace.capacity() < capacity)
         {
-            *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
+            *arena = Some(GraphWorkspace::with_capacity(capacity, self.ctx().device_id())?);
         }
         kernels::with_workspace_eager(
             arena.as_ref().expect("arena is populated above"),

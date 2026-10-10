@@ -14,6 +14,8 @@ pub struct CudaContext {
     stream: Arc<CudaStream>,
     runtime: crate::ffi::abi::types::Runtime,
     caps: CudaDeviceCaps,
+    cublas: crate::cublas::CublasHandle,
+    tuning: std::sync::RwLock<Arc<crate::tuning::TuningSession>>,
 }
 
 impl CudaContext {
@@ -53,11 +55,16 @@ impl CudaContext {
             }
         };
 
+        let cublas = crate::cublas::CublasHandle::new()?;
+        cublas.set_stream(&stream)?;
+
         Ok(Self {
             device_id,
             stream,
             runtime,
             caps,
+            cublas,
+            tuning: std::sync::RwLock::new(crate::tuning::default_session()),
         })
     }
 
@@ -77,6 +84,28 @@ impl CudaContext {
     }
     pub fn stream(&self) -> &CudaStream {
         &self.stream
+    }
+    /// Raw cuBLAS handle bound to the context stream, for the direct-launch
+    /// GEMM helpers that predate the tuned GEMM operator.
+    pub fn cublas(&self) -> &crate::cublas::CublasHandle {
+        &self.cublas
+    }
+    /// The installed tuning session (plan-invalidation identity; cuda-new
+    /// operators tune through recipes, not through this session).
+    pub fn tuning(&self) -> Arc<crate::tuning::TuningSession> {
+        self.tuning
+            .read()
+            .expect("CUDA tuning session lock is poisoned")
+            .clone()
+    }
+    /// Install a session before model prepare. Prepared plans keyed on the
+    /// previous session observe the identity change and rebuild.
+    pub fn install_tuning(&self, session: crate::tuning::TuningSession) -> Result<(), String> {
+        *self
+            .tuning
+            .write()
+            .map_err(|_| "CUDA tuning session lock is poisoned".to_string())? = Arc::new(session);
+        Ok(())
     }
     pub fn caps(&self) -> &CudaDeviceCaps {
         &self.caps

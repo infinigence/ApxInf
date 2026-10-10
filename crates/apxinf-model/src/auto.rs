@@ -328,6 +328,31 @@ impl AutoModel {
         }
 
         register_builtin_models();
+        // Migrated families receive a cuda-new backend instead of the legacy
+        // one. The LLM/VLM families compose entirely through `dyn Backend`,
+        // so the swap needs no model-side change; π0-FAST reaches cuda-new
+        // through its kernel seam and downcasts to the concrete backend.
+        // Remaining families take the legacy backend until their own stage.
+        #[cfg(feature = "cuda")]
+        let backend = if matches!(device, Device::Cuda(_))
+            && matches!(
+                model_name,
+                "llama"
+                    | "qwen3_vl"
+                    | "qwen3vl"
+                    | "pi0fast"
+                    | "pi0_fast"
+                    | "walloss"
+                    | "wall-oss"
+                    | "wall_oss_05"
+                    | "qwen_drive"
+            )
+        {
+            crate::accelerator::create_cuda_new_backend(device)?
+        } else {
+            create_backend(device)?
+        };
+        #[cfg(not(feature = "cuda"))]
         let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
         if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {

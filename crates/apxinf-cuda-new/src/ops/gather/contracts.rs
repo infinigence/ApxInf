@@ -118,10 +118,13 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn dtype_code(dtype: DType) -> Result<u32> {
+fn dtype_code(dtype: DType, semantic: GatherSemantic) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
+        // F32 output is accepted only for RGB preprocessing: pi0-fast keeps
+        // its patch pipeline in F32 until the first projection.
+        DType::F32 if semantic == GatherSemantic::RgbToPatches => Ok(0),
         _ => Err(invalid("Gather currently supports F16 and BF16")),
     }
 }
@@ -368,7 +371,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
         semantic: semantic.code(),
-        dtype: dtype_code(dtype)?,
+        dtype: dtype_code(dtype, semantic)?,
         has_bias: u32::from(!bias.is_null()),
         vocab_size: if matches!(semantic, GatherSemantic::EmbeddingLookup) {
             u32::try_from(args.vocab_size)

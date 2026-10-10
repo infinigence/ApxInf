@@ -3,6 +3,7 @@
 mod attention;
 mod attn_ops;
 mod cache;
+mod elementwise;
 mod gather;
 mod gdn;
 mod gemm;
@@ -34,7 +35,11 @@ pub use attention::{
 pub use attn_ops::{
     apply_output_gate, head_rms_norm, partial_rope, rotary_dim, split_query_and_gate,
 };
-pub use cache::{concat_rows, reserve_prefix};
+pub use cache::{append as cache_append, concat_rows, reserve_prefix};
+pub use elementwise::{
+    activation as elementwise_activation, add as elementwise_add, add_bias as elementwise_add_bias,
+    mul as elementwise_mul, scale as elementwise_scale, ElementwiseActivation,
+};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gdn::{
     convert_f16_to_bf16, flashinfer_gdn_prefill, flashinfer_gdn_workspace_bytes,
@@ -61,6 +66,8 @@ pub use norm::{
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
 pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{decode_rope, rope, DecodeRopeArgs, RopeArgs, RopeSemantic};
+pub use rope::{apply_batched as rope_apply_batched, apply_mrope as rope_apply_mrope,
+    apply_vision_2d as rope_apply_vision_2d};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(
