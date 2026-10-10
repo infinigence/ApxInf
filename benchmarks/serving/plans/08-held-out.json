@@ -1,0 +1,6 @@
+[
+  {"case_id":"held-out-p257-g32-r0","input_tokens":257,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"held-out-p512-g256-r0","input_tokens":512,"max_tokens":256,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"held-out-p8192-g32-r0","input_tokens":8192,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"held-out-p14336-g2048-r0","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":0}
+]

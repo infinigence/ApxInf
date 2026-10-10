@@ -1,0 +1,7 @@
+[
+  {"case_id":"edge-p16384-g0-r0","input_tokens":16384,"max_tokens":0,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"edge-p16383-g1-r0","input_tokens":16383,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"edge-p16352-g32-r0","input_tokens":16352,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"edge-p16128-g256-r0","input_tokens":16128,"max_tokens":256,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"edge-p14336-g2048-r0","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":0}
+]
