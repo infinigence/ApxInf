@@ -1,0 +1,4 @@
+[
+  {"case_id":"fresh-edge-p14336-g2048-r0","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"fresh-edge-p14336-g2048-r1","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":1}
+]

@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Design a small Python inventory program for a community workshop. Describe data structures for tools, borrowers, and return dates. Write functions that record a loan, reject a duplicate loan, process a return, and list overdue items. Include examples for empty input, unknown identifiers, and repeated returns. Explain the expected result of each example."
+  }
+]

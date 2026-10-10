@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Write a numbered maintenance notebook for a small library catalogue. Each entry must describe a different consistency check and give a concrete example. Include book identifiers, duplicate records, missing authors, shelf locations, loan dates, returns, and damaged copies. Explain each check in complete sentences."
+  }
+]
