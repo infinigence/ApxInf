@@ -6,12 +6,24 @@ missing asset, uncalibrated performance budget, or failed preflight cannot pass.
 
 ## Current repair qualification (2026-10-10)
 
-Private native BF16 controls now pass all 37 diagnostic chunks and every action
-step on both boards: 13/13 one view, 13/13 two views, 11/11 three views. Orin's
+Private native BF16 controls pass the original 37 diagnostic chunks and every
+action step on both boards: 13/13 one view, 13/13 two views, 11/11 three views. Orin's
 combined separate-QKV, one-view language output projection and three-view
 visual projector control has 11/11 three-view chunks bitwise OpenPI; repeats
 and revisits have zero drift. These are native diagnostic controls, not
 maintained model repairs or a qualified representative bank.
+
+Six additional diagnostics cross the configured T200 length boundary with zero
+noise: gradient and black images for each of one, two and three views. These
+exercise lengths whose GEMM recipes differ from the short-token zero-noise
+cases. Thor's candidate is bitwise OpenPI on all six. Orin's candidate passes
+five; one-view black+T200+zero has whole-chunk cosine .999300 and relative L2
+.047037, but action-step cosine reaches .998624 and relative L2 .060895, failing
+the unchanged .999/.05 floors. Both product builds fail black+T200+zero on all
+three view counts. The diagnostic generator now includes both combinations;
+generated arrays match all six GPU-tested inputs, and 22 CPU tests pass. These
+are synthetic diagnostics, not six real observations. Existing saved suites
+and goldens have not been rewritten. The long-token failure remains open.
 
 Performance remains a separate acceptance condition. Orin's combined three-view
 control measures T10/T200 P50 298.296/300.339ms against the same-library product
@@ -28,7 +40,20 @@ checkpoint, config and input hashes. This qualifies the measured warm controls,
 not a maintained repair. T10 first inference still increases by about 64–77ms
 on each view-count profile; one-view T200 also increases. Here `first_call_ms`
 is each shape's first inference in the resident model, not total process/model
-startup. First-call attribution and repair remain open.
+startup. Replacing the patch embedding with an exact ordered CUTLASS SIMT
+control retains all 37 original precision passes and improves warm pilots, but
+T10 first-call overhead still increases by about 38–48ms. The remaining large
+host calls include F32 GEMMs with M/N/K 1/1024/1024 and 50/1024/32, measured
+at approximately 29/26ms in a targeted probe. Replacing SGEMM with GemmEx
+retains precision but does not remove the cold-call regression. No initialization
+has been moved outside the timer to claim a pass; repair remains open.
+
+On Orin, rounded SM80 GeGLU plus compact K/V storage preserving the physical
+softmax reduction order retains all 37 original precision passes. Its T10/T200
+P50 pilots are 141.782/168.597, 218.273/236.210 and 297.927/299.074ms for
+one/two/three views. Against the same-library product 170.457/149.806,
+258.658/202.283 and 232.837/256.025ms, long-token and three-view cases still
+regress. These controls are rejected as complete performance repairs.
 
 On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
 outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster

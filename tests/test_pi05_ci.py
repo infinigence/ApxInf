@@ -158,6 +158,11 @@ class ReceiptTest(unittest.TestCase):
         np.testing.assert_array_equal(cases["black-normal-noise"]["noise"], base["noise"])
         np.testing.assert_array_equal(cases["gradient-zero-noise"]["images"], base["images"])
         self.assertEqual(len(cases["gradient-t200-boundary"]["token_ids"]), 200)
+        for name in ("gradient-t200-zero-noise-combined", "black-t200-zero-noise-combined"):
+            np.testing.assert_array_equal(cases[name]["token_ids"], cases["gradient-t200-boundary"]["token_ids"])
+            np.testing.assert_array_equal(cases[name]["noise"], np.zeros_like(base["noise"]))
+        np.testing.assert_array_equal(cases["gradient-t200-zero-noise-combined"]["images"], base["images"])
+        self.assertFalse(cases["black-t200-zero-noise-combined"]["images"].any())
 
 
 class MatrixTest(unittest.TestCase):

@@ -155,6 +155,8 @@ def prepare(args: argparse.Namespace) -> None:
             ("gradient-t10-second-noise", base, SHORT_TOKENS, second),
             ("gradient-t21-normal-noise", base, LONG_TOKENS, first),
             (f"gradient-t{args.max_token_len}-boundary", base, boundary_tokens, first),
+            (f"gradient-t{args.max_token_len}-zero-noise-combined", base, boundary_tokens, zeros),
+            (f"black-t{args.max_token_len}-zero-noise-combined", black, boundary_tokens, zeros),
             ("black-normal-noise", black, SHORT_TOKENS, first),
             ("gradient-zero-noise", base, SHORT_TOKENS, zeros),
             ("black-zero-noise-combined", black, SHORT_TOKENS, zeros),
