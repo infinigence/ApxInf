@@ -18,6 +18,7 @@
 | [Metal 参数实测](metal-results-20261009.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
 | [实现与验证](serving-validation-20261009.md) | 实际实现范围、HTTP 指标、资源边界和下一阶段 | 交付证据 |
 | [2026-10-11 验证](validation-20261011.md) | 当前 Rust、真实 HTTP、Claude Code、故障清理和分级内存校准结果 | 本轮验证证据与未覆盖范围 |
+| [退出与工具解析修复](review-fixes-20261011.md) | SIGINT/SIGTERM、HTTP 退出等待、工具 JSON 边界和测试同步 | 工作区修复及 PR 集成验证 |
 | [生命周期加固](lifecycle-hardening-20261009.md) | 命令轮换、准备结算、队列回收、关闭竞态和回归结果 | 本轮可靠性修复证据 |
 | [阶段观测与到达率负载](observability-load-20261009.md) | 阶段直方图、submit deadline、绝对 HTTP 超时及实机过载结果 | 后续内存准入和调度的测量依据 |
 | [内存压力准入与预算加固](host-pressure-memory-20261009.md) | 运行期压力控制、预算溢出修复、峰值补报及验证边界 | 内存准入的当前实现与证据 |

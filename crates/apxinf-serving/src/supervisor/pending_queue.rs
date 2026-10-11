@@ -38,6 +38,18 @@ impl PendingQueue {
             .closed
     }
 
+    pub(super) async fn wait_closed(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(State {

@@ -212,6 +212,7 @@ The optional `disable_parallel_tool_use` field must contain a Boolean.
 
 The selected model template defines the tool grammar.
 The parser accepts Qwen XML calls and JSON calls inside `tool_call` markers.
+For JSON calls, closing markers inside quoted strings remain argument text.
 The parser rejects undeclared tools and incomplete tool blocks.
 It checks object arguments, required properties, basic types, enums, and additional properties.
 It does not claim complete JSON Schema enforcement or constrained decoding.
@@ -348,12 +349,26 @@ This operation closes admission and the waiting queue.
 Active work retains its original deadline and cancellation rules.
 After active settlement, the coordinator stops and reaps the worker, then exits.
 Dropping external `Arc<Service>` references alone does not guarantee shutdown.
-The CLI calls `Service::shutdown` on Ctrl-C.
+The CLI registers Unix SIGINT and SIGTERM handlers before model loading.
+Either signal cancels startup or calls `Service::shutdown` after startup.
+
+An embedding host can cancel startup with `start_with_shutdown(Config, shutdown)`.
+The `shutdown` future resolves when the host requests shutdown.
+The operation returns `Ok(None)` only after it stops and reaps any worker it started.
+It returns `Ok(Some(service))` when startup completes first.
+Startup failures and process reaping failures return an error.
+The original `start(Config)` operation does not accept startup cancellation.
+
+Shutdown during replacement loading stops and reaps the replacement before the coordinator exits.
 
 The host must then await `Service::wait_stopped` before it stops the async runtime.
 This operation returns success only after the coordinator reaps all owned worker processes.
 The operation returns an error if the coordinator fails or cannot reap an owned worker process.
-The CLI awaits `Service::wait_stopped` after HTTP termination, including HTTP errors.
+The CLI awaits `Service::wait_stopped` before exit, including after HTTP errors.
+After a signal, the CLI waits for worker settlement and reaping before it limits HTTP shutdown time.
+Remaining HTTP connections then have 20 seconds to complete.
+The CLI reports expiry in diagnostics and closes remaining connections.
+This limit does not shorten an active request's execution or settlement deadline.
 
 ## Memory and device controls
 
