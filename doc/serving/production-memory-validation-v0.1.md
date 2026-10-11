@@ -1,7 +1,7 @@
 # Production memory validation profile 0.1
 
-Status: proposed P1 evidence procedure, with no execution results or approved limits.
-This profile defines no runner, worker fields, HTTP fields, or metrics.
+Status: P1 evidence procedure with an initial HTTP runner and CPU tests, without production results or approved limits.
+This profile adds no worker fields, HTTP fields, or metrics.
 It does not start batching, persistent caching, or another dependent stage.
 The [contract](contracts-v0.1.md) and [local service profile](local-service-v0.1.md) retain authority.
 
@@ -134,6 +134,82 @@ Do not disable pressure checks or increase system memory settings to continue.
 Stop progression after a pressure block, unexplained failure, invalid evidence, or incomplete cleanup evidence.
 A blocked run can retain earlier observations, but the blocked case does not pass.
 Successful checks do not approve an admission envelope without its separate contract and independent validation.
+
+## Initial HTTP runner
+
+`benchmarks/serving/production_memory_validation.py` attaches to an existing local service.
+It sends ordered Anthropic Messages requests and records their original SSE bytes.
+It does not start, signal, restart, or stop the service.
+Process reaping remains `unknown` because the runner does not own those processes.
+Its complete validation remains `incomplete`, even when all required case checks pass.
+
+Supply a plan file, base URL, process IDs, service binary, diagnostic file, and new output directory.
+Use a new run directory under `devlocal/<feature>/` or outside the checkout.
+Also supply the existing Metal lock path and an inherited `--lock-fd` descriptor.
+The runner checks the descriptor's inode and exclusive ownership before each request.
+A Boolean ownership claim or a lock held by another descriptor cannot satisfy this check.
+The launcher must retain the inherited descriptor until observation finishes.
+
+The plan format is `apxinf-production-memory-plan-v1`.
+Its fields are `format`, `expected`, `limits`, `environment`, and `cases`.
+`expected` contains `model_revision`, `capability_revision`, `worker_epoch`, and `service_binary_sha256`.
+The runner checks these values against readiness and the identified service executable.
+It checks the executable's mapped device and inode against the hashed file.
+
+The initial identity check covers those revisions, the worker epoch, the service executable, and the observed processes.
+Device identity remains unknown in this runner.
+The environment contains declared `process_limits`, `runtime_settings`, and `competing_workload_policy` records.
+These declarations do not prove the service's environment or process limits.
+
+Limits contain integer milliseconds for `request_timeout_ms`, `settlement_timeout_ms`, `observation_interval_ms`, and `observation_budget_ms`.
+They also contain `max_sample_gap_ms`, `max_response_bytes`, `max_samples`, and `max_diagnostic_bytes`.
+The runner records collection duration and gaps against these frozen limits.
+Each case contains `case_id`, `body`, `input_tokens_min`, `input_tokens_max`, and `required_checks`.
+The initial body permits plain text messages, greedy generation, and a positive output allowance, with streaming enabled.
+Stop conditions and tool requests require a later runner extension.
+
+Required check names are `identity`, `execution`, `input_band`, `full_output`, `settlement`, `host_pressure`, `external_memory`, and `runtime_peak`.
+Each case must require identity, execution, settlement, and host pressure.
+Case checks report `passed`, `failed`, `blocked`, `unreached`, or `unknown`.
+An early EOS leaves `full_output` unreached but permits the next case after settlement.
+Pressure blocks, failed checks, and required unknown observations stop later requests.
+The runner retains all planned cases, including those it skips.
+
+Before any request, the runner saves the source plan, frozen limits, readiness, process identities, tool hashes, and diagnostic offset.
+The output contains `frozen-plan.json`, `observations.jsonl`, `diagnostics.jsonl`, one SSE file per executed case, and `report.json`.
+The report records file digests and actual token counts from checked responses.
+Readiness memory remains a startup snapshot, and the aggregate peak remains an aggregate metric.
+Current allocator values after settlement and request cache payload remain unknown.
+
+The external collector checks process identity before and after each RSS read.
+It records `ps` RSS in KiB and converts that value to bytes on macOS.
+It never uses the collector's own RSS as service memory.
+PID, parent PID, start time, command, listener ownership, and worker epoch bind the observations.
+These checks reduce attribution errors but cannot eliminate every operating-system identity race.
+
+Host pressure must remain normal in both service readiness and the external host sensor.
+The external pressure tuple must contain state `normal`, dispatch value `1`, and no sensor error.
+The observation budget limits acceptable collection duration, not operating-system scheduling delay.
+An excessive duration or sample gap leaves external memory checks unknown.
+
+Settlement requires drained resource gauges and exactly one matching public outcome increment during the isolated case.
+The final metric observation must start after the HTTP client finishes.
+The checks include both `cleanup_pending` operations and reject missing metrics.
+Unexpected outcome increments invalidate attribution to the case.
+
+A diagnostic peak requires one matching request record, consistent usage, successful worker completion, and a positive peak value.
+Missing, duplicate, invalid, or incomplete diagnostics leave that peak unknown.
+Diagnostics alone never establish settlement.
+
+The current diagnostic record contains no worker epoch.
+The runner correlates its request ID with the response, diagnostic offset, and stable process observations.
+These sources do not provide an atomic process snapshot.
+
+Exit code zero means collection finished and each required case check passed.
+It does not establish process reaping, candidate validation, or admission approval.
+Other case outcomes return exit code one and preserve partial evidence.
+Argument errors before collection return exit code two.
+The operator retains shutdown and parent reaping evidence separately.
 
 ## Implementation references
 
