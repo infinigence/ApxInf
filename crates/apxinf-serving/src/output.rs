@@ -75,11 +75,51 @@ fn suffix_prefix_len(value: &str, markers: &[&str]) -> usize {
         .unwrap_or(0)
 }
 
-#[derive(PartialEq)]
 enum Mode {
     Text,
     Thinking,
-    Tool,
+    Tool(ToolBoundary),
+}
+
+#[derive(Default)]
+struct ToolBoundary {
+    scanned: usize,
+    is_json: Option<bool>,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl ToolBoundary {
+    fn find_end(&mut self, pending: &str) -> Option<usize> {
+        const END: &str = "</tool_call>";
+        while self.scanned < pending.len() {
+            let remaining = &pending[self.scanned..];
+            let character = remaining.chars().next().unwrap();
+            if self.is_json.is_none() && !character.is_whitespace() {
+                self.is_json = Some(character == '{');
+            }
+            if !self.in_string && character == '<' {
+                if remaining.starts_with(END) {
+                    return Some(self.scanned);
+                }
+                if END.starts_with(remaining) {
+                    // Only an unfinished delimiter needs inspection on the next push.
+                    return None;
+                }
+            }
+            if self.is_json == Some(true) {
+                if self.escaped {
+                    self.escaped = false;
+                } else if self.in_string && character == '\\' {
+                    self.escaped = true;
+                } else if character == '"' {
+                    self.in_string = !self.in_string;
+                }
+            }
+            self.scanned += character.len_utf8();
+        }
+        None
+    }
 }
 
 pub struct OutputParser {
@@ -106,7 +146,7 @@ impl OutputParser {
         }
         let mut parts = Vec::new();
         loop {
-            match self.mode {
+            match &mut self.mode {
                 Mode::Text => {
                     let markers = ["<tool_call>", "<think>"];
                     let found = markers
@@ -119,7 +159,7 @@ impl OutputParser {
                         }
                         self.pending.drain(..i + marker.len());
                         self.mode = if marker == markers[0] {
-                            Mode::Tool
+                            Mode::Tool(ToolBoundary::default())
                         } else {
                             Mode::Thinking
                         };
@@ -147,8 +187,8 @@ impl OutputParser {
                         break;
                     }
                 }
-                Mode::Tool => {
-                    if let Some(i) = self.pending.find("</tool_call>") {
+                Mode::Tool(boundary) => {
+                    if let Some(i) = boundary.find_end(&self.pending) {
                         let (name, input) = parse_tool(&self.pending[..i], &self.tools)?;
                         self.pending.drain(..i + "</tool_call>".len());
                         parts.push(Part::Tool {
@@ -164,7 +204,7 @@ impl OutputParser {
                 }
             }
         }
-        if last && self.mode != Mode::Text {
+        if last && !matches!(self.mode, Mode::Text) {
             return Err("The model output contains an incomplete structured block.".into());
         }
         Ok(parts)
@@ -366,6 +406,93 @@ mod tests {
                 "label":{"type":"string"}
             }
         }}})]
+    }
+
+    fn parse_json_label(label: &str, fragmented: bool) {
+        let body = json!({"name":"configure","arguments":{"label":label}});
+        let output = format!("<tool_call> \n{body}\n</tool_call>");
+        let mut parser = OutputParser::new(typed_parameter_tools());
+        let mut parts = Vec::new();
+        if fragmented {
+            for character in output.chars() {
+                parts.extend(parser.push(&character.to_string(), false).unwrap());
+            }
+            parts.extend(parser.push("", true).unwrap());
+        } else {
+            parts = parser.push(&output, true).unwrap();
+        }
+        assert_eq!(parts.len(), 1);
+        assert_eq!(anthropic_blocks(&parts)[0]["input"], json!({"label":label}));
+        assert_eq!(parser.tool_count, 1);
+    }
+
+    #[test]
+    fn json_tool_string_preserves_literal_closing_marker() {
+        parse_json_label("example </tool_call> tag", false);
+    }
+
+    #[test]
+    fn fragmented_json_tool_strings_preserve_quotes_and_backslashes() {
+        for label in [
+            "example </tool_call> tag",
+            "引用 \"</tool_call>\" 后继续",
+            r#"slashes \\\ "</tool_call>" trailing \"#,
+        ] {
+            parse_json_label(label, true);
+        }
+    }
+
+    #[test]
+    fn json_tool_boundaries_reject_invalid_or_unfinished_calls() {
+        for output in [
+            r#"<tool_call>{"name":"configure","arguments":{"label":"bad \q escape"}}</tool_call>"#,
+            r#"<tool_call>{"name":"configure","arguments":{"label":"missing brace"}</tool_call>"#,
+            r#"<tool_call>{"name":"configure","arguments":{"label":"unclosed </tool_call>"#,
+            r#"<tool_call>{"name":"configure","arguments":{"label":"complete JSON"}}"#,
+        ] {
+            for fragmented in [false, true] {
+                let mut parser = OutputParser::new(typed_parameter_tools());
+                let result = if fragmented {
+                    output
+                        .chars()
+                        .try_for_each(|character| {
+                            parser.push(&character.to_string(), false).map(|_| ())
+                        })
+                        .and_then(|_| parser.push("", true).map(|_| ()))
+                } else {
+                    parser.push(output, true).map(|_| ())
+                };
+                assert!(result.is_err(), "Invalid call succeeded: {output}");
+                assert_eq!(parser.tool_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_json_and_xml_calls_keep_their_own_string_rules() {
+        let output = concat!(
+            "<tool_call>{\"name\":\"configure\",\"arguments\":{\"label\":\"JSON </tool_call>\"}}</tool_call>",
+            "<tool_call><function=configure><parameter=label>XML \" slash \\\n</parameter></function></tool_call>",
+            "<tool_call>{\"name\":\"configure\",\"arguments\":{\"label\":\"last JSON\"}}</tool_call>"
+        );
+        for fragmented in [false, true] {
+            let mut parser = OutputParser::new(typed_parameter_tools());
+            let mut parts = Vec::new();
+            if fragmented {
+                for character in output.chars() {
+                    parts.extend(parser.push(&character.to_string(), false).unwrap());
+                }
+                parts.extend(parser.push("", true).unwrap());
+            } else {
+                parts = parser.push(output, true).unwrap();
+            }
+            let blocks = anthropic_blocks(&parts);
+            assert_eq!(blocks.len(), 3);
+            assert_eq!(blocks[0]["input"]["label"], "JSON </tool_call>");
+            assert_eq!(blocks[1]["input"]["label"], "XML \" slash \\");
+            assert_eq!(blocks[2]["input"]["label"], "last JSON");
+            assert_eq!(parser.tool_count, 3);
+        }
     }
 
     #[test]
