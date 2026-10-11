@@ -22,6 +22,12 @@ The content manifest includes the model template, tokenizer, adapter, interprete
 An identity mismatch prevents readiness.
 The service never selects another model or precision automatically.
 
+The supervisor withdraws readiness before it publishes an execution fault.
+It sends the checked error through admission or the reserved final event slot.
+This slot remains available when the content queue is full.
+A published public result remains final.
+Process recovery retains uncertain reservations until process reaping succeeds.
+
 The service supports stateless text requests.
 The existing v1 CLI and exact append interface retain their behavior.
 This HTTP profile does not expose sessions, images, embeddings, batch execution, or prefix reuse.

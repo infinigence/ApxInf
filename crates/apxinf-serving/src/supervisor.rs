@@ -5,6 +5,8 @@ mod pending_queue;
 #[cfg(test)]
 mod diagnostic_regressions;
 #[cfg(test)]
+mod fault_regressions;
+#[cfg(test)]
 mod generation_control_regressions;
 #[cfg(test)]
 mod generation_deadline_regressions;
@@ -681,15 +683,19 @@ fn start_queue_sweeper(service: &Arc<Service>) {
     });
 }
 
-async fn fence_worker(worker: &mut Worker, service: &Service, error: ApiError) {
+fn withdraw_worker(service: &Service) {
     service.available.store(false, Ordering::Release);
     service.rotating.store(false, Ordering::Release);
     service.host_pressure.stop();
+    service.queue.close(&service.metrics, service.timeout);
+}
+
+async fn fence_worker(worker: &mut Worker, service: &Service, error: ApiError) {
+    withdraw_worker(service);
     service
         .metrics
         .worker_faults
         .fetch_add(1, Ordering::Relaxed);
-    service.queue.close(&service.metrics, service.timeout);
     diagnostics::emit(format_args!("Worker fenced: {}", error.message));
     if stop_child(&mut worker.child).await.is_ok() {
         service.metrics.active.store(0, Ordering::Relaxed);
@@ -982,6 +988,19 @@ fn finish_before_execution(job: &mut Job, service: &Service, error: ApiError) {
     }
     let (unused, _) = oneshot::channel();
     let _ = std::mem::replace(&mut job.begin, unused).send(Err(error));
+}
+
+fn report_unadmitted_failure(
+    job: &mut Job,
+    service: &Service,
+    mut failure: ExecutionFailure,
+) -> ExecutionFailure {
+    withdraw_worker(service);
+    if !failure.reported {
+        finish_before_execution(job, service, failure.error.clone());
+        failure.reported = true;
+    }
+    failure
 }
 
 async fn prepare_request(
@@ -1336,12 +1355,16 @@ async fn execute(
     mut job: Job,
     timeout: Duration,
 ) -> Result<(), ExecutionFailure> {
-    let Some(prepared) = prepare_request(worker, service, &mut job, timeout).await? else {
+    let prepared = prepare_request(worker, service, &mut job, timeout)
+        .await
+        .map_err(|failure| report_unadmitted_failure(&mut job, service, failure))?;
+    let Some(prepared) = prepared else {
         return Ok(());
     };
     let input_tokens = prepared["effective_input_tokens"]
         .as_u64()
-        .ok_or_else(|| ApiError::worker("Prepared input has no token count."))?;
+        .ok_or_else(|| ApiError::worker("Prepared input has no token count."))
+        .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
     if input_tokens + job.request.max_tokens as u64
         > service.ready["capabilities"]["max_context"]
             .as_u64()
@@ -1394,8 +1417,12 @@ async fn execute(
     submit["eos_token_ids"] = service.ready["eos_token_ids"].clone();
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
     let mut tracker = contracts::AttemptTracker::new(&submit)
-        .map_err(|e| ApiError::new(500, "protocol_fault", e.to_string()))?;
-    if let Some(stopped) = send_submission(worker, service, &mut job, timeout, &submit).await? {
+        .map_err(|e| ApiError::new(500, "protocol_fault", e.to_string()))
+        .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
+    let stopped = send_submission(worker, service, &mut job, timeout, &submit)
+        .await
+        .map_err(|failure| report_unadmitted_failure(&mut job, service, failure))?;
+    if let Some(stopped) = stopped {
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
@@ -1613,9 +1640,13 @@ async fn execute(
     ));
     Ok(())
     }.await;
-    result.map_err(|error| ExecutionFailure {
-        error,
-        reported: public.status.is_some(),
+    result.map_err(|error| {
+        withdraw_worker(service);
+        public.finish(&job, service, "failed", Event::Error(error.clone()));
+        ExecutionFailure {
+            error,
+            reported: true,
+        }
     })
 }
 
