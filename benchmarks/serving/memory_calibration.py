@@ -537,7 +537,9 @@ def validate_arguments(args):
         raise ValueError("The model must be a directory.")
     args.output_dir = args.output_dir.resolve()
     if args.output_dir == ROOT or ROOT in args.output_dir.parents:
-        raise ValueError("Store raw calibration artifacts outside the checkout.")
+        relative = args.output_dir.relative_to(ROOT)
+        if len(relative.parts) < 2 or relative.parts[0] != "devlocal":
+            raise ValueError("Store raw calibration artifacts under devlocal/<feature> or outside the checkout.")
     integer(args.max_output_tokens, "output limit", 1, 65536)
     integer(args.max_context, "context limit", 2, 131072)
     integer(args.prefill_step_size, "prefill chunk", 1, 8192)

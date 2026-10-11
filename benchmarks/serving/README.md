@@ -27,7 +27,7 @@ Additional cases stop during prefill, stop after output, or request zero output.
 Every case remains in the report even when an earlier case fails or pressure blocks loading.
 `--timeout` bounds the complete probe process, including model loading.
 
-The output directory must be new and outside the checkout.
+Use a new directory under `devlocal/<feature>/` or outside the checkout.
 `calibration.json` contains identity, profiles, case results, and journal references.
 `samples.jsonl` retains flushed observations, including partial evidence from interrupted runs.
 `process.json` records the parent outcome, timeout, and reaping evidence.
@@ -82,6 +82,57 @@ Exit status 0 means the recorded evidence passes consistency checks.
 It does not establish complete coverage or approve an admission budget.
 Invalid evidence produces exit status 1 without derived coverage claims.
 The analyzer does not change source artifacts or service configuration.
+
+## Production memory observations
+
+`production_memory_validation.py` attaches to an existing local service and sends ordered streaming Messages requests.
+The [production profile](../../doc/serving/production-memory-validation-v0.1.md#initial-http-runner) defines its plan, checks, and evidence files.
+The runner adds no device synchronization or worker inspection calls.
+It records external process RSS, host observations, raw service metrics, response bytes, and matching diagnostic records.
+Unavailable allocator counters and request cache payload remain unknown.
+
+Prepare the plan before execution.
+Use a new directory under `devlocal/<feature>/` or outside the checkout.
+The service launcher must hold the existing Metal lock during loading, requests, and cleanup.
+Pass its locked descriptor to the runner through `subprocess.run(..., pass_fds=(descriptor,))` or an equivalent parent interface.
+The runner checks the descriptor's inode and exclusive ownership.
+It rejects a Boolean ownership declaration or a separately opened descriptor.
+
+```sh
+python3 benchmarks/serving/production_memory_validation.py \
+  --plan-file devlocal/serving-upstream/production-plan.json \
+  --base-url http://127.0.0.1:18080 \
+  --service-pid 12345 --worker-pid 12346 \
+  --service-binary /absolute/path/to/apxinf-serve \
+  --diagnostics-file /absolute/path/to/service-stderr.log \
+  --metal-lock /absolute/path/to/metal-measure.lock --lock-fd 3 \
+  --output-dir devlocal/serving-upstream/production-run-01
+```
+
+Replace the example identities, paths, and descriptor with values from the owning launcher.
+Do not run this command from an unrelated shell without the inherited descriptor.
+Exit status zero means all declared case checks passed and collection finished.
+Complete validation remains incomplete because this attached runner cannot establish process reaping or candidate validation.
+Retain the launcher's shutdown and reaping report separately.
+
+Run the CPU fixture tests without loading a model:
+
+```sh
+python3 -m unittest discover -s tests/python -p test_serving_production_memory_validation.py -v
+```
+
+These tests use temporary loopback HTTP servers and original fixture responses.
+
+Run the service's CPU HTTP integration checks separately:
+
+```sh
+cargo test --locked -p apxinf-serving --test http_gateway -- --nocapture
+```
+
+This suite uses the real CLI and TCP transport with an original CPU worker fixture.
+It loads no model or MLX runtime.
+Its default output directory is `devlocal/serving-http-integration/`.
+Set `APXINF_HTTP_TEST_OUTPUT` to select another output directory.
 
 ## Boundaries
 

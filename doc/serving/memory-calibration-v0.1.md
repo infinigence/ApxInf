@@ -52,6 +52,9 @@ An interrupted run must retain its completed observations.
 Only exclusive creation may start a new output artifact.
 
 The command creates a new output directory and writes `calibration.json` there.
+Use `devlocal/<feature>/<run>` for new artifacts within the checkout.
+The tool also accepts directories outside the checkout for existing measurement workflows.
+Other checkout paths and the `devlocal` root are invalid output destinations.
 A parent process acquires the device lock and starts one isolated probe process.
 Both processes retain the same inherited lock descriptor until the probe exits.
 The parent checks that the probe exited before it returns the lock.

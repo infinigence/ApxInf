@@ -281,6 +281,28 @@ class InputValidationTests(unittest.TestCase):
             with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, "conflicts"):
                 calibration.validate_arguments(self.args("--plan-file", str(path), *flags))
 
+    def test_checkout_artifacts_use_the_devlocal_feature_directory(self):
+        checkout = (self.directory / "checkout").resolve()
+        checkout.mkdir()
+        output = checkout / "devlocal" / "serving-test" / "run-1"
+        args = self.args("--output-dir", str(output))
+        with patch.object(calibration, "ROOT", checkout):
+            plan = calibration.validate_arguments(args)
+        self.assertTrue(plan)
+        self.assertEqual(args.output_dir, output)
+        self.assertFalse(output.exists())
+
+    def test_checkout_output_rejects_source_paths_and_symlink_escapes(self):
+        checkout = (self.directory / "checkout").resolve()
+        (checkout / "devlocal").mkdir(parents=True)
+        (checkout / "doc").mkdir()
+        (checkout / "devlocal" / "escape").symlink_to(checkout / "doc", target_is_directory=True)
+        for output in (checkout, checkout / "devlocal", checkout / "doc" / "run",
+                       checkout / "devlocal" / "escape" / "run"):
+            with self.subTest(output=output), patch.object(calibration, "ROOT", checkout):
+                with self.assertRaisesRegex(ValueError, "calibration artifacts"):
+                    calibration.validate_arguments(self.args("--output-dir", str(output)))
+
     def test_external_seed_records_original_source_content_and_digest(self):
         path = self.directory / "seed.json"
         payload = '[ {"role":"user","content":"Original 种子 input."} ]\n'.encode()
