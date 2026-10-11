@@ -5,21 +5,37 @@ struct SubmitProbe(PathBuf);
 
 impl SubmitProbe {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("apxinf-submit-{}.jsonl", uuid::Uuid::new_v4())))
+        let path = std::env::temp_dir().join(format!("apxinf-submit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
     }
 
     fn commands(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.0)
+        std::fs::read_to_string(self.0.join("commands.jsonl"))
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
     }
+
+    async fn wait_for(&self, event: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !self.0.join(event).exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("The submit probe did not reach {event}."));
+    }
+
+    fn resume(&self) {
+        std::fs::write(self.0.join("resume"), []).unwrap();
+    }
 }
 
 impl Drop for SubmitProbe {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -28,31 +44,41 @@ async fn blocked_submit_service(
     timeout: Duration,
     pipe_mode: &str,
 ) -> (Arc<Service>, tokio::task::JoinHandle<()>) {
-    // A large prepared prompt fills the real stdin pipe until this child resumes.
+    // A submit frame exceeds the pipe; the child stops reading after its first byte.
     let script = r#"
-import hashlib, json, struct, sys, time
-trace_path = sys.argv[1]
-def read_command():
-    line = sys.stdin.readline()
+import hashlib, json, os, pathlib, struct, sys, time
+directory = pathlib.Path(sys.argv[1])
+def mark(event):
+    (directory / event).touch()
+def read_command(prefix=b""):
+    line = prefix + sys.stdin.buffer.readline()
     if not line: return None
     command = json.loads(line)
-    with open(trace_path, "a") as trace: trace.write(command["kind"] + "\n")
+    with (directory / "commands.jsonl").open("a") as trace: trace.write(command["kind"] + "\n")
     return command
 def emit(command, kind, **fields):
     print(json.dumps(dict(protocol=command["protocol"], worker_epoch=command["worker_epoch"],
                          kind=kind, **fields)), flush=True)
-for index in range(2):
+# Startup deliberately exceeds the public deadline; it is outside the request.
+time.sleep(0.3)
+prompts = [[123456] * 16384, [3]]
+digests = [hashlib.sha256(b"apxinf-token-prefix-v1\0" + struct.pack("<Q", len(tokens)) +
+                        b"".join(struct.pack("<I", token) for token in tokens)).hexdigest()
+           for tokens in prompts]
+mark("ready")
+for index, tokens in enumerate(prompts):
     prepare = read_command()
-    tokens = [3] * (100000 if index == 0 else 1)
-    digest = hashlib.sha256(b"apxinf-token-prefix-v1\0" + struct.pack("<Q", len(tokens)) +
-                            b"".join(struct.pack("<I", token) for token in tokens)).hexdigest()
     emit(prepare, "prepared_input", command_id=prepare["command_id"],
          model_revision=prepare["model_revision"], token_ids=tokens,
-         effective_input_tokens=len(tokens), prompt_digest=digest)
+         effective_input_tokens=len(tokens), prompt_digest=digests[index])
+    prefix = b""
     if index == 0:
-        time.sleep(0.75)
+        prefix = os.read(0, 1)
+        assert prefix == b"{", prefix
+        mark("submit_started")
+        while not (directory / "resume").exists(): time.sleep(0.002)
         if sys.argv[2] == "close": sys.exit(0)
-    submit = read_command()
+    submit = read_command(prefix)
     identity = dict(request_id=submit["request_id"], attempt=submit["attempt"])
     emit(submit, "accepted", event_seq=0, **identity)
     emit(submit, "tokens", event_seq=1, output_index=0, token_ids=[10], text_delta="late", **identity)
@@ -66,7 +92,7 @@ for index in range(2):
         if sys.argv[2] == "after_terminal": sys.exit(0)
     emit(submit, "resources_released", event_seq=3,
          released_lease_ids=submit["capacity_lease_ids"], retained_lease_ids=[], **identity)
-sys.stdin.readline()
+sys.stdin.buffer.readline()
 "#;
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut child = Command::new("python3")
@@ -79,6 +105,7 @@ sys.stdin.readline()
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    probe.wait_for("ready").await;
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let worker = Worker {
@@ -204,8 +231,10 @@ async fn blocked_submit_deadline_finishes_public_request_before_pipe_recovers() 
     let probe = SubmitProbe::new();
     let (service, task) =
         blocked_submit_service(&probe, Duration::from_millis(150), "resume").await;
+    let response_deadline = tokio::time::Instant::now() + Duration::from_millis(450);
     let mut ticket = service.enqueue(request()).unwrap();
-    let response = tokio::time::timeout(Duration::from_millis(450), ticket.begin)
+    probe.wait_for("submit_started").await;
+    let response = tokio::time::timeout_at(response_deadline, ticket.begin)
         .await
         .expect("A blocked submit must not postpone the public deadline.")
         .unwrap();
@@ -222,6 +251,8 @@ async fn blocked_submit_deadline_finishes_public_request_before_pipe_recovers() 
             .await
             .is_err()
     );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    probe.resume();
     assert!(
         tokio::time::timeout(Duration::from_secs(2), ticket.output.recv())
             .await
@@ -258,8 +289,7 @@ async fn blocked_submit_cancellation_finishes_public_request_and_suppresses_late
     let probe = SubmitProbe::new();
     let (service, task) = blocked_submit_service(&probe, Duration::from_secs(3), "resume").await;
     let mut ticket = service.enqueue(request()).unwrap();
-    // Preparation is small in compute cost; the large submit remains blocked for 750 ms.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    probe.wait_for("submit_started").await;
     assert_eq!(probe.commands(), ["prepare_input"]);
     ticket.cancel.store(true, Ordering::Release);
     let response = tokio::time::timeout(Duration::from_millis(200), ticket.begin)
@@ -278,6 +308,8 @@ async fn blocked_submit_cancellation_finishes_public_request_and_suppresses_late
             .await
             .is_err()
     );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    probe.resume();
     assert!(
         tokio::time::timeout(Duration::from_secs(2), ticket.output.recv())
             .await
@@ -311,8 +343,10 @@ async fn blocked_submit_cancellation_finishes_public_request_and_suppresses_late
 async fn blocked_submit_pipe_failure_does_not_count_an_expired_request_twice() {
     let probe = SubmitProbe::new();
     let (service, task) = blocked_submit_service(&probe, Duration::from_millis(150), "close").await;
+    let response_deadline = tokio::time::Instant::now() + Duration::from_millis(450);
     let ticket = service.enqueue(request()).unwrap();
-    let response = tokio::time::timeout(Duration::from_millis(450), ticket.begin)
+    probe.wait_for("submit_started").await;
+    let response = tokio::time::timeout_at(response_deadline, ticket.begin)
         .await
         .unwrap()
         .unwrap();
@@ -322,6 +356,7 @@ async fn blocked_submit_pipe_failure_does_not_count_an_expired_request_twice() {
         observed_metric(&service, "apxinf_cleanup_pending", None),
         1.0
     );
+    probe.resume();
     assert!(
         tokio::time::timeout(Duration::from_secs(2), service.wait_stopped())
             .await
@@ -378,11 +413,20 @@ async fn memory_peak_survives_fault_after_stopped_submit_terminal() {
     let probe = SubmitProbe::new();
     let (service, task) =
         blocked_submit_service(&probe, Duration::from_millis(150), "after_terminal").await;
+    let response_deadline = tokio::time::Instant::now() + Duration::from_millis(450);
     let ticket = service.enqueue(request()).unwrap();
+    probe.wait_for("submit_started").await;
     assert_eq!(
-        ticket.begin.await.unwrap().err().unwrap().code,
+        tokio::time::timeout_at(response_deadline, ticket.begin)
+            .await
+            .unwrap()
+            .unwrap()
+            .err()
+            .unwrap()
+            .code,
         "deadline_exceeded"
     );
+    probe.resume();
     assert!(
         tokio::time::timeout(Duration::from_secs(2), service.wait_stopped())
             .await

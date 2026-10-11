@@ -17,6 +17,8 @@ mod memory_regressions;
 #[cfg(test)]
 mod rotation_pressure_regressions;
 #[cfg(test)]
+mod shutdown_regressions;
+#[cfg(test)]
 mod submit_regressions;
 use crate::{
     contracts,
@@ -462,15 +464,30 @@ impl LaunchError {
     fn message(self) -> String {
         match self {
             Self::Pressure(message) | Self::Worker(message) => message,
-            Self::Stopped => "The service stopped before replacement loading.".into(),
+            Self::Stopped => "The service stopped during worker loading.".into(),
         }
     }
 }
 
+#[cfg(test)]
 async fn launch_worker(
     config: &Config,
     pressure: &HostPressure,
 ) -> Result<(Worker, Value), LaunchError> {
+    launch_worker_until(config, pressure, std::future::pending()).await
+}
+
+async fn launch_worker_until(
+    config: &Config,
+    pressure: &HostPressure,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(Worker, Value), LaunchError> {
+    tokio::pin!(shutdown);
+    tokio::select! {
+        biased;
+        _ = &mut shutdown => return Err(LaunchError::Stopped),
+        _ = std::future::ready(()) => {}
+    }
     pressure.require_load().map_err(LaunchError::Pressure)?;
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut command = Command::new(&config.python);
@@ -529,7 +546,8 @@ async fn launch_worker(
         controls: Default::default(),
         sent_commands: 0,
     };
-    let startup: Result<Value, String> = async {
+    // The startup future borrows the worker. Cancellation retains its child for explicit reaping.
+    let startup = async {
         let ready = worker
             .receive(Duration::from_secs(180))
             .await
@@ -553,12 +571,28 @@ async fn launch_worker(
         let (resident, _) = ready_memory_totals(&ready)?;
         config.check_resident_capacity(resident)?;
         Ok(ready)
-    }
-    .await;
+    };
+    let startup: Result<Option<Value>, String> = tokio::select! {
+        biased;
+        result = startup => result.map(Some),
+        _ = &mut shutdown => Ok(None),
+    };
     match startup {
-        Ok(ready) => {
+        Ok(Some(ready)) => {
             check_loaded_pressure(&mut worker, pressure).await?;
-            Ok((worker, ready))
+            // Identity hashing is synchronous. Check signals again before publishing readiness.
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    stop_child(&mut worker.child).await?;
+                    Err(LaunchError::Stopped)
+                }
+                _ = std::future::ready(()) => Ok((worker, ready)),
+            }
+        }
+        Ok(None) => {
+            stop_child(&mut worker.child).await?;
+            Err(LaunchError::Stopped)
         }
         Err(error) => Err(startup_failure(error, stop_child(&mut worker.child).await).into()),
     }
@@ -624,14 +658,34 @@ async fn stop_child(child: &mut Child) -> StopResult {
 }
 
 pub async fn start(config: Config) -> Result<Arc<Service>, String> {
+    start_inner(config, std::future::pending())
+        .await
+        .map_err(LaunchError::message)
+}
+
+/// Cancel loading through `shutdown`, then await this operation to confirm child reaping.
+/// `None` means startup stopped cleanly. Dropping this future does not confirm cleanup.
+pub async fn start_with_shutdown(
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Option<Arc<Service>>, String> {
+    match start_inner(config, shutdown).await {
+        Ok(service) => Ok(Some(service)),
+        Err(LaunchError::Stopped) => Ok(None),
+        Err(error) => Err(error.message()),
+    }
+}
+
+async fn start_inner(
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+) -> Result<Arc<Service>, LaunchError> {
     config.validate_memory()?;
-    diagnostics::initialize()?;
+    diagnostics::initialize().map_err(str::to_owned)?;
     let pressure = Arc::new(HostPressure::new(config.host_pressure_policy));
     pressure.require_load()?;
     HostPressure::monitor(&pressure);
-    let (worker, ready) = launch_worker(&config, &pressure)
-        .await
-        .map_err(LaunchError::message)?;
+    let (worker, ready) = launch_worker_until(&config, &pressure, shutdown).await?;
     let (stopped_sender, stopped) = watch::channel(None);
     let (_, peak) = ready_memory_totals(&ready)?;
     let service = Arc::new(Service {
@@ -658,7 +712,17 @@ pub async fn start(config: Config) -> Result<Arc<Service>, String> {
             let config = config.clone();
             let pressure = pressure.clone();
             let weak_service = weak_service.clone();
-            async move { launch_replacement(weak_service, || launch_worker(&config, &pressure)).await }
+            async move {
+                launch_replacement(weak_service.clone(), || {
+                    let service = weak_service.clone();
+                    launch_worker_until(&config, &pressure, async move {
+                        if let Some(service) = service.upgrade() {
+                            service.queue.wait_closed().await;
+                        }
+                    })
+                })
+                .await
+            }
         },
         stopped_sender,
     ));
@@ -1467,8 +1531,7 @@ async fn execute(
         if cancelled_at.is_some_and(|t: Instant| t.elapsed() >= SETTLEMENT_GRACE) {
             return Err(ApiError::worker(
                 "The worker did not settle cancellation within 20 seconds.",
-            )
-            .into());
+            ));
         }
         let event = tokio::select! {
             event = worker.frames.recv() => event,
@@ -1483,8 +1546,7 @@ async fn execute(
                 500,
                 "protocol_fault",
                 "The worker epoch changed during execution.",
-            )
-            .into());
+            ));
         }
         let kind = frame["kind"].as_str().unwrap_or("");
         if worker.consume_control_reply(&frame)? {
@@ -1584,8 +1646,7 @@ async fn execute(
                     500,
                     "protocol_fault",
                     "The worker emitted an unsupported request event.",
-                )
-                .into())
+                ))
             }
         }
     }

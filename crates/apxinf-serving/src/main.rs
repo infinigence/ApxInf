@@ -4,12 +4,15 @@ use apxinf_serving::{
     supervisor::{self, Config},
 };
 use clap::Parser;
+use futures_util::FutureExt;
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::ExitCode,
     time::Duration,
 };
+
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Parser)]
 #[command(about = "Serve one local MLX text model through bounded HTTP APIs.")]
@@ -76,6 +79,7 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     diagnostics::initialize()?;
+    let mut shutdown = Box::pin(termination_signal()?);
     if !args.host.is_loopback() {
         return Err("This local profile requires a loopback address.".into());
     }
@@ -92,23 +96,31 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("A service limit is outside the supported range.".into());
     }
-    let service = supervisor::start(Config {
-        python: std::fs::canonicalize(args.python)?,
-        worker: std::fs::canonicalize(args.worker)?,
-        model: std::fs::canonicalize(args.model)?,
-        model_id: args.model_id,
-        max_context: args.max_context,
-        max_output: args.max_output_tokens,
-        prefill_step_size: args.prefill_step_size,
-        output_batch_tokens: args.output_batch_tokens,
-        queue_capacity: args.queue_capacity,
-        timeout: Duration::from_secs(args.timeout_seconds),
-        memory_budget: args.memory_budget_bytes,
-        sequence_reservation: args.sequence_reservation_bytes,
-        host_pressure_policy: args.host_pressure_policy,
-    })
+    let service = supervisor::start_with_shutdown(
+        Config {
+            python: std::fs::canonicalize(args.python)?,
+            worker: std::fs::canonicalize(args.worker)?,
+            model: std::fs::canonicalize(args.model)?,
+            model_id: args.model_id,
+            max_context: args.max_context,
+            max_output: args.max_output_tokens,
+            prefill_step_size: args.prefill_step_size,
+            output_batch_tokens: args.output_batch_tokens,
+            queue_capacity: args.queue_capacity,
+            timeout: Duration::from_secs(args.timeout_seconds),
+            memory_budget: args.memory_budget_bytes,
+            sequence_reservation: args.sequence_reservation_bytes,
+            host_pressure_policy: args.host_pressure_policy,
+        },
+        shutdown.as_mut(),
+    )
     .await?;
-    let serving: Result<(), Box<dyn std::error::Error>> = async {
+    let Some(service) = service else {
+        return Ok(());
+    };
+    let shutdown = shutdown.shared();
+    let http_shutdown = shutdown.clone();
+    let serving = async {
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(args.host, args.port)).await?;
         diagnostics::emit(format_args!(
             "ApxInf listener bound at http://{}",
@@ -117,16 +129,54 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let shutdown_service = service.clone();
         axum::serve(listener, gateway::router(service.clone()))
             .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                http_shutdown.await;
                 shutdown_service.shutdown();
             })
             .await?;
-        Ok(())
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    tokio::pin!(serving);
+    let stopping = async {
+        shutdown.await;
+        service.shutdown();
+        service.wait_stopped().await
+    };
+    tokio::select! {
+        result = &mut serving => {
+            service.shutdown();
+            let stopped = service.wait_stopped().await;
+            result?;
+            stopped?;
+        }
+        stopped = stopping => {
+            stopped?;
+            match tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut serving).await {
+                Ok(result) => result?,
+                Err(_) => diagnostics::emit(format_args!(
+                    "HTTP connections did not drain within 20 seconds after worker reaping."
+                )),
+            }
+        }
     }
-    .await;
-    service.shutdown();
-    let stopped = service.wait_stopped().await;
-    serving?;
-    stopped?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn termination_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn termination_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
