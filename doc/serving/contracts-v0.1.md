@@ -666,6 +666,18 @@ The host must await `Service::wait_stopped` before it stops the async runtime.
 This operation returns success only after the coordinator reaps all owned worker processes.
 The operation returns an error if the coordinator fails or cannot reap an owned worker process.
 
+An embedding host can use `start_with_shutdown(Config, shutdown)` to cancel startup.
+The `shutdown` future resolves when the host requests shutdown.
+The operation returns `Ok(None)` only after it stops and reaps any worker it started.
+It returns `Ok(Some(service))` when startup completes first.
+Startup failures and process reaping failures return an error.
+The original `start(Config)` operation does not accept startup cancellation.
+
+After startup, the host must use `Service::shutdown` and await `Service::wait_stopped`.
+Shutdown during replacement loading stops and reaps the replacement before the coordinator exits.
+The CLI registers Unix SIGINT and SIGTERM handlers before model loading.
+Either signal cancels startup or starts service shutdown.
+
 ## Faults and recovery
 
 The error record contains `code`, `message`, `scope`, and `state_validity`.
