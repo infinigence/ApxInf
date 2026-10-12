@@ -698,3 +698,67 @@ This remains a private operator prototype. Public full-model integration and
 paired first-call/warm measurements are pending on both boards; operator tests
 and prepare timings do not qualify model performance. Preparation and graph
 creation remain inside the inference timer during acceptance measurements.
+
+### 2026-10-12 follow-up: gate repairs and rejected integration probes
+
+The trusted worker now monitors GPU users and compiler processes throughout its
+run. Thor uses its compute-process query; Orin uses complete device-descriptor
+visibility because its SMI compute query returns `[N/A]`. A foreign process or
+missing audit invalidates the run. Hosted aggregation checks raw activity
+samples and the approved auditor digest. A real Thor CUDA subprocess passes
+this lifecycle check. The worker also verifies assets and case-specific budgets
+before a CUDA build. **27 CPU contract tests pass.** These changes do not enable
+the workflow or approve any numerical/performance baseline.
+
+The public staged-GeGLU integration is a component probe, not the complete
+private precision repair. At unchanged BF16 floors its 43 inputs pass
+10/15,7/15,7/13 on Thor and8/15,8/15,8/13 on Orin. Thor's completed 5,400 warm
+samples/54 first calls expose first-call regression: approximately502–785ms
+against275–474ms controls. Profiling observes20 tuning-event waits and201
+stream synchronizations. Removing per-operation synchronization during session
+preparation preserves43/43 outputs bitwise; one-view first-call pilots become
+479/503ms and still fail qualification. Disabling online tuning selects a slower
+fallback and is rejected. Explicit BF16 learned normalization and a sequential
+FP32 time-update control also leave numerical failures. No such probe is
+promoted; small pilots do not establish absence of performance regression.
+
+Independent integer quantization experiments preserve official masks, RoPE,
+attention and flow. Unsupported vendor INT8 shapes are diagnosed separately;
+an FP64 integer-dot oracle uses exact integer products/sums below2^31 and then
+the specified FP32 dequantization. It is not a native performance benchmark.
+Language-only quantization of BF16-loaded official weights produces whole-chunk
+cosines .853/.997/.945 on three selected failing real observations; action-only
+quantization remains above .9998. Binary layer controls find failures at4,13,14
+in the selected one-view observation, while excluding all three still fails,
+showing cumulative effects. These results identify sensitivity for that
+quantization convention; they do not qualify the native implementation.
+
+The independent reference must also match weight transformations. Native INT8
+quantizes checkpoint F32 weights, whereas the first intervention quantizes
+OpenPI's BF16-loaded weights. Using raw F32 weights changes both quality and
+native agreement; native-versus-reference whole cosines become
+.99229/.99949/.99972 on the three observations. Learned-scale source and rounding
+are being isolated separately. Patch Conv2d is included in this later control;
+its official `padding="valid"` is equivalent to zero padding. Do not attribute
+all remaining differences to quantization or implementation until the reference
+conventions and intermediate boundaries are aligned.
+
+An FP8 calibration control adds four real observations disjoint in frame index
+from the eight test observations: episode0 frames35/103, episode1 frames84/208.
+It retains the existing scale rule and margin1.1. Twelve view projections feed
+native BF16 activation capture. With pooled calibration, real-input pass counts
+improve from0/8,4/8,4/8 to1/8,7/8,8/8; diagnostic counts remain1/15,0/15,1/13.
+Separating the same measurements per view produces1/8,7/8,7/8 and2/15,0/15,0/13.
+Both calibrations remain rejected. Their files are diagnostic-only, not approved
+bank assets; the legacy schema's non-bootstrap production label is not a
+claim of deployment acceptance. No saved reference or existing calibration is
+overwritten, and distribution arguments do not waive the red inputs.
+
+Further Orin attention controls preserve every sampled QK/PV output and
+reconstruction but remain slower. Coalesced repair layouts and conservative
+per-group error bounds do not close the gap. The latter uses72/80 registers
+without spills; targeted profiling attributes about1.31/1.15ms to dot/bound
+kernels, .47ms to repair and .21ms to classification, versus .747/.704ms for
+teacher GEMMs. These are operator-level measurements, not full-model budgets.
+The complete maintained BF16 integration, Orin performance target, quantized
+quality failures and approved bank/budgets remain **unaccepted**.
