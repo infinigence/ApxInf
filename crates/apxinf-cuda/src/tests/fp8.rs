@@ -1972,6 +1972,305 @@ fn bias_gelu_quant_matches_tanh_reference() {
 }
 
 #[test]
+fn bias_residual_and_concat_quantize_packed8_match_references_bitwise() {
+    // cand-12 vectorization: pure elementwise, so the packed-8 kernels must be
+    // bitwise equal to the scalar contract. Vision shapes plus a width that is
+    // not a multiple of 8 (scalar fallback).
+    let backend = CudaBackend::new(0).unwrap();
+    for &(rows, cols) in &[(512usize, 1024usize), (256, 1024), (5, 1020)] {
+        let mut state = 0x853c_49e6_748f_ea9bu64 ^ ((rows as u64) << 32) ^ cols as u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+        };
+        let projection = (0..rows * cols).map(|_| bf16::from_f32(next() * 3.0)).collect::<Vec<_>>();
+        let residual = (0..rows * cols).map(|_| bf16::from_f32(next() * 4.0)).collect::<Vec<_>>();
+        let bias = (0..cols).map(|_| bf16::from_f32(next() * 0.9)).collect::<Vec<_>>();
+        let device = |shape: Vec<usize>, values: &[bf16]| {
+            backend.to_device(&Tensor::from_bf16(shape, values).unwrap()).unwrap()
+        };
+        let projection_gpu = device(vec![rows, cols], &projection);
+        let residual_gpu = device(vec![rows, cols], &residual);
+        let bias_gpu = device(vec![cols], &bias);
+        let actual = bias_residual_bf16(
+            backend.context(),
+            &projection_gpu,
+            Some(&bias_gpu),
+            &residual_gpu,
+        )
+        .unwrap();
+        backend.synchronize().unwrap();
+        let actual = backend.to_cpu(&actual).unwrap();
+        let actual = actual.as_bf16().unwrap();
+        for row in 0..rows {
+            for col in 0..cols {
+                let index = row * cols + col;
+                // Same order as the kernel: (projection + residual) then bias.
+                let expected = bf16::from_f32(
+                    projection[index].to_f32() + residual[index].to_f32() + bias[col].to_f32(),
+                );
+                assert_eq!(
+                    actual[index].to_bits(),
+                    expected.to_bits(),
+                    "bias_residual [{rows},{cols}] differs at row {row} col {col}"
+                );
+            }
+        }
+
+        // Concat+quantize must equal a host concatenation quantized by the
+        // established packed-8 quantize kernel (identical per-element math).
+        const SCALE: f32 = 0.0173;
+        let split = rows / 2 + 1;
+        let first = device(vec![split, cols], &projection[..split * cols]);
+        let second = device(vec![rows - split, cols], &projection[split * cols..]);
+        let fused = concat_rows_quantize_bf16_e4m3(
+            backend.context(),
+            &first,
+            &second,
+            SCALE,
+        )
+        .unwrap();
+        let reference = quantize_bf16_e4m3_packed8(backend.context(), &projection_gpu, SCALE)
+            .or_else(|_| quantize_bf16_e4m3(backend.context(), &projection_gpu, SCALE))
+            .unwrap();
+        backend.synchronize().unwrap();
+        let fused = backend.to_cpu(&fused).unwrap();
+        let reference = backend.to_cpu(&reference).unwrap();
+        assert_eq!(
+            fused.as_f8_e4m3().unwrap(),
+            reference.as_f8_e4m3().unwrap(),
+            "concat_rows_quantize [{rows},{cols}] split {split} differs from the quantize kernel"
+        );
+    }
+}
+
+#[test]
+fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
+    // Thor-only exact-shape GR00T DiT self-attention QKV fusion: compare
+    // bitwise against the production path (three FP8 GEMMs, then the in-place
+    // Q/K/V bias kernel).
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 110 {
+        return;
+    }
+    const M: usize = 41;
+    const H: usize = 1536;
+    const ACT_SCALE: f32 = 0.0137;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let activation = (0..M * H).map(|_| bf16::from_f32(next() * 2.0)).collect::<Vec<_>>();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, H], &activation).unwrap())
+        .unwrap();
+    let activation_fp8 = quantize_bf16_e4m3(backend.context(), &activation, ACT_SCALE).unwrap();
+    let weight_scales = [0.061f32 / 448.0, 0.047 / 448.0, 0.083 / 448.0];
+    let mut weights_fp8 = Vec::new();
+    let mut biases = Vec::new();
+    for (index, scale) in weight_scales.iter().enumerate() {
+        let amplitude = [0.06f32, 0.045, 0.08][index];
+        let weight = (0..H * H).map(|_| bf16::from_f32(next() * amplitude)).collect::<Vec<_>>();
+        let weight = backend
+            .to_device(&Tensor::from_bf16(vec![H, H], &weight).unwrap())
+            .unwrap();
+        weights_fp8.push(quantize_bf16_e4m3(backend.context(), &weight, *scale).unwrap());
+        let bias = (0..H).map(|_| bf16::from_f32(next() * 0.7)).collect::<Vec<_>>();
+        biases.push(
+            backend
+                .to_device(&Tensor::from_bf16(vec![H], &bias).unwrap())
+                .unwrap(),
+        );
+    }
+    let project = |index: usize| {
+        crate::kernels::gemm::fp8_bf16(
+            backend.context(),
+            &activation_fp8,
+            ACT_SCALE,
+            crate::kernels::gemm::Fp8WeightView {
+                values_e4m3: &weights_fp8[index],
+                scale: weight_scales[index],
+                dual_geglu_interleaved: false,
+                dual_geglu_auto_interleaved: None,
+            },
+        )
+        .unwrap()
+    };
+    let (query, key, value) = bias_qkv_in_place_bf16(
+        backend.context(),
+        project(0),
+        project(1),
+        project(2),
+        &biases[0],
+        &biases[1],
+        &biases[2],
+    )
+    .unwrap();
+
+    let host_weights = weights_fp8
+        .iter()
+        .map(|weight| backend.to_cpu(weight).unwrap())
+        .collect::<Vec<_>>();
+    let mut concat = Vec::with_capacity(H * 3 * H);
+    for row in 0..H {
+        for weight in &host_weights {
+            concat.extend_from_slice(&weight.as_f8_e4m3().unwrap()[row * H..(row + 1) * H]);
+        }
+    }
+    let mut alpha = Vec::with_capacity(3 * H);
+    let mut bias = Vec::with_capacity(3 * H);
+    for index in 0..3 {
+        alpha.extend(std::iter::repeat(ACT_SCALE * weight_scales[index]).take(H));
+        bias.extend_from_slice(backend.to_cpu(&biases[index]).unwrap().as_bf16().unwrap());
+    }
+    let concat = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![H, 3 * H], &concat).unwrap())
+        .unwrap();
+    let alpha = backend
+        .to_device(&Tensor::from_f32(vec![3 * H], &alpha).unwrap())
+        .unwrap();
+    let bias = backend
+        .to_device(&Tensor::from_bf16(vec![3 * H], &bias).unwrap())
+        .unwrap();
+    let fused = crate::kernels::gemm::fp8_self_qkv_bf16_m41(
+        backend.context(),
+        &activation_fp8,
+        &concat,
+        &alpha,
+        &bias,
+    )
+    .unwrap();
+    backend.synchronize().unwrap();
+    let fused = backend.to_cpu(&fused).unwrap();
+    let fused = fused.as_bf16().unwrap();
+    let references = [query, key, value]
+        .iter()
+        .map(|tensor| backend.to_cpu(tensor).unwrap())
+        .collect::<Vec<_>>();
+    let mut mismatches = 0usize;
+    let mut first = None;
+    for row in 0..M {
+        for (part, reference) in references.iter().enumerate() {
+            let reference = reference.as_bf16().unwrap();
+            for col in 0..H {
+                let actual = fused[row * 3 * H + part * H + col];
+                let expected = reference[row * H + col];
+                if actual.to_bits() != expected.to_bits() {
+                    mismatches += 1;
+                    first.get_or_insert((row, part, col, actual, expected));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "fused self-QKV differs from the three-GEMM reference in {mismatches} elements; first {first:?}"
+    );
+}
+
+#[test]
+fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
+    // Thor-only exact-shape GR00T DiT FC1 fusion: compare against the
+    // production two-kernel path (BF16 FP8 GEMM, then bias+GELU+quantize).
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 110 {
+        return;
+    }
+    const M: usize = 41;
+    const K: usize = 1536;
+    const N: usize = 6144;
+    const ACT_SCALE: f32 = 0.0125;
+    const OUT_SCALE: f32 = 0.02;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let activation = (0..M * K).map(|_| bf16::from_f32(next() * 1.5)).collect::<Vec<_>>();
+    let weight = (0..K * N).map(|_| bf16::from_f32(next() * 0.05)).collect::<Vec<_>>();
+    let bias = (0..N).map(|_| bf16::from_f32(next() * 0.5)).collect::<Vec<_>>();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, K], &activation).unwrap())
+        .unwrap();
+    let weight = backend
+        .to_device(&Tensor::from_bf16(vec![K, N], &weight).unwrap())
+        .unwrap();
+    let bias = backend
+        .to_device(&Tensor::from_bf16(vec![N], &bias).unwrap())
+        .unwrap();
+    let weight_scale = 0.05f32 / 448.0;
+    let activation_fp8 = quantize_bf16_e4m3(backend.context(), &activation, ACT_SCALE).unwrap();
+    let weight_fp8 = quantize_bf16_e4m3(backend.context(), &weight, weight_scale).unwrap();
+    let view = || crate::kernels::gemm::Fp8WeightView {
+        values_e4m3: &weight_fp8,
+        scale: weight_scale,
+        dual_geglu_interleaved: false,
+        dual_geglu_auto_interleaved: None,
+    };
+    let reference_bf16 =
+        crate::kernels::gemm::fp8_bf16(backend.context(), &activation_fp8, ACT_SCALE, view())
+            .unwrap();
+    let reference =
+        bias_gelu_quant_bf16_e4m3(backend.context(), &reference_bf16, &bias, OUT_SCALE).unwrap();
+    let fused = crate::kernels::gemm::fp8_bias_gelu_quant_e4m3_m41(
+        backend.context(),
+        &activation_fp8,
+        ACT_SCALE,
+        view(),
+        &bias,
+        OUT_SCALE,
+    )
+    .unwrap();
+    backend.synchronize().unwrap();
+    let reference = backend.to_cpu(&reference).unwrap();
+    let fused = backend.to_cpu(&fused).unwrap();
+    let reference = reference.as_f8_e4m3().unwrap();
+    let fused = fused.as_f8_e4m3().unwrap();
+    assert_eq!(reference.len(), M * N);
+    assert_eq!(fused.len(), M * N);
+    let decode = |bits: u8| -> f32 {
+        let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+        let exponent = ((bits >> 3) & 0x0f) as i32;
+        let mantissa = (bits & 0x07) as f32;
+        if exponent == 0 {
+            sign * (mantissa / 8.0) * 2.0f32.powi(-6)
+        } else {
+            sign * (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
+        }
+    };
+    let mut mismatches = 0usize;
+    let mut max_rel = 0.0f32;
+    for (index, (&a, &b)) in fused.iter().zip(reference.iter()).enumerate() {
+        if a != b {
+            mismatches += 1;
+            let (fa, fb) = (decode(a), decode(b));
+            let rel = (fa - fb).abs() / fb.abs().max(2.0f32.powi(-6));
+            max_rel = max_rel.max(rel);
+            // Accumulation-order differences may move a value across one
+            // E4M3 rounding boundary (12.5% relative); anything larger is a
+            // real epilogue mismatch.
+            assert!(
+                rel <= 0.13,
+                "fused E4M3 {fa} differs from reference {fb} at {index} (codes {a:#04x} vs {b:#04x})"
+            );
+        }
+    }
+    let mismatch_fraction = mismatches as f64 / (M * N) as f64;
+    assert!(
+        mismatch_fraction < 0.02,
+        "{mismatches} of {} E4M3 codes differ ({mismatch_fraction:.4}), max rel {max_rel}",
+        M * N
+    );
+}
+
+#[test]
 fn mqa_flash_uniform_scores_average_values() {
     const PREFIX: usize = 16;
     const SUFFIX: usize = 4;

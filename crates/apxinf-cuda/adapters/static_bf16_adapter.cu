@@ -7,8 +7,8 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
-#include <cstdint>
 #include <cstdint>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -31,6 +31,14 @@ namespace {
 
 int blocks_for(int64_t count) {
   return static_cast<int>((count + kThreads - 1) / kThreads);
+}
+
+// cand-12: force the scalar elementwise kernel for bitwise A/B testing.
+const bool kLegacyScalarElementwise =
+    std::getenv("APXINF_LEGACY_SCALAR_ELEMENTWISE") != nullptr;
+
+bool aligned16(const void* pointer) {
+  return reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
 }
 // A load-ahead CTA reads the whole projection/residual row before writing
 // hidden. The __restrict__ specialization also requires both output ranges
@@ -406,6 +414,17 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
+  if (!kLegacyScalarElementwise && cols % 8 == 0 && aligned16(projection) &&
+      aligned16(residual) && aligned16(output) &&
+      (bias == nullptr || aligned16(bias))) {
+    const int64_t vectors = count / 8;
+    bias_residual_bf16_packed8_kernel<<<blocks_for(vectors), kThreads, 0, stream>>>(
+        static_cast<const Bf16Pack8*>(projection),
+        static_cast<const Bf16Pack8*>(bias),
+        static_cast<const Bf16Pack8*>(residual),
+        static_cast<Bf16Pack8*>(output), vectors, cols / 8);
+    return cudaGetLastError();
+  }
   bias_residual_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(bias),

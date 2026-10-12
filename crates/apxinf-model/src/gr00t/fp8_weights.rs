@@ -278,6 +278,19 @@ pub(super) struct Gr00tFp8LinearWeights {
     weight_scale: f32,
     activation_scale: f32,
     bias: Option<Tensor>,
+    /// Thor-only exact self-attention Q|K|V fusion, attached to the query
+    /// projection of DiT self-attention blocks at load time.
+    exact_self_qkv: Option<Gr00tFp8ExactSelfQkv>,
+}
+
+/// Column-concatenated E4M3 Q|K|V weights with per-column combined scale and
+/// concatenated BF16 bias. The E4M3 values are copied from the already
+/// quantized Q/K/V weights, so no value or scale changes.
+#[derive(Debug)]
+pub(super) struct Gr00tFp8ExactSelfQkv {
+    weight: Tensor,
+    alpha: Tensor,
+    bias: Tensor,
 }
 
 impl Gr00tFp8LinearWeights {
@@ -324,6 +337,7 @@ impl Gr00tFp8LinearWeights {
             weight_scale,
             activation_scale,
             bias: Some(backend.to_device(&weights.bias)?),
+            exact_self_qkv: None,
         })
     }
 
@@ -350,6 +364,7 @@ impl Gr00tFp8LinearWeights {
             weight_scale,
             activation_scale,
             bias: None,
+            exact_self_qkv: None,
         })
     }
 }
@@ -458,6 +473,93 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         backend: &RuntimeBackend,
     ) -> Result<Tensor> {
         self.forward_quantized_tensor(input, backend)
+    }
+
+    fn l2_prefetch_tensors(&self, as_self_attention_input: bool) -> Vec<&Tensor> {
+        if std::env::var_os("APXINF_GR00T_FP8_NO_L2_PREFETCH").is_some() {
+            return Vec::new();
+        }
+        if as_self_attention_input {
+            if let Some(qkv) = self.exact_self_qkv.as_ref() {
+                return vec![&qkv.weight];
+            }
+        }
+        vec![&self.weight]
+    }
+
+    fn prepare_exact_self_qkv(
+        &mut self,
+        key: &Self,
+        value: &Self,
+        backend: &RuntimeBackend,
+    ) -> Result<()> {
+        const HIDDEN: usize = 1536;
+        let eligible = backend.context().caps().sm == 110
+            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_SELF_QKV").is_none()
+            && [self, key, value].iter().all(|linear| {
+                linear.weight.shape().dims() == [HIDDEN, HIDDEN]
+                    && linear
+                        .bias
+                        .as_ref()
+                        .is_some_and(|bias| bias.shape().dims() == [HIDDEN])
+            })
+            && self.activation_scale.to_bits() == key.activation_scale.to_bits()
+            && key.activation_scale.to_bits() == value.activation_scale.to_bits();
+        if !eligible {
+            return Ok(());
+        }
+        let host_weights = [
+            backend.to_cpu(&self.weight)?,
+            backend.to_cpu(&key.weight)?,
+            backend.to_cpu(&value.weight)?,
+        ];
+        let parts = host_weights
+            .iter()
+            .map(|tensor| tensor.as_f8_e4m3())
+            .collect::<Result<Vec<_>>>()?;
+        let mut weight = Vec::with_capacity(HIDDEN * 3 * HIDDEN);
+        for row in 0..HIDDEN {
+            for part in &parts {
+                weight.extend_from_slice(&part[row * HIDDEN..(row + 1) * HIDDEN]);
+            }
+        }
+        let mut alpha = Vec::with_capacity(3 * HIDDEN);
+        for linear in [&*self, key, value] {
+            // Same f32 product the cuBLASLt path passes as alpha.
+            let combined = linear.activation_scale * linear.weight_scale;
+            alpha.extend(std::iter::repeat(combined).take(HIDDEN));
+        }
+        let mut bias = Vec::with_capacity(3 * HIDDEN);
+        for linear in [&*self, key, value] {
+            let host = backend.to_cpu(linear.bias.as_ref().expect("bias checked"))?;
+            bias.extend_from_slice(host.as_bf16()?);
+        }
+        self.exact_self_qkv = Some(Gr00tFp8ExactSelfQkv {
+            weight: backend.to_device(&Tensor::from_f8_e4m3(vec![HIDDEN, 3 * HIDDEN], &weight)?)?,
+            alpha: backend.to_device(&Tensor::from_f32(vec![3 * HIDDEN], &alpha)?)?,
+            bias: backend.to_device(&Tensor::from_bf16(vec![3 * HIDDEN], &bias)?)?,
+        });
+        Ok(())
+    }
+
+    fn forward_exact_self_qkv(
+        &self,
+        input: &Self::ReusableInput,
+        backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        let Some(qkv) = self.exact_self_qkv.as_ref() else {
+            return Ok(None);
+        };
+        if input.shape().dims() != [41, 1536] {
+            return Ok(None);
+        }
+        Ok(Some(kernels::gemm::fp8_self_qkv_bf16_m41(
+            backend.context(),
+            input,
+            &qkv.weight,
+            &qkv.alpha,
+            &qkv.bias,
+        )?))
     }
 
     fn forward_reusable_quantized_bias_residual(

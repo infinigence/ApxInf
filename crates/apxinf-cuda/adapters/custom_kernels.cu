@@ -57,6 +57,34 @@ extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,vo
   return cudaGetLastError();
 }
 
+// L2 warm-up hint for a read-only weight that a later kernel will stream.
+// Issued on a forked side stream inside the CUDA graph so it overlaps
+// DRAM-light work on the main stream; it never changes any data.
+__global__ void l2_bulk_prefetch_kernel(const char* base, uint64_t bytes, uint32_t chunk) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint64_t count = (bytes + chunk - 1) / chunk;
+  for (uint64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+    const uint64_t offset = i * chunk;
+    const uint32_t size = static_cast<uint32_t>(
+        (bytes - offset) < chunk ? (bytes - offset) : chunk);
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                 :: "l"(base + offset), "r"(size) : "memory");
+  }
+#endif
+}
+
+extern "C" cudaError_t apxinf_l2_bulk_prefetch(
+    const void* base, uint64_t bytes, uint32_t chunk, uint32_t blocks,
+    uint32_t threads, cudaStream_t stream) {
+  if (!base || bytes == 0 || chunk == 0 || chunk % 16 != 0 || bytes % 16 != 0 ||
+      reinterpret_cast<uintptr_t>(base) % 16 != 0 || blocks == 0 || threads == 0)
+    return cudaErrorInvalidValue;
+  l2_bulk_prefetch_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const char*>(base), bytes, chunk);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_relu_bf16(const void* x,void* y,int64_t count,cudaStream_t stream) {
   if(!x||!y||count<=0) return cudaErrorInvalidValue;
   relu_bf16_kernel<<<256,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)y,count);
@@ -96,6 +124,14 @@ namespace {
 
 // Resolve the validated action Ada packed8 route before CUDA graph capture.
 // Auto enables it only for the exact supported shape.
+// cand-12: force the scalar elementwise kernels for bitwise A/B testing.
+const bool kLegacyScalarElementwise =
+    std::getenv("APXINF_LEGACY_SCALAR_ELEMENTWISE") != nullptr;
+
+bool aligned16(const void* pointer) {
+  return reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
+}
+
 const int kActionAdaPacked8Mode = [] {
     const char* value = std::getenv("APXINF_PI05_ACTION_ADA_PACKED8");
     if (value == nullptr || std::strcmp(value, "auto") == 0) {
@@ -231,6 +267,18 @@ extern "C" cudaError_t apxinf_static_concat_rows_quantize_bf16_e4m3(
   const int64_t first_count = static_cast<int64_t>(first_rows) * cols;
   const int64_t total_count =
       static_cast<int64_t>(first_rows + second_rows) * cols;
+  if (!kLegacyScalarElementwise && first_count % 8 == 0 && total_count % 8 == 0 &&
+      aligned16(first) && aligned16(second) && aligned16(output)) {
+    const int64_t total_vectors = total_count / 8;
+    int vector_blocks = static_cast<int>((total_vectors + 255) / 256);
+    vector_blocks = vector_blocks > 4096 ? 4096 : vector_blocks;
+    concat_rows_quantize_bf16_e4m3_packed8_kernel<<<vector_blocks, 256, 0, stream>>>(
+        static_cast<const Bf16Pack8*>(first),
+        static_cast<const Bf16Pack8*>(second),
+        static_cast<Fp8Pack8*>(output), first_count / 8, total_vectors,
+        1.0f / scale);
+    return cudaGetLastError();
+  }
   int blocks = static_cast<int>((total_count + 255) / 256);
   blocks = blocks > 4096 ? 4096 : blocks;
   concat_rows_quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(

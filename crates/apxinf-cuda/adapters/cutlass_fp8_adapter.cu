@@ -25,6 +25,14 @@ extern "C" int apxinf_static_cutlass_fp8_gemm_bias_then_residual_bf16_m41(
       activation, weight, bias, residual, output, m, n, k, alpha, stream);
 }
 
+extern "C" int apxinf_static_cutlass_fp8_gemm_self_qkv_bf16_m41(
+    const void* activation, const void* weight, const float* alpha,
+    const void* bias, void* output, int m, int n, int k,
+    cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::fp8_gemm_self_qkv_bf16_m41(
+      activation, weight, alpha, bias, output, m, n, k, stream);
+}
+
 extern "C" int apxinf_static_cutlass_fp8_gemm_bias_gelu_quant_e4m3_m41(
     const void* activation, const void* weight, const void* bias, void* output,
     int m, int n, int k, float alpha, float output_scale,

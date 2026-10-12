@@ -14,6 +14,14 @@ extern "C" {
         frequency_step: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_l2_bulk_prefetch(
+        base: *const c_void,
+        bytes: u64,
+        chunk: u32,
+        blocks: u32,
+        threads: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_relu_bf16(
         x: *const c_void,
         out: *mut c_void,

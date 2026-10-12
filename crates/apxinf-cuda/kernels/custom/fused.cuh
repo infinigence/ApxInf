@@ -439,6 +439,41 @@ __global__ void bias_then_residual_bf16_packed4_kernel(
   }
 }
 
+// Packed-8 form of bias_residual_bf16_kernel: 16-byte loads/stores with the
+// same per-element expression and f32 addition order, so results are bitwise
+// identical. A warp of scalar BF16 accesses uses only half of every 128-byte
+// sector, which held this kernel near 118 GB/s (cand-12).
+__global__ void bias_residual_bf16_packed8_kernel(
+    const Bf16Pack8* projection, const Bf16Pack8* bias,
+    const Bf16Pack8* residual, Bf16Pack8* output,
+    int64_t vector_count, int vector_cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < vector_count; index += stride) {
+    const Bf16Pack8 projected = projection[index];
+    const Bf16Pack8 residuals = residual[index];
+    Bf16Pack8 result;
+    if (bias != nullptr) {
+      const Bf16Pack8 biases = bias[index % vector_cols];
+#pragma unroll
+      for (int item = 0; item < 8; ++item) {
+        float value = __bfloat162float(projected.values[item]) +
+                      __bfloat162float(residuals.values[item]);
+        value += __bfloat162float(biases.values[item]);
+        result.values[item] = __float2bfloat16(value);
+      }
+    } else {
+#pragma unroll
+      for (int item = 0; item < 8; ++item) {
+        const float value = __bfloat162float(projected.values[item]) +
+                            __bfloat162float(residuals.values[item]);
+        result.values[item] = __float2bfloat16(value);
+      }
+    }
+    output[index] = result;
+  }
+}
+
 // Preserve a two-kernel `bias_bf16` then `add_bf16` contract in one launch:
 // the projection+bias sum is rounded to BF16 before adding the residual.
 __global__ void bias_then_residual_bf16_kernel(

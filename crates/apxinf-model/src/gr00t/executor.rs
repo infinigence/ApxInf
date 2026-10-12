@@ -55,6 +55,35 @@ const USE_FUSED_ADAPTIVE_LAYER_NORM_QUANT: bool = true;
 const USE_FUSED_FFN_BIAS_RESIDUAL: bool = true;
 const USE_FUSED_FP8_DIT_RESIDUAL_LAYER_NORM_QUANT: bool = true;
 
+/// cand-10 Qwen weight prefetch; APXINF_GR00T_FP8_NO_QWEN_L2_PREFETCH disables it.
+fn qwen_prefetch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("APXINF_GR00T_FP8_NO_QWEN_L2_PREFETCH").is_none())
+}
+
+fn prefetch_qwen<L: DeviceLinearWeights>(
+    backend: &RuntimeBackend,
+    linears: &BTreeMap<String, L>,
+    names: &[String],
+) -> Result<()> {
+    if !qwen_prefetch_enabled() {
+        return Ok(());
+    }
+    let tensors = names
+        .iter()
+        .filter_map(|name| linears.get(name))
+        .flat_map(|linear| linear.l2_prefetch_tensors(false))
+        .collect::<Vec<_>>();
+    prefetch_l2(backend, tensors)
+}
+
+fn prefetch_l2(backend: &RuntimeBackend, tensors: Vec<&Tensor>) -> Result<()> {
+    if tensors.is_empty() || backend.context().caps().sm != 110 {
+        return Ok(());
+    }
+    kernels::prefetch::l2_prefetch_fork_many(backend.context(), &tensors)
+}
+
 /// Precision-specific weight materialization and layer-composition policy.
 ///
 /// The public loader selects one concrete implementation.  `Gr00tExecutor`
@@ -1098,6 +1127,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     )
                 }
             };
+        // cand-14/cand-20: use the same side-lane L2 prefetcher for the
+        // vision encoder. This is a cache hint and does not change values.
+        let vision_prefetch = |names: &[&str]| -> Result<()> {
+            let owned = names.iter().map(|name| (*name).to_string()).collect::<Vec<_>>();
+            prefetch_qwen(&*self.backend, &self.backbone_linears, &owned)
+        };
         let vision_output = vision::forward_with_prepared_positions_and_matmul(
             &self.backbone_config,
             &self.backbone_vision,
@@ -1115,6 +1150,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             } else {
                 None
             },
+            Some(&vision_prefetch),
             use_fused_bf16_vision_mlp_residual_norm,
             Some(&vision_bias_residual),
             E::USE_CACHED_VISION_RESIDUAL_LAYER_NORM && self.backend.context().caps().sm == 87,
@@ -1122,6 +1158,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             use_vision_pointwise_pack,
         )
         .map_err(|error| Error::Other(format!("GR00T vision forward failed: {error}")))?;
+        kernels::prefetch::l2_prefetch_join(self.backend.context())?;
         let image_positions = &token_groups.image;
         if image_positions.len() != vision_output.primary.shape().dims()[0] {
             return Err(Error::Other(format!(
@@ -1204,6 +1241,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 hidden = scatter_rows(&*self.backend, &hidden, deepstack, true, &image_indices)?;
             }
         }
+        kernels::prefetch::l2_prefetch_join(self.backend.context())?;
         // GR00T consumes Qwen3-VL's selected decoder-layer hidden state via
         // `outputs.hidden_states[-1]`. That value is captured before the
         // language model's final RMSNorm, even though `last_hidden_state`
@@ -1449,6 +1487,11 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 && hidden.shape().dims() == [41, self.config.input_embedding_dim]
                 && std::env::var_os("APXINF_GR00T_W8A8_LEGACY_ATTENTION_BIAS_RESIDUAL").is_none();
             let defer_attention_bias = use_bias_residual_layer_norm || fuse_attention_bias_residual;
+            // cand-10: prefetch the current FFN input weight while the
+            // attention and normalization work is in flight.
+            let mut prefetch_fc1 = || -> Result<()> {
+                prefetch_l2(&self.backend, block.feed_forward.input.l2_prefetch_tensors(false))
+            };
             let attention = match prepared_key_value {
                 Some(key_value) => forward_attention_with_prepared_key_value(
                     &*self.backend,
@@ -1459,6 +1502,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     self.config.diffusion.num_attention_heads,
                     self.config.diffusion.attention_head_dim,
                     !defer_attention_bias,
+                    &mut prefetch_fc1,
                 )?,
                 None => forward_attention(
                     &*self.backend,
@@ -1470,6 +1514,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     self.config.diffusion.num_attention_heads,
                     self.config.diffusion.attention_head_dim,
                     !defer_attention_bias,
+                    &mut prefetch_fc1,
                 )?,
             };
             let fused_normalized = if USE_FUSED_FP8_DIT_RESIDUAL_LAYER_NORM_QUANT
@@ -1487,6 +1532,20 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             } else {
                 None
             };
+            // cand-10: FC1 now reads mostly from L2, leaving DRAM free to
+            // fetch FC2's weight while FC1 runs. cand-20 appends the next
+            // block's attention weights to the same lane, so they are fetched
+            // after FC2 (needed first) and are warm when that block starts.
+            // The index wraps because the next flow step reuses these blocks.
+            let next_index = (layer_index + 1) % self.action.dit_blocks.len();
+            let mut ffn_prefetch = block.feed_forward.output.l2_prefetch_tensors(false);
+            if let Some(next) = self.action.dit_blocks.get(next_index) {
+                let next_is_self = dit_attention_source(&self.config, next_index)?
+                    == Gr00tDitAttentionSource::StateActionSelf;
+                ffn_prefetch.extend(next.attention.query.l2_prefetch_tensors(next_is_self));
+                ffn_prefetch.extend(next.attention.output.l2_prefetch_tensors(false));
+            }
+            prefetch_l2(&self.backend, ffn_prefetch)?;
             hidden = if let Some((residual, normalized)) = fused_normalized {
                 forward_feed_forward_residual_quantized(
                     &*self.backend,
@@ -1578,6 +1637,8 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 }
             };
         }
+        // All weight prefetch lanes forked inside the DiT loop rejoin here.
+        kernels::prefetch::l2_prefetch_join(self.backend.context())?;
 
         let dynamic_output_modulation;
         let output_modulation = if use_static_conditioning {
@@ -1786,7 +1847,18 @@ impl<E: Gr00tPrecisionExecution> Gr00tDeviceActionWeights<E> {
         let dit_blocks = dit_blocks
             .into_iter()
             .enumerate()
-            .map(|(index, weights)| transfer_dit_block(weights, execution, index, backend))
+            .map(|(index, weights)| {
+                let mut block = transfer_dit_block(weights, execution, index, backend)?;
+                if dit_attention_source(config, index)? == Gr00tDitAttentionSource::StateActionSelf {
+                    let attention = &mut block.attention;
+                    attention.query.prepare_exact_self_qkv(
+                        &attention.key,
+                        &attention.value,
+                        backend,
+                    )?;
+                }
+                Ok(block)
+            })
             .collect::<Result<Vec<_>>>()?;
         let output_modulation = transfer_linear(
             output_modulation,
@@ -2343,6 +2415,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
     heads: usize,
     head_dim: usize,
     apply_output_bias: bool,
+    on_input_projected: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Tensor> {
     let query_len = query_input.shape().dims()[0];
     let key_value_len = key_value_input.shape().dims()[0];
@@ -2432,6 +2505,15 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         let input = query_quantized.ok_or_else(|| {
             Error::Other("fused FP8 self QKV bias requires shared quantized input".into())
         })?;
+        if let Some(qkv) = weights.query.forward_exact_self_qkv(input, backend)? {
+            on_input_projected()?;
+            let output = noncausal_strided_qkv_attention::<E>(backend, &qkv, heads, head_dim)?;
+            return if apply_output_bias {
+                linear(backend, &output, &weights.output)
+            } else {
+                weights.output.forward(&output, backend)
+            };
+        }
         let query = weights.query.forward_reusable_quantized(input, backend)?;
         let key = weights.key.forward_reusable_quantized(input, backend)?;
         let value = weights.value.forward_reusable_quantized(input, backend)?;
@@ -2455,6 +2537,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         let query = query.reshape(vec![query_len, heads, head_dim])?;
         let key = key.reshape(vec![key_value_len, heads, head_dim])?;
         let value = value.reshape(vec![key_value_len, heads, head_dim])?;
+        on_input_projected()?;
         let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
         return if apply_output_bias {
             linear(backend, &output, &weights.output)
@@ -2485,6 +2568,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         linear(backend, key_value_input, &weights.value)?
     }
     .reshape(vec![key_value_len, heads, head_dim])?;
+    on_input_projected()?;
     let output = noncausal_attention::<E>(backend, &query, &key, &value, heads, head_dim)?;
     if apply_output_bias {
         linear(backend, &output, &weights.output)
@@ -2535,6 +2619,7 @@ fn forward_attention_with_prepared_key_value<E: Gr00tPrecisionExecution>(
     heads: usize,
     head_dim: usize,
     apply_output_bias: bool,
+    on_input_projected: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Tensor> {
     let query_len = query_input.shape().dims()[0];
     let query = if let Some(input) = prequantized_query {
@@ -2543,6 +2628,7 @@ fn forward_attention_with_prepared_key_value<E: Gr00tPrecisionExecution>(
         linear(backend, query_input, &weights.query)?
     }
     .reshape(vec![query_len, heads, head_dim])?;
+    on_input_projected()?;
     let output = noncausal_attention::<E>(
         backend,
         &query,
@@ -2583,6 +2669,7 @@ fn forward_standard_block<E: Gr00tPrecisionExecution>(
         heads,
         head_dim,
         true,
+        &mut || Ok(()),
     )?;
     let hidden = backend.add(hidden, &attention)?;
     let normalized = layer_norm(
@@ -2900,6 +2987,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             }
         })
         .transpose()?;
+    prefetch_qwen(backend, linears, &[up_name.clone()])?;
     let gate = if let (Some((gate, _)), Some(input)) = (shared_gate_up, &shared_gate_up_input) {
         gate.forward_reusable_quantized(input, backend)?
     } else {
@@ -2913,6 +3001,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             &layer.w_gate,
         )?
     };
+    prefetch_qwen(backend, linears, &[format!("{prefix}.down")])?;
     let up = if let (Some((_, up)), Some(input)) = (shared_gate_up, &shared_gate_up_input) {
         up.forward_reusable_quantized(input, backend)?
     } else {
@@ -2927,6 +3016,14 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         )?
     };
     let down_name = format!("{prefix}.down");
+    if layer_index + 1 < text.n_layers {
+        let next = format!("backbone.text.layers.{}", layer_index + 1);
+        prefetch_qwen(
+            backend,
+            linears,
+            &[format!("{next}.query"), format!("{next}.key"), format!("{next}.value")],
+        )?;
+    }
     let feed_forward = if let Some(down) = linears
         .get(&down_name)
         .filter(|down| down.activation_scale().is_some())
