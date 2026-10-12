@@ -58,11 +58,23 @@ pub(crate) fn end(ctx: &CudaContext) -> std::result::Result<CapturedGraph, Strin
     let mut graph: ffi::cudaGraph_t = std::ptr::null_mut();
     let end_status = device_status
         .and_then(|_| unsafe { ffi::check_cuda(ffi::cudaStreamEndCapture(stream, &mut graph)) });
-    let retained = crate::workspace::end_capture_retention();
+    let retained = crate::workspace::end_capture_retention(end_status.is_ok())
+        .map_err(|error| error.to_string());
     if end_status.is_err() {
         clear_capture_error();
     }
     end_status?;
+    // A capture that ended but did not traverse the whole prepared operator
+    // sequence would replay wrong results; drop the graph and report it.
+    let retained = match retained {
+        Ok(retained) => retained,
+        Err(error) => {
+            unsafe {
+                let _ = ffi::cudaGraphDestroy(graph);
+            }
+            return Err(error);
+        }
+    };
     let mut exec: ffi::cudaGraphExec_t = std::ptr::null_mut();
     let status = unsafe {
         ffi::cudaGraphInstantiate(

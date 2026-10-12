@@ -47,4 +47,36 @@ unsafe extern "C" {
         spec: *const Spec,
         bindings: *const Bindings,
     ) -> i32;
+    pub(crate) fn apxinf_rope_apply_batched_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        n_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        theta: f32,
+        pos_offset: i32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_rope_apply_mrope_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        n_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        theta: f32,
+        pos_ids: *const c_void,
+        sec_h: i32,
+        sec_w: i32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_rope_apply_vision_2d_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        n_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        theta: f32,
+        pos_ids: *const c_void,
+        stream: CudaStream,
+    ) -> i32;
 }

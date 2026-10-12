@@ -36,6 +36,7 @@ pub enum PointwiseActivation {
     None,
     Gelu,
     Silu,
+    Relu,
 }
 
 impl PointwiseActivation {
@@ -44,6 +45,7 @@ impl PointwiseActivation {
             Self::None => 0,
             Self::Gelu => 1,
             Self::Silu => 2,
+            Self::Relu => 3,
         }
     }
 }

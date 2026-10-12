@@ -3,9 +3,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "../apxinf-cuda/build_support/nvcc_build.rs"]
+#[path = "build_support/nvcc_build.rs"]
 mod nvcc_build;
-#[path = "../apxinf-cuda/aot/link.rs"]
+#[path = "aot/link.rs"]
 mod aot;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
@@ -187,6 +187,10 @@ fn main() {
     // crate boundary, so the capability is a `pub const` instead.
     println!("cargo:rustc-check-cfg=cfg(apxinf_qwen38_dense_swiglu_aot)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_decode)");
+    // The sm110 AOT fast paths are not vendored into cuda-new; the cfg is
+    // declared so their `cfg!` guards compile and always take the generic
+    // route.
+    println!("cargo:rustc-check-cfg=cfg(apxinf_aot_sm110)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -253,7 +257,7 @@ fn main() {
     let aot_manifest = env::var_os("APXINF_CUDA_AOT_MANIFEST").map(PathBuf::from);
     let qwen38_aot = if selection.targets.iter().any(|target| target.sm() == 110) {
         aot_manifest.as_ref().and_then(|path| {
-            let aot_root = manifest.join("../apxinf-cuda/aot");
+            let aot_root = manifest.join("aot");
             aot::Bundle::load_required(
                 &aot_root,
                 &aot_root.join("qwen38.json"),
@@ -333,6 +337,15 @@ fn main() {
         "attention/execution.cpp",
         "attention/providers/custom.cu",
         "elementwise/execution.cpp",
+        "elementwise/ops.cpp",
+        "cache/ops.cpp",
+        "quant_fused/ops.cpp",
+        "vla_attn/ops.cpp",
+        "vla_la/ops.cu",
+        "gr00t/ops.cu",
+        "llm_decode/ops.cu",
+        "smolvla/ops.cu",
+        "preprocess/ops.cpp",
         "linear_attention/execution.cpp",
         "attn_helpers/execution.cpp",
         "reduction/execution.cpp",
@@ -346,6 +359,11 @@ fn main() {
     .map(|source| adapters.join(source))
     .to_vec();
     generic_sources.push(native.join("kernels/custom/mlp_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/elementwise_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/cache_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/quant_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/vla_attn_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/preprocess_ops.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
     generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
     generic_sources.push(native.join("kernels/custom/attn_ops.cu"));
@@ -400,6 +418,12 @@ fn main() {
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
         cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+    } else {
+        // No sm100 target: the kernel translation unit is absent, so link the
+        // unsupported-status stub in its place (a weak symbol is not enough —
+        // once the archive resolves the weak definition it never pulls the
+        // strong member, which turned the real kernel into the stub on Thor).
+        generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_stub.cpp"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
     // The allocation-free FA2 decode ABI is a stub that returns
@@ -408,9 +432,13 @@ fn main() {
     if has_fa2 {
         println!("cargo:rustc-cfg=apxinf_fa2_decode");
     }
+    // Always compiled: without APXINF_ATTENTION_FA2 the translation unit is
+    // only the extern "C" direct-dispatch stubs (strong symbols in the same
+    // TU — a weak stub beside a strong member does not link correctly out of
+    // a static archive).
+    generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
     let mut fa2_sources = Vec::new();
     if has_fa2 {
-        generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
         fa2_sources.extend(
             [
                 "fa2.cu",

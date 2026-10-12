@@ -12,12 +12,12 @@
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
+use apxinf_core::{Backend as _, DType, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
 
-use crate::accelerator::cuda::{
-    kernels, Context as CudaContext, CublasTranspose,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer,
-    RuntimeBackend as CudaBackend,
+use apxinf_cuda_new::{
+    kernels, CublasTranspose, CudaBuffer, CudaContext,
+    CudaKvCache as CudaKVCache, CudaNewBackend as CudaBackend,
+    HostMappedBuffer,
 };
 
 // ── Config + weight view types (model-level, not backend) ───────────────
@@ -186,6 +186,19 @@ fn device_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
         .map_err(Error::Cuda)
 }
 
+/// Borrow one layer's K/V cache storage as raw device buffers.
+///
+/// cuda-new's `CudaKvCache` owns its storage as tensors; the decode kernels
+/// take buffers. `from_tensor` only re-wraps the existing GPU storage handle
+/// (no allocation), so this is graph-safe. The cache layout is token-major
+/// `[1, max_seq, n_kv_heads, head_dim]` — the llm_decode kernels address it
+/// accordingly (unlike the legacy head-major cache).
+fn cache_buffers(cache: &CudaKVCache, layer: usize) -> Result<(CudaBuffer, CudaBuffer)> {
+    let k = CudaBuffer::from_tensor(cache.key(layer)).map_err(Error::Cuda)?;
+    let v = CudaBuffer::from_tensor(cache.value(layer)).map_err(Error::Cuda)?;
+    Ok((k, v))
+}
+
 // ── Decode forward (graph body) ──────────────────────────────────────────
 
 fn decode_forward_capturable(
@@ -274,6 +287,8 @@ fn decode_forward_capturable(
 
         // RoPE + KV cache append. bf16: fused rope_k_write for K; Q uses
         // rope_decode. V has no RoPE. fp32: 4-kernel fallback.
+        // Cache storage is cuda-new token-major [1, max_seq, n_kv_heads, head_dim].
+        let (k_cache, v_cache) = cache_buffers(cache, i)?;
         kernels::rope::apply_into(
             ctx,
             dtype,
@@ -288,7 +303,7 @@ fn decode_forward_capturable(
             kernels::rope::apply_k_write_cache_bf16(
                 ctx,
                 &k_view,
-                cache.k_buffer(i),
+                &k_cache,
                 head_dim,
                 n_kv_heads,
                 max_seq,
@@ -309,7 +324,7 @@ fn decode_forward_capturable(
             kernels::cache::append_at(
                 ctx,
                 dtype,
-                cache.k_buffer(i),
+                &k_cache,
                 &ws.k_rope,
                 n_kv_heads,
                 head_dim,
@@ -320,7 +335,7 @@ fn decode_forward_capturable(
         kernels::cache::append_at(
             ctx,
             dtype,
-            cache.v_buffer(i),
+            &v_cache,
             &v_view,
             n_kv_heads,
             head_dim,
@@ -333,8 +348,8 @@ fn decode_forward_capturable(
             kernels::attention::flash_bf16_into(
                 ctx,
                 &ws.q_rope,
-                cache.k_buffer(i),
-                cache.v_buffer(i),
+                &k_cache,
+                &v_cache,
                 &ws.attn_out,
                 n_heads,
                 n_kv_heads,
@@ -345,16 +360,22 @@ fn decode_forward_capturable(
                 position,
             )?;
         } else {
+            // Token-major cache: one head's K rows live at
+            // (t * n_kv_heads + kv_h) * head_dim — a strided [kv_len, head_dim]
+            // matrix with row stride n_kv_heads * head_dim, expressed through
+            // write_ex's explicit leading dimensions.
+            let kv_stride = n_kv_heads * head_dim;
             for kv_h in 0..n_kv_heads {
                 let q_offset = (kv_h * gqa_ratio) * head_dim;
                 let scores_offset = (kv_h * gqa_ratio) * bucket_kv_len;
-                let k_offset = kv_h * max_seq * head_dim;
+                let k_offset = kv_h * head_dim;
+                let k_block_len = ((bucket_kv_len - 1) * kv_stride + head_dim) * elem;
                 let q_group = ws.q_rope.view(q_offset * elem, gqa_ratio * head_dim * elem).map_err(Error::Cuda)?;
-                let k_block = cache.k_buffer(i).view(k_offset * elem, bucket_kv_len * head_dim * elem).map_err(Error::Cuda)?;
+                let k_block = k_cache.view(k_offset * elem, k_block_len).map_err(Error::Cuda)?;
                 let scores_block = ws.scores.view(scores_offset * elem, gqa_ratio * bucket_kv_len * elem).map_err(Error::Cuda)?;
                 kernels::gemm::write_ex(ctx, dtype, CublasTranspose::None, CublasTranspose::Transpose,
                     gqa_ratio, bucket_kv_len, head_dim, scale,
-                    &q_group, head_dim as i32, &k_block, head_dim as i32, 0.0, &scores_block, bucket_kv_len as i32)?;
+                    &q_group, head_dim as i32, &k_block, kv_stride as i32, 0.0, &scores_block, bucket_kv_len as i32)?;
             }
             kernels::attention::softmax_f32_into(
                 ctx,
@@ -366,14 +387,15 @@ fn decode_forward_capturable(
             )?;
             for kv_h in 0..n_kv_heads {
                 let attn_offset = (kv_h * gqa_ratio) * bucket_kv_len;
-                let v_offset = kv_h * max_seq * head_dim;
+                let v_offset = kv_h * head_dim;
+                let v_block_len = ((bucket_kv_len - 1) * kv_stride + head_dim) * elem;
                 let out_offset = (kv_h * gqa_ratio) * head_dim;
                 let attn_group = ws.attn_weights.view(attn_offset * elem, gqa_ratio * bucket_kv_len * elem).map_err(Error::Cuda)?;
-                let v_block = cache.v_buffer(i).view(v_offset * elem, bucket_kv_len * head_dim * elem).map_err(Error::Cuda)?;
+                let v_block = v_cache.view(v_offset * elem, v_block_len).map_err(Error::Cuda)?;
                 let out_block = ws.attn_out.view(out_offset * elem, gqa_ratio * head_dim * elem).map_err(Error::Cuda)?;
                 kernels::gemm::write_ex(ctx, dtype, CublasTranspose::None, CublasTranspose::None,
                     gqa_ratio, head_dim, bucket_kv_len, 1.0,
-                    &attn_group, bucket_kv_len as i32, &v_block, head_dim as i32, 0.0, &out_block, head_dim as i32)?;
+                    &attn_group, bucket_kv_len as i32, &v_block, kv_stride as i32, 0.0, &out_block, head_dim as i32)?;
             }
         }
 
@@ -546,12 +568,27 @@ impl DecodeGraph {
         let ctx = backend.context();
         let mut seen: std::collections::HashSet<usize> =
             self.buckets.iter().map(|b| b.bucket_kv_len).collect();
+        let mut warmed = false;
         for pos in 0..=max_pos {
             let bkl = self.bucket_for(pos);
             if !seen.insert(bkl) {
                 continue;
             }
-            backend.begin_capture_relaxed()?;
+            // cuda-new captures in thread-local mode (the legacy backend used
+            // relaxed mode, which tolerates cuBLAS allocating its workspace
+            // mid-capture). Run the forward once eagerly so every lazy cuBLAS
+            // resource exists before recording. The run is harmless: it
+            // replays the token/position currently in the mapped control
+            // buffers, so the K/V row it writes is either position 0 of a
+            // fresh cache (overwritten by prefill) or a bit-identical rewrite
+            // of the last decoded token's row.
+            if !warmed {
+                decode_forward_capturable(
+                    ctx, &self.workspace, weights, kv, &self.config, bkl)?;
+                backend.synchronize()?;
+                warmed = true;
+            }
+            backend.begin_capture()?;
             let cap_res = decode_forward_capturable(
                 ctx, &self.workspace, weights, kv, &self.config, bkl);
             let graph = backend.end_capture()?;
@@ -581,7 +618,7 @@ impl DecodeGraph {
             backend.synchronize()?;
             let logits = device_logits(&self.workspace, vocab)?;
 
-            backend.begin_capture_relaxed()?;
+            backend.begin_capture()?;
             let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
             let graph = backend.end_capture()?;
             cap_res?;

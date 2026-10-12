@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
+use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, CudaNewBackend, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
-use crate::accelerator::create_backend;
 use crate::llm_trait::LlmTrait;
 
 use super::config::{CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM,
@@ -23,7 +22,7 @@ use super::{backend, model, model_runner, weights};
 /// validated configuration. The kernel harness keeps its own switches for A/B
 /// comparison.
 pub struct Qwen38 {
-    ctx: CudaContext,
+    ctx: Arc<CudaContext>,
     backend: Arc<dyn Backend>,
     model: weights::Model,
     scratch: model::Scratch,
@@ -61,11 +60,15 @@ impl Qwen38 {
         // configuration. TODO(cuda-new): promote to per-call arguments.
         model_runner::apply_validated_kernel_defaults();
 
-        let ctx = CudaContext::new(ordinal).map_err(Error::Cuda)?;
-        let backend = create_backend(device)?;
+        let ctx = Arc::new(CudaContext::new(ordinal).map_err(Error::Cuda)?);
         let model = weights::load_model(&ctx, &weights, true);
         ctx.synchronize().map_err(Error::Cuda)?;
         drop(weights);
+        // The sampling surface is the only part of `LlmTrait` that needs a
+        // `dyn Backend`; everything else already runs on `ctx` through
+        // `apxinf_cuda_new::ops`. Sharing one context between the model and
+        // the backend keeps the sampler on the same stream and device.
+        let backend: Arc<dyn Backend> = Arc::new(CudaNewBackend::new(ctx.clone()));
 
         let capacity = kv_capacity.next_power_of_two();
         let gdn_states: Vec<model::GdnState> = (0..LAYERS - LAYERS / FULL_ATTENTION_INTERVAL)

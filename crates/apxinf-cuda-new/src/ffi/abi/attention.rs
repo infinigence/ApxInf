@@ -76,6 +76,46 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn apxinf_attention_enqueue(execution: Execution) -> i32;
     pub(crate) fn apxinf_attention_destroy(execution: Execution);
+    /// Direct FA2 BF16 forward (non-causal or causal), no tuning state. The
+    /// caller owns every buffer; returns a `cudaError_t`. Stubbed to
+    /// `cudaErrorNotSupported` when FA2 is not compiled in.
+    pub(crate) fn apxinf_cn_fa2_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        softmax_lse: *mut c_void,
+        batch: i32,
+        query_tokens: i32,
+        key_tokens: i32,
+        query_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        causal: i32,
+        stream: CudaStream,
+    ) -> i32;
+    /// Direct FA2 BF16 split-KV forward; `num_splits` is planned by the
+    /// caller (`plan_fa2_split_count`), accumulators are caller-owned.
+    pub(crate) fn apxinf_cn_fa2_bf16_splitkv(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        output: *mut c_void,
+        softmax_lse: *mut c_void,
+        softmax_lse_accum: *mut c_void,
+        o_accum: *mut c_void,
+        batch: i32,
+        query_tokens: i32,
+        key_tokens: i32,
+        query_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        softmax_scale: f32,
+        num_splits: i32,
+        causal: i32,
+        stream: CudaStream,
+    ) -> i32;
     #[cfg(test)]
     pub(crate) fn apxinf_attention_summary(execution: Execution) -> *const c_char;
     #[cfg(test)]

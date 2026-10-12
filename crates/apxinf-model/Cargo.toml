@@ -6,7 +6,6 @@ license = "Apache-2.0"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
-apxinf-cuda = { path = "../apxinf-cuda", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
@@ -18,9 +17,8 @@ serde_json = "1"
 
 [features]
 default = []
-# Full NVIDIA CUDA inference: links both the legacy (`apxinf-cuda`) and the
-# current (`apxinf-cuda-new`) runtimes and enables every CUDA model family.
-cuda = ["dep:apxinf-cuda", "dep:apxinf-cuda-new"]
+# Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
+cuda = ["dep:apxinf-cuda-new"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.

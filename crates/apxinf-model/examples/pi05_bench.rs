@@ -1057,12 +1057,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile_replay = std::env::var_os("APXINF_PI05_PROFILE_REPLAY").is_some();
     if profile_replay {
         eprintln!("profiling one steady-state CUDA graph replay...");
-        apxinf_cuda::profiler::start().map_err(std::io::Error::other)?;
+        apxinf_cuda_new::profiler::start().map_err(std::io::Error::other)?;
         let replay_result = {
-            let _range = apxinf_cuda::nvtx::range("pi05.graph_replay");
+            let _range = apxinf_cuda_new::nvtx::range("pi05.graph_replay");
             graph.replay_and_synchronize()
         };
-        let stop_result = apxinf_cuda::profiler::stop().map_err(std::io::Error::other);
+        let stop_result = apxinf_cuda_new::profiler::stop().map_err(std::io::Error::other);
         replay_result?;
         stop_result?;
     }

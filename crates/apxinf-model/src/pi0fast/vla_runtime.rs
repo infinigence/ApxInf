@@ -353,7 +353,7 @@ pub(super) fn load_registered(
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    let backend = crate::accelerator::cuda::downcast_arc(backend)
+    let backend = crate::accelerator::downcast_cuda_new_arc(backend)
         .ok_or_else(|| Error::Other("π0-FAST is only registered for CUDA".into()))?;
     if options.config.is_some() {
         return Err(Error::Other(

@@ -9,7 +9,10 @@ use super::{encode_e4m3, E4M3_MAX};
 
 #[derive(Debug)]
 pub struct DynamicFp8LinearWeights {
-    /// Contiguous output-major physical `[output, input]` E4M3 matrix.
+    /// Contiguous input-major physical `[input, output]` (`[K, N]`) E4M3
+    /// matrix — cuda-new's canonical GEMM orientation. Quantization still
+    /// happens per output channel in `[N, K]` orientation; the stored matrix
+    /// is a load-time byte transpose with no numerical effect.
     pub weight: Tensor,
     /// FP32 scale vector with one element per output channel.
     pub channel_scales: Tensor,
@@ -20,6 +23,11 @@ pub struct DynamicFp8LinearWeights {
 }
 
 impl DynamicFp8LinearWeights {
+    /// Aligned input width (`K` of the resident `[K, N]` matrix).
+    pub fn padded_input_features(&self) -> usize {
+        self.weight.shape().dims()[0]
+    }
+
     #[cfg(feature = "cuda")]
     pub fn as_kernel_view(&self) -> kernels::gemm::DynamicFp8WeightView<'_> {
         kernels::gemm::DynamicFp8WeightView {
@@ -66,6 +74,11 @@ impl DynamicFp8LinearWeights {
         #[cfg(not(feature = "cuda"))]
         let (weight, channel_scales) = quantize_rows_host(&padded_weight, backend)?;
 
+        // cuda-new's GEMM consumes the canonical [K, N] orientation; transpose
+        // the quantized bytes once at load. E4M3 values are untouched, so the
+        // quantization itself stays bit-identical to the legacy [N, K] path.
+        let weight = transpose_e4m3(&weight, backend)?;
+
         Ok(Self {
             weight,
             channel_scales,
@@ -73,6 +86,22 @@ impl DynamicFp8LinearWeights {
             output_features,
         })
     }
+}
+
+/// Transpose an `[N, K]` E4M3 matrix to `[K, N]` through the host — a pure
+/// byte permutation performed once at weight-load time.
+fn transpose_e4m3(weight: &Tensor, backend: &dyn Backend) -> Result<Tensor> {
+    let dims = weight.shape().dims().to_vec();
+    let host = backend.to_cpu(weight)?;
+    let source = host.as_f8_e4m3()?;
+    let (rows, cols) = (dims[0], dims[1]);
+    let mut transposed = vec![0u8; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            transposed[col * rows + row] = source[row * cols + col];
+        }
+    }
+    backend.to_device(&Tensor::from_f8_e4m3(vec![cols, rows], &transposed)?)
 }
 
 fn align_16(value: usize) -> usize {
@@ -142,8 +171,9 @@ mod tests {
             .enumerate()
         {
             for input in 0..2 {
+                // Resident layout is [K, N] = [input, output].
                 let decoded =
-                    crate::walloss::decode_e4m3(values[output * 16 + input]) * scales[output];
+                    crate::walloss::decode_e4m3(values[input * 16 + output]) * scales[output];
                 assert!((decoded - expected[input]).abs() < expected[input].abs() * 0.05);
             }
         }

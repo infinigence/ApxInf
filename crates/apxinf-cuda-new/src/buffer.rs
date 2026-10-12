@@ -133,6 +133,100 @@ impl CudaBuffer {
         unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len)) }
     }
 
+    /// Device-to-device async copy of `num_bytes` from `source` on `stream`.
+    pub fn copy_from_device_async(
+        &self,
+        source: &CudaBuffer,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len || num_bytes > source.len {
+            return Err(format!(
+                "device copy of {num_bytes} bytes exceeds {} or {}",
+                self.len, source.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                num_bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fill the first `num_bytes` with `value` on `stream`.
+    pub fn memset_async(
+        &self,
+        value: i32,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len {
+            return Err(format!(
+                "memset of {num_bytes} bytes exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                value,
+                num_bytes,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fill `height` runs of `width` bytes, the first at `offset` and each
+    /// `pitch` bytes after the last.
+    pub fn memset_2d_async(
+        &self,
+        value: i32,
+        offset: usize,
+        pitch: usize,
+        width: usize,
+        height: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if width > pitch {
+            return Err(format!("memset2d width {width} exceeds pitch {pitch}"));
+        }
+        let span = match height.checked_sub(1).and_then(|last| {
+            last.checked_mul(pitch)
+                .and_then(|skip| skip.checked_add(width))
+                .and_then(|end| end.checked_add(offset))
+        }) {
+            Some(span) => span,
+            None if height == 0 => return Ok(()),
+            None => return Err("memset2d extent overflow".into()),
+        };
+        if span > self.len {
+            return Err(format!(
+                "memset2d of {height}x{width} bytes at {offset} exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        if width == 0 {
+            return Ok(());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset2DAsync(
+                (self.ptr as *mut u8).add(offset) as *mut c_void,
+                pitch,
+                value,
+                width,
+                height,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Raw device pointer for crate-internal launch code.
     pub(crate) fn ptr(&self) -> *mut c_void {
         self.ptr

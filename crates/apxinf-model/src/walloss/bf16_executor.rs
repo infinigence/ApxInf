@@ -69,7 +69,7 @@ fn dynamic_linear(
             weight.input_features, input_shape
         )));
     }
-    let padded_input_features = weight.weight.shape().dims()[1];
+    let padded_input_features = weight.padded_input_features();
     let activation = kernels::quantization::quantize_rows_bf16_e4m3_padded(
         context,
         input,
@@ -88,10 +88,10 @@ fn dynamic_linear_prequantized(
     let weight_shape = weight.weight.shape().dims();
     if activation_shape.len() != 2
         || weight_shape.len() != 2
-        || activation_shape[1] != weight_shape[1]
+        || activation_shape[1] != weight_shape[0]
     {
         return Err(Error::Other(format!(
-            "prequantized dynamic FP8 linear shape mismatch: {:?} @ {:?}",
+            "prequantized dynamic FP8 linear shape mismatch: {:?} @ KN {:?}",
             activation_shape, weight_shape
         )));
     }
@@ -127,7 +127,7 @@ fn qkv_after_rms(
                 input,
                 norm_weight,
                 eps,
-                weight.weight.shape().dims()[1],
+                weight.padded_input_features(),
             )?;
             dynamic_linear_prequantized(context, &normalized, weight, false)
         }
@@ -219,7 +219,7 @@ fn residual_mlp(
                 input,
                 post_attention_norm,
                 eps,
-                gate_up.weight.shape().dims()[1],
+                gate_up.padded_input_features(),
             )?;
             let gate_up_output = dynamic_linear_prequantized(context, &normalized, gate_up, true)?;
             if gate_up.output_features % 2 != 0
@@ -235,7 +235,7 @@ fn residual_mlp(
                 &gate_up_output,
                 gate_up_bias,
                 gate_up.output_features / 2,
-                down.weight.shape().dims()[1],
+                down.padded_input_features(),
             )?;
             let down = dynamic_linear_prequantized(context, &activated, down, false)?;
             kernels::fused::bias_residual_bf16(context, &down, down_bias, &hidden)
@@ -268,7 +268,7 @@ fn residual_mlp(
                 input,
                 post_attention_norm,
                 eps,
-                gate_up.weight.shape().dims()[1],
+                gate_up.padded_input_features(),
             )?;
             let gate_up_output = dynamic_linear_prequantized(context, &normalized, gate_up, true)?;
             if gate_up.output_features % 2 != 0
@@ -284,7 +284,7 @@ fn residual_mlp(
                 &gate_up_output,
                 gate_up_bias,
                 gate_up.output_features / 2,
-                down.weight.shape().dims()[1],
+                down.padded_input_features(),
             )?;
             let down = dynamic_linear_prequantized(context, &activated, down, false)?;
             kernels::fused::bias_residual_bf16(context, &down, down_bias, &hidden)

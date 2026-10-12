@@ -5,8 +5,8 @@ use std::f64::consts::TAU;
 use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 use half::{bf16, f16};
 
-use crate::accelerator::cuda::{
-    downcast_arc, kernels, CudaEventTimer, Context, DeviceBuffer, RuntimeBackend,
+use super::backend::{
+    downcast_arc, kernels, Context, CudaEventTimer, DeviceBuffer, RuntimeBackend,
 };
 use crate::vla::{ImageLayout, Observation, VisionObservation};
 

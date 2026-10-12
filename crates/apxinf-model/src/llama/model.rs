@@ -14,12 +14,9 @@ use crate::profiling::GenerationProfile;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
-use crate::accelerator::cuda::{
-    kernels as cuda_kernels, transfers as cuda_ops, Context as CudaContext,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache,
-};
+use apxinf_cuda_new::{transfers as cuda_ops, CudaNewBackend};
 #[cfg(feature = "cuda")]
-use apxinf_core::KvCache;
+use apxinf_core::{Backend, KvCache};
 
 use super::weights::{LlamaWeights, TransformerLayer};
 
@@ -28,11 +25,9 @@ pub struct LlamaModel {
     pub config: ModelConfig,
     pub weights: LlamaWeights,
     #[cfg(feature = "cuda")]
-    cuda_ctx: Option<Arc<CudaContext>>,
+    cuda_backend: Option<Arc<CudaNewBackend>>,
     #[cfg(feature = "cuda")]
-    cuda_device_id: Option<usize>,
-    #[cfg(feature = "cuda")]
-    cuda_kv_cache: Option<CudaKVCache>,
+    cuda_kv_cache: Option<Box<dyn KvCache>>,
 }
 
 /// All weights for a Llama model.
@@ -60,9 +55,7 @@ impl LlamaModel {
             config,
             weights,
             #[cfg(feature = "cuda")]
-            cuda_ctx: None,
-            #[cfg(feature = "cuda")]
-            cuda_device_id: None,
+            cuda_backend: None,
             #[cfg(feature = "cuda")]
             cuda_kv_cache: None,
         })
@@ -76,9 +69,9 @@ impl LlamaModel {
         match device {
             Device::Cpu => Ok(()),
             Device::Cuda(device_id) => {
-                let ctx = CudaContext::new(device_id)
+                let ctx = apxinf_cuda_new::CudaContext::new(device_id)
                     .map_err(|e| Error::Cuda(format!("CUDA init: {e}")))?;
-                let ctx = Arc::new(ctx);
+                let backend = Arc::new(CudaNewBackend::new(Arc::new(ctx)));
 
                 self.weights.token_embedding = cuda_ops::to_cuda(&self.weights.token_embedding, device_id)?;
                 self.weights.output_norm_weight = cuda_ops::to_cuda(&self.weights.output_norm_weight, device_id)?;
@@ -96,8 +89,7 @@ impl LlamaModel {
                     layer.w_down = cuda_ops::to_cuda(&layer.w_down, device_id)?;
                 }
 
-                self.cuda_ctx = Some(ctx);
-                self.cuda_device_id = Some(device_id);
+                self.cuda_backend = Some(backend);
                 self.cuda_kv_cache = None;
                 Ok(())
             }
@@ -147,16 +139,15 @@ impl LlamaModel {
 
         // Set up KV cache based on device
         #[cfg(feature = "cuda")]
-        let mut cache: Option<KVCache> = if self.cuda_ctx.is_some() {
-            // CUDA path: create CudaKVCache, no CPU KVCache needed
-            let device_id = self.cuda_device_id.unwrap();
-            self.cuda_kv_cache = Some(CudaKVCache::new(
-                device_id,
+        let mut cache: Option<KVCache> = if self.cuda_backend.is_some() {
+            // CUDA path: create a cuda-new KV cache, no CPU KVCache needed
+            let backend = self.cuda_backend.as_ref().unwrap().clone();
+            self.cuda_kv_cache = Some(backend.create_kv_cache(
                 self.config.n_layers,
                 self.config.n_kv_heads,
                 self.config.head_dim(),
                 self.config.max_seq_len,
-            )?);
+            ));
             None
         } else {
             Some(KVCache::new(&self.config))
@@ -260,132 +251,82 @@ impl LlamaModel {
 
     // ── CUDA GPU-only forward pass ───────────────────────────────────────
 
-    /// Fully GPU-resident forward pass for CUDA.
+    /// Fully GPU-resident forward pass for CUDA on the cuda-new runtime.
     ///
-    /// All ops stay on GPU; single stream sync at the end.
+    /// Composes the portable `Backend` trait methods of `CudaNewBackend`
+    /// (embedding, rms_norm, matmul, rope, kv_append, sdpa) — the same ops
+    /// `GeneralLlama` uses — so this legacy entry point and the general model
+    /// share one numeric path on GPU. All ops stay on GPU; single stream sync
+    /// at the end. BF16 weights only (the cuda-new operators are BF16-first);
+    /// FP32 weights on CUDA report an operator error instead of silently
+    /// computing on the host.
     #[cfg(feature = "cuda")]
     fn forward_cuda(&mut self, token_ids: &[u32], start_pos: usize) -> Result<Tensor> {
-        let ctx = self.cuda_ctx.as_ref().unwrap();
-        let kv_cache = self.cuda_kv_cache.as_ref().unwrap();
+        let backend = self.cuda_backend.as_ref().unwrap().clone();
+        let b: &dyn Backend = &*backend;
+        let kv = self.cuda_kv_cache.as_mut().unwrap();
+
+        let seq_len = token_ids.len();
+        let n_heads = self.config.n_heads;
+        let n_kv_heads = self.config.n_kv_heads;
+        let head_dim = self.config.head_dim();
 
         // Embedding lookup on GPU
-        let seq_len = token_ids.len();
-        let device_id = self.cuda_device_id.unwrap();
-
-        // Upload token IDs to GPU
-        let ids_bytes = seq_len * std::mem::size_of::<u32>();
-        let ids_buf = CudaBuffer::alloc(ids_bytes, device_id)
-            .map_err(Error::Cuda)?;
-        let host_bytes: Vec<u8> = token_ids.iter()
-            .flat_map(|id| id.to_ne_bytes())
-            .collect();
-        ids_buf.copy_from_host(&host_bytes)
-            .map_err(Error::Cuda)?;
-
-        let mut x = cuda_kernels::embedding::lookup(ctx, &self.weights.token_embedding, &ids_buf, seq_len)?;
+        let mut x = b.embedding(&self.weights.token_embedding, token_ids)?;
 
         // Transformer layers
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            x = self.transformer_layer_cuda(&x, layer, layer_idx, start_pos, ctx, kv_cache)?;
+            // Pre-attention norm
+            let normed = b.rms_norm(&x, &layer.attn_norm_weight, self.config.rms_norm_eps)?;
+
+            // Attention: QKV projections + RoPE + cache append + SDPA
+            let q = b.matmul(&normed, &layer.wq)?;
+            let k = b.matmul(&normed, &layer.wk)?;
+            let v = b.matmul(&normed, &layer.wv)?;
+            let q = q.reshape(vec![seq_len, n_heads, head_dim])?;
+            let k = k.reshape(vec![seq_len, n_kv_heads, head_dim])?;
+            let v = v.reshape(vec![seq_len, n_kv_heads, head_dim])?;
+            let q = b.rope(&q, n_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
+            let k = b.rope(&k, n_kv_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
+            b.kv_append(&mut **kv, layer_idx, &k, &v, seq_len)?;
+
+            let kv_len = kv.seq_len() + seq_len;
+            let attn_out = if seq_len == 1 {
+                b.sdpa_decode(&q, &mut **kv, layer_idx,
+                              n_heads, n_kv_heads, head_dim, kv_len, self.config.max_seq_len)?
+            } else {
+                b.sdpa_prefill(&q, &mut **kv, layer_idx,
+                               n_heads, n_kv_heads, head_dim, kv_len, self.config.max_seq_len)?
+            };
+            let attn_out = attn_out.reshape(vec![seq_len, n_heads * head_dim])?;
+            let attn_out = b.matmul(&attn_out, &layer.wo)?;
+
+            // Residual
+            let x_res = b.add(&x, &attn_out)?;
+
+            // Pre-FFN norm + MLP
+            let normed = b.rms_norm(&x_res, &layer.ffn_norm_weight, self.config.rms_norm_eps)?;
+            let gate = b.matmul(&normed, &layer.w_gate)?;
+            let gate = b.silu(&gate)?;
+            let up = b.matmul(&normed, &layer.w_up)?;
+            let hidden = b.mul(&gate, &up)?;
+            let mlp_out = b.matmul(&hidden, &layer.w_down)?;
+
+            // Residual
+            x = b.add(&x_res, &mlp_out)?;
         }
 
         // Final RMS norm + output projection
-        x = cuda_kernels::norm::rms(ctx, &x, &self.weights.output_norm_weight, self.config.rms_norm_eps)?;
-        x = cuda_kernels::gemm::matmul(ctx, &x, &self.weights.output_weight)?;
+        x = b.rms_norm(&x, &self.weights.output_norm_weight, self.config.rms_norm_eps)?;
+        x = b.matmul(&x, &self.weights.output_weight)?;
 
         // Single sync point — wait for all queued work
-        ctx.synchronize().map_err(Error::Cuda)?;
+        backend.synchronize()?;
 
         // Advance KV cache
         self.cuda_kv_cache.as_mut().unwrap().advance(seq_len);
 
         Ok(x)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn transformer_layer_cuda(
-        &self,
-        x: &Tensor,
-        layer: &TransformerLayer,
-        layer_idx: usize,
-        start_pos: usize,
-        ctx: &CudaContext,
-        kv_cache: &CudaKVCache,
-    ) -> Result<Tensor> {
-        // Pre-attention norm
-        let normed = cuda_kernels::norm::rms(ctx, x, &layer.attn_norm_weight, self.config.rms_norm_eps)?;
-
-        // Attention
-        let attn_out = self.attention_gpu(&normed, layer, layer_idx, start_pos, ctx, kv_cache)?;
-
-        // Residual
-        let x = cuda_kernels::elementwise::add(ctx, x, &attn_out)?;
-
-        // Pre-FFN norm
-        let normed = cuda_kernels::norm::rms(ctx, &x, &layer.ffn_norm_weight, self.config.rms_norm_eps)?;
-
-        // MLP
-        let gate = cuda_kernels::gemm::matmul(ctx, &normed, &layer.w_gate)?;
-        let gate = cuda_kernels::activation::silu(ctx, &gate)?;
-        let up = cuda_kernels::gemm::matmul(ctx, &normed, &layer.w_up)?;
-        let hidden = cuda_kernels::elementwise::mul(ctx, &gate, &up)?;
-        let mlp_out = cuda_kernels::gemm::matmul(ctx, &hidden, &layer.w_down)?;
-
-        // Residual
-        cuda_kernels::elementwise::add(ctx, &x, &mlp_out)
-    }
-
-    /// GPU-only attention using cuBLAS GEMM for GQA.
-    #[cfg(feature = "cuda")]
-    fn attention_gpu(
-        &self,
-        x: &Tensor,
-        layer: &TransformerLayer,
-        layer_idx: usize,
-        start_pos: usize,
-        ctx: &CudaContext,
-        kv_cache: &CudaKVCache,
-    ) -> Result<Tensor> {
-        let n_heads = self.config.n_heads;
-        let n_kv_heads = self.config.n_kv_heads;
-        let head_dim = self.config.head_dim();
-        let seq_len = x.shape().dims()[0];
-        // Project to Q, K, V
-        let q = cuda_kernels::gemm::matmul(ctx, x, &layer.wq)?;
-        let k = cuda_kernels::gemm::matmul(ctx, x, &layer.wk)?;
-        let v = cuda_kernels::gemm::matmul(ctx, x, &layer.wv)?;
-
-        // Reshape to [seq_len, n_heads, head_dim] / [seq_len, n_kv_heads, head_dim]
-        let q = q.reshape(vec![seq_len, n_heads, head_dim])?;
-        let k = k.reshape(vec![seq_len, n_kv_heads, head_dim])?;
-        let v = v.reshape(vec![seq_len, n_kv_heads, head_dim])?;
-
-        // Apply batched RoPE (half-split)
-        let q_rope = cuda_kernels::rope::apply_batched(
-            ctx, &q, n_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
-        let k_rope = cuda_kernels::rope::apply_batched(
-            ctx, &k, n_kv_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
-
-        // Append K/V to GPU KV cache
-        kv_cache.append(ctx, layer_idx, &k_rope, &v, seq_len)?;
-
-        let kv_len = kv_cache.seq_len() + seq_len;
-        let attn_out = cuda_kernels::attention::sdpa(
-            ctx,
-            &q_rope,
-            kv_cache,
-            layer_idx,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_len,
-            self.config.max_seq_len,
-            start_pos as u32,
-        )?;
-        // Output projection
-        let proj = cuda_kernels::gemm::matmul(ctx, &attn_out, &layer.wo)?;
-
-        Ok(proj)
     }
 
     // ── Original forward pass (CPU or CUDA with debug) ──────────────────
@@ -408,7 +349,7 @@ impl LlamaModel {
         // Branch to CUDA GPU path when CUDA is active and no debug
         #[cfg(feature = "cuda")]
         {
-            if self.cuda_ctx.is_some() && self.cuda_kv_cache.is_some() && debug.is_none() {
+            if self.cuda_backend.is_some() && self.cuda_kv_cache.is_some() && debug.is_none() {
                 return self.forward_cuda(token_ids, start_pos);
             }
         }
@@ -825,9 +766,9 @@ impl LlamaModel {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let backend = self.cuda_backend.as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
-                cuda_kernels::norm::rms(ctx, x, weight, self.config.rms_norm_eps)
+                (&**backend as &dyn Backend).rms_norm(x, weight, self.config.rms_norm_eps)
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -895,9 +836,9 @@ impl LlamaModel {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let backend = self.cuda_backend.as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
-                cuda_kernels::activation::silu(ctx, x)
+                (&**backend as &dyn Backend).silu(x)
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -922,9 +863,9 @@ impl LlamaModel {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let backend = self.cuda_backend.as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
-                cuda_kernels::elementwise::add(ctx, a, b)
+                (&**backend as &dyn Backend).add(a, b)
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -949,9 +890,9 @@ impl LlamaModel {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let backend = self.cuda_backend.as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
-                cuda_kernels::elementwise::mul(ctx, a, b)
+                (&**backend as &dyn Backend).mul(a, b)
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -969,9 +910,9 @@ impl LlamaModel {
             Device::Cpu => a.matmul_cpu(b),
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let backend = self.cuda_backend.as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
-                cuda_kernels::gemm::matmul(ctx, a, b)
+                (&**backend as &dyn Backend).matmul(a, b)
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {

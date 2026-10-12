@@ -18,12 +18,11 @@
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, Shape, Tensor};
+use apxinf_core::{Backend as _, DType, Error, Graph, KvCache, Result, Shape, Tensor};
 
-use crate::accelerator::cuda::{
-    kernels, Context as CudaContext, DeviceAddress,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer,
-    RuntimeBackend as CudaBackend,
+use apxinf_cuda_new::{
+    kernels, CudaBuffer, CudaContext, CudaDeviceAddress as DeviceAddress,
+    CudaKvCache as CudaKVCache, CudaNewBackend as CudaBackend, HostMappedBuffer,
 };
 
 // ── Config + weight views ────────────────────────────────────────────────
@@ -158,6 +157,19 @@ fn device_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
     ws.logits
         .as_tensor(Shape::new(vec![1, vocab]), ws.dtype)
         .map_err(Error::Cuda)
+}
+
+/// Borrow one layer's K/V cache storage as raw device buffers.
+///
+/// cuda-new's `CudaKvCache` owns its storage as tensors; the decode kernels
+/// take buffers. `from_tensor` only re-wraps the existing GPU storage handle
+/// (no allocation), so this is graph-safe. The cache layout is token-major
+/// `[1, max_seq, n_kv_heads, head_dim]` — the llm_decode kernels address it
+/// accordingly (unlike the legacy head-major cache).
+fn cache_buffers(cache: &CudaKVCache, layer: usize) -> Result<(CudaBuffer, CudaBuffer)> {
+    let k = CudaBuffer::from_tensor(cache.key(layer)).map_err(Error::Cuda)?;
+    let v = CudaBuffer::from_tensor(cache.value(layer)).map_err(Error::Cuda)?;
+    Ok((k, v))
 }
 
 // ── Decode forward (graph body) ──────────────────────────────────────────
@@ -329,10 +341,11 @@ fn decode_forward_capturable(
         // I'll extend the workspace with `cache_pos_buf`.
         // (See DecodeGraph::decode below for how the caller populates it.)
         let cache_position = cache_pos_view(ws)?;
+        let (k_cache, v_cache) = cache_buffers(cache, i)?;
         kernels::cache::append_at(
             ctx,
             dtype,
-            cache.k_buffer(i),
+            &k_cache,
             &ws.k_rope,
             n_kv_heads,
             head_dim,
@@ -342,7 +355,7 @@ fn decode_forward_capturable(
         kernels::cache::append_at(
             ctx,
             dtype,
-            cache.v_buffer(i),
+            &v_cache,
             &v_view,
             n_kv_heads,
             head_dim,
@@ -354,8 +367,8 @@ fn decode_forward_capturable(
         kernels::attention::flash_bf16_into(
             ctx,
             &ws.q_rope,
-            cache.k_buffer(i),
-            cache.v_buffer(i),
+            &k_cache,
+            &v_cache,
             &ws.attn_out,
             n_heads,
             n_kv_heads,
@@ -498,7 +511,7 @@ impl Qwen3VLDecodeGraph {
             backend.synchronize()?;
             let logits = device_logits(&self.workspace, vocab)?;
 
-            backend.begin_capture_relaxed()?;
+            backend.begin_capture()?;
             let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
             let graph = backend.end_capture()?;
             cap_res?;

@@ -4,10 +4,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
-use apxinf_core::{Backend, Error, Graph, NormalGenerator, Result, SamplingBackend, Tensor};
+use apxinf_core::{Error, Graph, NormalGenerator, Result, SamplingBackend, Tensor};
 use half::{bf16, f16};
 
-use crate::accelerator::cuda::{kernels, transfers, DeviceBuffer};
+use super::backend::{kernels, transfers, DeviceBuffer};
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent,
     Observation, PreparationStatus, PreparedInference, VisionObservation, VlaContract,
@@ -281,7 +281,7 @@ impl SmolVlaCapturedGraph {
         let mut last_workspace_error = None;
         for capacity in GRAPH_WORKSPACE_CAPACITIES_BYTES {
             let workspace =
-                kernels::GraphWorkspace::new(capacity, device_id)?;
+                kernels::GraphWorkspace::with_capacity(capacity, device_id)?;
             let preflight = kernels::prepare_with_workspace(&workspace, || {
                 model.infer_fixed(
                     raw_images.as_ref(),
@@ -335,7 +335,7 @@ impl SmolVlaCapturedGraph {
             }
             eprintln!(
                 "[apxinf] SmolVLA CUDA Graph captured with {}/{} workspace bytes",
-                workspace.peak_used(),
+                workspace.used(),
                 workspace.capacity()
             );
 

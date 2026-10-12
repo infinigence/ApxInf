@@ -819,8 +819,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         inputs: Gr00tGraphInputs,
         device_observation: Gr00tObservation,
     ) -> Result<Gr00tCapturedGraph> {
-        let workspace =
-            kernels::GraphWorkspace::new(INITIAL_GRAPH_WORKSPACE_BYTES, self.backend.device_id())?;
+        let workspace = kernels::GraphWorkspace::with_capacity(
+            INITIAL_GRAPH_WORKSPACE_BYTES,
+            self.backend.device_id(),
+        )?;
 
         let preflight_start = Instant::now();
         let eager_output =

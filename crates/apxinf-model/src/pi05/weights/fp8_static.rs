@@ -140,41 +140,6 @@ mod linear {
             assert_eq!(pack_host_parts(&[&zero]).unwrap().1, 1.0);
         }
 
-        #[test]
-        #[ignore = "requires CUDA"]
-        fn gpu_weight_quantization_matches_legacy_bytes() {
-            use apxinf_core::Backend;
-
-            let context = Context::new(0).unwrap();
-            let legacy = apxinf_cuda::CudaBackend::new(0).unwrap();
-            for maximum in [448.0, 13.3, 0.0] {
-                let mut values = (0..512)
-                    .map(|index| (index as f32 / 511.0 - 0.5) * maximum)
-                    .collect::<Vec<_>>();
-                values.extend([maximum, 0.01513671875, 1.0004]);
-                if maximum == 0.0 {
-                    values.fill(0.0);
-                }
-                let source = linear(&values, [1, values.len()], None);
-                let (host, scale, _) = pack_host_parts(&[&source]).unwrap();
-                let input = legacy.to_device(&host).unwrap();
-                let expected = apxinf_cuda::kernels::quantization::quantize_f16_e4m3(
-                    legacy.context(),
-                    &input,
-                    scale,
-                )
-                .unwrap();
-                legacy.context().synchronize().unwrap();
-                let expected = legacy.to_cpu(&expected).unwrap();
-                let actual = Fp8StaticLinearWeights::from_host(&source, &context).unwrap();
-                context.synchronize().unwrap();
-                let actual = backend::to_cpu(&actual.weight).unwrap();
-                assert_eq!(actual.as_f8_e4m3().unwrap(), expected.as_f8_e4m3().unwrap());
-                if maximum == 448.0 {
-                    assert_eq!(actual.as_f8_e4m3().unwrap()[513], 0x08);
-                }
-            }
-        }
     }
 }
 pub use linear::*;

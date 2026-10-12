@@ -328,11 +328,19 @@ impl AutoModel {
         }
 
         register_builtin_models();
-        let backend = create_backend(device)?;
+        // Every family runs on the cuda-new backend. The LLM/VLM families
+        // compose through `dyn Backend`; the VLA families reach cuda-new
+        // through their kernel seams and downcast to the concrete backend.
+        // PI0.5 and Qwen3.8 construct their own `CudaContext` inside their
+        // factories and ignore this handle.
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
-            configure_cuda_tuning(cuda, path, options)?;
-        }
+        let backend = if matches!(device, Device::Cuda(_)) {
+            crate::accelerator::create_cuda_new_backend(device)?
+        } else {
+            create_backend(device)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let backend = create_backend(device)?;
         // Families may register a device-specific factory (`pi05-cuda`) and
         // fall back to a generic one (`qwen3vl`). No `-hip` factory exists yet,
         // so HIP resolves to the generic entry, which is what the models that
@@ -414,68 +422,6 @@ fn exact_recipe_directory(path: &Path) -> PathBuf {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn configure_cuda_tuning(
-    cuda: &apxinf_cuda::CudaBackend,
-    model_path: &Path,
-    options: &LoadOptions,
-) -> Result<()> {
-    use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
-
-    let default_paths = TuningPaths::resolve_for_cuda(
-        "configs/tuning",
-        cuda.context().caps(),
-        cuda.context().library_versions(),
-    );
-    let model_root = if model_path.is_dir() {
-        model_path
-    } else {
-        model_path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let legacy_path = model_root.join("tactics.json");
-    let selected = select_cuda_tuning_database_path(&default_paths.tactics, &legacy_path, options);
-    let database = selected
-        .as_deref()
-        .map(TuningDb::from_json_file)
-        .transpose()?;
-    let paths = options
-        .tuning_path
-        .clone()
-        .map(TuningPaths::from_tactics)
-        .unwrap_or(default_paths);
-    let mode = if options.autotune {
-        TuningMode::AutoTune
-    } else {
-        TuningMode::Inference
-    };
-    apxinf_cuda::kernels::gemm::configure_tuning(
-        cuda.context(),
-        mode,
-        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
-        Some(paths),
-    )
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn select_cuda_tuning_database_path(
-    default_path: &Path,
-    legacy_path: &Path,
-    options: &LoadOptions,
-) -> Option<PathBuf> {
-    match options.tuning_path.as_ref() {
-        Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
-        None => default_path
-            .is_file()
-            .then(|| default_path.to_path_buf())
-            .or_else(|| {
-                (options.synthetic.is_none() && legacy_path.is_file())
-                    .then(|| legacy_path.to_path_buf())
-            }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,51 +455,4 @@ mod tests {
         path
     }
 
-    #[test]
-    fn synthetic_load_ignores_model_local_legacy_tactics() {
-        let directory = temporary_directory("synthetic-tactics");
-        let default_path = directory.join("missing-hardware-tactics.json");
-        let legacy_path = directory.join("tactics.json");
-        std::fs::write(&legacy_path, "{}").unwrap();
-        let options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            None
-        );
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &LoadOptions::default()),
-            Some(legacy_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn synthetic_load_still_uses_hardware_or_explicit_tactics() {
-        let directory = temporary_directory("explicit-tactics");
-        let default_path = directory.join("hardware.json");
-        let legacy_path = directory.join("tactics.json");
-        let explicit_path = directory.join("explicit.json");
-        std::fs::write(&default_path, "{}").unwrap();
-        std::fs::write(&legacy_path, "{}").unwrap();
-        std::fs::write(&explicit_path, "{}").unwrap();
-        let mut options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(default_path.clone())
-        );
-        options.tuning_path = Some(explicit_path.clone());
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(explicit_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
 }

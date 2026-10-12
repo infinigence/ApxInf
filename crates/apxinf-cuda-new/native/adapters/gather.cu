@@ -23,9 +23,14 @@ bool may_have_bias(uint32_t semantic) {
 }
 
 void validate_spec(const apxinf_gather_spec_t& spec) {
+  // F32 is accepted only for RGB preprocessing: the pi0-fast vision tower
+  // keeps its patch pipeline in F32 until the first projection.
+  const bool dtype_ok =
+      spec.dtype == APXINF_DTYPE_F16 || spec.dtype == APXINF_DTYPE_BF16 ||
+      (spec.dtype == APXINF_DTYPE_F32 &&
+       spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES);
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES || !dtype_ok ||
       spec.has_bias > 1 || spec.nhwc > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
       spec.vocab_size > INT32_MAX || spec.tokens_per_view > INT32_MAX ||
@@ -153,8 +158,8 @@ extern "C" apxinf_status_t apxinf_gather_launch(
     validate_bindings(*spec, *bindings);
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(
-        spec->dtype == APXINF_DTYPE_BF16
-            ? launch<__nv_bfloat16>(*spec, *bindings)
-            : launch<__half>(*spec, *bindings));
+        spec->dtype == APXINF_DTYPE_BF16  ? launch<__nv_bfloat16>(*spec, *bindings)
+        : spec->dtype == APXINF_DTYPE_F32 ? launch<float>(*spec, *bindings)
+                                          : launch<__half>(*spec, *bindings));
   });
 }

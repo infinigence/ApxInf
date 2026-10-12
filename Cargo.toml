@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/apxinf-core",
-    "crates/apxinf-cuda",
     "crates/apxinf-cuda-new",
     "crates/apxinf-hip",
     "crates/apxinf-loader",
@@ -18,14 +17,12 @@ license = "Apache-2.0"
 
 [features]
 default = []
-# CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
-# build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
-# CUDA uses libnvToolsExt. Both are handled transparently — see
-# crates/apxinf-cuda/build.rs.
-cuda = ["dep:apxinf-cuda", "apxinf-cuda/nvtx", "apxinf-model/cuda"]
-# Same as `cuda` but with NVTX compiled out entirely (no-op stubs). Use
-# when the target has no NVTX library installed at all.
-cuda-no-nvtx = ["dep:apxinf-cuda", "apxinf-model/cuda"]
+# CUDA GPU inference on the apxinf-cuda-new runtime.
+cuda = ["dep:apxinf-cuda-new", "apxinf-model/cuda"]
+# Historical alias from the era when NVTX could be compiled out of the
+# legacy runtime; cuda-new's NVTX markers are no-op stubs unless the
+# profiler is attached, so this is the same as `cuda`.
+cuda-no-nvtx = ["cuda"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # `cuda` already links both CUDA runtimes and enables every CUDA model family,
 # Qwen3.8 included — see crates/apxinf-model/Cargo.toml.
@@ -40,7 +37,7 @@ openblas = ["apxinf-core/openblas"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
-apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
+apxinf-cuda-new = { path = "crates/apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "crates/apxinf-hip", optional = true }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }

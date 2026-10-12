@@ -3,6 +3,7 @@
 use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 
 use crate::ffi;
+use crate::ffi::abi::{cache as abi, status};
 use crate::{CudaBuffer, CudaContext};
 
 /// Allocate a persistent row-major K/V cache and copy `prefix` into its first
@@ -103,3 +104,61 @@ pub fn concat_rows(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> Result
     }
     Ok(output)
 }
+
+/// Append BF16 K/V rows into a flat `[1, max_seq_len, n_kv_heads, head_dim]`
+/// cache at sequence position `seq_len`.
+///
+/// `cache` is the full-capacity storage; `new_data` is
+/// `[append_len, n_kv_heads, head_dim]`, the layout the RoPE split produces.
+/// This is the write half of the portable `apxinf_core::KvCache` trait; the
+/// read half is [`crate::ops::kv_cache_attention`] over the same buffer.
+pub fn append(
+    ctx: &CudaContext,
+    cache: &Tensor,
+    new_data: &Tensor,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    seq_len: usize,
+    append_len: usize,
+) -> Result<()> {
+    let cache_dims = cache.shape().dims();
+    if cache_dims != [max_seq_len, n_kv_heads, head_dim] && cache_dims != [1, max_seq_len, n_kv_heads, head_dim] {
+        return Err(Error::Other(format!(
+            "KV cache append expects [1, {max_seq_len}, {n_kv_heads}, {head_dim}] or [{max_seq_len}, {n_kv_heads}, {head_dim}], got {cache_dims:?}"
+        )));
+    }
+    let data_dims = new_data.shape().dims();
+    if data_dims != [append_len, n_kv_heads, head_dim] {
+        return Err(Error::Other(format!(
+            "KV cache append expects new data [{append_len}, {n_kv_heads}, {head_dim}], got {data_dims:?}"
+        )));
+    }
+    if cache.dtype() != DType::BF16
+        || new_data.dtype() != DType::BF16
+        || cache.device() != Device::Cuda(ctx.device_id())
+        || new_data.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(
+            "KV cache append requires BF16 CUDA tensors".into(),
+        ));
+    }
+    let cache_buffer = CudaBuffer::from_tensor(cache).map_err(Error::Cuda)?;
+    let data_buffer = CudaBuffer::from_tensor(new_data).map_err(Error::Cuda)?;
+    let to_i32 = |value: usize, what: &str| {
+        i32::try_from(value).map_err(|_| Error::Other(format!("{what} exceeds i32")))
+    };
+    unsafe {
+        status::check(abi::apxinf_cache_append_bf16(
+            data_buffer.ptr(),
+            cache_buffer.ptr(),
+            to_i32(n_kv_heads, "KV heads")?,
+            to_i32(head_dim, "head dim")?,
+            to_i32(max_seq_len, "max seq len")?,
+            to_i32(seq_len, "seq len")?,
+            to_i32(append_len, "append len")?,
+            ctx.stream().handle(),
+        ))
+    }
+}
+

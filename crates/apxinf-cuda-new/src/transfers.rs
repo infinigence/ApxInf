@@ -62,6 +62,86 @@ pub fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     Tensor::from_raw(tensor.shape().clone(), tensor.dtype(), Device::Cpu, bytes)
 }
 
+/// Copy `rows` strided runs of `width` device bytes from a CUDA tensor into a
+/// device buffer at `destination_offset`, using `source_pitch` and
+/// `destination_pitch` as the run strides.
+pub(crate) fn copy_tensor_2d_to_buffer(
+    ctx: &crate::CudaContext,
+    source: &Tensor,
+    destination: &CudaBuffer,
+    destination_offset: usize,
+    destination_pitch: usize,
+    source_pitch: usize,
+    width: usize,
+    rows: usize,
+) -> Result<()> {
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    if source.device() != Device::Cuda(ctx.device_id()) {
+        return Err(Error::DeviceMismatch {
+            expected: Device::Cuda(ctx.device_id()),
+            got: source.device(),
+        });
+    }
+    if destination.device() != ctx.device_id() {
+        return Err(Error::Other(format!(
+            "2D CUDA destination is on device {}, expected {}",
+            destination.device(),
+            ctx.device_id()
+        )));
+    }
+    if width > source_pitch || width > destination_pitch {
+        return Err(Error::Other(format!(
+            "2D CUDA copy width {width} exceeds source/destination pitch {source_pitch}/{destination_pitch}"
+        )));
+    }
+    let source = source
+        .storage()
+        .as_gpu()
+        .ok_or_else(|| Error::Other("expected CUDA source tensor".into()))?;
+    let source_required = rows
+        .checked_mul(source_pitch)
+        .ok_or_else(|| Error::Other("2D CUDA source size overflow".into()))?;
+    if source_required > source.len() {
+        return Err(Error::Other(format!(
+            "2D CUDA source requires {source_required} bytes, has {}",
+            source.len()
+        )));
+    }
+    let destination_required = destination_offset
+        .checked_add(
+            rows.saturating_sub(1)
+                .checked_mul(destination_pitch)
+                .and_then(|offset| offset.checked_add(width))
+                .ok_or_else(|| Error::Other("2D CUDA destination size overflow".into()))?,
+        )
+        .ok_or_else(|| Error::Other("2D CUDA destination offset overflow".into()))?;
+    if destination_required > destination.len() {
+        return Err(Error::Other(format!(
+            "2D CUDA destination requires {destination_required} bytes, has {}",
+            destination.len()
+        )));
+    }
+    unsafe {
+        ffi::check_cuda(ffi::cudaMemcpy2DAsync(
+            destination
+                .ptr()
+                .cast::<u8>()
+                .add(destination_offset)
+                .cast(),
+            destination_pitch,
+            source.ptr() as *const std::ffi::c_void,
+            source_pitch,
+            width,
+            rows,
+            ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 pub(crate) fn copy_host_to_device(
     device_id: usize,
     source: &[u8],

@@ -1,11 +1,21 @@
 //! CUDA-facing seam for the GR00T runtime.
+//!
+//! GR00T now runs on the cuda-new runtime: `kernels` resolves to the
+//! legacy-named shim over cuda-new operators, and `RuntimeBackend` is the
+//! cuda-new backend. The executor and runtime files are unchanged — the
+//! runtime swap happens entirely in these aliases.
 
 #[cfg(feature = "cuda")]
-pub(crate) use crate::accelerator::cuda::{
-    downcast_arc, kernels, transfers, DeviceBuffer, RuntimeBackend,
+pub(crate) use apxinf_cuda_new::{
+    kernels, tuning, transfers, CudaBuffer as DeviceBuffer, CudaContext as Context,
+    CudaNewBackend as RuntimeBackend,
 };
 #[cfg(feature = "cuda")]
-pub(crate) use apxinf_cuda::{tuning::TuningMode, CudaBackend};
+pub(crate) use crate::accelerator::downcast_cuda_new_arc as downcast_arc;
+#[cfg(feature = "cuda")]
+pub(crate) use apxinf_cuda_new::tuning::TuningMode;
+#[cfg(feature = "cuda")]
+pub(crate) use apxinf_cuda_new::CudaNewBackend as CudaBackend;
 
 /// The model opts into packed8 only for its measured BF16 epilogues.
 const fn use_packed8_bias_activation(
