@@ -238,7 +238,15 @@ one first-event measurement, rather than a stationary latency percentile.
 Repeated independent runs must establish its budget. Suites without two token
 lengths or cells without an approved switch budget fail before compilation.
 
-The v4 parity, v2 performance and v4 bank schemas require regeneration; old mixed-purpose
+An Orin one-view BF16 diagnostic pilot collected 100 warm samples per input
+for eight observations: per-case P50 was 167.9–168.6ms and P95 169.2–171.9ms.
+The B -> A shape-first call took 791.7ms, versus 850.0–860.1ms for initial
+preparation of the two token lengths. Before/after activity snapshots both
+contained desktop GPU clients, so this pilot is not an accepted performance
+baseline or paired regression. It demonstrates why the switch needs its own
+measurement; it does not identify the cause of an uninstrumented robot log.
+
+The v4 parity, v2 performance and v5 bank schemas require regeneration; old mixed-purpose
 receipts are historical evidence and cannot be silently promoted into the new
 protocol.
 
