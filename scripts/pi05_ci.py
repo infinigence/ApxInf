@@ -12,11 +12,11 @@ import shutil
 import subprocess
 import sys
 
-from compare_pi05_openpi import compare_results, load_suite, sha256, write_json
+from compare_pi05_openpi import compare_results, load_suite, sha256, shape_switch_pair, write_json
 from monitor_pi05_ci import validate_receipt
 
 
-SCHEMA = "apxinf.pi05.ci.v3"
+SCHEMA = "apxinf.pi05.ci.v4"
 PRECISIONS = {"thor": ("bf16", "fp8"), "orin": ("bf16", "int8")}
 LIMIT_KEYS = {"min_cosine", "max_relative_l2", "max_abs", "zero_max_abs"}
 
@@ -65,6 +65,9 @@ def load_bank(path: Path, digest: str) -> dict:
             raise ValueError("invalid performance protocol")
         if type(cell["stability_repeats"]) is not int or cell["stability_repeats"] < 1:
             raise ValueError("stability repeats must be explicitly positive")
+        switch_limit = cell.get("shape_switch_limit_ms")
+        if switch_limit is not None and (not math.isfinite(switch_limit) or switch_limit <= 0):
+            raise ValueError("invalid shape-switch budget")
         if not cell.get("budget_reason"):
             raise ValueError("record the evidence/approval for each cell's budgets")
     return bank
@@ -101,6 +104,9 @@ def validate(args: argparse.Namespace) -> int:
             continue
         suite = asset(args.bank.parent, cell["suite"]).parent
         manifest = load_suite(suite)
+        shape_switch_pair(suite, manifest)
+        if cell.get("shape_switch_limit_ms") is None:
+            raise ValueError(f"uncalibrated shape-switch budget: {cell['id']}")
         names = {entry["name"] for entry in manifest["cases"]}
         limits = cell.get("performance_limits")
         if limits is None:
@@ -179,7 +185,7 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
              actual: dict, revision: str, latency: dict) -> dict:
     if len(load_suite(suite)["image_keys"]) != cell["views"]:
         raise ValueError("suite/cell view count differs")
-    if latency.get("schema") != "apxinf.pi05.performance.v1" or latency.get("layer") != "l1":
+    if latency.get("schema") != "apxinf.pi05.performance.v2" or latency.get("layer") != "l1":
         raise ValueError("invalid performance receipt")
     candidate_runtime = runtime_fingerprint(actual)
     if runtime_fingerprint(reference) != candidate_runtime:
@@ -225,6 +231,16 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
     official = compare_results(suite, reference, actual, cell["reference_limits"])
     regression = compare_results(suite, baseline, actual, cell["baseline_limits"])
     perf = performance(latency["cases"], cell)
+    source, target = shape_switch_pair(suite, load_suite(suite))
+    switch = latency["shape_switch"]
+    expected = {"from": source["name"], "from_input_sha256": source["sha256"],
+                "to": target["name"], "to_input_sha256": target["sha256"]}
+    if any(switch.get(key) != value for key, value in expected.items()):
+        raise ValueError("shape-switch input receipt differs")
+    if not math.isfinite(switch["latency_ms"]) or switch["latency_ms"] <= 0:
+        raise ValueError("invalid shape-switch latency")
+    limit = cell.get("shape_switch_limit_ms")
+    switch_ok = limit is not None and switch["latency_ms"] <= limit
     stability = actual["stability"]
     if stability is None or stability["repeats"] != cell["stability_repeats"]:
         raise ValueError("stability protocol missing or differs")
@@ -235,9 +251,9 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
         raise ValueError("invalid stability drift")
     repeat_ok = all(value <= cell["baseline_limits"]["max_abs"] for value in drifts)
     return dict(reference=official, baseline=regression, performance=perf,
-          repeat_passed=repeat_ok,
+          repeat_passed=repeat_ok, shape_switch={**switch, "passed": switch_ok},
           passed=all(row["passed"] for row in official + regression) and repeat_ok
-          and perf["state"] == "pass")
+          and perf["state"] == "pass" and switch_ok)
 
 
 def run(args: argparse.Namespace) -> int:

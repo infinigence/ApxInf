@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import compare_pi05_openpi as parity
 import pi05_ci as ci
 import monitor_pi05_ci as activity
+import bench_pi05 as bench
 
 
 LIMITS = {"min_cosine": .999, "max_relative_l2": .05, "max_abs": .01, "zero_max_abs": .0001}
@@ -260,7 +261,8 @@ class MatrixTest(unittest.TestCase):
              "views": views, "stability_repeats": 2,
              "performance_protocol": {"warmup": 1, "samples": 2}, "budget_reason": "test fixture only",
              "reference_limits": LIMITS, "baseline_limits": LIMITS,
-             "performance_limits": {"one": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30}}}
+             "shape_switch_limit_ms": 30,
+             "performance_limits": {name: {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30} for name in ("one", "other")}}
             for board, precisions in ci.PRECISIONS.items() for precision in precisions for views in (1, 2, 3)]}
         for cell in self.bank["cells"]:
             self.make_evidence(cell)
@@ -283,8 +285,11 @@ class MatrixTest(unittest.TestCase):
         suite = output / "evidence" / cell["id"]
         entry = parity.save_case(suite, "one", np.zeros((cell["views"], 224, 224, 3), np.uint8),
                                  (2, 108), np.zeros((2, 32), np.float32))
+        other = parity.save_case(suite, "other", np.zeros((cell["views"], 224, 224, 3), np.uint8),
+                                  (2, 108, 3), np.zeros((2, 32), np.float32))
+        entries = [entry, other]
         parity.write_json(suite / "manifest.json", {
-            "schema": parity.SCHEMA, "cases": [entry], "image_keys": list(range(cell["views"])),
+            "schema": parity.SCHEMA, "cases": entries, "image_keys": list(range(cell["views"])),
             "horizon": 2, "num_flow_steps": 10,
         })
         receipt = {"schema": parity.SCHEMA, "suite_sha256": parity.sha256(suite / "manifest.json"),
@@ -295,14 +300,16 @@ class MatrixTest(unittest.TestCase):
                    "runtime_libraries": {name: {"path": f"/fixture/{name}.so", "sha256": "e" * 64}
                                          for name in ("libcuda", "libcudart", "libcublas", "libcublasLt")},
                    "stability": {"repeats": 2, "revisit_max_abs": 0,
-                                 "cases": [{"name": "one", "repeat_max_abs": 0}]},
-                   "cases": [{"name": "one", "input_sha256": entry["sha256"],
-                              "actions": np.ones((2, 32)).tolist()}]}
+                                 "cases": [{"name": item["name"], "repeat_max_abs": 0} for item in entries]},
+                   "cases": [{"name": item["name"], "input_sha256": item["sha256"],
+                              "actions": np.ones((2, 32)).tolist()} for item in entries]}
         parity.write_json(output / f"{cell['id']}.json", receipt)
         parity.write_json(output / f"{cell['id']}.performance.json", dict(receipt,
-            schema="apxinf.pi05.performance.v1", layer="l1", warmup=1, samples=2,
-            cases=[{"name": "one", "input_sha256": entry["sha256"],
-                    "first_call_ms": 20, "latency_ms": [10, 11]}]))
+            schema="apxinf.pi05.performance.v2", layer="l1", warmup=1, samples=2,
+            cases=[{"name": item["name"], "input_sha256": item["sha256"],
+                    "first_call_ms": 20, "latency_ms": [10, 11]} for item in entries],
+            shape_switch={"from": "other", "from_input_sha256": other["sha256"],
+                          "to": "one", "to_input_sha256": entry["sha256"], "latency_ms": 25}))
         parity.write_json(suite / "baseline.json", receipt)
         parity.write_json(suite / "reference.json", dict(receipt, engine="openpi"))
         for key, name in (("suite", "manifest.json"), ("reference", "reference.json"), ("baseline", "baseline.json")):
@@ -471,6 +478,44 @@ class MatrixTest(unittest.TestCase):
         budgets["performance_limits"].pop("fast")
         with self.assertRaisesRegex(ValueError, "exactly"):
             ci.performance(rows, budgets)
+
+    def test_benchmark_revisits_prior_shape_separately_from_warm_samples(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        extension = self.root / "extension.so"
+        extension.write_bytes(b"fixture")
+        (self.root / "model.safetensors").write_bytes(b"fixture weights")
+        (self.root / "config.json").write_text("{}")
+        calls = []
+        class Model:
+            def __init__(self, *args, **kwargs):
+                pass
+            def infer(self, case):
+                calls.append(len(case["token_ids"]))
+                return np.ones((2, 32), np.float32)
+        args = SimpleNamespace(model_dir=self.root, layer="l1", out=self.root / "bench.json",
+            suite_dir=suite, warmup=1, samples=2, model_variant="bf16", calibration=None,
+            device="cuda:0", revision=SHA, hardware="thor")
+        with patch.dict(sys.modules, {"apxinf_py": SimpleNamespace(__file__=str(extension))}), patch.object(
+                parity, "ApxInfModel", Model), patch.object(parity, "cuda_runtime_libraries", return_value={}):
+            bench.benchmark_suite(args)
+        self.assertEqual(calls, [2, 2, 2, 2, 3, 3, 3, 3, 3, 2])
+        receipt = ci.read_json(args.out)
+        self.assertEqual(receipt["shape_switch"]["from"], "other")
+        self.assertEqual(receipt["shape_switch"]["to"], "one")
+        self.assertEqual([len(row["latency_ms"]) for row in receipt["cases"]], [2, 2])
+
+    def test_shape_switch_regression_and_forged_route_fail(self):
+        path = self.reports[0].parent / f"{self.bank['cells'][0]['id']}.performance.json"
+        receipt = ci.read_json(path)
+        receipt["shape_switch"]["latency_ms"] = 31
+        parity.write_json(path, receipt, force=True)
+        self.assertEqual(ci.aggregate(self.args()), 1)
+        receipt["shape_switch"]["latency_ms"] = 25
+        receipt["shape_switch"]["from_input_sha256"] = "0" * 64
+        parity.write_json(path, receipt, force=True)
+        with self.assertRaisesRegex(ValueError, "shape-switch input"):
+            ci.aggregate(self.args())
 
     def test_uncalibrated_performance_is_not_green(self):
         rows = [{"name": "case", "latency_ms": [10, 11], "first_call_ms": 20}]

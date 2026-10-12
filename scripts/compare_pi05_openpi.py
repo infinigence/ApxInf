@@ -204,6 +204,16 @@ def load_case(root: Path, case: dict[str, str]) -> dict[str, np.ndarray]:
         return {name: np.array(archive[name], copy=True) for name in archive.files}
 
 
+def shape_switch_pair(root: Path, manifest: dict[str, Any]) -> tuple[dict, dict]:
+    """Use existing inputs: return to the first case from a different token shape."""
+    target = manifest["cases"][0]
+    count = len(load_case(root, target)["token_ids"])
+    for source in reversed(manifest["cases"]):
+        if len(load_case(root, source)["token_ids"]) != count:
+            return source, target
+    raise ValueError("performance suite lacks token-shape-switch coverage")
+
+
 def checkpoint_hash(root: Path) -> str:
     weight = root / "model.safetensors"
     if not weight.is_file():

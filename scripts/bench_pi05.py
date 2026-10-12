@@ -274,7 +274,7 @@ def _run_l3(host, port, model_variant, prompt, warmup, samples):
 
 def benchmark_suite(args):
     """Use the existing warmup/time-loop/statistics protocol on frozen L1 inputs."""
-    from compare_pi05_openpi import ApxInfModel, cuda_runtime_libraries, load_case, load_suite, sha256, write_json
+    from compare_pi05_openpi import ApxInfModel, cuda_runtime_libraries, load_case, load_suite, sha256, shape_switch_pair, write_json
     import apxinf_py
 
     if args.model_dir is None or args.layer != "l1" or args.out is None:
@@ -282,6 +282,7 @@ def benchmark_suite(args):
     if args.warmup < 0 or args.samples < 1:
         raise SystemExit("warmup must be nonnegative and samples positive")
     manifest = load_suite(args.suite_dir)
+    source, target = shape_switch_pair(args.suite_dir, manifest)
     precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}[args.model_variant]
     model = ApxInfModel(args.model_dir, manifest, args.device, precision,
                         pathlib.Path(args.calibration) if args.calibration else None)
@@ -299,8 +300,18 @@ def benchmark_suite(args):
         rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
                      "first_call_ms": first_ms, "latency_ms": samples, "statistics": _stats(samples)})
         print(f"L1 {entry['name']}: {_stats(samples)}", flush=True)
+    # This is one shape-first event, separate from the stationary warm samples.
+    model.infer(load_case(args.suite_dir, source))
+    target_case = load_case(args.suite_dir, target)
+    started = time.perf_counter()
+    actions = np.asarray(model.infer(target_case))
+    switch_ms = (time.perf_counter() - started) * 1000
+    if actions.shape != shape or not np.isfinite(actions).all():
+        raise ValueError("invalid shape-switch output")
     write_json(args.out, {
-        "schema": "apxinf.pi05.performance.v1", "engine": "apxinf", "layer": "l1",
+        "schema": "apxinf.pi05.performance.v2", "engine": "apxinf", "layer": "l1",
+        "shape_switch": {"from": source["name"], "from_input_sha256": source["sha256"],
+                         "to": target["name"], "to_input_sha256": target["sha256"], "latency_ms": switch_ms},
         "revision": args.revision, "hardware": args.hardware, "precision": precision,
         "suite_sha256": sha256(args.suite_dir / "manifest.json"),
         "checkpoint_sha256": sha256(args.model_dir / "model.safetensors"),

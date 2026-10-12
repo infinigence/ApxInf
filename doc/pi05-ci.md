@@ -2,7 +2,7 @@
 
 This PR prepares the CI tools and workflows. It does **not** register runners,
 enable GPU dispatch, or change branch protection. An incomplete board matrix,
-missing asset, uncalibrated performance budget, or failed preflight cannot pass.
+missing asset, uncalibrated performance or shape-switch budget, or failed preflight cannot pass.
 
 ## Acceptance status
 
@@ -222,7 +222,17 @@ case. For example, a 10ms baseline and a 100ms baseline need separate measured
 budgets, rather than giving both cases the latter's ceiling. These numbers
 illustrate the failure mode and are not proposed gate thresholds.
 
-The v4 parity and v3 bank schemas require regeneration; old mixed-purpose
+The implicit runtime caches only the latest prepared token shape. A different
+token count can rebuild its CUDA graph; constant-shape warm samples cannot
+detect a regression when returning to an earlier shape. Performance therefore
+adds one B -> A shape-first call after the warm phase, using the first frozen
+case and the last case with a different token length. It records both input
+hashes and checks a separate `shape_switch_limit_ms` budget per cell. This is
+one first-event measurement, rather than a stationary latency percentile.
+Repeated independent runs must establish its budget. Suites without two token
+lengths or cells without an approved switch budget fail before compilation.
+
+The v4 parity, v2 performance and v4 bank schemas require regeneration; old mixed-purpose
 receipts are historical evidence and cannot be silently promoted into the new
 protocol.
 
