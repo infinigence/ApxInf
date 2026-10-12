@@ -389,6 +389,13 @@ operator setting; a PR cannot choose another bank or edit the trusted harness.
 Changing checkpoint, preprocessing, precision recipe or reference semantics
 requires an explicit bank review and regeneration with pinned OpenPI.
 
+Reference receipts are board-specific: the template uses
+`{hardware}-openpi.json` so Thor and Orin cannot silently reuse one receipt.
+Before compiling, validation checks the frozen reference/baseline provenance,
+checkpoint configuration, runtime identities and complete output shapes. An
+approved baseline must itself pass the official-reference limits for every
+chunk and action step; hashing a known failing baseline does not qualify it.
+
 ## Offline board deployment
 
 Linux ARM64 runners need Git, Bash, flock, realpath, Rust/Cargo, the supported

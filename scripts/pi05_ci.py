@@ -109,9 +109,29 @@ def validate(args: argparse.Namespace) -> int:
                 or not all(math.isfinite(v) and v > 0 for v in value.values())
                 for value in limits.values()):
             raise ValueError(f"invalid per-case performance budgets: {cell['id']}")
-        for key in ("checkpoint", "config", "reference", "baseline", "calibration"):
-            if cell.get(key) is not None:
-                asset(args.bank.parent, cell[key])
+        paths = {key: asset(args.bank.parent, cell[key])
+                 for key in ("checkpoint", "config", "reference", "baseline", "calibration")
+                 if cell.get(key) is not None}
+        if len(manifest["image_keys"]) != cell["views"]:
+            raise ValueError("suite/cell view count differs")
+        if sha256(paths["checkpoint"].parent / "config.json") != cell["config"]["sha256"]:
+            raise ValueError("checkpoint configuration differs")
+        reference, baseline = (read_json(paths[key]) for key in ("reference", "baseline"))
+        for record, engine in ((reference, "openpi"), (baseline, "apxinf")):
+            if record.get("engine") != engine or record.get("hardware") != cell["hardware"]:
+                raise ValueError("frozen reference/baseline engine or hardware differs")
+            if not re.fullmatch(r"[0-9a-f]{40}", record.get("revision", "")):
+                raise ValueError("frozen reference/baseline revision missing")
+            for key in ("checkpoint", "config"):
+                if record.get(f"{key}_sha256") != cell[key]["sha256"]:
+                    raise ValueError(f"frozen reference/baseline {key} differs")
+        calibration = cell["calibration"]["sha256"] if cell.get("calibration") else None
+        if (baseline.get("precision"), baseline.get("calibration_sha256")) != (cell["precision"], calibration):
+            raise ValueError("frozen baseline precision or calibration differs")
+        if runtime_fingerprint(reference) != runtime_fingerprint(baseline):
+            raise ValueError("frozen reference/baseline CUDA runtime differs")
+        if not all(row["passed"] for row in compare_results(suite, reference, baseline, cell["reference_limits"])):
+            raise ValueError(f"frozen baseline fails official reference limits: {cell['id']}")
     return 0
 
 

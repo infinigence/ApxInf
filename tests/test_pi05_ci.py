@@ -273,6 +273,43 @@ class MatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "uncalibrated"):
             ci.validate(args)
 
+    def test_frozen_assets_must_be_qualified_before_build(self):
+        checkpoint = self.root / "checkpoint"
+        checkpoint.mkdir()
+        (checkpoint / "model.safetensors").write_bytes(b"fixture weights")
+        (checkpoint / "config.json").write_text("{}")
+        for cell in self.bank["cells"]:
+            for key, filename in (("checkpoint", "model.safetensors"), ("config", "config.json")):
+                path = checkpoint / filename
+                cell[key] = {"path": str(path), "sha256": parity.sha256(path)}
+            for key in ("reference", "baseline"):
+                path = Path(cell[key]["path"])
+                receipt = ci.read_json(path)
+                receipt.update(checkpoint_sha256=cell["checkpoint"]["sha256"], config_sha256=cell["config"]["sha256"])
+                parity.write_json(path, receipt, force=True)
+                cell[key]["sha256"] = parity.sha256(path)
+        self.save_bank()
+        args = self.args()
+        args.hardware = "thor"
+        self.assertEqual(ci.validate(args), 0)
+        cell = self.bank["cells"][0]
+        path = Path(cell["baseline"]["path"])
+        receipt = ci.read_json(path)
+        receipt["cases"][0]["actions"][0][0] = 2
+        parity.write_json(path, receipt, force=True)
+        cell["baseline"]["sha256"] = parity.sha256(path)
+        self.save_bank()
+        args.bank_sha256 = self.digest
+        with self.assertRaisesRegex(ValueError, "baseline fails official"):
+            ci.validate(args)
+        receipt["hardware"] = "orin"
+        parity.write_json(path, receipt, force=True)
+        cell["baseline"]["sha256"] = parity.sha256(path)
+        self.save_bank()
+        args.bank_sha256 = self.digest
+        with self.assertRaisesRegex(ValueError, "hardware differs"):
+            ci.validate(args)
+
     def test_complete_matrix(self):
         self.assertEqual(ci.aggregate(self.args()), 0)
 

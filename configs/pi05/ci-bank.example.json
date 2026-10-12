@@ -10,7 +10,7 @@
       "suite": "./{profile}-{views}view/manifest.json",
       "checkpoint": "./checkpoints/{profile}/model.safetensors",
       "config": "./checkpoints/{profile}/config.json",
-      "reference": "./{profile}-{views}view/openpi.json"
+      "reference": "./{profile}-{views}view/{hardware}-openpi.json"
     }
   ],
   "policies": [
