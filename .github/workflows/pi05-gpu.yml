@@ -70,6 +70,7 @@ jobs:
           TESTED_SHA: ${{ inputs.sha }}
           APXINF_CI_BANK_SHA256: ${{ vars.PI05_CI_BANK_SHA256 }}
           APXINF_CI_PREFLIGHT_SHA256: ${{ vars.PI05_CI_PREFLIGHT_SHA256 }}
+          APXINF_CI_ACTIVITY_AUDIT_SHA256: ${{ vars.PI05_CI_ACTIVITY_AUDIT_SHA256 }}
           APXINF_CI_ENVIRONMENT_SHA256: ${{ vars[format('PI05_CI_{0}_ENVIRONMENT_SHA256', matrix.board)] }}
         run: >-
           bash trusted/scripts/run_pi05_ci.sh '${{ matrix.board }}' "$TESTED_SHA"
@@ -111,10 +112,12 @@ jobs:
         env:
           TESTED_SHA: ${{ inputs.sha }}
           BANK_SHA: ${{ vars.PI05_CI_BANK_SHA256 }}
+          ACTIVITY_AUDIT_SHA: ${{ vars.PI05_CI_ACTIVITY_AUDIT_SHA256 }}
         run: >-
           python scripts/pi05_ci.py aggregate
           --bank devlocal/pi05-ci-gate/reports/pi05-thor/bank.json
           --bank-sha256 "$BANK_SHA" --revision "$TESTED_SHA"
+          --activity-audit-sha256 "$ACTIVITY_AUDIT_SHA"
           --report devlocal/pi05-ci-gate/reports/pi05-thor/summary.json
           --report devlocal/pi05-ci-gate/reports/pi05-orin/summary.json
       - uses: actions/github-script@v7

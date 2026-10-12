@@ -422,6 +422,7 @@ Set these environment variables in the runner service or local shell:
 | `APXINF_CI_PYTHON` | Absolute runtime Python path |
 | `APXINF_CI_BANK` / `APXINF_CI_BANK_SHA256` | Approved bank and digest |
 | `APXINF_CI_PREFLIGHT` / `APXINF_CI_PREFLIGHT_SHA256` | Operator-owned copy of `preflight_pi05_ci.py` and digest |
+| `APXINF_CI_ACTIVITY_AUDIT` / `APXINF_CI_ACTIVITY_AUDIT_SHA256` | Operator-owned read-only activity auditor and digest |
 | `APXINF_CI_ENVIRONMENT` / `APXINF_CI_ENVIRONMENT_SHA256` | Board environment JSON and digest |
 | `APXINF_CI_GPU_LOCK` | Shared developer/CI lock; default `/tmp/apxinf-thor-gpu.lock` or `/tmp/apxinf-orin-gpu.lock` |
 
@@ -433,9 +434,32 @@ same lock. It also checks sampled GPU utilization and approved clocks/power/
 temperature before and after inference. The wrapper releases the GPU reservation
 during CPU/CUDA compilation, then reacquires it and repeats preflight before
 inference; a developer who takes the GPU meanwhile causes exit 75.
-These checks cannot prevent a developer
-who bypasses the reservation from starting work mid-run; coordinate a quiet
-measurement window. Save build/preflight logs, raw outputs and summary JSON.
+The trusted wrapper also polls GPU device users and compiler processes during
+inference. A foreign process invalidates the run and stops only the CI process
+group. The hosted aggregate requires `activity.json` and checks its raw samples;
+a green summary cannot override interference or missing coverage. Sampling does
+not prove that no sub-second interference occurred; developers must still use
+the lock and coordinate a quiet measurement window.
+
+Install a root-owned copy of `monitor_pi05_ci.py` under `/opt/apxinf-ci/`.
+The operator-owned auditor executable should contain only:
+
+```sh
+#!/bin/sh
+exec sudo -n /usr/bin/python3 /opt/apxinf-ci/monitor_pi05_ci.py audit
+```
+
+Give the runner passwordless permission for that exact read-only command only.
+The root-owned script and its parent directory must not be writable by the
+runner. Full `/proc` descriptor visibility is required on Orin: an unprivileged
+scan can silently miss another user's GPU process. The audit checks compute
+device descriptors on both boards, including `/dev/nvhost-gpu` and
+`/dev/nvhost-as-gpu`; it rejects permission errors instead of accepting a partial
+scan. Approve the executable digest as `PI05_CI_ACTIVITY_AUDIT_SHA256` in GitHub
+and set its path in the runner environment. This PR does not install it or grant
+sudo access.
+
+Save build/preflight logs, raw outputs, activity samples and summary JSON.
 
 ## GitHub rollout after this PR
 

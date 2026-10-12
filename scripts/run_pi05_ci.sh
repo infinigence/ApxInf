@@ -19,6 +19,8 @@ trusted=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${APXINF_CI_BANK_SHA256:?set the approved bank digest}"
 : "${APXINF_CI_PREFLIGHT:?set the operator-owned hardware preflight executable}"
 : "${APXINF_CI_PREFLIGHT_SHA256:?set the approved preflight digest}"
+: "${APXINF_CI_ACTIVITY_AUDIT:?set the read-only activity auditor}"
+: "${APXINF_CI_ACTIVITY_AUDIT_SHA256:?set the approved activity auditor digest}"
 
 # Developers use this same lock for their GPU commands. Never kill their jobs.
 exec 9>"${APXINF_CI_GPU_LOCK:-/tmp/apxinf-${board}-gpu.lock}"
@@ -60,7 +62,9 @@ reserve_gpu
 export PYTHONPATH="$output/python${PYTHONPATH:+:$PYTHONPATH}"
 "$APXINF_CI_PYTHON" -c 'import apxinf_py'
 status=0
-"$APXINF_CI_PYTHON" "$trusted/pi05_ci.py" run \
+"$APXINF_CI_PYTHON" "$trusted/monitor_pi05_ci.py" monitor \
+  --output "$output/activity.json" -- \
+  "$APXINF_CI_PYTHON" "$trusted/pi05_ci.py" run \
   --bank "$APXINF_CI_BANK" --bank-sha256 "$APXINF_CI_BANK_SHA256" \
   --revision "$revision" --hardware "$board" --output-dir "$output" || status=$?
 "$APXINF_CI_PREFLIGHT" "$board" > "$output/postflight.log" 2>&1

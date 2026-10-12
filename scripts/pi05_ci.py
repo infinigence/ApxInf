@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from compare_pi05_openpi import compare_results, load_suite, sha256, write_json
+from monitor_pi05_ci import validate_receipt
 
 
 SCHEMA = "apxinf.pi05.ci.v2"
@@ -264,6 +265,10 @@ def aggregate(args: argparse.Namespace) -> int:
     seen = set()
     passed = True
     for path in args.report:
+        activity = read_json(path.parent / "activity.json")
+        validate_receipt(activity)
+        if activity.get("auditor_sha256") != args.activity_audit_sha256:
+            raise ValueError("activity auditor digest differs from approved digest")
         report = read_json(path)
         board = report["hardware"]
         if board not in PRECISIONS or board in seen:
@@ -298,6 +303,7 @@ def main() -> int:
     parser.add_argument("command", choices=("freeze", "run", "aggregate"))
     parser.add_argument("--bank", type=Path, required=True)
     parser.add_argument("--bank-sha256")
+    parser.add_argument("--activity-audit-sha256")
     parser.add_argument("--revision")
     parser.add_argument("--definition", type=Path)
     parser.add_argument("--hardware", choices=tuple(PRECISIONS))
@@ -315,6 +321,8 @@ def main() -> int:
         parser.error("revision must be a full commit SHA")
     if args.command == "run" and (args.hardware is None or args.output_dir is None):
         parser.error("run requires hardware and output-dir")
+    if args.command == "aggregate" and not re.fullmatch(r"[0-9a-f]{64}", args.activity_audit_sha256 or ""):
+        parser.error("aggregate requires the approved activity-audit-sha256")
     return run(args) if args.command == "run" else aggregate(args)
 
 

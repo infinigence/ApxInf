@@ -2,6 +2,10 @@
 
 import copy
 import json
+import hashlib
+import os
+import time
+from unittest.mock import patch
 from pathlib import Path
 import sys
 import tempfile
@@ -13,6 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import compare_pi05_openpi as parity
 import pi05_ci as ci
+import monitor_pi05_ci as activity
 
 
 LIMITS = {"min_cosine": .999, "max_relative_l2": .05, "max_abs": .01, "zero_max_abs": .0001}
@@ -165,6 +170,32 @@ class ReceiptTest(unittest.TestCase):
         self.assertFalse(cases["black-t200-zero-noise-combined"]["images"].any())
 
 
+class ActivityTest(unittest.TestCase):
+    def test_monitor_rejects_interference_and_terminates_own_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auditor = root / "auditor"
+            auditor.write_text("fixture executable")
+            args = SimpleNamespace(output=root / "activity.json",
+                command=[sys.executable, "-c", "import time; time.sleep(60)"])
+            calls = 0
+            def sample(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                processes = [] if calls == 1 else [{"pid": 987654, "group": 987654,
+                    "name": "python", "gpu": True, "compiler": False}]
+                return json.dumps({"time": time.time(), "processes": processes})
+            environment = {"APXINF_CI_ACTIVITY_AUDIT": str(auditor),
+                "APXINF_CI_ACTIVITY_AUDIT_SHA256": hashlib.sha256(auditor.read_bytes()).hexdigest()}
+            with patch.dict(os.environ, environment), patch.object(activity.subprocess, "check_output", side_effect=sample):
+                self.assertEqual(activity.monitor(args), 1)
+            receipt = ci.read_json(args.output)
+            self.assertFalse(receipt["passed"])
+            self.assertIn("foreign GPU", receipt["error"])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(receipt["group"], 0)
+
+
 class MatrixTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -189,6 +220,9 @@ class MatrixTest(unittest.TestCase):
                                     "cells": [{"id": cell["id"], "passed": True}
                                               for cell in self.bank["cells"] if cell["hardware"] == board]})
             self.reports.append(path)
+            parity.write_json(path.parent / "activity.json", {"schema": activity.SCHEMA,
+                "passed": True, "auditor_sha256": "f" * 64, "start": 1, "finish": 2, "group": 123,
+                "samples": [{"time": 1, "processes": []}, {"time": 2, "processes": []}]})
 
     def make_evidence(self, cell):
         output = self.root / cell["hardware"]
@@ -228,10 +262,27 @@ class MatrixTest(unittest.TestCase):
 
     def args(self, reports=None):
         return SimpleNamespace(bank=self.path, bank_sha256=self.digest, revision=SHA,
+                               activity_audit_sha256="f" * 64,
                                report=self.reports if reports is None else reports)
 
     def test_complete_matrix(self):
         self.assertEqual(ci.aggregate(self.args()), 0)
+
+    def test_environment_interference_cannot_pass_green_summary(self):
+        path = self.reports[0].parent / "activity.json"
+        receipt = ci.read_json(path)
+        receipt["samples"][1]["processes"] = [{"pid": 456, "group": 456,
+            "name": "python", "gpu": True, "compiler": False}]
+        parity.write_json(path, receipt, force=True)
+        with self.assertRaisesRegex(ValueError, "foreign GPU"):
+            ci.aggregate(self.args())
+
+    def test_missing_activity_coverage_is_rejected(self):
+        receipt = {"schema": activity.SCHEMA, "passed": True, "start": 1,
+                   "finish": 2, "group": 123,
+                   "samples": [{"time": 1, "processes": []}]}
+        with self.assertRaisesRegex(ValueError, "cover"):
+            activity.validate_receipt(receipt)
 
     def test_missing_bank_cell(self):
         self.bank["cells"].pop()
