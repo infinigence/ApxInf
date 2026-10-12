@@ -331,7 +331,8 @@ esac
 On Orin, give the runner passwordless permission for that exact read-only command only.
 The root-owned script and its parent directory must not be writable by the
 runner. Full `/proc` descriptor visibility is required on Orin: an unprivileged
-scan can silently miss another user's GPU process. Thor uses its unprivileged compute-process query from `nvidia-smi`;
+scan can silently miss another user's GPU process. Thor uses the unprivileged XML process inventory from `nvidia-smi -q -x`,
+including graphics clients that the compute-apps query omits;
 Orin checks compute device descriptors, including `/dev/nvhost-gpu`,
 `/dev/nvhost-as-gpu`, `/dev/nvgpu/igpu0/ctrl`, and anonymous nvgpu/host1x GPU
 channels. Missing telemetry or permission errors reject the run

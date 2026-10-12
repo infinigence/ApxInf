@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 
 SCHEMA = "apxinf.pi05.activity.v1"
@@ -29,9 +30,14 @@ def audit(proc: Path = Path("/proc")) -> dict:
     # visibility cannot establish exclusive use of a shared board.
     compatible = Path("/proc/device-tree/compatible").read_bytes()
     if b"tegra264" in compatible:
-        output = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
-            "--format=csv,noheader,nounits"], text=True, timeout=15)
-        gpu_pids = {int(line.strip()) for line in output.splitlines() if line.strip()}
+        output = subprocess.check_output(["nvidia-smi", "-q", "-x"], text=True, timeout=15)
+        gpus = ET.fromstring(output).findall("gpu")
+        if not gpus or any(gpu.find("processes") is None or
+                (gpu.findtext("processes") or "").strip() == "N/A" for gpu in gpus):
+            raise ValueError("GPU process inventory unavailable")
+        # The compute-apps query omits persistent graphics clients.
+        gpu_pids = {int(process.findtext("pid")) for gpu in gpus
+                    for process in gpu.findall("processes/process_info")}
     elif b"tegra234" in compatible:
         gpu_pids = None
     else:
@@ -104,7 +110,7 @@ def monitor(args: argparse.Namespace) -> int:
         # Numerical/performance failures are separate from environment validity.
         receipt["passed"] = True
         validate_receipt(receipt)
-    except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, KeyError, ET.ParseError, subprocess.SubprocessError) as error:
         receipt["error"] = str(error)
         status = 1
     finally:

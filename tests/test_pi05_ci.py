@@ -178,6 +178,33 @@ class ReceiptTest(unittest.TestCase):
 
 
 class ActivityTest(unittest.TestCase):
+    def test_thor_audit_includes_graphics_gpu_clients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            for pid, name in ((101, "python"), (202, "Xorg")):
+                process = proc / str(pid)
+                process.mkdir()
+                (process / "stat").write_text(f"{pid} ({name}) S 1 {pid} 1")
+                (process / "comm").write_text(name)
+            xml = "<nvidia_smi_log><gpu><processes>" + "".join(
+                f"<process_info><pid>{pid}</pid><type>{kind}</type></process_info>"
+                for pid, kind in ((101, "C"), (202, "G"))) + "</processes></gpu></nvidia_smi_log>"
+            def query(command, **kwargs):
+                return "101\n" if "--query-compute-apps=pid" in command else xml
+            with patch.object(Path, "read_bytes", return_value=b"nvidia,tegra264"), patch.object(
+                    activity.subprocess, "check_output", side_effect=query):
+                receipt = activity.audit(proc)
+            self.assertEqual({p["pid"] for p in receipt["processes"]}, {101, 202})
+
+    def test_thor_audit_rejects_unavailable_process_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for xml in ("<nvidia_smi_log/>", "<nvidia_smi_log><gpu/></nvidia_smi_log>",
+                    "<nvidia_smi_log><gpu><processes>N/A</processes></gpu></nvidia_smi_log>"):
+                with self.subTest(xml=xml), patch.object(Path, "read_bytes", return_value=b"tegra264"), patch.object(
+                        activity.subprocess, "check_output", return_value=xml):
+                    with self.assertRaisesRegex(ValueError, "inventory unavailable"):
+                        activity.audit(Path(directory))
+
     def test_orin_audit_detects_current_driver_gpu_descriptors(self):
         with tempfile.TemporaryDirectory() as directory:
             proc = Path(directory)

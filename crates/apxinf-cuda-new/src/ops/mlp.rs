@@ -10,9 +10,10 @@ use crate::ffi::abi::{mlp as abi, status};
 use crate::ops::gemm::contracts::{invalid, tensor_storage};
 use crate::CudaContext;
 
-/// `y[r,c] = x[r,c] / sqrt(mean(x[r,:]^2) + epsilon) * weight[c]`
+/// `y[r,c] = x[r,c] / sqrt(mean(x[r,:]^2) + epsilon) * (1 + weight[c])`
 ///
-/// The reduction runs in f32 regardless of the BF16 storage.
+/// `weight` stores the learned BF16 offset. The reduction and offset addition
+/// run in f32; callers must not supply an already finalized scale.
 pub fn rms_norm(
     ctx: &CudaContext,
     input: &Tensor,
