@@ -30,14 +30,17 @@ or warm-performance qualification. They have not been promoted. The maintained
 INT8 learned-norm packing and allocation-schedule fixes have passed prior paired
 performance regression checks; no new numerical prototype inherits that acceptance.
 
-Independent INT8 quantization interventions expose language-path sensitivity.
-An adapter using raw F32 checkpoint weights and BF16 final RMS scales agrees
-with native INT8 on 1/8, 7/8 and 8/8 inputs, including every action step. Its
-nonlinear, reduction and flow-time conventions are not fully aligned, so this
-is not proof that remaining differences are kernel defects or that the native
-implementation is correct. FP8 calibration on four different observations
-improves the real-image count to 16/24 with a pooled profile, but still fails
-one-view and constructed diagnostics. Those profiles are unapproved.
+Independent INT8 interventions identify differences in CPU/GPU weight packing,
+GeGLU rounding and language RMS parameter/reduction conventions. The expanded
+adapter using CPU F32 weight quantization, native GeGLU and post-RMS conventions
+agrees with native on 1/8, 7/8 and 8/8 inputs, including every action step.
+Remaining one-view errors include relative L2 of 0.548, so three successful
+selected cases do not establish correctness. A forced FlashAttention factor
+still fails two of the three selected cases. These are private diagnostic
+adapters, not official quantized OpenPI or approved references. FP8 calibration
+on four different observations improves real-image passes to 16/24 with a
+pooled profile, but still fails one-view and constructed diagnostics. Those
+profiles are unapproved.
 
 The activity auditor must be validated on the actual driver. Orin R39 CUDA
 clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
