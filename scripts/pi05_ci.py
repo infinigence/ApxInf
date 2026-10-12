@@ -16,7 +16,7 @@ from compare_pi05_openpi import compare_results, load_suite, sha256, write_json
 from monitor_pi05_ci import validate_receipt
 
 
-SCHEMA = "apxinf.pi05.ci.v2"
+SCHEMA = "apxinf.pi05.ci.v3"
 PRECISIONS = {"thor": ("bf16", "fp8"), "orin": ("bf16", "int8")}
 LIMIT_KEYS = {"min_cosine", "max_relative_l2", "max_abs", "zero_max_abs"}
 
@@ -107,13 +107,17 @@ def performance(rows: list[dict], cell: dict) -> dict:
     budgets = cell.get("performance_limits")
     if budgets is None:
         return {"state": "uncalibrated", **measured}
-    if set(budgets) != set(measured) or not all(math.isfinite(v) and v > 0 for v in budgets.values()):
-        raise ValueError("invalid performance budgets")
+    if set(budgets) != {row["name"] for row in rows}:
+        raise ValueError("performance budgets must cover exactly the measured cases")
+    if any(set(limits) != set(measured) or not all(math.isfinite(v) and v > 0
+            for v in limits.values()) for limits in budgets.values()):
+        raise ValueError("invalid per-case performance budgets")
     # A pooled distribution alone can hide a regression of a slow case.
     per_case = [{"name": row["name"], "p50_ms": float(np.percentile(row["latency_ms"], 50, method="lower")),
                  "p95_ms": float(np.percentile(row["latency_ms"], 95, method="lower")),
                  "first_call_ms": row["first_call_ms"]} for row in rows]
-    passed = all(row[key] <= budgets[key] for row in per_case for key in budgets)
+    passed = all(row[key] <= budgets[row["name"]][key]
+                 for row in per_case for key in measured)
     return {"state": "pass" if passed else "fail", **measured, "cases": per_case}
 
 

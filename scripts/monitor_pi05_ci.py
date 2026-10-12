@@ -24,6 +24,15 @@ GPU_DEVICES = {"/dev/nvhost-gpu", "/dev/nvhost-as-gpu", "/dev/nvidia0", "/dev/nv
 def audit(proc: Path = Path("/proc")) -> dict:
     # Install a root-owned copy for this read-only operation. Partial process
     # visibility cannot establish exclusive use of a shared board.
+    compatible = Path("/proc/device-tree/compatible").read_bytes()
+    if b"tegra264" in compatible:
+        output = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits"], text=True, timeout=15)
+        gpu_pids = {int(line.strip()) for line in output.splitlines() if line.strip()}
+    elif b"tegra234" in compatible:
+        gpu_pids = None
+    else:
+        raise ValueError("unsupported activity audit hardware")
     records = []
     for directory in proc.iterdir():
         if not directory.name.isdigit():
@@ -31,8 +40,11 @@ def audit(proc: Path = Path("/proc")) -> dict:
         try:
             fields = (directory / "stat").read_text().rsplit(")", 1)[1].split()
             name = (directory / "comm").read_text().strip()
-            devices = {os.readlink(fd) for fd in (directory / "fd").iterdir()}
-            gpu = bool(devices & GPU_DEVICES)
+            if gpu_pids is None:
+                devices = {os.readlink(fd) for fd in (directory / "fd").iterdir()}
+                gpu = bool(devices & GPU_DEVICES)
+            else:
+                gpu = int(directory.name) in gpu_pids
             if gpu or name in COMPILERS:
                 records.append({"pid": int(directory.name), "group": int(fields[2]),
                                 "name": name, "gpu": gpu, "compiler": name in COMPILERS})

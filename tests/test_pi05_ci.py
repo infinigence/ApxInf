@@ -206,7 +206,7 @@ class MatrixTest(unittest.TestCase):
              "views": views, "stability_repeats": 2,
              "performance_protocol": {"warmup": 1, "samples": 2}, "budget_reason": "test fixture only",
              "reference_limits": LIMITS, "baseline_limits": LIMITS,
-             "performance_limits": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30}}
+             "performance_limits": {"one": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30}}}
             for board, precisions in ci.PRECISIONS.items() for precision in precisions for views in (1, 2, 3)]}
         for cell in self.bank["cells"]:
             self.make_evidence(cell)
@@ -362,10 +362,21 @@ class MatrixTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provenance missing"):
             ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
 
+    def test_fast_case_regression_cannot_hide_under_slow_case_budget(self):
+        rows = [{"name": "fast", "latency_ms": [15, 15], "first_call_ms": 20},
+                {"name": "slow", "latency_ms": [90, 90], "first_call_ms": 100}]
+        budgets = {"performance_limits": {
+            "fast": {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30},
+            "slow": {"p50_ms": 100, "p95_ms": 100, "first_call_ms": 120}}}
+        self.assertEqual(ci.performance(rows, budgets)["state"], "fail")
+        budgets["performance_limits"].pop("fast")
+        with self.assertRaisesRegex(ValueError, "exactly"):
+            ci.performance(rows, budgets)
+
     def test_uncalibrated_performance_is_not_green(self):
         rows = [{"name": "case", "latency_ms": [10, 11], "first_call_ms": 20}]
         self.assertEqual(ci.performance(rows, {})["state"], "uncalibrated")
-        budgets = {"performance_limits": {"p50_ms": 9.9, "p95_ms": 12, "first_call_ms": 30}}
+        budgets = {"performance_limits": {"case": {"p50_ms": 9.9, "p95_ms": 12, "first_call_ms": 30}}}
         self.assertEqual(ci.performance(rows, budgets)["state"], "fail")
 
 

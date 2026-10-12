@@ -276,8 +276,15 @@ whether the intended regression is reliably distinguishable. Ten repetitions
 are not an approved P95 protocol. Keep first/cold/shape-switch and warm budgets
 separate. The example's zero warmups/one sample is deliberately unqualified and
 cannot establish a deployable performance baseline. Missing budgets still fail.
+`performance_limits` maps **each case name** to its approved `p50_ms`, `p95_ms`
+and `first_call_ms` ceilings. The names must match the frozen suite exactly.
+A common ceiling derived from the slowest case could let a formerly fast case
+regress substantially; pooled statistics are informational and never approve a
+case. For example, a 10ms baseline and a 100ms baseline need separate measured
+budgets, rather than giving both cases the latter's ceiling. These numbers
+illustrate the failure mode and are not proposed gate thresholds.
 
-The v4 parity and v2 bank schemas require regeneration; old mixed-purpose
+The v4 parity and v3 bank schemas require regeneration; old mixed-purpose
 receipts are historical evidence and cannot be silently promoted into the new
 protocol.
 
@@ -442,20 +449,24 @@ not prove that no sub-second interference occurred; developers must still use
 the lock and coordinate a quiet measurement window.
 
 Install a root-owned copy of `monitor_pi05_ci.py` under `/opt/apxinf-ci/`.
-The operator-owned auditor executable should contain only:
+The same operator-owned auditor executable works on both boards:
 
 ```sh
 #!/bin/sh
-exec sudo -n /usr/bin/python3 /opt/apxinf-ci/monitor_pi05_ci.py audit
+case "$(tr '\0' ' ' < /proc/device-tree/compatible)" in
+  *tegra234*) exec sudo -n /usr/bin/python3 /opt/apxinf-ci/monitor_pi05_ci.py audit ;;
+  *tegra264*) exec /usr/bin/python3 /opt/apxinf-ci/monitor_pi05_ci.py audit ;;
+  *) exit 1 ;;
+esac
 ```
 
-Give the runner passwordless permission for that exact read-only command only.
+On Orin, give the runner passwordless permission for that exact read-only command only.
 The root-owned script and its parent directory must not be writable by the
 runner. Full `/proc` descriptor visibility is required on Orin: an unprivileged
-scan can silently miss another user's GPU process. The audit checks compute
-device descriptors on both boards, including `/dev/nvhost-gpu` and
-`/dev/nvhost-as-gpu`; it rejects permission errors instead of accepting a partial
-scan. Approve the executable digest as `PI05_CI_ACTIVITY_AUDIT_SHA256` in GitHub
+scan can silently miss another user's GPU process. Thor uses its unprivileged compute-process query from `nvidia-smi`;
+Orin checks compute device descriptors, including `/dev/nvhost-gpu` and
+`/dev/nvhost-as-gpu`. Missing telemetry or permission errors reject the run
+instead of accepting a partial scan. Approve the executable digest as `PI05_CI_ACTIVITY_AUDIT_SHA256` in GitHub
 and set its path in the runner environment. This PR does not install it or grant
 sudo access.
 
