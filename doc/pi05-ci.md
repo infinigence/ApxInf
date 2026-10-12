@@ -435,7 +435,10 @@ Set these environment variables in the runner service or local shell:
 
 Make the preflight executable and ensure its interpreter can read the vendor
 tools. Run `bash /trusted/scripts/run_pi05_ci.sh thor SHA /candidate /candidate/devlocal/pi05-ci-gate/run-001`.
-The candidate must be a clean checkout at SHA. GPU reservation uses nonblocking
+The candidate must be a clean checkout at SHA. The wrapper validates the bank,
+per-case budgets and every required board asset before compiling; an unqualified
+template or missing file therefore fails without spending a full CUDA build.
+GPU reservation uses nonblocking
 flock; busy returns 75 and does not kill/preempt jobs. Developers must use the
 same lock. It also checks sampled GPU utilization and approved clocks/power/
 temperature before and after inference. The wrapper releases the GPU reservation

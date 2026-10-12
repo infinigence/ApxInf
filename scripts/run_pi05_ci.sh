@@ -35,6 +35,9 @@ mkdir -p "$output"
 [[ $(sha256sum "$APXINF_CI_PREFLIGHT" | cut -d ' ' -f 1) == "$APXINF_CI_PREFLIGHT_SHA256" ]]
 "$APXINF_CI_PREFLIGHT" "$board" > "$output/reservation-preflight.log" 2>&1
 [[ -z $(git -C "$candidate" status --porcelain) ]]
+"$APXINF_CI_PYTHON" "$trusted/pi05_ci.py" validate \
+  --bank "$APXINF_CI_BANK" --bank-sha256 "$APXINF_CI_BANK_SHA256" \
+  --revision "$revision" --hardware "$board" > "$output/assets-preflight.log" 2>&1
 flock -u 9
 cd "$candidate"
 PYO3_PYTHON="$APXINF_CI_PYTHON" cargo build --locked --release -p apxinf-py \

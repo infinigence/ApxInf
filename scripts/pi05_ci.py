@@ -93,6 +93,28 @@ def freeze(args: argparse.Namespace) -> int:
     return 0
 
 
+def validate(args: argparse.Namespace) -> int:
+    """Reject incomplete board assets/budgets before compiling the candidate."""
+    bank = load_bank(args.bank, args.bank_sha256)
+    for cell in bank["cells"]:
+        if cell["hardware"] != args.hardware:
+            continue
+        suite = asset(args.bank.parent, cell["suite"]).parent
+        manifest = load_suite(suite)
+        names = {entry["name"] for entry in manifest["cases"]}
+        limits = cell.get("performance_limits")
+        if limits is None:
+            raise ValueError(f"uncalibrated performance budgets: {cell['id']}")
+        if set(limits) != names or any(set(value) != {"p50_ms", "p95_ms", "first_call_ms"}
+                or not all(math.isfinite(v) and v > 0 for v in value.values())
+                for value in limits.values()):
+            raise ValueError(f"invalid per-case performance budgets: {cell['id']}")
+        for key in ("checkpoint", "config", "reference", "baseline", "calibration"):
+            if cell.get(key) is not None:
+                asset(args.bank.parent, cell[key])
+    return 0
+
+
 def performance(rows: list[dict], cell: dict) -> dict:
     import numpy as np
 
@@ -304,7 +326,7 @@ def aggregate(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("freeze", "run", "aggregate"))
+    parser.add_argument("command", choices=("freeze", "validate", "run", "aggregate"))
     parser.add_argument("--bank", type=Path, required=True)
     parser.add_argument("--bank-sha256")
     parser.add_argument("--activity-audit-sha256")
@@ -323,6 +345,10 @@ def main() -> int:
         parser.error("run/aggregate require bank-sha256 and revision")
     if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
         parser.error("revision must be a full commit SHA")
+    if args.command == "validate":
+        if args.hardware is None:
+            parser.error("validate requires hardware")
+        return validate(args)
     if args.command == "run" and (args.hardware is None or args.output_dir is None):
         parser.error("run requires hardware and output-dir")
     if args.command == "aggregate" and not re.fullmatch(r"[0-9a-f]{64}", args.activity_audit_sha256 or ""):

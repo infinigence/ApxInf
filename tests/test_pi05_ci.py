@@ -265,6 +265,14 @@ class MatrixTest(unittest.TestCase):
                                activity_audit_sha256="f" * 64,
                                report=self.reports if reports is None else reports)
 
+    def test_uncalibrated_bank_is_rejected_before_build(self):
+        self.bank["cells"][0]["performance_limits"] = None
+        self.save_bank()
+        args = self.args()
+        args.hardware = "thor"
+        with self.assertRaisesRegex(ValueError, "uncalibrated"):
+            ci.validate(args)
+
     def test_complete_matrix(self):
         self.assertEqual(ci.aggregate(self.args()), 0)
 
