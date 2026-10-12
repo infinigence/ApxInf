@@ -401,8 +401,10 @@ def metrics(reference: np.ndarray, actual: np.ndarray) -> dict[str, float | None
 def meets_limits(result: dict[str, Any], limits: dict[str, float]) -> bool:
     if result["max_abs"] > limits["max_abs"]:
         return False
-    if result["cosine"] is None or result["relative_l2"] is None:
+    if result["relative_l2"] is None:
         return result["max_abs"] <= limits["zero_max_abs"]
+    if result["cosine"] is None:
+        return False
     return result["cosine"] >= limits["min_cosine"] and result["relative_l2"] <= limits["max_relative_l2"]
 
 

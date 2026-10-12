@@ -42,6 +42,13 @@ class MetricsTest(unittest.TestCase):
         self.assertTrue(parity.meets_limits(parity.metrics(values, values), LIMITS))
         self.assertFalse(parity.meets_limits(parity.metrics(values, values + .001), LIMITS))
 
+    def test_zero_candidate_cannot_bypass_nonzero_reference_relative_error(self):
+        expected = np.full((2, 32), 1e-6)
+        result = parity.metrics(expected, np.zeros_like(expected))
+        self.assertIsNone(result["cosine"])
+        self.assertEqual(result["relative_l2"], 1)
+        self.assertFalse(parity.meets_limits(result, LIMITS))
+
     def test_invalid_outputs(self):
         for actual in (np.array([np.nan]), np.array([np.inf]), np.zeros(2)):
             with self.assertRaises(ValueError):
