@@ -178,6 +178,26 @@ class ReceiptTest(unittest.TestCase):
 
 
 class ActivityTest(unittest.TestCase):
+    def test_orin_audit_detects_current_driver_gpu_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            process = proc / "123"
+            (process / "fd").mkdir(parents=True)
+            (process / "stat").write_text("123 (python) S 1 123 1")
+            (process / "comm").write_text("python")
+            for target, expected in (("/dev/nvhost-gpu", True),
+                    ("/dev/nvgpu/igpu0/ctrl", True),
+                    ("anon_inode:nvgpu-ga10b-tsg18", True),
+                    ("anon_inode:nvhost-17000000.gpu-fd19", True),
+                    ("anon_inode:[eventfd]", False), ("/dev/nvmap", False)):
+                with self.subTest(target=target):
+                    fd = process / "fd/10"
+                    fd.symlink_to(target)
+                    with patch.object(Path, "read_bytes", return_value=b"nvidia,tegra234"):
+                        receipt = activity.audit(proc)
+                    fd.unlink()
+                    self.assertEqual(bool(receipt["processes"]), expected)
+
     def test_monitor_rejects_interference_and_terminates_own_process(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

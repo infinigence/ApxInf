@@ -4,118 +4,55 @@ This PR prepares the CI tools and workflows. It does **not** register runners,
 enable GPU dispatch, or change branch protection. An incomplete board matrix,
 missing asset, uncalibrated performance budget, or failed preflight cannot pass.
 
-## Current repair qualification (2026-10-10)
+## Acceptance status
 
-Private native BF16 controls pass the original 37 diagnostic chunks and every
-action step on both boards: 13/13 one view, 13/13 two views, 11/11 three views. Orin's
-combined separate-QKV, one-view language output projection and three-view
-visual projector control has 11/11 three-view chunks bitwise OpenPI; repeats
-and revisits have zero drift. These are native diagnostic controls, not
-maintained model repairs or a qualified representative bank.
+**Not accepted / not online.** The shared-board harness and CPU contracts are
+implemented; model precision and performance qualification remain open.
+Current real-image diagnostics contain eight observations projected to each
+view count. Whole-chunk and per-action-step checks give:
 
-Six additional diagnostics cross the configured T200 length boundary with zero
-noise: gradient and black images for each of one, two and three views. These
-exercise lengths whose GEMM recipes differ from the short-token zero-noise
-cases. Thor's candidate is bitwise OpenPI on all six. Orin's candidate passes
-five; one-view black+T200+zero has whole-chunk cosine .999300 and relative L2
-.047037, but action-step cosine reaches .998624 and relative L2 .060895, failing
-the unchanged .999/.05 floors. Both product builds fail black+T200+zero on all
-three view counts. The diagnostic generator now includes both combinations;
-generated arrays match all six GPU-tested inputs, and 22 CPU tests pass. These
-are synthetic diagnostics, not six real observations. Existing saved suites
-and goldens have not been rewritten. A subsequent one-variable Orin Q projection
-control changes workspace at M456 while retaining the M266 recipe. It passes
-all 15 one-view chunks and every step, with repeats/revisit drift zero. The
-black+T200+zero chunk improves to cosine .999826 / L2 .020106; worst-step
-cosine/L2 are .999637/.030680. T10/T200 P50 is 141.954/168.739ms: long text
-still regresses against the same-library product 149.806ms. This is a private
-causal control, not a maintained shape-specific dispatch or an accepted repair.
+| Board / precision | 1 view | 2 views | 3 views |
+| --- | --- | --- | --- |
+| Thor maintained BF16 | 6/8 | 8/8 | 8/8 |
+| Thor existing FP8 calibration | 0/8 | 4/8 | 4/8 |
+| Orin maintained BF16 | 7/8 | 8/8 | 8/8 |
+| Orin maintained INT8 | 0/8 | 6/8 | 4/8 |
 
-Performance remains a separate acceptance condition. Orin's combined three-view
-control measures T10/T200 P50 298.296/300.339ms against the same-library product
-232.837/256.025ms. A Thor one-view auto-fusion control's 1,800-sample alternating
-comparison measures T200 71.057ms against bracketing product 70.703/70.616ms;
-every block reproduces the increment. It is rejected. A later cluster2x1,
-stage4 control retains all 37 precision passes. Its 5,400-sample comparison
-(one/two/three views, T10/T200, three product → candidate → product blocks)
-places every candidate P50 and P95 below both bracketing same-library controls.
-Candidate P50 ranges are 67.338–67.458/69.141–69.267ms, 73.461–73.497/
-77.319–77.356ms and 87.845–88.024/90.701–91.042ms for the three view counts.
-All receipts have the same four actual CUDA-library hashes and matching
-checkpoint, config and input hashes. This qualifies the measured warm controls,
-not a maintained repair. T10 first inference still increases by about 64–77ms
-on each view-count profile; one-view T200 also increases. Here `first_call_ms`
-is each shape's first inference in the resident model, not total process/model
-startup. Replacing the patch embedding with an exact ordered CUTLASS SIMT
-control retains all 37 original precision passes and improves warm pilots, but
-T10 first-call overhead still increases by about 38–48ms. The remaining large
-host calls include F32 GEMMs with M/N/K 1/1024/1024 and 50/1024/32, measured
-at approximately 29/26ms in a targeted probe. Replacing SGEMM with GemmEx
-retains precision but does not remove the cold-call regression. No initialization
-has been moved outside the timer to claim a pass; repair remains open.
+These results use the historical comparison limits described below. They are
+fixed-observation implementation diagnostics, not policy-success evaluations
+or an approved deployment bank. The images come from two official DROID
+episodes; the third exterior camera is explicitly mapped to the third model
+slot for shape coverage. DROID state normalization is not claimed.
 
-Two faster custom F32 projection controls fail two-view zero-noise checks;
-separate M1 and M50 replacement experiments each reproduce failures. A later
-cuBLASLt control targets the original native Sgemm recipe (TN, 8MiB workspace,
-math mode 0 for M1 / 3 for M50, separate bias), rather than an approximately
-matching high-precision projection. Selected plans reproduce 91 captured
-projection outputs bitwise. Complete inference passes 15/15, 15/15, 13/13
-chunks and all steps, with 40/43 bitwise official and repeat/revisit drift zero.
-Warm P50 T10/T200 pilots are 67.222/68.917, 73.318/76.544 and
-87.496/90.352ms. First calls remain 325.581/285.066, 350.090/344.128 and
-389.465/404.043ms. This still fails cold-call acceptance; changing the library
-API or matching operator outputs does not by itself remove initialization cost.
-These 600 samples are a pilot, not a replacement for alternating qualification.
+Private complete BF16 controls can match the official outputs, but their
+maintained operator integration has failed full precision checks and first-call
+or warm-performance qualification. They have not been promoted. The maintained
+INT8 learned-norm packing and allocation-schedule fixes have passed prior paired
+performance regression checks; no new numerical prototype inherits that acceptance.
 
-On Orin, rounded SM80 GeGLU plus compact K/V storage preserving the physical
-softmax reduction order retains all 37 original precision passes. Its T10/T200
-P50 pilots are 141.782/168.597, 218.273/236.210 and 297.927/299.074ms for
-one/two/three views. Against the same-library product 170.457/149.806,
-258.658/202.283 and 232.837/256.025ms, long-token and three-view cases still
-regress. These controls are rejected as complete performance repairs.
+Independent INT8 quantization interventions expose language-path sensitivity.
+An adapter using raw F32 checkpoint weights and BF16 final RMS scales agrees
+with native INT8 on 1/8, 7/8 and 8/8 inputs, including every action step. Its
+nonlinear, reduction and flow-time conventions are not fully aligned, so this
+is not proof that remaining differences are kernel defects or that the native
+implementation is correct. FP8 calibration on four different observations
+improves the real-image count to 16/24 with a pooled profile, but still fails
+one-view and constructed diagnostics. Those profiles are unapproved.
 
-A later Orin GeGLU scheduling control (128x256x64, three stages, CTA
-swizzle one) retains the Q workspace correction and compact ordered attention.
-Fresh same-board official references yield all 43 chunk/step passes: 15/15,
-15/15, 13/13; 35 outputs are bitwise official, repeats/revisits have zero drift.
-T10/T200 warm P50 pilots are 137.485/166.423, 213.560/230.665,
-291.934/293.732ms. First calls are 896.637/973.946, 1222.294/1301.447,
-1591.092/1705.064ms. Long-token and three-view regressions remain against the
-products above. The operator improvement does not qualify the complete repair.
+The activity auditor must be validated on the actual driver. Orin R39 CUDA
+clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
+checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
+persistent Xorg/GNOME GPU clients, which the corrected auditor rejects. A
+headless maintenance window and fresh environment/performance qualification
+are required before accepting this board as an exclusive GPU worker. This PR
+does not stop desktop services or interrupt developers.
 
-A Thor native-reduction auxiliary control reproduces 80 actual GEMV operands
-and 11 SM100 FP32 Tensor Core projections bitwise. All 43 chunk/step checks
-pass, with zero repeat/revisit drift. Its 5,400 paired warm samples have every
-P50/P95 below both bracketing products, but 11/18 shape-first groups exceed
-both controls. This candidate remains unaccepted.
-
-A following bias/SiLU fusion reproduces 111 actual auxiliary operands bitwise
-and leaves all 43 complete outputs bitwise unchanged from that control. All
-43 chunk/step checks pass. Warm P50 pilots T10/T200 are 67.085/68.736,
-73.194/77.193, 87.342/90.370ms; first calls are 268.869/276.102,
-295.920/333.587, 335.984/429.250ms. The 5,400-sample paired run completed;
-16 groups are uncontaminated and all their P50/P95 values fall below both
-controls. An external GPU benchmark invalidated one two-view block; subsequent
-rechecks also captured external CPU compilation and are preserved as invalid.
-A final two-view A/B/A recheck has 58/57/58 continuous process samples with no
-foreign GPU client or compiler. T10 first calls are 297.638/295.932/297.641ms
-and P50 is 73.771/73.476/73.875ms; T200 first calls are
-352.788/331.417/350.400ms and P50 is 84.390/77.314/84.478ms. Every recheck
-P50/P95 and first call is below both controls. This qualifies this private
-candidate on the selected inputs; formal operator integration still requires
-its own precision and performance regression.
-
-On 90 captured Orin QK/PV operands, ordered FP32 FMA reproduces official BF16
-outputs exactly; reverse/grouped sums and FP64 real-sum controls differ. Faster
-padded Tensor Core recipes fail complete-chunk or per-step checks. Exact tiled
-and guarded-recompute controls also remain slower in operator measurements;
-none is promoted. A micro-oracle is not complete inference qualification.
-
-The maintained INT8 learned-norm packing repair retains its earlier
-27,000-sample paired qualification without reproducible performance regression.
-Private BF16 controls have not changed that implementation. FP8/base INT8
-failures, representative input provenance and performance-budget approval remain
-unresolved; GPU CI stays disabled and this PR remains unaccepted.
+Before rollout, complete the production-representative input bank, approve
+numerical/stability/per-case performance budgets from measurements, qualify
+all twelve board/precision/view cells, and replay every maintained numerical
+repair through the same accuracy and paired performance protocols. Detailed
+experiment snapshots and raw receipts remain in the ignored development
+artifact directory; rejected probes are not product dependencies.
 
 ## Scope
 
@@ -215,7 +152,8 @@ For vectors a,b, cosine is `dot(a,b)/(norm(a)*norm(b))`; relative L2 is
 `norm(b-a)/norm(a)`. Cosine alone accepts b=2a, so the gate also uses relative
 L2 and maximum absolute error. It checks the whole chunk **and each timestep**,
 and fails on NaN, Inf, shape mismatch or receipt mismatch. Undefined zero-norm
-metrics are JSON null and require the explicit `zero_max_abs` budget.
+metrics are JSON null. Only a zero reference uses the explicit `zero_max_abs`
+budget; an all-zero candidate against a nonzero reference fails.
 
 There are two independent comparisons: official OpenPI and a frozen approved
 implementation on the same hardware/precision/calibration. Do not advance the
@@ -265,7 +203,7 @@ OpenPI reference must be generated on the same hardware family as its cell,
 recording GPU name/capability, PyTorch/CUDA build, actual math flags and loaded
 library digests. A Thor reference cannot qualify an Orin cell: identical OpenPI
 source/weights/inputs already produced failures against each other on these
-boards (see the diagnosis below). Different approved reference/runtime recipes
+boards in the recorded diagnostics. Different approved reference/runtime recipes
 remain explicit per-board bank assets; never silently replace a golden.
 Installed toolkit version alone is insufficient.
 Old receipts without these fields must be rerun before gate acceptance.
@@ -287,86 +225,6 @@ illustrate the failure mode and are not proposed gate thresholds.
 The v4 parity and v3 bank schemas require regeneration; old mixed-purpose
 receipts are historical evidence and cannot be silently promoted into the new
 protocol.
-
-## Qualification snapshot (2026-10-09)
-
-Product math at `5c7ac664` completed the twelve board/precision/view cells with
-148 first accuracy outputs and 4,440 independent warm samples. Two stability
-repeats and an A -> other inputs -> A revisit measured zero drift throughout.
-These pilot counts are exploratory, not an approved protocol. Twenty-one CPU
-contract tests and the focused Rust weight-folding regression pass.
-
-The real LIBERO 2-view INT8 failure was traced to folding learned language
-RMSNorm into projections before per-output-channel weight quantization. Keeping
-raw weights and explicit normalization improves state cosine .926409 -> .999824
-(relative L2 .383409 -> .018752) and text .901550 -> .999696
-(.439377 -> .024661). Both complete chunks and every action timestep meet the
-historical INT8 comparison floors. BF16/FP8 retain folding in their own packing
-paths; all nine corresponding board/view cells are bitwise unchanged on the
-historical overlapping inputs. Random unit-normalization weights would miss
-this learned-checkpoint failure.
-
-This does not qualify the entire model: base BF16 still fails black+zero,
-white+normal, zero-noise and some real token-mode comparisons. Base FP8 and
-INT8 also fail ordinary gradient/noise and real-input cases. Official prefix
-KV substitution improves several failures but leaves action-side error.
-Layer/flow traces measure iterative amplification. Separate GeGLU gives the
-same output; split normalization or an FP32 patch projection does not repair
-all cases. FP8 group ablations identify strong action-activation sensitivity
-on gradient+zero and vision/language sensitivity on other inputs. Increasing
-the old H10 calibration margin is insufficient. A per-site H50 recalibration
-also improves some inputs and worsens others; it is a diagnosis experiment with
-overlapping calibration/test inputs, not a production profile. No numerical
-limit was relaxed.
-
-The full v4/v2 raw receipt matrix was revalidated through the maintained
-aggregator. Exact same-build comparisons and stability pass, while missing
-performance budgets correctly prevent acceptance. A representative held-out
-bank, genuine three-camera observations, rebuilt variability and performance
-qualification remain outstanding. The system is **not accepted and not online**.
-Fixed-observation chunk agreement is not closed-loop or LIBERO task-success
-certification.
-
-## Matched-operand operator diagnosis
-
-Further native instrumentation at product math `5c7ac664` captures operands,
-quantized codes/scales and outputs, then recomputes them independently with
-PyTorch. Instrumented complete action outputs are bitwise identical to the
-product receipts on the tested inputs. This controls for changes introduced by
-the probes. No new product arithmetic change follows from these experiments.
-
-| Path | Matched-operand evidence | Interpretation and scope |
-| --- | --- | --- |
-| BF16 language | QKV/output/down GEMM and residual sums match exactly on three inputs across all 18 layers; a complete layer recomputed from its input has relative L2 at most .000652 under the native recipe, versus .003526 under the selected official recipe. | Explicit versus folded RMSNorm, FP32 RoPE and GeGLU intermediates introduce different rounding boundaries. Sampled GEMM is not the source of that difference. |
-| BF16 vision | Layers 0/13/26, three inputs: sampled GEMM, fused residual and FP32 GELU match; native attention agrees with SDPA within .000022 relative L2. | Official sequential BF16 bias/residual or activation rounding differs by roughly .001–.003 locally. FP32 patch embedding is another measured contributor, but changing it alone does not repair all chunks. |
-| BF16 action | Layers 0/8/16 at first and last flow steps, three inputs: GEMM, fused gate/residual and native GeGLU match exactly; adaptive norm relative L2 is at most .000061. | Official separate BF16 gate multiplication/residual addition and activation rounding differ by roughly .002–.004 locally. |
-| FP8 prefix/action | Independent E4M3 code/scale reconstruction agrees with sampled native GEMM to relative L2 at most .000066; GeGLU quantization differences are at most about .0002. | Quantization and iterative amplification remain causes of quality loss; these probes do not establish an FP8 GEMM defect. |
-| Orin INT8 | 108 sampled GEMMs: 36 prefix and 72 action, three inputs, layers 0/8/16 and first/last action flow steps; actual integer codes/scales produce bitwise identical outputs. Activation codes, sampled weight codes and weight-scale bits also match. Native gate/residual and GeGLU match; norm differences are at most .000037. | The confirmed learned-norm packing bug was repaired separately. No integer GEMM/quantizer defect is found in these samples; quantization recipe and BF16 rounding remain contributors to base-model failures. |
-
-The actual official `sample_actions` path forces **eager language/action
-attention**, despite the constructor's SDPA config. Eager-only interventions
-leave the output unchanged and are not evidence for an attention-backend fix.
-Full-chunk single-factor reference changes have mixed effects: black+zero
-cosine .865597 becomes .938741 with prefix FP32 GeGLU, .888755 with prefix FP32
-RoPE, and .921981 with combined prefix/action changes. Other cases can worsen.
-Intermediate rounding differences and their amplification are measured; no
-single cast or fusion rewrite has been proved to repair every failure.
-
-FP8 action layer 0 MLP norm at the first flow step clips about .2% of values on
-black+zero and gradient+zero. Its local quantization relative L2 is about .176
-and .178, versus about .026–.029 at typical unclipped sampled sites. A controlled
-scale change at only that site changes gradient+zero cosine .464966 -> .361706
-(relative L2 3.767167 -> 6.754926); also changing layer 16 yields .362401 /
-6.707144. All three profiles still fail all 13 two-view diagnostic inputs under
-historical whole-chunk plus timestep floors. Full per-site H50 recalibration
-has different mixed results, documented above. Eliminating clipping is
-insufficient: changing static range also changes resolution and the iterative
-trajectory. These overlapping calibration/test probes are not production
-profiles and are not a reason to relax limits.
-
-These operator samples narrow the causes; they do not exhaust every layer,
-token, checkpoint, view or board, prove complete port correctness, or certify
-remaining failed cases as acceptable. The OpenPI disagreement stays red.
 
 ## Freeze the approved bank
 
@@ -474,8 +332,9 @@ On Orin, give the runner passwordless permission for that exact read-only comman
 The root-owned script and its parent directory must not be writable by the
 runner. Full `/proc` descriptor visibility is required on Orin: an unprivileged
 scan can silently miss another user's GPU process. Thor uses its unprivileged compute-process query from `nvidia-smi`;
-Orin checks compute device descriptors, including `/dev/nvhost-gpu` and
-`/dev/nvhost-as-gpu`. Missing telemetry or permission errors reject the run
+Orin checks compute device descriptors, including `/dev/nvhost-gpu`,
+`/dev/nvhost-as-gpu`, `/dev/nvgpu/igpu0/ctrl`, and anonymous nvgpu/host1x GPU
+channels. Missing telemetry or permission errors reject the run
 instead of accepting a partial scan. Approve the executable digest as `PI05_CI_ACTIVITY_AUDIT_SHA256` in GitHub
 and set its path in the runner environment. This PR does not install it or grant
 sudo access.
@@ -489,7 +348,8 @@ Save build/preflight logs, raw outputs, activity samples and summary JSON.
    no inbound public GPU endpoint is needed. Use operator-owned assets and
    service configuration. Do not put registration tokens into the repository.
 2. Set repository variables `PI05_CI_BANK_SHA256`, `PI05_CI_PREFLIGHT_SHA256`,
-   `PI05_CI_thor_ENVIRONMENT_SHA256`, `PI05_CI_orin_ENVIRONMENT_SHA256`. After
+   `PI05_CI_ACTIVITY_AUDIT_SHA256`, `PI05_CI_thor_ENVIRONMENT_SHA256`,
+   `PI05_CI_orin_ENVIRONMENT_SHA256`. After
    offline acceptance, set `PI05_CI_ENABLED=true`. Without it dispatch fails.
 3. A maintainer reviews an **internal** PR and dispatches `PI05 GPU gate` from
    the default branch with PR number and the reviewed full head SHA. CPU
@@ -514,258 +374,3 @@ can still damage same-user assets and forge same-host results. Do not enable
 automatic fork PR execution; use disposable isolated workers for that threat
 model. Host hardening, read-only mounts and resource ownership remain operator
 responsibilities. See [GitHub's self-hosted runner security guidance](https://docs.github.com/en/actions/reference/security/secure-use).
-
-
-## Repair performance regression (2026-10-09)
-
-The learned-RMSNorm INT8 packing repair was rerun on Orin with separate fresh
-processes in **before -> after -> before** order. Only one model is resident at
-once. Each checkpoint/view profile uses two fixed inputs, three timing blocks
-per input per process, 30 warmups and 100 measured samples per block. The
-maintained `bench_pi05.py` timer and empirical P50/P95 definitions are reused;
-all 7,200 raw INT8 samples are retained without tail filtering. This is a repair
-regression experiment, not an approved merge-gate sample count or budget.
-
-| Orin INT8 profile/input | Before P50/P95 ms | After P50/P95 ms | P50/P95 change |
-| --- | --- | --- | --- |
-| LIBERO 2-view state | 130.244 / 130.639 | 129.747 / 129.995 | -0.382% / -0.493% |
-| LIBERO 2-view text | 127.871 / 128.085 | 127.717 / 127.876 | -0.120% / -0.163% |
-| Base 1-view T10 | 87.921 / 88.190 | 87.944 / 88.146 | +0.026% / -0.050% |
-| Base 1-view T200 | 105.014 / 105.296 | 105.087 / 105.354 | +0.069% / +0.055% |
-| Base 2-view T10 | 127.839 / 128.215 | 127.866 / 128.335 | +0.021% / +0.093% |
-| Base 2-view T200 | 145.007 / 145.398 | 144.987 / 145.321 | -0.014% / -0.052% |
-| Base 3-view T10 | 167.107 / 167.532 | 166.972 / 167.511 | -0.081% / -0.012% |
-| Base 3-view T200 | 184.264 / 184.656 | 184.198 / 184.575 | -0.036% / -0.044% |
-
-The comparison shows no performance regression distinguishable from measured
-run variation on these inputs. Every block reports zero major page faults and
-zero process swap; rebuilding the original model reproduces identical actions.
-The independent LIBERO accuracy replay also reproduces the improved cosine,
-relative L2 and all-timestep verdicts stated above. This does not certify every
-input or a zero-cost repair. An earlier two-model-resident attempt experienced
-swap and a worker exit; it is preserved as invalid evidence and excluded.
-
-Further BF16 experiments explicitly reproduce the official weight casts,
-normalization, intermediate BF16 GeGLU/gated-residual/RoPE rounding and FP32
-auxiliary projections/flow state. Ordinary inputs improve, but complete
-whole-chunk plus timestep checks still fail. These private candidates are not
-product changes. An initial auxiliary projection lost graph capture and was
-rejected for its latency increase; a workspace-based version restored capture.
-Remaining candidates must establish precision and controlled performance
-before promotion. The gate remains unaccepted and offline.
-
-The same A/B/A protocol also completed 10,800 Thor BF16/FP8 samples and 5,400
-Orin BF16 samples, covering base 1–3 views at T10 and T200. All paired actions
-are bitwise identical; all blocks report zero major faults and zero process swap.
-Orin BF16 P50/P95 deltas range from -0.370% to +0.384%. Thor BF16/FP8 deltas
-range from -0.286% to +0.469%. Two Thor FP8 input profiles initially had non-overlapping block intervals.
-A further 3,600-sample **after -> before -> after** run on FP8 2/3 views
-produces overlapping block intervals throughout; 3-view T10 changes sign.
-Fixed/original P50/P95 differences in that run range from -0.064% to +0.180%.
-Together, 27,000 retained paired **warm** samples show no reproducible regression beyond
-measured process variation on the selected inputs. They do not prove identical
-latency or supply an approved performance budget.
-Longest text is not necessarily slowest: Orin 2-view BF16 T10 is slower than
-T200. These two inputs do not constitute worst-case performance coverage.
-
-The prior INT8 regression receipt did not separately retain first-call latency.
-A targeted cold comparison completed: real LIBERO 2-view state/text and
-base 1/2/3-view T10/T200, three independent before -> after -> before blocks,
-36 fresh model processes and 72 shape-first measurements. It reuses the same
-frozen inputs, checkpoints, bundled libraries and `bench_pi05.py` timer. Zero
-warmups and one subsequent sample are used here; that single sample is not
-warm-performance qualification. All input/checkpoint/configuration and loaded-library digests match across
-paired blocks. First-call acceptance remains pending because timing concerns
-require further causal controls.
-
-The cold run reproduces a base 2-view T10 concern in all three
-independent blocks: before/after/before first calls are 1216.89/1273.10/1229.94ms
-1015.93/1245.23/980.34ms and 1018.86/1161.21/972.57ms. Do not extend the warm-performance conclusion
-to cold inference. Before/after extension `.nv_fatbin` contents have identical
-SHA256 and byte size; no differing CUDA kernel body is established by this
-binary comparison. A same-runtime first-call profile measures 1202.034ms before and 1253.163ms
-after. Both have 1566 allocations, 1191 frees and 7632 kernel launches. About
-36.8ms of the 51.1ms wall-time gap occurs in one allocation; graph instance
-creation differs by about .25ms. Memory tracing identifies the reservation as
-8,304,121,344 bytes in both builds. A reversed profiled pair changes the sign
-of its allocation-time difference (742.3ms after versus 768.6ms before), so the
-profile does not establish a repair-specific allocation cost. Reversed
-unprofiled controls completed another nine fresh processes and 18 first calls.
-The base two-view T10 difference changes direction in two of three reversed
-blocks; this does not establish a repair-specific cold cost or an approved
-first-call budget.
-
-Six independent native arena observations measure 2.019/2.766GB,
-3.406/4.153GB and 4.794/5.540GB for one/two/three views at T10/T200,
-about 40–42.2% of the old reservation. An ignored half-capacity causal probe
-preserves all 43 outputs bitwise and lowers first-call pilots, but an empirical
-fraction is not a safe production bound. The maintained reservation candidate
-instead adds each captured W8A8 linear's aligned quantized input, FP32 row
-scales and vendor INT32 accumulator to the BF16 bound, plus maximum split-KV
-scratch. It reduces the selected reservations by about 6.5–9%, without changing
-kernels, arithmetic or the inference timer. Nine CPU configuration tests pass;
-Orin base 43 inputs and both LIBERO token modes are bitwise unchanged, including
-repeat/revisit checks. Three product → candidate → product blocks per base
-view count and LIBERO profile retain 7,200 warm samples and 72 shape-first
-calls. P50 changes span −.385% to +.301%; P95 spans −.668% to +.280%.
-One-view T200 initially has a small, same-sign mean P50 increment of +.125%.
-A further 1,800-sample, 18-first-call candidate → product → candidate comparison
-reverses the increment in two of three blocks: mean P50/P95 changes are
-+.0027%/−.0060%, while mean first-call change is −5.04% (T10: −8.03%).
-No reproducible warm regression is detected in this counterbalanced check;
-this is not a claim of identical latency or an approved CI budget. The native
-CUDA fatbin is identical between the product and reservation candidate.
-
-The matrix's read-only resource observer begins during block0, leaving the
-first five phases unobserved; observed phases have no foreign GPU clients or
-compiler processes. The counterbalanced follow-up has 353 continuous samples
-with neither interference. Some matrix processes incur major page faults;
-those samples cover model loading too, so the receipt cannot assert fault-free
-inference. All raw timings remain included.
-
-A forced full-vendor pressure probe fails with cuBLAS status15; it cannot count
-as capacity qualification. A separate layout/algorithm ablation passes a fully
-aligned128×1024×1024 control eagerly and in graph replay for both layouts and
-all three algorithms, but the sampled actual multirow shapes still return15.
-Neither a general M%4 explanation nor a library-wide lack of INT8 support is
-established. A production call trace identifies the vendor patch projection as
-768×1152×588; all thirteen three-view outputs remain bitwise unchanged.
-Independent C++ eager/graph calls and a later ctypes control both execute this
-patch shape successfully. This contradicts the initial ctypes patch failure;
-initialization alone is not established as its cause. The tested language/action
-shapes still return15. Forced full-vendor support remains unqualified; the bound
-reserves every vendor accumulator and does not depend on CUTLASS selection.
-
-## Additional real-image diagnostics
-
-One official [DROID debug shard](https://github.com/droid-dataset/droid/blob/main/docs/the-droid-dataset.md)
-contains two different tasks and 404 synchronized three-camera observations.
-Per episode, the fixed selection is the initial frame, maximum observed gripper
-position, largest one-step gripper-position decrease, and final frame. These
-select eight distinct observations; the number follows the selected differences,
-not a target case count. Source JPEG/object hashes and episode/frame identities
-are retained with the frozen NPZ inputs.
-
-| Task | Episode identity | Frame indices |
-| --- | --- | --- |
-| Put the marker in the pot | RAIL / 2023-04-17 / Mon_Apr_17_14:48:05_2023 | 0, 70, 137, 165 |
-| Put the candy bar on the left side of the first shelf | RPL / 2023-06-05 / Mon_Jun__5_20:15:38_2023 | 0, 169, 179, 237 |
-
-The camera order is exterior 1, wrist, exterior 2. The third exterior camera maps
-to the canonical third model slot for shape coverage; this is not an official
-three-camera DROID policy configuration. Pinned OpenPI CPU uint8 bilinear
-resize/padding produces 224×224 RGB. Cached official SentencePiece weights and
-the unchanged text-only tokenizer method produce 8/14 valid tokens. There are
-no DROID normalization assets in the selected checkpoint: these are real-image,
-text-only direct-model fixtures, not full normalized robot observations.
-Gaussian noise is frozen per observation with seeds 5105–5112, horizon 50 and
-flow steps 10. One/two-view inputs select the first cameras of these same eight
-observations, not additional independent scenes. No held-out-from-pretraining
-or task-success claim is made.
-
-Orin's BF16 product passes 7/8, 8/8, 8/8 at one/two/three views. The one-view marker
-initial frame passes whole-chunk cosine/L2 (.999230/.045073), but fails step
-floors: worst cosine .997329, relative L2 .075504. The existing combined precision
-control is bitwise OpenPI on all 24 projections, with zero repeat/revisit drift.
-Fresh references recording Torch 2.9.1+cu130, high precision and TF32 settings are
-bitwise unchanged from initial collection. This strengthens diagnosis only:
-the control's established long-token/three-view performance regressions still
-prevent promotion, and this bank has not been approved as the production gate.
-
-Fresh same-board Thor references add the following results on those eight
-observations projected to each view count. The unchanged limits apply to the
-complete chunk and every action step; passing the chunk average alone is not
-sufficient.
-
-| Board and precision | 1 view | 2 views | 3 views |
-| --- | --- | --- | --- |
-| Thor product BF16 | 6/8 | 8/8 | 8/8 |
-| Thor private BF16 control | 8/8 | 8/8 | 8/8 |
-| Thor product FP8, existing calibration | 0/8 | 4/8 | 4/8 |
-| Orin product BF16 | 7/8 | 8/8 | 8/8 |
-| Orin private BF16 control | 8/8 | 8/8 | 8/8 |
-| Orin maintained INT8 reservation repair | 0/8 | 6/8 | 4/8 |
-
-Both private BF16 controls are bitwise official on all 24 projections.
-All measured repeat/revisit drifts are zero. Quantized failures remain red:
-these results do not isolate quantization from every other arithmetic boundary,
-justify a threshold change, or qualify performance on the new observations.
-The Orin BF16 control remains rejected for its established performance regression.
-
-A public staged GeGLU probe measures a resource risk: ten executions sharing one
-action weight separately allocate ten 16 MiB prepacks (160 MiB); two language
-executions allocate two 128 MiB prepacks (256 MiB). A runtime-scoped weak sharing
-prototype reduces these physical allocations to one 16 MiB and one 128 MiB pack,
-respectively. The same immutable test binary passes three numerical/graph tests
-and two resource/identity tests, including changed versions, distinct sources,
-owner release and reprepare. Summing each execution's referenced bytes after
-sharing would double-count the shared allocation.
-
-This remains a private operator prototype. Public full-model integration and
-paired first-call/warm measurements are pending on both boards; operator tests
-and prepare timings do not qualify model performance. Preparation and graph
-creation remain inside the inference timer during acceptance measurements.
-
-### 2026-10-12 follow-up: gate repairs and rejected integration probes
-
-The trusted worker now monitors GPU users and compiler processes throughout its
-run. Thor uses its compute-process query; Orin uses complete device-descriptor
-visibility because its SMI compute query returns `[N/A]`. A foreign process or
-missing audit invalidates the run. Hosted aggregation checks raw activity
-samples and the approved auditor digest. A real Thor CUDA subprocess passes
-this lifecycle check. The worker also verifies assets and case-specific budgets
-before a CUDA build. **27 CPU contract tests pass.** These changes do not enable
-the workflow or approve any numerical/performance baseline.
-
-The public staged-GeGLU integration is a component probe, not the complete
-private precision repair. At unchanged BF16 floors its 43 inputs pass
-10/15,7/15,7/13 on Thor and8/15,8/15,8/13 on Orin. Thor's completed 5,400 warm
-samples/54 first calls expose first-call regression: approximately502–785ms
-against275–474ms controls. Profiling observes20 tuning-event waits and201
-stream synchronizations. Removing per-operation synchronization during session
-preparation preserves43/43 outputs bitwise; one-view first-call pilots become
-479/503ms and still fail qualification. Disabling online tuning selects a slower
-fallback and is rejected. Explicit BF16 learned normalization and a sequential
-FP32 time-update control also leave numerical failures. No such probe is
-promoted; small pilots do not establish absence of performance regression.
-
-Independent integer quantization experiments preserve official masks, RoPE,
-attention and flow. Unsupported vendor INT8 shapes are diagnosed separately;
-an FP64 integer-dot oracle uses exact integer products/sums below2^31 and then
-the specified FP32 dequantization. It is not a native performance benchmark.
-Language-only quantization of BF16-loaded official weights produces whole-chunk
-cosines .853/.997/.945 on three selected failing real observations; action-only
-quantization remains above .9998. Binary layer controls find failures at4,13,14
-in the selected one-view observation, while excluding all three still fails,
-showing cumulative effects. These results identify sensitivity for that
-quantization convention; they do not qualify the native implementation.
-
-The independent reference must also match weight transformations. Native INT8
-quantizes checkpoint F32 weights, whereas the first intervention quantizes
-OpenPI's BF16-loaded weights. Using raw F32 weights changes both quality and
-native agreement; native-versus-reference whole cosines become
-.99229/.99949/.99972 on the three observations. Learned-scale source and rounding
-are being isolated separately. Patch Conv2d is included in this later control;
-its official `padding="valid"` is equivalent to zero padding. Do not attribute
-all remaining differences to quantization or implementation until the reference
-conventions and intermediate boundaries are aligned.
-
-An FP8 calibration control adds four real observations disjoint in frame index
-from the eight test observations: episode0 frames35/103, episode1 frames84/208.
-It retains the existing scale rule and margin1.1. Twelve view projections feed
-native BF16 activation capture. With pooled calibration, real-input pass counts
-improve from0/8,4/8,4/8 to1/8,7/8,8/8; diagnostic counts remain1/15,0/15,1/13.
-Separating the same measurements per view produces1/8,7/8,7/8 and2/15,0/15,0/13.
-Both calibrations remain rejected. Their files are diagnostic-only, not approved
-bank assets; the legacy schema's non-bootstrap production label is not a
-claim of deployment acceptance. No saved reference or existing calibration is
-overwritten, and distribution arguments do not waive the red inputs.
-
-Further Orin attention controls preserve every sampled QK/PV output and
-reconstruction but remain slower. Coalesced repair layouts and conservative
-per-group error bounds do not close the gap. The latter uses72/80 registers
-without spills; targeted profiling attributes about1.31/1.15ms to dot/bound
-kernels, .47ms to repair and .21ms to classification, versus .747/.704ms for
-teacher GEMMs. These are operator-level measurements, not full-model budgets.
-The complete maintained BF16 integration, Orin performance target, quantized
-quality failures and approved bank/budgets remain **unaccepted**.

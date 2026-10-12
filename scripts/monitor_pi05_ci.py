@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -18,7 +19,9 @@ import time
 SCHEMA = "apxinf.pi05.activity.v1"
 COMPILERS = {"cargo", "rustc", "nvcc", "cicc", "ptxas", "cc1", "cc1plus",
              "cmake", "ninja", "make"}
-GPU_DEVICES = {"/dev/nvhost-gpu", "/dev/nvhost-as-gpu", "/dev/nvidia0", "/dev/nvidia1"}
+GPU_DEVICES = {"/dev/nvhost-gpu", "/dev/nvhost-as-gpu", "/dev/nvidia0", "/dev/nvidia1",
+               "/dev/nvgpu/igpu0/ctrl"}
+GPU_CHANNEL = re.compile(r"anon_inode:(?:nvgpu-[\w.-]+-tsg|nvhost-[\w.-]+\.gpu-fd)\d+")
 
 
 def audit(proc: Path = Path("/proc")) -> dict:
@@ -42,7 +45,8 @@ def audit(proc: Path = Path("/proc")) -> dict:
             name = (directory / "comm").read_text().strip()
             if gpu_pids is None:
                 devices = {os.readlink(fd) for fd in (directory / "fd").iterdir()}
-                gpu = bool(devices & GPU_DEVICES)
+                # R39's CUDA contexts retain anonymous GPU channel descriptors.
+                gpu = bool(devices & GPU_DEVICES) or any(GPU_CHANNEL.fullmatch(fd) for fd in devices)
             else:
                 gpu = int(directory.name) in gpu_pids
             if gpu or name in COMPILERS:
