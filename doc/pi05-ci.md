@@ -184,9 +184,12 @@ all operations being BF16.
 Stability is a separate phase enabled by `--stability-repeats`: compare repeated
 calls against the saved accuracy output, then explicitly run A -> other suite
 inputs -> A. Its drifts are separate from accuracy outputs and latency. Daily
-bank policies require an explicit positive stability count, chosen after
+bank policies require an independent `stability_max_abs` budget and an explicit
+positive stability count, chosen after
 same-input and rebuilt-extension measurements; the example's one repetition is
-an unapproved placeholder, not an established protocol.
+an unapproved placeholder, not an established protocol. Stability never borrows
+the OpenPI or baseline accuracy tolerance; an uncalibrated stability budget
+fails pre-build validation and hosted aggregation.
 
 Performance runs in a separate process through `bench_pi05.py --suite-dir ...
 --model-dir ... --layer l1`, with independent `--warmup` and `--samples`. This

@@ -38,7 +38,8 @@
       "performance_protocol": {
         "warmup": 0,
         "samples": 1
-      }
+      },
+      "stability_max_abs": null
     },
     {
       "hardware": "thor",
@@ -64,7 +65,8 @@
       "performance_protocol": {
         "warmup": 0,
         "samples": 1
-      }
+      },
+      "stability_max_abs": null
     },
     {
       "hardware": "orin",
@@ -90,7 +92,8 @@
       "performance_protocol": {
         "warmup": 0,
         "samples": 1
-      }
+      },
+      "stability_max_abs": null
     },
     {
       "hardware": "orin",
@@ -116,7 +119,8 @@
       "performance_protocol": {
         "warmup": 0,
         "samples": 1
-      }
+      },
+      "stability_max_abs": null
     }
   ]
 }

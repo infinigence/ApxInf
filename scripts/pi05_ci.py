@@ -16,7 +16,7 @@ from compare_pi05_openpi import compare_results, load_suite, sha256, shape_switc
 from monitor_pi05_ci import validate_receipt
 
 
-SCHEMA = "apxinf.pi05.ci.v4"
+SCHEMA = "apxinf.pi05.ci.v5"
 PRECISIONS = {"thor": ("bf16", "fp8"), "orin": ("bf16", "int8")}
 LIMIT_KEYS = {"min_cosine", "max_relative_l2", "max_abs", "zero_max_abs"}
 
@@ -65,6 +65,9 @@ def load_bank(path: Path, digest: str) -> dict:
             raise ValueError("invalid performance protocol")
         if type(cell["stability_repeats"]) is not int or cell["stability_repeats"] < 1:
             raise ValueError("stability repeats must be explicitly positive")
+        stability_limit = cell.get("stability_max_abs")
+        if stability_limit is not None and (not math.isfinite(stability_limit) or stability_limit < 0):
+            raise ValueError("invalid stability budget")
         switch_limit = cell.get("shape_switch_limit_ms")
         if switch_limit is not None and (not math.isfinite(switch_limit) or switch_limit <= 0):
             raise ValueError("invalid shape-switch budget")
@@ -107,6 +110,8 @@ def validate(args: argparse.Namespace) -> int:
         shape_switch_pair(suite, manifest)
         if cell.get("shape_switch_limit_ms") is None:
             raise ValueError(f"uncalibrated shape-switch budget: {cell['id']}")
+        if cell.get("stability_max_abs") is None:
+            raise ValueError(f"uncalibrated stability budget: {cell['id']}")
         names = {entry["name"] for entry in manifest["cases"]}
         limits = cell.get("performance_limits")
         if limits is None:
@@ -249,7 +254,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
     drifts = [row["repeat_max_abs"] for row in stability["cases"]] + [stability["revisit_max_abs"]]
     if not all(math.isfinite(value) and value >= 0 for value in drifts):
         raise ValueError("invalid stability drift")
-    repeat_ok = all(value <= cell["baseline_limits"]["max_abs"] for value in drifts)
+    stability_limit = cell.get("stability_max_abs")
+    repeat_ok = stability_limit is not None and all(value <= stability_limit for value in drifts)
     return dict(reference=official, baseline=regression, performance=perf,
           repeat_passed=repeat_ok, shape_switch={**switch, "passed": switch_ok},
           passed=all(row["passed"] for row in official + regression) and repeat_ok

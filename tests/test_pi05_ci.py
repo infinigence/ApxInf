@@ -261,7 +261,7 @@ class MatrixTest(unittest.TestCase):
              "views": views, "stability_repeats": 2,
              "performance_protocol": {"warmup": 1, "samples": 2}, "budget_reason": "test fixture only",
              "reference_limits": LIMITS, "baseline_limits": LIMITS,
-             "shape_switch_limit_ms": 30,
+             "shape_switch_limit_ms": 30, "stability_max_abs": 0,
              "performance_limits": {name: {"p50_ms": 12, "p95_ms": 12, "first_call_ms": 30} for name in ("one", "other")}}
             for board, precisions in ci.PRECISIONS.items() for precision in precisions for views in (1, 2, 3)]}
         for cell in self.bank["cells"]:
@@ -416,6 +416,29 @@ class MatrixTest(unittest.TestCase):
         report = ci.read_json(self.reports[0])
         report["cells"][0]["passed"] = False
         parity.write_json(self.reports[0], report, force=True)
+        self.assertEqual(ci.aggregate(self.args()), 1)
+
+    def test_invalid_or_missing_stability_budget(self):
+        cell = self.bank["cells"][0]
+        for value in (-1, float("inf")):
+            cell["stability_max_abs"] = value
+            self.path.write_text(json.dumps(self.bank))
+            self.digest = parity.sha256(self.path)
+            with self.assertRaisesRegex(ValueError, "stability budget"):
+                ci.load_bank(self.path, self.digest)
+        cell["stability_max_abs"] = None
+        self.save_bank()
+        args = self.args()
+        args.hardware = "thor"
+        with self.assertRaisesRegex(ValueError, "uncalibrated stability"):
+            ci.validate(args)
+
+    def test_stability_uses_its_own_budget(self):
+        cell = self.bank["cells"][0]
+        path = self.root / cell["hardware"] / f"{cell['id']}.json"
+        actual = ci.read_json(path)
+        actual["stability"]["cases"][0]["repeat_max_abs"] = .005
+        parity.write_json(path, actual, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
 
     def test_raw_error_cannot_be_overridden_by_green_summary(self):
