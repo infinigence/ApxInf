@@ -2,7 +2,7 @@
 //!
 //! These have a single implementation each and nothing to select between, so
 //! they are direct entry points rather than registry-backed operators
-//! (`doc/adding-new-kernels.md` section 6).
+//! (`../../../../doc/guides/adding-new-kernels.md` section 6).
 
 use apxinf_core::{DType, Result, Tensor};
 

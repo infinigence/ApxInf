@@ -34,7 +34,7 @@ doc/reference/model-layer-architecture.md and model-organization.md.
 ## Layering invariants
 
 1. Backend is device management + single-kernel APIs. Model structure
-   lives in apxinf-model. The two never cross (doc/design.md).
+   lives in apxinf-model. The two never cross (design/design-principles.md).
 2. Families never import each other's private modules — enforced by
    scripts/check_model_family_boundaries.sh (just boundaries).
 3. Python calls into Rust through the PyO3 binding; scripts/ are thin

@@ -212,11 +212,11 @@ This framework is conceptually broader than the existing ApxInf porting docs.
 
 Relevant current documents:
 
-- `doc/porting-workflow.md` defines the evidence-driven model port process;
-- `doc/adding-a-new-model.md` defines model-layer ownership and boundaries;
-- `doc/model-layer-architecture.md` defines what belongs in the model layer
+- `../guides/porting-workflow.md` defines the evidence-driven model port process;
+- `../guides/adding-a-new-model.md` defines model-layer ownership and boundaries;
+- `../reference/model-layer-architecture.md` defines what belongs in the model layer
   versus the backend;
-- `doc/adding-new-kernels.md` defines the backend gap analysis and validation
+- `../guides/adding-new-kernels.md` defines the backend gap analysis and validation
   path;
 - `scripts/roofline_analysis.py` is a standalone roofline analysis tool.
 

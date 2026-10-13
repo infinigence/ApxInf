@@ -34,7 +34,7 @@ runtime through the Rust operation, backend/provider selection, C ABI adapter,
 and device implementation. Record the condition selecting each branch.
 
 For ApxInf, first read the selected checkout's
-`doc/model-layer-architecture.md#current-module-names-and-responsibilities`.
+`../../doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities`.
 Trace construction separately from repeated inference: Python `AutoPolicy`
 selects a policy; the native `ModelRunner` calls Rust `AutoModel`; the latter
 returns `LoadedModel::{Text,Vla}`. PI0.5 inference goes through

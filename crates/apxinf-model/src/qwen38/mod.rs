@@ -2,7 +2,7 @@
 //!
 //! 64 layers: 48 Gated DeltaNet (linear attention) + 16 full attention, mixed
 //! NVFP4/FP8/BF16 from a ModelOpt checkpoint. Module owners follow
-//! `doc/model-layer-architecture.md`:
+//! `../../../../doc/reference/model-layer-architecture.md`:
 //!
 //! - [`config`] — checkpoint shape constants;
 //! - [`weights`] — checkpoint interpretation, packing and the device weight

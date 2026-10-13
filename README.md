@@ -251,13 +251,13 @@ One or two views, batch 1. Best recorded P50.
 | Jetson AGX Orin | BF16 | 75.778 ms | 84.864 ms |
 | Jetson AGX Orin | W8A8 | 56.711 ms | 64.924 ms |
 
-[Details](doc/gr00t-n1.7.md).
+[Details](doc/models/gr00t.md).
 
 ### Qwen3.8-27B-NVFP4
 
 Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
 2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
-after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+after one warm-up generation. See [doc/models/qwen38.md](doc/models/qwen38.md)
 for CLI inference.
 
 | Hardware | Precision | TTFT (2048) | Decode | Throughput |
@@ -279,7 +279,7 @@ the end-to-end request from resident decoded images to the host trajectory.
 |---|---|---:|---:|---:|
 | Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
 
-[Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
+[Test setup, reproduction steps and accuracy results](doc/models/qwen-drive.md).
 
 
 ### SmolVLA
@@ -298,10 +298,10 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 
 `skills/model-port-workflow` drives the whole sequence.
 Start with the [documentation index](doc/README.md) and
-[current module responsibilities](doc/model-layer-architecture.md#current-module-names-and-responsibilities).
+[current module responsibilities](../doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities).
 New VLA code separates Model forward computation, ModelRunner execution ownership,
 and weights; reuse the existing native binding and policy registries. The
-[integration guide](doc/adding-a-new-model.md#registration-and-public-integration)
+[integration guide](../doc/guides/adding-a-new-model.md#registration-and-public-integration)
 identifies current contracts and family-specific option limits.
 
 Install it once, from the repository root:
@@ -322,10 +322,10 @@ ApxInf, Jetson Thor, BF16, parity against the reference within 1e-2
 ```
 
 It works from the same guides a human would follow:
-- [porting workflow](doc/porting-workflow.md),
-- [adding a new model](doc/adding-a-new-model.md),
-- [model-layer architecture](doc/model-layer-architecture.md),
-- [adding new kernels](doc/adding-new-kernels.md).
+- [porting workflow](../doc/guides/porting-workflow.md),
+- [adding a new model](../doc/guides/adding-a-new-model.md),
+- [model-layer architecture](../doc/reference/model-layer-architecture.md),
+- [adding new kernels](../doc/guides/adding-new-kernels.md).
 
 ## Build ApxInf
 
@@ -507,7 +507,7 @@ The NPZ form makes the calibration input a reviewable artifact rather than a sid
 effect of a rollout; `--libero-suite` drives MuJoCo here and needs the same
 dependencies as [LIBERO evaluation](#libero-evaluation).
 
-See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
+See [PI0.5 FP8 calibration](../doc/guides/fp8-calibration.md) for the Observation
 format, native LIBERO sampling, and output options.
 
 
@@ -661,7 +661,7 @@ Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
 `config.json`, so the same command benchmarks the next model without a flag
 change.
 
-For one-step evaluation, please refer to `doc/run_warmstart_with_onestep.md`
+For one-step evaluation, please refer to `../doc/reports/run-warmstart-with-onestep.md`
 
 
 ## NVIDIA build environment
