@@ -25,8 +25,7 @@ The two selection inputs that do exist are both build- or shape-derived:
 
 `APXINF_QWEN38_GEMM_TUNE_CACHE` / `APXINF_QWEN38_TUNE_CACHE` still override the
 autotune recipe directory, and the `qwen38_*` test harnesses keep their own
-switches for A/B comparison, but neither changes which product path runs. See
-[Qwen3.8 env-gate audit](qwen38-env-gates-audit.md).
+switches for A/B comparison, but neither changes which product path runs.
 
 ## Requirements
 

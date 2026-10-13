@@ -34,8 +34,8 @@ CARGO_TARGET_DIR=../../target/wheel maturin build --release --features cuda --au
 pip install --force-reinstall ../../target/wheel/wheels/apxinf_py-*.whl
 ```
 
-On Thor set the usual environment (see repo memory): `APXINF_CUDA_ARCH=sm_110`,
-`CUDA_PATH`, proxy, and checkpoint path.
+On Thor set the usual environment: `APXINF_CUDA_ARCH=sm_110`, `CUDA_PATH`,
+proxy, and checkpoint path.
 
 Compile-check only (no CUDA, no link):
 
