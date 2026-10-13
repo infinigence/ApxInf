@@ -52,6 +52,16 @@ comparison does not qualify the full model or authorize replacing an official
 golden. These findings concern the diagnostic reference, not a promoted native
 kernel repair or a performance claim.
 
+The diagnostic adapter also inserted a BF16 bias rounding into an originally
+FP32 patch convolution. Official architecture dtype checks confirm that the
+patch input, weight, bias, output and position parameters use FP32. Correcting
+that boundary makes the first vision input and QKV bitwise equal to native on
+two selected observations. A native position-rounding candidate matched the
+incorrect adapter and was rejected; its operator timing is not evidence of a
+valid model repair. Subsequent attention/residual/activation differences and
+full-model qualification remain unresolved. Neither these diagnostic adapters
+nor any shared native-operator injection replace the official reference.
+
 The activity auditor must be validated on the actual driver. Orin R39 CUDA
 clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
 checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
