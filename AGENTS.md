@@ -1,40 +1,65 @@
 # Repository Instructions
 
-## Development artifacts
+ApxInf is a Rust + CUDA inference engine for VLA models (PI0.5, GR00T,
+Qwen-Drive, SmolVLA, ...) with a PyO3 binding and a Python frontend. Read
+[doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the codemap and
+[doc/README.md](doc/README.md) for documentation rules before changing docs.
 
-- This policy applies to ordinary development sessions, skills, and workflows.
-- Store task-generated intermediate artifacts under
-  `<project-root>/devlocal/<feat-name>/`.
-- `project-root` is the root of the project or Git worktree being modified,
-  not the session's parent directory or the skill's installation directory.
-- Use a stable, concise kebab-case feature name. Reuse the feature directory
-  across related sessions; use separate run subdirectories for repeated
-  experiments to preserve existing evidence.
-- Intermediate artifacts include analysis reports, plans, experimental code,
-  one-off scripts, debug probes, logs, benchmark results, traces, screenshots,
-  generated captures, and agent state. Create subdirectories such as `reports/`,
-  `scripts/`, `logs/`, and `results/` only as needed.
-- Do not scatter these artifacts across `doc/`, `docs/`, `scripts/`, `tests/`,
-  or the project root. Skill and workflow default output paths must follow
-  this policy. An explicit user-specified output location takes precedence.
-- Keep maintained product code, tests, reusable tools, and formal documentation
-  in their established project locations. When promoting an intermediate
-  artifact into a maintained deliverable, curate it and update its references.
-- `devlocal/` is ignored by Git. Do not force-add its contents; keep the review
-  diff limited to maintained deliverables. Verify ignore rules and the diff
-  before preparing a review.
-- Reuse existing external checkpoints, reference repositories, and datasets in
-  place; record their paths and revisions in the feature directory rather than
-  copying or moving them merely to satisfy this layout. Keep credentials out
-  of generated artifacts.
-- Existing build and dependency caches may retain their tool-managed locations.
-  Use explicit output-directory options for task-specific reports and runs.
+## Commands
 
-## Model integration and module ownership
+Run `just --list` for the full menu. Common recipes:
 
-When adding a family, changing precision/preparation, or moving model code, read
+- `just build-py` — build and install the Python binding + frontend
+  (`--features cuda` is baked in; without it the runtimes silently don't
+  exist).
+- `just check` — type-check the whole workspace INCLUDING cfg(cuda) code;
+  needs no GPU (build scripts skip kernels without a toolkit).
+- `just test-cpu` — CPU-only Rust + Python tests. `just test-gpu <family>`
+  and `just bench <model>` need an NVIDIA device.
+- `just pre-pr` — the full pre-PR check; CI runs the same recipes.
+
+Pitfalls:
+
+- `cargo check` WITHOUT `--features cuda` passes while skipping ~230
+  cfg(cuda) sites — that is not a real check. Use `just check`.
+- Jetson builds OOM unless nvcc parallelism is capped; the platform
+  presets in `configs/platforms/` (selected via
+  `APXINF_PLATFORM=<name> just build-py`) already set it.
+- When no CUDA toolkit is found, build.rs skips kernel compilation
+  silently — a "successful" build may still lack GPU kernels.
+
+## Testing tiers
+
+| Tier | Recipe | Hardware |
+|---|---|---|
+| Rust unit tests | `just test-rust-cpu` | CPU |
+| Python unit tests | `just test-py` | CPU |
+| Family GPU tests | `just test-gpu <family>` | NVIDIA + checkpoint |
+| L3 candidate tests | `just test-l3` | NVIDIA |
+| Benchmarks | `just bench <model>` | NVIDIA |
+
+If you have no suitable device, write "not verified" — never "pass".
+
+## Boundaries
+
+- Always: docs and code change in the same PR; new `APXINF_*` env vars get
+  registered in `doc/reference/env-vars.md`; intermediate artifacts go to
+  `devlocal/<feat-name>/` (gitignored, never force-add).
+- Ask first: changing the PyO3 binding ABI or the Python `Policy` API;
+  touching vendored CUTLASS/fa2 code; deleting tests.
+- Never: new kernels in legacy `apxinf-cuda` (use `apxinf-cuda-new`);
+  claiming GPU results without a device; hardcoding host-specific paths
+  into maintained docs.
+
+## Model integration
+
+When adding a family or changing precision/preparation, read
 [Model Layer Architecture](doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities)
-and [Adding a New Model](doc/guides/adding-a-new-model.md) from the checkout being modified.
-Use [model-port-workflow](skills/model-port-workflow/SKILL.md) for a full port.
-Keep module/capability docs and relevant skills in the same change; historical
-Session/Network proposals are not current integration APIs.
+and [Adding a New Model](doc/guides/adding-a-new-model.md). Use the
+`model-port-workflow` skill for a full port. Historical Session/Network
+names in `doc/archive/` are not integration APIs.
+
+## Review
+
+Review against [REVIEW.md](REVIEW.md). See  for the full workflow, PR evidence
+requirements, and AI-assistance policy.
