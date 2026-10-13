@@ -296,23 +296,16 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 
 ## Port a new model with an agent
 
-`skills/model-port-workflow` drives the whole sequence.
+The `model-port-workflow` skill drives the whole sequence. Skills live in
+[`.agents/skills/`](.agents/skills/) and are symlinked into `.claude/skills/`,
+so a fresh clone works in Claude Code and in Codex with no setup.
+
 Start with the [documentation index](doc/README.md) and
 [current module responsibilities](doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities).
 New VLA code separates Model forward computation, ModelRunner execution ownership,
 and weights; reuse the existing native binding and policy registries. The
 [integration guide](doc/guides/adding-a-new-model.md#registration-and-public-integration)
 identifies current contracts and family-specific option limits.
-
-Install it once, from the repository root:
-
-```bash
-# Claude Code
-mkdir -p .claude/skills && ln -s ../../skills/model-port-workflow .claude/skills/
-
-# Codex
-mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/model-port-workflow" ~/.agents/skills/
-```
 
 Then invoke it with the model, the target, and the acceptance bar:
 

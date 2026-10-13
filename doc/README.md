@@ -62,9 +62,9 @@ cover Jetson Thor.
 
 ## Agent workflows
 
-- [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
-- [analyze-model-impl](../skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.
-- [l3-reference-testing](../skills/l3-reference-testing/SKILL.md): independent numerical tests for apxinf-cuda-new L3 semantics/candidates; these are separate from current PI0.5 backend and model-level acceptance.
+- [model-port-workflow](../.agents/skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
+- [analyze-model-impl](../.agents/skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.
+- [l3-reference-testing](../.agents/skills/l3-reference-testing/SKILL.md): independent numerical tests for apxinf-cuda-new L3 semantics/candidates; these are separate from current PI0.5 backend and model-level acceptance.
 
 Skills resolve these documents from the checkout/worktree being modified,
 even when installed globally through a symlink to another branch. Repository

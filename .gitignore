@@ -17,7 +17,9 @@ experiment/
 crates/.gemm-pilot-link.lock
 target-gemm-pilot/
 target-p92i/
-.claude/
+# Agent config: shared via git; only local overrides are ignored
+.claude/settings.local.json
+.claude/worktrees/
 
 /configs/tuning/**/*.recipe
 /configs/tuning/**/*.recipe.*.tmp
