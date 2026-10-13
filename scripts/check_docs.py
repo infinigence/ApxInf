@@ -114,7 +114,8 @@ if RECIPES is not None:
     seen = set()
     for root, dirs, files in os.walk('.'):
         dirs[:] = [d for d in dirs if d not in
-                   ('target', 'devlocal', '.git', 'node_modules', '.venv')]
+                   ('target', 'devlocal', '.git', 'node_modules', '.venv',
+                    '.github', 'hooks', '.claude', '.agents')]
         for f in files:
             if not f.endswith('.md'):
                 continue
@@ -131,7 +132,8 @@ LINK = re.compile(r'\[[^\]]*\]\((?!https?://)([^)#\s]+)(#[^)]*)?\)')
 def all_md():
     for root, dirs, files in os.walk('.'):
         dirs[:] = [d for d in dirs if d not in
-                   ('target', 'devlocal', '.git', 'node_modules', '.venv')]
+                   ('target', 'devlocal', '.git', 'node_modules', '.venv',
+                    '.github', 'hooks', '.claude', '.agents')]
         for f in files:
             if f.endswith('.md'):
                 yield os.path.join(root, f).lstrip('./')
