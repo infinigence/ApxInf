@@ -2932,3 +2932,349 @@ fn workspace_recycles_non_overlapping_lifetimes() {
 
     with_workspace(&workspace, || Ok(())).unwrap();
 }
+
+/// Deterministic BF16 test rows covering the LayerNorm hazards that matter for
+/// bitwise equivalence: ordinary values, a large common offset with tiny
+/// variance (cancellation), signed zeros mixed with tiny values, values that
+/// saturate E4M3 after scaling, a coarse BF16 grid that produces ties, and
+/// (family 5) rows whose per-thread column groups are [A, -A, a, a] with
+/// A = 2^20, a = 0.01, so the per-thread FP32 summation order decides whether
+/// 2a survives and therefore the row mean.
+fn layer_norm_test_values(count: usize, seed: u64, family: usize) -> Vec<bf16> {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut uniform = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    (0..count)
+        .map(|index| {
+            let u = uniform();
+            let value = match family {
+                0 => u * 3.0,
+                1 => 1000.0 + 0.01 * u,
+                2 if index % 7 == 0 => -0.0,
+                2 => 1.0e-3 * u,
+                3 => 300.0 * u,
+                4 => (1.0 + (u * 64.0).floor() / 64.0) * 2f32.powi((index % 5) as i32 - 2),
+                // Column c belongs to thread c % 256 at position c / 256 (for widths of 4 * 256).
+                _ => match (index % 1024) / 256 {
+                    0 => 1048576.0,
+                    1 => -1048576.0,
+                    _ => 0.01 + 0.001 * u,
+                },
+            };
+            bf16::from_f32(value)
+        })
+        .collect()
+}
+
+fn bf16_bits(tensor: &Tensor) -> Vec<u16> {
+    tensor
+        .as_bf16()
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+#[test]
+fn fixed_width_layer_norm_quant_matches_generic_kernel_bitwise() {
+    const SCALE: f32 = 0.0371;
+    let backend = CudaBackend::new(0).unwrap();
+    // 1024 takes the fixed-width kernel; 1536 and 768 exercise the generic fallback.
+    for cols in [1024usize, 1536, 768] {
+        for rows in [256usize, 512, 1, 3, 255] {
+            for family in 0..6 {
+                let seed = (rows * 31 + family * 7 + cols) as u64;
+                let upload = |count: usize, seed: u64, family: usize, shape: Vec<usize>| {
+                    backend
+                        .to_device(
+                            &Tensor::from_bf16(shape, &layer_norm_test_values(count, seed, family))
+                                .unwrap(),
+                        )
+                        .unwrap()
+                };
+                let input = upload(rows * cols, seed, family, vec![rows, cols]);
+                let weight = upload(cols, seed + 1, 0, vec![cols]);
+                let bias = upload(cols, seed + 2, 0, vec![cols]);
+                let production =
+                    layer_quant_bf16_e4m3(backend.context(), &input, &weight, &bias, 1.0e-6, SCALE)
+                        .unwrap();
+                let reference = CudaBuffer::alloc(rows * cols, backend.device_id()).unwrap();
+                unsafe {
+                    ffi::check_cuda(ffi::apxinf_static_layer_norm_quant_bf16_e4m3_generic(
+                        gpu_ptr(&input).unwrap(),
+                        gpu_ptr(&weight).unwrap(),
+                        gpu_ptr(&bias).unwrap(),
+                        reference.ptr(),
+                        rows as i32,
+                        cols as i32,
+                        1.0e-6,
+                        SCALE,
+                        backend.context().stream().handle(),
+                    ))
+                    .unwrap();
+                }
+                let reference =
+                    make_gpu_tensor(Shape::new(vec![rows, cols]), DType::F8E4M3, 0, reference);
+                backend.synchronize().unwrap();
+                assert_eq!(
+                    backend.to_cpu(&production).unwrap().as_f8_e4m3().unwrap(),
+                    backend.to_cpu(&reference).unwrap().as_f8_e4m3().unwrap(),
+                    "LayerNorm FP8 bytes differ: cols={cols} rows={rows} family={family}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_residual_layer_norm_quant_matches_generic_kernel_bitwise() {
+    const SCALE: f32 = 0.0371;
+    let backend = CudaBackend::new(0).unwrap();
+    for cols in [1024usize, 1536] {
+        for rows in [256usize, 512, 1, 3, 255] {
+            for family in 0..6 {
+                for with_bias in [false, true] {
+                    let seed = (rows * 17 + family * 5 + cols) as u64;
+                    let upload = |count: usize, seed: u64, family: usize, shape: Vec<usize>| {
+                        backend
+                            .to_device(
+                                &Tensor::from_bf16(
+                                    shape,
+                                    &layer_norm_test_values(count, seed, family),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                    };
+                    let projection = upload(rows * cols, seed, family, vec![rows, cols]);
+                    let residual = upload(
+                        rows * cols,
+                        seed + 1,
+                        if family == 1 { 0 } else { family },
+                        vec![rows, cols],
+                    );
+                    let projection_bias =
+                        upload(cols, seed + 2, if family == 2 { 2 } else { 0 }, vec![cols]);
+                    let norm_weight = upload(cols, seed + 3, 0, vec![cols]);
+                    let norm_bias = upload(cols, seed + 4, 0, vec![cols]);
+                    let bias = with_bias.then_some(&projection_bias);
+                    let production = bias_residual_layer_quant_bf16_e4m3(
+                        backend.context(),
+                        &projection,
+                        bias,
+                        &residual,
+                        &norm_weight,
+                        &norm_bias,
+                        1.0e-6,
+                        SCALE,
+                    )
+                    .unwrap();
+                    let hidden = CudaBuffer::alloc(rows * cols * 2, backend.device_id()).unwrap();
+                    let normalized = CudaBuffer::alloc(rows * cols, backend.device_id()).unwrap();
+                    unsafe {
+                        ffi::check_cuda(
+                            ffi::apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3_generic(
+                                gpu_ptr(&projection).unwrap(),
+                                if with_bias {
+                                    gpu_ptr(&projection_bias).unwrap()
+                                } else {
+                                    std::ptr::null_mut()
+                                },
+                                gpu_ptr(&residual).unwrap(),
+                                gpu_ptr(&norm_weight).unwrap(),
+                                gpu_ptr(&norm_bias).unwrap(),
+                                hidden.ptr(),
+                                normalized.ptr(),
+                                rows as i32,
+                                cols as i32,
+                                1.0e-6,
+                                SCALE,
+                                backend.context().stream().handle(),
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    let hidden =
+                        make_gpu_tensor(Shape::new(vec![rows, cols]), DType::BF16, 0, hidden);
+                    let normalized =
+                        make_gpu_tensor(Shape::new(vec![rows, cols]), DType::F8E4M3, 0, normalized);
+                    backend.synchronize().unwrap();
+                    let context =
+                        format!("cols={cols} rows={rows} family={family} bias={with_bias}");
+                    assert_eq!(
+                        bf16_bits(&backend.to_cpu(&production.hidden).unwrap()),
+                        bf16_bits(&backend.to_cpu(&hidden).unwrap()),
+                        "residual hidden bits differ: {context}"
+                    );
+                    assert_eq!(
+                        backend
+                            .to_cpu(&production.normalized)
+                            .unwrap()
+                            .as_f8_e4m3()
+                            .unwrap(),
+                        backend.to_cpu(&normalized).unwrap().as_f8_e4m3().unwrap(),
+                        "residual LayerNorm FP8 bytes differ: {context}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vectorized_vision_qkv_rope_matches_scalar_kernel_bitwise() {
+    use crate::kernels::rope::{
+        prepare_vision_2d_rotation_table, split_qkv_bias_apply_vision_2d_precomputed,
+    };
+    const HEADS: usize = 16;
+    const DIM: usize = 64;
+    const WIDTH: usize = 3 * HEADS * DIM;
+    let backend = CudaBackend::new(0).unwrap();
+    for seq in [256usize, 512] {
+        let positions: Vec<u32> = (0..seq as u32).flat_map(|s| [s / 16, s % 16]).collect();
+        let pos_ids = upload_u32(&backend, &positions);
+        let table =
+            prepare_vision_2d_rotation_table(backend.context(), seq, DIM, 10000.0, &pos_ids)
+                .unwrap();
+        for family in [0usize, 2, 3, 4] {
+            let seed = (seq * 5 + family) as u64;
+            let qkv = backend
+                .to_device(
+                    &Tensor::from_bf16(
+                        vec![seq, WIDTH],
+                        &layer_norm_test_values(seq * WIDTH, seed, family),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let bias = backend
+                .to_device(
+                    &Tensor::from_bf16(vec![WIDTH], &layer_norm_test_values(WIDTH, seed + 1, 0))
+                        .unwrap(),
+                )
+                .unwrap();
+            let production = split_qkv_bias_apply_vision_2d_precomputed(
+                backend.context(),
+                &qkv,
+                &bias,
+                HEADS,
+                DIM,
+                &table,
+            )
+            .unwrap();
+            let bytes = seq * HEADS * DIM * 2;
+            let reference: Vec<CudaBuffer> = (0..3)
+                .map(|_| CudaBuffer::alloc(bytes, backend.device_id()).unwrap())
+                .collect();
+            unsafe {
+                ffi::check_cuda(
+                    ffi::apxinf_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
+                        gpu_ptr(&qkv).unwrap(),
+                        gpu_ptr(&bias).unwrap(),
+                        reference[0].ptr(),
+                        reference[1].ptr(),
+                        reference[2].ptr(),
+                        DIM as u32,
+                        HEADS as u32,
+                        seq as u32,
+                        table.ptr(),
+                        backend.context().stream().handle(),
+                    ),
+                )
+                .unwrap();
+            }
+            backend.synchronize().unwrap();
+            for (name, tensor, buffer) in [
+                ("q", &production.q, &reference[0]),
+                ("k", &production.k, &reference[1]),
+                ("v", &production.v, &reference[2]),
+            ] {
+                let mut expected = vec![0u8; bytes];
+                buffer.copy_to_host(&mut expected).unwrap();
+                let actual: Vec<u8> = bf16_bits(&backend.to_cpu(tensor).unwrap())
+                    .iter()
+                    .flat_map(|bits| bits.to_le_bytes())
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "{name} bits differ: seq={seq} family={family}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vec8_bias_gelu_quant_matches_packed4_kernel_bitwise() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Every finite BF16 bit pattern as input, rotated per case so each pattern
+    // meets several bias values; FP8 bytes must equal the packed-4 kernel's.
+    let finite = |bits: u16| if bits & 0x7f80 == 0x7f80 { 0 } else { bits };
+    for (case, (rows, cols, scale)) in [
+        (256usize, 4096usize, 0.0417f32),
+        (512, 4096, 0.0417),
+        (64, 4096, 1.0),
+        (41, 1536, 0.0123),
+        (3, 8, 0.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let count = rows * cols;
+        let input: Vec<bf16> = (0..count)
+            .map(|i| bf16::from_bits(finite(((i * 7 + case * 9973) % 65536) as u16)))
+            .collect();
+        let input = backend
+            .to_device(&Tensor::from_bf16(vec![rows, cols], &input).unwrap())
+            .unwrap();
+        let bias = backend
+            .to_device(
+                &Tensor::from_bf16(
+                    vec![cols],
+                    &layer_norm_test_values(cols, case as u64 + 17, 0),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let production =
+            bias_gelu_quant_bf16_e4m3(backend.context(), &input, &bias, scale).unwrap();
+        let reference = CudaBuffer::alloc(count, backend.device_id()).unwrap();
+        unsafe {
+            ffi::check_cuda(ffi::apxinf_static_bias_gelu_quant_packed4_bf16_e4m3(
+                gpu_ptr(&input).unwrap(),
+                gpu_ptr(&bias).unwrap(),
+                reference.ptr(),
+                rows as i32,
+                cols as i32,
+                scale,
+                backend.context().stream().handle(),
+            ))
+            .unwrap();
+        }
+        backend.synchronize().unwrap();
+        let mut expected = vec![0u8; count];
+        reference.copy_to_host(&mut expected).unwrap();
+        let actual = backend.to_cpu(&production).unwrap();
+        let actual = actual.as_f8_e4m3().unwrap().to_vec();
+        assert_eq!(
+            actual, expected,
+            "FP8 bytes differ: rows={rows} cols={cols} scale={scale}"
+        );
+    }
+}
+
+fn upload_u32(backend: &CudaBackend, values: &[u32]) -> CudaBuffer {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let buffer = CudaBuffer::alloc(bytes.len(), backend.device_id()).unwrap();
+    buffer.copy_from_host(&bytes).unwrap();
+    buffer
+}

@@ -1107,6 +1107,68 @@ __global__ void bias_residual_layer_norm_bf16_cached_1024_kernel(
   }
 }
 
+// Fixed-width form of bias_residual_layer_norm_quant_bf16_e4m3_kernel for
+// 256-thread blocks. Each thread keeps its BF16-rounded residual sums (columns
+// t + 256 * k, as in the generic kernel) in registers instead of re-reading
+// `hidden`, and issues all row loads before the first reduction. Arithmetic
+// order, reduction tree and rounding points are unchanged, so `hidden` and
+// the FP8 output are bitwise identical to the generic kernel.
+template <int kCols>
+__global__ void __launch_bounds__(256)
+bias_residual_layer_norm_quant_bf16_e4m3_fixed_kernel(
+    const __nv_bfloat16* projection, const __nv_bfloat16* projection_bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
+    const __nv_bfloat16* norm_bias, __nv_bfloat16* hidden,
+    __nv_fp8_e4m3* normalized, int rows, float eps, float inverse_scale) {
+  static_assert(kCols % 256 == 0, "width must be a multiple of the block size");
+  constexpr int kPerThread = kCols / 256;
+  __shared__ float scratch[8];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = static_cast<int64_t>(row) * kCols;
+  float projected[kPerThread], residuals[kPerThread], biases[kPerThread];
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    const int col = threadIdx.x + k * 256;
+    projected[k] = __bfloat162float(projection[base + col]);
+    residuals[k] = __bfloat162float(residual[base + col]);
+    biases[k] = projection_bias != nullptr ? __bfloat162float(projection_bias[col]) : 0.0f;
+  }
+  float rounded_sum[kPerThread];
+  float sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    float value = projected[k] + residuals[k];
+    if (projection_bias != nullptr) value += biases[k];
+    const __nv_bfloat16 rounded = __float2bfloat16(value);
+    hidden[base + threadIdx.x + k * 256] = rounded;
+    rounded_sum[k] = __bfloat162float(rounded);
+    sum += rounded_sum[k];
+  }
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / kCols;
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    const float centered = rounded_sum[k] - mean;
+    variance_sum += centered * centered;
+  }
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / kCols + eps);
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    const int col = threadIdx.x + k * 256;
+    float value = (rounded_sum[k] - mean) * inverse_std *
+                      __bfloat162float(norm_weight[col]) +
+                  __bfloat162float(norm_bias[col]);
+    // Match bias_residual_layer_norm_bf16 followed by quantize_bf16_e4m3.
+    value = __bfloat162float(__float2bfloat16(value));
+    value = fminf(448.0f, fmaxf(-448.0f, value * inverse_scale));
+    normalized[base + col] = static_cast<__nv_fp8_e4m3>(value);
+  }
+}
+
 __global__ void ada_gate_residual_bf16_kernel(
     const __nv_bfloat16* projection, const __nv_bfloat16* residual,
     const __nv_bfloat16* style, __nv_bfloat16* output,

@@ -127,6 +127,10 @@ namespace {
 // cand-12: force the scalar elementwise kernels for bitwise A/B testing.
 const bool kLegacyScalarElementwise =
     std::getenv("APXINF_LEGACY_SCALAR_ELEMENTWISE") != nullptr;
+// Selects the generic shared-memory LayerNorm kernels in the same binary for
+// bitwise and profiling comparisons.
+const bool kGenericLayerNormQuant =
+    std::getenv("APXINF_GENERIC_LAYER_NORM_QUANT") != nullptr;
 
 bool aligned16(const void* pointer) {
   return reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
@@ -786,7 +790,35 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3_generic(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream);
+
 extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  // GR00T vision width (Qwen3-VL ViT hidden 1024): register-resident form,
+  // bitwise identical to the generic kernel.
+  if (cols == 1024 && !kGenericLayerNormQuant) {
+    layer_norm_quant_bf16_e4m3_fixed_kernel<1024><<<rows, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<const __nv_bfloat16*>(bias),
+        static_cast<__nv_fp8_e4m3*>(output), rows, eps, 1.0f / scale);
+    return cudaGetLastError();
+  }
+  return apxinf_static_layer_norm_quant_bf16_e4m3_generic(
+      input, weight, bias, output, rows, cols, eps, scale, stream);
+}
+
+// Generic shared-memory kernel for any width; also the bitwise reference
+// for the fixed-width specialization in tests.
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3_generic(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
   if (input == nullptr || weight == nullptr || bias == nullptr ||
@@ -828,7 +860,39 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_packed4_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream);
+
 extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+  static const bool packed4_only =
+      std::getenv("APXINF_PACKED4_BIAS_GELU_QUANT") != nullptr;
+  if (!packed4_only && cols % 8 == 0 && rows <= 65535 &&
+      reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(bias) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(output) % 8 == 0) {
+    const int groups_per_row = cols / 8;
+    const int threads = groups_per_row < 256 ? groups_per_row : 256;
+    const dim3 grid((groups_per_row + threads - 1) / threads, rows);
+    bias_gelu_quant_bf16_e4m3_vec8_kernel<<<grid, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<const __nv_bfloat16*>(bias),
+        static_cast<__nv_fp8_e4m3*>(output), cols, 1.0f / scale);
+    return cudaGetLastError();
+  }
+  return apxinf_static_bias_gelu_quant_packed4_bf16_e4m3(
+      input, bias, output, rows, cols, scale, stream);
+}
+
+// The original packed-4 kernel; also the reference for the vec8 kernel's test.
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_packed4_bf16_e4m3(
     const void* input, const void* bias, void* output, int rows, int cols,
     float scale, cudaStream_t stream) {
   if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
