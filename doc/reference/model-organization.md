@@ -1,8 +1,8 @@
 # apxinf-model Organization
 
-Status: current source map. Use [Model Layer Architecture](model-layer-architecture.md#current-module-names-and-responsibilities)
+Status: current source map. Use [Model Layer Architecture](../reference/model-layer-architecture.md#current-module-names-and-responsibilities)
 for authoritative responsibility/dependency rules and
-[Adding a New Model](adding-a-new-model.md) for the integration procedure.
+[Adding a New Model](../guides/adding-a-new-model.md) for the integration procedure.
 
 ## Shared contracts and construction
 
@@ -30,7 +30,7 @@ There is no Python `AutoModel` binding or Python PI0.5 network class.
 | `walloss/` | Existing BF16 runtime/executor, `fp8.rs`, schedule/geometry and weight files |
 | `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
 | `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |
-| `qwen_drive/` | Planning VLA: `load.rs`, `model/mod.rs`, one `model/blocks/bf16.rs`, `model_runner/` execution state/local GDN graphs, and `weights/`; [scope and current limits](qwen-drive.md) |
+| `qwen_drive/` | Planning VLA: `load.rs`, `model/mod.rs`, one `model/blocks/bf16.rs`, `model_runner/` execution state/local GDN graphs, and `weights/`; [scope and current limits](../models/qwen-drive.md) |
 | `qwen3vl/` | `GeneralQwen3VL` in `general.rs`, text/vision weights, vision computation and family-specific multimodal/decode state |
 
 New VLA code names forward computation `Model` and execution ownership
@@ -56,7 +56,7 @@ removed files or claim all families have migrated.
 - Model-neutral device operation: safe backend API and its provider implementation.
 
 For PI0.5's exact paths and callable interfaces, see the
-[current component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
-and [preparation contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract).
-The [current coverage table](model-layer-architecture.md#current-coverage-and-port-decisions)
+[current component view](../archive/model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
+and [preparation contract](../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract).
+The [current coverage table](../reference/model-layer-architecture.md#current-coverage-and-port-decisions)
 records which capabilities are still family-specific.

@@ -2,7 +2,7 @@
 
 Status: Draft
 
-Follow [Development artifacts](../AGENTS.md#development-artifacts) for
+Follow [Development artifacts](../../AGENTS.md#development-artifacts) for
 task-specific output. Keep intermediate representations, experimental code,
 search notes, profiles, and evaluation results under
 `<project-root>/devlocal/<feat-name>/`. Curate reusable findings before

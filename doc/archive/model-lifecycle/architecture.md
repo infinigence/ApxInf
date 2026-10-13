@@ -3,12 +3,12 @@
 Status: PI0.5's implemented model/model_runner/weights organization on this
 branch. Start with the current component view below. For cross-family naming,
 module placement and current option limits, use
-[Model Layer Architecture](../model-layer-architecture.md#current-module-names-and-responsibilities).
-For new integration steps, use [Adding a New Model](../adding-a-new-model.md).
+[Model Layer Architecture](../../reference/model-layer-architecture.md#current-module-names-and-responsibilities).
+For new integration steps, use [Adding a New Model](../../guides/adding-a-new-model.md).
 
-[Lifecycle contracts](lifecycle.md#implemented-pi05-preparation-contract) define
-the implemented preparation API. The [migration tracker](migration.md) and
-[baseline record](baseline.md) preserve revision-qualified GPU evidence.
+[Lifecycle contracts](../../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract) define
+the implemented preparation API. The [migration tracker](../../archive/model-lifecycle/migration.md) and
+[baseline record](../../archive/model-lifecycle/baseline.md) preserve revision-qualified GPU evidence.
 WallOSS, GR00T and LLM/VLM have not inherited PI0.5's internal organization or
 preparation guarantees merely by sharing a trait.
 
@@ -17,7 +17,7 @@ preparation guarantees merely by sharing a trait.
 PI0.5 now uses model/model_runner/weights modules; the former precision runtime
 files and compatibility types have been removed. This section describes PI0.5,
 not unmigrated families. Source-qualified CPU/CUDA and performance results are
-tracked in [migration.md](migration.md), with historical evidence in [baseline.md](baseline.md).
+tracked in [migration.md](../../archive/model-lifecycle/migration.md), with historical evidence in [baseline.md](../../archive/model-lifecycle/baseline.md).
 
 ### Canonical names and Python/Rust relationship
 
@@ -62,7 +62,7 @@ keys, calibration formats and `model_variant` values retain their meaning.
 
 ### CPU helpers in `pi05/math.rs`
 
-[`math.rs`](../../crates/apxinf-model/src/pi05/math.rs) is directly under `pi05/`,
+[`math.rs`](../../../crates/apxinf-model/src/pi05/math.rs) is directly under `pi05/`,
 alongside `model/`, `model_runner/` and `weights/`. It is compiled without the
 `cuda` feature and its four functions are re-exported by `pi05/mod.rs`:
 

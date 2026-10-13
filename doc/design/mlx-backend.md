@@ -24,7 +24,7 @@ layers call safe `Array`, `Compiled` and fused Metal operations directly;
 there is no provisional `PortableOps`/`AttentionPlan` prerequisite. A future
 multi-backend design can revisit this seam with evidence from working paths.
 
-The [CUDA operator layers](../crates/apxinf-cuda-new/README.md) retain their own
+The [CUDA operator layers](../../crates/apxinf-cuda-new/README.md) retain their own
 APIs and execution design. The Metal implementation keeps native FFI, resource
 ownership and unsafe custom kernels behind the safe Rust MLX API.
 
@@ -103,9 +103,9 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 
 These rows describe implemented scopes, not qualified targets. The maintained
-owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
-[MiniCPM5](../crates/apxinf-model/src/metal_minicpm5/README.md), with model-neutral
-arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
+owners are [Qwen3](../../crates/apxinf-model/src/metal_qwen3/README.md) and
+[MiniCPM5](../../crates/apxinf-model/src/metal_minicpm5/README.md), with model-neutral
+arrays and guarded fusions in [apxinf-mlx](../../crates/apxinf-mlx/README.md).
 Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
 official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
@@ -334,7 +334,7 @@ and avoid per-layer host synchronization introduced only for measurement.
 | Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
 
 Temporary references, captures and reports stay in ignored `devlocal/` per
-[AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
+[AGENTS.md](../../AGENTS.md). Product code, focused maintained tests, capability
 docs and dependency/license provenance belong in their corresponding PRs.
 
 ## Shared tokenizer compatibility

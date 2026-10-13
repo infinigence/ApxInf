@@ -10,13 +10,13 @@ claim that every integration already implements an identical lifecycle API.
 Implementations must declare their supported paths and limitations. A model does
 not need a separate architecture document or one source file per stage.
 
-Read [Model Layer Architecture](model-layer-architecture.md) for dependency and
-family-isolation rules, [Model Execution Wiring](model-execution-wiring.md) for
-device execution and allocation details, and [Adding a New Model](adding-a-new-model.md)
+Read [Model Layer Architecture](../reference/model-layer-architecture.md) for dependency and
+family-isolation rules, [Model Execution Wiring](../reference/model-execution-wiring.md) for
+device execution and allocation details, and [Adding a New Model](../guides/adding-a-new-model.md)
 for the integration procedure. Those documents remain the detailed authorities
 for their respective topics; this document connects their responsibilities over
 time. Development-time porting and release qualification are described in
-[Porting Workflow](porting-workflow.md).
+[Porting Workflow](../guides/porting-workflow.md).
 
 ## Three lifetimes
 
@@ -149,7 +149,7 @@ rather than duplicating its mathematics. Backend operations remain model-neutral
 and are accessed through safe interfaces.
 
 For accelerator paths, intermediate layer computation remains on the device as
-described in [Model Execution Wiring](model-execution-wiring.md). Host-to-device
+described in [Model Execution Wiring](../reference/model-execution-wiring.md). Host-to-device
 input transfer and the requested final output transfer are explicit parts of the
 contract. Define when an output is ready to read, whether storage is borrowed or
 owned, and whether another invocation may overwrite it.
@@ -237,7 +237,7 @@ python/apxinf/apxinf/
 
 PI0.5 uses `model/`, `model_runner/` and `weights/`; WallOSS/GR00T retain their
 runtime/executor filenames, and LLM/VLM use their existing `LlmTrait` paths.
-The [current module table](model-layer-architecture.md#current-module-names-and-responsibilities)
+The [current module table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities)
 is authoritative for names and owners. `AutoModel` returns `LoadedModel`;
 `ModelRunner` is the native VLA binding, and a concrete family runner implements
 `VlaRuntime`. None of the seven stages requires another wrapper or shared trait.
@@ -249,7 +249,7 @@ family-specific input/output semantics local to their owner when reorganizing
 existing processors. Do not introduce shared family switches or a new generic
 policy crate solely to make the directory tree symmetric.
 
-Follow the existing [dependency matrix](model-layer-architecture.md#per-model-isolation).
+Follow the existing [dependency matrix](../reference/model-layer-architecture.md#per-model-isolation).
 Model computation must not depend on runner/capture types;
 shape/budget definitions should remain leaf concepts. A family implementation
 is not another family's reuse library.

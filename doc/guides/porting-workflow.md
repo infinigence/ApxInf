@@ -3,7 +3,7 @@
 This document is the workflow. It guides an agent porting a working reference
 model into ApxInf while keeping private reference material and generated
 evidence out of the product diff, and credentials out of generated artifacts.
-Follow [Development artifacts](../AGENTS.md#development-artifacts) for all
+Follow [Development artifacts](../../AGENTS.md#development-artifacts) for all
 task-specific output locations.
 
 The agent owns investigation and implementation decisions. Commands and small
@@ -11,12 +11,12 @@ temporary programs are tools for collecting evidence, not a workflow engine.
 The repository accepts a port only when the implementation and its independent
 verification evidence agree.
 
-Before implementation, read [Adding a New Model](adding-a-new-model.md). Use
-[the model-layer architecture](model-layer-architecture.md) to decide ownership
+Before implementation, read [Adding a New Model](../guides/adding-a-new-model.md). Use
+[the model-layer architecture](../reference/model-layer-architecture.md) to decide ownership
 and refactoring boundaries. Design the target device path with
-[Model Execution Wiring](model-execution-wiring.md). When coverage is missing,
+[Model Execution Wiring](../reference/model-execution-wiring.md). When coverage is missing,
 switch explicitly to
-[Adding New Kernels](adding-new-kernels.md) and return here after the kernel has
+[Adding New Kernels](../guides/adding-new-kernels.md) and return here after the kernel has
 been replayed against the original model evidence.
 
 ## 1. Define the port
@@ -114,7 +114,7 @@ specific blocker or approval request that prevents that work.
 
 The **private port workspace** is the ignored
 `<project-root>/devlocal/<feat-name>/` directory defined by
-[AGENTS.md](../AGENTS.md#development-artifacts). Keep generated captures,
+[AGENTS.md](../../AGENTS.md#development-artifacts). Keep generated captures,
 temporary programs, port notes, and reproducibility evidence there. Reuse
 existing external reference checkouts and checkpoints in place and record their
 identities in the workspace. Verify ignore rules with `git check-ignore` and
@@ -186,18 +186,18 @@ the gap.
 ## 5. Design the target execution path
 
 Before implementing the model and its runner, assign family-local owners using
-the [current responsibility table](model-layer-architecture.md#current-module-names-and-responsibilities).
+the [current responsibility table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities).
 Record forward order, precision composition, fixed weight transformations,
 request state, workspace/capture, policy transforms and public registration.
 Check the current family's supported options; a proposal or a different
 family's readiness does not establish the new port's contract.
 
 Then build the execution ledger required by
-[Model Execution Wiring](model-execution-wiring.md). Resolve repeated semantic
+[Model Execution Wiring](../reference/model-execution-wiring.md). Resolve repeated semantic
 sequences against maintained model/Blocks implementations and the safe CUDA kernel
 facade before consulting only the portable backend trait.
 
-Apply the [accelerator acceptance contract](model-execution-wiring.md#accelerator-port-acceptance):
+Apply the [accelerator acceptance contract](../reference/model-execution-wiring.md#accelerator-port-acceptance):
 native GPU computation and required fixed-profile capture are completion gates;
 latency remains best effort unless explicitly gated. The design must identify fusion choices, tensor lifetimes, reusable KV/state,
 workspace ownership, host transfers, and CUDA Graph eligibility. Any CPU
@@ -224,7 +224,7 @@ unfinished until the fallback is replaced. An unresolved operator blocker is
 reported as blocked, not as a completed port with performance debt.
 
 When a genuine gap is found, follow
-[`adding-new-kernels.md`](adding-new-kernels.md). Hand off the operation's full
+[`adding-new-kernels.md`](../guides/adding-new-kernels.md). Hand off the operation's full
 semantics, shapes, dtype, layout, tolerance, golden tensor identities, frequency,
 performance impact, and expected safe Rust interface.
 
@@ -234,9 +234,9 @@ because it builds or passes a synthetic unit test.
 
 ## 7. Implement the model
 
-Follow [Adding a New Model](adding-a-new-model.md), including its separate model
+Follow [Adding a New Model](../guides/adding-a-new-model.md), including its separate model
 directory, runtime-contract choice, and YAGNI rules. Consult
-[the model-layer architecture](model-layer-architecture.md) before extracting
+[the model-layer architecture](../reference/model-layer-architecture.md) before extracting
 shared code or moving behavior across the model/backend boundary.
 
 Keep model code responsible for model structure, weight mapping, scheduling,
@@ -251,7 +251,7 @@ Prefer this order:
 3. compose existing device primitives when fusion semantics do not match;
 4. add a model-neutral operator when semantics are genuinely missing.
 
-Complete [Rust registration and Python policy integration](adding-a-new-model.md#registration-and-public-integration)
+Complete [Rust registration and Python policy integration](../guides/adding-a-new-model.md#registration-and-public-integration)
 through existing factories/bindings. Keep LLM/VLM on `LlmTrait`; use a family
 `ModelRunner` implementing `VlaRuntime` for VLA. Do not add a factory or execution
 wrapper merely to make the call chain symmetrical.

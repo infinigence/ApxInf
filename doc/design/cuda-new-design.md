@@ -1,4 +1,5 @@
 # cuda-new Design
+Status: Accepted (implemented in apxinf-cuda-new).
 
 > Architecture notes for `crates/apxinf-cuda-new`.
 > Public API listing: `../reference/cuda-new-api.md`;

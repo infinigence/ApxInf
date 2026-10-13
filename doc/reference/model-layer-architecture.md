@@ -4,7 +4,7 @@ This document defines ownership and dependency rules for
 `crates/apxinf-model/`. Read it when adding a model, adding a precision path, or
 changing model execution topology. For model-instance, session and request lifetimes,
 stage contracts and their source ownership, see
-[Model Lifecycle and Contracts](model-lifecycle.md).
+[Model Lifecycle and Contracts](../reference/model-lifecycle.md).
 
 ## Responsibility
 
@@ -37,7 +37,7 @@ apxinf-core / apxinf-cuda / apxinf-mlx
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
-The [MLX backend contract](mlx-backend.md) applies these owners to Apple Silicon.
+The [MLX backend contract](../design/mlx-backend.md) applies these owners to Apple Silicon.
 Its native arrays, opaque storage and family-selected compiled execution are
 implemented. The selection table defines each family's supported geometry,
 precision and compilation scopes; a compiled callable alone does not establish
@@ -45,7 +45,7 @@ hardware or workload acceptance.
 
 Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
 private `src/ffi/` declarations. The C/C++ boundary in
-[`adapters/`](../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
+[`adapters/`](../../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
 launches; device implementations belong in `kernels/`, and offline CuTe export
 belongs in `aot/`. These are backend implementation details, not additional
 model-layer interfaces.
@@ -83,20 +83,20 @@ not a port requirement.
 
 | Owner / name | Inputs and output; responsibility | PI0.5 or shared source |
 | --- | --- | --- |
-| Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
-| Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text` or `Vla`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
-| `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
-| `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
-| `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
-| `model/` (`<Family>Model<B>`) | Canonical tensors → model-domain result; shared forward order, modality connections and fixed flow schedule | [model/mod.rs](../crates/apxinf-model/src/pi05/model/mod.rs) |
-| `model/model.rs` (`ModelVariant`) | Private dispatch among constructed precision-specific models and fixed time embeddings; does not own graph/cache policy | [model.rs](../crates/apxinf-model/src/pi05/model/model.rs) |
-| `model/blocks/` (`Blocks`, `PrepareBlocks`) | Backbone/layer composition, physical intermediate representations and precision-specific fusion; reports workspace needs without allocating the graph workspace | [blocks/mod.rs](../crates/apxinf-model/src/pi05/model/blocks/mod.rs) |
-| `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
-| `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
-| `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
-| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
-| `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
+| Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../../python/apxinf/apxinf/policies/impls/pi05.py) |
+| Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../../crates/apxinf-py/src/lib.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text` or `Vla`; these do not add another inference loop | [auto.rs](../../crates/apxinf-model/src/auto.rs), [registry.rs](../../crates/apxinf-model/src/registry.rs) |
+| `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../../crates/apxinf-model/src/pi05/load.rs) |
+| `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
+| `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
+| `model/` (`<Family>Model<B>`) | Canonical tensors → model-domain result; shared forward order, modality connections and fixed flow schedule | [model/mod.rs](../../crates/apxinf-model/src/pi05/model/mod.rs) |
+| `model/model.rs` (`ModelVariant`) | Private dispatch among constructed precision-specific models and fixed time embeddings; does not own graph/cache policy | [model.rs](../../crates/apxinf-model/src/pi05/model/model.rs) |
+| `model/blocks/` (`Blocks`, `PrepareBlocks`) | Backbone/layer composition, physical intermediate representations and precision-specific fusion; reports workspace needs without allocating the graph workspace | [blocks/mod.rs](../../crates/apxinf-model/src/pi05/model/blocks/mod.rs) |
+| `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../../crates/apxinf-model/src/pi05/weights/mod.rs) |
+| `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../../crates/apxinf-model/src/pi05/backend.rs) |
+| `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../../crates/apxinf-cuda/src/lib.rs) |
+| `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
 `ModelVariantChoice` is a configuration choice; `ModelVariant` is a loaded private
@@ -127,7 +127,7 @@ the model interface and typed dispatch; precision-specific matches and concrete
 Blocks construction stay in the model construction/variant module. It allocates
 from model-reported requirements rather than encoding a second workspace-size
 formula. Config and resource descriptions are leaf data. PI0.5 enforces these
-directions with [check_pi05_module_boundaries.py](../scripts/check_pi05_module_boundaries.py).
+directions with [check_pi05_module_boundaries.py](../../scripts/check_pi05_module_boundaries.py).
 That guard checks PI0.5 only; a new family must enforce its own declared boundaries.
 
 ### Current coverage and port decisions
@@ -136,7 +136,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
-| Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive.md). |
+| Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](../models/qwen-drive.md). |
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
@@ -166,15 +166,15 @@ cross-backend design. With the `mlx` feature, Metal selection resolves `metal_qw
 Qwen3 checkpoint detection uses `model_type=qwen3`; MiniCPM5 requires explicit
 family selection because its official metadata says `llama`. Unsupported
 families fail instead of silently moving work to CPU. See the
-[implemented MLX selection table](mlx-backend.md#implemented-text-selections)
+[implemented MLX selection table](../design/mlx-backend.md#implemented-text-selections)
 for profiles, compilation scopes and CLI options.
 
-See [Adding a New Model](adding-a-new-model.md#registration-and-public-integration)
+See [Adding a New Model](../guides/adding-a-new-model.md#registration-and-public-integration)
 for the exact integration sequence and
-[PI0.5 preparation](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+[PI0.5 preparation](../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 for implemented signatures and output-lifetime rules. Capture acceptance for a
 new accelerator port is defined in
-[Model Execution Wiring](model-execution-wiring.md#accelerator-port-acceptance);
+[Model Execution Wiring](../reference/model-execution-wiring.md#accelerator-port-acceptance);
 it is not a claim that every existing family has already passed those gates.
 
 ## VLA input seam and preprocessing ownership
@@ -216,7 +216,7 @@ policies still construct the model inputs and interpret the model actions.
 
 These are structural responsibilities within the model layer, not sequential
 lifecycle stages. The temporal stages are defined in
-[Model Lifecycle and Contracts](model-lifecycle.md#seven-stages). Use these roles
+[Model Lifecycle and Contracts](../reference/model-lifecycle.md#seven-stages). Use these roles
 to understand a directory rather than requiring a fixed file recipe:
 
 1. **Frontage and contract** — registration, configuration, public runtime
@@ -372,7 +372,7 @@ are private to `model/`. Preparation resource contracts also belong to `model`;
 model-to-runner dependency. Python Policy retains encode/decode context and holds
 the native `ModelRunner` binding. `AutoPolicy` and Rust `AutoModel` are separate
 construction entry points; `LoadedModel` remains the Rust loading-result enum.
-See the [implemented component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
-[callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
-and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
+See the [implemented component view](../archive/model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
+[callable lifecycle contract](../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+and [migration tracker](../archive/model-lifecycle/migration.md) for qualification and scope.
 WallOSS and GR00T retain their previous implementations pending their own stages.

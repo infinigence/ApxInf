@@ -1,8 +1,8 @@
 # Model lifecycle refactor: staged rollout and documentation gates
 
-Current integration rules: [module ownership and family support](../model-layer-architecture.md#current-module-names-and-responsibilities),
-[registration procedure](../adding-a-new-model.md#registration-and-public-integration),
-and [implemented PI0.5 preparation](lifecycle.md#implemented-pi05-preparation-contract).
+Current integration rules: [module ownership and family support](../../reference/model-layer-architecture.md#current-module-names-and-responsibilities),
+[registration procedure](../../guides/adding-a-new-model.md#registration-and-public-integration),
+and [implemented PI0.5 preparation](../../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract).
 Stage descriptions below retain the terminology of their recorded revisions;
 use the naming follow-up and current guides for new code, not the earlier
 Session/Network or runtime/executor layouts.
@@ -12,8 +12,8 @@ fixed-asset organization, model_variant naming and module encapsulation.
 Session G qualifies final-source Thor performance after the earlier contention
 window; Orin performance and final native checks retain their separately recorded
 sources. Later model stages remain open.
-Architecture and interface decisions live in [architecture.md](architecture.md)
-and [lifecycle.md](lifecycle.md); this file owns rollout order and evidence tracking.
+Architecture and interface decisions live in [architecture.md](../../archive/model-lifecycle/architecture.md)
+and [lifecycle.md](../../archive/model-lifecycle/lifecycle.md); this file owns rollout order and evidence tracking.
 Current-source review baseline: upstream/main
 `7baa69b281ef862e6afa32c476c58143d3964241`.
 
@@ -69,7 +69,7 @@ Exit: baseline commands and results are reproducible on selected hardware; every
 matrix cell is qualified, explicitly pending, or unsupported. Unavailable GPU
 access blocks GPU qualification, not documentation or local structural work.
 Current status: source merge and inventory complete; local checks recorded in
-[Stage 1 baseline protocol](baseline.md). PI0.5 now passes the final Thor/Orin matrix and lifecycle
+[Stage 1 baseline protocol](../../archive/model-lifecycle/baseline.md). PI0.5 now passes the final Thor/Orin matrix and lifecycle
 qualification. Other families, their target assets and deployment budgets remain
 open in the broader Stage 1 inventory; this does not block the completed PI0.5 pilot.
 
@@ -119,7 +119,7 @@ macOS without linking CUDA; all 14 moved method bodies match baseline ignoring
 formatting; family dependency check passes. Thor native AutoModel smoke passes
 for baseline and candidate. All four two-view H10/H50 × T10/T21 cases show exact
 baseline/candidate and eager/graph parity (max_abs=0, relative L2=0, cosine=1).
-See [baseline evidence and limits](baseline.md#thor-bf16-slice-a-numerical-result-2026-09-15).
+See [baseline evidence and limits](../../archive/model-lifecycle/baseline.md#thor-bf16-slice-a-numerical-result-2026-09-15).
 Performance and full matrix qualification remain open. No operator source changed.
 
 ### Stage 2 slice B: explicit PI0.5 Session preparation
@@ -133,7 +133,7 @@ plans for both eager and graph. Real-input tuning stays in preparation or the
 legacy infer cache-miss path. Old implicit plans are released before replacement
 tuning allocations. Explicitly held plans are not silently destroyed.
 
-See [the callable lifecycle contract](lifecycle.md#implemented-pi05-preparation-contract)
+See [the callable lifecycle contract](../../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 for output aliasing and remaining limitations. Host-side tuning suppression is
 scoped and unwind-safe; operator sources and build flags are unchanged.
 
@@ -143,7 +143,7 @@ tests and one tuning-guard test. Final public smoke `3884257` passes on BF16,
 FP8 and W8A8: actual Eager/RequireGraph, populated cache eviction, invalid-spec
 recovery, RNG and raw RGB paths. All seven fixed-input comparisons are exact
 (four BF16, two FP8, one Thor W8A8). Library code is `f81d02d`; no CUDA operator
-was compiled. See [slice B evidence](baseline.md#thor-session-slice-b-evidence-2026-09-15).
+was compiled. See [slice B evidence](../../archive/model-lifecycle/baseline.md#thor-session-slice-b-evidence-2026-09-15).
 Orin, full online tuning/invalidation, forced native capture-failure cleanup,
 resource/performance gates and remaining computation/Blocks work stay open.
 
@@ -213,7 +213,7 @@ execution ownership, `model/Pi05Model<B>` for forward computation, and
 and access use `model_runner`. Per-timestep modulation data is `StepModulation`.
 The existing Rust `AutoModel` factory and `LoadedModel` result keep their names.
 No wrapper, resource ownership or computation is added. See the
-[canonical mapping and call relationships](architecture.md#canonical-names-and-pythonrust-relationship).
+[canonical mapping and call relationships](../../archive/model-lifecycle/architecture.md#canonical-names-and-pythonrust-relationship).
 Rebuild the native extension and update Python callers together.
 
 The candidate records above and GPU qualification below retain their historical
@@ -276,7 +276,7 @@ last supplementary target. Report same-profile baseline latency and resource
 deltas; no new percentage or absolute memory budget has been approved. A measured
 comparison must not be relabeled as an agreed deployment SLO. Baseline/candidate
 sources and asset identities remain pinned; known resident GPU services are
-recorded rather than stopped. Final evidence belongs in [baseline.md](baseline.md).
+recorded rather than stopped. Final evidence belongs in [baseline.md](../../archive/model-lifecycle/baseline.md).
 
 ## Stage 3: WallOSS; extract proven common mechanisms
 
@@ -284,7 +284,7 @@ Deliverables:
 
 - Adopt the shared `model_variant` selection contract with model-owned values;
   validate naming and construction with PI0.5 and WallOSS before generalizing the
-  common loader representation. See [compute selection](architecture.md#compute-implementation-selection-agreed-target).
+  common loader representation. See [compute selection](../../archive/model-lifecycle/architecture.md#compute-implementation-selection-agreed-target).
 
 - Use WallOSS as the second implementation to test which PI0.5 mechanisms are
   actually shared, rather than exporting PI0.5-specific assumptions as a framework.

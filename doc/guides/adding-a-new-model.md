@@ -1,11 +1,11 @@
 # Adding a New Model to ApxInf
 
 Use this guide after the reference model runs and its semantics are understood.
-Follow [the porting workflow](porting-workflow.md) for evidence and acceptance,
-[Model Lifecycle and Contracts](model-lifecycle.md) for stages and data contracts,
-[the model-layer architecture](model-layer-architecture.md) for ownership and
-dependencies, [Model Execution Wiring](model-execution-wiring.md) for composing
-the maintained device path, and [the kernel guide](adding-new-kernels.md) for
+Follow [the porting workflow](../guides/porting-workflow.md) for evidence and acceptance,
+[Model Lifecycle and Contracts](../reference/model-lifecycle.md) for stages and data contracts,
+[the model-layer architecture](../reference/model-layer-architecture.md) for ownership and
+dependencies, [Model Execution Wiring](../reference/model-execution-wiring.md) for composing
+the maintained device path, and [the kernel guide](../guides/adding-new-kernels.md) for
 genuine backend gaps. For a VLA, the *body* side of deployment — which
 observation keys a client sends, how state is routed, how a named robot fixes
 them together — is not needed to land a model here. A policy registered in
@@ -30,7 +30,7 @@ before the second implementation exposes the real common boundary. Preserve
 provenance when copying and rename model-specific concepts immediately.
 
 Model-family directories are private architecture modules. Follow the
-[dependency matrix](model-layer-architecture.md#per-model-isolation): inspect
+[dependency matrix](../reference/model-layer-architecture.md#per-model-isolation): inspect
 and copy from a close implementation when useful, but keep the new product code
 independent of other families. Run
 `scripts/check_model_family_boundaries.sh` before review.
@@ -78,7 +78,7 @@ path with model-specific state, image, language, noise, schedule, and action
 semantics.
 
 PI0.5 is the maintained VLA structural reference. Use the
-[module responsibility table](model-layer-architecture.md#current-module-names-and-responsibilities)
+[module responsibility table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities)
 to assign ownership; this is its current layout, not a required number of files:
 
 ```text
@@ -182,7 +182,7 @@ Do not begin coverage discovery from `dyn Backend` alone. First inspect the
 closest maintained model/Blocks implementation at the requested precision and the safe interfaces
 under `apxinf_cuda::kernels`, especially fused normalization/residual,
 QKV/RoPE/cache, attention, activation, and GEMM paths. Complete the execution
-ledger from [Model Execution Wiring](model-execution-wiring.md) before treating
+ledger from [Model Execution Wiring](../reference/model-execution-wiring.md) before treating
 an operation as missing.
 
 ### Execution and preparation
@@ -228,7 +228,7 @@ declare the actual `status`. Implement `prepare_with_policy`, `prepare_for` and
 are unsupported, not successful readiness. Verify mode/fallback reporting,
 incompatible inputs, tuning-store replacement/generation, retained-plan lifetime,
 and output overwrite behavior through native calls. The
-[PI0.5 contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+[PI0.5 contract](../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 is the executable reference; new-family support needs its own evidence.
 
 ### Registration and public integration
@@ -251,7 +251,7 @@ Complete these steps in the new family's own code and the existing registries:
 3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
-   [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)
+   [current option limits](../reference/model-layer-architecture.md#current-coverage-and-port-decisions)
    before adopting `model_variant` or binding config overrides.
 4. Reuse the generic native `ModelRunner` binding. Add a
    `python/apxinf/apxinf/policies/impls/<family>.py` policy implementing the
@@ -276,7 +276,7 @@ Policy `infer` preprocesses, calls the existing binding and decodes the result.
 Keep robot adaptation, prompt, state/action normalization and output context at
 that boundary. Checkpoint-fixed conversion after the declared RGB/tensor input
 seam remains in the native model computation. See the
-[current ownership table](model-layer-architecture.md#current-module-names-and-responsibilities).
+[current ownership table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities).
 
 ## Add static-FP8 calibration
 
@@ -390,7 +390,7 @@ otherwise.
 Match repeated model sequences to existing fused safe interfaces first, then
 compose device primitives and layouts. A missing dtype, layout, shape, mask, or
 semantic variant may require backend work, but the new API must be
-model-neutral. Follow [Adding New Kernels](adding-new-kernels.md) and return to
+model-neutral. Follow [Adding New Kernels](../guides/adding-new-kernels.md) and return to
 the original model references for operator replay.
 
 ## Verification
@@ -407,13 +407,13 @@ Verify progressively:
 8. latency and memory, reported separately from correctness.
 
 Temporary capture and replay programs belong in the
-[private port workspace](porting-workflow.md#private-port-workspace). Commit only
+[private port workspace](../guides/porting-workflow.md#private-port-workspace). Commit only
 maintained product tests or examples whose purpose remains after the port is
 complete.
 
 ## Completion criteria
 
-Apply the [accelerator acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
+Apply the [accelerator acceptance contract](../reference/model-execution-wiring.md#accelerator-port-acceptance)
 when completing a new GPU port. The model has its own directory, uses the correct runtime contract, respects the
 model/backend boundary, loads through the maintained registry, passes declared
 numerical tolerances through the public path, has no accelerator hot-path host
