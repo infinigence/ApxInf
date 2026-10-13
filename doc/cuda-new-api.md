@@ -12,7 +12,7 @@ Contents:
 1. Overview (§1)
 2. Infrastructure: context / stream / buffer (§2)
 3. Tunable operators: GEMM family, Attention family (§3)
-4. Fixed operators: gdn / attn_ops / mlp / model / NVFP4 quantization (§4)
+4. Family and fixed operators: gdn / norm / pointwise / quantization / rope / gather / NVFP4 quantization (§4)
 5. Sessions and graph capture (§5)
 6. Build-time constants (§6)
 
@@ -40,7 +40,7 @@ Only three calling shapes exist:
 | Category | Shape | Synchronization |
 |---|---|---|
 | Tunable operators (§3) | `ops::gemm(ctx, Args)` — an Args struct + policy | synchronous under eager; enqueue-only under session/capture |
-| Fixed operators (§4) | `ops::rms_norm(ctx, tensors, scalars…)` — flat parameters | asynchronous enqueue; the caller synchronizes |
+| Family and fixed operators (§4) | `ops::swiglu(ctx, fused, output)` — flat parameters, or an Args struct for a Spec-dispatched family such as norm (§4.3) | asynchronous enqueue; the caller synchronizes |
 | Host helpers (§4.6) | pure arithmetic / constant queries, no GPU | immediate |
 
 All tensor parameters must live on the current `CudaContext` device, be contiguous
@@ -88,7 +88,7 @@ buf.as_tensor(shape, dtype) -> Result<Tensor, String>
 
 ### 2.4 `HostMappedBuffer` — fixed-address host-mapped memory
 
-The carrier for a CUDA Graph's "runtime-mutable parameters" (design doc §5.6). The CPU
+The carrier for a CUDA Graph's "runtime-mutable parameters" (design doc §7.6). The CPU
 writes, the kernel reads; the address never changes after capture.
 
 ```rust
@@ -104,7 +104,7 @@ hmb.len() / hmb.is_empty()
 ## 3. Tunable Operators
 
 Multiple implementations, autotune selection, recipes persisted to disk (design doc
-§2/§4). Every Args struct carries a `policy` field.
+§3/§6). Every Args struct carries a `policy` field.
 
 ### 3.1 Policy
 
@@ -123,12 +123,13 @@ pub struct GemmPolicy {
 }
 ```
 
-### 3.2 GEMM family (4 semantics)
+### 3.2 GEMM family (5 semantics)
 
 ```rust
 ops::gemm(ctx, GemmArgs) -> Result<()>                      // Y = alpha·A@B / output_scale
 ops::gemm_bias(ctx, GemmBiasArgs { gemm, bias }) -> Result<()>
 ops::gemm_bias_gelu(ctx, GemmBiasGeluArgs { gemm, bias }) -> Result<()>
+ops::gemm_bias_residual(ctx, GemmBiasResidualArgs { gemm, bias, residual }) -> Result<()>
 ops::gemm_geglu(ctx, GemmGegluArgs { gemm }) -> Result<()>  // B=[K,2N], gate/up halves
 ```
 
@@ -183,7 +184,7 @@ SegmentedAttentionArgs::new(query, key, value, out, offsets, host_offsets)
 // offsets: &CudaBuffer (U32 segment boundaries), host_offsets: &[u32] (same content on the host)
 ```
 
-`KvCacheDecodeMeta` — fixed-address metadata for CUDA Graph decode (design doc §5.6):
+`KvCacheDecodeMeta` — fixed-address metadata for CUDA Graph decode (design doc §7.6):
 
 ```rust
 KvCacheDecodeMeta::new(device, key_capacity) -> Result<Self>
@@ -192,10 +193,12 @@ meta.update(valid_key_tokens, query_start) -> Result<()>    // call before each 
 
 ---
 
-## 4. Fixed Operators
+## 4. Family and Fixed Operators
 
-Single implementation, direct enqueue, asynchronous return (design doc §3). Listed by
-module.
+One implementation per semantic, direct enqueue, asynchronous return. Two shapes
+share this section: Spec-dispatched **families**, whose variants are Args fields
+(design doc §4), and **fixed** operators with flat parameters (design doc §5).
+Listed by module.
 
 ### 4.1 `ops::` GDN linear attention (`gdn.rs`)
 
@@ -222,31 +225,76 @@ gdn_chunk_scan_interleaved(ctx, fused, g, beta, out, state,
 gdn_widen_f16_to_bf16(ctx, input, output, count)
 ```
 
-### 4.2 `ops::` attention companions (`attn_ops.rs`)
+### 4.2 `ops::` non-Spec family members
+
+Each of these belongs to a Spec-dispatched family but is not one of its
+semantics, for a stated reason -- it writes in place, its rank does not fit the
+Spec's shape, or its reduction order differs. They keep flat parameters (design doc §5).
 
 ```rust
-partial_rope(ctx, data, positions, rotary_width, theta)    // partial rotary embedding, in place
-head_rms_norm(ctx, data, weight, epsilon)                  // per-head RMSNorm, in place
+// rope/partial.rs -- the Spec semantics fuse a QKV split and write three
+// outputs; this rotates one tensor in place
+partial_rope(ctx, data, positions, rotary_width, theta)
+
+// norm/head.rs -- in place over a rank-3 activation, and the norm family's
+// third reduction tree: not bit-comparable with `norm` or its `offset` form
+head_rms_norm(ctx, data, weight, epsilon)
+
+// attention/gates.rs -- Qwen3.5's `attn_output_gate: true` pair
 split_query_and_gate(ctx, fused, query, gate)              // q_proj output split
-apply_output_gate(ctx, data, gate)                         // sigmoid output gate, in place
+apply_output_gate(ctx, data, gate)                         // sigmoid, in place
+
+// gather/embedding.rs -- plain copy; GatherSemantic::EmbeddingLookup always
+// applies Gemma's sqrt(cols) scale and indexes with u32
+embedding_gather(ctx, table, ids, output)
+
+// sampling.rs -- greedy selection; the stateful samplers are `sampling::`
+argmax(ctx, logits, index)                                 // index is a 1-element I32
 ```
 
-### 4.3 `ops::` MLP building blocks (`mlp.rs`)
+### 4.3 `ops::` norm family (`norm/`)
+
+The norm family is three entry points whose Args describe the row-wise
+pipeline as data, so one call shape covers RMS/LayerNorm, adaptive
+conditioning, residual combines and fused E4M3 output:
 
 ```rust
-rms_norm(ctx, input, weight, output, epsilon)
+norm(ctx, NormArgs { input, out, kind, affine, eps, post })
+fused_add_norm(ctx, FusedAddNormArgs { input, residual, bias, gate,
+                                       hidden, normalized, kind, affine, eps, post })
+residual_add(ctx, ResidualAddArgs { input, residual, bias, gate, order, out })
+
+enum NormKind { Rms, Layer { bias } }
+enum Affine   { Weight { weight, offset }, AdaScaleShift { style } }
+enum QuantOut { E4m3 { scale } }                           // F16 input only
+enum BiasOrder { SingleRound, RoundAfterBias }             // BF16 only
+```
+
+`Affine::Weight { offset: true }` is the Qwen3.8 `(1 + weight)` RMSNorm. It
+shares the family's ABI but not its kernels: its block size follows `cols` and
+its reduction tree differs from `norm.cuh`, so the two `offset` settings are
+not interchangeable beyond the `1 +`. It is valid only on `norm` with
+`NormKind::Rms`, BF16 in and out and no `post`. Every other combination is
+refused by name, never approximated: those that describe a coherent pipeline
+with no kernel -- any `fused_add_norm` form, F16 -- return
+`APXINF_STATUS_UNSUPPORTED` naming the fields, while those the stage rules
+already exclude (`NormKind::Layer`, or a `post` on an F16 pipeline) return
+`APXINF_STATUS_INVALID_ARGUMENT` from `validate_spec` first.
+
+### 4.4 `ops::` elementwise and M=1 members
+
+```rust
+// pointwise/elementwise.rs -- SiLU-gated, not PointwiseSemantic::Geglu's GELU
 swiglu(ctx, fused, output)                                 // fused=[.., 2N] → [.., N]
 add_into(ctx, addend, accumulator)                         // accumulator += addend
+
+// quantization/per_tensor.rs -- same arithmetic as FixedScaleE4m3, but 8-wide
+// where that path is scalar, and it differs on NaN input
 quantize_fp8_per_tensor(ctx, input, output, input_scale)
-fp8_gemv(ctx, weight, activation, output, alpha)           // M=1 projection
+
+// gemm/gemv.rs -- GEMMs at M=1, but one implementation each, so no registry
+fp8_gemv(ctx, weight, activation, output, alpha)
 nvfp4_gemv(ctx, weight, weight_scales, activation, activation_scales, output, alpha)
-```
-
-### 4.4 `ops::` model level (`model.rs`)
-
-```rust
-embedding_gather(ctx, table, ids, output)                  // embedding row gather
-argmax(ctx, logits, index)                                 // greedy sampling; index is a 1-element I32
 ```
 
 ### 4.5 `ops::` NVFP4 quantization (`gemm/nvfp4_scales.rs`)
@@ -274,7 +322,7 @@ nvfp4_dense_swiglu_aot(ctx, activation, activation_scales, weight, weight_scales
 ### 4.6 Host helpers (no GPU work)
 
 ```rust
-ops::rotary_dim(head_dim, partial_rotary_factor) -> usize
+ops::rotary_dim(head_dim, partial_rotary_factor) -> usize   // rope/partial.rs
 ops::gdn_state_elements(v_heads, v_dim, k_dim) -> usize
 ops::gdn_prefill_workspace_bytes(v_heads, num_seqs) -> usize
 ops::decode_attention_workspace_bytes() -> usize
@@ -291,13 +339,13 @@ ops::decode_attention(ctx, query, key_cache, value_cache, output, workspace,
 Qwen3.8-specialized allocation-free FA2 decode (`[1,1,24,256]` query, BF16 caches).
 Note: `key_tokens` is a scalar argument and **gets frozen into a captured graph** — any
 path meant for CUDA Graph should use `kv_cache_attention + with_decode_meta` instead
-(design doc §5.6). Availability: §6 `FA2_DECODE`.
+(design doc §7.6). Availability: §6 `FA2_DECODE`.
 
 ---
 
 ## 5. Sessions and Graph Capture
 
-Concepts and the two-pass mechanism are in design doc §5. The interface:
+Concepts and the two-pass mechanism are in design doc §7. The interface:
 
 ```rust
 // session: handle cache + operator order + workspace arena

@@ -7,29 +7,33 @@
 
 /* Normalization family.
  *
- * Every semantic here is a row-wise operation over a [rows, cols] row-major
- * activation: an optional bias/residual/gate combine, followed by an optional
- * normalization, followed by an optional output quantization.  The family is
- * grouped into one adapter because the bindings shape is shared; the semantic
- * selects which of the bindings participate.
+ * Every operation here is a row-wise pipeline over a [rows, cols] row-major
+ * activation:
  *
- * Which bindings each semantic reads:
+ *   combine   optional bias or gate applied to `input`, plus `residual`
+ *   norm      optional RMS or LayerNorm reduction over the combined row
+ *   affine    optional rescale of the normalized row
+ *   quant     optional output quantization
  *
- *   RMS                    input, weight                     -> normalized
- *   LAYER                  input, weight, norm_bias          -> normalized
- *   ADAPTIVE_RMS           input, norm_style                 -> normalized
- *   BIAS_RESIDUAL          input, bias, residual             -> hidden
- *   BIAS_RESIDUAL_RMS      input, bias, residual, weight     -> hidden, normalized
- *   BIAS_RESIDUAL_LAYER    input, bias, residual, weight,
- *                          norm_bias                         -> hidden, normalized
- *   ADA_GATE_RESIDUAL      input, residual, gate_style       -> hidden
- *   ADA_GATE_RESIDUAL_RMS  input, residual, gate_style,
- *                          norm_style                        -> hidden, normalized
- *   BIAS_THEN_RESIDUAL     input, bias, residual             -> hidden
+ * The Spec describes those stages with independent fields rather than one
+ * fused semantic code, so the adapter dispatches on the stage combination.
+ * `semantic` only says which outputs are written:
  *
- * BIAS_THEN_RESIDUAL is BF16-only.  Unlike BIAS_RESIDUAL, it rounds
- * input+bias to BF16 before adding residual, preserving the legacy two-step
- * numerical contract in a single launch.
+ *   NORM          combine skipped; writes `normalized` only
+ *   FUSED_ADD_NORM  combine runs; writes `hidden` and `normalized`
+ *   RESIDUAL_ADD  norm skipped; writes `hidden` only
+ *
+ * Which bindings participate is fully determined by the fields:
+ *
+ *   input         always
+ *   residual      semantic != NORM
+ *   bias          optional, and only when semantic != NORM && !has_gate
+ *   gate_style    has_gate
+ *   weight        affine_kind == WEIGHT or WEIGHT_OFFSET
+ *   norm_bias     norm_kind == LAYER
+ *   norm_style    affine_kind == ADA_SCALE_SHIFT
+ *   hidden        semantic != NORM
+ *   normalized    semantic != RESIDUAL_ADD
  *
  * The two adaptive-conditioning vectors are distinct and are not
  * interchangeable:
@@ -38,27 +42,73 @@
  *   gate_style  [3 * cols]  the gate is the third segment,
  *                           [2 * cols, 3 * cols)
  *
- * ADA_GATE_RESIDUAL_RMS reads the gate from the *current* layer's gate_style
- * and normalizes with the *next* layer's norm_style: the pi05 action expert
- * folds the next layer's normalization into the current layer's residual.
+ * The gated FUSED_ADD_NORM form reads the gate from the *current* layer's
+ * gate_style and normalizes with the *next* layer's norm_style: the pi05
+ * action expert folds the next layer's normalization into the current layer's
+ * residual.
  */
 typedef enum {
-  APXINF_NORM_SEMANTIC_RMS = 0,
-  APXINF_NORM_SEMANTIC_LAYER = 1,
-  APXINF_NORM_SEMANTIC_ADAPTIVE_RMS = 2,
-  APXINF_NORM_SEMANTIC_BIAS_RESIDUAL = 3,
-  APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_RMS = 4,
-  APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_LAYER = 5,
-  APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL = 6,
-  APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL_RMS = 7,
-  APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL = 8,
+  /* Pure normalization: no residual combine, single output. */
+  APXINF_NORM_SEMANTIC_NORM = 0,
+  /* Residual combine followed by normalization: hidden + normalized. */
+  APXINF_NORM_SEMANTIC_FUSED_ADD_NORM = 1,
+  /* Residual combine only: hidden, no reduction. */
+  APXINF_NORM_SEMANTIC_RESIDUAL_ADD = 2,
 } apxinf_norm_semantic_t;
 
-#define APXINF_NORM_SPEC_VERSION 1u
+typedef enum {
+  APXINF_NORM_KIND_NONE = 0,
+  APXINF_NORM_KIND_RMS = 1,
+  APXINF_NORM_KIND_LAYER = 2,
+} apxinf_norm_kind_t;
+
+typedef enum {
+  APXINF_NORM_AFFINE_NONE = 0,
+  /* normalized * weight[col] */
+  APXINF_NORM_AFFINE_WEIGHT = 1,
+  /* normalized * (1 + weight[col]).  Not a flag on WEIGHT: it is served by a
+     kernel of its own in kernels/custom/norm_offset.cu, whose block size
+     follows `cols` and whose reduction tree differs from the norm.cuh family,
+     so the two are not bit-comparable beyond the `1 +`.  That kernel covers
+     exactly one combination -- semantic NORM, KIND_RMS, BF16 dtype,
+     QUANT_NONE -- and the adapter reports UNSUPPORTED for the rest rather
+     than falling back to WEIGHT. */
+  APXINF_NORM_AFFINE_WEIGHT_OFFSET = 2,
+  /* normalized * (1 + norm_style[col]) + norm_style[cols + col] */
+  APXINF_NORM_AFFINE_ADA_SCALE_SHIFT = 3,
+} apxinf_norm_affine_t;
+
+typedef enum {
+  /* One rounding of input + bias + residual. */
+  APXINF_NORM_BIAS_ORDER_SINGLE_ROUND = 0,
+  /* input + bias rounds to the storage dtype before residual is added and
+     rounded again.  BF16-only, and distinct from SINGLE_ROUND at rounding
+     boundaries: it preserves the legacy two-kernel contract in one launch. */
+  APXINF_NORM_BIAS_ORDER_ROUND_AFTER_BIAS = 1,
+} apxinf_norm_bias_order_t;
+
+typedef enum {
+  APXINF_NORM_QUANT_NONE = 0,
+  /* Fused E4M3 output; consumes output_scale.  F16 input only. */
+  APXINF_NORM_QUANT_E4M3 = 1,
+} apxinf_norm_quant_t;
+
+#define APXINF_NORM_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
+  /* apxinf_norm_semantic_t: which outputs are written. */
   uint32_t semantic;
+  /* apxinf_norm_kind_t: which reduction, if any, runs over the row. */
+  uint32_t norm_kind;
+  /* apxinf_norm_affine_t: how the normalized row is rescaled. */
+  uint32_t affine_kind;
+  /* Whether the combine multiplies the projection by gate_style's gate. */
+  uint32_t has_gate;
+  /* apxinf_norm_bias_order_t: rounding order of the combine. */
+  uint32_t bias_order;
+  /* apxinf_norm_quant_t: fused output quantization. */
+  uint32_t quant_kind;
   uint32_t dtype;
   /* E4M3 output is the fused-quantization form and consumes output_scale.
      BF16/F16 output leaves the scale at one. */
@@ -91,9 +141,9 @@ typedef struct {
   const void* norm_style;
   /* [3 * cols]; only the third segment, the gate, is read. */
   const void* gate_style;
-  /* Pre-normalization result.  Null for the pure-normalization semantics. */
+  /* Pre-normalization result.  Null when semantic is NORM. */
   void* hidden;
-  /* Normalized result.  Null for the combine-only semantics. */
+  /* Normalized result.  Null when semantic is RESIDUAL_ADD. */
   void* normalized;
   apxinf_cuda_stream_t stream;
   /* Numeric per-call data: changes the result, never the fastest candidate. */

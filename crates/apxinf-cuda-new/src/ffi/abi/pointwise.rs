@@ -42,4 +42,21 @@ unsafe extern "C" {
         spec: *const Spec,
         bindings: *const Bindings,
     ) -> i32;
+
+    /// The family's non-Spec members: BF16-only, one implementation each, so
+    /// they take flat parameters instead of a [`Spec`].
+    pub(crate) fn apxinf_pointwise_swiglu(
+        fused_gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i64,
+        width: i64,
+        stream: CudaStream,
+    ) -> i32;
+
+    pub(crate) fn apxinf_pointwise_add_into(
+        addend: *const c_void,
+        accumulator: *mut c_void,
+        count: i64,
+        stream: CudaStream,
+    ) -> i32;
 }

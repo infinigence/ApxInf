@@ -1,18 +1,25 @@
 //! Raw bindings for CUDA token sampling and normal generation.
+//!
+//! These live under `raw/` rather than `abi/` because they return
+//! `cudaError_t`, the same convention as the CUDA runtime bindings beside them.
+//! `abi/` is the `apxinf_status_t` surface — the greedy `apxinf_sampling_argmax`
+//! is declared there for exactly that reason, even though it is the same
+//! family and the same adapter file. The split tracks the error convention, so
+//! moving these without converting them would make `abi/` inconsistent instead.
 
 use std::ffi::c_void;
 
 use super::cuda_runtime::{cudaError_t, cudaStream_t};
 
 extern "C" {
-    pub fn apxinf_cuda_new_token_sampling_workspace_sizes(
+    pub fn apxinf_sampling_workspace_sizes(
         vocab_size: u32,
         sort_bytes: *mut usize,
         scan_bytes: *mut usize,
     ) -> cudaError_t;
 
     #[allow(clippy::too_many_arguments)]
-    pub fn apxinf_cuda_new_sample_token(
+    pub fn apxinf_sampling_sample_token(
         logits: *const c_void,
         dtype: i32,
         vocab_size: u32,
@@ -45,7 +52,7 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 
-    pub fn apxinf_cuda_new_fill_standard_normal(
+    pub fn apxinf_sampling_fill_standard_normal(
         output: *mut c_void,
         dtype: i32,
         count: u64,

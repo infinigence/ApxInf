@@ -1,11 +1,25 @@
 // Copyright 2026 ApxInf contributors.
 //
-// Elementwise and reduction operators the Qwen3.8 MLP needs, kept alongside
-// the NVFP4 GEMM they feed. Each has exactly one implementation and no
-// persisted selection, so per `doc/adding-new-kernels.md` section 6 they carry
-// no recipe: there is nothing to tune between.
+// The M=1 projections: FP8 and NVFP4 GEMV.
+//
+// Moved verbatim out of kernels/custom/mlp_ops.cu, which was named after a call
+// site rather than a mathematical family (doc/cuda-new-design.md section 1.3).
+// Every kernel and both host launches below are that code unchanged apart from
+// the enclosing namespace.
+//
+// One exception, and it removes code rather than changing any: the unreferenced
+// `__constant__ float kE2M1Table[16]` did not come along. It had no reader --
+// `nvfp4_gemv_kernel` decodes by bit placement and `nvfp4_dp4a_gemv_kernel`
+// through `unpack_e2m1_int8` -- and the comment on `nvfp4_gemv_kernel` records
+// why the table approach was rejected in round-01. The comment stays; the dead
+// array does not.
+//
+// These are GEMMs, but not members of the tunable GEMM family: one
+// implementation each, no candidates to measure between, so they keep flat
+// parameters per doc/cuda-new-design.md section 5 and launch from here rather
+// than through apxinf_gemm_prepare.
 
-#include "mlp_ops.h"
+#include "gemv.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -15,213 +29,8 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace apxinf::cuda_new::mlp_ops {
+namespace apxinf::cuda_new::gemv {
 namespace {
-
-constexpr int kWarpSize = 32;
-
-__device__ __forceinline__ float warp_sum(float value) {
-  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(0xFFFFFFFFu, value, offset);
-  }
-  return value;
-}
-
-// One block per row. The reduction is in f32 regardless of the BF16 storage:
-// summing 5120 squares in BF16 loses the small terms entirely.
-__global__ void rms_norm_kernel(const __nv_bfloat16* __restrict__ input,
-                                const __nv_bfloat16* __restrict__ weight,
-                                __nv_bfloat16* __restrict__ output, int rows,
-                                int width, float epsilon) {
-  extern __shared__ float partials[];
-  const int row = blockIdx.x;
-  if (row >= rows) return;
-  const long long base = (long long)row * width;
-
-  float sum = 0.0f;
-  for (int index = threadIdx.x; index < width; index += blockDim.x) {
-    const float value = __bfloat162float(input[base + index]);
-    sum += value * value;
-  }
-  sum = warp_sum(sum);
-  const int lane = threadIdx.x % kWarpSize;
-  const int warp = threadIdx.x / kWarpSize;
-  if (lane == 0) partials[warp] = sum;
-  __syncthreads();
-
-  if (threadIdx.x < kWarpSize) {
-    const int warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
-    float total = threadIdx.x < warps ? partials[threadIdx.x] : 0.0f;
-    total = warp_sum(total);
-    if (threadIdx.x == 0) partials[0] = total;
-  }
-  __syncthreads();
-
-  const float scale = rsqrtf(partials[0] / static_cast<float>(width) + epsilon);
-  for (int index = threadIdx.x; index < width; index += blockDim.x) {
-    const float value = __bfloat162float(input[base + index]) * scale *
-                        (1.0f + __bfloat162float(weight[index]));
-    output[base + index] = __float2bfloat16(value);
-  }
-}
-
-__device__ __forceinline__ float silu(float value) {
-  return value / (1.0f + __expf(-value));
-}
-
-// `fused` holds gate and up side by side: [rows, 2*width] with gate first.
-// Qwen's MLP is SwiGLU -- silu(gate) * up -- which is not what gemm_geglu
-// computes, so it cannot be reused.
-__global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ fused,
-                              __nv_bfloat16* __restrict__ output, int rows,
-                              int width) {
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  const long long total = (long long)rows * width;
-  if (index >= total) return;
-  const int row = static_cast<int>(index / width);
-  const int column = static_cast<int>(index % width);
-  const long long base = (long long)row * 2 * width;
-  const float gate = __bfloat162float(fused[base + column]);
-  const float up = __bfloat162float(fused[base + width + column]);
-  // Reference semantics are bf16(bf16(silu(gate)) * up): the SiLU output
-  // materializes in BF16 before the multiply (vLLM parity defect D4,
-  // report 64 / Codex round 63 -- rounding only the product is not enough).
-  const float activated = __bfloat162float(__float2bfloat16(silu(gate)));
-  output[index] = __float2bfloat16(activated * up);
-}
-
-// Eight elements per thread through 16-byte vectors. One bf16 per thread
-// (round-05 nsys: 46.7 ms of a 874 ms prefill across 130 calls) leaves the
-// kernel launch-and-index bound; the tail elements run scalar so any count
-// works. Same per-element arithmetic, bit-identical.
-__global__ void add_kernel(const __nv_bfloat16* __restrict__ addend,
-                           __nv_bfloat16* __restrict__ accumulator,
-                           long long count) {
-  const long long vectors = count / 8;
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index < vectors) {
-    uint4 a = reinterpret_cast<const uint4*>(addend)[index];
-    uint4 c = reinterpret_cast<uint4*>(accumulator)[index];
-    const __nv_bfloat16* av = reinterpret_cast<const __nv_bfloat16*>(&a);
-    __nv_bfloat16* cv = reinterpret_cast<__nv_bfloat16*>(&c);
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-      cv[element] = __float2bfloat16(__bfloat162float(cv[element]) +
-                                     __bfloat162float(av[element]));
-    }
-    reinterpret_cast<uint4*>(accumulator)[index] = c;
-    return;
-  }
-  const long long tail = vectors * 8 + (index - vectors);
-  if (tail < count) {
-    accumulator[tail] = __float2bfloat16(__bfloat162float(accumulator[tail]) +
-                                         __bfloat162float(addend[tail]));
-  }
-}
-
-// E4M3 with bias 7, saturating at +-448. Values are pre-divided by the
-// per-tensor scale, so the representable range maps onto the calibrated one.
-// The hardware SATFINITE convert keeps subnormals (the old frexpf ladder
-// flushed them to signed zero -- vLLM parity defect D3, report 64).
-__device__ __forceinline__ uint8_t to_e4m3(float value) {
-  return __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
-}
-
-// Eight elements per thread, 16-byte input vectors and 8-byte output
-// stores. Same to_e4m3 per element in element order; bit-identical.
-__global__ void quantize_fp8_kernel(const __nv_bfloat16* __restrict__ input,
-                                    uint8_t* __restrict__ output,
-                                    long long count, float inverse_scale) {
-  const long long vectors = count / 8;
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index < vectors) {
-    const uint4 in = reinterpret_cast<const uint4*>(input)[index];
-    const __nv_bfloat16* iv = reinterpret_cast<const __nv_bfloat16*>(&in);
-    uint64_t packed = 0;
-#pragma unroll
-    for (int element = 0; element < 8; ++element) {
-      packed |= static_cast<uint64_t>(
-                    to_e4m3(__bfloat162float(iv[element]) * inverse_scale))
-                << (8 * element);
-    }
-    reinterpret_cast<uint64_t*>(output)[index] = packed;
-    return;
-  }
-  const long long tail = vectors * 8 + (index - vectors);
-  if (tail < count) {
-    output[tail] = to_e4m3(__bfloat162float(input[tail]) * inverse_scale);
-  }
-}
-
-// Same conversion as to_e4m3; kept as a separate name so the vector kernel's
-// dispatch identity survives (it used to be a bit-twiddling variant with the
-// same D3 subnormal flush).
-__device__ __forceinline__ uint8_t to_e4m3_bits(float value) {
-  return to_e4m3(value);
-}
-
-__global__ void quantize_fp8_vector_kernel(const uint4* __restrict__ input,
-                                           uint2* __restrict__ output,
-                                           long long vectors, float inverse_scale) {
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index >= vectors) return;
-  const uint4 packed_input = input[index];
-  const auto* elements = reinterpret_cast<const __nv_bfloat16*>(&packed_input);
-  uint2 packed_output;
-  auto* codes = reinterpret_cast<uint8_t*>(&packed_output);
-#pragma unroll
-  for (int offset = 0; offset < 8; ++offset) {
-    codes[offset] = to_e4m3_bits(__bfloat162float(elements[offset]) * inverse_scale);
-  }
-  output[index] = packed_output;
-}
-
-__device__ __forceinline__ uint16_t to_e4m3_native_pair(float low, float high) {
-  // Bare SATFINITE convert: the old small-magnitude zeroing branch replicated
-  // the D3 subnormal flush (report 64); the hardware keeps subnormals.
-  return __nv_cvt_float2_to_fp8x2(make_float2(low, high), __NV_SATFINITE, __NV_E4M3);
-}
-
-__global__ void quantize_fp8_native_pair_kernel(const uint4* __restrict__ input,
-                                               uint2* __restrict__ output,
-                                               long long vectors, float inverse_scale) {
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index >= vectors) return;
-  const uint4 packed_input = input[index];
-  const auto* elements = reinterpret_cast<const __nv_bfloat16*>(&packed_input);
-  uint2 packed_output;
-  auto* pairs = reinterpret_cast<uint16_t*>(&packed_output);
-#pragma unroll
-  for (int offset = 0; offset < 4; ++offset)
-    pairs[offset] = to_e4m3_native_pair(
-        __bfloat162float(elements[2 * offset]) * inverse_scale,
-        __bfloat162float(elements[2 * offset + 1]) * inverse_scale);
-  output[index] = packed_output;
-}
-
-__global__ void add_vector_kernel(const uint4* __restrict__ addend,
-                                  uint4* __restrict__ accumulator,
-                                  long long vectors) {
-  const long long index = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-  if (index >= vectors) return;
-  const uint4 source = addend[index];
-  uint4 destination = accumulator[index];
-  const auto* source_pairs = reinterpret_cast<const __nv_bfloat162*>(&source);
-  auto* destination_pairs = reinterpret_cast<__nv_bfloat162*>(&destination);
-#pragma unroll
-  for (int offset = 0; offset < 4; ++offset) {
-    destination_pairs[offset] = __hadd2(destination_pairs[offset], source_pairs[offset]);
-  }
-  accumulator[index] = destination;
-}
-
-bool vector_elementwise_enabled(const void* source, const void* destination,
-                                long long count) {
-  const char* flag = std::getenv("APXINF_QWEN38_VECTOR_ELEMENTWISE");
-  return flag != nullptr && std::strcmp(flag, "1") == 0 && count % 8 == 0 &&
-         reinterpret_cast<uintptr_t>(source) % 16 == 0 &&
-         reinterpret_cast<uintptr_t>(destination) % 16 == 0;
-}
 
 // One warp per output row, four rows per block, 16-byte loads.
 //
@@ -323,11 +132,6 @@ __global__ void fp8_gemv_shared_kernel(const uint4* __restrict__ weight,
     sum += __shfl_down_sync(0xFFFFFFFFu, sum, offset);
   if (lane == 0) output[row] = __float2bfloat16(alpha * sum);
 }
-
-// E2M1 magnitudes indexed by the low three bits; bit 3 is the sign.
-__constant__ float kE2M1Table[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 __device__ __forceinline__ float from_e4m3(uint8_t code) {
   return __half2float(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3));
@@ -450,7 +254,6 @@ __global__ void nvfp4_dp4a_gemv_kernel(
   }
   if (lane == 0) output[row] = __float2bfloat16(alpha * sum);
 }
-
 }  // namespace
 
 int nvfp4_gemv(const void* weight, const void* weight_scales,
@@ -508,73 +311,4 @@ int fp8_gemv(const void* weight, const void* activation, void* output, int n,
       static_cast<__nv_bfloat16*>(output), n, k / 16, alpha);
   return cudaGetLastError() == cudaSuccess ? 0 : -3;
 }
-
-int quantize_fp8_per_tensor(const void* input, void* output, long long count,
-                            float input_scale, cudaStream_t stream) {
-  if (count <= 0 || !(input_scale > 0.0f)) return -1;
-  const int threads = 256;
-  if (vector_elementwise_enabled(input, output, count)) {
-    const long long vectors = count / 8;
-    const char* native_pair = std::getenv("APXINF_FP8_NATIVE_PAIR");
-    if (native_pair != nullptr && std::strcmp(native_pair, "1") == 0) {
-      quantize_fp8_native_pair_kernel<<<static_cast<int>((vectors + threads - 1) / threads), threads, 0, stream>>>(
-          static_cast<const uint4*>(input), static_cast<uint2*>(output), vectors, 1.0f / input_scale);
-      return cudaGetLastError() == cudaSuccess ? 0 : -2;
-    }
-    quantize_fp8_vector_kernel<<<static_cast<int>((vectors + threads - 1) / threads), threads, 0, stream>>>(
-        static_cast<const uint4*>(input), static_cast<uint2*>(output), vectors, 1.0f / input_scale);
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
-  }
-  // One thread per 8-element vector plus one per tail element.
-  const long long work = count / 8 + count % 8;
-  const long long blocks = (work + threads - 1) / threads;
-  quantize_fp8_kernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(input), static_cast<uint8_t*>(output),
-      count, 1.0f / input_scale);
-  return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-int rms_norm_bf16(const void* input, const void* weight, void* output,
-                  int rows, int width, float epsilon, cudaStream_t stream) {
-  if (rows <= 0 || width <= 0) return -1;
-  const int threads = width >= 1024 ? 1024 : ((width + 31) / 32) * 32;
-  const int warps = (threads + kWarpSize - 1) / kWarpSize;
-  rms_norm_kernel<<<rows, threads, warps * sizeof(float), stream>>>(
-      static_cast<const __nv_bfloat16*>(input),
-      static_cast<const __nv_bfloat16*>(weight),
-      static_cast<__nv_bfloat16*>(output), rows, width, epsilon);
-  return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-int swiglu_bf16(const void* fused_gate_up, void* output, int rows, int width,
-                cudaStream_t stream) {
-  if (rows <= 0 || width <= 0) return -1;
-  const long long total = (long long)rows * width;
-  const int threads = 256;
-  const long long blocks = (total + threads - 1) / threads;
-  swiglu_kernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(fused_gate_up),
-      static_cast<__nv_bfloat16*>(output), rows, width);
-  return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-int add_bf16(const void* addend, void* accumulator, long long count,
-             cudaStream_t stream) {
-  if (count <= 0) return -1;
-  const int threads = 256;
-  if (vector_elementwise_enabled(addend, accumulator, count)) {
-    const long long vectors = count / 8;
-    add_vector_kernel<<<static_cast<int>((vectors + threads - 1) / threads), threads, 0, stream>>>(
-        static_cast<const uint4*>(addend), static_cast<uint4*>(accumulator), vectors);
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
-  }
-  // One thread per 8-element vector plus one per tail element.
-  const long long work = count / 8 + count % 8;
-  const long long blocks = (work + threads - 1) / threads;
-  add_kernel<<<static_cast<int>(blocks), threads, 0, stream>>>(
-      static_cast<const __nv_bfloat16*>(addend),
-      static_cast<__nv_bfloat16*>(accumulator), count);
-  return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-}  // namespace apxinf::cuda_new::mlp_ops
+}  // namespace apxinf::cuda_new::gemv

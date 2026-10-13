@@ -1,5 +1,7 @@
 #include "internal.h"
 
+#include "../../kernels/custom/gemv.h"
+
 #ifdef APXINF_GEMM_CUTLASS
 #include "../../kernels/cutlass/ops/gemm/gemm_nvfp4_sm100.h"
 #endif
@@ -643,6 +645,53 @@ extern "C" uint64_t apxinf_gemm_execution_weight_prepack_count(
     return 0;
   }
   return apxinf::gemm::cutlass_weight_prepack_count(*execution);
+}
+
+// The M=1 projections. These do not go through prepare/enqueue: one
+// implementation each, nothing to measure between, so there is no Recipe or
+// Execution to carry. They forward straight to kernels/custom/gemv.cu.
+
+extern "C" apxinf_status_t apxinf_gemm_fp8_gemv(const void* weight,
+                                           const void* activation,
+                                           void* output, int64_t n, int64_t k,
+                                           float alpha,
+                                           apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (weight == nullptr || activation == nullptr || output == nullptr ||
+        n <= 0 || k <= 0 || n > INT32_MAX || k > INT32_MAX) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid FP8 GEMV arguments");
+    }
+    const int status = apxinf::cuda_new::gemv::fp8_gemv(
+        weight, activation, output, static_cast<int>(n), static_cast<int>(k),
+        alpha, static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "FP8 GEMV failed with status " + std::to_string(status));
+    }
+  });
+}
+
+extern "C" apxinf_status_t apxinf_gemm_nvfp4_gemv(
+    const void* weight, const void* weight_scales, const void* activation,
+    const void* activation_scales, void* output, int64_t n, int64_t k,
+    float alpha, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (weight == nullptr || weight_scales == nullptr ||
+        activation == nullptr || activation_scales == nullptr ||
+        output == nullptr || n <= 0 || k <= 0 || n > INT32_MAX ||
+        k > INT32_MAX) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid NVFP4 GEMV arguments");
+    }
+    const int status = apxinf::cuda_new::gemv::nvfp4_gemv(
+        weight, weight_scales, activation, activation_scales, output,
+        static_cast<int>(n), static_cast<int>(k), alpha,
+        static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "NVFP4 GEMV failed with status " + std::to_string(status));
+    }
+  });
 }
 
 extern "C" apxinf_status_t apxinf_gemm_test_validate_candidates(

@@ -1,155 +1,246 @@
 use apxinf_core::{Result, Tensor};
 
-use super::contracts::{normalize, RawArgs, Semantic};
+use super::contracts::{invalid, normalize, Fields, RawArgs};
 use super::launch;
+use crate::ffi::abi::norm as abi;
 use crate::CudaContext;
 
-/// Inputs for ordinary RMS normalization.
-pub struct RmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
+/// Which reduction the row-wise normalization runs over a `[rows, cols]`
+/// activation. Both reduce in f32 regardless of the F16/BF16 storage.
+pub enum NormKind<'a> {
+    /// `x[r,c] / sqrt(mean(x[r,:]^2) + eps)`
+    Rms,
+    /// `(x[r,c] - mean(x[r,:])) / sqrt(var(x[r,:]) + eps)`, then `+ bias[c]`
+    /// after the affine. `bias` is the `[cols]` LayerNorm shift and is
+    /// separate from the projection bias a fused add takes.
+    Layer { bias: &'a Tensor },
 }
 
-impl<'a> RmsNormArgs<'a> {
-    pub fn new(input: &'a Tensor, weight: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, weight, normalized, eps, output_scale: 1.0 }
+/// How the normalized row is rescaled. There is no `None`: [`residual_add`],
+/// the one form that applies no affine, takes no `Affine` at all.
+pub enum Affine<'a> {
+    /// `* weight[c]`, or `* (1 + weight[c])` when `offset`.
+    ///
+    /// The two settings are **not** one kernel with a flag: `offset` selects
+    /// the Qwen3.8 RMSNorm kernel, which has its own block size and reduction
+    /// tree, so the results differ by more than the `1 +`. That kernel covers
+    /// exactly one pipeline -- [`norm`] with [`NormKind::Rms`], BF16 in and
+    /// out, no `post`. Every other combination is refused by name rather than
+    /// approximated: those describing a coherent pipeline with no kernel (any
+    /// [`fused_add_norm`] form, F16) are `UNSUPPORTED`, while those the stage
+    /// rules already exclude ([`NormKind::Layer`], a `post`) are
+    /// `INVALID_ARGUMENT`.
+    Weight { weight: &'a Tensor, offset: bool },
+    /// `* (1 + style[c]) + style[cols + c]`, where `style` is `[2 * cols]`:
+    /// scale in `[0, cols)` and shift in `[cols, 2 * cols)`.
+    AdaScaleShift { style: &'a Tensor },
+}
+
+/// Fused output quantization, applied instead of writing the storage dtype.
+/// Must agree with the output tensor's dtype: `Some` requires an E4M3 output
+/// and an E4M3 output requires `Some`. The two state one decision, so a
+/// disagreement is refused rather than resolved in either direction.
+pub enum QuantOut {
+    /// E4M3 saturating at +/-448 against a static dequantization `scale`.
+    /// F16 input only.
+    E4m3 { scale: f32 },
+}
+
+/// Rounding order of a bias plus residual combine.
+pub enum BiasOrder {
+    /// One rounding of `input + bias + residual`.
+    SingleRound,
+    /// `input + bias` rounds to the storage dtype before the residual is added
+    /// and rounded again. BF16 only, and observably different from
+    /// [`Self::SingleRound`] at rounding boundaries: it reproduces the legacy
+    /// two-kernel contract in one launch.
+    RoundAfterBias,
+}
+
+/// Pure row-wise normalization: one input, one output, no residual.
+pub struct NormArgs<'a> {
+    pub input: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub kind: NormKind<'a>,
+    pub affine: Affine<'a>,
+    pub eps: f32,
+    pub post: Option<QuantOut>,
+}
+
+impl<'a> NormArgs<'a> {
+    pub fn new(
+        input: &'a Tensor,
+        out: &'a mut Tensor,
+        kind: NormKind<'a>,
+        affine: Affine<'a>,
+        eps: f32,
+    ) -> Self {
+        Self {
+            input,
+            out,
+            kind,
+            affine,
+            eps,
+            post: None,
+        }
+    }
+
+    /// `out[r,c] = input[r,c] * rms(input[r,:])^-1 * (1 + weight[c])`, the
+    /// Qwen3.8 RMSNorm. See [`Affine::Weight`] for why this is not the same
+    /// kernel as the `offset: false` form.
+    pub fn rms_weight_offset(
+        input: &'a Tensor,
+        weight: &'a Tensor,
+        out: &'a mut Tensor,
+        eps: f32,
+    ) -> Self {
+        Self::new(
+            input,
+            out,
+            NormKind::Rms,
+            Affine::Weight {
+                weight,
+                offset: true,
+            },
+            eps,
+        )
     }
 }
 
-/// Inputs for ordinary layer normalization.
-pub struct LayerNormArgs<'a> {
+/// Residual combine followed by normalization, writing both the combined row
+/// (`hidden`) and the normalized row (`normalized`).
+///
+/// `bias` and `gate` are mutually exclusive: the gate multiplies the
+/// projection where the bias would be added. `gate` is `[3 * cols]` and only
+/// its third segment, `[2 * cols, 3 * cols)`, is read -- it is not
+/// interchangeable with [`Affine::AdaScaleShift`]'s `[2 * cols]` style.
+///
+/// The gated form reads the gate from the *current* layer's conditioning and
+/// normalizes with the *next* layer's: the pi05 action expert folds the next
+/// layer's normalization into this layer's residual.
+pub struct FusedAddNormArgs<'a> {
     pub input: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub bias: &'a Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> LayerNormArgs<'a> {
-    pub fn new(input: &'a Tensor, weight: &'a Tensor, bias: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, weight, bias, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// Inputs for adaptive RMS normalization. `norm_style` is `[2 * cols]`.
-pub struct AdaptiveRmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub norm_style: &'a Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> AdaptiveRmsNormArgs<'a> {
-    pub fn new(input: &'a Tensor, norm_style: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, norm_style, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// Inputs for bias plus residual. Bias is optional by contract.
-pub struct BiasResidualArgs<'a> {
-    pub input: &'a Tensor,
+    pub residual: &'a Tensor,
     pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-}
-
-impl<'a> BiasResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, bias, residual, hidden }
-    }
-}
-
-pub struct BiasResidualRmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub weight: &'a Tensor,
+    pub gate: Option<&'a Tensor>,
     pub hidden: &'a mut Tensor,
     pub normalized: &'a mut Tensor,
+    pub kind: NormKind<'a>,
+    pub affine: Affine<'a>,
     pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
+    pub post: Option<QuantOut>,
 }
 
-impl<'a> BiasResidualRmsNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, weight: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, bias, residual, weight, hidden, normalized, eps, output_scale: 1.0 }
+impl<'a> FusedAddNormArgs<'a> {
+    pub fn new(
+        input: &'a Tensor,
+        residual: &'a Tensor,
+        hidden: &'a mut Tensor,
+        normalized: &'a mut Tensor,
+        kind: NormKind<'a>,
+        affine: Affine<'a>,
+        eps: f32,
+    ) -> Self {
+        Self {
+            input,
+            residual,
+            bias: None,
+            gate: None,
+            hidden,
+            normalized,
+            kind,
+            affine,
+            eps,
+            post: None,
+        }
     }
 }
 
-pub struct BiasResidualLayerNormArgs<'a> {
+/// Residual combine with no normalization. `bias` and `gate` are mutually
+/// exclusive; see [`FusedAddNormArgs`] for the gate layout.
+pub struct ResidualAddArgs<'a> {
     pub input: &'a Tensor,
+    pub residual: &'a Tensor,
     pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub norm_bias: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
+    pub gate: Option<&'a Tensor>,
+    pub order: BiasOrder,
+    pub out: &'a mut Tensor,
 }
 
-impl<'a> BiasResidualLayerNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, weight: &'a Tensor, norm_bias: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, bias, residual, weight, norm_bias, hidden, normalized, eps, output_scale: 1.0 }
+impl<'a> ResidualAddArgs<'a> {
+    pub fn new(
+        input: &'a Tensor,
+        bias: Option<&'a Tensor>,
+        residual: &'a Tensor,
+        out: &'a mut Tensor,
+    ) -> Self {
+        Self {
+            input,
+            residual,
+            bias,
+            gate: None,
+            order: BiasOrder::SingleRound,
+            out,
+        }
+    }
+
+    /// Gated combine: `out = residual + input * gate[2 * cols + c]`.
+    pub fn gated(
+        input: &'a Tensor,
+        residual: &'a Tensor,
+        gate: &'a Tensor,
+        out: &'a mut Tensor,
+    ) -> Self {
+        Self {
+            input,
+            residual,
+            bias: None,
+            gate: Some(gate),
+            order: BiasOrder::SingleRound,
+            out,
+        }
     }
 }
 
-/// Inputs for adaptive gate plus residual. `gate_style` is `[3 * cols]`.
-pub struct AdaGateResidualArgs<'a> {
-    pub input: &'a Tensor,
-    pub residual: &'a Tensor,
-    pub gate_style: &'a Tensor,
-    pub hidden: &'a mut Tensor,
+/// The Spec stage fields and the tensors a `kind`/`affine` pair binds.
+struct Stage<'a> {
+    norm_kind: u32,
+    affine_kind: u32,
+    weight: Option<&'a Tensor>,
+    norm_bias: Option<&'a Tensor>,
+    norm_style: Option<&'a Tensor>,
 }
 
-impl<'a> AdaGateResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, residual: &'a Tensor, gate_style: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, residual, gate_style, hidden }
+fn stage<'a>(kind: &NormKind<'a>, affine: &Affine<'a>) -> Stage<'a> {
+    let (norm_kind, norm_bias) = match kind {
+        NormKind::Rms => (abi::NORM_KIND_RMS, None),
+        NormKind::Layer { bias } => (abi::NORM_KIND_LAYER, Some(*bias)),
+    };
+    let (affine_kind, weight, norm_style) = match affine {
+        Affine::Weight { weight, offset } => (
+            if *offset {
+                abi::AFFINE_WEIGHT_OFFSET
+            } else {
+                abi::AFFINE_WEIGHT
+            },
+            Some(*weight),
+            None,
+        ),
+        Affine::AdaScaleShift { style } => (abi::AFFINE_ADA_SCALE_SHIFT, None, Some(*style)),
+    };
+    Stage {
+        norm_kind,
+        affine_kind,
+        weight,
+        norm_bias,
+        norm_style,
     }
 }
 
-pub struct AdaGateResidualRmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub residual: &'a Tensor,
-    pub norm_style: &'a Tensor,
-    pub gate_style: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> AdaGateResidualRmsNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, residual: &'a Tensor, norm_style: &'a Tensor, gate_style: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, residual, norm_style, gate_style, hidden, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// BF16-only two-rounding bias-then-residual contract.
-pub struct BiasThenResidualArgs<'a> {
-    pub input: &'a Tensor,
-    pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-}
-
-impl<'a> BiasThenResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, bias, residual, hidden }
+fn quant_scale(post: &Option<QuantOut>) -> Option<f32> {
+    match post {
+        Some(QuantOut::E4m3 { scale }) => Some(*scale),
+        None => None,
     }
 }
 
@@ -157,38 +248,140 @@ fn execute(ctx: &CudaContext, args: RawArgs<'_>) -> Result<()> {
     launch::execute(ctx, normalize(ctx, args)?)
 }
 
-pub fn rms_norm(ctx: &CudaContext, args: RmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::Rms, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+// Args -> RawArgs is kept as its own function per entry point so a test can
+// assert the Spec fields a given Args produces without launching anything.
+// This mapping is the whole content of the field model: a bug here silently
+// routes an operator to an arithmetically different kernel, which is exactly
+// what the nine fused semantics used to do by falling through.
+
+fn norm_raw_args(args: NormArgs<'_>) -> RawArgs<'_> {
+    let stage = stage(&args.kind, &args.affine);
+    let post_scale = quant_scale(&args.post);
+    RawArgs {
+        fields: Fields {
+            semantic: abi::SEMANTIC_NORM,
+            norm_kind: stage.norm_kind,
+            affine_kind: stage.affine_kind,
+            has_gate: false,
+            bias_order: abi::BIAS_ORDER_SINGLE_ROUND,
+        },
+        input: args.input,
+        bias: None,
+        residual: None,
+        weight: stage.weight,
+        norm_bias: stage.norm_bias,
+        norm_style: stage.norm_style,
+        gate_style: None,
+        hidden: None,
+        normalized: Some(args.out),
+        eps: args.eps,
+        post_scale,
+    }
 }
 
-pub fn layer_norm(ctx: &CudaContext, args: LayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::Layer, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: Some(args.bias), norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn fused_add_norm_raw_args(args: FusedAddNormArgs<'_>) -> RawArgs<'_> {
+    let stage = stage(&args.kind, &args.affine);
+    let post_scale = quant_scale(&args.post);
+    let has_gate = args.gate.is_some();
+    RawArgs {
+        fields: Fields {
+            semantic: abi::SEMANTIC_FUSED_ADD_NORM,
+            norm_kind: stage.norm_kind,
+            affine_kind: stage.affine_kind,
+            has_gate,
+            bias_order: abi::BIAS_ORDER_SINGLE_ROUND,
+        },
+        input: args.input,
+        bias: args.bias,
+        residual: Some(args.residual),
+        weight: stage.weight,
+        norm_bias: stage.norm_bias,
+        norm_style: stage.norm_style,
+        gate_style: args.gate,
+        hidden: Some(args.hidden),
+        normalized: Some(args.normalized),
+        eps: args.eps,
+        post_scale,
+    }
 }
 
-pub fn adaptive_rms_norm(ctx: &CudaContext, args: AdaptiveRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaptiveRms, input: args.input, bias: None, residual: None, weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn residual_add_raw_args(args: ResidualAddArgs<'_>) -> RawArgs<'_> {
+    let bias_order = match args.order {
+        BiasOrder::SingleRound => abi::BIAS_ORDER_SINGLE_ROUND,
+        BiasOrder::RoundAfterBias => abi::BIAS_ORDER_ROUND_AFTER_BIAS,
+    };
+    let has_gate = args.gate.is_some();
+    RawArgs {
+        fields: Fields {
+            semantic: abi::SEMANTIC_RESIDUAL_ADD,
+            norm_kind: abi::NORM_KIND_NONE,
+            affine_kind: abi::AFFINE_NONE,
+            has_gate,
+            bias_order,
+        },
+        input: args.input,
+        bias: args.bias,
+        residual: Some(args.residual),
+        weight: None,
+        norm_bias: None,
+        norm_style: None,
+        gate_style: args.gate,
+        hidden: Some(args.out),
+        normalized: None,
+        // The combine forms take no epsilon; the ABI validates it as a
+        // positive float whether or not a reduction consumes it.
+        eps: 1e-6,
+        post_scale: None,
+    }
 }
 
-pub fn bias_residual(ctx: &CudaContext, args: BiasResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+/// The `Spec` a `NormArgs` produces, without launching. Test-only hook for the
+/// field-mapping table in `l3_behavior`.
+#[cfg(test)]
+pub(crate) fn norm_spec(ctx: &CudaContext, args: NormArgs<'_>) -> Result<abi::Spec> {
+    Ok(normalize(ctx, norm_raw_args(args))?.spec)
 }
 
-pub fn bias_residual_rms_norm(ctx: &CudaContext, args: BiasResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidualRms, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+/// The `Spec` a `FusedAddNormArgs` produces, without launching.
+#[cfg(test)]
+pub(crate) fn fused_add_norm_spec(
+    ctx: &CudaContext,
+    args: FusedAddNormArgs<'_>,
+) -> Result<abi::Spec> {
+    Ok(normalize(ctx, fused_add_norm_raw_args(args))?.spec)
 }
 
-pub fn bias_residual_layer_norm(ctx: &CudaContext, args: BiasResidualLayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidualLayer, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: Some(args.norm_bias), norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+/// The `Spec` a `ResidualAddArgs` produces, without launching.
+#[cfg(test)]
+pub(crate) fn residual_add_spec(
+    ctx: &CudaContext,
+    args: ResidualAddArgs<'_>,
+) -> Result<abi::Spec> {
+    Ok(normalize(ctx, residual_add_raw_args(args))?.spec)
 }
 
-pub fn ada_gate_residual(ctx: &CudaContext, args: AdaGateResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaGateResidual, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+/// Row-wise normalization of a `[rows, cols]` activation.
+pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
+    execute(ctx, norm_raw_args(args))
 }
 
-pub fn ada_gate_residual_rms_norm(ctx: &CudaContext, args: AdaGateResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaGateResidualRms, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+/// Residual combine plus normalization in one launch, writing the combined
+/// row and the normalized row.
+pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<()> {
+    if args.bias.is_some() && args.gate.is_some() {
+        return Err(invalid(
+            "a fused add takes either a bias or a gate, not both",
+        ));
+    }
+    execute(ctx, fused_add_norm_raw_args(args))
 }
 
-pub fn bias_then_residual(ctx: &CudaContext, args: BiasThenResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasThenResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+/// Bias or gate combine plus residual, with no normalization.
+pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> {
+    if args.bias.is_some() && args.gate.is_some() {
+        return Err(invalid(
+            "a residual add takes either a bias or a gate, not both",
+        ));
+    }
+    execute(ctx, residual_add_raw_args(args))
 }

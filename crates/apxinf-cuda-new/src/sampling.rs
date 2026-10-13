@@ -62,7 +62,7 @@ impl CudaTokenSampler {
         let mut sort_bytes = 0usize;
         let mut scan_bytes = 0usize;
         let status = unsafe {
-            sampling_ffi::apxinf_cuda_new_token_sampling_workspace_sizes(
+            sampling_ffi::apxinf_sampling_workspace_sizes(
                 vocab_size,
                 &mut sort_bytes,
                 &mut scan_bytes,
@@ -192,7 +192,7 @@ impl TokenSampler for CudaTokenSampler {
         };
         let penalties = params.penalties;
         let status = unsafe {
-            sampling_ffi::apxinf_cuda_new_sample_token(
+            sampling_ffi::apxinf_sampling_sample_token(
                 logits_row.ptr(),
                 dtype_tag,
                 u32::try_from(self.spec.vocab_size).map_err(|_| {
@@ -291,7 +291,7 @@ impl NormalGenerator for CudaNormalGenerator {
     fn generate(&mut self, rng: RngKey) -> Result<&Tensor> {
         let output = CudaBuffer::from_tensor(&self.output).map_err(Error::Cuda)?;
         let status = unsafe {
-            sampling_ffi::apxinf_cuda_new_fill_standard_normal(
+            sampling_ffi::apxinf_sampling_fill_standard_normal(
                 output.ptr(),
                 dtype_tag(self.output.dtype())?,
                 u64::try_from(self.output.numel()).map_err(|_| {

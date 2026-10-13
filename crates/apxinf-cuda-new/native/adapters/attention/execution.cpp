@@ -1,5 +1,7 @@
 #include "internal.h"
 
+#include "../../kernels/custom/attention_gates.h"
+
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
@@ -585,5 +587,54 @@ extern "C" apxinf_status_t apxinf_decode_attention(
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "allocation-free FA2 decode is not compiled");
 #endif
+  });
+}
+
+// Qwen3.5's `attn_output_gate: true` pair. Neither goes through
+// prepare/enqueue: one implementation each and nothing to measure, so they
+// forward straight to kernels/custom/attention_gates.cu.
+
+namespace {
+
+bool gate_extent(int64_t value) { return value > 0 && value <= INT32_MAX; }
+
+}  // namespace
+
+extern "C" apxinf_status_t apxinf_attention_split_query_and_gate(
+    const void* fused, void* query, void* gate, int64_t tokens, int64_t heads,
+    int64_t head_dim, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (fused == nullptr || query == nullptr || gate == nullptr ||
+        !gate_extent(tokens) || !gate_extent(heads) ||
+        !gate_extent(head_dim)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid query/gate split arguments");
+    }
+    const int status = apxinf::cuda_new::attention_gates::split_query_and_gate(
+        fused, query, gate, static_cast<int>(tokens), static_cast<int>(heads),
+        static_cast<int>(head_dim), static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "query/gate split failed with status " +
+                        std::to_string(status));
+    }
+  });
+}
+
+extern "C" apxinf_status_t apxinf_attention_apply_output_gate(
+    void* data, const void* gate, int64_t count,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (data == nullptr || gate == nullptr || count <= 0) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid output gate arguments");
+    }
+    const int status = apxinf::cuda_new::attention_gates::apply_output_gate(
+        data, gate, count, static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "attention output gate failed with status " +
+                        std::to_string(status));
+    }
   });
 }

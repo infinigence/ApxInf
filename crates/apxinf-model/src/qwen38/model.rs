@@ -304,7 +304,7 @@ pub(crate) fn gdn_decode_layer(
     scratch: &mut Scratch,
     state: &mut GdnState,
 ) {
-    ops::mlp::rms_norm(ctx, &scratch.hidden, &gdn.input_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::norm(ctx, ops::NormArgs::rms_weight_offset(&scratch.hidden, &gdn.input_norm, &mut scratch.normalized, EPSILON)).unwrap();
     fp8_projection(
         ctx,
         &gdn.qkv,
@@ -487,7 +487,7 @@ pub(crate) fn decode_step_inner(
                 let cache = &mut kv_caches[attention_index];
                 attention_index += 1;
 
-                ops::mlp::rms_norm(ctx, &scratch.hidden, &attention.input_norm, &scratch.normalized, EPSILON).unwrap();
+                ops::norm(ctx, ops::NormArgs::rms_weight_offset(&scratch.hidden, &attention.input_norm, &mut scratch.normalized, EPSILON)).unwrap();
                 fp8_projection(ctx, &attention.q, &scratch.normalized, &scratch.fp8_activation, &mut scratch.qkv_fused);
                 let fused_heads = view(&scratch.qkv_fused, vec![1, HEADS, 2 * HEAD_DIM], DType::BF16);
                 ops::split_query_and_gate(ctx, &fused_heads, &scratch.query, &scratch.query_gate).unwrap();
@@ -600,7 +600,7 @@ pub(crate) fn decode_step_inner(
         );
     }
 
-    ops::mlp::rms_norm(ctx, &scratch.hidden, &model.final_norm, &scratch.normalized, EPSILON).unwrap();
+    ops::norm(ctx, ops::NormArgs::rms_weight_offset(&scratch.hidden, &model.final_norm, &mut scratch.normalized, EPSILON)).unwrap();
     ops::nvfp4_quantize_activation(ctx, &scratch.normalized, &scratch.nvfp4_activation, &scratch.nvfp4_scales, model.lm_head.input_scale, BLOCK, ops::ScaleLayout::GemmAtom).unwrap();
     nvfp4_decode_gemm(
         ctx,
@@ -984,8 +984,8 @@ pub(crate) fn prefill_step(
                 attention_index += 1;
 
                 let hidden = prefix(&scratch.hidden, vec![tokens, HIDDEN], DType::BF16);
-                let normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
-                ops::mlp::rms_norm(ctx, &hidden, &attention.input_norm, &normalized, EPSILON).unwrap();
+                let mut normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
+                ops::norm(ctx, ops::NormArgs::rms_weight_offset(&hidden, &attention.input_norm, &mut normalized, EPSILON)).unwrap();
 
                 if reuse_fp8_enabled() {
                     // q, k and v read the same post-norm activation, so it is
@@ -1101,8 +1101,8 @@ pub(crate) fn prefill_step(
                 };
 
                 let hidden = prefix(&scratch.hidden, vec![tokens, HIDDEN], DType::BF16);
-                let normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
-                ops::mlp::rms_norm(ctx, &hidden, &gdn.input_norm, &normalized, EPSILON).unwrap();
+                let mut normalized = prefix(&scratch.normalized, vec![tokens, HIDDEN], DType::BF16);
+                ops::norm(ctx, ops::NormArgs::rms_weight_offset(&hidden, &gdn.input_norm, &mut normalized, EPSILON)).unwrap();
 
                 if reuse_fp8_enabled() {
                     // qkv and z read the same post-norm activation, so it is
@@ -1383,7 +1383,10 @@ pub(crate) fn prefill_logits(
     tokens: usize,
 ) {
     let last = view_row(&prefill.hidden, tokens - 1, HIDDEN, DType::BF16);
-    ops::mlp::rms_norm(ctx, &last, &model.final_norm, &decode.normalized, EPSILON).unwrap();
+    // `decode` is shared here, so normalize through an aliasing handle to the
+    // same allocation rather than widening the signature to &mut.
+    let mut normalized = prefix(&decode.normalized, vec![1, HIDDEN], DType::BF16);
+    ops::norm(ctx, ops::NormArgs::rms_weight_offset(&last, &model.final_norm, &mut normalized, EPSILON)).unwrap();
     ops::nvfp4_quantize_activation(
         ctx,
         &decode.normalized,

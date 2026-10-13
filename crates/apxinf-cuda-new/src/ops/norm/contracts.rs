@@ -3,48 +3,26 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::norm as abi;
 use crate::{CudaBuffer, CudaContext};
 
-/// Which row-wise operation the bindings describe. See `norm_types.h` for the
-/// binding table; every variant here matches one native semantic.
+/// The stage fields of one native Norm Spec, minus the quantization kind,
+/// which follows from the output tensor's dtype rather than from the pipeline
+/// shape. Mirrors the field group in `norm_types.h`, and the predicates below
+/// mirror the ones the native adapter derives from the same fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Semantic {
-    Rms,
-    Layer,
-    AdaptiveRms,
-    BiasResidual,
-    BiasResidualRms,
-    BiasResidualLayer,
-    AdaGateResidual,
-    AdaGateResidualRms,
-    /// Adds the optional bias, rounds that intermediate to BF16, then adds the
-    /// residual and rounds again. This is deliberately distinct from
-    /// [`Self::BiasResidual`], which rounds only the final sum.
-    BiasThenResidual,
+pub(crate) struct Fields {
+    pub semantic: u32,
+    pub norm_kind: u32,
+    pub affine_kind: u32,
+    pub has_gate: bool,
+    pub bias_order: u32,
 }
 
-impl Semantic {
-    fn code(self) -> u32 {
-        match self {
-            Self::Rms => 0,
-            Self::Layer => 1,
-            Self::AdaptiveRms => 2,
-            Self::BiasResidual => 3,
-            Self::BiasResidualRms => 4,
-            Self::BiasResidualLayer => 5,
-            Self::AdaGateResidual => 6,
-            Self::AdaGateResidualRms => 7,
-            Self::BiasThenResidual => 8,
-        }
-    }
-
+impl Fields {
     fn writes_hidden(self) -> bool {
-        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
+        self.semantic != abi::SEMANTIC_NORM
     }
 
     fn writes_normalized(self) -> bool {
-        !matches!(
-            self,
-            Self::BiasResidual | Self::AdaGateResidual | Self::BiasThenResidual
-        )
+        self.semantic != abi::SEMANTIC_RESIDUAL_ADD
     }
 
     fn reads_residual(self) -> bool {
@@ -52,32 +30,29 @@ impl Semantic {
     }
 
     fn reads_weight(self) -> bool {
-        matches!(
-            self,
-            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
-        )
+        self.affine_kind == abi::AFFINE_WEIGHT || self.affine_kind == abi::AFFINE_WEIGHT_OFFSET
     }
 
     fn reads_norm_bias(self) -> bool {
-        matches!(self, Self::Layer | Self::BiasResidualLayer)
+        self.norm_kind == abi::NORM_KIND_LAYER
     }
 
     fn reads_norm_style(self) -> bool {
-        matches!(self, Self::AdaptiveRms | Self::AdaGateResidualRms)
+        self.affine_kind == abi::AFFINE_ADA_SCALE_SHIFT
     }
 
     fn reads_gate_style(self) -> bool {
-        matches!(self, Self::AdaGateResidual | Self::AdaGateResidualRms)
+        self.has_gate
     }
 
+    /// The gate replaces the bias in the combine, so a gated pipeline never
+    /// takes one, and a pipeline with no combine has nothing to add it to.
     fn may_have_bias(self) -> bool {
-        matches!(
-            self,
-            Self::BiasResidual
-                | Self::BiasResidualRms
-                | Self::BiasResidualLayer
-                | Self::BiasThenResidual
-        )
+        self.writes_hidden() && !self.has_gate
+    }
+
+    fn rounds_after_bias(self) -> bool {
+        self.bias_order == abi::BIAS_ORDER_ROUND_AFTER_BIAS
     }
 }
 
@@ -86,7 +61,7 @@ impl Semantic {
 /// `norm_style` is `[2 * cols]` (scale then shift) and `gate_style` is
 /// `[3 * cols]` whose third segment is the gate; they are not interchangeable.
 pub(crate) struct RawArgs<'a> {
-    pub(crate) semantic: Semantic,
+    pub(crate) fields: Fields,
     pub(crate) input: &'a Tensor,
     pub(crate) bias: Option<&'a Tensor>,
     pub(crate) residual: Option<&'a Tensor>,
@@ -97,7 +72,12 @@ pub(crate) struct RawArgs<'a> {
     pub(crate) hidden: Option<&'a mut Tensor>,
     pub(crate) normalized: Option<&'a mut Tensor>,
     pub(crate) eps: f32,
-    pub(crate) output_scale: f32,
+    /// The `QuantOut` scale, or `None` when the caller asked for no output
+    /// quantization. Deliberately not a bare `f32` defaulting to 1.0: that
+    /// made `post: Some(E4m3 { scale: 1.0 })` indistinguishable from `post:
+    /// None`, so a quantization request against a non-E4M3 output was
+    /// silently dropped instead of refused.
+    pub(crate) post_scale: Option<f32>,
 }
 
 pub(crate) struct Normalized {
@@ -160,7 +140,7 @@ fn tensor_storage(
 }
 
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
-    let semantic = args.semantic;
+    let fields = args.fields;
     let dims = args.input.shape().dims();
     if dims.len() != 2 {
         return Err(invalid("Norm input must be rank 2 [rows, cols]"));
@@ -174,7 +154,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Norm column count exceeds the CUDA kernel range"))?;
     let dtype = args.input.dtype();
-    if semantic == Semantic::BiasThenResidual && dtype != DType::BF16 {
+    if fields.rounds_after_bias() && dtype != DType::BF16 {
         return Err(invalid(
             "BiasThenResidual is a BF16-only semantic because its intermediate rounding is part of the contract",
         ));
@@ -186,31 +166,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     if !(args.eps.is_finite() && args.eps > 0.0) {
         return Err(invalid("Norm eps must be finite and positive"));
     }
-    if !(args.output_scale.is_finite() && args.output_scale > 0.0) {
+    let output_scale = args.post_scale.unwrap_or(1.0);
+    if !(output_scale.is_finite() && output_scale > 0.0) {
         return Err(invalid("Norm output_scale must be finite and positive"));
     }
-    if args.bias.is_some() && !semantic.may_have_bias() {
+    if args.bias.is_some() && !fields.may_have_bias() {
         return Err(invalid("Norm semantic does not take a bias"));
     }
-    if args.residual.is_some() && !semantic.reads_residual() {
+    if args.residual.is_some() && !fields.reads_residual() {
         return Err(invalid("Norm semantic does not take a residual"));
     }
-    if args.weight.is_some() && !semantic.reads_weight() {
+    if args.weight.is_some() && !fields.reads_weight() {
         return Err(invalid("Norm semantic does not take a weight"));
     }
-    if args.norm_bias.is_some() && !semantic.reads_norm_bias() {
+    if args.norm_bias.is_some() && !fields.reads_norm_bias() {
         return Err(invalid("Norm semantic does not take a norm bias"));
     }
-    if args.norm_style.is_some() && !semantic.reads_norm_style() {
+    if args.norm_style.is_some() && !fields.reads_norm_style() {
         return Err(invalid("Norm semantic does not take a norm style"));
     }
-    if args.gate_style.is_some() && !semantic.reads_gate_style() {
+    if args.gate_style.is_some() && !fields.reads_gate_style() {
         return Err(invalid("Norm semantic does not take a gate style"));
     }
-    if args.hidden.is_some() && !semantic.writes_hidden() {
+    if args.hidden.is_some() && !fields.writes_hidden() {
         return Err(invalid("Norm semantic does not write a hidden output"));
     }
-    if args.normalized.is_some() && !semantic.writes_normalized() {
+    if args.normalized.is_some() && !fields.writes_normalized() {
         return Err(invalid("Norm semantic does not write a normalized output"));
     }
 
@@ -242,21 +223,21 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (bias, bias_alignment) = bind_vector(args.bias, false, cols, "bias", &mut storage)?;
     let (residual, residual_alignment) = bind_vector(
         args.residual,
-        semantic.reads_residual(),
+        fields.reads_residual(),
         count,
         "residual",
         &mut storage,
     )?;
     let (weight, weight_alignment) = bind_vector(
         args.weight,
-        semantic.reads_weight(),
+        fields.reads_weight(),
         cols,
         "weight",
         &mut storage,
     )?;
     let (norm_bias, norm_bias_alignment) = bind_vector(
         args.norm_bias,
-        semantic.reads_norm_bias(),
+        fields.reads_norm_bias(),
         cols,
         "norm_bias",
         &mut storage,
@@ -266,7 +247,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .ok_or_else(|| invalid("Norm style size overflow"))?;
     let (norm_style, norm_style_alignment) = bind_vector(
         args.norm_style,
-        semantic.reads_norm_style(),
+        fields.reads_norm_style(),
         norm_style_elements,
         "norm_style",
         &mut storage,
@@ -276,7 +257,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .ok_or_else(|| invalid("Norm gate style size overflow"))?;
     let (gate_style, gate_style_alignment) = bind_vector(
         args.gate_style,
-        semantic.reads_gate_style(),
+        fields.reads_gate_style(),
         gate_style_elements,
         "gate_style",
         &mut storage,
@@ -303,7 +284,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
 
     let (hidden, hidden_alignment) = bind_output(
         args.hidden,
-        semantic.writes_hidden(),
+        fields.writes_hidden(),
         dtype,
         "hidden",
         &mut storage,
@@ -312,20 +293,41 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .normalized
         .as_ref()
         .map_or(dtype, |tensor| tensor.dtype());
-    if output_dtype == DType::F8E4M3 {
-        if dtype != DType::F16 || !semantic.writes_normalized() {
-            return Err(invalid(
-                "Quantized Norm output requires an F16 normalization semantic",
-            ));
+    // The output dtype and `post` are one decision stated twice, so they must
+    // agree. Deriving `quant_kind` from the dtype alone let a `post` on a
+    // non-E4M3 output be dropped whenever its scale happened to be 1.0 -- the
+    // caller asked for quantization and got a plain norm, silently.
+    let quant_kind = match (output_dtype == DType::F8E4M3, args.post_scale.is_some()) {
+        (true, true) => {
+            if dtype != DType::F16 || !fields.writes_normalized() {
+                return Err(invalid(
+                    "Quantized Norm output requires an F16 normalization semantic",
+                ));
+            }
+            abi::QUANT_E4M3
         }
-    } else if output_dtype != dtype || args.output_scale != 1.0 {
-        return Err(invalid(
-            "Non-quantized Norm output must preserve dtype and use unit output_scale",
-        ));
-    }
+        (false, false) => {
+            if output_dtype != dtype {
+                return Err(invalid(
+                    "Non-quantized Norm output must preserve dtype and use unit output_scale",
+                ));
+            }
+            abi::QUANT_NONE
+        }
+        (true, false) => {
+            return Err(invalid(
+                "E4M3 Norm output requires a post quantization scale",
+            ))
+        }
+        (false, true) => {
+            return Err(invalid(
+                "Non-quantized Norm output must preserve dtype and use unit output_scale",
+            ))
+        }
+    };
     let (normalized, normalized_alignment) = bind_output(
         args.normalized,
-        semantic.writes_normalized(),
+        fields.writes_normalized(),
         output_dtype,
         "normalized",
         &mut storage,
@@ -334,7 +336,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let dtype_value = dtype_code(dtype)?;
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
-        semantic: semantic.code(),
+        semantic: fields.semantic,
+        norm_kind: fields.norm_kind,
+        affine_kind: fields.affine_kind,
+        has_gate: u32::from(fields.has_gate),
+        bias_order: fields.bias_order,
+        quant_kind,
         dtype: dtype_value,
         output_dtype: output_dtype_code(output_dtype)?,
         has_bias: u32::from(!bias.is_null()),
@@ -347,7 +354,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         normalized_alignment,
         rows: i64::from(rows_abi),
         cols: i64::from(cols_abi),
-        output_scale_is_unit: u32::from(args.output_scale == 1.0),
+        output_scale_is_unit: u32::from(output_scale == 1.0),
     };
 
     let bindings = abi::Bindings {
@@ -362,7 +369,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         normalized,
         stream: ctx.stream().handle() as abi::CudaStream,
         eps: args.eps,
-        output_scale: args.output_scale,
+        output_scale,
     };
 
     Ok(Normalized {

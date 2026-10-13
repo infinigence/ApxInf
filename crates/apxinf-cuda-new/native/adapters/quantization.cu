@@ -1,5 +1,6 @@
 #include "../include/apxinf_cuda/quantization.h"
 #include "../framework/runtime_internal.h"
+#include "../kernels/custom/quantization_ops.h"
 
 #include <climits>
 #include <cmath>
@@ -311,5 +312,32 @@ extern "C" apxinf_status_t apxinf_quantization_launch(
     validate_bindings(*spec, *bindings);
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(launch(*spec, *bindings));
+  });
+}
+
+// The family's non-Spec member. It forwards straight to
+// kernels/custom/quantization_ops.cu rather than through the Spec above: the
+// FIXED_SCALE_E4M3 semantic computes the same arithmetic, but that kernel's
+// BF16 path is scalar where this one is 8-wide, and the two differ on NaN
+// input, so they are not yet interchangeable.
+
+extern "C" apxinf_status_t apxinf_quantization_fp8_per_tensor(
+    const void* input, void* output, int64_t count, float input_scale,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (input == nullptr || output == nullptr || count <= 0 ||
+        !(input_scale > 0.0F)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid FP8 quantization arguments");
+    }
+    const int status =
+        apxinf::cuda_new::quantization_ops::quantize_fp8_per_tensor(
+            input, output, count, input_scale,
+            static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "FP8 quantization failed with status " +
+                        std::to_string(status));
+    }
   });
 }

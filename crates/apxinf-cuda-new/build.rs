@@ -332,10 +332,7 @@ fn main() {
         "attention/autotune.cpp",
         "attention/execution.cpp",
         "attention/providers/custom.cu",
-        "elementwise/execution.cpp",
-        "linear_attention/execution.cpp",
-        "attn_helpers/execution.cpp",
-        "reduction/execution.cpp",
+        "gdn/execution.cpp",
         "sampling.cu",
         "norm.cu",
         "pointwise.cu",
@@ -345,11 +342,17 @@ fn main() {
     ]
     .map(|source| adapters.join(source))
     .to_vec();
-    generic_sources.push(native.join("kernels/custom/mlp_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/pointwise_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/quantization_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/gemv.cu"));
+    generic_sources.push(native.join("kernels/custom/norm_offset.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
     generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
-    generic_sources.push(native.join("kernels/custom/attn_ops.cu"));
-    generic_sources.push(native.join("kernels/custom/model_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/rope_partial.cu"));
+    generic_sources.push(native.join("kernels/custom/norm_head.cu"));
+    generic_sources.push(native.join("kernels/custom/attention_gates.cu"));
+    generic_sources.push(native.join("kernels/custom/gather_embedding.cu"));
+    generic_sources.push(native.join("kernels/custom/sampling_argmax.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));
     let cutlass_root = native.join("kernels/cutlass");
     let fa2_root = native.join("kernels/fa2");

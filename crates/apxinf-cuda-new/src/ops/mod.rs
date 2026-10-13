@@ -1,17 +1,15 @@
 //! Semantic CUDA APIs with selection and native state behind L1.
 
 mod attention;
-mod attn_ops;
 mod cache;
 mod gather;
 mod gdn;
 mod gemm;
-pub mod mlp;
-mod model;
 mod norm;
 mod pointwise;
 mod quantization;
 mod rope;
+mod sampling;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -21,21 +19,24 @@ pub(crate) use attention::{
     normalize_kv_cache_attention, normalize_segmented_attention,
 };
 #[cfg(test)]
+pub(crate) use norm::{fused_add_norm_spec, norm_spec, residual_add_spec};
+#[cfg(test)]
 pub(crate) use gemm::contracts;
 #[cfg(test)]
 pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use attention::{
-    attention, decode_attention, decode_attention_workspace_bytes, kv_cache_attention,
-    packed_qkv_attention, segmented_attention, AttentionArgs, AttentionMask, AttentionPolicy,
-    KvCacheAttentionArgs, KvCacheDecodeMeta, PackedQkvAttentionArgs, SegmentedAttentionArgs,
-};
-pub use attn_ops::{
-    apply_output_gate, head_rms_norm, partial_rope, rotary_dim, split_query_and_gate,
+    apply_output_gate, attention, decode_attention, decode_attention_workspace_bytes,
+    kv_cache_attention, packed_qkv_attention, segmented_attention, split_query_and_gate,
+    AttentionArgs, AttentionMask, AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta,
+    PackedQkvAttentionArgs, SegmentedAttentionArgs,
 };
 pub use cache::{concat_rows, reserve_prefix};
-pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
+pub use gather::{
+    embedding_gather, gather, GatherArgs, GatherSemantic,
+    PatchGeometry as GatherPatchGeometry,
+};
 pub use gdn::{
     gdn_causal_conv_forward, gdn_causal_conv_step, gdn_decay_and_beta,
     gdn_decay_and_beta_seq, gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
@@ -45,23 +46,25 @@ pub use gdn::{
     gdn_recurrent_step, gdn_state_elements,
 };
 pub use gemm::{
-    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, nvfp4_dense_swiglu_aot,
-    nvfp4_pack_block_scales, nvfp4_quantize_activation, nvfp4_quantize_rms_norm,
+    fp8_gemv, gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, nvfp4_dense_swiglu_aot,
+    nvfp4_gemv, nvfp4_pack_block_scales, nvfp4_quantize_activation, nvfp4_quantize_rms_norm,
     nvfp4_quantize_swiglu, nvfp4_scale_buffer_bytes, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
     GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization, ScaleLayout, WeightVersion,
 };
-pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
-pub use model::{argmax, embedding_gather};
 pub use norm::{
-    ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual,
-    bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, layer_norm, rms_norm,
-    AdaGateResidualArgs, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs, BiasResidualArgs,
-    BiasResidualLayerNormArgs, BiasResidualRmsNormArgs, BiasThenResidualArgs, LayerNormArgs,
-    RmsNormArgs,
+    fused_add_norm, head_rms_norm, norm, residual_add, Affine, BiasOrder, FusedAddNormArgs,
+    NormArgs, NormKind, QuantOut, ResidualAddArgs,
 };
-pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
-pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
-pub use rope::{decode_rope, rope, DecodeRopeArgs, RopeArgs, RopeSemantic};
+pub use pointwise::{
+    add_into, pointwise, swiglu, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
+};
+pub use quantization::{
+    quantization, quantize_fp8_per_tensor, QuantizationArgs, QuantizationSemantic,
+};
+pub use rope::{
+    decode_rope, partial_rope, rope, rotary_dim, DecodeRopeArgs, RopeArgs, RopeSemantic,
+};
+pub use sampling::argmax;
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

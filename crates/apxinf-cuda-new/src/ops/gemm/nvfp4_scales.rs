@@ -166,7 +166,8 @@ pub fn nvfp4_quantize_activation(
 
 /// RMSNorm fused with NVFP4 quantization.
 ///
-/// Equivalent to [`crate::ops::mlp::rms_norm`] followed by
+/// Equivalent to [`crate::ops::norm`] with the
+/// [`Affine::Weight`](crate::ops::Affine) `offset` form, followed by
 /// [`nvfp4_quantize_activation`], but never materializes the normalized BF16
 /// tensor. At prefill widths that round trip dominates both ops' arithmetic.
 pub fn nvfp4_quantize_rms_norm(

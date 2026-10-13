@@ -1,6 +1,7 @@
 #include "../include/apxinf_cuda/rope.h"
 #include "../framework/runtime_internal.h"
 #include "../kernels/custom/rope.cuh"
+#include "../kernels/custom/rope_partial.h"
 
 #include <climits>
 #include <cmath>
@@ -207,5 +208,37 @@ extern "C" apxinf_status_t apxinf_rope_launch(
                    ? launch_split<__nv_bfloat16>(*spec, *bindings)
                    : launch_split<__half>(*spec, *bindings));
     apxinf::framework::check_cuda(status);
+  });
+}
+
+// The family's non-Spec member. Rotates one tensor in place, where every Spec
+// semantic fuses a QKV split and writes three outputs, so it forwards straight
+// to kernels/custom/rope_partial.cu instead of taking a Spec.
+
+namespace {
+
+bool rope_extent(int64_t value) { return value > 0 && value <= INT32_MAX; }
+
+}  // namespace
+
+extern "C" apxinf_status_t apxinf_rope_partial(
+    void* data, const void* positions, int64_t tokens, int64_t heads,
+    int64_t head_dim, int64_t rotary_dim, float theta,
+    apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (data == nullptr || positions == nullptr || !rope_extent(tokens) ||
+        !rope_extent(heads) || !rope_extent(head_dim) ||
+        !rope_extent(rotary_dim)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE arguments");
+    }
+    const int status = apxinf::cuda_new::rope_partial::partial_rope(
+        data, positions, static_cast<int>(tokens), static_cast<int>(heads),
+        static_cast<int>(head_dim), static_cast<int>(rotary_dim), theta,
+        static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "partial RoPE failed with status " +
+                        std::to_string(status));
+    }
   });
 }

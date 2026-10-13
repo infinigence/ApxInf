@@ -69,6 +69,26 @@ apxinf_status_t apxinf_gemm_nvfp4_dense_swiglu_aot(
     const void* token_map, const void* tile_count,
     int64_t rows, int64_t n, int64_t k, apxinf_cuda_stream_t stream);
 
+/* The M=1 projections: one implementation each and no candidates to measure
+   between, so they take flat parameters rather than going through
+   apxinf_gemm_prepare (doc/cuda-new-design.md section 5). The math is still a
+   GEMM, so they belong to this family rather than to the MLP that calls them.
+   Kernels in kernels/custom/gemv.cu. */
+
+/* Single-token FP8 projection over a [N, K] weight -- the checkpoint's own
+   orientation, so no transpose is needed. */
+apxinf_status_t apxinf_gemm_fp8_gemv(const void* weight, const void* activation,
+                                void* output, int64_t n, int64_t k,
+                                float alpha, apxinf_cuda_stream_t stream);
+
+/* Single-token NVFP4 projection. Scales are plain row-major [rows, K/16] --
+   the checkpoint's own layout, no atom relayout needed. */
+apxinf_status_t apxinf_gemm_nvfp4_gemv(const void* weight, const void* weight_scales,
+                                  const void* activation,
+                                  const void* activation_scales, void* output,
+                                  int64_t n, int64_t k, float alpha,
+                                  apxinf_cuda_stream_t stream);
+
 uint64_t apxinf_gemm_execution_weight_prepack_count(
     apxinf_gemm_execution_t execution);
 apxinf_status_t apxinf_gemm_test_validate_candidates(

@@ -1,4 +1,11 @@
-// Linear-attention (GDN) kernels: recurrent step, causal conv, gated norm, L2 norm, decay/beta.
+// GDN (gated delta net) linear-attention kernels: recurrent step, causal conv,
+// gated norm, L2 norm, decay/beta.
+//
+// This directory was `adapters/linear_attention/` while the Rust side was
+// `ops/gdn.rs` and all sixteen entry points were `apxinf_gdn_*`. GDN is the
+// mathematical object -- doc/cuda-new-design.md section 8.1 uses `gdn_prefill`
+// as its own example of a well-formed name -- so the directory moved to match
+// the layer above and below it rather than the other way round.
 //
 // These ops have a single fixed implementation and no persisted selection,
 // so per doc/adding-new-kernels.md §6 they carry no candidate registry,

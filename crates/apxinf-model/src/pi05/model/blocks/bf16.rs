@@ -2,17 +2,13 @@
 
 use crate::pi05::backend::{
     ops::{
-        attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
-        adaptive_rms_norm as l3_adaptive_rms_norm, bias_residual as l3_bias_residual,
-        bias_residual_layer_norm as l3_bias_residual_layer_norm,
-        bias_residual_rms_norm as l3_bias_residual_rms_norm, gemm as l3_gemm,
-        gemm_geglu as l3_gemm_geglu, layer_norm as l3_layer_norm,
-        pointwise as l3_pointwise, rms_norm as l3_rms_norm,
-        reserve_prefix as l3_reserve_prefix, rope as l3_rope, AttentionArgs, GatherArgs,
-        AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs, GemmGegluArgs,
-        LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic, RmsNormArgs,
-        RopeArgs, RopeSemantic, WeightVersion,
+        attention as l3_attention, concat_rows as l3_concat_rows,
+        fused_add_norm as l3_fused_add_norm, gather as l3_gather, gemm as l3_gemm,
+        gemm_geglu as l3_gemm_geglu, norm as l3_norm, pointwise as l3_pointwise,
+        reserve_prefix as l3_reserve_prefix, residual_add as l3_residual_add, rope as l3_rope,
+        Affine, AttentionArgs, FusedAddNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic,
+        GemmArgs, GemmGegluArgs, NormArgs, NormKind, PointwiseActivation, PointwiseArgs,
+        PointwiseSemantic, ResidualAddArgs, RopeArgs, RopeSemantic, WeightVersion,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -48,7 +44,16 @@ struct ResidualNormTensors {
 
 fn rms_bf16(ctx: &Context, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_rms_norm(ctx, RmsNormArgs::new(input, weight, &mut output, eps))?;
+    l3_norm(
+        ctx,
+        NormArgs::new(
+            input,
+            &mut output,
+            NormKind::Rms,
+            Affine::Weight { weight, offset: false },
+            eps,
+        ),
+    )?;
     Ok(output)
 }
 
@@ -60,9 +65,15 @@ fn layer_bf16(
     eps: f32,
 ) -> Result<Tensor> {
     let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_layer_norm(
+    l3_norm(
         ctx,
-        LayerNormArgs::new(input, weight, bias, &mut output, eps),
+        NormArgs::new(
+            input,
+            &mut output,
+            NormKind::Layer { bias },
+            Affine::Weight { weight, offset: false },
+            eps,
+        ),
     )?;
     Ok(output)
 }
@@ -81,9 +92,15 @@ fn adaptive_rms_bf16(
         .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
     let style = bf16_vector_prefix(style, 2 * cols)?;
     let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_adaptive_rms_norm(
+    l3_norm(
         ctx,
-        AdaptiveRmsNormArgs::new(input, &style, &mut output, eps),
+        NormArgs::new(
+            input,
+            &mut output,
+            NormKind::Rms,
+            Affine::AdaScaleShift { style: &style },
+            eps,
+        ),
     )?;
     Ok(output)
 }
@@ -436,9 +453,9 @@ fn bias_residual_bf16(
     residual: &Tensor,
 ) -> Result<Tensor> {
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual(
+    l3_residual_add(
         ctx,
-        BiasResidualArgs::new(projection, bias, residual, &mut hidden),
+        ResidualAddArgs::new(projection, bias, residual, &mut hidden),
     )?;
     Ok(hidden)
 }
@@ -453,18 +470,17 @@ fn bias_residual_rms_bf16(
 ) -> Result<ResidualNormTensors> {
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual_rms_norm(
-        ctx,
-        BiasResidualRmsNormArgs::new(
-            projection,
-            bias,
-            residual,
-            weight,
-            &mut hidden,
-            &mut normalized,
-            eps,
-        ),
-    )?;
+    let mut args = FusedAddNormArgs::new(
+        projection,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        NormKind::Rms,
+        Affine::Weight { weight, offset: false },
+        eps,
+    );
+    args.bias = bias;
+    l3_fused_add_norm(ctx, args)?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
 
@@ -480,19 +496,17 @@ fn bias_residual_layer_bf16(
 ) -> Result<ResidualNormTensors> {
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual_layer_norm(
-        ctx,
-        BiasResidualLayerNormArgs::new(
-            projection,
-            projection_bias,
-            residual,
-            norm_weight,
-            norm_bias,
-            &mut hidden,
-            &mut normalized,
-            eps,
-        ),
-    )?;
+    let mut args = FusedAddNormArgs::new(
+        projection,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        NormKind::Layer { bias: norm_bias },
+        Affine::Weight { weight: norm_weight, offset: false },
+        eps,
+    );
+    args.bias = projection_bias;
+    l3_fused_add_norm(ctx, args)?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
 
@@ -513,18 +527,17 @@ fn adaptive_gate_residual_rms_bf16(
     let norm_style = bf16_vector_prefix(norm_style, 2 * cols)?;
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    crate::pi05::backend::ops::ada_gate_residual_rms_norm(
-        ctx,
-        crate::pi05::backend::ops::AdaGateResidualRmsNormArgs::new(
-            projection,
-            residual,
-            &norm_style,
-            gate_style,
-            &mut hidden,
-            &mut normalized,
-            eps,
-        ),
-    )?;
+    let mut args = FusedAddNormArgs::new(
+        projection,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        NormKind::Rms,
+        Affine::AdaScaleShift { style: &norm_style },
+        eps,
+    );
+    args.gate = Some(gate_style);
+    l3_fused_add_norm(ctx, args)?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
 

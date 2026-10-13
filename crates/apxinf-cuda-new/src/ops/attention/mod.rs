@@ -1,10 +1,12 @@
 mod attention;
 pub(crate) mod contracts;
 pub(crate) mod execution;
+mod gates;
 mod kv_cache_attention;
 mod segmented_attention;
 
 pub use attention::{attention, packed_qkv_attention};
+pub use gates::{apply_output_gate, split_query_and_gate};
 pub use contracts::{AttentionArgs, AttentionMask, AttentionPolicy, PackedQkvAttentionArgs};
 pub use kv_cache_attention::{
     decode_attention, decode_attention_workspace_bytes, kv_cache_attention, KvCacheAttentionArgs,

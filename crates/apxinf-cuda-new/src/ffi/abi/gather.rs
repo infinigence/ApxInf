@@ -42,4 +42,17 @@ unsafe extern "C" {
         spec: *const Spec,
         bindings: *const Bindings,
     ) -> i32;
+
+    /// Plain BF16 embedding lookup. Not the `EmbeddingLookup` [`Spec`]
+    /// semantic: that one always applies Gemma's `sqrt(cols)` scale and
+    /// indexes with `u32`, where this is a plain copy indexed with `i32`.
+    pub(crate) fn apxinf_gather_embedding(
+        table: *const c_void,
+        ids: *const c_void,
+        output: *mut c_void,
+        tokens: i64,
+        hidden: i64,
+        vocab: i64,
+        stream: CudaStream,
+    ) -> i32;
 }

@@ -1,11 +1,13 @@
 #include "../include/apxinf_cuda/pointwise.h"
 #include "../framework/runtime_internal.h"
 #include "../kernels/custom/pointwise.cuh"
+#include "../kernels/custom/pointwise_ops.h"
 
 #include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <string>
 
 namespace {
 #include "../kernels/primitives/math.cuh"
@@ -287,5 +289,57 @@ extern "C" apxinf_status_t apxinf_pointwise_launch(
         spec->dtype == APXINF_DTYPE_BF16
             ? launch_bf16(*spec, *bindings)
             : launch<__half>(*spec, *bindings));
+  });
+}
+
+// The family's non-Spec members. They forward straight to
+// kernels/custom/pointwise_ops.cu: one BF16 implementation each, no Spec to
+// validate and nothing to select, so there is no candidate registry or tuning
+// key here (doc/adding-new-kernels.md section 6).
+
+namespace {
+
+void check_kernel_status(int status, const char* what) {
+  if (status != 0) {
+    throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                  std::string(what) + " failed with status " +
+                      std::to_string(status));
+  }
+}
+
+bool valid_extent(int64_t value) {
+  return value > 0 && value <= INT32_MAX;
+}
+
+}  // namespace
+
+extern "C" apxinf_status_t apxinf_pointwise_swiglu(const void* fused_gate_up,
+                                              void* output, int64_t rows,
+                                              int64_t width,
+                                              apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (fused_gate_up == nullptr || output == nullptr || !valid_extent(rows) ||
+        !valid_extent(width)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid SwiGLU arguments");
+    }
+    check_kernel_status(apxinf::cuda_new::pointwise_ops::swiglu_bf16(
+                            fused_gate_up, output, static_cast<int>(rows),
+                            static_cast<int>(width),
+                            static_cast<cudaStream_t>(stream)),
+                        "SwiGLU");
+  });
+}
+
+extern "C" apxinf_status_t apxinf_pointwise_add_into(const void* addend,
+                                           void* accumulator, int64_t count,
+                                           apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (addend == nullptr || accumulator == nullptr || count <= 0) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid add arguments");
+    }
+    check_kernel_status(apxinf::cuda_new::pointwise_ops::add_bf16(
+                            addend, accumulator, count,
+                            static_cast<cudaStream_t>(stream)),
+                        "add");
   });
 }

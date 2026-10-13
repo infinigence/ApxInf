@@ -230,9 +230,15 @@ fn rms_normalized_fp8(
     scale: f32,
 ) -> Result<Tensor> {
     let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::RmsNormArgs::new(input, weight, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::rms_norm(ctx, args)?;
+    let mut args = ops::NormArgs::new(
+        input,
+        &mut normalized,
+        ops::NormKind::Rms,
+        ops::Affine::Weight { weight, offset: false },
+        eps,
+    );
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::norm(ctx, args)?;
     Ok(normalized)
 }
 
@@ -246,9 +252,15 @@ fn layer_normalized_fp8(
     scale: f32,
 ) -> Result<Tensor> {
     let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::LayerNormArgs::new(input, weight, bias, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::layer_norm(ctx, args)?;
+    let mut args = ops::NormArgs::new(
+        input,
+        &mut normalized,
+        ops::NormKind::Layer { bias },
+        ops::Affine::Weight { weight, offset: false },
+        eps,
+    );
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::norm(ctx, args)?;
     Ok(normalized)
 }
 
@@ -284,9 +296,15 @@ fn adaptive_rms_normalized_fp8(
         .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
     let norm_style = f16_vector_prefix(norm_style, 2 * cols)?;
     let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::AdaptiveRmsNormArgs::new(input, &norm_style, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::adaptive_rms_norm(ctx, args)?;
+    let mut args = ops::NormArgs::new(
+        input,
+        &mut normalized,
+        ops::NormKind::Rms,
+        ops::Affine::AdaScaleShift { style: &norm_style },
+        eps,
+    );
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::norm(ctx, args)?;
     Ok(normalized)
 }
 
@@ -304,11 +322,18 @@ fn bias_residual_rms_normalized_fp8(
     let shape = input.shape().dims().to_vec();
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::BiasResidualRmsNormArgs::new(
-        input, bias, residual, weight, &mut hidden, &mut normalized, eps,
+    let mut args = ops::FusedAddNormArgs::new(
+        input,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        ops::NormKind::Rms,
+        ops::Affine::Weight { weight, offset: false },
+        eps,
     );
-    args.output_scale = scale;
-    ops::bias_residual_rms_norm(ctx, args)?;
+    args.bias = bias;
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::fused_add_norm(ctx, args)?;
     Ok((hidden, normalized))
 }
 
@@ -327,11 +352,18 @@ fn bias_residual_layer_normalized_fp8(
     let shape = input.shape().dims().to_vec();
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::BiasResidualLayerNormArgs::new(
-        input, bias, residual, weight, norm_bias, &mut hidden, &mut normalized, eps,
+    let mut args = ops::FusedAddNormArgs::new(
+        input,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        ops::NormKind::Layer { bias: norm_bias },
+        ops::Affine::Weight { weight, offset: false },
+        eps,
     );
-    args.output_scale = scale;
-    ops::bias_residual_layer_norm(ctx, args)?;
+    args.bias = bias;
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::fused_add_norm(ctx, args)?;
     Ok((hidden, normalized))
 }
 
@@ -356,11 +388,18 @@ fn ada_gate_residual_rms_normalized_fp8(
     let shape = input.shape().dims().to_vec();
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::AdaGateResidualRmsNormArgs::new(
-        input, residual, &norm_style, gate_style, &mut hidden, &mut normalized, eps,
+    let mut args = ops::FusedAddNormArgs::new(
+        input,
+        residual,
+        &mut hidden,
+        &mut normalized,
+        ops::NormKind::Rms,
+        ops::Affine::AdaScaleShift { style: &norm_style },
+        eps,
     );
-    args.output_scale = scale;
-    ops::ada_gate_residual_rms_norm(ctx, args)?;
+    args.gate = Some(gate_style);
+    args.post = Some(ops::QuantOut::E4m3 { scale });
+    ops::fused_add_norm(ctx, args)?;
     Ok((hidden, normalized))
 }
 

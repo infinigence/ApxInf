@@ -1,6 +1,7 @@
 #include "../include/apxinf_cuda/gather.h"
 #include "../framework/runtime_internal.h"
 #include "../kernels/custom/gather.cuh"
+#include "../kernels/custom/gather_embedding.h"
 
 #include <climits>
 #include <cstdint>
@@ -156,5 +157,37 @@ extern "C" apxinf_status_t apxinf_gather_launch(
         spec->dtype == APXINF_DTYPE_BF16
             ? launch<__nv_bfloat16>(*spec, *bindings)
             : launch<__half>(*spec, *bindings));
+  });
+}
+
+// The plain embedding lookup. Not a Spec semantic: EMBEDDING_LOOKUP above
+// always applies Gemma's sqrt(cols) scale and indexes with uint32, so routing
+// this through it would change both the arithmetic and the index contract.
+
+namespace {
+
+bool gather_extent(int64_t value) { return value > 0 && value <= INT32_MAX; }
+
+}  // namespace
+
+extern "C" apxinf_status_t apxinf_gather_embedding(
+    const void* table, const void* ids, void* output, int64_t tokens,
+    int64_t hidden, int64_t vocab, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (table == nullptr || ids == nullptr || output == nullptr ||
+        !gather_extent(tokens) || !gather_extent(hidden) ||
+        !gather_extent(vocab)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid embedding gather arguments");
+    }
+    const int status = apxinf::cuda_new::gather_embedding::embedding_gather(
+        table, static_cast<const int32_t*>(ids), output,
+        static_cast<int>(tokens), static_cast<int>(hidden),
+        static_cast<int>(vocab), static_cast<cudaStream_t>(stream));
+    if (status != 0) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                    "embedding gather failed with status " +
+                        std::to_string(status));
+    }
   });
 }
