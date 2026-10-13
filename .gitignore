@@ -5,6 +5,7 @@ nsys/
 
 # Local generated artifacts
 .DS_Store
+.venv/
 __pycache__/
 *.py[cod]
 

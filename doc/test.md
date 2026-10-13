@@ -6,8 +6,11 @@
 # Run the portable library test suite
 cargo test -p apxinf-core -p apxinf-loader -p apxinf-model -p apxinf-tokenizer --lib
 
-# Compile all workspace library, binary, and test targets
-cargo check --workspace --lib --bins --tests
+# Compile all workspace library and binary targets.
+# NOTE: without --features cuda, the cfg(feature="cuda") code paths
+# (~230 sites across apxinf-model / apxinf-cuda / apxinf-cuda-new) are NOT
+# type-checked.
+cargo check --workspace --lib --bins --features cuda
 
 # Run tests for a specific crate
 cargo test -p apxinf-core
@@ -189,16 +192,18 @@ curl -L -o model.safetensors \
 
 2. Build the release binary:
 ```bash
-cargo build --release
+cargo build --release --features cuda
 ```
 
 ### Running Inference
 
+`-m` takes the model *directory* (the CLI loads `model.safetensors` and
+`tokenizer.json` from inside it; there is no separate tokenizer flag):
+
 ```bash
 ./target/release/apxinf generate \
-  -m models/tinyllama/model.safetensors \
-  -t models/tinyllama/tokenizer.json \
-  -p "Once upon a time" \
+  --model models/tinyllama \
+  --prompt "Once upon a time" \
   --max-tokens 50
 ```
 
@@ -208,11 +213,16 @@ cargo build --release
 apxinf generate [OPTIONS]
 
 Options:
-  -m, --model <PATH>       Path to model weights (SafeTensors format)
-  -t, --tokenizer <PATH>   Path to tokenizer file (tokenizer.json)
+  -m, --model <PATH>       Path to the HuggingFace model directory
+                           (contains model.safetensors and tokenizer.json)
   -p, --prompt <TEXT>      Input prompt text
-  --max-tokens <N>         Maximum new tokens to generate [default: 50]
+  --device <cuda|cpu>      Execution device [default: cpu]
+  --max-tokens <N>         Maximum new tokens to generate
+  --generation-config <apxinf|model>  Which generation defaults to use
+  --sample                 Enable backend sampling (temperature, top-k, ...)
 ```
+
+Run `apxinf generate --help` for the full list.
 
 ### Quick Test
 
@@ -226,9 +236,8 @@ Options:
 ```
 apxinf — LLM inference engine
 
-Loading tokenizer from "models/tinyllama/tokenizer.json"...
+Loading model from "models/tinyllama"...
 Vocab size: 32000
-Loading model from "models/tinyllama/model.safetensors"...
 Loaded 201 tensors
 Model config: hidden=2048, layers=22, heads=32
 Building model...

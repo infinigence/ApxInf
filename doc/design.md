@@ -175,8 +175,7 @@ architecture + workspace orchestration.
 
 ## Relationship to existing philosophies
 
-This restates and sharpishes philosophies #1 and #2 from
-`doc/20260619-qwen3vl/notes.md`:
+Two long-standing design philosophies, restated here:
 
 > 1. Trait is the floor; concrete types are the ceiling.
 > 2. Layering is strict: model → backend, never backend → model.
