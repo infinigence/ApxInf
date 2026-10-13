@@ -3,6 +3,12 @@
 All entry points are justfile recipes — just --list shows the menu. This
 guide explains which tier runs where and what evidence to attach to a PR.
 
+CI runs Rust tests serially (`RUST_TEST_THREADS=1`) because the synthetic
+PI0.5 weight tests allocate full models. It sets
+`CARGO_PROFILE_TEST_OPT_LEVEL=1` to speed up their weight generation while
+retaining test-profile debug assertions and overflow checks. Neither
+setting removes tests or changes their inputs.
+
 ## Tiers
 
 | Tier | Recipe | Needs | Runs in CI |
