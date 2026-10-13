@@ -42,6 +42,16 @@ on four different observations improves real-image passes to 16/24 with a
 pooled profile, but still fails one-view and constructed diagnostics. Those
 profiles are unapproved.
 
+A same-input check at 38 captured language RMS sites also found 660 activation
+scale-bit differences and 14 INT8 code differences between the native row
+quantizer and the diagnostic adapter. Correctly rounded F32 scale division
+eliminates both differences without changing the official chunk outputs.
+Changing only that adapter convention reduces the two worst one-view relative
+L2 errors from 0.548/0.249 to 0.217/0.123; both still fail. A successful operator
+comparison does not qualify the full model or authorize replacing an official
+golden. These findings concern the diagnostic reference, not a promoted native
+kernel repair or a performance claim.
+
 The activity auditor must be validated on the actual driver. Orin R39 CUDA
 clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
 checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
