@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python frontend
+        run: pip install -e python/apxinf pytest sentencepiece
+
+      - name: fmt
+        run: just fmt-check
+
+      # doc-lint and boundaries are deterministic and cheap; keep them
+      # blocking. clippy currently reports ~500 warnings on main and stays
+      # advisory until they are reduced.
+      - name: doc-lint
+        run: just doc-lint
+
+      - name: Architecture boundaries
+        run: just boundaries
+
+      # NOTE: `just check` compiles cfg(feature="cuda") code without a GPU;
+      # the CUDA build scripts skip nvcc when no toolkit is present.
+      - name: check
+        run: just check
+
+      - name: clippy (advisory)
+        run: just clippy
+        continue-on-error: true
+
+      # CPU tests: two root tests/ modules are broken on main
+      # (doc/guides/testing.md) and five python/apxinf tests fail; this job
+      # is advisory until those are fixed in code PRs.
+      - name: test-cpu (advisory)
+        run: just test-cpu
+        continue-on-error: true
