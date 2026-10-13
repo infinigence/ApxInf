@@ -1,0 +1,96 @@
+# UNTESTED — not yet validated end-to-end on this repository.
+#
+# Trigger: a maintainer comments `/ai-review` (optionally followed by a
+# request) on a pull request. Runs Claude Code against the PR diff with the
+# repository's REVIEW.md as the review rules and posts the findings as
+# inline comments plus one summary comment.
+#
+# Before this can run, a repo admin must configure:
+#   Secret:    AI_REVIEW_API_KEY    (Anthropic API key or the key for the
+#                                   gateway named below)
+#   Variables: AI_REVIEW_BASE_URL   (optional; set when using an
+#                                   Anthropic-compatible gateway)
+#              AI_REVIEW_MODEL      (e.g. claude-sonnet-5-5)
+#
+# After the first real run, remove this block and record what was validated:
+# inline comment placement, gateway compatibility, fork PR behavior, and
+# the per-review cost.
+name: ai-review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-review-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Only on PRs, only the exact trigger phrase at the start of the
+    # comment, only from users who could push to the repo.
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/ai-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+               github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_BASE_URL: ${{ vars.AI_REVIEW_BASE_URL }}
+    steps:
+      # Fail safe when the key is not configured: leave a note on the PR
+      # instead of a red run.
+      - name: Check configuration
+        env:
+          AI_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          if [ -z "$AI_KEY" ]; then
+            gh pr comment "$PR" --body \
+              "AI review is not configured: the \`AI_REVIEW_API_KEY\` secret is missing. See .github/workflows/ai-review.yml."
+            exit 0
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout base branch (REVIEW.md, AGENTS.md, hooks, skills)
+        uses: actions/checkout@v6
+
+      - name: Checkout PR head into pr-head/ (read-only)
+        uses: actions/checkout@v6
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          path: pr-head
+          persist-credentials: false
+
+      - name: AI review
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.AI_REVIEW_API_KEY }}
+          prompt: |
+            Review PR #${{ github.event.issue.number }} of
+            ${{ github.repository }}.
+
+            Rules: REVIEW.md and AGENTS.md at the workspace root (base
+            branch) — follow them exactly. The PR's files are under
+            pr-head/ (read-only). Use `gh pr diff` and `gh pr view` for the
+            change set.
+
+            Reviewer's request (may be empty):
+            ${{ github.event.comment.body }}
+
+            Post findings as inline comments on the diff, then one summary
+            comment. Follow the severity definitions and the Nit cap in
+            REVIEW.md.
+          claude_args: >-
+            --model ${{ vars.AI_REVIEW_MODEL }}
+            --max-turns 30
+            --add-dir pr-head
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
