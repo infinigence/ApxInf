@@ -17,6 +17,11 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@just
 
+      - name: Install actionlint
+        uses: taiki-e/install-action@v2
+        with:
+          tool: actionlint@1.7.12
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -26,7 +31,7 @@ jobs:
         run: pip install -e python/apxinf pytest sentencepiece
 
       # fmt-check is advisory: main carries pre-existing rustfmt drift
-      # (~941 files); a cleanup PR should run  separately.
+      # (~941 files); a cleanup PR should run `just fmt` separately.
       - name: fmt-check (advisory)
         run: just fmt-check
         continue-on-error: true
@@ -39,6 +44,12 @@ jobs:
 
       - name: Architecture boundaries
         run: just boundaries
+
+      - name: Tooling regression tests
+        run: just test-tooling
+
+      - name: Workflow lint
+        run: just workflow-lint
 
       # NOTE: `just check` compiles cfg(feature="cuda") code without a GPU;
       # the CUDA build scripts skip nvcc when no toolkit is present.

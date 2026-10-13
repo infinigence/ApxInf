@@ -26,6 +26,11 @@ Do not document here: anything a recipe, type, or script already enforces
 (commands go in the justfile, argument lists in --help), per-file tours,
 TODOs (GitHub issues), or session notes (devlocal/).
 
+`just doc-lint` checks tracked and new non-ignored Markdown, including
+`.agents/skills/`, for relative links and heading anchors. Ignored local
+artifacts and vendored submodules are outside that scan. Keep skill links
+relative to the source skill directory; Claude's symlinks share that source.
+
 ## Add or change a model
 
 | Read when | Guide / authority |

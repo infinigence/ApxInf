@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Documentation lint for ApxInf. Run from repo root: `just doc-lint`."""
+import html
 import os
 import re
 import subprocess
 import sys
+from urllib.parse import unquote, urlsplit
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO)
@@ -92,8 +94,6 @@ for root, dirs, files in os.walk('doc'):
             continue
         p = os.path.join(root, f)
         in_code = False
-        if not os.path.exists(p):
-                    continue
         for i, line in enumerate(open(p), 1):
             stripped = line.rstrip()
             if stripped.lstrip().startswith('```'):
@@ -105,84 +105,109 @@ for root, dirs, files in os.walk('doc'):
                     '(doc/README.md#how-docs-are-organized)')
                 break
 
-# Rule 6: `just <recipe>` references must exist in the justfile
-try:
-    out = subprocess.check_output(['just', '--summary']).decode()
-    RECIPES = set(out.split())
-except Exception:
-    RECIPES = None
-if RECIPES is not None:
-    JUST_REF = re.compile(r'`just ([a-z][a-z0-9-]+)`')
-    seen = set()
-    for root, dirs, files in os.walk('.'):
-        dirs[:] = [d for d in dirs if d not in
-                   ('target', 'devlocal', '.git', 'node_modules', '.venv',
-                    '.github', 'hooks', '.claude', '.agents')]
-        for f in files:
-            if not f.endswith('.md'):
-                continue
-            p = os.path.join(root, f).lstrip('./')
-            for i, line in enumerate(open(p, errors='replace'), 1):
-                for m in JUST_REF.finditer(line):
-                    name = m.group(1)
-                    if name not in RECIPES and name != '--list':
-                        err(p, 'line {0}: `just {1}` does not exist'.format(i, name),
-                            'add the recipe to the justfile or fix the doc')
-
-# Rule 7: relative markdown links must resolve (files; anchor check TODO)
-LINK = re.compile(r'\[[^\]]*\]\((?!https?://)([^)#\s]+)(#[^)]*)?\)')
+# Include tracked and new, non-ignored Markdown, including agent instructions.
+# Git handles build trees, devlocal, vendored submodules and local venvs.
 def all_md():
-    for root, dirs, files in os.walk('.', followlinks=True):
-        dirs[:] = [d for d in dirs if d not in
-                   ('target', 'devlocal', '.git', 'node_modules', '.venv',
-                    '.github', 'hooks', '.claude', '.agents')]
-        for f in files:
-            if f.endswith('.md'):
-                yield os.path.join(root, f).lstrip('./')
+    paths = subprocess.check_output(
+        ['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'])
+    return sorted({os.fsdecode(p) for p in paths.split(b'\0')
+                   if p.endswith(b'.md') and os.path.isfile(os.fsdecode(p))})
 
-for p in all_md():
-    base = os.path.dirname(p)
+
+markdown_files = all_md()
+
+# Rule 6: recipe references (including arguments and fenced examples) exist.
+try:
+    RECIPES = set(subprocess.check_output(['just', '--summary'], text=True).split())
+except (OSError, subprocess.CalledProcessError) as exc:
+    err('justfile', 'cannot read recipe list: {0}'.format(exc),
+        'install just and ensure just --summary succeeds')
+    RECIPES = set()
+JUST_REF = re.compile(r'(?:`|^\s*(?:\w+=\S+\s+)*)just ([a-z][a-z0-9-]+)\b')
+for p in markdown_files:
     for i, line in enumerate(open(p, errors='replace'), 1):
-        for m in LINK.finditer(line):
-            target = m.group(1)
-            if target.startswith('/'):
+        for name in JUST_REF.findall(line):
+            if name not in RECIPES:
+                err(p, 'line {0}: just {1} does not exist'.format(i, name),
+                    'add the recipe to the justfile or fix the doc')
+
+
+# Rule 7: local Markdown links, including same-file and duplicate anchors.
+LINK = re.compile(r'\[[^\]]*\]\(([^\s)]*)(?:\s+"[^"\n]*")?\)')
+
+
+def markdown_anchors(path):
+    anchors = set()
+    fence = None
+    for line in open(path, errors='replace'):
+        stripped = line.lstrip()
+        marker = re.match(r'(`{3,}|~{3,})', stripped)
+        if marker:
+            char = marker[1][0]
+            if fence is None:
+                fence = char
+            elif fence == char:
+                fence = None
+            continue
+        if fence:
+            continue
+        anchors.update(re.findall(r'<a\s+(?:id|name)=["\']([^"\']+)', line))
+        heading = re.match(r'^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$', line)
+        if not heading:
+            continue
+        title = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', heading[1])
+        title = html.unescape(re.sub(r'<[^>]*>', '', title))
+        slug = re.sub(r'[^\w\- ]', '', title.lower()).replace(' ', '-')
+        anchor = slug
+        suffix = 0
+        while anchor in anchors:
+            suffix += 1
+            anchor = '{0}-{1}'.format(slug, suffix)
+        anchors.add(anchor)
+    return anchors
+
+
+anchor_cache = {}
+for p in markdown_files:
+    for i, line in enumerate(open(p, errors='replace'), 1):
+        for target in LINK.findall(line):
+            url = urlsplit(target)
+            if url.scheme or url.netloc or url.path.startswith('/'):
                 continue
-            dest = os.path.normpath(os.path.join(base, target))
+            dest = os.path.normpath(os.path.join(os.path.dirname(p), unquote(url.path))) if url.path else p
             if not os.path.exists(dest):
                 err(p, 'line {0}: broken link {1}'.format(i, target),
                     'fix the path or remove the link')
+            elif url.fragment and dest.endswith('.md'):
+                if dest not in anchor_cache:
+                    anchor_cache[dest] = markdown_anchors(dest)
+                if unquote(url.fragment) not in anchor_cache[dest]:
+                    err(p, 'line {0}: missing anchor in {1}'.format(i, target),
+                        'link to an existing heading or explicit anchor')
 
 # Rule 8: line budgets
 BUDGETS = [
     ('AGENTS.md', 150),
     ('REVIEW.md', 120),
 ]
-for root, dirs, files in os.walk('.'):
-    dirs[:] = [d for d in dirs if d not in
-               ('target', 'devlocal', '.git', 'node_modules', '.venv')]
-    for f in files:
-        p = os.path.join(root, f).lstrip('./')
-        if f == 'AGENTS.md' and p != 'AGENTS.md':
-            n = sum(1 for _ in open(p, errors='replace'))
-            if n > 60:
-                err(p, 'nested AGENTS.md is {0} lines, budget 60'.format(n),
-                    'keep nested rules to what is unique to this directory')
+for p in markdown_files:
+    if os.path.basename(p) == 'AGENTS.md' and p != 'AGENTS.md':
+        n = sum(1 for _ in open(p, errors='replace'))
+        if n > 60:
+            err(p, 'nested AGENTS.md is {0} lines, budget 60'.format(n),
+                'keep nested rules to what is unique to this directory')
 for p, budget in BUDGETS:
     if os.path.exists(p):
         n = sum(1 for _ in open(p))
         if n > budget:
             err(p, '{0} is {1} lines, budget {2}'.format(p, n, budget),
                 'trim per doc/README.md#how-docs-are-organized')
-for root, dirs, files in os.walk('.agents', followlinks=True):
-    for f in files:
-        if f == 'SKILL.md':
-            p = os.path.join(root, f)
-            if not os.path.exists(p):
-                continue
-            n = sum(1 for _ in open(p, errors='replace'))
-            if n > 500:
-                err(p, 'SKILL.md is {0} lines, budget 500'.format(n),
-                    'keep skills short; move detail into linked docs')
+for p in markdown_files:
+    if os.path.basename(p) == 'SKILL.md':
+        n = sum(1 for _ in open(p, errors='replace'))
+        if n > 500:
+            err(p, 'SKILL.md is {0} lines, budget 500'.format(n),
+                'keep skills short; move detail into linked docs')
 
 # Rule 9: every APXINF_* env var read in source must be registered in
 # doc/reference/env-vars.md
@@ -206,6 +231,9 @@ if os.path.exists(registry_path):
     for name in sorted(env_src - registered):
         err(registry_path, 'env var {0} read in source but not registered'.format(name),
             'add it to the appropriate section of doc/reference/env-vars.md')
+
+if not os.path.exists(registry_path):
+    err(registry_path, 'environment registry is missing', 'restore the registry')
 
 if errors:
     print('\n'.join(errors))

@@ -63,4 +63,3 @@ An earlier run measured 498.78 ms. Repeating the same binary on the same Thor3
 later gave 484.90 ms P50, so the earlier slowdown was not evidence of a lost
 code optimization or a fixed difference between the two boards. That run lacks
 continuous resource telemetry; its exact transient cause remains unproven.
-

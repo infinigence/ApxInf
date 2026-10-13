@@ -3,11 +3,11 @@
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "if": "git commit",
         "hooks": [
           {
             "type": "command",
-            "command": "just pre-commit"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard_git_commit.py\"",
+            "timeout": 60
           }
         ]
       }

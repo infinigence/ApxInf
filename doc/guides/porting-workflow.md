@@ -3,7 +3,7 @@
 This document is the workflow. It guides an agent porting a working reference
 model into ApxInf while keeping private reference material and generated
 evidence out of the product diff, and credentials out of generated artifacts.
-Follow [Development artifacts](../../AGENTS.md#development-artifacts) for all
+Follow [Development artifacts](../../AGENTS.md#boundaries) for all
 task-specific output locations.
 
 The agent owns investigation and implementation decisions. Commands and small
@@ -114,7 +114,7 @@ specific blocker or approval request that prevents that work.
 
 The **private port workspace** is the ignored
 `<project-root>/devlocal/<feat-name>/` directory defined by
-[AGENTS.md](../../AGENTS.md#development-artifacts). Keep generated captures,
+[AGENTS.md](../../AGENTS.md#boundaries). Keep generated captures,
 temporary programs, port notes, and reproducibility evidence there. Reuse
 existing external reference checkouts and checkpoints in place and record their
 identities in the workspace. Verify ignore rules with `git check-ignore` and

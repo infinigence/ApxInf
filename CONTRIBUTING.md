@@ -7,6 +7,15 @@
 - Rust stable via [rustup](https://rustup.rs).
 - [just](https://just.systems): `cargo install just`. All commands run
   through the justfile — run `just --list` first.
+- [actionlint](https://github.com/rhysd/actionlint/blob/main/docs/install.md)
+  for workflow validation (`brew install actionlint` on macOS).
+- Create a Python virtual environment and install the CPU test dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e 'python/apxinf[test]'
+```
 
 ```bash
 git config core.hooksPath .githooks   # commit-time quick checks
@@ -61,6 +70,13 @@ thumb:
 ## Review
 
 - `just pre-commit` runs on every commit locally; CI runs `just pre-pr`.
+- `just test-tooling` tests recipe dispatch, documentation links and anchors,
+  the Claude commit guard, and workflow configuration without a GPU or API key.
+  `just workflow-lint` validates workflows with actionlint. Both run in
+  `just pre-pr` and CI.
+- The Claude Bash hook runs the quick check when a command may invoke
+  `git commit`, returning exit code 2 on failure. Enable the Git hook above
+  for commits through aliases, other tools, and human shells as well.
 - Maintainers can additionally request an AI review by commenting
   `/ai-review` on a PR (see `.github/workflows/ai-review.yml`). Its output
   is advisory, like any other review; a human still approves.

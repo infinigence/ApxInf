@@ -10,7 +10,8 @@ guide explains which tier runs where and what evidence to attach to a PR.
 | Rust unit tests | just test-rust-cpu | CPU only | yes |
 | Python unit tests | just test-py | CPU only | yes |
 | Both | just test-cpu | CPU only | yes |
-| Model family GPU tests | just test-gpu <family> | NVIDIA device + checkpoint | no, attach output to the PR |
+| Repository tooling | just test-tooling | CPU + Python test dependencies + just | yes |
+| Model family GPU library tests | just test-gpu <family> | NVIDIA device + checkpoint | no, attach output to the PR |
 | cuda-new L3 candidate tests | just test-l3 [extra args] | NVIDIA device | no |
 | Benchmarks | just bench <model> [args] | NVIDIA device | no |
 
@@ -38,18 +39,24 @@ PRs; they are not silently green:
 
 ## Running a specific test
 
-    just test-l3 test -p apxinf-cuda-new -- --nocapture --test-threads=1
-    cargo test -p apxinf-core test_matmul_cpu
+    just test-l3 --lib -- --nocapture --test-threads=1
+    just test-rust-cpu test_matmul_cpu
     pytest python/apxinf/tests/test_tokenize.py
 
 just test-l3 defaults to APXINF_CUDA_ARCH=sm_110 and a dedicated
 target-gemm-pilot directory (matching the old test-new.sh behavior);
-override either with just test-l3 APXINF_CUDA_ARCH=sm_89 or a platform
+override either with APXINF_CUDA_ARCH=sm_89 just test-l3 --lib or a platform
 preset: APXINF_PLATFORM=orin just test-l3.
 
 ## GPU acceptance
 
-just test-gpu <family> runs the family Rust tests with
---features cuda --release. PRs that touch GPU behavior must attach the
+just test-gpu <family> runs matching library tests in apxinf-model (with
+--features cuda) and apxinf-cuda-new, both in release mode. Integration
+targets are selected explicitly with just test-l3 --test <target>; the
+known-broken qwen38_gdn_batched_ops target remains excluded from the
+library suite. Verify the output includes the intended tests: a filter
+matching zero tests is not evidence of GPU correctness.
+
+PRs that touch GPU behavior must attach the
 recipe output plus board, arch, and commit, per the PR template. If you
 have no suitable device, say "not verified" — do not report "pass".
