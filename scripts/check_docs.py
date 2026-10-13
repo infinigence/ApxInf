@@ -92,6 +92,8 @@ for root, dirs, files in os.walk('doc'):
             continue
         p = os.path.join(root, f)
         in_code = False
+        if not os.path.exists(p):
+                    continue
         for i, line in enumerate(open(p), 1):
             stripped = line.rstrip()
             if stripped.lstrip().startswith('```'):
@@ -130,7 +132,7 @@ if RECIPES is not None:
 # Rule 7: relative markdown links must resolve (files; anchor check TODO)
 LINK = re.compile(r'\[[^\]]*\]\((?!https?://)([^)#\s]+)(#[^)]*)?\)')
 def all_md():
-    for root, dirs, files in os.walk('.'):
+    for root, dirs, files in os.walk('.', followlinks=True):
         dirs[:] = [d for d in dirs if d not in
                    ('target', 'devlocal', '.git', 'node_modules', '.venv',
                     '.github', 'hooks', '.claude', '.agents')]
@@ -171,10 +173,12 @@ for p, budget in BUDGETS:
         if n > budget:
             err(p, '{0} is {1} lines, budget {2}'.format(p, n, budget),
                 'trim per doc/README.md#how-docs-are-organized')
-for root, dirs, files in os.walk('.agents'):
+for root, dirs, files in os.walk('.agents', followlinks=True):
     for f in files:
         if f == 'SKILL.md':
-            p = os.path.join(root, f).lstrip('./')
+            p = os.path.join(root, f)
+            if not os.path.exists(p):
+                continue
             n = sum(1 for _ in open(p, errors='replace'))
             if n > 500:
                 err(p, 'SKILL.md is {0} lines, budget 500'.format(n),
