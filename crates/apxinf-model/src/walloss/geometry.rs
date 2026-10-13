@@ -32,7 +32,9 @@ impl VisionGeometry {
         let merge_unit = merge * merge;
         let merger_window = config.window_size / merge / config.patch_size;
         if merge == 0 || merger_window == 0 {
-            return Err(Error::Other("walloss vision merge geometry is invalid".into()));
+            return Err(Error::Other(
+                "walloss vision merge geometry is invalid".into(),
+            ));
         }
 
         let mut merged_order = Vec::new();
@@ -54,13 +56,18 @@ impl VisionGeometry {
                     for group_w in 0..llm_w {
                         for inner_h in 0..merge {
                             for inner_w in 0..merge {
-                                base_positions.push(((group_h * merge + inner_h) as u32, (group_w * merge + inner_w) as u32));
+                                base_positions.push((
+                                    (group_h * merge + inner_h) as u32,
+                                    (group_w * merge + inner_w) as u32,
+                                ));
                             }
                         }
                     }
                 }
                 let next = full_offsets.last().copied().unwrap() as usize + h * w;
-                full_offsets.push(u32::try_from(next).map_err(|_| Error::Other("walloss full-attention offsets overflow u32".into()))?);
+                full_offsets.push(u32::try_from(next).map_err(|_| {
+                    Error::Other("walloss full-attention offsets overflow u32".into())
+                })?);
             }
 
             for frame in 0..t {
@@ -79,7 +86,9 @@ impl VisionGeometry {
                         }
                         let tokens = (merged_order.len() - before) * merge_unit;
                         let next = window_offsets.last().copied().unwrap() as usize + tokens;
-                        window_offsets.push(u32::try_from(next).map_err(|_| Error::Other("walloss window offsets overflow u32".into()))?);
+                        window_offsets.push(u32::try_from(next).map_err(|_| {
+                            Error::Other("walloss window offsets overflow u32".into())
+                        })?);
                     }
                 }
             }
@@ -91,7 +100,10 @@ impl VisionGeometry {
         for &group in &merged_order {
             for inner in 0..merge_unit {
                 let patch = group * merge_unit + inner;
-                patch_order.push(u32::try_from(patch).map_err(|_| Error::Other("walloss patch index overflow u32".into()))?);
+                patch_order.push(
+                    u32::try_from(patch)
+                        .map_err(|_| Error::Other("walloss patch index overflow u32".into()))?,
+                );
                 let (height, width) = base_positions[patch];
                 position_ids.extend([height, width]);
             }
@@ -153,8 +165,8 @@ fn upload_u32(context: &Context, values: &[u32]) -> Result<DeviceBuffer> {
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect::<Vec<_>>();
-    let buffer = DeviceBuffer::alloc_zeros(bytes.len(), context.device_id())
-        .map_err(Error::Cuda)?;
+    let buffer =
+        DeviceBuffer::alloc_zeros(bytes.len(), context.device_id()).map_err(Error::Cuda)?;
     buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
     Ok(buffer)
 }
@@ -182,7 +194,11 @@ pub fn multimodal_position_ids(
             .iter()
             .position(|&token| token == image_token_id)
             .map(|index| token_offset + index)
-            .ok_or_else(|| Error::Other("walloss prompt has fewer image-token runs than configured grids".into()))?;
+            .ok_or_else(|| {
+                Error::Other(
+                    "walloss prompt has fewer image-token runs than configured grids".into(),
+                )
+            })?;
         for position in token_offset..image_start {
             let value = next_position + (position - token_offset) as u32;
             for axis in &mut axes {
@@ -193,7 +209,9 @@ pub fn multimodal_position_ids(
         let llm_h = h / spatial_merge;
         let llm_w = w / spatial_merge;
         let image_tokens = t * llm_h * llm_w;
-        if token_ids.get(image_start..image_start + image_tokens).is_none()
+        if token_ids
+            .get(image_start..image_start + image_tokens)
+            .is_none()
             || token_ids[image_start..image_start + image_tokens]
                 .iter()
                 .any(|&token| token != image_token_id)
@@ -258,7 +276,6 @@ mod tests {
         assert_eq!(geometry.reverse_indices.len(), 40);
         assert_eq!(geometry.max_full_tokens, 96);
     }
-
 
     #[test]
     fn positions_advance_by_multimodal_extent() {

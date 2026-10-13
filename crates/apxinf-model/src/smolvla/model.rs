@@ -1,12 +1,12 @@
-use std::sync::Arc;
 use std::collections::BTreeMap;
 use std::f64::consts::TAU;
+use std::sync::Arc;
 
 use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 use half::{bf16, f16};
 
 use crate::accelerator::cuda::{
-    downcast_arc, kernels, CudaEventTimer, Context, DeviceBuffer, RuntimeBackend,
+    downcast_arc, kernels, Context, CudaEventTimer, DeviceBuffer, RuntimeBackend,
 };
 use crate::vla::{ImageLayout, Observation, VisionObservation};
 
@@ -209,13 +209,9 @@ impl SmolVlaModel {
         expert_timer.start(ctx)?;
         let time_embeddings = self.time_embeddings()?;
         for step in 0..self.config.num_flow_steps {
-            let velocity = self.denoise_step_with_embedding(
-                &state,
-                &time_embeddings[step],
-                &prefix_states,
-            )?;
-            if step == 0 {
-            }
+            let velocity =
+                self.denoise_step_with_embedding(&state, &time_embeddings[step], &prefix_states)?;
+            if step == 0 {}
             state = (if self.fp16_gemm {
                 kernels::elementwise::euler_update_f16
             } else {
@@ -339,12 +335,7 @@ impl SmolVlaModel {
             kernels::embedding::lookup_f16
         } else {
             kernels::embedding::lookup_bf16
-        })(
-            ctx,
-            &self.weights.token_embedding,
-            token_ids,
-            token_count,
-        )?;
+        })(ctx, &self.weights.token_embedding, token_ids, token_count)?;
         let state = self.embed_state(state)?;
         let concat_rows = if self.fp16_gemm {
             kernels::elementwise::concat_rows_f16
@@ -356,11 +347,7 @@ impl SmolVlaModel {
     }
 
     fn encode_vision(&self, ctx: &Context, patches: &Tensor) -> Result<Tensor> {
-        let projection = self.gemm(
-            ctx,
-            patches,
-            &self.weights.patch_embedding.weight,
-        )?;
+        let projection = self.gemm(ctx, patches, &self.weights.patch_embedding.weight)?;
         let mut hidden = (if self.fp16_gemm {
             kernels::embedding::add_position_f16
         } else {
@@ -390,17 +377,9 @@ impl SmolVlaModel {
             kernels::preprocess::pixel_shuffle_4_f16
         } else {
             kernels::preprocess::pixel_shuffle_4_bf16
-        })(
-            ctx,
-            &hidden,
-            self.config.patches_per_view(),
-        )?;
+        })(ctx, &hidden, self.config.patches_per_view())?;
         let projected = self.gemm(ctx, &shuffled, &self.weights.connector.weight)?;
-        kernels::elementwise::scale(
-            ctx,
-            &projected,
-            (self.config.language_width as f32).sqrt(),
-        )
+        kernels::elementwise::scale(ctx, &projected, (self.config.language_width as f32).sqrt())
     }
 
     fn vision_layer(
@@ -450,8 +429,7 @@ impl SmolVlaModel {
             )?
         }
         .reshape(vec![input.shape().dims()[0], self.config.vision_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
+        let projected = self.gemm(ctx, &attention, &weights.attention_output.weight)?;
         let hidden = if self.fp16_gemm {
             let projected = self.add_bias(
                 ctx,
@@ -483,15 +461,10 @@ impl SmolVlaModel {
             kernels::activation::bias_gelu_f16
         } else {
             kernels::activation::bias_gelu_bf16
-        })(
-            ctx,
-            &activated,
-            weights.fc1.bias.as_ref(),
-        )?;
+        })(ctx, &activated, weights.fc1.bias.as_ref())?;
         let projected = self.gemm(ctx, &activated, &weights.fc2.weight)?;
         if self.fp16_gemm {
-            let projected =
-                self.add_bias(ctx, &projected, weights.fc2.bias.as_ref().unwrap())?;
+            let projected = self.add_bias(ctx, &projected, weights.fc2.bias.as_ref().unwrap())?;
             self.backend.add(&projected, &hidden)
         } else {
             kernels::fused::bias_then_residual_bf16_packed4(
@@ -515,7 +488,9 @@ impl SmolVlaModel {
         }
         let values = state.to_f32_vec()?;
         if values.len() > self.config.max_state_dim {
-            return Err(Error::Other("SmolVLA state exceeds maximum dimension".into()));
+            return Err(Error::Other(
+                "SmolVLA state exceeds maximum dimension".into(),
+            ));
         }
         let mut padded = vec![0.0; self.config.max_state_dim];
         padded[..values.len()].copy_from_slice(&values);
@@ -560,16 +535,12 @@ impl SmolVlaModel {
         let mut keys = Vec::with_capacity(self.config.language_depth);
         let mut values = Vec::with_capacity(self.config.language_depth);
         for layer in &self.weights.text_layers {
-            let normalized = (if self.fp16_gemm {
-                kernels::norm::rms_f16
-            } else {
-                kernels::norm::rms_bf16
-            })(
-                ctx,
-                &hidden,
-                &layer.input_norm,
-                self.config.rms_norm_eps,
-            )?;
+            let normalized =
+                (if self.fp16_gemm {
+                    kernels::norm::rms_f16
+                } else {
+                    kernels::norm::rms_bf16
+                })(ctx, &hidden, &layer.input_norm, self.config.rms_norm_eps)?;
             let qkv = self.gemm(ctx, &normalized, &layer.qkv.weight)?;
             let qkv = (if self.fp16_gemm {
                 kernels::rope::split_qkv_apply_f16
@@ -594,23 +565,14 @@ impl SmolVlaModel {
                 kernels::attention::prefix_gqa_f16
             } else {
                 kernels::attention::prefix_gqa_bf16
-            })(
-                ctx,
-                &qkv.q,
-                &qkv.k,
-                &qkv.v,
-                tokens - 1,
-            )?
+            })(ctx, &qkv.q, &qkv.k, &qkv.v, tokens - 1)?
             .reshape(vec![tokens, self.config.language_width])?;
-            if keys.len() == 1 {
-            }
-            let projected =
-                self.gemm(ctx, &attention, &layer.attention_output.weight)?;
+            if keys.len() == 1 {}
+            let projected = self.gemm(ctx, &attention, &layer.attention_output.weight)?;
             hidden = self.backend.add(&projected, &hidden)?;
             let mlp_output =
                 self.mlp(ctx, &hidden, &layer.post_norm, &layer.gate_up, &layer.down)?;
-            if keys.len() == 1 {
-            }
+            if keys.len() == 1 {}
             hidden = mlp_output;
         }
         let hidden = (if self.fp16_gemm {
@@ -667,8 +629,7 @@ impl SmolVlaModel {
         } else {
             kernels::norm::rms_bf16
         })(ctx, input, norm, self.config.rms_norm_eps)?;
-        let activated =
-            self.gemm(ctx, &normalized, &gate_up.weight)?;
+        let activated = self.gemm(ctx, &normalized, &gate_up.weight)?;
         let activated = (if self.fp16_gemm {
             kernels::activation::swiglu_f16
         } else {
@@ -678,12 +639,7 @@ impl SmolVlaModel {
         self.backend.add(&projected, input)
     }
 
-    fn denoise_step(
-        &self,
-        state: &Tensor,
-        time: f32,
-        prefix: &PrefixStates,
-    ) -> Result<Tensor> {
+    fn denoise_step(&self, state: &Tensor, time: f32, prefix: &PrefixStates) -> Result<Tensor> {
         let embedding = self.time_embedding(time)?;
         self.denoise_step_with_embedding(state, &embedding, prefix)
     }
@@ -696,24 +652,13 @@ impl SmolVlaModel {
     ) -> Result<Tensor> {
         let ctx = self.backend.context();
         let action = self.gemm(ctx, state, &self.weights.action_in.weight)?;
-        let action = self.add_bias(
-            ctx,
-            &action,
-            self.weights.action_in.bias.as_ref().unwrap(),
-        )?;
+        let action = self.add_bias(ctx, &action, self.weights.action_in.bias.as_ref().unwrap())?;
         let action_time = (if self.fp16_gemm {
             kernels::elementwise::concat_columns_f16
         } else {
             kernels::elementwise::concat_columns_bf16
-        })(
-            ctx,
-            &[&action, embedding],
-        )?;
-        let fused = self.gemm(
-            ctx,
-            &action_time,
-            &self.weights.action_time_in.weight,
-        )?;
+        })(ctx, &[&action, embedding])?;
+        let fused = self.gemm(ctx, &action_time, &self.weights.action_time_in.weight)?;
         let fused = self.add_bias(
             ctx,
             &fused,
@@ -759,7 +704,11 @@ impl SmolVlaModel {
             self.config.rms_norm_eps,
         )?;
         let velocity = self.gemm(ctx, &hidden, &self.weights.action_out.weight)?;
-        self.add_bias(ctx, &velocity, self.weights.action_out.bias.as_ref().unwrap())
+        self.add_bias(
+            ctx,
+            &velocity,
+            self.weights.action_out.bias.as_ref().unwrap(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -775,12 +724,7 @@ impl SmolVlaModel {
             kernels::norm::rms_f16
         } else {
             kernels::norm::rms_bf16
-        })(
-            ctx,
-            input,
-            &weights.input_norm,
-            self.config.rms_norm_eps,
-        )?;
+        })(ctx, input, &weights.input_norm, self.config.rms_norm_eps)?;
         let qkv = self.gemm(ctx, &normalized, &weights.qkv.weight)?;
         let prefix_tokens = prefix_key.shape().dims()[0];
         let qkv = (if self.fp16_gemm {
@@ -835,19 +779,18 @@ impl SmolVlaModel {
                 key_tokens - input_tokens,
             )?
         } else {
-            kernels::attention::causal_gqa_bf16(
-                ctx,
-                &qkv.q,
-                &key,
-                &value,
-                key_tokens,
-            )?
+            kernels::attention::causal_gqa_bf16(ctx, &qkv.q, &key, &value, key_tokens)?
         }
         .reshape(vec![input_tokens, self.config.language_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
+        let projected = self.gemm(ctx, &attention, &weights.attention_output.weight)?;
         let hidden = self.backend.add(&projected, input)?;
-        self.mlp(ctx, &hidden, &weights.post_norm, &weights.gate_up, &weights.down)
+        self.mlp(
+            ctx,
+            &hidden,
+            &weights.post_norm,
+            &weights.gate_up,
+            &weights.down,
+        )
     }
 
     fn expert_cross_layer(
@@ -862,12 +805,7 @@ impl SmolVlaModel {
             kernels::norm::rms_f16
         } else {
             kernels::norm::rms_bf16
-        })(
-            ctx,
-            input,
-            &weights.input_norm,
-            self.config.rms_norm_eps,
-        )?;
+        })(ctx, input, &weights.input_norm, self.config.rms_norm_eps)?;
         let query = self.gemm(ctx, &normalized, &weights.query.weight)?;
         let query = query.reshape(vec![
             input.shape().dims()[0],
@@ -898,18 +836,17 @@ impl SmolVlaModel {
             kernels::attention::full_gqa_f16
         } else {
             kernels::attention::full_gqa_bf16
-        })(
-            ctx,
-            &query,
-            &key,
-            &value,
-            prefix_tokens,
-        )?
+        })(ctx, &query, &key, &value, prefix_tokens)?
         .reshape(vec![input.shape().dims()[0], self.config.language_width])?;
-        let projected =
-            self.gemm(ctx, &attention, &weights.attention_output.weight)?;
+        let projected = self.gemm(ctx, &attention, &weights.attention_output.weight)?;
         let hidden = self.backend.add(&projected, input)?;
-        self.mlp(ctx, &hidden, &weights.post_norm, &weights.gate_up, &weights.down)
+        self.mlp(
+            ctx,
+            &hidden,
+            &weights.post_norm,
+            &weights.gate_up,
+            &weights.down,
+        )
     }
 
     fn time_embedding(&self, time: f32) -> Result<Tensor> {
@@ -919,20 +856,24 @@ impl SmolVlaModel {
             self.config.time_min_period,
             self.config.time_max_period,
         );
-        let mut values = Vec::with_capacity(
-            self.config.action_horizon * self.config.expert_width,
-        );
+        let mut values = Vec::with_capacity(self.config.action_horizon * self.config.expert_width);
         for _ in 0..self.config.action_horizon {
             values.extend_from_slice(&base);
         }
         let host = if self.fp16_gemm {
-            let row = values.iter().map(|value| f16::from_f32(*value)).collect::<Vec<_>>();
+            let row = values
+                .iter()
+                .map(|value| f16::from_f32(*value))
+                .collect::<Vec<_>>();
             Tensor::from_f16(
                 vec![self.config.action_horizon, self.config.expert_width],
                 &row,
             )?
         } else {
-            let row = values.iter().map(|value| bf16::from_f32(*value)).collect::<Vec<_>>();
+            let row = values
+                .iter()
+                .map(|value| bf16::from_f32(*value))
+                .collect::<Vec<_>>();
             Tensor::from_bf16(
                 vec![self.config.action_horizon, self.config.expert_width],
                 &row,
@@ -975,7 +916,6 @@ pub struct PrefixStates {
     hidden: Tensor,
 }
 
-
 fn kernel_layout(layout: crate::vla::ImageLayout) -> kernels::preprocess::ImageLayout {
     match layout {
         crate::vla::ImageLayout::Nhwc => kernels::preprocess::ImageLayout::Nhwc,
@@ -984,6 +924,5 @@ fn kernel_layout(layout: crate::vla::ImageLayout) -> kernels::preprocess::ImageL
 }
 
 pub fn downcast_backend(backend: Arc<dyn Backend>) -> Result<Arc<RuntimeBackend>> {
-    downcast_arc(backend)
-        .ok_or_else(|| Error::Other("SmolVLA is only registered for CUDA".into()))
+    downcast_arc(backend).ok_or_else(|| Error::Other("SmolVLA is only registered for CUDA".into()))
 }

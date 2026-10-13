@@ -15,61 +15,60 @@ mod backend;
 mod bf16_executor;
 #[cfg(feature = "cuda")]
 mod bf16_runtime;
+mod bf16_weights;
 #[cfg(feature = "cuda")]
 mod calibration;
-#[cfg(feature = "cuda")]
-mod fp8_executor;
-mod fp8_calibration;
-#[cfg(feature = "cuda")]
-mod fp8_runtime;
-#[cfg(feature = "cuda")]
-mod vla_runtime;
-mod bf16_weights;
 mod config;
 mod device_weights;
+mod fp8_calibration;
+#[cfg(feature = "cuda")]
+mod fp8_executor;
+#[cfg(feature = "cuda")]
+mod fp8_runtime;
 mod fp8_weights;
 mod static_bf16_weights;
 mod static_fp8_weights;
+#[cfg(feature = "cuda")]
+mod vla_runtime;
 mod weights;
 
 #[cfg(feature = "cuda")]
 pub use bf16_executor::{
     language_layer_bf16, language_layer_cached_bf16, language_layer_cached_decode_bf16,
-    vision_layer_bf16,
-    vision_patch_embed_f32_bf16, Bf16LanguageLayerOutput,
+    vision_layer_bf16, vision_patch_embed_f32_bf16, Bf16LanguageLayerOutput,
 };
-pub use bf16_weights::{bf16_to_device, f32_to_device, Bf16LinearWeights};
 #[cfg(feature = "cuda")]
 pub use bf16_runtime::Pi0FastBf16Runtime;
+pub use bf16_weights::{bf16_to_device, f32_to_device, Bf16LinearWeights};
 #[cfg(feature = "cuda")]
-pub use fp8_executor::{
-    language_layer_cached_decode_fp8, language_layer_fp8, vision_layer_fp8, Pi0FastFp8Scales,
-    Fp8LanguageLayerOutput, LanguageLayerScales, VisionLayerScales,
-};
+pub use calibration::Pi0FastCalibrationObserver;
+pub use config::{Pi0FastConfig, Pi0FastLanguageConfig, Pi0FastPerformanceProfile};
 pub use fp8_calibration::{
     checkpoint_identity, Pi0FastCalibrationPlan, Pi0FastFp8Calibration, LM_HEAD_SITE,
     MULTIMODAL_PROJECTOR_SITE,
 };
 #[cfg(feature = "cuda")]
-pub use calibration::Pi0FastCalibrationObserver;
+pub use fp8_executor::{
+    language_layer_cached_decode_fp8, language_layer_fp8, vision_layer_fp8, Fp8LanguageLayerOutput,
+    LanguageLayerScales, Pi0FastFp8Scales, VisionLayerScales,
+};
 #[cfg(feature = "cuda")]
 pub use fp8_runtime::Pi0FastFp8Runtime;
 pub use fp8_weights::{Fp8LinearWeights, E4M3_MAX};
+#[cfg(feature = "cuda")]
+pub use static_bf16_weights::{
+    Bf16DeviceLanguageLayer, Bf16DeviceLayerNorm, Bf16DeviceVisionBlock, StaticBf16Pi0FastWeights,
+    VisionPatchEmbeddingF32,
+};
 #[cfg(feature = "cuda")]
 pub use static_fp8_weights::{
     Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, StaticFp8Pi0FastWeights,
 };
 #[cfg(feature = "cuda")]
 pub use vla_runtime::Pi0FastVlaRuntime;
-pub use config::{Pi0FastConfig, Pi0FastLanguageConfig, Pi0FastPerformanceProfile};
-#[cfg(feature = "cuda")]
-pub use static_bf16_weights::{
-    Bf16DeviceLanguageLayer, Bf16DeviceLayerNorm, Bf16DeviceVisionBlock, StaticBf16Pi0FastWeights,
-    VisionPatchEmbeddingF32,
-};
 pub use weights::{
-    GemmaAttentionWeights, GemmaMlpWeights, LanguageLayerWeights, LayerNormWeights,
-    LinearWeights, Pi0FastWeights, VisionBlockWeights, VisionWeights,
+    GemmaAttentionWeights, GemmaMlpWeights, LanguageLayerWeights, LayerNormWeights, LinearWeights,
+    Pi0FastWeights, VisionBlockWeights, VisionWeights,
 };
 
 /// Device table mapping each pruned LM-head column back to a global token id.

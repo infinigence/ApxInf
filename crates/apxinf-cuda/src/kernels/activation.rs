@@ -322,11 +322,7 @@ pub fn bias_gelu_bf16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>)
     bias_activation(ctx, input, value, 1)
 }
 
-pub fn bias_gelu_f16(
-    ctx: &CudaContext,
-    input: &Tensor,
-    value: Option<&Tensor>,
-) -> Result<Tensor> {
+pub fn bias_gelu_f16(ctx: &CudaContext, input: &Tensor, value: Option<&Tensor>) -> Result<Tensor> {
     let (rows, cols) = matrix_shape(input, "bias GELU")?;
     if input.dtype() != DType::F16
         || value.is_some_and(|bias| bias.dtype() != DType::F16 || bias.shape().dims() != [cols])

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use once_cell::sync::Lazy;
 use apxinf_core::{Backend, Device, Result};
+use once_cell::sync::Lazy;
 
 use crate::auto::{LoadOptions, LoadedModel};
 

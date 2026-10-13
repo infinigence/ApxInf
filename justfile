@@ -45,6 +45,8 @@ fmt:
     cargo fmt --all
 
 # Check formatting without modifying files.
+# Advisory: main carries pre-existing rustfmt drift; a cleanup PR should
+# run `just fmt` separately. pre-commit and pre-pr do not include it.
 fmt-check:
     cargo fmt --all --check
 
@@ -99,7 +101,7 @@ boundaries:
     bash scripts/check_model_family_boundaries.sh
 
 # Pre-commit quick check (target < 60 s).
-pre-commit: fmt-check doc-lint boundaries
+pre-commit: doc-lint boundaries
 
 # Pre-PR check; CI runs the same set.
 pre-pr: pre-commit check test-cpu

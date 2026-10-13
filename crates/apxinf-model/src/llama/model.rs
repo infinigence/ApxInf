@@ -12,14 +12,14 @@ use crate::debug::DebugCapture;
 use crate::profiling::GenerationProfile;
 
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
-#[cfg(feature = "cuda")]
 use crate::accelerator::cuda::{
     kernels as cuda_kernels, transfers as cuda_ops, Context as CudaContext,
     DeviceBuffer as CudaBuffer, KvCache as CudaKVCache,
 };
 #[cfg(feature = "cuda")]
 use apxinf_core::KvCache;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 use super::weights::{LlamaWeights, TransformerLayer};
 
@@ -80,9 +80,12 @@ impl LlamaModel {
                     .map_err(|e| Error::Cuda(format!("CUDA init: {e}")))?;
                 let ctx = Arc::new(ctx);
 
-                self.weights.token_embedding = cuda_ops::to_cuda(&self.weights.token_embedding, device_id)?;
-                self.weights.output_norm_weight = cuda_ops::to_cuda(&self.weights.output_norm_weight, device_id)?;
-                self.weights.output_weight = cuda_ops::to_cuda(&self.weights.output_weight, device_id)?;
+                self.weights.token_embedding =
+                    cuda_ops::to_cuda(&self.weights.token_embedding, device_id)?;
+                self.weights.output_norm_weight =
+                    cuda_ops::to_cuda(&self.weights.output_norm_weight, device_id)?;
+                self.weights.output_weight =
+                    cuda_ops::to_cuda(&self.weights.output_weight, device_id)?;
 
                 for layer in &mut self.weights.layers {
                     layer.attn_norm_weight = cuda_ops::to_cuda(&layer.attn_norm_weight, device_id)?;
@@ -254,7 +257,12 @@ impl LlamaModel {
     /// `eos_token_id`: optional EOS token ID for early stopping
     ///
     /// Returns generated token IDs (excluding prompt) and a generation profile.
-    pub fn generate(&mut self, prompt_tokens: &[u32], max_new_tokens: usize, eos_token_id: Option<u32>) -> Result<(Vec<u32>, GenerationProfile)> {
+    pub fn generate(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<(Vec<u32>, GenerationProfile)> {
         self.generate_streaming(prompt_tokens, max_new_tokens, |_| {}, None, eos_token_id)
     }
 
@@ -274,15 +282,12 @@ impl LlamaModel {
 
         // Upload token IDs to GPU
         let ids_bytes = seq_len * std::mem::size_of::<u32>();
-        let ids_buf = CudaBuffer::alloc(ids_bytes, device_id)
-            .map_err(Error::Cuda)?;
-        let host_bytes: Vec<u8> = token_ids.iter()
-            .flat_map(|id| id.to_ne_bytes())
-            .collect();
-        ids_buf.copy_from_host(&host_bytes)
-            .map_err(Error::Cuda)?;
+        let ids_buf = CudaBuffer::alloc(ids_bytes, device_id).map_err(Error::Cuda)?;
+        let host_bytes: Vec<u8> = token_ids.iter().flat_map(|id| id.to_ne_bytes()).collect();
+        ids_buf.copy_from_host(&host_bytes).map_err(Error::Cuda)?;
 
-        let mut x = cuda_kernels::embedding::lookup(ctx, &self.weights.token_embedding, &ids_buf, seq_len)?;
+        let mut x =
+            cuda_kernels::embedding::lookup(ctx, &self.weights.token_embedding, &ids_buf, seq_len)?;
 
         // Transformer layers
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
@@ -290,7 +295,12 @@ impl LlamaModel {
         }
 
         // Final RMS norm + output projection
-        x = cuda_kernels::norm::rms(ctx, &x, &self.weights.output_norm_weight, self.config.rms_norm_eps)?;
+        x = cuda_kernels::norm::rms(
+            ctx,
+            &x,
+            &self.weights.output_norm_weight,
+            self.config.rms_norm_eps,
+        )?;
         x = cuda_kernels::gemm::matmul(ctx, &x, &self.weights.output_weight)?;
 
         // Single sync point — wait for all queued work
@@ -313,7 +323,8 @@ impl LlamaModel {
         kv_cache: &CudaKVCache,
     ) -> Result<Tensor> {
         // Pre-attention norm
-        let normed = cuda_kernels::norm::rms(ctx, x, &layer.attn_norm_weight, self.config.rms_norm_eps)?;
+        let normed =
+            cuda_kernels::norm::rms(ctx, x, &layer.attn_norm_weight, self.config.rms_norm_eps)?;
 
         // Attention
         let attn_out = self.attention_gpu(&normed, layer, layer_idx, start_pos, ctx, kv_cache)?;
@@ -322,7 +333,8 @@ impl LlamaModel {
         let x = cuda_kernels::elementwise::add(ctx, x, &attn_out)?;
 
         // Pre-FFN norm
-        let normed = cuda_kernels::norm::rms(ctx, &x, &layer.ffn_norm_weight, self.config.rms_norm_eps)?;
+        let normed =
+            cuda_kernels::norm::rms(ctx, &x, &layer.ffn_norm_weight, self.config.rms_norm_eps)?;
 
         // MLP
         let gate = cuda_kernels::gemm::matmul(ctx, &normed, &layer.w_gate)?;
@@ -362,9 +374,21 @@ impl LlamaModel {
 
         // Apply batched RoPE (half-split)
         let q_rope = cuda_kernels::rope::apply_batched(
-            ctx, &q, n_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
+            ctx,
+            &q,
+            n_heads,
+            head_dim,
+            self.config.rope_theta,
+            start_pos as u32,
+        )?;
         let k_rope = cuda_kernels::rope::apply_batched(
-            ctx, &k, n_kv_heads, head_dim, self.config.rope_theta, start_pos as u32)?;
+            ctx,
+            &k,
+            n_kv_heads,
+            head_dim,
+            self.config.rope_theta,
+            start_pos as u32,
+        )?;
 
         // Append K/V to GPU KV cache
         kv_cache.append(ctx, layer_idx, &k_rope, &v, seq_len)?;
@@ -434,7 +458,14 @@ impl LlamaModel {
 
         // Transformer layers
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            x = self.transformer_layer(&x, layer, layer_idx, start_pos, kv_cache.as_deref_mut(), debug)?;
+            x = self.transformer_layer(
+                &x,
+                layer,
+                layer_idx,
+                start_pos,
+                kv_cache.as_deref_mut(),
+                debug,
+            )?;
         }
 
         // Advance KV cache by seq_len (after all layers have appended)
@@ -493,9 +524,7 @@ impl LlamaModel {
         }
 
         match device {
-            Device::Cpu => {
-                Tensor::from_f32(vec![seq_len, embed_dim], &embed_data)
-            }
+            Device::Cpu => Tensor::from_f32(vec![seq_len, embed_dim], &embed_data),
             #[cfg(feature = "cuda")]
             Device::Cuda(device_id) => {
                 let cpu_tensor = Tensor::from_f32(vec![seq_len, embed_dim], &embed_data)?;
@@ -524,13 +553,21 @@ impl LlamaModel {
         // Pre-attention norm
         if let Some(d) = debug {
             let x_cpu = self.tensor_to_cpu(x)?;
-            d.capture(&format!("{}.norm_attn.input", prefix), &x_cpu.as_f32()?, x.shape().dims());
+            d.capture(
+                &format!("{}.norm_attn.input", prefix),
+                &x_cpu.as_f32()?,
+                x.shape().dims(),
+            );
         }
         let normed = self.rms_norm(x, &layer.attn_norm_weight)?;
 
         if let Some(d) = debug {
             let normed_cpu = self.tensor_to_cpu(&normed)?;
-            d.capture(&format!("{}.norm_attn.output", prefix), &normed_cpu.as_f32()?, normed.shape().dims());
+            d.capture(
+                &format!("{}.norm_attn.output", prefix),
+                &normed_cpu.as_f32()?,
+                normed.shape().dims(),
+            );
         }
 
         // Attention
@@ -538,7 +575,11 @@ impl LlamaModel {
 
         if let Some(d) = debug {
             let attn_cpu = self.tensor_to_cpu(&attn_out)?;
-            d.capture(&format!("{}.attn.proj_output", prefix), &attn_cpu.as_f32()?, attn_out.shape().dims());
+            d.capture(
+                &format!("{}.attn.proj_output", prefix),
+                &attn_cpu.as_f32()?,
+                attn_out.shape().dims(),
+            );
         }
 
         // Residual
@@ -546,19 +587,31 @@ impl LlamaModel {
 
         if let Some(d) = debug {
             let x_cpu = self.tensor_to_cpu(&x)?;
-            d.capture(&format!("{}.residual_attn", prefix), &x_cpu.as_f32()?, x.shape().dims());
+            d.capture(
+                &format!("{}.residual_attn", prefix),
+                &x_cpu.as_f32()?,
+                x.shape().dims(),
+            );
         }
 
         // Pre-FFN norm
         if let Some(d) = debug {
             let x_cpu = self.tensor_to_cpu(&x)?;
-            d.capture(&format!("{}.norm_ffn.input", prefix), &x_cpu.as_f32()?, x.shape().dims());
+            d.capture(
+                &format!("{}.norm_ffn.input", prefix),
+                &x_cpu.as_f32()?,
+                x.shape().dims(),
+            );
         }
         let normed = self.rms_norm(&x, &layer.ffn_norm_weight)?;
 
         if let Some(d) = debug {
             let normed_cpu = self.tensor_to_cpu(&normed)?;
-            d.capture(&format!("{}.norm_ffn.output", prefix), &normed_cpu.as_f32()?, normed.shape().dims());
+            d.capture(
+                &format!("{}.norm_ffn.output", prefix),
+                &normed_cpu.as_f32()?,
+                normed.shape().dims(),
+            );
         }
 
         // MLP
@@ -569,7 +622,11 @@ impl LlamaModel {
 
         if let Some(d) = debug {
             let x_cpu = self.tensor_to_cpu(&x)?;
-            d.capture(&format!("{}.residual_ffn", prefix), &x_cpu.as_f32()?, x.shape().dims());
+            d.capture(
+                &format!("{}.residual_ffn", prefix),
+                &x_cpu.as_f32()?,
+                x.shape().dims(),
+            );
         }
 
         Ok(x)
@@ -599,9 +656,21 @@ impl LlamaModel {
             let q_cpu = self.tensor_to_cpu(&q)?;
             let k_cpu = self.tensor_to_cpu(&k)?;
             let v_cpu = self.tensor_to_cpu(&v)?;
-            d.capture(&format!("{}.attn.q", prefix), &q_cpu.as_f32()?, q.shape().dims());
-            d.capture(&format!("{}.attn.k", prefix), &k_cpu.as_f32()?, k.shape().dims());
-            d.capture(&format!("{}.attn.v", prefix), &v_cpu.as_f32()?, v.shape().dims());
+            d.capture(
+                &format!("{}.attn.q", prefix),
+                &q_cpu.as_f32()?,
+                q.shape().dims(),
+            );
+            d.capture(
+                &format!("{}.attn.k", prefix),
+                &k_cpu.as_f32()?,
+                k.shape().dims(),
+            );
+            d.capture(
+                &format!("{}.attn.v", prefix),
+                &v_cpu.as_f32()?,
+                v.shape().dims(),
+            );
         }
 
         // Reshape to [seq_len, n_heads, head_dim] / [seq_len, n_kv_heads, head_dim]
@@ -609,7 +678,7 @@ impl LlamaModel {
         let k = k.reshape(vec![seq_len, n_kv_heads, head_dim])?;
         let v = v.reshape(vec![seq_len, n_kv_heads, head_dim])?;
 
-// ── CPU fallback path ────────────────────────────────────────
+        // ── CPU fallback path ────────────────────────────────────────
 
         // Convert to f32 vectors (CPU-based attention)
         #[cfg(feature = "cuda")]
@@ -618,20 +687,40 @@ impl LlamaModel {
                 let q_cpu = cuda_ops::to_cpu(&q)?;
                 let k_cpu = cuda_ops::to_cpu(&k)?;
                 let v_cpu = cuda_ops::to_cpu(&v)?;
-                (q_cpu.as_f32()?.to_vec(), k_cpu.as_f32()?.to_vec(), v_cpu.as_f32()?.to_vec())
+                (
+                    q_cpu.as_f32()?.to_vec(),
+                    k_cpu.as_f32()?.to_vec(),
+                    v_cpu.as_f32()?.to_vec(),
+                )
             }
-            _ => (q.as_f32()?.to_vec(), k.as_f32()?.to_vec(), v.as_f32()?.to_vec()),
+            _ => (
+                q.as_f32()?.to_vec(),
+                k.as_f32()?.to_vec(),
+                v.as_f32()?.to_vec(),
+            ),
         };
         #[cfg(not(feature = "cuda"))]
-        let (q_data, k_data, v_data) = (q.as_f32()?.to_vec(), k.as_f32()?.to_vec(), v.as_f32()?.to_vec());
+        let (q_data, k_data, v_data) = (
+            q.as_f32()?.to_vec(),
+            k.as_f32()?.to_vec(),
+            v.as_f32()?.to_vec(),
+        );
 
         // Apply RoPE with position offsets per token
         let q_rope = self.rope_batched(&q_data, seq_len, n_heads, head_dim, start_pos)?;
         let k_rope = self.rope_batched(&k_data, seq_len, n_kv_heads, head_dim, start_pos)?;
 
         if let Some(d) = debug {
-            d.capture(&format!("{}.attn.q_rope", prefix), &q_rope, &[seq_len, n_heads, head_dim]);
-            d.capture(&format!("{}.attn.k_rope", prefix), &k_rope, &[seq_len, n_kv_heads, head_dim]);
+            d.capture(
+                &format!("{}.attn.q_rope", prefix),
+                &q_rope,
+                &[seq_len, n_heads, head_dim],
+            );
+            d.capture(
+                &format!("{}.attn.k_rope", prefix),
+                &k_rope,
+                &[seq_len, n_kv_heads, head_dim],
+            );
         }
 
         // Update KV cache and compute attention
@@ -670,8 +759,8 @@ impl LlamaModel {
                     // Weighted sum of V
                     for t in 0..attn_len {
                         for d in 0..head_dim {
-                            output[s * n_heads * head_dim + h * head_dim + d]
-                                += scores[t] * v_cached[kv_h][t][d];
+                            output[s * n_heads * head_dim + h * head_dim + d] +=
+                                scores[t] * v_cached[kv_h][t][d];
                         }
                     }
                 }
@@ -704,8 +793,8 @@ impl LlamaModel {
 
                     for t in 0..=s {
                         for d in 0..head_dim {
-                            output[s * n_heads * head_dim + h * head_dim + d]
-                                += scores[t] * v_data[t * n_kv_heads * head_dim + kv_h * head_dim + d];
+                            output[s * n_heads * head_dim + h * head_dim + d] +=
+                                scores[t] * v_data[t * n_kv_heads * head_dim + kv_h * head_dim + d];
                         }
                     }
                 }
@@ -716,7 +805,11 @@ impl LlamaModel {
 
         // Reshape output for projection
         if let Some(d) = debug {
-            d.capture(&format!("{}.attn.output", prefix), &attn_out, &[seq_len, n_heads * head_dim]);
+            d.capture(
+                &format!("{}.attn.output", prefix),
+                &attn_out,
+                &[seq_len, n_heads * head_dim],
+            );
         }
 
         // Create output tensor on the correct device: [seq_len, hidden_size]
@@ -741,13 +834,23 @@ impl LlamaModel {
         Ok(proj)
     }
 
-    fn mlp(&self, x: &Tensor, layer: &TransformerLayer, debug: &mut Option<&mut DebugCapture>, prefix: &str) -> Result<Tensor> {
+    fn mlp(
+        &self,
+        x: &Tensor,
+        layer: &TransformerLayer,
+        debug: &mut Option<&mut DebugCapture>,
+        prefix: &str,
+    ) -> Result<Tensor> {
         // gate = silu(x @ w_gate)
         let gate = self.matmul(x, &layer.w_gate)?;
 
         if let Some(d) = debug {
             let gate_cpu = self.tensor_to_cpu(&gate)?;
-            d.capture(&format!("{}.ffn.gate", prefix), &gate_cpu.as_f32()?, gate.shape().dims());
+            d.capture(
+                &format!("{}.ffn.gate", prefix),
+                &gate_cpu.as_f32()?,
+                gate.shape().dims(),
+            );
         }
         let gate = self.silu(&gate)?;
 
@@ -756,7 +859,11 @@ impl LlamaModel {
 
         if let Some(d) = debug {
             let up_cpu = self.tensor_to_cpu(&up)?;
-            d.capture(&format!("{}.ffn.up", prefix), &up_cpu.as_f32()?, up.shape().dims());
+            d.capture(
+                &format!("{}.ffn.up", prefix),
+                &up_cpu.as_f32()?,
+                up.shape().dims(),
+            );
         }
 
         // hidden = gate * up
@@ -764,7 +871,11 @@ impl LlamaModel {
 
         if let Some(d) = debug {
             let hidden_cpu = self.tensor_to_cpu(&hidden)?;
-            d.capture(&format!("{}.ffn.gated", prefix), &hidden_cpu.as_f32()?, hidden.shape().dims());
+            d.capture(
+                &format!("{}.ffn.gated", prefix),
+                &hidden_cpu.as_f32()?,
+                hidden.shape().dims(),
+            );
         }
 
         // out = hidden @ w_down
@@ -772,7 +883,11 @@ impl LlamaModel {
 
         if let Some(d) = debug.as_mut() {
             let out_cpu = self.tensor_to_cpu(&out)?;
-            d.capture(&format!("{}.ffn.output", prefix), &out_cpu.as_f32()?, out.shape().dims());
+            d.capture(
+                &format!("{}.ffn.output", prefix),
+                &out_cpu.as_f32()?,
+                out.shape().dims(),
+            );
         }
 
         Ok(out)
@@ -825,14 +940,14 @@ impl LlamaModel {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let ctx = self
+                    .cuda_ctx
+                    .as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
                 cuda_kernels::norm::rms(ctx, x, weight, self.config.rms_norm_eps)
             }
             #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                Err(Error::Other("CUDA not compiled in".into()))
-            }
+            Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
             // This model dispatches on the device itself rather than through
             // `Backend`, so it only knows CPU and CUDA. Reject anything else
             // instead of silently computing on the host.
@@ -847,7 +962,14 @@ impl LlamaModel {
     /// `n_heads`: number of heads (n_heads for Q, n_kv_heads for K)
     /// `head_dim`: dimension per head
     /// `start_pos`: starting position offset (first token's position)
-    fn rope_batched(&self, data: &[f32], seq_len: usize, n_heads: usize, head_dim: usize, start_pos: usize) -> Result<Vec<f32>> {
+    fn rope_batched(
+        &self,
+        data: &[f32],
+        seq_len: usize,
+        n_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
         let theta = self.config.rope_theta;
         let half_dim = head_dim / 2;
         let mut out = vec![0.0f32; data.len()];
@@ -872,7 +994,7 @@ impl LlamaModel {
                     let cos_v = angle.cos();
                     let sin_v = angle.sin();
 
-                    let x1 = data[base + i];            // first half
+                    let x1 = data[base + i]; // first half
                     let x2 = data[base + half_dim + i]; // second half
 
                     out[base + i] = x1 * cos_v - x2 * sin_v;
@@ -888,21 +1010,19 @@ impl LlamaModel {
         match x.device() {
             Device::Cpu => {
                 let data = x.as_f32()?;
-                let out: Vec<f32> = data.iter()
-                    .map(|&v| v / (1.0 + (-v).exp()))
-                    .collect();
+                let out: Vec<f32> = data.iter().map(|&v| v / (1.0 + (-v).exp())).collect();
                 Tensor::from_f32(x.shape().dims().to_vec(), &out)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let ctx = self
+                    .cuda_ctx
+                    .as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
                 cuda_kernels::activation::silu(ctx, x)
             }
             #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                Err(Error::Other("CUDA not compiled in".into()))
-            }
+            Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
             // This model dispatches on the device itself rather than through
             // `Backend`, so it only knows CPU and CUDA. Reject anything else
             // instead of silently computing on the host.
@@ -915,21 +1035,23 @@ impl LlamaModel {
             Device::Cpu => {
                 let a_data = a.as_f32()?;
                 let b_data = b.as_f32()?;
-                let out: Vec<f32> = a_data.iter().zip(b_data.iter())
+                let out: Vec<f32> = a_data
+                    .iter()
+                    .zip(b_data.iter())
                     .map(|(a, b)| a + b)
                     .collect();
                 Tensor::from_f32(a.shape().dims().to_vec(), &out)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let ctx = self
+                    .cuda_ctx
+                    .as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
                 cuda_kernels::elementwise::add(ctx, a, b)
             }
             #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                Err(Error::Other("CUDA not compiled in".into()))
-            }
+            Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
             // This model dispatches on the device itself rather than through
             // `Backend`, so it only knows CPU and CUDA. Reject anything else
             // instead of silently computing on the host.
@@ -942,21 +1064,23 @@ impl LlamaModel {
             Device::Cpu => {
                 let a_data = a.as_f32()?;
                 let b_data = b.as_f32()?;
-                let out: Vec<f32> = a_data.iter().zip(b_data.iter())
+                let out: Vec<f32> = a_data
+                    .iter()
+                    .zip(b_data.iter())
                     .map(|(a, b)| a * b)
                     .collect();
                 Tensor::from_f32(a.shape().dims().to_vec(), &out)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let ctx = self
+                    .cuda_ctx
+                    .as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
                 cuda_kernels::elementwise::mul(ctx, a, b)
             }
             #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                Err(Error::Other("CUDA not compiled in".into()))
-            }
+            Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
             // This model dispatches on the device itself rather than through
             // `Backend`, so it only knows CPU and CUDA. Reject anything else
             // instead of silently computing on the host.
@@ -969,14 +1093,14 @@ impl LlamaModel {
             Device::Cpu => a.matmul_cpu(b),
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
-                let ctx = self.cuda_ctx.as_ref()
+                let ctx = self
+                    .cuda_ctx
+                    .as_ref()
                     .ok_or_else(|| Error::Other("CUDA context not initialized".into()))?;
                 cuda_kernels::gemm::matmul(ctx, a, b)
             }
             #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                Err(Error::Other("CUDA not compiled in".into()))
-            }
+            Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
             // This model dispatches on the device itself rather than through
             // `Backend`, so it only knows CPU and CUDA. Reject anything else
             // instead of silently computing on the host.
@@ -1011,11 +1135,7 @@ impl KVCache {
         let k_cache = (0..n_layers)
             .map(|_| {
                 (0..n_kv_heads)
-                    .map(|_| {
-                        (0..max_seq_len)
-                            .map(|_| vec![0.0f32; head_dim])
-                            .collect()
-                    })
+                    .map(|_| (0..max_seq_len).map(|_| vec![0.0f32; head_dim]).collect())
                     .collect()
             })
             .collect();
@@ -1023,11 +1143,7 @@ impl KVCache {
         let v_cache = (0..n_layers)
             .map(|_| {
                 (0..n_kv_heads)
-                    .map(|_| {
-                        (0..max_seq_len)
-                            .map(|_| vec![0.0f32; head_dim])
-                            .collect()
-                    })
+                    .map(|_| (0..max_seq_len).map(|_| vec![0.0f32; head_dim]).collect())
                     .collect()
             })
             .collect();
@@ -1047,13 +1163,23 @@ impl KVCache {
     /// `seq_len`: number of positions to append
     /// `n_kv_heads`: number of KV heads
     /// `head_dim`: dimension per head
-    pub fn append(&mut self, layer_idx: usize, k_rope: &[f32], v: &[f32], seq_len: usize, n_kv_heads: usize, head_dim: usize) {
+    pub fn append(
+        &mut self,
+        layer_idx: usize,
+        k_rope: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) {
         for s in 0..seq_len {
             let pos = self.seq_len + s;
             for h in 0..n_kv_heads {
                 for d in 0..head_dim {
-                    self.k_cache[layer_idx][h][pos][d] = k_rope[s * n_kv_heads * head_dim + h * head_dim + d];
-                    self.v_cache[layer_idx][h][pos][d] = v[s * n_kv_heads * head_dim + h * head_dim + d];
+                    self.k_cache[layer_idx][h][pos][d] =
+                        k_rope[s * n_kv_heads * head_dim + h * head_dim + d];
+                    self.v_cache[layer_idx][h][pos][d] =
+                        v[s * n_kv_heads * head_dim + h * head_dim + d];
                 }
             }
         }
@@ -1062,10 +1188,7 @@ impl KVCache {
     /// Get K and V for a layer up to current position.
     /// Returns (K, V) where each is [n_kv_heads, seq_len, head_dim]
     pub fn get_kv(&self, layer_idx: usize) -> (&[Vec<Vec<f32>>], &[Vec<Vec<f32>>]) {
-        (
-            &self.k_cache[layer_idx],
-            &self.v_cache[layer_idx],
-        )
+        (&self.k_cache[layer_idx], &self.v_cache[layer_idx])
     }
 
     /// Advance sequence length by n positions.
@@ -1153,11 +1276,17 @@ mod tests {
             );
             tensors.insert(
                 format!("{prefix}.self_attn.k_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
             );
             tensors.insert(
                 format!("{prefix}.self_attn.v_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
             );
             tensors.insert(
                 format!("{prefix}.self_attn.o_proj.weight"),
@@ -1234,11 +1363,17 @@ mod tests {
             );
             tensors.insert(
                 format!("{prefix}.self_attn.k_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
             );
             tensors.insert(
                 format!("{prefix}.self_attn.v_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
             );
             tensors.insert(
                 format!("{prefix}.self_attn.o_proj.weight"),

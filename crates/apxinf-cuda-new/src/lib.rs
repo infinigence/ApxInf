@@ -13,7 +13,6 @@ pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
 pub use context::CudaContext;
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use graph::{capture, CapturedGraph};
-pub use phase::PreparedPhase;
 pub use ops::{
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, attention, bias_residual,
     bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, concat_rows, decode_rope,
@@ -26,6 +25,7 @@ pub use ops::{
     PointwiseActivation, PointwiseArgs, PointwiseSemantic, QuantizationArgs, QuantizationSemantic,
     RmsNormArgs, RopeArgs, RopeSemantic, SegmentedAttentionArgs,
 };
+pub use phase::PreparedPhase;
 pub use stream::CudaStream;
 
 pub mod ops;

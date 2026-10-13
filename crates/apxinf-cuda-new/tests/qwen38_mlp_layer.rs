@@ -189,11 +189,7 @@ impl Scratch {
             ),
             fused: device_zeros(ctx, vec![tokens, 2 * INTERMEDIATE], DType::BF16),
             activated: device_zeros(ctx, vec![tokens, INTERMEDIATE], DType::BF16),
-            activated_quantized: device_zeros(
-                ctx,
-                vec![tokens, INTERMEDIATE / 2],
-                DType::E2M1Pair,
-            ),
+            activated_quantized: device_zeros(ctx, vec![tokens, INTERMEDIATE / 2], DType::E2M1Pair),
             activated_scales: device_zeros(
                 ctx,
                 vec![ops::nvfp4_scale_buffer_bytes(tokens, INTERMEDIATE, BLOCK).unwrap()],
@@ -293,7 +289,13 @@ fn mlp_block(
     )?;
 
     ops::add_into(ctx, &scratch.projected, residual)?;
-    let _ = (tokens, gate_up.out_features, gate_up.in_features, down.out_features, down.in_features);
+    let _ = (
+        tokens,
+        gate_up.out_features,
+        gate_up.in_features,
+        down.out_features,
+        down.in_features,
+    );
     Ok(())
 }
 
@@ -303,7 +305,10 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
     let ctx = CudaContext::new(0).unwrap();
     let load_start = Instant::now();
     let tensors = checkpoint();
-    println!("checkpoint load: {:.2}s", load_start.elapsed().as_secs_f64());
+    println!(
+        "checkpoint load: {:.2}s",
+        load_start.elapsed().as_secs_f64()
+    );
 
     let build_start = Instant::now();
     let gate_up = Projection::fused_gate_up(&ctx, &tensors, 0);
@@ -338,7 +343,14 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
         for fused in [false, true] {
             let residual = upload_bytes(&ctx, &seed, vec![tokens, HIDDEN], DType::BF16);
             mlp_block(
-                &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                &ctx,
+                &residual,
+                &norm_weight,
+                &gate_up,
+                &down,
+                &mut scratch,
+                tokens,
+                fused,
             )
             .unwrap();
             ctx.synchronize().unwrap();
@@ -374,14 +386,21 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
         let weight_bytes = (2.0 * INTERMEDIATE as f64 * HIDDEN as f64
             + HIDDEN as f64 * INTERMEDIATE as f64)
             * (0.5 + 1.0 / 16.0);
-        let flops = 2.0 * tokens as f64
-            * (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) as f64;
+        let flops =
+            2.0 * tokens as f64 * (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) as f64;
 
         let mut timings = [0.0f64; 2];
         for (slot, fused) in [(0usize, false), (1usize, true)] {
             // Warm up: the first call tunes and prepares native executions.
             mlp_block(
-                &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                &ctx,
+                &residual,
+                &norm_weight,
+                &gate_up,
+                &down,
+                &mut scratch,
+                tokens,
+                fused,
             )
             .unwrap();
             ctx.synchronize().unwrap();
@@ -390,7 +409,14 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
             let start = Instant::now();
             for _ in 0..iterations {
                 mlp_block(
-                    &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                    &ctx,
+                    &residual,
+                    &norm_weight,
+                    &gate_up,
+                    &down,
+                    &mut scratch,
+                    tokens,
+                    fused,
                 )
                 .unwrap();
             }

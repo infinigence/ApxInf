@@ -486,8 +486,11 @@ mod tests {
 
     #[test]
     fn toolkit_directory_names_both_libraries() {
-        let paths =
-            TuningPaths::for_cuda_toolkit("configs/tuning", &caps("NVIDIA Thor", 110), &versions("13.2", "13.2.1"));
+        let paths = TuningPaths::for_cuda_toolkit(
+            "configs/tuning",
+            &caps("NVIDIA Thor", 110),
+            &versions("13.2", "13.2.1"),
+        );
         assert_eq!(
             paths.tactics,
             Path::new("configs/tuning/nvidia/thor-sm110/cuda13.2-cublas13.2/tactics.json")

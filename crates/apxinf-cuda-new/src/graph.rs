@@ -178,7 +178,9 @@ mod tests {
                 panic!("capture recovery fixture");
             });
         }));
-        let payload = result.err().expect("capture must resume the original panic");
+        let payload = result
+            .err()
+            .expect("capture must resume the original panic");
         assert_eq!(
             payload.downcast_ref::<&str>(),
             Some(&"capture recovery fixture")

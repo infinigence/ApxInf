@@ -340,10 +340,14 @@ pub fn decode_attention(
     let out = tensor_storage(ctx, output, DType::BF16, &q_shape)?;
     let k_shape = key_cache.shape().dims();
     if k_shape.len() != 4 || k_shape[0] != 1 || k_shape[2] != 4 || k_shape[3] != 256 {
-        return Err(invalid("FA2 decode key cache must be [1, capacity, 4, 256]"));
+        return Err(invalid(
+            "FA2 decode key cache must be [1, capacity, 4, 256]",
+        ));
     }
     if value_cache.shape().dims() != k_shape || key_tokens < 128 || key_tokens > k_shape[1] {
-        return Err(invalid("FA2 decode requires matching caches and 128 <= key_tokens <= capacity"));
+        return Err(invalid(
+            "FA2 decode requires matching caches and 128 <= key_tokens <= capacity",
+        ));
     }
     if !scale.is_finite() || scale <= 0.0 {
         return Err(invalid("FA2 decode scale must be finite and positive"));
@@ -353,7 +357,8 @@ pub fn decode_attention(
     let workspace_shape = workspace.shape().dims();
     let workspace_buffer = tensor_storage(ctx, workspace, DType::F32, workspace_shape)?;
     let workspace_bytes = workspace_shape.iter().try_fold(4usize, |bytes, dim| {
-        bytes.checked_mul(*dim)
+        bytes
+            .checked_mul(*dim)
             .ok_or_else(|| invalid("FA2 decode workspace size overflow"))
     })?;
     let required = decode_attention_workspace_bytes();
@@ -364,8 +369,16 @@ pub fn decode_attention(
     }
     unsafe {
         status::check(abi::apxinf_decode_attention(
-            ctx.runtime(), q.ptr(), key.ptr(), value.ptr(), out.ptr(), workspace_buffer.ptr(),
-            workspace_bytes as i64, key_tokens as i64, scale, ctx.stream().handle(),
+            ctx.runtime(),
+            q.ptr(),
+            key.ptr(),
+            value.ptr(),
+            out.ptr(),
+            workspace_buffer.ptr(),
+            workspace_bytes as i64,
+            key_tokens as i64,
+            scale,
+            ctx.stream().handle(),
         ))
     }
 }

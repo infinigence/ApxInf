@@ -67,9 +67,8 @@ impl GenerationProfile {
 
     /// Time to first token (prefill duration) in milliseconds.
     pub fn ttft_ms(&self) -> Option<f64> {
-        self.first_token_time.map(|ft| {
-            (ft - self.start_time).as_nanos() as f64 / 1_000_000.0
-        })
+        self.first_token_time
+            .map(|ft| (ft - self.start_time).as_nanos() as f64 / 1_000_000.0)
     }
 
     /// Time per output token (decode phase only, excluding the first token).
@@ -79,11 +78,7 @@ impl GenerationProfile {
         match (self.first_token_time, self.end_time, self.output_tokens) {
             (Some(ft), Some(et), n) if n > 1 => {
                 // Decode tokens = output_tokens - 1 (first token comes "free" from prefill)
-                Some(
-                    self.engine_duration(ft, et).as_nanos() as f64
-                        / 1_000_000.0
-                        / (n - 1) as f64,
-                )
+                Some(self.engine_duration(ft, et).as_nanos() as f64 / 1_000_000.0 / (n - 1) as f64)
             }
             _ => None,
         }
@@ -103,9 +98,8 @@ impl GenerationProfile {
 
     /// Total generation latency in milliseconds.
     pub fn total_latency_ms(&self) -> Option<f64> {
-        self.end_time.map(|et| {
-            self.engine_duration(self.start_time, et).as_nanos() as f64 / 1_000_000.0
-        })
+        self.end_time
+            .map(|et| self.engine_duration(self.start_time, et).as_nanos() as f64 / 1_000_000.0)
     }
 
     /// Number of input (prompt) tokens.
@@ -120,19 +114,23 @@ impl GenerationProfile {
 
     /// Format a human-readable summary of all metrics.
     pub fn summary(&self) -> String {
-        let ttft = self.ttft_ms()
+        let ttft = self
+            .ttft_ms()
             .map(|ms| format!("{ms:.1} ms"))
             .unwrap_or_else(|| "N/A".to_string());
 
-        let tpot = self.tpot_ms()
+        let tpot = self
+            .tpot_ms()
             .map(|ms| format!("{ms:.1} ms/token"))
             .unwrap_or_else(|| "N/A".to_string());
 
-        let gen_tps = self.generation_tps()
+        let gen_tps = self
+            .generation_tps()
             .map(|tps| format!("{tps:.2} tok/s"))
             .unwrap_or_else(|| "N/A".to_string());
 
-        let total = self.total_latency_ms()
+        let total = self
+            .total_latency_ms()
             .map(|ms| {
                 if ms >= 1000.0 {
                     format!("{:.2} s", ms / 1000.0)
@@ -150,14 +148,8 @@ impl GenerationProfile {
              TPOT:             {}\n\
              Generation TPS:   {}\n\
              Total latency:    {}\n\
-             ========================="
-            ,
-            self.input_tokens,
-            self.output_tokens,
-            ttft,
-            tpot,
-            gen_tps,
-            total,
+             =========================",
+            self.input_tokens, self.output_tokens, ttft, tpot, gen_tps, total,
         )
     }
 }

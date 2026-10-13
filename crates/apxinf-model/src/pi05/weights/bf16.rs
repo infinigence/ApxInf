@@ -39,21 +39,21 @@ mod linear {
             let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
                 None
             } else if linears.iter().all(|linear| linear.bias.is_some()) {
-                Some(backend::to_device(context, &concat_biases_bf16(
-                    &linears
-                        .iter()
-                        .map(|linear| linear.bias.as_ref().unwrap())
-                        .collect::<Vec<_>>(),
-                )?)?)
+                Some(backend::to_device(
+                    context,
+                    &concat_biases_bf16(
+                        &linears
+                            .iter()
+                            .map(|linear| linear.bias.as_ref().unwrap())
+                            .collect::<Vec<_>>(),
+                    )?,
+                )?)
             } else {
                 return Err(Error::Other(
                     "cannot pack BF16 projections with mixed bias presence".into(),
                 ));
             };
-            Ok(Self {
-                weight,
-                bias,
-            })
+            Ok(Self { weight, bias })
         }
     }
 
@@ -110,18 +110,15 @@ mod linear {
                 v.bias.as_ref().unwrap(),
             ])
             .unwrap();
-            assert_eq!(
-                biases.to_f32_vec().unwrap(),
-                vec![1., 2., 3., 4.]
-            );
+            assert_eq!(biases.to_f32_vec().unwrap(), vec![1., 2., 3., 4.]);
         }
     }
 }
 pub use linear::*;
 // Fully materialized native-BF16 π0.5 weights.
 
-use apxinf_core::{Result, Tensor};
 use crate::pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,

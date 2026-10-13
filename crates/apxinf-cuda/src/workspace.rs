@@ -51,10 +51,7 @@ impl Drop for WorkspaceLease {
             .live_requested_bytes
             .saturating_sub(self.requested_bytes);
         if self.extent != 0 {
-            state
-                .free_blocks
-                .entry(self.start)
-                .or_insert(self.extent);
+            state.free_blocks.entry(self.start).or_insert(self.extent);
             merge_adjacent_free_blocks(&mut state.free_blocks);
         }
     }
@@ -176,9 +173,7 @@ impl GraphWorkspace {
             .checked_add(bytes)
             .ok_or_else(|| Error::Other("workspace high-water overflow".into()))?;
         state.high_water_bytes = state.high_water_bytes.max(allocation_end);
-        state.peak_requested_bytes = state
-            .peak_requested_bytes
-            .max(state.live_requested_bytes);
+        state.peak_requested_bytes = state.peak_requested_bytes.max(state.live_requested_bytes);
 
         let lease = Arc::new(WorkspaceLease {
             state: Arc::clone(&self.state),
@@ -297,8 +292,7 @@ fn take_free_block(free_blocks: &mut BTreeMap<usize, usize>, extent: usize) -> O
     let mut selected = None;
     for (start, block_extent) in free_blocks.iter() {
         if *block_extent >= extent
-            && selected
-                .is_none_or(|(_, selected_extent)| *block_extent < selected_extent)
+            && selected.is_none_or(|(_, selected_extent)| *block_extent < selected_extent)
         {
             selected = Some((*start, *block_extent));
         }
@@ -316,8 +310,7 @@ fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
     for (&start, &extent) in free_blocks.iter() {
         if let Some((&last_start, &last_extent)) = merged.last_key_value() {
             if last_start + last_extent == start {
-                *merged.get_mut(&last_start).expect("last key exists") =
-                    last_extent + extent;
+                *merged.get_mut(&last_start).expect("last key exists") = last_extent + extent;
                 continue;
             }
         }
@@ -391,10 +384,7 @@ pub(crate) fn output_buffer(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffe
 ///
 /// GEMM writes every output element with `beta = 0`, so clearing a fresh
 /// allocation is avoidable host- and device-side work.
-pub(crate) fn output_buffer_uninitialized(
-    ctx: &CudaContext,
-    bytes: usize,
-) -> Result<CudaBuffer> {
+pub(crate) fn output_buffer_uninitialized(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
     ACTIVE_WORKSPACE.with(|active| {
         let workspace = active.get();
         if workspace.is_null() {

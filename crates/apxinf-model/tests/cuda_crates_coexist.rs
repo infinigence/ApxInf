@@ -25,7 +25,9 @@ fn both_cuda_crates_link_and_launch() {
         apxinf_cuda::CudaBuffer::alloc(bytes.len(), legacy_ctx.device_id()).expect("legacy alloc");
     legacy_buf.copy_from_host(&bytes).expect("legacy h2d");
     let mut legacy_back = vec![0u8; bytes.len()];
-    legacy_buf.copy_to_host(&mut legacy_back).expect("legacy d2h");
+    legacy_buf
+        .copy_to_host(&mut legacy_back)
+        .expect("legacy d2h");
     assert_eq!(bytes, legacy_back, "legacy round-trip");
 
     // New crate: context + buffer round-trip through its (renamed) runtime.

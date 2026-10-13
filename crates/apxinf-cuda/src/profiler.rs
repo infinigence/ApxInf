@@ -30,8 +30,7 @@ impl CudaEventTimer {
         unsafe {
             crate::ffi::check_cuda(crate::ffi::cudaEventCreate(&mut timer.start))
                 .map_err(apxinf_core::Error::Cuda)?;
-            if let Err(error) =
-                crate::ffi::check_cuda(crate::ffi::cudaEventCreate(&mut timer.stop))
+            if let Err(error) = crate::ffi::check_cuda(crate::ffi::cudaEventCreate(&mut timer.stop))
             {
                 let _ = crate::ffi::cudaEventDestroy(timer.start);
                 return Err(apxinf_core::Error::Cuda(error));

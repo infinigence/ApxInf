@@ -5,8 +5,7 @@ use apxinf_core::{Result, Tensor};
 use kernels::{activation, attention, embedding, fused, gemm, norm, rope};
 
 use super::{
-    Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Pi0FastLanguageConfig,
-    VisionPatchEmbeddingF32,
+    Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Pi0FastLanguageConfig, VisionPatchEmbeddingF32,
 };
 
 pub struct Bf16LanguageLayerOutput {
@@ -265,10 +264,8 @@ pub fn language_layer_cached_bf16(
         value_cache,
         position_offset,
     )?;
-    let attention =
-        attention::mqa_bf16(ctx, &q, key_cache, value_cache, position_offset + tokens)?.reshape(
-            vec![tokens, config.num_heads * config.head_dim],
-        )?;
+    let attention = attention::mqa_bf16(ctx, &q, key_cache, value_cache, position_offset + tokens)?
+        .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     let projected = gemm::bf16(ctx, &attention, &weights.output.weight)?;
     let fused = fused::bias_residual_rms_bf16(
         ctx,

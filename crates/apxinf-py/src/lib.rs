@@ -67,7 +67,11 @@ impl HfTokenizer {
     }
 
     #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
-    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+    fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<Vec<u32>> {
         self.inner
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(runtime_err)
@@ -1479,8 +1483,7 @@ impl ModelRunner {
                 let noise_tensor = self.noise_tensor(noise)?;
                 self.run_profiled_provided(py, observation, noise_tensor)
             }
-            None => self
-                .run_profiled_generated(py, observation, self.next_sampling_rng()?),
+            None => self.run_profiled_generated(py, observation, self.next_sampling_rng()?),
         }
     }
 

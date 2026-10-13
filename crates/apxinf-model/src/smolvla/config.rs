@@ -129,27 +129,30 @@ impl SmolVlaConfig {
         }
         config.time_min_period = f32_field(&value, "min_period", config.time_min_period);
         config.time_max_period = f32_field(&value, "max_period", config.time_max_period);
-        let expert_width_multiplier =
-            f32_field(&value, "expert_width_multiplier", 1.0);
+        let expert_width_multiplier = f32_field(&value, "expert_width_multiplier", 1.0);
         if !expert_width_multiplier.is_finite() || expert_width_multiplier <= 0.0 {
             return Err(Error::Other(
                 "SmolVLA expert_width_multiplier must be positive and finite".into(),
             ));
         }
         if value.get("expert_width_multiplier").is_some() {
-            config.expert_width = (config.language_width as f32
-                * expert_width_multiplier)
-                .round() as usize;
-            config.expert_mlp_dim = (config.language_mlp_dim as f32
-                * expert_width_multiplier)
-                .round() as usize;
+            config.expert_width =
+                (config.language_width as f32 * expert_width_multiplier).round() as usize;
+            config.expert_mlp_dim =
+                (config.language_mlp_dim as f32 * expert_width_multiplier).round() as usize;
         }
-        if let Some(outputs) = value.pointer("/output_features/action/shape").and_then(|x| x.as_array()) {
+        if let Some(outputs) = value
+            .pointer("/output_features/action/shape")
+            .and_then(|x| x.as_array())
+        {
             if let Some(dim) = outputs.first().and_then(|x| x.as_u64()) {
                 config.action_dim = dim as usize;
             }
         }
-        if let Some(resize) = value.get("resize_imgs_with_padding").and_then(|x| x.as_array()) {
+        if let Some(resize) = value
+            .get("resize_imgs_with_padding")
+            .and_then(|x| x.as_array())
+        {
             if let Some(size) = resize.first().and_then(|x| x.as_u64()) {
                 config.image_size = size as usize;
             }
@@ -163,9 +166,15 @@ impl SmolVlaConfig {
 }
 
 fn usize_field(value: &serde_json::Value, key: &str, fallback: usize) -> usize {
-    value.get(key).and_then(|x| x.as_u64()).map_or(fallback, |x| x as usize)
+    value
+        .get(key)
+        .and_then(|x| x.as_u64())
+        .map_or(fallback, |x| x as usize)
 }
 
 fn f32_field(value: &serde_json::Value, key: &str, fallback: f32) -> f32 {
-    value.get(key).and_then(|x| x.as_f64()).map_or(fallback, |x| x as f32)
+    value
+        .get(key)
+        .and_then(|x| x.as_f64())
+        .map_or(fallback, |x| x as f32)
 }

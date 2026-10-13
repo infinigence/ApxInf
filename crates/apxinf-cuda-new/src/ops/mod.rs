@@ -37,12 +37,11 @@ pub use attn_ops::{
 pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gdn::{
-    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_decay_and_beta,
-    gdn_decay_and_beta_seq, gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
-    gdn_prefill, gdn_prefill_workspace_bytes,
-    gdn_widen_f16_to_bf16, gdn_prepare_prefill, gdn_conv_prepare,
-    gdn_chunk_scan, gdn_chunk_scan_interleaved, gdn_l2_normalize_heads,
-    gdn_recurrent_step, gdn_state_elements,
+    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_chunk_scan_interleaved,
+    gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq, gdn_gated_norm,
+    gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16, gdn_l2_normalize_heads,
+    gdn_prefill, gdn_prefill_workspace_bytes, gdn_prepare_prefill, gdn_recurrent_step,
+    gdn_state_elements, gdn_widen_f16_to_bf16,
 };
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, nvfp4_dense_swiglu_aot,

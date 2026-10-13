@@ -256,7 +256,10 @@ mod tests {
         let x = Tensor::zeros(vec![2, 2], apxinf_core::DType::F32);
         let message = backend.silu(&x).unwrap_err().to_string();
         assert!(message.contains("silu"), "unexpected message: {message}");
-        assert!(message.contains("apxinf-hip"), "unexpected message: {message}");
+        assert!(
+            message.contains("apxinf-hip"),
+            "unexpected message: {message}"
+        );
     }
 
     /// `create_kv_cache` cannot fail in the trait, so the failure has to land on

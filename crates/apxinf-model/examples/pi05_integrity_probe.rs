@@ -50,9 +50,7 @@ fn signature(values: &[f32]) -> serde_json::Value {
     })
 }
 
-fn device_signature(
-    tensor: &Tensor,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+fn device_signature(tensor: &Tensor) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let values = transfers::to_cpu(tensor)?.to_f32_vec()?;
     Ok(signature(&values))
 }
@@ -82,10 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("loading π0.5 checkpoint...");
     let host_weights = Pi05Weights::from_safetensors(&config, Path::new(&arguments[1]))?;
     eprintln!("quantizing and uploading static FP8 weights...");
-    let device_weights = Arc::new(Fp8StaticWeights::from_host(
-        &host_weights,
-        &context,
-    )?);
+    let device_weights = Arc::new(Fp8StaticWeights::from_host(&host_weights, &context)?);
     drop(host_weights);
 
     let patch_tokens = config.num_views * config.patches_per_view();
@@ -95,10 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         context.device_id(),
     )?;
     let noise = transfers::to_cuda(
-        &Tensor::zeros(
-            vec![config.action_horizon, config.action_dim],
-            DType::F16,
-        ),
+        &Tensor::zeros(vec![config.action_horizon, config.action_dim], DType::F16),
         context.device_id(),
     )?;
     let token_ids = CudaBuffer::alloc_zeros(token_count * 4, context.device_id())
@@ -148,10 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("probing vision projection...");
     let vision = runtime.encode_vision(&patches)?;
-    signatures.insert(
-        "vision_projected".into(),
-        device_signature(&vision)?,
-    );
+    signatures.insert("vision_projected".into(), device_signature(&vision)?);
     eprintln!("probing language prefix K/V...");
     let prefix_input = runtime.embed_prefix(&vision, &token_ids, token_count)?;
     let prefix = runtime.prefix_forward(&prefix_input)?;
@@ -167,10 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt = -1.0 / config.num_flow_steps as f32;
     for (step, embedding) in time_embeddings.iter().enumerate() {
         state = runtime.denoise_step(&state, embedding, &prefix, dt)?;
-        signatures.insert(
-            format!("denoise_step_{step}"),
-            device_signature(&state)?,
-        );
+        signatures.insert(format!("denoise_step_{step}"), device_signature(&state)?);
     }
     println!(
         "{}",

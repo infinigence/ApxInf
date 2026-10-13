@@ -5,7 +5,9 @@ use apxinf_core::{Error, Result};
 /// Build the inclusive solver timeline used by inference.
 pub fn solver_times(steps: usize, scheduler_s: f32, time_shift: f32) -> Result<Vec<f32>> {
     if steps == 0 {
-        return Err(Error::Other("walloss solver requires at least one step".into()));
+        return Err(Error::Other(
+            "walloss solver requires at least one step".into(),
+        ));
     }
     if !(scheduler_s.is_finite() && scheduler_s > 0.0 && scheduler_s <= 1.0) {
         return Err(Error::Other(format!(

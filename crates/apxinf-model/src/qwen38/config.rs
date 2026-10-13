@@ -33,4 +33,3 @@ pub(crate) const Z_WIDTH: usize = 6144;
 pub(crate) fn is_full_attention(layer: usize) -> bool {
     (layer + 1) % FULL_ATTENTION_INTERVAL == 0
 }
-

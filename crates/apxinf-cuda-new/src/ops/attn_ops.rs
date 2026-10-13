@@ -91,8 +91,7 @@ pub fn split_query_and_gate(
         return Err(invalid("query must be [tokens, heads, head_dim]"));
     }
     let (tokens, heads, head_dim) = (dims[0], dims[1], dims[2]);
-    let fused_buffer =
-        tensor_storage(ctx, fused, DType::BF16, &[tokens, heads, 2 * head_dim])?;
+    let fused_buffer = tensor_storage(ctx, fused, DType::BF16, &[tokens, heads, 2 * head_dim])?;
     let query_buffer = tensor_storage(ctx, query, DType::BF16, &dims)?;
     let gate_buffer = tensor_storage(ctx, gate, DType::BF16, &dims)?;
     unsafe {

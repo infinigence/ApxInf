@@ -62,10 +62,7 @@ pub(in crate::pi05) fn build_int8_dynamic_model_with_policies(
         backend, config, weights, policies,
     )?)))
 }
-pub fn upload_time_embeddings_bf16(
-    config: &Pi05Config,
-    context: &Context,
-) -> Result<Vec<Tensor>> {
+pub fn upload_time_embeddings_bf16(config: &Pi05Config, context: &Context) -> Result<Vec<Tensor>> {
     (0..config.num_flow_steps)
         .map(|step| {
             let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
@@ -78,10 +75,10 @@ pub fn upload_time_embeddings_bf16(
             .into_iter()
             .map(half::bf16::from_f32)
             .collect::<Vec<_>>();
-            backend::to_device(context, &Tensor::from_bf16(
-                vec![1, config.action_expert.width],
-                &values,
-            )?)
+            backend::to_device(
+                context,
+                &Tensor::from_bf16(vec![1, config.action_expert.width], &values)?,
+            )
         })
         .collect()
 }

@@ -204,9 +204,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         ));
     }
     if quantized_geglu && cols % 2 != 0 {
-        return Err(invalid(
-            "F16-to-E4M3 GeGLU requires an even output width",
-        ));
+        return Err(invalid("F16-to-E4M3 GeGLU requires an even output width"));
     }
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Pointwise semantic does not take a bias"));

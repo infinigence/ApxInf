@@ -3,7 +3,6 @@
 //!
 //! Calls the model computation in `super::model`; does not re-implement it.
 
-
 use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 
 use super::backend::{graph_tensor_bytes, zero_tensor};
@@ -12,7 +11,6 @@ use super::model::{
     decode_step_inner, gdn_decode_layer, nvfp4_mlp, GdnState, KvCache, PrefillScratch, Scratch,
 };
 use super::weights::{Layer, Model};
-
 
 /// Install the validated kernel-path selectors, unless the caller already set
 /// one. Called by `Qwen38::new`; capture-level tests must call it too, or they
@@ -166,7 +164,6 @@ pub(crate) fn report_session(label: &str, session: &ops::ExecutionSession) {
     );
 }
 
-
 /// Arena capacity per decode phase.
 ///
 /// Measured, not guessed: `APXINF_QWEN38_GRAPH_REPORT=1` reports 0 bytes used
@@ -209,8 +206,7 @@ pub(crate) fn capture_decode_phases(
         let phase = match layer {
             Layer::Attention(attention) => PreparedPhase::prepare_and_capture(
                 ctx,
-                ops::ExecutionSession::with_capacity(PHASE_WORKSPACE, ctx.device_id())
-                    .unwrap(),
+                ops::ExecutionSession::with_capacity(PHASE_WORKSPACE, ctx.device_id()).unwrap(),
                 || {
                     nvfp4_mlp(
                         ctx,
@@ -233,8 +229,7 @@ pub(crate) fn capture_decode_phases(
                 let state = &mut states[state_index];
                 let phase = PreparedPhase::prepare_and_capture(
                     ctx,
-                    ops::ExecutionSession::with_capacity(PHASE_WORKSPACE, ctx.device_id())
-                        .unwrap(),
+                    ops::ExecutionSession::with_capacity(PHASE_WORKSPACE, ctx.device_id()).unwrap(),
                     || {
                         gdn_decode_layer(ctx, gdn, scratch, state);
                         nvfp4_mlp(ctx, &gdn.gate_up, &gdn.down, &gdn.post_norm, scratch);
@@ -286,10 +281,14 @@ fn verify_gdn_graphs(
             let hidden = (0..HIDDEN)
                 .flat_map(|index| {
                     half::bf16::from_f32(((index * 17 + step * 23) % 101) as f32 / 50.0 - 1.0)
-                        .to_bits().to_le_bytes()
+                        .to_bits()
+                        .to_le_bytes()
                 })
                 .collect::<Vec<_>>();
-            CudaBuffer::from_tensor(&scratch.hidden).unwrap().copy_from_host(&hidden).unwrap();
+            CudaBuffer::from_tensor(&scratch.hidden)
+                .unwrap()
+                .copy_from_host(&hidden)
+                .unwrap();
             ctx.synchronize().unwrap();
             let initial_state = graph_tensor_bytes(&state.recurrent);
             let initial_conv = graph_tensor_bytes(&state.conv_window);
@@ -300,15 +299,30 @@ fn verify_gdn_graphs(
             let expected_state = graph_tensor_bytes(&state.recurrent);
             let expected_conv = graph_tensor_bytes(&state.conv_window);
             let expected_readout = graph_tensor_bytes(&scratch.gdn_readout);
-            assert!(expected_hidden.chunks_exact(2).all(|bytes| {
-                half::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).is_finite()
-            }), "nonfinite hidden at layer {layer_index}, step {step}");
-            assert!(expected_state.chunks_exact(4).all(|bytes| {
-                f32::from_le_bytes(bytes.try_into().unwrap()).is_finite()
-            }), "nonfinite state at layer {layer_index}, step {step}");
-            CudaBuffer::from_tensor(&scratch.hidden).unwrap().copy_from_host(&hidden).unwrap();
-            CudaBuffer::from_tensor(&state.recurrent).unwrap().copy_from_host(&initial_state).unwrap();
-            CudaBuffer::from_tensor(&state.conv_window).unwrap().copy_from_host(&initial_conv).unwrap();
+            assert!(
+                expected_hidden.chunks_exact(2).all(|bytes| {
+                    half::bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).is_finite()
+                }),
+                "nonfinite hidden at layer {layer_index}, step {step}"
+            );
+            assert!(
+                expected_state
+                    .chunks_exact(4)
+                    .all(|bytes| { f32::from_le_bytes(bytes.try_into().unwrap()).is_finite() }),
+                "nonfinite state at layer {layer_index}, step {step}"
+            );
+            CudaBuffer::from_tensor(&scratch.hidden)
+                .unwrap()
+                .copy_from_host(&hidden)
+                .unwrap();
+            CudaBuffer::from_tensor(&state.recurrent)
+                .unwrap()
+                .copy_from_host(&initial_state)
+                .unwrap();
+            CudaBuffer::from_tensor(&state.conv_window)
+                .unwrap()
+                .copy_from_host(&initial_conv)
+                .unwrap();
             graph.replay().unwrap();
             ctx.synchronize().unwrap();
             for (name, expected, tensor) in [
@@ -317,8 +331,10 @@ fn verify_gdn_graphs(
                 ("conv", &expected_conv, &state.conv_window),
                 ("readout", &expected_readout, &scratch.gdn_readout),
             ] {
-                assert!(expected == &graph_tensor_bytes(tensor),
-                    "GDN graph mismatch: {name}, layer {layer_index}, step {step}");
+                assert!(
+                    expected == &graph_tensor_bytes(tensor),
+                    "GDN graph mismatch: {name}, layer {layer_index}, step {step}"
+                );
                 checked += 1;
             }
         }
@@ -387,7 +403,11 @@ pub(crate) fn set_position(scratch: &Scratch, pos: usize) {
         .unwrap();
 }
 
-pub(crate) fn reset_state(ctx: &CudaContext, gdn_states: &mut [GdnState], kv_caches: &mut [KvCache]) {
+pub(crate) fn reset_state(
+    ctx: &CudaContext,
+    gdn_states: &mut [GdnState],
+    kv_caches: &mut [KvCache],
+) {
     for s in gdn_states.iter() {
         zero_tensor(&s.recurrent);
         zero_tensor(&s.conv_window);
@@ -401,8 +421,8 @@ pub(crate) fn reset_state(ctx: &CudaContext, gdn_states: &mut [GdnState], kv_cac
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::weights;
+    use super::*;
 
     /// Fill a device tensor with a finite, layer-dependent pattern.
     fn fill_f32(tensor: &apxinf_core::Tensor, seed: usize) {
@@ -414,7 +434,10 @@ mod tests {
             let value = (((index * 31 + seed * 17) % 2003) as f32 / 2003.0) - 0.5;
             raw.extend_from_slice(&value.to_le_bytes());
         }
-        CudaBuffer::from_tensor(tensor).unwrap().copy_from_host(&raw).unwrap();
+        CudaBuffer::from_tensor(tensor)
+            .unwrap()
+            .copy_from_host(&raw)
+            .unwrap();
     }
 
     fn fill_bf16(tensor: &apxinf_core::Tensor, seed: usize) {
@@ -424,7 +447,10 @@ mod tests {
             let value = (((index * 17 + seed * 23) % 101) as f32 / 50.0) - 1.0;
             raw.extend_from_slice(&half::bf16::from_f32(value).to_bits().to_le_bytes());
         }
-        CudaBuffer::from_tensor(tensor).unwrap().copy_from_host(&raw).unwrap();
+        CudaBuffer::from_tensor(tensor)
+            .unwrap()
+            .copy_from_host(&raw)
+            .unwrap();
     }
 
     /// Graph capture must leave GDN state exactly as it found it.

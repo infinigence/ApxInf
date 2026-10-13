@@ -23,7 +23,11 @@ const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
 fn e2m1_value(code: u8) -> f64 {
     let magnitude = E2M1[(code & 0x7) as usize] as f64;
-    if code & 0x8 != 0 { -magnitude } else { magnitude }
+    if code & 0x8 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 /// Decode E4M3 (bias 7). Scale tensors are non-negative, where the unsigned
@@ -36,7 +40,11 @@ fn e4m3_value(code: u8) -> f64 {
         return mantissa / 8.0 * (-6.0f64).exp2();
     }
     let magnitude = (1.0 + mantissa / 8.0) * ((exponent - 7) as f64).exp2();
-    if code & 0x80 != 0 { -magnitude } else { magnitude }
+    if code & 0x80 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 fn bf16_to_f64(raw: u16) -> f64 {
@@ -97,8 +105,7 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
     let weight_slice = &weight_bytes[..rows * k / 2];
     let scale_slice = &scale_bytes[..rows * blocks];
 
-    let weight_cpu =
-        Tensor::from_e2m1_pairs(Shape::new(vec![rows, k / 2]), weight_slice).unwrap();
+    let weight_cpu = Tensor::from_e2m1_pairs(Shape::new(vec![rows, k / 2]), weight_slice).unwrap();
     let scale_cpu = Tensor::from_f8_e4m3(Shape::new(vec![rows, blocks]), scale_slice).unwrap();
     let weight = upload(&ctx, &weight_cpu);
     let checkpoint_scales = upload(&ctx, &scale_cpu);
@@ -181,9 +188,17 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
             let mut accumulator = 0.0f64;
             for index in 0..k {
                 let a_byte = activation_bytes[row * (k / 2) + index / 2];
-                let a_code = if index % 2 == 0 { a_byte & 0x0F } else { a_byte >> 4 };
+                let a_code = if index % 2 == 0 {
+                    a_byte & 0x0F
+                } else {
+                    a_byte >> 4
+                };
                 let b_byte = weight_slice[column * (k / 2) + index / 2];
-                let b_code = if index % 2 == 0 { b_byte & 0x0F } else { b_byte >> 4 };
+                let b_code = if index % 2 == 0 {
+                    b_byte & 0x0F
+                } else {
+                    b_byte >> 4
+                };
                 let b_scale = e4m3_value(scale_slice[column * blocks + index / block]);
                 accumulator += e2m1_value(a_code) * e2m1_value(b_code) * b_scale;
             }

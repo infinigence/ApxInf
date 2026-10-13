@@ -61,8 +61,8 @@ fn fp8_finite_bf16_domain_matches_independent_rne_oracle() {
     // the 8-aligned full domain never reaches. Values sit around the
     // subnormal boundary, the midpoints and the saturation edge.
     let fallback = vec![
-        0, 0x8000, 0x3a80, 0xba80, 0x3b00, 0xbb00, 0x3c00,
-        0xbc00, 0x3c70, 0xbc70, 0x3f80, 0x7f7f, 0xff7f,
+        0, 0x8000, 0x3a80, 0xba80, 0x3b00, 0xbb00, 0x3c00, 0xbc00, 0x3c70, 0xbc70, 0x3f80, 0x7f7f,
+        0xff7f,
     ];
     let mut checked_values = 0;
     for bits in [&full_domain, &fallback] {

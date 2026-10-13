@@ -180,8 +180,8 @@ mod linear {
 pub use linear::*;
 // Fully materialized static-FP8 π0.5 weights.
 
-use apxinf_core::{Result, Tensor};
 use crate::pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,

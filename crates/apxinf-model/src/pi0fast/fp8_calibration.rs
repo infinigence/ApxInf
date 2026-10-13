@@ -20,8 +20,8 @@ use apxinf_core::{Error, Result};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use super::Pi0FastConfig;
 use super::fp8_weights::E4M3_MAX;
+use super::Pi0FastConfig;
 
 pub const CALIBRATION_SCHEMA: &str = "apxinf.pi0fast.fp8-calibration.v1";
 pub const FP8_FORMAT: &str = "e4m3fn";
@@ -252,11 +252,7 @@ impl<'de> Visitor<'de> for ScaleMapVisitor {
 }
 
 impl Pi0FastFp8Calibration {
-    pub fn from_json_file(
-        path: &Path,
-        config: &Pi0FastConfig,
-        checkpoint: &str,
-    ) -> Result<Self> {
+    pub fn from_json_file(path: &Path, config: &Pi0FastConfig, checkpoint: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Other(format!("read {}: {e}", path.display())))?;
         let calibration = Self::from_json_str(&raw, config, checkpoint)?;
@@ -759,9 +755,7 @@ mod tests {
                 .unwrap();
         assert_eq!(calibration.len(), plan_sites().len());
         assert!(calibration.warnings().is_empty());
-        assert!(
-            (calibration.scale(LM_HEAD_SITE).unwrap() - 10.0 * 1.1 / 448.0).abs() < 1e-9
-        );
+        assert!((calibration.scale(LM_HEAD_SITE).unwrap() - 10.0 * 1.1 / 448.0).abs() < 1e-9);
     }
 
     #[test]
@@ -825,8 +819,8 @@ mod tests {
 
     #[test]
     fn checkpoint_identity_matches_the_shared_cross_language_fixture() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/checkpoint_identity");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/checkpoint_identity");
         let expected = std::fs::read_to_string(fixture.join("expected.sha256"))
             .unwrap()
             .trim()

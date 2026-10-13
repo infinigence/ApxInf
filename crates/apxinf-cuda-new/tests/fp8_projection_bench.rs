@@ -98,5 +98,12 @@ fn fp8_projection_rate() {
     measure(&ctx, "attention q_proj", 2048, 5120, 12288, DType::BF16);
     // The F16 arm is what the CUTLASS candidate accepted before this branch;
     // it bounds how much of any BF16 gap is the output dtype itself.
-    measure(&ctx, "gdn in_proj_qkv (f16 out)", 2048, 5120, 10240, DType::F16);
+    measure(
+        &ctx,
+        "gdn in_proj_qkv (f16 out)",
+        2048,
+        5120,
+        10240,
+        DType::F16,
+    );
 }

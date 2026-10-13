@@ -94,12 +94,23 @@ impl SmolVlaWeights {
         let text_prefix = format!("{prefix}.vlm.model.text_model");
         let expert_prefix = format!("{prefix}.lm_expert");
 
-        let patch = tensor(&tensors, &format!("{vision_prefix}.embeddings.patch_embedding.weight"))?;
-        let patch_bias = tensor(&tensors, &format!("{vision_prefix}.embeddings.patch_embedding.bias"))?;
+        let patch = tensor(
+            &tensors,
+            &format!("{vision_prefix}.embeddings.patch_embedding.weight"),
+        )?;
+        let patch_bias = tensor(
+            &tensors,
+            &format!("{vision_prefix}.embeddings.patch_embedding.bias"),
+        )?;
         let patch_weight = patch.reshape(vec![config.vision_width, 768])?;
-        let position_embedding = tensor(&tensors, &format!("{vision_prefix}.embeddings.position_embedding.weight"))?;
+        let position_embedding = tensor(
+            &tensors,
+            &format!("{vision_prefix}.embeddings.position_embedding.weight"),
+        )?;
         if position_embedding.shape().dims() != [config.patches_per_view(), config.vision_width] {
-            return Err(Error::Other("SmolVLA vision position embedding mismatch".into()));
+            return Err(Error::Other(
+                "SmolVLA vision position embedding mismatch".into(),
+            ));
         }
 
         let mut vision_layers = Vec::with_capacity(config.vision_depth);
@@ -119,7 +130,10 @@ impl SmolVlaWeights {
                 qkv: Linear::pack(&[q, k, v], &[q_bias, k_bias, v_bias])?,
                 attention_output: Linear::new(
                     tensor(&tensors, &format!("{root}.self_attn.out_proj.weight"))?,
-                    Some(tensor(&tensors, &format!("{root}.self_attn.out_proj.bias"))?),
+                    Some(tensor(
+                        &tensors,
+                        &format!("{root}.self_attn.out_proj.bias"),
+                    )?),
                 )?,
                 norm2: LayerNorm::new(
                     tensor(&tensors, &format!("{root}.layer_norm2.weight"))?,
@@ -169,7 +183,10 @@ impl SmolVlaWeights {
                     tensor(&tensors, &format!("{expert_root}.self_attn.o_proj.weight"))?,
                     None,
                 )?,
-                post_norm: tensor(&tensors, &format!("{expert_root}.post_attention_layernorm.weight"))?,
+                post_norm: tensor(
+                    &tensors,
+                    &format!("{expert_root}.post_attention_layernorm.weight"),
+                )?,
                 gate_up: Linear::pack(&[expert_gate, expert_up], &[])?,
                 down: Linear::new(
                     tensor(&tensors, &format!("{expert_root}.mlp.down_proj.weight"))?,
@@ -213,10 +230,16 @@ impl SmolVlaWeights {
             vision_layers,
             vision_post_norm: LayerNorm::new(
                 tensor(&tensors, &format!("{vision_prefix}.post_layernorm.weight"))?,
-                Some(tensor(&tensors, &format!("{vision_prefix}.post_layernorm.bias"))?),
+                Some(tensor(
+                    &tensors,
+                    &format!("{vision_prefix}.post_layernorm.bias"),
+                )?),
             ),
             connector: Linear::new(
-                tensor(&tensors, &format!("{prefix}.vlm.model.connector.modality_projection.proj.weight"))?,
+                tensor(
+                    &tensors,
+                    &format!("{prefix}.vlm.model.connector.modality_projection.proj.weight"),
+                )?,
                 None,
             )?,
             token_embedding: tensor(&tensors, &format!("{text_prefix}.embed_tokens.weight"))?,
@@ -354,21 +377,13 @@ macro_rules! upload_impl {
 }
 
 trait UploadField {
-    fn upload_field(
-        self,
-        backend: &dyn Backend,
-        use_fp16_gemm: bool,
-    ) -> Result<Self>
+    fn upload_field(self, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<Self>
     where
         Self: Sized;
 }
 
 impl UploadField for Tensor {
-    fn upload_field(
-        self,
-        backend: &dyn Backend,
-        use_fp16_gemm: bool,
-    ) -> Result<Self> {
+    fn upload_field(self, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<Self> {
         if use_fp16_gemm {
             upload_f16(self, backend)
         } else {
@@ -378,37 +393,55 @@ impl UploadField for Tensor {
 }
 
 impl UploadField for Linear {
-    fn upload_field(
-        self,
-        backend: &dyn Backend,
-        use_fp16_gemm: bool,
-    ) -> Result<Self> {
+    fn upload_field(self, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<Self> {
         self.upload(backend, use_fp16_gemm)
     }
 }
 
 impl UploadField for LayerNorm {
-    fn upload_field(
-        self,
-        backend: &dyn Backend,
-        use_fp16_gemm: bool,
-    ) -> Result<Self> {
+    fn upload_field(self, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<Self> {
         self.upload(backend, use_fp16_gemm)
     }
 }
 
-fn upload_field<T: UploadField>(
-    field: T,
-    backend: &dyn Backend,
-    use_fp16_gemm: bool,
-) -> Result<T> {
+fn upload_field<T: UploadField>(field: T, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<T> {
     field.upload_field(backend, use_fp16_gemm)
 }
 
-upload_impl!(VisionLayer { norm1, qkv, attention_output, norm2, fc1, fc2 });
-upload_impl!(TextLayer { input_norm, qkv, attention_output, post_norm, gate_up, down });
-upload_impl!(ExpertSelfLayer { input_norm, qkv, attention_output, post_norm, gate_up, down });
-upload_impl!(ExpertCrossLayer { input_norm, query, key, value, attention_output, post_norm, gate_up, down });
+upload_impl!(VisionLayer {
+    norm1,
+    qkv,
+    attention_output,
+    norm2,
+    fc1,
+    fc2
+});
+upload_impl!(TextLayer {
+    input_norm,
+    qkv,
+    attention_output,
+    post_norm,
+    gate_up,
+    down
+});
+upload_impl!(ExpertSelfLayer {
+    input_norm,
+    qkv,
+    attention_output,
+    post_norm,
+    gate_up,
+    down
+});
+upload_impl!(ExpertCrossLayer {
+    input_norm,
+    query,
+    key,
+    value,
+    attention_output,
+    post_norm,
+    gate_up,
+    down
+});
 
 impl ExpertLayer {
     fn upload(self, backend: &dyn Backend, use_fp16_gemm: bool) -> Result<Self> {
@@ -506,7 +539,9 @@ fn concat_rows(tensors: &[Tensor]) -> Result<Tensor> {
 }
 
 fn concat(tensors: &[Tensor], rows: bool) -> Result<Tensor> {
-    let first = tensors.first().ok_or_else(|| Error::Other("empty tensor concat".into()))?;
+    let first = tensors
+        .first()
+        .ok_or_else(|| Error::Other("empty tensor concat".into()))?;
     let first_dims = first.shape().dims();
     let values = tensors
         .iter()

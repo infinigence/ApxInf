@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Device, Result};
 #[cfg(not(all(feature = "cuda", feature = "hip")))]
 use apxinf_core::Error;
+use apxinf_core::{Backend, Device, Result};
 
 pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {

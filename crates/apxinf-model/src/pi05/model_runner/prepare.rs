@@ -276,10 +276,10 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             .map_err(Error::Cuda)?;
         let patch_rows = self.config.num_views * self.config.patches_per_view();
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
-        let patches = backend::to_device(backend, &Tensor::zeros(
-            vec![patch_rows, patch_width],
-            self.model.raw_patch_dtype(),
-        ))?;
+        let patches = backend::to_device(
+            backend,
+            &Tensor::zeros(vec![patch_rows, patch_width], self.model.raw_patch_dtype()),
+        )?;
         self.capture_infer_impl(
             patches,
             Some(raw_images),

@@ -54,9 +54,6 @@ mod tests {
         let b = Tensor::from_f32(vec![2, 1], &[5., 6.]).unwrap();
         let packed = concat_host_2d(&[&a, &b]).unwrap();
         assert_eq!(packed.shape().dims(), &[2, 3]);
-        assert_eq!(
-            packed.to_f32_vec().unwrap(),
-            vec![1., 2., 5., 3., 4., 6.]
-        );
+        assert_eq!(packed.to_f32_vec().unwrap(), vec![1., 2., 5., 3., 4., 6.]);
     }
 }

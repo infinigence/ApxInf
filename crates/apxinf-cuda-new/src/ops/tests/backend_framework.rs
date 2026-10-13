@@ -471,8 +471,12 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // A spread of finite E4M3 codes. Constant operands would hide an indexing
     // fault, because every element of the result would be identical.
     const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
-    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
-    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a_codes: Vec<u8> = (0..m * k)
+        .map(|i| CODES[(i * 7 + 1) % CODES.len()])
+        .collect();
+    let b_codes: Vec<u8> = (0..k * n)
+        .map(|i| CODES[(i * 5 + 3) % CODES.len()])
+        .collect();
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
@@ -484,8 +488,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
         for column in 0..n {
             let mut accumulator = 0.0f32;
             for index in 0..k {
-                accumulator += e4m3_value(a_codes[row * k + index])
-                    * e4m3_value(b_codes[index * n + column]);
+                accumulator +=
+                    e4m3_value(a_codes[row * k + index]) * e4m3_value(b_codes[index * n + column]);
             }
             expected[row * n + column] = accumulator * alpha;
         }
@@ -493,7 +497,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // Guard the magnitude as well as the direction: a candidate that is the
     // right shape and the wrong scale scores near-perfect cosine.
     let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
-    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+    assert!(
+        peak > 0.1 && peak < 1.0e4,
+        "degenerate reference peak {peak}"
+    );
 
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.quantization = GemmQuantization::Fp8UnitScale;
@@ -526,7 +533,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
     // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
     // bound is deliberately far above that and far below any real fault.
-    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+    assert!(
+        relative_l2 < 0.01,
+        "winner drifted by relative L2 {relative_l2}"
+    );
 }
 
 #[test]

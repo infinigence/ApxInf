@@ -9,9 +9,8 @@ use half::{bf16, f16};
 
 use crate::accelerator::cuda::{kernels, transfers, DeviceBuffer};
 use crate::vla::{
-    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent,
-    Observation, PreparationStatus, PreparedInference, VisionObservation, VlaContract,
-    VlaRequest, VlaRuntime,
+    Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent, Observation,
+    PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
 };
 
 use super::{SmolVlaConfig, SmolVlaModel};
@@ -189,10 +188,7 @@ impl SmolVlaModelRunner {
         Ok(())
     }
 
-    fn infer_profiled(
-        &self,
-        request: &VlaRequest<'_>,
-    ) -> Result<(Action, BTreeMap<String, f64>)> {
+    fn infer_profiled(&self, request: &VlaRequest<'_>) -> Result<(Action, BTreeMap<String, f64>)> {
         self.ensure_prepared_plan(request)?;
         let uses_graph = self
             .prepared
@@ -201,9 +197,7 @@ impl SmolVlaModelRunner {
             .is_some_and(|plan| matches!(plan.strategy, PreparedStrategy::Graph(_)));
         if uses_graph {
             let prepared = self.prepared.borrow();
-            let plan = prepared
-                .as_ref()
-                .expect("prepared plan was just checked");
+            let plan = prepared.as_ref().expect("prepared plan was just checked");
             plan.run_profiled(request)
         } else {
             self.infer_profiled_eager(request)
@@ -258,19 +252,14 @@ impl SmolVlaCapturedGraph {
             }
             None => None,
         };
-        let patches = backend.to_device(&Tensor::zeros(
-            vec![patch_rows, patch_width],
-            model.dtype(),
-        ))?;
+        let patches =
+            backend.to_device(&Tensor::zeros(vec![patch_rows, patch_width], model.dtype()))?;
         let state = backend.to_device(&Tensor::zeros(
             vec![1, model_config.max_state_dim],
             model.dtype(),
         ))?;
         let noise = backend.to_device(&Tensor::zeros(
-            vec![
-                model_config.action_horizon,
-                model_config.max_action_dim,
-            ],
+            vec![model_config.action_horizon, model_config.max_action_dim],
             model.dtype(),
         ))?;
         let token_ids = DeviceBuffer::alloc_zeros(token_bytes, device_id).map_err(Error::Cuda)?;
@@ -280,8 +269,7 @@ impl SmolVlaCapturedGraph {
 
         let mut last_workspace_error = None;
         for capacity in GRAPH_WORKSPACE_CAPACITIES_BYTES {
-            let workspace =
-                kernels::GraphWorkspace::new(capacity, device_id)?;
+            let workspace = kernels::GraphWorkspace::new(capacity, device_id)?;
             let preflight = kernels::prepare_with_workspace(&workspace, || {
                 model.infer_fixed(
                     raw_images.as_ref(),
@@ -367,11 +355,7 @@ impl SmolVlaCapturedGraph {
         )))
     }
 
-    fn update(
-        &self,
-        observation: &Observation,
-        provided_noise: Option<&Tensor>,
-    ) -> Result<()> {
+    fn update(&self, observation: &Observation, provided_noise: Option<&Tensor>) -> Result<()> {
         if observation.token_ids.len() != self.token_count {
             return Err(Error::Other(format!(
                 "SmolVLA graph expects {} token IDs, got {}",
@@ -485,7 +469,9 @@ impl SmolVlaPreparedPlan {
                     config: Arc::clone(&self.config),
                     prepared: RefCell::new(None),
                 };
-                runner.infer_profiled_eager(request).map(|(action, _)| action)
+                runner
+                    .infer_profiled_eager(request)
+                    .map(|(action, _)| action)
             }
         }
     }
@@ -581,10 +567,7 @@ impl VlaRuntime for SmolVlaModelRunner {
 
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         let action = self.infer(request)?;
-        self.model
-            .backend()
-            .to_cpu(action.tensor())?
-            .to_f32_vec()
+        self.model.backend().to_cpu(action.tensor())?.to_f32_vec()
     }
 
     fn infer_host_f32_profiled(
@@ -592,11 +575,7 @@ impl VlaRuntime for SmolVlaModelRunner {
         request: &VlaRequest<'_>,
     ) -> Result<(Vec<f32>, BTreeMap<String, f64>)> {
         let (action, profile) = self.infer_profiled(request)?;
-        let values = self
-            .model
-            .backend()
-            .to_cpu(action.tensor())?
-            .to_f32_vec()?;
+        let values = self.model.backend().to_cpu(action.tensor())?.to_f32_vec()?;
         Ok((values, profile))
     }
 }

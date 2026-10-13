@@ -101,10 +101,7 @@ unsafe extern "C" {
         scale: f32,
         stream: CudaStream,
     ) -> i32;
-    pub(crate) fn apxinf_gdn_prefill_workspace_bytes(
-        v_heads: i64,
-        num_seqs: i64,
-    ) -> i64;
+    pub(crate) fn apxinf_gdn_prefill_workspace_bytes(v_heads: i64, num_seqs: i64) -> i64;
     pub(crate) fn apxinf_gdn_causal_conv_forward(
         input: *const c_void,
         weight: *const c_void,

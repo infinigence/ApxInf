@@ -105,11 +105,7 @@ fn recurrent_step_matches_the_reference_over_many_tokens() {
 
     let state_len = ops::gdn_state_elements(v_heads, v_dim, k_dim);
     assert_eq!(state_len, 48 * 128 * 128);
-    let device_state = upload_f32(
-        &ctx,
-        &vec![0.0f32; state_len],
-        vec![v_heads, v_dim, k_dim],
-    );
+    let device_state = upload_f32(&ctx, &vec![0.0f32; state_len], vec![v_heads, v_dim, k_dim]);
     let mut host_state = vec![0.0f64; state_len];
 
     let output = upload_bf16(&ctx, &vec![0.0f32; v_heads * v_dim], vec![v_heads, v_dim]);
@@ -156,9 +152,18 @@ fn recurrent_step_matches_the_reference_over_many_tokens() {
 
         // The reference consumes BF16-rounded inputs so the comparison isolates
         // the recurrence rather than re-measuring input rounding.
-        let q_rounded: Vec<f32> = q.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect();
-        let k_rounded: Vec<f32> = k.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect();
-        let v_rounded: Vec<f32> = v.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect();
+        let q_rounded: Vec<f32> = q
+            .iter()
+            .map(|x| half::bf16::from_f32(*x).to_f32())
+            .collect();
+        let k_rounded: Vec<f32> = k
+            .iter()
+            .map(|x| half::bf16::from_f32(*x).to_f32())
+            .collect();
+        let v_rounded: Vec<f32> = v
+            .iter()
+            .map(|x| half::bf16::from_f32(*x).to_f32())
+            .collect();
         let expected = reference_step(
             &mut host_state,
             &q_rounded,
