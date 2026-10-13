@@ -49,9 +49,7 @@ jobs:
         run: just clippy
         continue-on-error: true
 
-      # CPU tests: two root tests/ modules are broken on main
-      # (doc/guides/testing.md) and five python/apxinf tests fail; this job
-      # is advisory until those are fixed in code PRs.
-      - name: test-cpu (advisory)
+      # CPU tests. Two root tests/ modules are excluded inside the recipe
+      # (see doc/guides/testing.md); the remaining suite is blocking.
+      - name: test-cpu
         run: just test-cpu
-        continue-on-error: true
