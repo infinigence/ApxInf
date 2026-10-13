@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Install actionlint
+        run: |
+          actionlint_version=1.7.12
+          case "$RUNNER_ARCH" in
+            X64) actionlint_arch=amd64 ;;
+            ARM64) actionlint_arch=arm64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$install_dir"
+          release="https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}"
+          archive="actionlint_${actionlint_version}_linux_${actionlint_arch}.tar.gz"
+          curl -fsSL --retry 3 "$release/$archive" -o "$install_dir/$archive"
+          curl -fsSL --retry 3 "$release/actionlint_${actionlint_version}_checksums.txt" -o "$install_dir/checksums.txt"
+          (cd "$install_dir" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "$install_dir/$archive" -C "$install_dir" actionlint
+          "$install_dir/actionlint" -version
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python frontend
+        run: pip install -e python/apxinf pytest sentencepiece
+
+      # fmt-check is advisory: main carries pre-existing rustfmt drift
+      # (~941 files); a cleanup PR should run `just fmt` separately.
+      - name: fmt-check (advisory)
+        run: just fmt-check
+        continue-on-error: true
+
+      # doc-lint and boundaries are deterministic and cheap; keep them
+      # blocking. clippy currently reports ~500 warnings on main and stays
+      # advisory until they are reduced.
+      - name: doc-lint
+        run: just doc-lint
+
+      - name: Architecture boundaries
+        run: just boundaries
+
+      - name: Tooling regression tests
+        run: just test-tooling
+
+      - name: Workflow lint
+        run: just workflow-lint
+
+      # NOTE: `just check` compiles cfg(feature="cuda") code without a GPU;
+      # the CUDA build scripts skip nvcc when no toolkit is present.
+      - name: check
+        run: just check
+
+      - name: clippy (advisory)
+        run: just clippy
+        continue-on-error: true
+
+      # CPU tests. Two root tests/ modules are excluded inside the recipe
+      # (see doc/guides/testing.md); the remaining suite is blocking.
+      - name: test-cpu
+        # The synthetic-weight tests allocate full PI0.5 models. Running
+        # them concurrently exceeds a standard runner's memory budget.
+        env:
+          RUST_TEST_THREADS: "1"
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+        run: just test-cpu

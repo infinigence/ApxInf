@@ -2,7 +2,7 @@
 //
 // Elementwise and reduction operators the Qwen3.8 MLP needs, kept alongside
 // the NVFP4 GEMM they feed. Each has exactly one implementation and no
-// persisted selection, so per `doc/adding-new-kernels.md` section 6 they carry
+// persisted selection, so per `doc/guides/adding-new-kernels.md` section 6 they carry
 // no recipe: there is nothing to tune between.
 
 #include "mlp_ops.h"

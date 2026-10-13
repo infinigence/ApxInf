@@ -25,13 +25,13 @@ Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf)
 Benchmarking PI-0.5 with randomly generated weights.
 
 ```bash
-python scripts/bench_pi05.py --random-weights --model-variant bf16 --layer l1 \
+just bench pi05 --random-weights --model-variant bf16 --layer l1 \
   --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 \
   --warmup 10 --samples 100 --autotune
 ```
 
 ```bash
-python scripts/bench_pi05.py --random-weights --model-variant fp8_static --layer l1 \
+just bench pi05 --random-weights --model-variant fp8_static --layer l1 \
   --views 2 --token-count 10 --action-horizon 10 --num-flow-steps 10 --autotune
 ```
 
@@ -139,13 +139,13 @@ One or two views, batch 1. Best recorded P50.
 | Jetson AGX Orin | BF16 | 75.778 ms | 84.864 ms |
 | Jetson AGX Orin | W8A8 | 56.711 ms | 64.924 ms |
 
-[Details](doc/gr00t-n1.7.md).
+[Details](doc/models/gr00t.md).
 
 ### Qwen3.8-27B-NVFP4
 
 Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
 2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
-after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+after one warm-up generation. See [doc/models/qwen38.md](doc/models/qwen38.md)
 for CLI inference.
 
 | Hardware | Precision | TTFT (2048) | Decode | Throughput |
@@ -167,7 +167,7 @@ the end-to-end request from resident decoded images to the host trajectory.
 |---|---|---:|---:|---:|
 | Jetson AGX Thor SM110 | BF16 | 482.60 ms | 2.07 Hz | 85.6786 |
 
-[Test setup, reproduction steps and accuracy results](doc/qwen-drive-benchmark.md).
+[Test setup, reproduction steps and accuracy results](doc/models/qwen-drive.md).
 
 
 ### SmolVLA
@@ -184,23 +184,16 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 
 ## Port a new model with an agent
 
-`skills/model-port-workflow` drives the whole sequence.
+The `model-port-workflow` skill drives the whole sequence. Skills live in
+[`.agents/skills/`](.agents/skills/) and are symlinked into `.claude/skills/`,
+so a fresh clone works in Claude Code and in Codex with no setup.
+
 Start with the [documentation index](doc/README.md) and
-[current module responsibilities](doc/model-layer-architecture.md#current-module-names-and-responsibilities).
+[current module responsibilities](doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities).
 New VLA code separates Model forward computation, ModelRunner execution ownership,
 and weights; reuse the existing native binding and policy registries. The
-[integration guide](doc/adding-a-new-model.md#registration-and-public-integration)
+[integration guide](doc/guides/adding-a-new-model.md#registration-and-public-integration)
 identifies current contracts and family-specific option limits.
-
-Install it once, from the repository root:
-
-```bash
-# Claude Code
-mkdir -p .claude/skills && ln -s ../../skills/model-port-workflow .claude/skills/
-
-# Codex
-mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/model-port-workflow" ~/.agents/skills/
-```
 
 Then invoke it with the model, the target, and the acceptance bar:
 
@@ -210,45 +203,44 @@ ApxInf, Jetson Thor, BF16, parity against the reference within 1e-2
 ```
 
 It works from the same guides a human would follow:
-- [porting workflow](doc/porting-workflow.md),
-- [adding a new model](doc/adding-a-new-model.md),
-- [model-layer architecture](doc/model-layer-architecture.md),
-- [adding new kernels](doc/adding-new-kernels.md).
+- [porting workflow](doc/guides/porting-workflow.md),
+- [adding a new model](doc/guides/adding-a-new-model.md),
+- [model-layer architecture](doc/reference/model-layer-architecture.md),
+- [adding new kernels](doc/guides/adding-new-kernels.md).
 
 ## Build ApxInf
+
+All commands go through the repo's [justfile](justfile) — `just --list` shows
+the full menu. Prereqs: a venv or conda env (the `serving` extra adds
+msgpack/websockets), [just](https://just.systems) (`cargo install just`),
+a Linux host with an NVIDIA driver and CUDA toolkit, and a stable Rust
+toolchain ([NVIDIA build environment](#nvidia-build-environment),
+[Rust toolchain](#rust-toolchain)).
 
 ```bash
 git clone <repo-url> && cd ApxInf
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
-CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip -m crates/apxinf-py/Cargo.toml
-pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
-pip install -e "python/apxinf[serving]"
+just build-py
 ```
 
-Activate a venv or conda env before installing. The `serving` extra adds msgpack/websockets.
-
-`--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
-CUDA backend into the binding, and it is required — the PI0.5 runtime is only
-registered on CUDA devices, as is WallOSS.
+`--features cuda` is baked into the `build-py` recipe; it is required — the
+PI0.5 runtime is only registered on CUDA devices, as is WallOSS.
 
 The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;
-cross-compiling fails unless `APXINF_CUDA_ARCH` names the target (`sm_87` Orin,
-`sm_101` Thor-U, `sm_110` Thor).
+cross-compiling fails unless `APXINF_CUDA_ARCH` names the target. Per-platform
+presets (arch, nvcc parallelism) live in
+[configs/platforms/](configs/platforms/) and are selected with
+`APXINF_PLATFORM=<name> just build-py` (`thor`, `thor-u`, `orin`, `rtx4090`,
+`gb10`).
 
 Confirm the binding imports and reaches the GPU:
 
 ```bash
 python -c 'import apxinf_py; print(apxinf_py.__version__)'
-python scripts/bench_pi05.py --random-weights --model-variant bf16 --layer l1 --samples 5
+just bench pi05 --random-weights --model-variant bf16 --layer l1 --samples 5
 ```
-
-Needs a Linux host with an NVIDIA driver and a CUDA toolkit plus a stable Rust
-toolchain. If `nvcc --version` or `cargo --version` fails, set them up first:
-
-- [NVIDIA build environment](#nvidia-build-environment)
-- [Rust toolchain](#rust-toolchain)
 
 
 ## Using ApxInf from Python
@@ -396,7 +388,7 @@ The NPZ form makes the calibration input a reviewable artifact rather than a sid
 effect of a rollout; `--libero-suite` drives MuJoCo here and needs the same
 dependencies as [LIBERO evaluation](#libero-evaluation).
 
-See [PI0.5 FP8 calibration](doc/pi05-fp8-calibration.md) for the Observation
+See [PI0.5 FP8 calibration](doc/guides/fp8-calibration.md) for the Observation
 format, native LIBERO sampling, and output options.
 
 
@@ -509,9 +501,7 @@ read from the assets the checkpoint names (`text_tokenizer_name`,
 ### Run
 
 ```bash
-# the native binding then the frontend, as in "Build ApxInf" - no extra of its own
-pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
-pip install -e python/apxinf
+just build-py
 huggingface-cli download lerobot/pi0fast-libero-v044 --local-dir <path-to-model>
 
 python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \
@@ -530,7 +520,7 @@ no-op).
 be attributed to the engine, the processors, or the transport.
 
 ```bash
-python scripts/bench_pi05.py --model-dir <path-to-model> --model-variant bf16 --layer l1,l2
+just bench pi05 --model-dir <path-to-model> --model-variant bf16 --layer l1,l2
 ```
 
 - `--layer` selects any subset of `l1` (bare model), `l2` (full policy), `l3`
@@ -552,7 +542,7 @@ Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
 `config.json`, so the same command benchmarks the next model without a flag
 change.
 
-For one-step evaluation, please refer to `doc/run_warmstart_with_onestep.md`
+For one-step evaluation, please refer to `../doc/reports/2026-07-04-run-warmstart-with-onestep.md`
 
 
 ## NVIDIA build environment

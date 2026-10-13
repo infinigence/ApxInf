@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Runs on every commit (humans and agents alike). Enable once per clone:
+#   git config core.hooksPath .githooks
+# Bypass a broken check only with an explicit reason:
+#   git commit --no-verify   # and say why in the message
+set -euo pipefail
+exec just pre-commit
