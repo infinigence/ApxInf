@@ -77,4 +77,9 @@ jobs:
       # CPU tests. Two root tests/ modules are excluded inside the recipe
       # (see doc/guides/testing.md); the remaining suite is blocking.
       - name: test-cpu
+        # The synthetic-weight tests allocate full PI0.5 models. Running
+        # them concurrently exceeds a standard runner's memory budget.
+        env:
+          RUST_TEST_THREADS: "1"
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
         run: just test-cpu
