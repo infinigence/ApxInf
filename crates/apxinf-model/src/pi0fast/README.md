@@ -277,7 +277,7 @@ MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
   --results-jsonl out/libero_10_fp8.jsonl --summary-json out/libero_10_fp8.summary.json
 
 # latency, and the fixed / per-step split
-python scripts/bench_pi0_fast.py --model-dir <checkpoint> \
+just bench pi0_fast --model-dir <checkpoint> \
   --state-key observation/state --mode all \
   --frames devlocal/pi0-fast/results/raw/libero_frames.npz \
   --out devlocal/pi0-fast/results/bench_pi0_fast.json

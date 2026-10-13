@@ -1,263 +1,55 @@
-# ApxInf Test Documentation
-
-## Running Tests
-
-```bash
-# Run the portable library test suite
-cargo test -p apxinf-core -p apxinf-loader -p apxinf-model -p apxinf-tokenizer --lib
-
-# Compile all workspace library and binary targets.
-# NOTE: without --features cuda, the cfg(feature="cuda") code paths
-# (~230 sites across apxinf-model / apxinf-cuda / apxinf-cuda-new) are NOT
-# type-checked.
-cargo check --workspace --lib --bins --features cuda
-
-# Run tests for a specific crate
-cargo test -p apxinf-core
-cargo test -p apxinf-loader
-cargo test -p apxinf-model
-cargo test -p apxinf-tokenizer
-
-# Run a specific test
-cargo test -p apxinf-core test_matmul_cpu
-```
-
-## Test Summary
-
-The portable suite currently contains 65 tests across `apxinf-core`,
-`apxinf-loader`, `apxinf-model`, and `apxinf-tokenizer`. CUDA compilation is
-covered by the workspace check above; CUDA-linked tests and benchmarks run on
-NVIDIA devices.
-
----
-
-## apxinf-core
-
-### Shape Tests (`shape::tests`)
-
-#### `test_numel`
-Tests that `Shape::numel()` correctly computes the total number of elements.
-```rust
-Shape::new(vec![2, 3, 4]).numel() == 24
-Shape::new(vec![1]).numel() == 1
-Shape::scalar().numel() == 1
-```
-
-#### `test_strides`
-Tests that row-major strides are computed correctly.
-```rust
-Shape::new(vec![2, 3, 4]).strides() == vec![12, 4, 1]
-```
-
-#### `test_dim_negative`
-Tests negative indexing for dimension access (Python-style).
-```rust
-shape.dim(-1) == last dimension
-shape.dim(-2) == second-to-last dimension
-```
-
-#### `test_display`
-Tests the `Display` trait implementation for `Shape`.
-
-#### `test_matmul_shape`
-Tests shape inference for 2D matrix multiplication.
-```rust
-[2, 3] @ [3, 4] -> [2, 4]
-```
-
-#### `test_matmul_shape_batch`
-Tests shape inference for batched matrix multiplication.
-```rust
-[1, 2, 3] @ [1, 3, 4] -> [1, 2, 4]
-```
-
-#### `test_matmul_dim_mismatch`
-Tests that mismatched dimensions return an error.
-```rust
-[2, 3] @ [4, 5] -> Error (3 != 4)
-```
-
-### Tensor Tests (`tensor::tests`)
-
-#### `test_from_f32`
-Tests creating a tensor from f32 data.
-
-#### `test_from_bf16`
-Tests creating a tensor from bf16 data.
-
-#### `test_to_f32_vec_from_bf16`
-Tests converting bf16 tensor data back to f32.
-
-#### `test_zeros`
-Tests creating a zero-filled tensor.
-
-#### `test_reshape`
-Tests reshaping a tensor to a compatible shape.
-
-#### `test_reshape_mismatch`
-Tests that reshaping to incompatible shape returns an error.
-
-#### `test_transpose_2d`
-Tests 2D tensor transposition.
-
-#### `test_matmul_cpu`
-Tests CPU matrix multiplication.
-```rust
-[2, 3] @ [3, 2] -> [2, 2]
-```
-
-#### `test_display`
-Tests the `Display` trait implementation for `Tensor`.
-
----
-
-## apxinf-loader
-
-### SafeTensors Tests (`safetensors::tests`)
-
-#### `test_load_f32_tensor`
-Tests loading a single f32 tensor from SafeTensors format.
-
-#### `test_load_bf16_tensor`
-Tests loading a bf16 tensor and converting to f32.
-
-#### `test_load_multiple_tensors`
-Tests loading multiple tensors from a single SafeTensors file.
-
-#### `test_unsupported_dtype_skipped`
-Tests that unsupported dtypes (e.g., INT8) return an error.
-
-### GGUF Tests (`gguf::tests`)
-
-#### `test_load_f32_tensor`
-Tests loading a single f32 tensor from GGUF format.
-
-#### `test_load_metadata`
-Tests parsing GGUF metadata key-value pairs.
-
-#### `test_config_from_metadata`
-Tests extracting `ModelConfig` from GGUF metadata.
-
-#### `test_multiple_tensors`
-Tests loading multiple tensors from a GGUF file.
-
-#### `test_bad_magic`
-Tests that files with incorrect magic number return an error.
-
----
-
-## apxinf-model
-
-### Llama Model Tests (`llama::tests`)
-
-#### `test_model_construction`
-Tests building a LlamaModel from weight tensors:
-- Verifies all weight names are correct
-- Tests weight transposition (PyTorch -> matmul format)
-- Verifies model can be constructed without errors
-
-#### `test_kv_cache`
-Tests KV cache operations:
-- Creating empty cache
-- Verifying cache dimensions match config
-
-#### `test_generation`
-Tests end-to-end token generation:
-- Build model from weights
-- Encode prompt tokens
-- Run autoregressive generation
-- Verify output token count
-
----
-
-## Running TinyLlama Model
-
-### Prerequisites
-
-1. Download TinyLlama 1.1B Chat model files:
-```bash
-mkdir -p models/tinyllama
-cd models/tinyllama
-
-# Download tokenizer files
-curl -L -o tokenizer.json \
-  "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json"
-curl -L -o tokenizer_config.json \
-  "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer_config.json"
-
-# Download model weights
-curl -L -o model.safetensors \
-  "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors"
-```
-
-2. Build the release binary:
-```bash
-cargo build --release --features cuda
-```
-
-### Running Inference
-
-`-m` takes the model *directory* (the CLI loads `model.safetensors` and
-`tokenizer.json` from inside it; there is no separate tokenizer flag):
-
-```bash
-./target/release/apxinf generate \
-  --model models/tinyllama \
-  --prompt "Once upon a time" \
-  --max-tokens 50
-```
-
-### CLI Options
-
-```
-apxinf generate [OPTIONS]
-
-Options:
-  -m, --model <PATH>       Path to the HuggingFace model directory
-                           (contains model.safetensors and tokenizer.json)
-  -p, --prompt <TEXT>      Input prompt text
-  --device <cuda|cpu>      Execution device [default: cpu]
-  --max-tokens <N>         Maximum new tokens to generate
-  --generation-config <apxinf|model>  Which generation defaults to use
-  --sample                 Enable backend sampling (temperature, top-k, ...)
-```
-
-Run `apxinf generate --help` for the full list.
-
-### Quick Test
-
-```bash
-# Run the built-in CPU matmul verification
-./target/release/apxinf test
-```
-
-### Expected Output
-
-```
-apxinf — LLM inference engine
-
-Loading model from "models/tinyllama"...
-Vocab size: 32000
-Loaded 201 tensors
-Model config: hidden=2048, layers=22, heads=32
-Building model...
-Model ready.
-
-Prompt: Once upon a time
-Prompt tokens: [9682, 682, 451, 825]
-
-Generating up to 50 tokens...
-
-Output: Once upon a time...
-```
-
-### Notes
-
-- The model runs on CPU by default
-- Build with `--features cuda` and select `--device cuda` for NVIDIA GPU inference
-- Loads model defaults from `generation_config.json`; missing settings retain
-  deterministic greedy compatibility behavior. `--generation-config apxinf`
-  ignores model defaults.
-- `--sample` enables backend sampling with temperature, top-k, top-p,
-  repetition/frequency/presence penalties, and a reproducible seed. On CUDA,
-  the logits pipeline stays on the GPU and returns only the sampled result.
+# Testing ApxInf
+
+All entry points are justfile recipes — just --list shows the menu. This
+guide explains which tier runs where and what evidence to attach to a PR.
+
+## Tiers
+
+| Tier | Recipe | Needs | Runs in CI |
+|---|---|---|---|
+| Rust unit tests | just test-rust-cpu | CPU only | yes |
+| Python unit tests | just test-py | CPU only | yes |
+| Both | just test-cpu | CPU only | yes |
+| Model family GPU tests | just test-gpu <family> | NVIDIA device + checkpoint | no, attach output to the PR |
+| cuda-new L3 candidate tests | just test-l3 [extra args] | NVIDIA device | no |
+| Benchmarks | just bench <model> [args] | NVIDIA device | no |
+
+just check type-checks every lib and bin target including
+cfg(feature=cuda) code and needs no GPU. It deliberately skips
+--all-targets: the qwen38_gdn_batched_ops test target does not compile on
+main (pre-existing upstream breakage; the test references
+ops::gdn_prepare_flashinfer and ops::convert_f16_to_bf16, which no longer
+exist). Fix that in a code PR, then re-enable --all-targets here.
+
+## Known-failing and excluded tests (as of main fde5feb3)
+
+These are excluded from just test-py and just check until fixed in code
+PRs; they are not silently green:
+
+- tests/test_libero_observation.py: IndentationError at line 67 upstream.
+- tests/test_pi05_openpi_websocket.py: imports the undeclared
+  openpi_client package.
+- tests/test_eval_libero_norm_stats.py::test_run_episode_obeys_explicit_max_steps
+  fails on a CPU-only run.
+- python/apxinf/tests/test_examples.py: 3 websocket CLI tests fail
+  (bf16, fp8_static, int8_dynamic variants).
+- python/apxinf/tests/test_pi0fast_policy.py::test_from_pretrained_rejects_options_that_cannot_mean_anything_here
+  fails on CPU.
+
+## Running a specific test
+
+    just test-l3 test -p apxinf-cuda-new -- --nocapture --test-threads=1
+    cargo test -p apxinf-core test_matmul_cpu
+    pytest python/apxinf/tests/test_tokenize.py
+
+just test-l3 defaults to APXINF_CUDA_ARCH=sm_110 and a dedicated
+target-gemm-pilot directory (matching the old test-new.sh behavior);
+override either with just test-l3 APXINF_CUDA_ARCH=sm_89 or a platform
+preset: APXINF_PLATFORM=orin just test-l3.
+
+## GPU acceptance
+
+just test-gpu <family> runs the family Rust tests with
+--features cuda --release. PRs that touch GPU behavior must attach the
+recipe output plus board, arch, and commit, per the PR template. If you
+have no suitable device, say "not verified" — do not report "pass".

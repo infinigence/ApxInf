@@ -281,6 +281,9 @@ pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
 
+The repo-level equivalent, which also runs the root `tests/` suite:
+`just test-py`.
+
 The `test` extra holds reference implementations, never runtime dependencies: the
 native tokenizer differential tests need the Python `sentencepiece` reference and
 a SentencePiece model (`APXINF_TOKENIZER` or `APXINF_PI05_MODEL_DIR`). Everything

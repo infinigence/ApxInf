@@ -64,14 +64,15 @@ consume the generated artifacts. Follow the
 [AOT export instructions](../crates/apxinf-cuda/aot/README.md), then build:
 
 ```sh
-APXINF_CUDA_ARCH=sm_110 \
+APXINF_PLATFORM=thor \
 APXINF_CUDA_AOT_MANIFEST=/path/to/artifacts/manifest.json \
-  maturin build --release --features cuda,extension-module \
-  --compatibility linux -m crates/apxinf-py/Cargo.toml
+  just build-py
 ```
 
-Install the resulting wheel and `python/apxinf` in the test environment. The
-checkpoint, planner, tokenizer and test fixtures are external assets.
+The preset (`configs/platforms/thor.env`) supplies `APXINF_CUDA_ARCH=sm_110`.
+For `--compatibility linux` wheels invoke `maturin` directly — see
+doc/guides/building.md. The checkpoint, planner, tokenizer and test fixtures
+are external assets.
 
 ```python
 from pathlib import Path

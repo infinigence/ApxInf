@@ -80,6 +80,10 @@ The CUDA binding must be rebuilt after changing the Rust runtime:
 cd <repo-root>
 source ~/.cargo/env
 
+# On main today the canonical entry point is:
+#   APXINF_PLATFORM=orin just build-py
+# The invocation below predates the justfile and is kept for provenance;
+# it builds against the CUDA 12.6 toolkit explicitly.
 env -u CONDA_PREFIX \
   CUDA_PATH=/usr/local/cuda-12.6 \
   CUDA_HOME=/usr/local/cuda-12.6 \
@@ -97,7 +101,8 @@ Checks run:
   python/apxinf/apxinf/policies/impls/pi05.py
 
 source ~/.cargo/env
-cargo check -p apxinf-model -p apxinf-py
+# Workspace-wide check including cfg(feature="cuda") code:
+just check
 ```
 
 ## Smoke Test

@@ -155,12 +155,12 @@ cargo run --release -p apxinf-model --features cuda \
   --dtype bf16 --token-count 10 --iterations 30
 
 # Public Policy timing with deterministic synthetic images, not a golden fixture.
-python scripts/bench_pi05.py --model-dir "$PI05_CHECKPOINT" \
+just bench pi05 --model-dir "$PI05_CHECKPOINT" \
   --model-variant bf16 --layer l1,l2 --warmup 10 --samples 30 \
   --out "$TASK_DIR/results/pi05-policy-bf16.json"
 
 # WallOSS supports L2 only in this Python benchmark; no lower-level guesswork.
-python scripts/bench_pi05.py --model-dir "$WALLOSS_CHECKPOINT" \
+just bench pi05 --model-dir "$WALLOSS_CHECKPOINT" \
   --model-type walloss --model-variant bf16 --layer l2 --warmup 10 --samples 30 \
   --out "$TASK_DIR/results/walloss-policy-bf16.json"
 
