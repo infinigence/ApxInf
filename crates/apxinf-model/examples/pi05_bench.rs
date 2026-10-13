@@ -39,8 +39,8 @@ use apxinf_model::pi05::{
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic, Bf16Model, Bf16Weights, CapturedGraph,
     Fp8StaticActivationScales, Fp8StaticCalibration, Fp8StaticModel, Fp8StaticWeights,
-    Int8DynamicModel, Int8DynamicWeights, ModelVariantChoice, Pi05Config, Pi05ImageLayout,
-    Pi05Weights,
+    Int8DynamicModel, Int8DynamicWeights, Pi05Config, Pi05ImageLayout, Pi05Weights,
+    ModelVariantChoice,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -781,9 +781,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || args.num_flow_steps.is_some()
         || args.max_token_len.is_some();
     if !random && has_checkpoint_shape_overrides {
-        return Err("checkpoint mode permits --views and --action-horizon, but \
+        return Err(
+            "checkpoint mode permits --views and --action-horizon, but \
              --image-size/--action-dim/--num-flow-steps/--max-token-len require `random`"
-            .into());
+                .into(),
+        );
     }
     if random && args.reference.is_some() {
         return Err(
@@ -842,8 +844,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     let config = Arc::new(config);
 
-    let context =
-        Arc::new(CudaContext::new_with_autotune(0, args.autotune).map_err(std::io::Error::other)?);
+    let context = Arc::new(
+        CudaContext::new_with_autotune(0, args.autotune).map_err(std::io::Error::other)?,
+    );
     eprintln!(
         "cuda-new: autotune={} recipe_cache={}",
         args.autotune,
@@ -872,7 +875,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bench = match model_variant {
         BenchVariant::Bf16 => {
             eprintln!("converting and uploading native BF16 weights...");
-            let device_weights = Arc::new(Bf16Weights::from_host(&host_weights, &context)?);
+            let device_weights = Arc::new(Bf16Weights::from_host(
+                &host_weights,
+                &context,
+            )?);
             Bench::Bf16(build_bf16_model(
                 context.clone(),
                 config.clone(),
@@ -921,7 +927,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             eprintln!("quantizing and uploading static FP8 weights...");
-            let device_weights = Arc::new(Fp8StaticWeights::from_host(&host_weights, &context)?);
+            let device_weights = Arc::new(Fp8StaticWeights::from_host(
+                &host_weights,
+                &context,
+            )?);
             Bench::Fp8Static(build_fp8_static_model(
                 context.clone(),
                 config.clone(),

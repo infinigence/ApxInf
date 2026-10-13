@@ -353,7 +353,8 @@ pub(crate) fn output_buffer(ctx: &crate::CudaContext, bytes: usize) -> Result<Cu
             // the legacy default stream is not ordered before the operator
             // that consumes this output. Keep initialization on the same
             // stream to prevent a late memset from erasing kernel results.
-            CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream()).map_err(Error::Cuda)
+            CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream())
+                .map_err(Error::Cuda)
         } else {
             unsafe { &*inner }
                 .workspace

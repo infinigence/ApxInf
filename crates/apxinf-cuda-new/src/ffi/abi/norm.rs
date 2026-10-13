@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
-pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
+pub(crate) use super::types::CudaStream;
 
 pub(crate) const SPEC_VERSION: u32 = 1;
 

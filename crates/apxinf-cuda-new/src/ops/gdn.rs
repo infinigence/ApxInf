@@ -446,9 +446,7 @@ pub fn gdn_chunk_scan(
     }
     let (sv_heads, v_dim, k_dim) = (state_dims[0], state_dims[1], state_dims[2]);
     if sv_heads != v_heads || v_dim != k_dim {
-        return Err(invalid(
-            "GDN chunk scan expects square v_dim == k_dim state",
-        ));
+        return Err(invalid("GDN chunk scan expects square v_dim == k_dim state"));
     }
     if k_heads == 0 || v_heads % k_heads != 0 {
         return Err(invalid("GDN value heads must be a multiple of key heads"));
@@ -462,9 +460,7 @@ pub fn gdn_chunk_scan(
     }
     let seq_padded = q_dims[0];
     if seq_padded % chunk_size != 0 {
-        return Err(invalid(
-            "GDN chunk scan seq must be a multiple of chunk_size",
-        ));
+        return Err(invalid("GDN chunk scan seq must be a multiple of chunk_size"));
     }
     let num_chunks = seq_padded / chunk_size;
 
@@ -541,7 +537,8 @@ pub fn gdn_chunk_scan_interleaved(
     let fused_buffer = tensor_storage(ctx, fused, DType::BF16, &[seq_padded, row_width])?;
     let g_buffer = tensor_storage(ctx, g, DType::F32, &[seq_padded, v_heads])?;
     let beta_buffer = tensor_storage(ctx, beta, DType::F32, &[seq_padded, v_heads])?;
-    let out_buffer = tensor_storage(ctx, out, DType::BF16, &[seq_padded, v_heads, k_dim])?;
+    let out_buffer =
+        tensor_storage(ctx, out, DType::BF16, &[seq_padded, v_heads, k_dim])?;
     let state_buffer = tensor_storage(ctx, state, DType::F32, &[v_heads, k_dim, k_dim])?;
 
     // Byte offsets into the one fused allocation; the kernel walks rows itself.
@@ -621,11 +618,13 @@ pub fn gdn_prefill(
     let gate_buffer = tensor_storage(ctx, gate_log, DType::F32, &[tokens, v_heads])?;
     let beta_buffer = tensor_storage(ctx, beta, DType::F32, &[tokens, v_heads])?;
     let seqlens_buffer = tensor_storage(ctx, cu_seqlens, DType::I32, &[num_seqs + 1])?;
-    let state_buffer = tensor_storage(ctx, state, DType::F32, &[v_heads, head_dim, head_dim])?;
+    let state_buffer =
+        tensor_storage(ctx, state, DType::F32, &[v_heads, head_dim, head_dim])?;
     // The kernel treats this as raw bytes; validating it against its own
     // declared shape keeps the check meaningful without inventing a dtype.
     let workspace_dims = workspace.shape().dims().to_vec();
-    let workspace_buffer = tensor_storage(ctx, workspace, workspace.dtype(), &workspace_dims)?;
+    let workspace_buffer =
+        tensor_storage(ctx, workspace, workspace.dtype(), &workspace_dims)?;
 
     unsafe {
         status::check(abi::apxinf_gdn_prefill(
@@ -651,7 +650,8 @@ pub fn gdn_prefill(
 /// Scratch bytes `gdn_prefill` needs for its TMA rewrites.
 pub fn gdn_prefill_workspace_bytes(v_heads: usize, num_seqs: usize) -> usize {
     unsafe {
-        abi::apxinf_gdn_prefill_workspace_bytes(v_heads as i64, num_seqs as i64).max(0) as usize
+        abi::apxinf_gdn_prefill_workspace_bytes(v_heads as i64, num_seqs as i64)
+            .max(0) as usize
     }
 }
 
@@ -721,19 +721,12 @@ pub fn gdn_conv_prepare(
     v_heads: usize,
     epsilon: f32,
 ) -> Result<()> {
-    let channels = k_heads
-        .checked_mul(2)
+    let channels = k_heads.checked_mul(2)
         .and_then(|heads| heads.checked_add(v_heads))
         .and_then(|heads| heads.checked_mul(128))
         .ok_or_else(|| invalid("fused GDN channel count overflow"))?;
-    if tokens == 0
-        || tokens > i32::MAX as usize
-        || k_heads == 0
-        || v_heads == 0
-        || channels > 536_870_911
-        || !epsilon.is_finite()
-        || epsilon <= 0.0
-    {
+    if tokens == 0 || tokens > i32::MAX as usize || k_heads == 0 || v_heads == 0
+        || channels > 536_870_911 || !epsilon.is_finite() || epsilon <= 0.0 {
         return Err(invalid("invalid fused GDN dimensions or epsilon"));
     }
     let input_buffer = tensor_storage(ctx, input, DType::BF16, &[tokens, channels])?;
@@ -746,19 +739,10 @@ pub fn gdn_conv_prepare(
     let alpha_buffer = tensor_storage(ctx, alpha, DType::F32, &[tokens, v_heads])?;
     unsafe {
         status::check(abi::apxinf_gdn_conv_prepare(
-            input_buffer.ptr(),
-            weight_buffer.ptr(),
-            window_buffer.ptr(),
-            q_buffer.ptr(),
-            k_buffer.ptr(),
-            v_buffer.ptr(),
-            decay_buffer.ptr(),
-            alpha_buffer.ptr(),
-            tokens as i64,
-            k_heads as i64,
-            v_heads as i64,
-            epsilon,
-            ctx.stream().handle(),
+            input_buffer.ptr(), weight_buffer.ptr(), window_buffer.ptr(),
+            q_buffer.ptr(), k_buffer.ptr(), v_buffer.ptr(), decay_buffer.ptr(),
+            alpha_buffer.ptr(), tokens as i64, k_heads as i64, v_heads as i64,
+            epsilon, ctx.stream().handle(),
         ))
     }
 }

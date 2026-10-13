@@ -34,10 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !(2..=4).contains(&arguments.len()) {
         return Err(format!(
             "usage: {} <checkpoint> [stop-token] [token-count=21]",
-            arguments
-                .first()
-                .map(String::as_str)
-                .unwrap_or("pi0_fast_smoke")
+            arguments.first().map(String::as_str).unwrap_or("pi0_fast_smoke")
         )
         .into());
     }

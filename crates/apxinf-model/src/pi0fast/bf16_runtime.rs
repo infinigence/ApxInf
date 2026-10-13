@@ -160,7 +160,10 @@ impl Pi0FastBf16Runtime {
         {
             *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
         }
-        kernels::with_workspace_eager(arena.as_ref().expect("arena is populated above"), operation)
+        kernels::with_workspace_eager(
+            arena.as_ref().expect("arena is populated above"),
+            operation,
+        )
     }
 
     /// Bytes of the arena the last call used.
@@ -182,7 +185,7 @@ impl Pi0FastBf16Runtime {
     ///
     /// `patches` is the FP32 patch-major tensor PaliGemma's SigLIP tower
     /// consumes; the BF16 encoder input is produced inside the patch embedding.
-
+    
     fn embed_images(&self, patches: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let weights = &self.weights;
@@ -252,7 +255,8 @@ impl Pi0FastBf16Runtime {
             &self.config,
             &self.weights,
         )?);
-        let _guard = kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard =
+            kernels::gemm::install_bf16_observer(observer.clone())?;
         let _ = self.infer(patches, token_ids, token_count, stop_token)?;
         self.backend.synchronize()?;
         observer.records()
@@ -283,11 +287,9 @@ impl Pi0FastBf16Runtime {
         let prefix_len = token_count + config.patch_tokens();
 
         let step_bytes = std::mem::size_of::<u32>();
-        let tokens = CudaBuffer::alloc(
-            config.max_action_tokens * step_bytes,
-            self.ctx().device_id(),
-        )
-        .map_err(Error::Cuda)?;
+        let tokens =
+            CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
+                .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
         // One generated token per step: argmax on device, feed the id straight
@@ -300,7 +302,12 @@ impl Pi0FastBf16Runtime {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_remapped_into(self.ctx(), &logits, &self.lm_head_remap, &slot)?;
+            sampling::argmax_bf16_remapped_into(
+                self.ctx(),
+                &logits,
+                &self.lm_head_remap,
+                &slot,
+            )?;
             if let Some(stop) = stop_token {
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;
@@ -387,11 +394,7 @@ impl Pi0FastBf16Runtime {
             &self.weights.language_final_norm_scale,
             self.config.rms_norm_eps,
         )?;
-        super::bf16_executor::decode_projection(
-            self.ctx(),
-            &normalized,
-            &self.weights.lm_head.weight,
-        )
+        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
     }
 
     /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
@@ -402,8 +405,7 @@ impl Pi0FastBf16Runtime {
     /// action token, and the autoregressive feedback loop all share this path.
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let tensor =
-            embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
+        let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
         elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
     }
 }

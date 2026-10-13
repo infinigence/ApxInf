@@ -4,17 +4,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, DType, Device, Error, Result, Shape, Tensor};
+use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
 use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
 use crate::accelerator::create_backend;
 use crate::llm_trait::LlmTrait;
 
-use super::config::{
-    CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM, GDN_V_HEADS, HEAD_DIM, KV_HEADS,
-    LAYERS, QKV_WIDTH, VOCAB,
-};
+use super::config::{CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM,
+    GDN_V_HEADS, HEAD_DIM, KV_HEADS, LAYERS, QKV_WIDTH, VOCAB};
 use super::{backend, model, model_runner, weights};
 
 /// Qwen3.8-27B-NVFP4. Batch 1, text only, BF16 KV cache.
@@ -261,11 +259,7 @@ impl LlmTrait for Qwen38 {
 impl model::GdnState {
     pub(crate) fn new(ctx: &CudaContext) -> Self {
         model::GdnState {
-            recurrent: backend::zeros(
-                ctx,
-                vec![GDN_V_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM],
-                DType::F32,
-            ),
+            recurrent: backend::zeros(ctx, vec![GDN_V_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM], DType::F32),
             conv_window: backend::zeros(ctx, vec![QKV_WIDTH, CONV_WIDTH], DType::F32),
         }
     }

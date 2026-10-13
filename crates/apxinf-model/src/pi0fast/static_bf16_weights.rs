@@ -99,7 +99,10 @@ impl StaticBf16Pi0FastWeights {
                 .iter()
                 .map(|layer| Bf16DeviceLanguageLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
+            language_final_norm_scale: bf16_to_device(
+                &weights.language_final_norm_scale,
+                backend,
+            )?,
         })
     }
 }
@@ -135,10 +138,7 @@ impl Bf16DeviceVisionBlock {
     fn from_host(weights: &VisionBlockWeights, backend: &dyn Backend) -> Result<Self> {
         Ok(Self {
             norm1: Bf16DeviceLayerNorm::from_host(&weights.norm1, backend)?,
-            qkv: Bf16LinearWeights::from_host_parts(
-                &[&weights.q, &weights.k, &weights.v],
-                backend,
-            )?,
+            qkv: Bf16LinearWeights::from_host_parts(&[&weights.q, &weights.k, &weights.v], backend)?,
             output: Bf16LinearWeights::from_host(&weights.output, backend)?,
             norm2: Bf16DeviceLayerNorm::from_host(&weights.norm2, backend)?,
             fc1: Bf16LinearWeights::from_host(&weights.fc1, backend)?,
@@ -160,7 +160,10 @@ impl Bf16DeviceLanguageLayer {
                 backend,
             )?,
             output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
+            post_attention_norm_scale: bf16_to_device(
+                &weights.post_attention_norm_scale,
+                backend,
+            )?,
             gate_up: Bf16LinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

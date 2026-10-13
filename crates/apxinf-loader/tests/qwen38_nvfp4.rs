@@ -24,8 +24,8 @@ fn checkpoint_path() -> Option<PathBuf> {
 
 fn load() -> HashMap<String, Tensor> {
     let path = checkpoint_path().expect("set APXINF_QWEN38_CHECKPOINT");
-    let (tensors, _) =
-        apxinf_loader::safetensors::load_native_path(&path).expect("checkpoint failed to load");
+    let (tensors, _) = apxinf_loader::safetensors::load_native_path(&path)
+        .expect("checkpoint failed to load");
     tensors
 }
 
@@ -66,21 +66,9 @@ fn nvfp4_weights_carry_matching_packed_shapes_and_scales() {
     let block = 16usize;
 
     for (name, out_features, in_features) in [
-        (
-            "model.language_model.layers.0.mlp.gate_proj",
-            intermediate,
-            hidden,
-        ),
-        (
-            "model.language_model.layers.0.mlp.up_proj",
-            intermediate,
-            hidden,
-        ),
-        (
-            "model.language_model.layers.0.mlp.down_proj",
-            hidden,
-            intermediate,
-        ),
+        ("model.language_model.layers.0.mlp.gate_proj", intermediate, hidden),
+        ("model.language_model.layers.0.mlp.up_proj", intermediate, hidden),
+        ("model.language_model.layers.0.mlp.down_proj", hidden, intermediate),
         ("lm_head", 248320, hidden),
     ] {
         let weight = tensors
@@ -134,11 +122,7 @@ fn fp8_projections_carry_scalar_scales_not_vectors() {
         let scale = tensors
             .get(&format!("{name}.weight_scale"))
             .unwrap_or_else(|| panic!("{name}.weight_scale missing"));
-        assert_eq!(
-            scale.shape().numel(),
-            1,
-            "{name}.weight_scale is per-tensor"
-        );
+        assert_eq!(scale.shape().numel(), 1, "{name}.weight_scale is per-tensor");
         assert!(
             !tensors.contains_key(&format!("{name}.weight_scale_2")),
             "{name} is FP8 and must not carry a second-level scale"
@@ -151,9 +135,7 @@ fn fp8_projections_carry_scalar_scales_not_vectors() {
 fn gate_and_up_share_the_scales_that_make_fusion_lossless() {
     let tensors = load();
     let scalar = |name: &str| -> f32 {
-        let tensor = tensors
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} missing"));
+        let tensor = tensors.get(name).unwrap_or_else(|| panic!("{name} missing"));
         tensor.to_f32_vec().unwrap()[0]
     };
     // Fusing gate and up into one [2N, K] GEMM is only exact when both

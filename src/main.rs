@@ -3,13 +3,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use clap::{Parser, Subcommand};
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
-    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput, LoadOptions,
-    SamplingMode,
+    AutoModel, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
+    LoadOptions, SamplingMode,
 };
-use apxinf_tokenizer::{ChatMessage, Tokenizer};
-use clap::{Parser, Subcommand};
+use apxinf_tokenizer::{Tokenizer, ChatMessage};
 
 #[derive(Parser)]
 #[command(name = "apxinf")]
@@ -262,23 +262,24 @@ fn run_generate(
         ..LoadOptions::default()
     };
 
-    println!(
-        "Loading {model_name} from {:?}... (dtype: {dtype})",
-        model_dir
-    );
+    println!("Loading {model_name} from {:?}... (dtype: {dtype})", model_dir);
     let mut model = AutoModel::load_model(device, model_dir, &options)
         .map_err(|error| format!("Failed to load model: {error}"))?;
     if prepared_image.is_some() {
         match model.text_capabilities() {
             Ok(capabilities) if capabilities.image => {}
-            Ok(_) => return Err(format!("Model `{model_name}` does not support image input")),
+            Ok(_) => {
+                return Err(format!("Model `{model_name}` does not support image input"))
+            }
             Err(error) => return Err(format!("Cannot generate with this model: {error}")),
         }
     }
     println!("Model ready.");
 
     let input = match prepared_image.as_ref() {
-        Some((pixels, grids)) => LlmInput::with_image(&tokens, ImageInput::new(pixels, grids)),
+        Some((pixels, grids)) => {
+            LlmInput::with_image(&tokens, ImageInput::new(pixels, grids))
+        }
         None => LlmInput::text(&tokens),
     };
 
@@ -357,9 +358,7 @@ fn encode_prompt(
             messages.push(ChatMessage::system(system));
         }
         messages.push(ChatMessage::user(prompt));
-        tokenizer
-            .encode_chat(&messages)
-            .map_err(|error| error.to_string())
+        tokenizer.encode_chat(&messages).map_err(|error| error.to_string())
     } else {
         tokenizer.encode(prompt).map_err(|error| error.to_string())
     }
@@ -376,8 +375,10 @@ fn preprocess_image(
     use std::process::Command;
 
     let suffix = std::process::id();
-    let pixel_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
-    let metadata_path = std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
+    let pixel_path =
+        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-pixels.npy"));
+    let metadata_path =
+        std::env::temp_dir().join(format!("apxinf-cli-{suffix}-metadata.json"));
     let script = r#"
 import json
 import sys
@@ -450,13 +451,16 @@ with open(metadata_path, "w") as output:
     let grid = [
         grid_values[0]
             .as_u64()
-            .ok_or_else(|| "processor grid T is not an integer".to_string())? as u32,
+            .ok_or_else(|| "processor grid T is not an integer".to_string())?
+            as u32,
         grid_values[1]
             .as_u64()
-            .ok_or_else(|| "processor grid H is not an integer".to_string())? as u32,
+            .ok_or_else(|| "processor grid H is not an integer".to_string())?
+            as u32,
         grid_values[2]
             .as_u64()
-            .ok_or_else(|| "processor grid W is not an integer".to_string())? as u32,
+            .ok_or_else(|| "processor grid W is not an integer".to_string())?
+            as u32,
     ];
     let tokens = metadata
         .get("tokens")
@@ -478,7 +482,9 @@ with open(metadata_path, "w") as output:
 }
 
 /// Read a NumPy v1 f32 array and convert it to bf16.
-fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
+fn read_npy_f32_to_bf16(
+    path: &std::path::Path,
+) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     use std::io::Read;
 
     let mut file =
@@ -519,7 +525,9 @@ fn read_npy_f32_to_bf16(path: &std::path::Path) -> Result<(Vec<usize>, Vec<half:
     }
     let data = raw
         .chunks_exact(4)
-        .map(|bytes| half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap())))
+        .map(|bytes| {
+            half::bf16::from_f32(f32::from_le_bytes(bytes.try_into().unwrap()))
+        })
         .collect();
     Ok((shape, data))
 }
@@ -605,10 +613,7 @@ fn cuda_test() {
     let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
     let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
-        .iter()
-        .map(|x| x / (1.0 + (-x).exp()))
-        .collect();
+    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0].iter().map(|x| x / (1.0 + (-x).exp())).collect();
     println!("[CUDA] silu: {:?}", silu_data);
 
     // Add test
@@ -642,8 +647,7 @@ fn cuda_test() {
     println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
 
     // RoPE test
-    let rope_input =
-        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
+    let rope_input = Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
     let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
     let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
     let rope_cpu = transfers::to_cpu(&rope_out).unwrap();

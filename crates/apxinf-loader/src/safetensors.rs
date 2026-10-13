@@ -15,8 +15,8 @@ use std::path::{Component, Path};
 use memmap2::Mmap;
 use serde::Deserialize;
 
-use apxinf_core::{DType, Device, Shape, Tensor};
 use bytemuck;
+use apxinf_core::{DType, Device, Shape, Tensor};
 
 use crate::config::ModelConfig;
 

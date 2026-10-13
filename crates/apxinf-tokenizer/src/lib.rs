@@ -109,11 +109,7 @@ impl Tokenizer {
     }
 
     /// Encode text, optionally applying the tokenizer's post-processor.
-    pub fn encode_with_special_tokens(
-        &self,
-        text: &str,
-        add_special_tokens: bool,
-    ) -> Result<Vec<u32>> {
+    pub fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self
             .inner
             .encode(text, add_special_tokens)

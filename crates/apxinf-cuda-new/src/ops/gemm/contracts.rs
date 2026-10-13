@@ -366,7 +366,13 @@ pub(crate) fn normalize_bias_residual<'a>(
     bias: Option<&'a Tensor>,
     residual: &'a Tensor,
 ) -> Result<Normalized> {
-    normalize_fused(ctx, args, Semantic::GemmBiasResidual, bias, Some(residual))
+    normalize_fused(
+        ctx,
+        args,
+        Semantic::GemmBiasResidual,
+        bias,
+        Some(residual),
+    )
 }
 
 fn normalize_fused<'a>(
@@ -416,7 +422,10 @@ fn normalize_fused<'a>(
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
-    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu);
+    let needs_bias = matches!(
+        semantic,
+        Semantic::GemmBias | Semantic::GemmBiasGelu
+    );
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
         return Err(invalid("fused operands do not match the semantic operator"));
@@ -473,7 +482,9 @@ fn normalize_fused<'a>(
             if args.a.dtype() != DType::E2M1Pair || args.b.dtype() != DType::E2M1Pair {
                 return Err(invalid("NVFP4 GEMM requires two packed E2M1 tensors"));
             }
-            if a_block_scales.dtype() != DType::F8E4M3 || b_block_scales.dtype() != DType::F8E4M3 {
+            if a_block_scales.dtype() != DType::F8E4M3
+                || b_block_scales.dtype() != DType::F8E4M3
+            {
                 // The kernel reads these as unsigned E4M3. For the non-negative
                 // values a scale tensor holds, that encoding is bit-identical
                 // to signed E4M3, so the checkpoint bytes pass through as-is.
@@ -562,11 +573,7 @@ fn normalize_fused<'a>(
                 output_bytes,
                 &buffer,
                 bytes,
-                if slot == 0 {
-                    "A block scale"
-                } else {
-                    "B block scale"
-                },
+                if slot == 0 { "A block scale" } else { "B block scale" },
             )?;
             if slot == 0 {
                 bindings.a_block_scales = buffer.ptr();

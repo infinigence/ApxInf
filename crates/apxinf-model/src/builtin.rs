@@ -112,6 +112,7 @@ fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
     Ok(())
 }
 
+
 /// Qwen3.8-27B-NVFP4 on CUDA: safetensors shards in the checkpoint directory,
 /// validated default execution (FlashInfer-GDN prefill, CUDA-graph decode,
 /// split-KV attention).

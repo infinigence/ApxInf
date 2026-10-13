@@ -7,10 +7,7 @@ use std::sync::Arc;
 
 use apxinf_core::{Error, Result, Tensor};
 
-use crate::pi05::{
-    backend::{self, Context},
-    Bf16Weights, Pi05CalibrationPlan, Pi05Config,
-};
+use crate::pi05::{backend::{self, Context}, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
 
 pub struct Pi05CalibrationObserver {
     backend: Arc<Context>,
@@ -58,7 +55,11 @@ pub(in crate::pi05::model) fn observe_bf16_activation(
 }
 
 impl Pi05CalibrationObserver {
-    pub fn new(backend: Arc<Context>, config: &Pi05Config, weights: &Bf16Weights) -> Result<Self> {
+    pub fn new(
+        backend: Arc<Context>,
+        config: &Pi05Config,
+        weights: &Bf16Weights,
+    ) -> Result<Self> {
         let mut sites = HashMap::new();
         let plan = Pi05CalibrationPlan::for_config(config);
         let mut insert = |tensor: &Tensor, name: String| -> Result<()> {

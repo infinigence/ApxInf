@@ -26,9 +26,7 @@ impl Bf16LinearWeights {
     /// remain one tensor-core GEMM.
     pub fn from_host_parts(linears: &[&LinearWeights], backend: &dyn Backend) -> Result<Self> {
         if linears.is_empty() {
-            return Err(Error::Other(
-                "cannot pack an empty BF16 linear group".into(),
-            ));
+            return Err(Error::Other("cannot pack an empty BF16 linear group".into()));
         }
         let plain_weight = concat_host_2d(
             &linears

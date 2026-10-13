@@ -715,12 +715,23 @@ pub fn full_gqa_bf16(
         || key_tokens == 0
         || key_tokens != k_shape[0]
     {
-        return Err(Error::Other("non-causal BF16 GQA shape mismatch".into()));
+        return Err(Error::Other(
+            "non-causal BF16 GQA shape mismatch".into(),
+        ));
     }
     #[cfg(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100))]
     {
         return fa2_attention(
-            ctx, q, k, v, 1, q_shape[0], key_tokens, q_shape[1], k_shape[1], q_shape[2],
+            ctx,
+            q,
+            k,
+            v,
+            1,
+            q_shape[0],
+            key_tokens,
+            q_shape[1],
+            k_shape[1],
+            q_shape[2],
         );
     }
     #[cfg(not(any(apxinf_fa2_sm80, apxinf_fa2_f16_sm100)))]
@@ -748,7 +759,9 @@ pub fn full_gqa_f16(
         || key_tokens == 0
         || key_tokens != k_shape[0]
     {
-        return Err(Error::Other("non-causal FP16 GQA shape mismatch".into()));
+        return Err(Error::Other(
+            "non-causal FP16 GQA shape mismatch".into(),
+        ));
     }
     let output = output_buffer(ctx, q.size_in_bytes())?;
     unsafe {
@@ -801,7 +814,9 @@ pub fn suffix_causal_gqa_f16(
         || key_offset >= key_tokens
         || q_shape[0] + key_offset != key_tokens
     {
-        return Err(Error::Other("causal suffix FP16 GQA shape mismatch".into()));
+        return Err(Error::Other(
+            "causal suffix FP16 GQA shape mismatch".into(),
+        ));
     }
     let output = output_buffer(ctx, q.size_in_bytes())?;
     unsafe {
@@ -868,7 +883,9 @@ pub fn vision_mha_f16(
         let view_output = full_gqa_f16(ctx, &view_q, &view_k, &view_v, tokens_per_view)?
             .reshape(vec![tokens_per_view, head_width])?;
         output = Some(match output {
-            Some(output) => super::elementwise::concat_rows_f16(ctx, &output, &view_output)?,
+            Some(output) => {
+                super::elementwise::concat_rows_f16(ctx, &output, &view_output)?
+            }
             None => view_output,
         });
     }
@@ -933,7 +950,8 @@ pub fn prefix_gqa_f16(
     let shared_k = row_view_f16(ctx, k, 0, shared_tokens)?;
     let shared_v = row_view_f16(ctx, v, 0, shared_tokens)?;
     let state_q = row_view_f16(ctx, q, shared_tokens, key_tokens)?;
-    let shared_output = full_gqa_f16(ctx, &shared_q, &shared_k, &shared_v, shared_tokens)?;
+    let shared_output =
+        full_gqa_f16(ctx, &shared_q, &shared_k, &shared_v, shared_tokens)?;
     let state_output = full_gqa_f16(ctx, &state_q, k, v, key_tokens)?;
     let head_width = q_shape[1] * q_shape[2];
     let shared_rows = shared_output.reshape(vec![shared_tokens, head_width])?;
@@ -975,10 +993,7 @@ fn row_view_bf16(
         .and_then(|buffer| buffer.view(offset, bytes))
         .map_err(Error::Cuda)?;
     buffer
-        .as_tensor(
-            Shape::new(vec![end_row - start_row, shape[1], shape[2]]),
-            DType::BF16,
-        )
+        .as_tensor(Shape::new(vec![end_row - start_row, shape[1], shape[2]]), DType::BF16)
         .map_err(Error::Cuda)
 }
 
@@ -1015,10 +1030,7 @@ fn row_view_f16(
         .and_then(|buffer| buffer.view(offset, bytes))
         .map_err(Error::Cuda)?;
     buffer
-        .as_tensor(
-            Shape::new(vec![end_row - start_row, shape[1], shape[2]]),
-            DType::F16,
-        )
+        .as_tensor(Shape::new(vec![end_row - start_row, shape[1], shape[2]]), DType::F16)
         .map_err(Error::Cuda)
 }
 

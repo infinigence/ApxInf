@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use apxinf_core::{DType, Error, Result, Tensor};
 use half::bf16;
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::Pi0FastConfig;
 
@@ -198,15 +198,12 @@ impl Pi0FastWeights {
         validate_shapes(config, &weights)?;
         Ok(weights)
     }
+
 }
 
 fn validate_shapes(config: &Pi0FastConfig, weights: &Pi0FastWeights) -> Result<()> {
     let lang = config.language;
-    expect(
-        &weights.lm_head,
-        &[config.vocab_size, lang.width],
-        "lm_head",
-    )?;
+    expect(&weights.lm_head, &[config.vocab_size, lang.width], "lm_head")?;
     if weights.language_layers.len() != lang.depth {
         return Err(Error::Other(format!(
             "π0-FAST language depth mismatch: config {}, weights {}",
@@ -272,10 +269,7 @@ fn take_mlp(tensors: &mut HashMap<String, Tensor>, layer: &str) -> Result<GemmaM
     })
 }
 
-fn take_layer_norm(
-    tensors: &mut HashMap<String, Tensor>,
-    prefix: &str,
-) -> Result<LayerNormWeights> {
+fn take_layer_norm(tensors: &mut HashMap<String, Tensor>, prefix: &str) -> Result<LayerNormWeights> {
     Ok(LayerNormWeights {
         weight: take(tensors, &format!("{prefix}.weight"))?,
         bias: take(tensors, &format!("{prefix}.bias"))?,

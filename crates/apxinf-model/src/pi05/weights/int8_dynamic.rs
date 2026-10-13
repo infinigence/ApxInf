@@ -35,7 +35,10 @@ mod linear {
 
         /// Pack QKV or gate/up along the output dimension, then independently
         /// quantize every output channel across its complete input row.
-        pub fn from_host_parts(linears: &[&LinearWeights], backend: &Context) -> Result<Self> {
+        pub fn from_host_parts(
+            linears: &[&LinearWeights],
+            backend: &Context,
+        ) -> Result<Self> {
             if linears.is_empty() {
                 return Err(Error::Other(
                     "cannot pack an empty INT8 linear group".into(),
@@ -48,24 +51,23 @@ mod linear {
                     .collect::<Vec<_>>(),
             )?;
             let (quantized, scales, input_dim, output_dim) = quantize_output_channels(&packed)?;
-            let weight = backend::to_device(
+            let weight = backend::to_device(backend, &Tensor::from_i8(
+                vec![input_dim, output_dim],
+                &quantized,
+            )?)?;
+            let channel_scales = backend::to_device(
                 backend,
-                &Tensor::from_i8(vec![input_dim, output_dim], &quantized)?,
+                &Tensor::from_f32(vec![output_dim], &scales)?,
             )?;
-            let channel_scales =
-                backend::to_device(backend, &Tensor::from_f32(vec![output_dim], &scales)?)?;
             let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
                 None
             } else if linears.iter().all(|linear| linear.bias.is_some()) {
-                Some(backend::to_device(
-                    backend,
-                    &concat_biases_bf16(
-                        &linears
-                            .iter()
-                            .map(|linear| linear.bias.as_ref().unwrap())
-                            .collect::<Vec<_>>(),
-                    )?,
-                )?)
+                Some(backend::to_device(backend, &concat_biases_bf16(
+                    &linears
+                        .iter()
+                        .map(|linear| linear.bias.as_ref().unwrap())
+                        .collect::<Vec<_>>(),
+                )?)?)
             } else {
                 return Err(Error::Other(
                     "cannot pack INT8 projections with mixed bias presence".into(),

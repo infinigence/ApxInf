@@ -89,7 +89,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
     if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
         return Err(invalid("dynamic decode RoPE requires rank-4 Q/K/V"));
     }
-    let (batch, tokens, q_heads, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    let (batch, tokens, q_heads, head_dim) =
+        (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
     let (k_batch, k_tokens, kv_heads, k_head_dim) =
         (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
     let cache_shape = args.key_cache.shape().dims();
@@ -138,9 +139,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
     let cache_capacity = cache_shape[1];
     for value in [q_heads, kv_heads, head_dim, cache_capacity] {
         if value > i32::MAX as usize {
-            return Err(invalid(
-                "dynamic decode RoPE dimension exceeds native limits",
-            ));
+            return Err(invalid("dynamic decode RoPE dimension exceeds native limits"));
         }
     }
 

@@ -49,10 +49,13 @@ impl Shape {
         } else {
             i as usize
         };
-        self.dims.get(idx).copied().ok_or(Error::InvalidAxis {
-            axis: idx,
-            ndim: self.ndim(),
-        })
+        self.dims
+            .get(idx)
+            .copied()
+            .ok_or(Error::InvalidAxis {
+                axis: idx,
+                ndim: self.ndim(),
+            })
     }
 
     /// Compute row-major strides.

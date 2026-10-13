@@ -22,10 +22,7 @@ fn upload_bf16(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
 }
 
 fn upload_f32(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
     let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer.as_tensor(Shape::new(dims), DType::F32).unwrap()
@@ -69,11 +66,7 @@ fn cosine_rel_l2(got: &[f32], want: &[f32]) -> (f64, f64) {
     } else {
         1.0
     };
-    let rel = if nw > 0.0 {
-        (diff / nw).sqrt()
-    } else {
-        diff.sqrt()
-    };
+    let rel = if nw > 0.0 { (diff / nw).sqrt() } else { diff.sqrt() };
     (cos, rel)
 }
 

@@ -167,7 +167,8 @@ impl Pi0FastConfig {
         cfg.max_action_dim = usize_field(&v, &["max_action_dim"], cfg.max_action_dim);
         cfg.max_action_tokens = usize_field(&v, &["max_action_tokens"], cfg.max_action_tokens);
         cfg.fast_skip_tokens = usize_field(&v, &["fast_skip_tokens"], cfg.fast_skip_tokens);
-        cfg.action_vocab_size = usize_field(&v, &["action_vocab_size"], cfg.action_vocab_size);
+        cfg.action_vocab_size =
+            usize_field(&v, &["action_vocab_size"], cfg.action_vocab_size);
         if let Some(tokens) = v.get("action_head_extra_tokens").and_then(|x| x.as_array()) {
             cfg.action_head_extra_tokens = tokens
                 .iter()
@@ -245,8 +246,7 @@ impl Pi0FastConfig {
     /// remaps through.
     pub fn action_head_columns(&self) -> Result<Vec<usize>> {
         let (start, end) = (self.action_token_start(), self.action_token_end());
-        let mut columns =
-            Vec::with_capacity(self.action_vocab_size + self.action_head_extra_tokens.len());
+        let mut columns = Vec::with_capacity(self.action_vocab_size + self.action_head_extra_tokens.len());
         columns.extend(start..end);
         for &token in &self.action_head_extra_tokens {
             let index = token as usize;
@@ -292,10 +292,14 @@ impl Pi0FastConfig {
             return Err(Error::Other("pi0fast action_horizon must be > 0".into()));
         }
         if self.max_action_tokens == 0 {
-            return Err(Error::Other("pi0fast max_action_tokens must be > 0".into()));
+            return Err(Error::Other(
+                "pi0fast max_action_tokens must be > 0".into(),
+            ));
         }
         if self.action_vocab_size == 0 {
-            return Err(Error::Other("pi0fast action_vocab_size must be > 0".into()));
+            return Err(Error::Other(
+                "pi0fast action_vocab_size must be > 0".into(),
+            ));
         }
         if self.fast_skip_tokens + self.action_vocab_size > self.vocab_size {
             return Err(Error::Other(format!(
@@ -443,10 +447,7 @@ mod tests {
 
     #[test]
     fn action_window_must_fit_the_vocabulary() {
-        let raw = CHECKPOINT.replace(
-            "\"max_action_tokens\": 256",
-            "\"max_action_tokens\": 256, \"action_vocab_size\": 257152",
-        );
+        let raw = CHECKPOINT.replace("\"max_action_tokens\": 256", "\"max_action_tokens\": 256, \"action_vocab_size\": 257152");
         assert!(Pi0FastConfig::from_json_str(&raw).is_err());
     }
 

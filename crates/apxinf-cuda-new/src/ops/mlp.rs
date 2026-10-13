@@ -201,16 +201,10 @@ pub fn nvfp4_gemv(
         return Err(invalid("NVFP4 GEMV activation must hold K/2 bytes"));
     }
     let activation_scale_dims = activation_scales.shape().dims().to_vec();
-    let activation_scale_buffer = tensor_storage(
-        ctx,
-        activation_scales,
-        DType::F8E4M3,
-        &activation_scale_dims,
-    )?;
+    let activation_scale_buffer =
+        tensor_storage(ctx, activation_scales, DType::F8E4M3, &activation_scale_dims)?;
     if activation_scale_buffer.len() < k / 16 {
-        return Err(invalid(
-            "NVFP4 GEMV activation scales must hold K/16 entries",
-        ));
+        return Err(invalid("NVFP4 GEMV activation scales must hold K/16 entries"));
     }
     let output_dims = output.shape().dims().to_vec();
     if output_dims.iter().product::<usize>() != n {

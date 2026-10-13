@@ -310,12 +310,8 @@ impl AutoModel {
         if options.model_variant.is_some()
             && !matches!(
                 model_name,
-                "pi05"
-                    | "pi05-cuda"
-                    | "qwen_drive"
-                    | "qwen_drive-cuda"
-                    | "smolvla"
-                    | "smolvla_libero"
+                "pi05" | "pi05-cuda" | "qwen_drive" | "qwen_drive-cuda"
+                    | "smolvla" | "smolvla_libero"
             )
         {
             return Err(Error::Other(format!(

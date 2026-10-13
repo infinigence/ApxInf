@@ -55,8 +55,11 @@ fn fixed_quantize(
     scale: f32,
 ) -> Result<Tensor> {
     let mut out = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args =
-        ops::QuantizationArgs::new(ops::QuantizationSemantic::FixedScaleE4m3, input, &mut out);
+    let mut args = ops::QuantizationArgs::new(
+        ops::QuantizationSemantic::FixedScaleE4m3,
+        input,
+        &mut out,
+    );
     args.scale = scale;
     ops::quantization(ctx, args)?;
     Ok(out)
@@ -180,8 +183,9 @@ fn fp8_gemm_geglu(
     if weight_dims[1] % 2 != 0 {
         return Err(Error::Other("π0.5 FP8 GeGLU width must be even".into()));
     }
-    let fused_shape =
-        matches!(dims[0], 522 | 533 | 778 | 789) && dims[1] == 2048 && weight_dims == [2048, 32768];
+    let fused_shape = matches!(dims[0], 522 | 533 | 778 | 789)
+        && dims[1] == 2048
+        && weight_dims == [2048, 32768];
     if fused_shape {
         let mut out = output(ctx, vec![dims[0], weight_dims[1] / 2], DType::F8E4M3)?;
         let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
@@ -301,13 +305,7 @@ fn bias_residual_rms_normalized_fp8(
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
     let mut args = ops::BiasResidualRmsNormArgs::new(
-        input,
-        bias,
-        residual,
-        weight,
-        &mut hidden,
-        &mut normalized,
-        eps,
+        input, bias, residual, weight, &mut hidden, &mut normalized, eps,
     );
     args.output_scale = scale;
     ops::bias_residual_rms_norm(ctx, args)?;
@@ -330,14 +328,7 @@ fn bias_residual_layer_normalized_fp8(
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
     let mut args = ops::BiasResidualLayerNormArgs::new(
-        input,
-        bias,
-        residual,
-        weight,
-        norm_bias,
-        &mut hidden,
-        &mut normalized,
-        eps,
+        input, bias, residual, weight, norm_bias, &mut hidden, &mut normalized, eps,
     );
     args.output_scale = scale;
     ops::bias_residual_layer_norm(ctx, args)?;
@@ -366,13 +357,7 @@ fn ada_gate_residual_rms_normalized_fp8(
     let mut hidden = output(ctx, shape.clone(), input.dtype())?;
     let mut normalized = output(ctx, shape, DType::F8E4M3)?;
     let mut args = ops::AdaGateResidualRmsNormArgs::new(
-        input,
-        residual,
-        &norm_style,
-        gate_style,
-        &mut hidden,
-        &mut normalized,
-        eps,
+        input, residual, &norm_style, gate_style, &mut hidden, &mut normalized, eps,
     );
     args.output_scale = scale;
     ops::ada_gate_residual_rms_norm(ctx, args)?;
@@ -525,13 +510,7 @@ fn language_layer_fp8_static_with_policies(
         rms_eps,
         scales.attention_norm,
     )?;
-    let qkv = fp8_gemm(
-        ctx,
-        policies,
-        &normalized,
-        scales.attention_norm,
-        &weights.qkv,
-    )?;
+    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
     let qkv = split_qkv(
         ctx,
         policies,
@@ -675,13 +654,7 @@ fn action_layer_fp8_static_with_policies(
             scales.attention_norm,
         )?,
     };
-    let qkv = fp8_gemm(
-        ctx,
-        policies,
-        &normalized,
-        scales.attention_norm,
-        &weights.qkv,
-    )?;
+    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
     let q = split_qkv_to_cache(
         ctx,
         policies,
@@ -873,21 +846,9 @@ fn vision_layer_fp8_static_with_policies(
         && head_dim == 72
         && weights.qkv.bias.is_some();
     let qkv = if use_packed_qkv {
-        fp8_gemm_bias(
-            ctx,
-            policies,
-            &normalized,
-            scales.attention_norm,
-            &weights.qkv,
-        )?
+        fp8_gemm_bias(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
     } else {
-        fp8_gemm(
-            ctx,
-            policies,
-            &normalized,
-            scales.attention_norm,
-            &weights.qkv,
-        )?
+        fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
     };
     let tokens = input.shape().dims()[0];
     let views = tokens / patches_per_view;
@@ -1030,8 +991,11 @@ mod tests {
         let source = (0..64)
             .map(|i| f16::from_f32((i as f32 - 31.0) / 32.0))
             .collect::<Vec<_>>();
-        let input =
-            backend::to_device(&backend, &Tensor::from_f16(vec![4, 16], &source).unwrap()).unwrap();
+        let input = backend::to_device(
+            &backend,
+            &Tensor::from_f16(vec![4, 16], &source).unwrap(),
+        )
+        .unwrap();
         let output = language_layer_fp8_static(
             &backend,
             config,
@@ -1257,8 +1221,16 @@ pub(in crate::pi05::model) mod backbone {
                 )?;
                 hidden = output.hidden;
                 let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
-                keys.push(ops::reserve_prefix(self.ctx(), &output.key, cache_rows)?);
-                values.push(ops::reserve_prefix(self.ctx(), &output.value, cache_rows)?);
+                keys.push(ops::reserve_prefix(
+                    self.ctx(),
+                    &output.key,
+                    cache_rows,
+                )?);
+                values.push(ops::reserve_prefix(
+                    self.ctx(),
+                    &output.value,
+                    cache_rows,
+                )?);
             }
             Ok(Fp8StaticPrefixKvCache {
                 keys,
@@ -1288,8 +1260,12 @@ pub(in crate::pi05::model) mod backbone {
                 self.weights.time_mlp_in.bias.as_ref(),
                 ops::PointwiseActivation::Silu,
             )?;
-            let hidden =
-                fixed_quantize(self.ctx(), &self.policies, &hidden, self.scales.time_hidden)?;
+            let hidden = fixed_quantize(
+                self.ctx(),
+                &self.policies,
+                &hidden,
+                self.scales.time_hidden,
+            )?;
             let output = fp8_gemm(
                 self.ctx(),
                 &self.policies,
@@ -1390,8 +1366,12 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 prefix KV/modulation depth mismatch".into(),
                 ));
             }
-            let state_fp8 =
-                fixed_quantize(self.ctx(), &self.policies, state, self.scales.action_input)?;
+            let state_fp8 = fixed_quantize(
+                self.ctx(),
+                &self.policies,
+                state,
+                self.scales.action_input,
+            )?;
             let hidden = fp8_gemm(
                 self.ctx(),
                 &self.policies,

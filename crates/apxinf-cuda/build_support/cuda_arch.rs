@@ -66,16 +66,9 @@ pub struct ArchSelection {
 pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     matches!(
         arch,
-        "sm_100"
-            | "sm_100a"
-            | "sm_101"
-            | "sm_101a"
-            | "sm_110"
-            | "sm_110a"
-            | "sm_120"
-            | "sm_120a"
-            | "sm_121"
-            | "sm_121a"
+        "sm_100" | "sm_100a" | "sm_101" | "sm_101a"
+        | "sm_110" | "sm_110a"
+        | "sm_120" | "sm_120a" | "sm_121" | "sm_121a"
     )
 }
 
@@ -300,14 +293,8 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ComputeCapability {
-                    major: 11,
-                    minor: 0
-                },
-                ComputeCapability {
-                    major: 11,
-                    minor: 0
-                }
+                ComputeCapability { major: 11, minor: 0 },
+                ComputeCapability { major: 11, minor: 0 }
             ]
         );
         assert_eq!(select_uniform_arch(&parsed).unwrap(), "sm_110");
@@ -317,10 +304,7 @@ mod tests {
     fn rejects_mixed_visible_architectures() {
         let capabilities = [
             ComputeCapability { major: 8, minor: 7 },
-            ComputeCapability {
-                major: 11,
-                minor: 0,
-            },
+            ComputeCapability { major: 11, minor: 0 },
         ];
         let error = select_uniform_arch(&capabilities).unwrap_err();
         assert!(error.contains("sm_87, sm_110"), "{error}");

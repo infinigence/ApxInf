@@ -1,10 +1,10 @@
 pub(crate) mod attention;
 pub(crate) mod attn;
-pub(crate) mod gather;
 pub(crate) mod gdn;
 pub(crate) mod gemm;
-pub(crate) mod mlp;
 pub(crate) mod model;
+pub(crate) mod mlp;
+pub(crate) mod gather;
 pub(crate) mod norm;
 pub(crate) mod pointwise;
 pub(crate) mod quantization;

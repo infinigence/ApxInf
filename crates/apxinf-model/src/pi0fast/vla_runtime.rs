@@ -15,8 +15,8 @@ use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, InferenceSpec, Observation, PreparedInference, VisionObservation, VlaContract,
-    VlaRequest, VlaRuntime,
+    Action, InferenceSpec, Observation, PreparedInference, VlaContract, VlaRequest,
+    VisionObservation, VlaRuntime,
 };
 
 use super::backend::{
@@ -24,8 +24,8 @@ use super::backend::{
 };
 use super::fp8_calibration::{checkpoint_identity, Pi0FastFp8Calibration};
 use super::{
-    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime, Pi0FastFp8Scales,
-    Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
+    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime,
+    Pi0FastFp8Scales, Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
 };
 
 /// Explicit opt-in for an uncalibrated FP8 bring-up, in the form
@@ -52,9 +52,7 @@ fn artifact_root(path: &Path) -> PathBuf {
     if path.is_dir() {
         path.to_path_buf()
     } else {
-        path.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
+        path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
     }
 }
 
@@ -121,8 +119,8 @@ impl Pi0FastVlaRuntime {
 
     fn device_tokens(&self, tokens: &[u32]) -> Result<CudaBuffer> {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        let buffer =
-            CudaBuffer::alloc(bytes.len(), self.backend.device_id()).map_err(Error::Cuda)?;
+        let buffer = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
+            .map_err(Error::Cuda)?;
         buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
         Ok(buffer)
     }
@@ -144,9 +142,9 @@ impl Pi0FastVlaRuntime {
             }
             VisionObservation::RgbU8 { bytes, layout } => {
                 let config = &self.config;
-                let patches = self
-                    .backend
-                    .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
+                let patches =
+                    self.backend
+                        .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
                 let images = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
                     .map_err(Error::Cuda)?;
                 images.copy_from_host(bytes).map_err(Error::Cuda)?;
@@ -292,9 +290,7 @@ fn fp8_activation_scale() -> Result<Option<f32>> {
         Err(_) => return Ok(None),
     };
     let scale = raw.parse::<f32>().map_err(|error| {
-        Error::Other(format!(
-            "{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"
-        ))
+        Error::Other(format!("{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"))
     })?;
     if !scale.is_finite() || scale <= 0.0 {
         return Err(Error::Other(format!(

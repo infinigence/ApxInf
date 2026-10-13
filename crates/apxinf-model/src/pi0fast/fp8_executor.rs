@@ -15,7 +15,9 @@ use super::backend::{kernels, Context};
 use apxinf_core::{Result, Tensor};
 use kernels::{activation, attention, fused, gemm, norm, quantization, rope};
 
-use super::{Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, Pi0FastLanguageConfig};
+use super::{
+    Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, Pi0FastLanguageConfig,
+};
 
 /// Activation scales for one vision block, one per GEMM input.
 #[derive(Clone, Copy, Debug)]
@@ -175,12 +177,7 @@ pub fn language_layer_fp8(
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let gate_up = fp8_projection(
-        ctx,
-        &fused.normalized,
-        &weights.gate_up,
-        scales.gate_up_input,
-    )?;
+    let gate_up = fp8_projection(ctx, &fused.normalized, &weights.gate_up, scales.gate_up_input)?;
     let activated = activation::geglu_bf16(ctx, &gate_up)?;
     let projected = fp8_projection(ctx, &activated, &weights.down, scales.down_input)?;
     let hidden =
@@ -272,12 +269,7 @@ pub fn language_layer_cached_decode_fp8(
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let gate_up = fp8_projection(
-        ctx,
-        &fused.normalized,
-        &weights.gate_up,
-        scales.gate_up_input,
-    )?;
+    let gate_up = fp8_projection(ctx, &fused.normalized, &weights.gate_up, scales.gate_up_input)?;
     let activated = activation::geglu_bf16(ctx, &gate_up)?;
     let projected = fp8_projection(ctx, &activated, &weights.down, scales.down_input)?;
     fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)

@@ -61,11 +61,7 @@ fn e4m3_value(code: u8) -> f64 {
     } else {
         (1.0 + mantissa / 8.0) * ((exponent - 7) as f64).exp2()
     };
-    if code & 0x80 != 0 {
-        -magnitude
-    } else {
-        magnitude
-    }
+    if code & 0x80 != 0 { -magnitude } else { magnitude }
 }
 
 fn bf16_to_f64(raw: u16) -> f64 {
@@ -102,7 +98,9 @@ fn per_tensor_fp8_projection_needs_no_new_contract() {
 
     let n_full = weight_host.shape().dims()[0];
     let k = weight_host.shape().dims()[1];
-    println!("q_proj [{n_full}, {k}]  weight_scale={weight_scale:e}  input_scale={input_scale:e}");
+    println!(
+        "q_proj [{n_full}, {k}]  weight_scale={weight_scale:e}  input_scale={input_scale:e}"
+    );
     assert_eq!(k, 5120);
     // 12288 = 2 * (24 heads * 256): q and its output gate share one projection.
     assert_eq!(n_full, 12288);

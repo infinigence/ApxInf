@@ -74,17 +74,20 @@ fn partial_rope_rotates_only_the_rotary_prefix() {
         for head in 0..KV_HEADS {
             let base = (token * KV_HEADS + head) * HEAD_DIM;
             for index in 0..half {
-                let frequency = (theta as f64).powf(-2.0 * index as f64 / width as f64);
+                let frequency =
+                    (theta as f64).powf(-2.0 * index as f64 / width as f64);
                 let angle = positions[token] as f64 * frequency;
                 let low = half::bf16::from_f32(values[base + index]).to_f32() as f64;
-                let high = half::bf16::from_f32(values[base + half + index]).to_f32() as f64;
+                let high =
+                    half::bf16::from_f32(values[base + half + index]).to_f32() as f64;
                 let expect_low = low * angle.cos() - high * angle.sin();
                 let expect_high = high * angle.cos() + low * angle.sin();
                 for (got, want) in [
                     (produced[base + index] as f64, expect_low),
                     (produced[base + half + index] as f64, expect_high),
                 ] {
-                    worst_rotated = worst_rotated.max((got - want).abs() / want.abs().max(1e-2));
+                    worst_rotated =
+                        worst_rotated.max((got - want).abs() / want.abs().max(1e-2));
                 }
             }
             // Everything past the rotary prefix must be untouched, which is
@@ -92,8 +95,7 @@ fn partial_rope_rotates_only_the_rotary_prefix() {
             for index in width..HEAD_DIM {
                 let untouched = half::bf16::from_f32(values[base + index]).to_f32();
                 assert_eq!(
-                    produced[base + index],
-                    untouched,
+                    produced[base + index], untouched,
                     "element {index} past the rotary width was modified"
                 );
             }

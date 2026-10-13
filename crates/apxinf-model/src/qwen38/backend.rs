@@ -4,8 +4,10 @@
 //! `../../../../doc/reference/model-layer-architecture.md`: every other qwen38 module reaches
 //! device memory through these helpers or through `apxinf_cuda_new::ops`.
 
+
 use apxinf_core::{DType, Shape, Tensor};
 use apxinf_cuda_new::{CudaBuffer, CudaContext};
+
 
 pub(crate) fn cpu_bytes(tensor: &Tensor) -> &[u8] {
     match tensor.storage() {

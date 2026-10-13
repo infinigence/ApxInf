@@ -426,7 +426,11 @@ mod tests {
             89,
             DEVICE_FEATURE_FA2 | DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU
         ));
-        assert!(!supports_target(&targets, 89, DEVICE_FEATURE_CUTLASS_SM100));
+        assert!(!supports_target(
+            &targets,
+            89,
+            DEVICE_FEATURE_CUTLASS_SM100
+        ));
         assert!(supports_target(
             &targets,
             110,

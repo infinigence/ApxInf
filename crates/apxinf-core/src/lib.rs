@@ -2,8 +2,8 @@ mod backend;
 mod dtype;
 mod error;
 mod kv_cache;
-mod op_impls;
 mod ops;
+mod op_impls;
 mod sampling;
 mod shape;
 pub mod storage;
@@ -15,9 +15,10 @@ pub use error::{Error, Result};
 pub use kv_cache::{CpuKVCache, KvCache};
 pub use op_impls::cpu::CpuBackend;
 pub use sampling::{
-    philox4x32_10, standard_normal_f32, uniform_f32, NextTokenLogits, NormalGenerator, RngKey,
-    SamplingBackend, TokenPenalties, TokenSample, TokenSampler, TokenSamplingInit,
-    TokenSamplingParams, TokenSamplingSpec, TokenSelection,
+    philox4x32_10, standard_normal_f32, uniform_f32, NextTokenLogits,
+    NormalGenerator, RngKey, SamplingBackend, TokenPenalties, TokenSample,
+    TokenSampler, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+    TokenSelection,
 };
 pub use shape::Shape;
 pub use storage::Storage;

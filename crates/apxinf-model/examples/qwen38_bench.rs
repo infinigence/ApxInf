@@ -46,9 +46,10 @@ fn arg_value(args: &[String], name: &str, default: usize) -> usize {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let checkpoint = args.get(1).filter(|arg| !arg.starts_with("--")).expect(
-        "usage: qwen38_bench <checkpoint-dir> [--prompt-len N] [--max-new N] [--repeats N]",
-    );
+    let checkpoint = args
+        .get(1)
+        .filter(|arg| !arg.starts_with("--"))
+        .expect("usage: qwen38_bench <checkpoint-dir> [--prompt-len N] [--max-new N] [--repeats N]");
     let prompt_len = arg_value(&args, "--prompt-len", 2048);
     let max_new = arg_value(&args, "--max-new", 128);
     let repeats = arg_value(&args, "--repeats", 3);
@@ -106,3 +107,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+

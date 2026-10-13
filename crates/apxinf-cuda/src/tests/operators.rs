@@ -495,7 +495,8 @@ fn rope_half_split_f16_matches_fp32_reference() {
         for head in 0..n_heads {
             let base = sequence * n_heads * head_dim + head * head_dim;
             for pair in 0..half {
-                let frequency = 1.0f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                let frequency =
+                    1.0f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
                 let angle = position as f32 * frequency;
                 let cosine = angle.cos();
                 let sine = angle.sin();
@@ -507,21 +508,28 @@ fn rope_half_split_f16_matches_fp32_reference() {
         }
     }
 
-    let input_f16: Vec<half::f16> = input
-        .iter()
-        .map(|value| half::f16::from_f32(*value))
-        .collect();
+    let input_f16: Vec<half::f16> =
+        input.iter().map(|value| half::f16::from_f32(*value)).collect();
     let input_bytes: Vec<u8> = input_f16
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
     let input_buffer = CudaBuffer::alloc(input_bytes.len(), ctx.device_id()).unwrap();
     input_buffer.copy_from_host(&input_bytes).unwrap();
-    let input_tensor =
-        input_buffer.into_tensor(Shape::from(vec![seq_len, n_heads, head_dim]), DType::F16);
+    let input_tensor = input_buffer.into_tensor(
+        Shape::from(vec![seq_len, n_heads, head_dim]),
+        DType::F16,
+    );
 
-    let output =
-        apply_half_split_f16(&ctx, &input_tensor, n_heads, head_dim, theta, pos_offset).unwrap();
+    let output = apply_half_split_f16(
+        &ctx,
+        &input_tensor,
+        n_heads,
+        head_dim,
+        theta,
+        pos_offset,
+    )
+    .unwrap();
     let output_buffer = CudaBuffer::from_tensor(&output).unwrap();
     let mut output_bytes = vec![0u8; output_buffer.len()];
     output_buffer.copy_to_host(&mut output_bytes).unwrap();
@@ -562,15 +570,23 @@ fn f16_matmul_reused_output_overwrites_previous_values() {
             .collect()
     }
 
-    let first_input = upload_f16(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
-    let first_weight = upload_f16(&ctx, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]);
-    let first_output = crate::kernels::gemm::matmul(&ctx, &first_input, &first_weight).unwrap();
+    let first_input = upload_f16(
+        &ctx,
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![2, 3],
+    );
+    let first_weight =
+        upload_f16(&ctx, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2]);
+    let first_output =
+        crate::kernels::gemm::matmul(&ctx, &first_input, &first_weight).unwrap();
     assert_eq!(download_f16(&first_output), vec![58.0, 64.0, 139.0, 154.0]);
     drop(first_output);
 
     let second_input = upload_f16(&ctx, &[1.0; 6], vec![2, 3]);
-    let second_weight = upload_f16(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]);
-    let second_output = crate::kernels::gemm::matmul(&ctx, &second_input, &second_weight).unwrap();
+    let second_weight =
+        upload_f16(&ctx, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]);
+    let second_output =
+        crate::kernels::gemm::matmul(&ctx, &second_input, &second_weight).unwrap();
     assert_eq!(download_f16(&second_output), vec![9.0, 12.0, 9.0, 12.0]);
 }
 
