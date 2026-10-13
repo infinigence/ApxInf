@@ -1,7 +1,7 @@
 // RoPE and attention-helper kernels: partial RoPE, per-head RMSNorm, query/gate split, output gate.
 //
 // These ops have a single fixed implementation and no persisted selection,
-// so per doc/adding-new-kernels.md §6 they carry no candidate registry,
+// so per doc/guides/adding-new-kernels.md §6 they carry no candidate registry,
 // tuning key, or autotuner; they are direct C-ABI forwarders.
 
 #include "../../include/apxinf_cuda/attn.h"

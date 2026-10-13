@@ -194,7 +194,7 @@ families.
 
 ## Normative document reconciliation
 
-The merged upstream doc/model-lifecycle.md and model-layer-architecture.md are the
+The merged upstream ../../reference/model-lifecycle.md and model-layer-architecture.md are the
 current shared responsibilities. This directory adds target refactor contracts,
 not a claim that public prepare semantics have already changed.
 

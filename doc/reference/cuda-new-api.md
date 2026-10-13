@@ -1,7 +1,7 @@
 # cuda-new Public API
 
 > The complete public interface that `crates/apxinf-cuda-new` exposes to the model layer.
-> Architecture: `doc/cuda-new-design.md`; mathematical contracts: `crates/apxinf-cuda-new/cuda-operator.md`.
+> Architecture: `../design/cuda-new-design.md`; mathematical contracts: `crates/apxinf-cuda-new/cuda-operator.md`.
 
 This document lists only **what the model layer may call**: the public items of the
 crate root and the `ops` module. The internals of `ffi`, `workspace`, and `graph` are

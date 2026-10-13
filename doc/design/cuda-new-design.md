@@ -1,7 +1,7 @@
 # cuda-new Design
 
 > Architecture notes for `crates/apxinf-cuda-new`.
-> Public API listing: `doc/cuda-new-api.md`;
+> Public API listing: `../reference/cuda-new-api.md`;
 > English contract: `crates/apxinf-cuda-new/README.md`; tunable operator catalog: `cuda-operator.md`.
 
 Contents:

@@ -38,7 +38,7 @@ use super::Gr00tConfig;
 // not peak live bytes. Nsight measured 2.521 GiB for the representative
 // three-view input; 4 GiB leaves alignment and small-shape variance headroom.
 // This is intentionally a first graph-correctness bound, not the final memory
-// plan. The maintained rationale lives in doc/gr00t-n1.7.md.
+// plan. The maintained rationale lives in doc/models/gr00t.md.
 const INITIAL_GRAPH_WORKSPACE_BYTES: usize = 4usize << 30;
 const USE_FUSED_FP8_RMS_NORM: bool = true;
 const USE_FUSED_FP8_VISION_LAYER_NORM: bool = true;

@@ -1,7 +1,7 @@
 //! Device helpers: upload, zero-fill, readback and typed views.
 //!
 //! The model-family CUDA seam in the sense of
-//! `doc/model-layer-architecture.md`: every other qwen38 module reaches
+//! `../../../../doc/reference/model-layer-architecture.md`: every other qwen38 module reaches
 //! device memory through these helpers or through `apxinf_cuda_new::ops`.
 
 

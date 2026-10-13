@@ -12,20 +12,20 @@ below refer to that checkout, even when this skill is loaded through a global
 symlink pointing at another checkout. Read its `AGENTS.md` for artifact placement,
 then read the relevant documents from that same source revision:
 
-1. [`doc/porting-workflow.md`](../../doc/porting-workflow.md) for the complete
+1. [`../../doc/guides/porting-workflow.md`](../../doc/guides/porting-workflow.md) for the complete
    evidence and acceptance sequence.
-2. [`doc/adding-a-new-model.md`](../../doc/adding-a-new-model.md) before creating
+2. [`../../doc/guides/adding-a-new-model.md`](../../doc/guides/adding-a-new-model.md) before creating
    or changing model-layer code. Follow its separate-directory and YAGNI rules.
-3. [`doc/model-layer-architecture.md`](../../doc/model-layer-architecture.md)
+3. [`../../doc/reference/model-layer-architecture.md`](../../doc/reference/model-layer-architecture.md)
    for the canonical module names, responsibility table, dependency direction
    and current family/option limits before deciding code placement.
-4. [`doc/model-execution-wiring.md`](../../doc/model-execution-wiring.md) before
+4. [`../../doc/reference/model-execution-wiring.md`](../../doc/reference/model-execution-wiring.md) before
    composing model/Blocks calls, preparing a runner, or deciding that optimized
    coverage is missing. Its accelerator acceptance section defines the native
    GPU and required capture gates. For Apple Silicon MLX, also read
-   [`doc/mlx-backend.md`](../../doc/mlx-backend.md) for the separate compiled
+   [`../../doc/design/mlx-backend.md`](../../doc/design/mlx-backend.md) for the separate compiled
    execution/storage contract; never report MLX compile as CUDA Graph replay.
-5. [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md) whenever
+5. [`../../doc/guides/adding-new-kernels.md`](../../doc/guides/adding-new-kernels.md) whenever
    operator, dtype, layout, shape, or hardware coverage is missing.
 
 Read each selected document completely. Treat them as instructions, not
@@ -33,7 +33,7 @@ background material.
 
 ## Assign module ownership before implementation
 
-Use `doc/model-layer-architecture.md#current-module-names-and-responsibilities`
+Use `../../doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities`
 in the selected checkout as the source of truth. The port plan must name the
 actual family-local owner for each responsibility:
 
@@ -55,7 +55,7 @@ additional wrapper just to match PI0.5. Keep model and weights independent of
 runner/capture types; keep concrete precision dispatch out of the runner.
 
 New accelerator ports must satisfy
-`doc/model-execution-wiring.md#accelerator-port-acceptance`: ApxInf-native GPU
+`../../doc/reference/model-execution-wiring.md#accelerator-port-acceptance`: ApxInf-native GPU
 computation, explicit public transfers, and required fixed-profile capture.
 For an MLX target, the backend-specific compiled execution contract applies;
 its explicit IO, scope, warm-resource and eager/compiled checks replace neither
@@ -103,14 +103,14 @@ and historical GPU evidence do not prove a new family's acceptance.
    shared extraction to a separate review after repeated maintained
    implementations prove the seam. Run
    `scripts/check_model_family_boundaries.sh` before review.
-7. Follow `doc/adding-a-new-model.md#registration-and-public-integration`.
+7. Follow `../../doc/guides/adding-a-new-model.md#registration-and-public-integration`.
    Use `LlmTrait` and `LoadedModel::text` for LLM/VLM, or `VlaRuntime` on the
    family runner and `LoadedModel::Vla` for VLA. Wire Rust registration; for
    VLA, also wire Python policy discovery and reuse `apxinf.ModelRunner` / `apxinf_py.ModelRunner`
    and `model_runner` injection. Check the common loader's current
    `model_variant` admission and PI0.5-only config overrides before extending
    options. When adopting explicit preparation, read the implemented PI0.5
-   section of `doc/model-lifecycle/lifecycle.md`. Test mode/fallback, stale-plan
+   section of `../../doc/archive/model-lifecycle/lifecycle.md`. Test mode/fallback, stale-plan
    rejection, tuning-store replacement/generation, compatible run without
    capture/autotune, input/RNG rebinding and output/resource lifetime. Default
    `RuntimeManaged` status and unsupported policy methods are not readiness.
