@@ -178,11 +178,16 @@ different Metal implementation solely because both report `metal:0`.
 
 The current `GpuStorageHandle::from_raw_parts` requires a live device allocation
 at `ptr..ptr+len`. A lazy MLX array is not that pointer. `Storage::Opaque` and
-`Tensor::from_opaque_parts` retain a tagged owner with checked logical extent;
-existing CPU/CUDA storage and its safety contract remain intact. Core may
-validate logical capacity/device/dtype without accessing array contents or
-forcing evaluation. The backend validates handle identity and physical
-representation. Foreign or forged metadata must not reach a native kernel.
+`Tensor::from_opaque_parts` retain a tagged owner with a recorded logical extent,
+not an allocation capacity. That constructor checks Metal device metadata and
+requires the recorded byte count to equal shape times element size. Core cannot
+inspect the owner's native dtype/device/extent, and the legacy raw-parts APIs
+can rebuild metadata without these checks. The constructor check is advisory;
+`MlxBackend::array()` authoritatively validates the recorded extent, native
+representation and owner identity before every use. Existing CPU/CUDA storage
+and its accessible-byte safety contract remain intact; opaque owners instead
+retain a matching native array. Foreign or forged metadata must not reach a
+native kernel.
 
 Public tensors remain dense, contiguous, row-major. `MlxBackend::from_array`
 materializes that boundary; internal `Array` views retain MLX layout semantics.

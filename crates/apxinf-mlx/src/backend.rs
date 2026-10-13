@@ -80,7 +80,7 @@ impl MlxBackend {
             });
         }
         let bytes = checked_bytes(t.shape().dims(), t.dtype())?;
-        if t.storage().len() < bytes {
+        if t.storage().len() != bytes {
             return Err(Error::DataLengthMismatch {
                 expected: bytes,
                 got: t.storage().len(),

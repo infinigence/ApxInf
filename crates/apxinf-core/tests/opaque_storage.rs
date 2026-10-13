@@ -44,6 +44,7 @@ mod opaque {
     fn invalid_extents_and_non_metal_opaque_owners_are_rejected() {
         for (shape, device, bytes) in [
             (vec![2, 3], Device::Metal(0), 23),
+            (vec![2, 3], Device::Metal(0), 25),
             (vec![usize::MAX, 2], Device::Metal(0), usize::MAX),
             (vec![usize::MAX], Device::Metal(0), usize::MAX),
             (vec![0, 2], Device::Metal(0), 0),

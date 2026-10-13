@@ -40,7 +40,9 @@ impl Tensor {
     /// This compatibility constructor is retained while the existing CUDA
     /// backend and `apxinf-cuda-new` coexist. New device backends should call
     /// [`Tensor::from_raw_parts_unchecked`] so the raw-storage safety boundary
-    /// remains explicit at their call site.
+    /// remains explicit at their call site. Lazy array backends should use
+    /// `from_opaque_parts` instead. This constructor does not validate opaque
+    /// metadata; the owning backend must validate it before every use.
     pub fn from_raw_parts(shape: Shape, dtype: DType, device: Device, storage: Storage) -> Self {
         // This method intentionally preserves the legacy API. The old backend
         // owns its allocation through `GpuStorageHandle::_prevent_leak`.
@@ -51,9 +53,14 @@ impl Tensor {
     ///
     /// # Safety
     ///
-    /// `storage` must belong to `device`, remain valid for the returned
-    /// tensor's lifetime, and contain at least `shape.numel() *
-    /// dtype.size_in_bytes()` accessible bytes without arithmetic overflow.
+    /// `storage` must belong to `device` and remain valid for the returned
+    /// tensor's lifetime. CPU/GPU storage must contain at least
+    /// `shape.numel() * dtype.size_in_bytes()` accessible bytes without
+    /// arithmetic overflow. For opaque storage, the owner must retain a native
+    /// array matching `device`, `dtype` and element count, with its recorded
+    /// logical byte extent equal to that product. No allocation pointer or
+    /// accessible-byte guarantee is required for a lazy array. Its owning
+    /// backend must still validate the native representation before every use.
     pub unsafe fn from_raw_parts_unchecked(
         shape: Shape,
         dtype: DType,
@@ -70,9 +77,12 @@ impl Tensor {
 
     /// Retain a thread-affine backend array without pretending it is a pointer.
     ///
-    /// Validates the logical extent; the backend is responsible for downcasting
-    /// `owner` and validating its native dtype/device/extent before every use.
-    /// CPU data uses `from_raw` so CPU access never encounters an opaque owner.
+    /// Checks that `device` is Metal and `num_bytes` exactly matches the
+    /// metadata's logical byte extent, not an allocation capacity. This is an
+    /// advisory metadata check: core cannot inspect `owner`, and the legacy
+    /// raw-parts constructor can rebuild different metadata around the same
+    /// storage. The owning backend's downcast and native dtype/device/extent
+    /// validation before every use is authoritative. CPU data uses `from_raw`.
     #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
     pub fn from_opaque_parts(
         shape: Shape,
@@ -91,7 +101,7 @@ impl Tensor {
             n.checked_mul(d)
                 .ok_or(Error::Contract("opaque storage byte size overflow"))
         })?;
-        if num_bytes < expected {
+        if num_bytes != expected {
             return Err(Error::DataLengthMismatch {
                 expected,
                 got: num_bytes,
@@ -462,8 +472,13 @@ impl Tensor {
     ///
     /// # Safety
     ///
-    /// `storage` must belong to `device`, remain alive for this tensor, and
-    /// contain enough accessible bytes for this tensor's shape and dtype.
+    /// `storage` must belong to `device` and remain alive for this tensor.
+    /// CPU/GPU storage must contain enough accessible bytes for its shape and
+    /// dtype, without arithmetic overflow. An opaque owner must instead retain
+    /// a native array matching this tensor's dtype and element count on `device`,
+    /// with exactly the corresponding logical byte extent. The owning backend
+    /// must validate that representation before every use; a lazy array does
+    /// not promise accessible allocation bytes.
     pub unsafe fn set_device_and_storage(&mut self, device: Device, storage: Storage) {
         self.device = device;
         self.storage = storage;

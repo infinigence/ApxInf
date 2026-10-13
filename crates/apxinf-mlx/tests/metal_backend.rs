@@ -39,6 +39,40 @@ fn opaque_storage_reconciles_reshape_and_rejects_foreign_metadata() -> Result<()
         Rc::new(source),
     )?;
     assert!(b.array(&forged).is_err());
+    // The legacy safe constructor can rewrap a cloned opaque owner. Only the
+    // backend can establish whether the metadata still describes its array.
+    for (shape, dtype, device) in [
+        (vec![2, 2], DType::F32, Device::Metal(0)),
+        (vec![2, 4], DType::F32, Device::Metal(0)),
+        (vec![2, 3], DType::I32, Device::Metal(0)),
+        (vec![2, 3], DType::F32, Device::Cuda(0)),
+    ] {
+        let rebuilt = Tensor::from_raw_parts(Shape::new(shape), dtype, device, a.storage().clone());
+        assert!(b.array(&rebuilt).is_err());
+    }
+    let rebuilt = Tensor::from_raw_parts(
+        Shape::new(vec![3, 2]),
+        DType::F32,
+        Device::Metal(0),
+        a.storage().clone(),
+    );
+    assert_eq!(b.to_cpu(&rebuilt)?.to_f32_vec()?, [1., 2., 3., 4., 5., 6.]);
+    // Core cannot inspect an owner's native extent. Even if a later rewrap
+    // matches the native array, the inconsistent recorded extent is rejected.
+    let overstated = Tensor::from_opaque_parts(
+        Shape::new(vec![3, 3]),
+        DType::F32,
+        Device::Metal(0),
+        36,
+        Rc::new(b.array(&a)?),
+    )?;
+    let rebuilt = Tensor::from_raw_parts(
+        Shape::new(vec![2, 3]),
+        DType::F32,
+        Device::Metal(0),
+        overstated.storage().clone(),
+    );
+    assert!(b.array(&rebuilt).is_err());
     let cpu = Array::from_f32(&Stream::cpu()?, &[2, 3], &[0.; 6])?;
     assert!(b.from_array(cpu).is_err());
     assert!(b.begin_capture().is_err());

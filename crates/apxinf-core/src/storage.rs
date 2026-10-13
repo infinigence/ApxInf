@@ -141,11 +141,13 @@ impl Storage {
     }
 }
 
-/// A retained backend-specific lazy array with a checked logical byte extent.
+/// A retained backend-specific lazy array with a recorded logical byte extent.
 ///
-/// The owning backend must downcast and validate its actual dtype, device, and
-/// element count before use. Core never dereferences this owner. It deliberately
-/// uses Rc: enabling opaque storage makes Tensor thread-affine without imposing
+/// `Tensor::from_opaque_parts` checks the supplied metadata's extent, but legacy
+/// raw-parts APIs can rebuild tensor metadata without that check. The owning
+/// backend must downcast and validate its actual dtype, device, element count
+/// and recorded extent before every use. Core never dereferences this owner.
+/// It uses Rc so opaque storage makes Tensor thread-affine without imposing
 /// unproven Send/Sync guarantees on a native runtime.
 #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone)]
