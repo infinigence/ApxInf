@@ -1,15 +1,15 @@
 # PI0.5 preparation and lifecycle contracts
 
 The first section describes the implemented PI0.5 API on this branch. Use
-[Model Lifecycle and Contracts](../model-lifecycle.md) for shared lifecycle
-responsibilities and [Model Layer Architecture](../model-layer-architecture.md#current-coverage-and-port-decisions)
+[Model Lifecycle and Contracts](../../reference/model-lifecycle.md) for shared lifecycle
+responsibilities and [Model Layer Architecture](../../reference/model-layer-architecture.md#current-coverage-and-port-decisions)
 for family support. Historical cross-family observations and target interfaces
 are retained at the end; they are not additional APIs to implement by name.
 
 ## Implemented PI0.5 preparation contract
 
 These Rust interfaces are implemented on the refactor branch. Hardware evidence
-and model coverage are recorded in the [migration tracker](migration.md).
+and model coverage are recorded in the [migration tracker](../../archive/model-lifecycle/migration.md).
 PI0.5 supports them for all three ModelVariantChoice choices. Qwen-Drive supports
 sample-based `prepare_for` for fixed-profile BF16 direct planning, with owning
 eager/whole-graph plans and a bounded implicit cache; its shape-only `prepare`

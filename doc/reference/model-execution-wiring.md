@@ -1,7 +1,7 @@
 # Model Execution Wiring
 
 Use this guide after model semantics are known and before composing the model
-and its runner. Use the [module ownership table](model-layer-architecture.md#current-module-names-and-responsibilities)
+and its runner. Use the [module ownership table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities)
 for names and placement; this guide defines device execution and acceptance.
 It bridges the model equation and ApxInf's safe CUDA interfaces. The purpose is
 to design the maintained hot path, not merely to find an implementation that
@@ -31,7 +31,7 @@ completed port. An eager path remains useful for parity and explicit fallback;
 it does not satisfy this capture gate by itself.
 
 For Apple Silicon MLX ports, use the separate [prepared compiled execution
-contract](mlx-backend.md#prepared-compiled-execution). Compiled functions are
+contract](../design/mlx-backend.md#prepared-compiled-execution). Compiled functions are
 not CUDA Graphs: report their actual scope and mode, retain device-resident
 input/state/output handoff, verify changed inputs and all new state, and prove
 bounded warm resource use. Fixed VLA profiles require the complete action loop
@@ -45,7 +45,7 @@ These are new-port acceptance requirements, not a statement that every existing
 family has migrated. Record a missing device/capture path as a blocker. Once
 these correctness, residency and capture gates pass, latency optimization is
 best effort unless the task specifies a performance release gate. See
-[current family coverage](model-layer-architecture.md#current-coverage-and-port-decisions).
+[current family coverage](../reference/model-layer-architecture.md#current-coverage-and-port-decisions).
 
 ## Start from an execution ledger
 
@@ -56,7 +56,7 @@ Write one row for every repeated block and every boundary operation:
 | semantic expression, including adjacent operations | shape, dtype, layout, broadcasting, rounding | per request, layer, or solver step | fused call, then primitive alternative | output, scratch, cache, stable address | expected transfer or `none` | replay fixture and tolerance |
 
 The ledger is a design artifact and may stay in the
-[private port workspace](porting-workflow.md#private-port-workspace). It must cover
+[private port workspace](../guides/porting-workflow.md#private-port-workspace). It must cover
 preprocessing-to-output, not only transformer blocks. Update it when the
 implementation differs from the plan.
 
@@ -77,7 +77,7 @@ Search for an implementation in this order:
 The portable trait is the capability floor, not a catalog of every optimized
 CUDA path. A missing `dyn Backend` method does not establish a kernel gap.
 Model code may recover the concrete CUDA seam described in
-[Adding a New Model](adding-a-new-model.md), but must not call raw FFI.
+[Adding a New Model](../guides/adding-a-new-model.md), but must not call raw FFI.
 
 ## Select compositions before primitives
 
@@ -125,7 +125,7 @@ A CPU implementation inside a layer may be used briefly to establish numerical
 evidence, but it is a **correctness scaffold**. Mark the affected ledger row,
 profile its cost, and use it to validate the replacement boundary. Once the
 semantics are established, resolve the row through an existing safe device
-composition or the complete [Adding New Kernels](adding-new-kernels.md) path.
+composition or the complete [Adding New Kernels](../guides/adding-new-kernels.md) path.
 For an accelerator target, a steady-state host scaffold remains unfinished
 implementation. If a correct device path is unavailable, record the concrete
 operator blocker. Long CUDA build times, adapter rebuild scope, or the availability
@@ -159,7 +159,7 @@ For a fixed target profile, query model/Blocks workspace requirements and let
 the runner's preparation code allocate stable inputs, outputs and scratch.
 Use `GraphWorkspace` and `prepare_with_workspace` for warmup, then `with_workspace`
 during capture through the shared CUDA capture scope. PI0.5's
-[`model_runner/prepare.rs`](../crates/apxinf-model/src/pi05/model_runner/prepare.rs)
+[`model_runner/prepare.rs`](../../crates/apxinf-model/src/pi05/model_runner/prepare.rs)
 repeats warmup until tuning generation stabilizes; one invocation is not a
 universal readiness guarantee. Capture and eager call the same model semantics.
 Update captured input contents in place and replay through the prepared object.
@@ -204,6 +204,6 @@ Best effort does not waive the device-residency rule for repeated accelerator
 model computation.
 
 Only after this review should a genuinely missing row be handed to
-[Adding New Kernels](adding-new-kernels.md). That guide explains how to add a
+[Adding New Kernels](../guides/adding-new-kernels.md). That guide explains how to add a
 kernel vertically; this guide decides which safe interface the model should
 call and how those calls form the execution path.

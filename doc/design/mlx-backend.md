@@ -19,7 +19,7 @@ second private validator or silently substitute a different numerical contract.
 Device implementations remain separate, and unsupported operations fail
 explicitly without an implicit host fallback.
 
-The [CUDA operator layers](../crates/apxinf-cuda-new/README.md) remain unchanged.
+The [CUDA operator layers](../../crates/apxinf-cuda-new/README.md) remain unchanged.
 Their separation also guides MLX: model-visible semantics in safe Rust;
 validation/resource lifetime in the backend execution layer; native adaptation
 behind a C ABI; MLX/Metal kernels below it. MLX need not duplicate CUDA's
@@ -300,5 +300,5 @@ regressions remain explicitly open migration work, not a completed port.
 | Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
 
 Temporary references, captures and reports stay in ignored `devlocal/` per
-[AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
+[AGENTS.md](../../AGENTS.md). Product code, focused maintained tests, capability
 docs and dependency/license provenance belong in their corresponding PRs.

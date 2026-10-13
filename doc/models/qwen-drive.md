@@ -20,7 +20,7 @@ public path (`AutoPolicy` → `QwenDrivePolicy` → `apxinf_py.ModelRunner` →
 Use Linux AArch64, CUDA 13.2 and the native SM110 operator artifacts. The offline
 exporter requires CuTe DSL 4.7.0 and pinned upstream sources; normal engine builds
 consume the generated artifacts. Follow the
-[AOT export instructions](../crates/apxinf-cuda/aot/README.md), then build:
+[AOT export instructions](../../crates/apxinf-cuda/aot/README.md), then build:
 
 ```sh
 APXINF_PLATFORM=thor \
@@ -172,7 +172,7 @@ bash scripts/check_model_family_boundaries.sh
   and patch packing. Other supported inputs retain their preprocessing contract.
 - `model_runner/prepare.rs` owns preparation and tests; `model/blocks/bf16.rs`
   owns BF16 computation and direct inputs; `blocks/mod.rs` declares execution
-  callbacks. Follow the [model architecture](model-layer-architecture.md).
+  callbacks. Follow the [model architecture](../reference/model-layer-architecture.md).
 - This result qualifies direct planning on SM110. It does not establish the
   same latency or downstream accuracy for reasoning, Orin or RTX 4090.
 
@@ -238,7 +238,7 @@ hashes; use a compatible explicit store, or the empty vendor store used here.
 Do not carry an unrelated measured tactic file across toolkit or kernel changes.
 
 The model architecture owns composition and preparation. The
-[CUDA adapter boundary](../crates/apxinf-cuda/adapters/README.md) owns exported
+[CUDA adapter boundary](../../crates/apxinf-cuda/adapters/README.md) owns exported
 module lifetime, tensor descriptors and launch ABI. NVTX markers use the existing
 profiling feature and do not select different numerical implementations.
 

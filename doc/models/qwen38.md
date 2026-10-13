@@ -5,7 +5,7 @@ attention — quantized to mixed NVFP4/FP8 by NVIDIA ModelOpt. ApxInf runs it
 on Jetson AGX Thor (sm_110): batch 1, BF16 KV cache, CUDA-graph decode.
 
 Implementation: `crates/apxinf-model/src/qwen38/`, organized per
-[Model Layer Architecture](model-layer-architecture.md).
+[Model Layer Architecture](../reference/model-layer-architecture.md).
 
 ## Optimizations are always on
 

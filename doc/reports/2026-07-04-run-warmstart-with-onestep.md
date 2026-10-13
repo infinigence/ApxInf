@@ -1,3 +1,6 @@
+- Report date: 2026-07-04 (predates the reports taxonomy).
+- Baseline commit: a9a2cd11 (the merge that carried these measurements).
+
 # PI0.5 One-Step Warm-Start LIBERO Eval
 
 This note records the PI0.5 one-step warm-start optimization implemented in

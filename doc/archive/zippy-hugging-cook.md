@@ -4,8 +4,8 @@ Status: historical planning note, not the current source layout or a supported
 model-port recipe. The `apxinf-metal` crate paths and single-file `llama.rs`
 listed below are absent from this checkout. They are retained as the original
 proposal, not instructions to recreate those modules. Use
-[Model Organization](model-organization.md) for current source locations and
-[Adding a New Model](adding-a-new-model.md) for integration.
+[Model Organization](../reference/model-organization.md) for current source locations and
+[Adding a New Model](../guides/adding-a-new-model.md) for integration.
 
 ## Context
 

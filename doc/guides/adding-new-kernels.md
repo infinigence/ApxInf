@@ -4,9 +4,9 @@ This document is the kernel development procedure for `crates/apxinf-cuda-new`. 
 
 GEMM and Attention are the current reference implementations, not the complete set of allowed operator families. Future operators may define their own Spec, Bindings, and candidate descriptor, but they must follow the cross-layer boundaries and execution lifecycle specified here.
 
-Before starting, read the [`apxinf-cuda-new` architecture](../crates/apxinf-cuda-new/README.md) and the [CUDA L3 operator catalog](../crates/apxinf-cuda-new/cuda-operator.md). This document does not repeat the architecture; it specifies only the files and interfaces that must change, prohibited practices, and acceptance criteria.
+Before starting, read the [`apxinf-cuda-new` architecture](../../crates/apxinf-cuda-new/README.md) and the [CUDA L3 operator catalog](../../crates/apxinf-cuda-new/cuda-operator.md). This document does not repeat the architecture; it specifies only the files and interfaces that must change, prohibited practices, and acceptance criteria.
 
-Temporary probes, logs, and benchmark results must be placed in `devlocal/<feat-name>/` according to [`AGENTS.md`](../AGENTS.md), not mixed into production source directories.
+Temporary probes, logs, and benchmark results must be placed in `devlocal/<feat-name>/` according to [`AGENTS.md`](../../AGENTS.md), not mixed into production source directories.
 
 ## 0. Identify the Layer to Change First
 
@@ -21,7 +21,7 @@ Temporary probes, logs, and benchmark results must be placed in `devlocal/<feat-
 model → L3 Rust → L2 Rust → C ABI → L1 C++ → L0 CUDA
 ```
 
-A new L0 kernel must first be integrated into L1; L2 calls L1 only through the C ABI; models call only L3. See the [`apxinf-cuda-new` architecture](../crates/apxinf-cuda-new/README.md) for the core objects and keys.
+A new L0 kernel must first be integrated into L1; L2 calls L1 only through the C ABI; models call only L3. See the [`apxinf-cuda-new` architecture](../../crates/apxinf-cuda-new/README.md) for the core objects and keys.
 
 ## 1. Single Decision Table
 

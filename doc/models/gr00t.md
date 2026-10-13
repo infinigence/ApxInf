@@ -191,6 +191,6 @@ not copied into the read-only checkpoint and is not committed to this tree.
 Best measured latency (Thor BF16/FP8, Orin BF16/W8A8) and the LIBERO-10
 accuracy table are published as a dated report:
 
-[reports/2026-09-28-gr00t-n1.7](../reports/2026-09-28-gr00t-n1.7.md)
+[reports/2026-09-28-gr00t-n1.7](../reports/2026-09-28-gr00t-n17.md)
 
 Summary (Thor, BF16, 2-view P50): 54.2 ms; LIBERO-10 Thor BF16 94.0%.
