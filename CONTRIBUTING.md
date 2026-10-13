@@ -9,6 +9,7 @@
   through the justfile — run `just --list` first.
 - [actionlint](https://github.com/rhysd/actionlint/blob/main/docs/install.md)
   for workflow validation (`brew install actionlint` on macOS).
+  CI installs a pinned official release and verifies its SHA-256 checksum.
 - Create a Python virtual environment and install the CPU test dependencies:
 
 ```bash

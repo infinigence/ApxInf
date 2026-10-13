@@ -18,9 +18,23 @@ jobs:
         uses: taiki-e/install-action@just
 
       - name: Install actionlint
-        uses: taiki-e/install-action@v2
-        with:
-          tool: actionlint@1.7.12
+        run: |
+          actionlint_version=1.7.12
+          case "$RUNNER_ARCH" in
+            X64) actionlint_arch=amd64 ;;
+            ARM64) actionlint_arch=arm64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$install_dir"
+          release="https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}"
+          archive="actionlint_${actionlint_version}_linux_${actionlint_arch}.tar.gz"
+          curl -fsSL --retry 3 "$release/$archive" -o "$install_dir/$archive"
+          curl -fsSL --retry 3 "$release/actionlint_${actionlint_version}_checksums.txt" -o "$install_dir/checksums.txt"
+          (cd "$install_dir" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "$install_dir/$archive" -C "$install_dir" actionlint
+          "$install_dir/actionlint" -version
+          echo "$install_dir" >> "$GITHUB_PATH"
 
       - name: Setup Python
         uses: actions/setup-python@v6
