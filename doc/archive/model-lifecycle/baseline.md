@@ -59,7 +59,7 @@ The inherited PI0.5 performance protocol has 16 cells: four device/precision
 paths times two views (2/3) times two token lengths (10/21), H=10 and 10 flow
 steps. Three views duplicates the wrist fixture and is not a real third LIBERO
 camera. H=50, two views and 500 episodes are the separate formal accuracy
-protocol. See [PI0.5 regression](../pi05-cuda-regression.md); do not relabel
+protocol. See [PI0.5 regression](../../models/pi05.md); do not relabel
 historical 100-episode runs as new formal qualification.
 
 ## Numerical gates already present
@@ -96,7 +96,7 @@ identity before using those dumps for any newly selected model size.
 
 ## Performance and memory gates
 
-Reuse the matching baseline and review policy in pi05-cuda-regression.md. Keep
+Reuse the matching baseline and review policy in models/pi05.md. Keep
 shape, checkpoint, precision, tactics, calibration, device/power state, input
 representation and measurement boundary identical. No new percentage-regression
 allowance has been approved. Report cold load, cold prepare, first execution,
