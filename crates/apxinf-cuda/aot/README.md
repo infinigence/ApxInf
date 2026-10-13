@@ -58,8 +58,12 @@ There is no reserved bundle directory in the source tree:
 
 ```sh
 APXINF_CUDA_AOT_MANIFEST=/path/to/bundle/manifest.json \
-  cargo build --release -p apxinf-py --features cuda
+  just build-py
 ```
+
+(This is what `build-py` does internally; for a bare `cargo build -p apxinf-py
+--features cuda` without `extension-module`, add that feature manually —
+`extension-module` is what maturin sets so the cdylib does not link libpython.)
 
 This is a build input, not a runtime optimization switch. Cargo checks the
 checksums, AArch64 ELF type, CUDA/DSL versions, symbols and tensor contracts

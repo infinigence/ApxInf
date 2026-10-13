@@ -220,7 +220,7 @@ Its timing boundary starts at those host tensors and ends after model-core
 action D2H; it excludes simulator and raw-observation preprocessing time.
 
 ```bash
-python scripts/bench_gr00t.py \
+just bench gr00t \
   --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
   --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
   --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \

@@ -35,7 +35,7 @@ switches for A/B comparison, but neither changes which product path runs.
   from `config.json`.
 
 ```bash
-cargo build --features cuda --release --bin apxinf
+just build-cli
 ```
 
 ## Inference with the CLI
@@ -80,9 +80,10 @@ resident process reaches steady state from its second generation.
 ## Benchmarking
 
 ```bash
-cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
-    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
+just bench qwen38 <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
 ```
+
+(Equivalent to `cargo run -p apxinf-model --features cuda --release --example qwen38_bench`.)
 
 Deterministic prompt through the public entry (`AutoModel` →
 `generate_streaming`); JSON per repeat plus a summary. Repeat 0 is the

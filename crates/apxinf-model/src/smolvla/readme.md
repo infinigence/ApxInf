@@ -172,7 +172,7 @@ python -m pytest python/apxinf/tests/test_smolvla_policy.py
 Benchmark and LIBERO evaluation use the maintained scripts:
 
 ```bash
-python scripts/bench_smolvla.py --model-dir /path/to/checkpoint \
+just bench smolvla --model-dir /path/to/checkpoint \
   --model-variant fp16 --num-views 2 --image-size 512 --profile
 python scripts/eval_smolvla_libero.py --model-dir /path/to/checkpoint \
   --model-variant fp16 --suite libero_spatial --tasks all \
