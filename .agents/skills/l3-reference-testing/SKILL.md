@@ -16,7 +16,7 @@ Resolve source and docs in the checkout being modified. This skill applies to
 `crates/apxinf-cuda-new/` L3 semantics and candidate tests. The current PI0.5
 `model`/Blocks and `model_runner` path uses `apxinf-cuda-new`; passing an L3 candidate
 test does not prove that a model calls it. For model integration, follow
-`../../doc/reference/model-execution-wiring.md` and trace the actual safe call and backend.
+`../../../doc/reference/model-execution-wiring.md` and trace the actual safe call and backend.
 
 Model forward order belongs in Model/Blocks, preparation and graph resources in
 ModelRunner, and checkpoint/device representations in weights. Keep L3 Args,

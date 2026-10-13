@@ -10,6 +10,7 @@ All commands go through the justfile; `just --list` shows the menu.
 - A stable Rust toolchain (`rustup default stable`) and
   [just](https://just.systems) (`cargo install just`).
 - Python 3.10+ with a venv or conda env.
+- Install maturin in that environment with `python -m pip install maturin`.
 
 ## Build the Python binding and frontend
 

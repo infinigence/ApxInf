@@ -299,11 +299,11 @@ graph.replay()?;
 | target-SM compile and link | MUST | MUST | MUST | MUST |
 | cold tune, warm hit, profiling | MUST when tuning is used | MUST when tuning is used | MUST when tuning is used | MUST when tuning is used |
 
-Run the complete tests from the repository root:
+Run the complete L3 library tests from the repository root, then the
+affected integration targets (see [testing](testing.md) for known failures):
 
 ```bash
-bash crates/apxinf-cuda-new/test-new.sh \
-  test -p apxinf-cuda-new -- --nocapture --test-threads=1
+just test-l3 --lib -- --nocapture --test-threads=1
 ```
 
 Finally, verify on the actual target GPU: correct `APXINF_CUDA_ARCH`; new sources are linked; semantic, all-candidate, graph, and applicable recipe tests pass; the actual provider/configuration is explainable; cold/warm cache behavior is correct when tuning is used; real-shape benchmarks and end-to-end model numerical/performance targets are met.

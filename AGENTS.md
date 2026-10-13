@@ -61,5 +61,5 @@ names in `doc/archive/` are not integration APIs.
 
 ## Review
 
-Review against [REVIEW.md](REVIEW.md). See  for the full workflow, PR evidence
+Review against [REVIEW.md](REVIEW.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, PR evidence
 requirements, and AI-assistance policy.

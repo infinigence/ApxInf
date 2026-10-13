@@ -186,6 +186,8 @@ consumer/site, incomplete provenance, and non-production data labels. The
 profile is an external deployment artifact passed through `calibration=`; it is
 not copied into the read-only checkpoint and is not committed to this tree.
 
+<a id="fixed-input-benchmark"></a>
+
 ## Measured performance and accuracy
 
 Best measured latency (Thor BF16/FP8, Orin BF16/W8A8) and the LIBERO-10

@@ -75,4 +75,3 @@ The naive W8A8 PTQ scaling strategy used by language QKV causes accuracy loss on
 |---|---|---|---:|---:|
 | Orin | BF16 | 2 views / T=10 | **93/100 (93%)** | 92.4% |
 | Orin | INT8 W8A8 | 2 views / T=10 | **91/100 (91%)** | 92.4% |
-
