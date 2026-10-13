@@ -75,7 +75,7 @@ activation scales from a calibration profile. An autoregressive argmax decoder h
 no error budget to spend on a guessed scale, so FP8 **requires** a profile
 (`<model-dir>/calibration.json`, or an explicit `calibration=`) and refuses to
 load without one; `APXINF_PI0FAST_FP8_ACTIVATION_SCALE` overrides that for
-bring-up and prints a warning. See `../../../../doc/guides/fp8-calibration-pi0fast.md`.
+bring-up and prints a warning. See `../../../../doc/guides/fp8-calibration.md`.
 
 ## Accuracy: LIBERO-10
 

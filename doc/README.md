@@ -93,4 +93,4 @@ ignored devlocal/<feat-name>/ according to [AGENTS.md](../AGENTS.md).
 - [Qwen3.8 NVFP4](models/qwen38.md)
 - [Python API and policies](../python/apxinf/README.md)
 - [Native binding](../crates/apxinf-py/README.md)
-- [One-step warm-start evaluation](reports/2026-run-warmstart-with-onestep.md)
+- [One-step warm-start evaluation](reports/2026-07-04-run-warmstart-with-onestep.md)

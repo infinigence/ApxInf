@@ -90,12 +90,10 @@ Deterministic prompt through the public entry (`AutoModel` →
 warm-up and excluded from the means. The run asserts identical tokens
 across repeats.
 
-Jetson AGX Thor, locked clocks (1575 MHz GPC):
-
-| Metric | Steady state |
-|---|---:|
-| TTFT, 2048-token prompt | 534 ms |
-| Decode | 78.1 ms/token (12.8 tok/s) |
+Measured steady state (Jetson AGX Thor, locked 1575 MHz GPC): TTFT 534 ms
+for a 2048-token prompt; decode 78.1 ms/token (12.8 tok/s). Details and
+measurement conditions:
+[reports/2026-10-13-qwen38-nvfp4](../reports/2026-10-13-qwen38-nvfp4.md).
 
 ## Correctness
 

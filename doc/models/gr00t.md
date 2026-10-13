@@ -186,97 +186,11 @@ consumer/site, incomplete provenance, and non-production data labels. The
 profile is an external deployment artifact passed through `calibration=`; it is
 not copied into the read-only checkpoint and is not committed to this tree.
 
-## Performance optimizations
+## Measured performance and accuracy
 
-- Optimize Thor BF16/FP8 and Orin BF16/W8A8 inference.
-- Fuse quantization, normalization, RoPE, attention, and projection epilogues to reduce kernel launches and intermediate tensors.
-- GR00T explicitly selects optimized operations; shared default paths and interfaces remain compatible.
+Best measured latency (Thor BF16/FP8, Orin BF16/W8A8) and the LIBERO-10
+accuracy table are published as a dated report:
 
-## Best measured performance
+[reports/2026-09-28-gr00t-n1.7](../reports/2026-09-28-gr00t-n1.7.md)
 
-| Device | Precision | 1-view P50 | 2-view P50 |
-| --- | --- | ---: | ---: |
-| Thor | BF16 | 51.834 ms | 54.216 ms |
-| Thor | FP8 | 32.557 ms | 35.436 ms |
-| Orin | BF16 | 75.778 ms | 84.864 ms |
-| Orin | W8A8 | 56.711 ms | 64.924 ms |
-
-## LIBERO-10 task accuracy
-
-| Device | Precision | Episodes | Successes | Success rate |
-| --- | --- | ---: | ---: | ---: |
-| Thor | BF16 | 100 | 94 | 94.0% |
-| Thor | FP8 | 100 | 92 | 92.0% |
-| Orin | BF16 | 100 | 93 | 93.0% |
-| Orin | W8A8 | 100 | 93 | 93.0% |
-
-Two views, 10 episodes for each of the 10 tasks, a 720-step limit, and eight
-executed actions per chunk.
-
-## Fixed-input benchmark
-
-The maintained runner uses tensors produced by the official NVIDIA processor.
-Its timing boundary starts at those host tensors and ends after model-core
-action D2H; it excludes simulator and raw-observation preprocessing time.
-
-```bash
-just bench gr00t \
-  --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
-  --backbone /models/GR00T-N1.7-LIBERO/libero_10/assets/cosmos \
-  --fixture devlocal/gr00t-n1d7/fixtures/libero-two-view \
-  --precision bf16 \
-  --warmup 10 \
-  --iterations 50
-```
-
-Use `--calibration` for FP8, `--tactics` for an explicit tactic database, and
-`--reference` for a numerical parity gate. When the installed CUDA/cuBLAS or
-kernel implementation version does not match a stored database, pass an
-explicit new `--tactics` path together with `--autotune`; never rewrite the
-bundled database merely to bypass provenance validation. The report records
-P50/P95 and the complete normalized model-core output. Generated fixtures,
-reference dumps, logs, tactic databases, and result JSON belong under
-`devlocal/gr00t-n1d7/` and are not committed.
-
-The repository's shared LIBERO evaluator selects the GR00T state adapter while
-leaving the existing OpenPI state wire format unchanged for other policies:
-
-```bash
-python scripts/eval_libero.py \
-  --backend in-process \
-  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 \
-  --precision bf16 \
-  --suite libero_10 \
-  --trials-per-task 10 \
-  --max-steps 720 \
-  --replan-steps 8 \
-  --results-jsonl devlocal/gr00t-n1d7/results/libero-bf16.jsonl \
-  --summary-json devlocal/gr00t-n1d7/results/libero-bf16-summary.json
-```
-
-## Validation contract
-
-Correctness comparison uses the same official processor output, embodiment ID,
-and initial noise on both implementations. The native model-core output is
-`[40, 132]`; the processor decodes and trims the LIBERO action to `[16, 7]`.
-The closed-loop evaluator executes eight actions before replanning.
-
-Minimum release gates are:
-
-- BF16: cosine similarity at least `0.999`, relative L2 at most `0.05`.
-- FP8: cosine similarity at least `0.997`, relative L2 at most `0.10`.
-- INT8: cosine similarity at least `0.995`, relative L2 at most `0.10`.
-- Every output must be finite and have the exact expected shape.
-
-One-view fixtures are used only for fixed-input numerical accuracy and
-performance; they are never used for LIBERO closed-loop task evaluation. The
-two-view release campaign uses 10 episodes for each of the 10 LIBERO-10 tasks
-and each supported platform/precision pair. GR00T LIBERO rollouts explicitly
-use the NVIDIA N1.7 evaluation protocol of 720 maximum simulator steps and 8
-executed actions per predicted chunk; the evaluator's 520/5 defaults remain
-unchanged for existing PI0.5 and WallOSS callers.
-
-PI0.5 regression acceptance uses a same-host upstream-versus-candidate A/B
-with the same checkpoint, evaluator, trials, frozen noise, and calibration.
-Unmatched historical aggregate success rates are useful context, but are not
-used to attribute a regression to this change.
+Summary (Thor, BF16, 2-view P50): 54.2 ms; LIBERO-10 Thor BF16 94.0%.
