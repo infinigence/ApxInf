@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "if": "git commit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just pre-commit"
+          }
+        ]
+      }
+    ]
+  }
+}
