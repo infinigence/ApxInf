@@ -62,6 +62,26 @@ valid model repair. Subsequent attention/residual/activation differences and
 full-model qualification remain unresolved. Neither these diagnostic adapters
 nor any shared native-operator injection replace the official reference.
 
+A fresh original Orin INT8 three-view control completes all eight observations
+without OOM, with bitwise-identical outputs and zero measured repeat/revisit
+drift. This does not establish the cause of the earlier private-candidate
+control OOM. Two repeats are a diagnostic count, not an approved stability
+protocol.
+
+Flow-rounding factors also fail to resolve the remaining errors. With the
+corrected diagnostic adapter, the two selected INT8 relative L2 errors are
+0.276/0.222; rounding initial noise gives 0.264/0.208, and additionally rounding
+each latent update gives 0.288/0.226. All remain failures. An independent
+unquantized BF16 experiment preserves every official control bitwise and tests
+all eight one-view observations. The control and all three rounding factors
+still pass only 7/8 including per-action-step checks. The failed observation's
+whole-chunk relative L2 rises from 0.045 to 0.051 with latent rounding and to
+0.055 with velocity rounding. These tests exclude flow rounding alone as a
+sufficient explanation or repair on the tested inputs. They do not authorize
+changing reference outputs, weakening per-step checks, or promoting a native
+change. Earlier adapter results above predate the FP32 convolution-boundary
+correction and remain historical diagnostic evidence.
+
 The activity auditor must be validated on the actual driver. Orin R39 CUDA
 clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
 checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
