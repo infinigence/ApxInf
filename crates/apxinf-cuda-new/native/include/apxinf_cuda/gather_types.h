@@ -20,14 +20,19 @@
  *                     [views * patches_per_view, 3 * patch_size^2],
  *                     mapping [0, 255] to [-1, 1].
  *                     `rows` and `cols` must agree with that shape.
+ *
+ *   REPLACE_ROWS      input [rows, cols], replacement [replacement_rows, cols],
+ *                     row_map [rows] (u32) -> output [rows, cols].
+ *                     UINT32_MAX keeps the input row.
  */
 typedef enum {
   APXINF_GATHER_SEMANTIC_EMBEDDING_LOOKUP = 0,
   APXINF_GATHER_SEMANTIC_BIAS_POSITION = 1,
   APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES = 2,
+  APXINF_GATHER_SEMANTIC_REPLACE_ROWS = 3,
 } apxinf_gather_semantic_t;
 
-#define APXINF_GATHER_SPEC_VERSION 1u
+#define APXINF_GATHER_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
@@ -37,6 +42,8 @@ typedef struct {
   uint32_t has_bias;
   /* EMBEDDING_LOOKUP only. */
   uint32_t vocab_size;
+  /* REPLACE_ROWS only. */
+  uint32_t replacement_rows;
   /* BIAS_POSITION only. */
   uint32_t tokens_per_view;
   /* RGB_TO_PATCHES only. */
@@ -58,6 +65,9 @@ typedef struct {
   const void* input;
   /* EMBEDDING_LOOKUP token ids. */
   const uint32_t* ids;
+  /* REPLACE_ROWS source and per-output-row mapping. */
+  const void* replacement;
+  const uint32_t* row_map;
   const void* bias;
   /* BIAS_POSITION learned position embedding. */
   const void* position;

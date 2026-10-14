@@ -36,6 +36,7 @@ pub enum PointwiseActivation {
     None,
     Gelu,
     Silu,
+    GeluExact,
 }
 
 impl PointwiseActivation {
@@ -44,6 +45,7 @@ impl PointwiseActivation {
             Self::None => 0,
             Self::Gelu => 1,
             Self::Silu => 2,
+            Self::GeluExact => 3,
         }
     }
 }
@@ -204,9 +206,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         ));
     }
     if quantized_geglu && cols % 2 != 0 {
-        return Err(invalid(
-            "F16-to-E4M3 GeGLU requires an even output width",
-        ));
+        return Err(invalid("F16-to-E4M3 GeGLU requires an even output width"));
     }
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Pointwise semantic does not take a bias"));

@@ -118,4 +118,20 @@ __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
   }
 }
 
+template <class T>
+__global__ void replace_rows(const T* input, const T* replacement,
+                             const uint32_t* row_map, T* output,
+                             int64_t count, int cols,
+                             uint32_t replacement_rows) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const int row = static_cast<int>(index / cols);
+    const uint32_t source_row = row_map[row];
+    output[index] = source_row < replacement_rows
+        ? replacement[static_cast<int64_t>(source_row) * cols + index % cols]
+        : input[index];
+  }
+}
+
 }  // namespace apxinf::gather::kernels

@@ -398,6 +398,15 @@ __global__ void cast_f16_bf16_kernel(
   }
 }
 
+__global__ void cast_f32_bf16_kernel(
+    const float* input, __nv_bfloat16* output, int64_t count) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    output[index] = __float2bfloat16(input[index]);
+  }
+}
+
 // Four values per thread with one half2 pair per load and one uint32 store.
 // The scalar kernel above remains the fallback for unaligned buffers and the
 // final 0..3 values.

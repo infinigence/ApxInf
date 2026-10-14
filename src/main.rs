@@ -52,9 +52,9 @@ enum Commands {
         #[arg(short, long)]
         prompt: String,
 
-        /// Path to an image file (for Qwen3-VL multimodal). When set, the
+        /// Path to an image file (for Qwen3-VL/Qwen3.5 multimodal). When set, the
         /// image is preprocessed by a Python helper and fed alongside the
-        /// prompt. Only for qwen3_vl models.
+        /// prompt.
         #[arg(long)]
         image: Option<PathBuf>,
 
@@ -347,7 +347,12 @@ fn run_generate(
         None => AutoModel::detect_model_name(model_dir)
             .map_err(|error| format!("Failed to detect model type: {error}"))?,
     };
-    if image_path.is_some() && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl") {
+    if image_path.is_some()
+        && !matches!(
+            model_name.as_str(),
+            "qwen3_vl" | "qwen3vl" | "qwen38" | "qwen3_8" | "qwen3_5" | "qwen3_5_text"
+        )
+    {
         return Err(format!("Model `{model_name}` does not support image input"));
     }
 
@@ -568,7 +573,8 @@ np.save(pixel_path, pixels)
 with open(metadata_path, "w") as output:
     json.dump({"grid": grid, "tokens": tokens}, output)
 "#;
-    let output = Command::new("python3")
+    let python = std::env::var("APXINF_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let output = Command::new(&python)
         .arg("-c")
         .arg(script)
         .arg(model_dir)
@@ -578,7 +584,7 @@ with open(metadata_path, "w") as output:
         .arg(&pixel_path)
         .arg(&metadata_path)
         .output()
-        .map_err(|error| format!("python3: {error}"))?;
+        .map_err(|error| format!("{python}: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "python preprocessing failed: {}",

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <type_traits>
 
 namespace {
 
@@ -63,12 +64,14 @@ bool valid_alignment(uint32_t alignment) {
 
 bool applies_rope(uint32_t semantic) {
   return semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE ||
-         semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE;
+         semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE ||
+         semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL ||
+         semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE;
 }
 
 void validate_spec(const apxinf_rope_spec_t& spec) {
   if (spec.version != APXINF_ROPE_SPEC_VERSION ||
-      spec.semantic > APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE ||
+      spec.semantic > APXINF_ROPE_SEMANTIC_PARTIAL_MROPE ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.has_bias > 1 || spec.tokens <= 0 || spec.tokens > INT32_MAX ||
       spec.q_heads == 0 || spec.kv_heads == 0 || spec.head_dim == 0 ||
@@ -83,10 +86,12 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE Spec");
   }
   if (spec.semantic != APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
+      spec.semantic != APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
       static_cast<uint64_t>(spec.q_heads) + 2ull * spec.kv_heads > 65535) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE grid");
   }
-  if (spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_BIAS &&
+  if ((spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_BIAS ||
+       spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL) &&
       spec.q_heads != spec.kv_heads) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "unrotated QKV split requires q_heads == kv_heads");
@@ -98,12 +103,34 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dynamic decode RoPE Spec");
   }
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL &&
+      (spec.dtype != APXINF_DTYPE_BF16 || spec.head_dim > 256 ||
+       spec.head_dim % 4 != 0 || spec.rotary_dim != spec.head_dim ||
+       spec.section_t != 0 || spec.section_h != spec.head_dim / 4 ||
+       spec.section_w != spec.head_dim / 4 || spec.cache_capacity != 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid axial RoPE Spec");
+  }
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
+      (spec.dtype != APXINF_DTYPE_BF16 || spec.has_bias != 0 ||
+       spec.rotary_dim == 0 || spec.rotary_dim > spec.head_dim ||
+       spec.rotary_dim % 2 != 0 ||
+       static_cast<uint64_t>(spec.section_t) + spec.section_h +
+               spec.section_w !=
+           spec.rotary_dim / 2 ||
+       spec.cache_capacity != 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid multimodal RoPE Spec");
+  }
 }
 
 void validate_bindings(const apxinf_rope_spec_t& spec,
                        const apxinf_rope_bindings_t& bindings) {
-  if (bindings.qkv == nullptr || bindings.q == nullptr ||
-      bindings.k == nullptr || bindings.v == nullptr) {
+  const bool partial_mrope =
+      spec.semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE;
+  if (bindings.qkv == nullptr ||
+      (!partial_mrope && (bindings.q == nullptr || bindings.k == nullptr ||
+                          bindings.v == nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "missing RoPE binding");
   }
   if ((spec.has_bias != 0) != (bindings.bias != nullptr)) {
@@ -121,6 +148,13 @@ void validate_bindings(const apxinf_rope_spec_t& spec,
       (bindings.position_offset != 0 || bindings.kv_output_offset != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "unrotated QKV split does not take offsets");
+  }
+  if ((spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL ||
+       partial_mrope) &&
+      (bindings.position == nullptr || bindings.position_offset != 0 ||
+       bindings.kv_output_offset != 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "missing multimodal RoPE position binding");
   }
   if (spec.semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
       (bindings.key_input == nullptr || bindings.value_input == nullptr ||
@@ -165,9 +199,34 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
       kernels::split_qkv_bias<T><<<tokens, 256, 0, stream>>>(
           qkv, bias, q, kv_k, kv_v, tokens, q_heads * head_dim);
       break;
+    case APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL:
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        kernels::split_qkv_axial_rope<<<
+            tokens, 256, static_cast<size_t>(head_dim) * sizeof(float), stream>>>(
+            qkv, bias, bindings.position, q, kv_k, kv_v, tokens, q_heads,
+            head_dim, bindings.theta);
+      } else {
+        return cudaErrorInvalidValue;
+      }
+      break;
     default:
       return cudaErrorInvalidValue;
   }
+  return cudaGetLastError();
+}
+
+cudaError_t launch_partial_mrope(const apxinf_rope_spec_t& spec,
+                                 const apxinf_rope_bindings_t& bindings) {
+  const int half = static_cast<int>(spec.rotary_dim / 2);
+  const int threads = half >= 128 ? 128 : ((half + 31) / 32) * 32;
+  kernels::partial_multimodal_rope<<<
+      dim3(static_cast<unsigned>(spec.tokens), spec.q_heads), threads, 0,
+      static_cast<cudaStream_t>(bindings.stream)>>>(
+      static_cast<__nv_bfloat16*>(const_cast<void*>(bindings.qkv)),
+      bindings.position, static_cast<int>(spec.tokens),
+      static_cast<int>(spec.q_heads), static_cast<int>(spec.head_dim),
+      static_cast<int>(spec.rotary_dim), static_cast<int>(spec.section_h),
+      static_cast<int>(spec.section_w), bindings.theta);
   return cudaGetLastError();
 }
 
@@ -203,6 +262,8 @@ extern "C" apxinf_status_t apxinf_rope_launch(
     const cudaError_t status =
         spec->semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE
             ? launch_decode(*spec, *bindings)
+            : spec->semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE
+                  ? launch_partial_mrope(*spec, *bindings)
             : (spec->dtype == APXINF_DTYPE_BF16
                    ? launch_split<__nv_bfloat16>(*spec, *bindings)
                    : launch_split<__half>(*spec, *bindings));

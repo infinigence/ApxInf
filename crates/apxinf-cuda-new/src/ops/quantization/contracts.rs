@@ -15,6 +15,8 @@ pub enum QuantizationSemantic {
     SliceColumnsBf16,
     /// BF16 to signed INT8 with one computed F32 scale per row.
     RowwiseI8,
+    /// Shape-preserving F32 to BF16 conversion.
+    CastF32ToBf16,
 }
 
 impl QuantizationSemantic {
@@ -25,6 +27,7 @@ impl QuantizationSemantic {
             Self::CastF16ToBf16 => 2,
             Self::SliceColumnsBf16 => 3,
             Self::RowwiseI8 => 4,
+            Self::CastF32ToBf16 => 5,
         }
     }
 
@@ -125,7 +128,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             }
             (input_shape[0], input_shape[1], output_shape[1])
         }
-        QuantizationSemantic::FixedScaleE4m3 | QuantizationSemantic::CastF16ToBf16 => {
+        QuantizationSemantic::FixedScaleE4m3
+        | QuantizationSemantic::CastF16ToBf16
+        | QuantizationSemantic::CastF32ToBf16 => {
             if args.input.shape() != args.out.shape() {
                 return Err(invalid(
                     "fixed-scale/cast Quantization requires identical shapes",
@@ -159,6 +164,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             (DType::BF16, DType::F8E4M3)
         }
         QuantizationSemantic::CastF16ToBf16 => (DType::F16, DType::BF16),
+        QuantizationSemantic::CastF32ToBf16 => (DType::F32, DType::BF16),
         QuantizationSemantic::SliceColumnsBf16 => {
             if output_cols > input_cols {
                 return Err(invalid("BF16 column slice cannot widen input"));

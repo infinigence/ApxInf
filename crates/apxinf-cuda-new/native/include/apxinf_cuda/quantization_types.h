@@ -14,6 +14,7 @@
  * CAST_F16_BF16    F16 input -> BF16 output, same shape.
  * SLICE_BF16       leading columns of a contiguous BF16 matrix.
  * ROWWISE_I8       BF16 input -> I8 output plus F32 scales [rows].
+ * CAST_F32_BF16    F32 input -> BF16 output, same shape.
  */
 typedef enum {
   APXINF_QUANTIZATION_SEMANTIC_FIXED_E4M3 = 0,
@@ -21,9 +22,10 @@ typedef enum {
   APXINF_QUANTIZATION_SEMANTIC_CAST_F16_BF16 = 2,
   APXINF_QUANTIZATION_SEMANTIC_SLICE_BF16 = 3,
   APXINF_QUANTIZATION_SEMANTIC_ROWWISE_I8 = 4,
+  APXINF_QUANTIZATION_SEMANTIC_CAST_F32_BF16 = 5,
 } apxinf_quantization_semantic_t;
 
-#define APXINF_QUANTIZATION_SPEC_VERSION 1u
+#define APXINF_QUANTIZATION_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;

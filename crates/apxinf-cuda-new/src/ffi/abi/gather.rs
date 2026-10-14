@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 
-use super::types::Runtime;
 pub(crate) use super::types::CudaStream;
+use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 1;
+pub(crate) const SPEC_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -13,6 +13,7 @@ pub(crate) struct Spec {
     pub dtype: u32,
     pub has_bias: u32,
     pub vocab_size: u32,
+    pub replacement_rows: u32,
     pub tokens_per_view: u32,
     pub views: u32,
     pub image_size: u32,
@@ -30,6 +31,8 @@ pub(crate) struct Spec {
 pub(crate) struct Bindings {
     pub input: *const c_void,
     pub ids: *const u32,
+    pub replacement: *const c_void,
+    pub row_map: *const u32,
     pub bias: *const c_void,
     pub position: *const c_void,
     pub output: *mut c_void,

@@ -5,6 +5,37 @@ use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
 use crate::ffi;
 use crate::{CudaBuffer, CudaContext};
 
+/// Copy one same-shape CUDA tensor into another on the context stream.
+pub fn copy_tensor(ctx: &CudaContext, source: &Tensor, destination: &Tensor) -> Result<()> {
+    if source.shape() != destination.shape()
+        || source.dtype() != destination.dtype()
+        || source.device() != Device::Cuda(ctx.device_id())
+        || destination.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(Error::Other(
+            "tensor copy requires matching shape, dtype, and CUDA device".into(),
+        ));
+    }
+    let bytes = source.size_in_bytes();
+    let source_buffer = CudaBuffer::from_tensor(source).map_err(Error::Cuda)?;
+    let destination_buffer = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    if source_buffer.len() < bytes || destination_buffer.len() < bytes {
+        return Err(Error::Other(
+            "tensor copy exceeds the backing CUDA buffer".into(),
+        ));
+    }
+    unsafe {
+        ffi::check_cuda(ffi::cudaMemcpyAsync(
+            destination_buffer.ptr(),
+            source_buffer.ptr(),
+            bytes,
+            ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 /// Allocate a persistent row-major K/V cache and copy `prefix` into its first
 /// rows. During an execution session the cache is a deterministic arena slice,
 /// so prepare and capture reuse the same address without allocating inside CUDA
