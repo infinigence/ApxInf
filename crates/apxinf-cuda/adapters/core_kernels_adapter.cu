@@ -1,6 +1,8 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch policy for core custom operators.
 
+#include "kernel_specialization_policy.h"
+
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -780,6 +782,7 @@ extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
     // Four rotary pairs per thread with 8-byte BF16 and 32-byte table
     // accesses; same per-element arithmetic as the scalar kernel below.
     const bool vectorized =
+        apxinf::cuda::static_fp8_specializations &&
         std::getenv("APXINF_SCALAR_VISION_QKV_ROPE") == nullptr &&
         (head_dim / 2) % 4 == 0 &&
         reinterpret_cast<uintptr_t>(qkv) % 8 == 0 &&

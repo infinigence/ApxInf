@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    pub fn apxinf_set_static_fp8_specializations(enabled: i32) -> i32;
     pub fn apxinf_sinusoidal_embedding_bf16(
         positions: *const c_void,
         output: *mut c_void,

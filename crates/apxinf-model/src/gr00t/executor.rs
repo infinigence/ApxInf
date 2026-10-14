@@ -551,6 +551,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
     /// Run one batch-one GR00T inference and return CPU BF16 actions shaped
     /// `[1, action_horizon, max_action_dim]`.
     pub fn infer(&mut self, observation: &Gr00tObservation) -> Result<Tensor> {
+        let _kernel_scope = kernels::specialization::StaticFp8KernelScope::new(
+            self.backend.context(),
+            E::NAME == "fp8",
+        );
         let _inference_range = crate::profiling::trace::range("gr00t_infer");
         self.validate_observation(observation)?;
 

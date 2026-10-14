@@ -20,6 +20,7 @@ pub mod preprocess;
 pub mod quantization;
 pub mod rope;
 pub mod sampling;
+pub mod specialization;
 
 pub use crate::workspace::GraphWorkspace;
 

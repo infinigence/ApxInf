@@ -1,6 +1,8 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch adapter for custom static-inference operators.
 
+#include "kernel_specialization_policy.h"
+
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -47,6 +49,13 @@ namespace {
 #endif
 #include "../kernels/custom/gdn_chunk_gemm_tri.cuh"
 }  // namespace
+
+// Return the previous policy so a Rust scope can restore nested callers.
+extern "C" int apxinf_set_static_fp8_specializations(int enabled) {
+  const bool previous = apxinf::cuda::static_fp8_specializations;
+  apxinf::cuda::static_fp8_specializations = enabled != 0;
+  return previous ? 1 : 0;
+}
 
 extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,void* output,
     int rows,int dim,float scale,float frequency_step,cudaStream_t stream) {
@@ -271,7 +280,8 @@ extern "C" cudaError_t apxinf_static_concat_rows_quantize_bf16_e4m3(
   const int64_t first_count = static_cast<int64_t>(first_rows) * cols;
   const int64_t total_count =
       static_cast<int64_t>(first_rows + second_rows) * cols;
-  if (!kLegacyScalarElementwise && first_count % 8 == 0 && total_count % 8 == 0 &&
+  if (apxinf::cuda::static_fp8_specializations &&
+      !kLegacyScalarElementwise && first_count % 8 == 0 && total_count % 8 == 0 &&
       aligned16(first) && aligned16(second) && aligned16(output)) {
     const int64_t total_vectors = total_count / 8;
     int vector_blocks = static_cast<int>((total_vectors + 255) / 256);
@@ -804,7 +814,8 @@ extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
   }
   // GR00T vision width (Qwen3-VL ViT hidden 1024): register-resident form,
   // bitwise identical to the generic kernel.
-  if (cols == 1024 && !kGenericLayerNormQuant) {
+  if (apxinf::cuda::static_fp8_specializations &&
+      cols == 1024 && !kGenericLayerNormQuant) {
     layer_norm_quant_bf16_e4m3_fixed_kernel<1024><<<rows, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input),
         static_cast<const __nv_bfloat16*>(weight),
@@ -874,7 +885,8 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
     return cudaErrorInvalidValue;
   static const bool packed4_only =
       std::getenv("APXINF_PACKED4_BIAS_GELU_QUANT") != nullptr;
-  if (!packed4_only && cols % 8 == 0 && rows <= 65535 &&
+  if (apxinf::cuda::static_fp8_specializations &&
+      !packed4_only && cols % 8 == 0 && rows <= 65535 &&
       reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(bias) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(output) % 8 == 0) {

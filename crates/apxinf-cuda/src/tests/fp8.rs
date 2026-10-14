@@ -1977,6 +1977,8 @@ fn bias_residual_and_concat_quantize_packed8_match_references_bitwise() {
     // bitwise equal to the scalar contract. Vision shapes plus a width that is
     // not a multiple of 8 (scalar fallback).
     let backend = CudaBackend::new(0).unwrap();
+    let _kernel_scope =
+        crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
     for &(rows, cols) in &[(512usize, 1024usize), (256, 1024), (5, 1020)] {
         let mut state = 0x853c_49e6_748f_ea9bu64 ^ ((rows as u64) << 32) ^ cols as u64;
         let mut next = move || {
@@ -2046,10 +2048,46 @@ fn bias_residual_and_concat_quantize_packed8_match_references_bitwise() {
     }
 }
 
+// Pin the full fused mainloop schedule, independent of vendor heuristics and
+// external tuning databases: M64/N128/K128, cluster 1, three stages, one SM.
+#[cfg(apxinf_cutlass_gemm)]
+fn m41_fixed_schedule_reference(
+    backend: &CudaBackend,
+    activation: &Tensor,
+    weight: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+) -> Tensor {
+    let output = CudaBuffer::alloc(m * n * 2, backend.device_id()).unwrap();
+    let status = unsafe {
+        ffi::apxinf_static_cutlass_fp8_gemm_bf16(
+            gpu_ptr(activation).unwrap(),
+            gpu_ptr(weight).unwrap(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            8,
+            backend.context().stream().handle(),
+        )
+    };
+    assert_eq!(status, 0, "fixed M41 reference tactic rejected");
+    make_gpu_tensor(
+        Shape::new(vec![m, n]),
+        DType::BF16,
+        backend.device_id(),
+        output,
+    )
+}
+
+#[cfg(apxinf_cutlass_gemm)]
 #[test]
 fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
     // Thor-only exact-shape GR00T DiT self-attention QKV fusion: compare
-    // bitwise against the production path (three FP8 GEMMs, then the in-place
+    // bitwise against a fixed-schedule reference (three FP8 GEMMs, then the in-place
     // Q/K/V bias kernel).
     let backend = CudaBackend::new(0).unwrap();
     if backend.context().caps().sm != 110 {
@@ -2065,7 +2103,9 @@ fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
         state ^= state << 17;
         ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
     };
-    let activation = (0..M * H).map(|_| bf16::from_f32(next() * 2.0)).collect::<Vec<_>>();
+    let activation = (0..M * H)
+        .map(|_| bf16::from_f32(next() * 2.0))
+        .collect::<Vec<_>>();
     let activation = backend
         .to_device(&Tensor::from_bf16(vec![M, H], &activation).unwrap())
         .unwrap();
@@ -2075,12 +2115,16 @@ fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
     let mut biases = Vec::new();
     for (index, scale) in weight_scales.iter().enumerate() {
         let amplitude = [0.06f32, 0.045, 0.08][index];
-        let weight = (0..H * H).map(|_| bf16::from_f32(next() * amplitude)).collect::<Vec<_>>();
+        let weight = (0..H * H)
+            .map(|_| bf16::from_f32(next() * amplitude))
+            .collect::<Vec<_>>();
         let weight = backend
             .to_device(&Tensor::from_bf16(vec![H, H], &weight).unwrap())
             .unwrap();
         weights_fp8.push(quantize_bf16_e4m3(backend.context(), &weight, *scale).unwrap());
-        let bias = (0..H).map(|_| bf16::from_f32(next() * 0.7)).collect::<Vec<_>>();
+        let bias = (0..H)
+            .map(|_| bf16::from_f32(next() * 0.7))
+            .collect::<Vec<_>>();
         biases.push(
             backend
                 .to_device(&Tensor::from_bf16(vec![H], &bias).unwrap())
@@ -2088,18 +2132,15 @@ fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
         );
     }
     let project = |index: usize| {
-        crate::kernels::gemm::fp8_bf16(
-            backend.context(),
+        m41_fixed_schedule_reference(
+            &backend,
             &activation_fp8,
-            ACT_SCALE,
-            crate::kernels::gemm::Fp8WeightView {
-                values_e4m3: &weights_fp8[index],
-                scale: weight_scales[index],
-                dual_geglu_interleaved: false,
-                dual_geglu_auto_interleaved: None,
-            },
+            &weights_fp8[index],
+            M,
+            H,
+            H,
+            ACT_SCALE * weight_scales[index],
         )
-        .unwrap()
     };
     let (query, key, value) = bias_qkv_in_place_bf16(
         backend.context(),
@@ -2173,10 +2214,11 @@ fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
     );
 }
 
+#[cfg(apxinf_cutlass_gemm)]
 #[test]
 fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
     // Thor-only exact-shape GR00T DiT FC1 fusion: compare against the
-    // production two-kernel path (BF16 FP8 GEMM, then bias+GELU+quantize).
+    // fixed-schedule two-kernel reference (BF16 GEMM, then bias+GELU+quantize).
     let backend = CudaBackend::new(0).unwrap();
     if backend.context().caps().sm != 110 {
         return;
@@ -2193,9 +2235,15 @@ fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
         state ^= state << 17;
         ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
     };
-    let activation = (0..M * K).map(|_| bf16::from_f32(next() * 1.5)).collect::<Vec<_>>();
-    let weight = (0..K * N).map(|_| bf16::from_f32(next() * 0.05)).collect::<Vec<_>>();
-    let bias = (0..N).map(|_| bf16::from_f32(next() * 0.5)).collect::<Vec<_>>();
+    let activation = (0..M * K)
+        .map(|_| bf16::from_f32(next() * 1.5))
+        .collect::<Vec<_>>();
+    let weight = (0..K * N)
+        .map(|_| bf16::from_f32(next() * 0.05))
+        .collect::<Vec<_>>();
+    let bias = (0..N)
+        .map(|_| bf16::from_f32(next() * 0.5))
+        .collect::<Vec<_>>();
     let activation = backend
         .to_device(&Tensor::from_bf16(vec![M, K], &activation).unwrap())
         .unwrap();
@@ -2208,26 +2256,28 @@ fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
     let weight_scale = 0.05f32 / 448.0;
     let activation_fp8 = quantize_bf16_e4m3(backend.context(), &activation, ACT_SCALE).unwrap();
     let weight_fp8 = quantize_bf16_e4m3(backend.context(), &weight, weight_scale).unwrap();
-    let view = || crate::kernels::gemm::Fp8WeightView {
-        values_e4m3: &weight_fp8,
-        scale: weight_scale,
-        dual_geglu_interleaved: false,
-        dual_geglu_auto_interleaved: None,
-    };
-    let reference_bf16 =
-        crate::kernels::gemm::fp8_bf16(backend.context(), &activation_fp8, ACT_SCALE, view())
-            .unwrap();
+    let reference_bf16 = m41_fixed_schedule_reference(
+        &backend,
+        &activation_fp8,
+        &weight_fp8,
+        M,
+        N,
+        K,
+        ACT_SCALE * weight_scale,
+    );
     let reference =
         bias_gelu_quant_bf16_e4m3(backend.context(), &reference_bf16, &bias, OUT_SCALE).unwrap();
-    let fused = crate::kernels::gemm::fp8_bias_gelu_quant_e4m3_m41(
+    let fused = crate::kernels::fused::try_fp8_bias_gelu_quant_e4m3_m41(
         backend.context(),
         &activation_fp8,
-        ACT_SCALE,
-        view(),
+        &weight_fp8,
         &bias,
+        ACT_SCALE,
+        weight_scale,
         OUT_SCALE,
     )
-    .unwrap();
+    .unwrap()
+    .expect("Thor M41 FC1 specialization");
     backend.synchronize().unwrap();
     let reference = backend.to_cpu(&reference).unwrap();
     let fused = backend.to_cpu(&fused).unwrap();
@@ -2235,38 +2285,9 @@ fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
     let fused = fused.as_f8_e4m3().unwrap();
     assert_eq!(reference.len(), M * N);
     assert_eq!(fused.len(), M * N);
-    let decode = |bits: u8| -> f32 {
-        let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
-        let exponent = ((bits >> 3) & 0x0f) as i32;
-        let mantissa = (bits & 0x07) as f32;
-        if exponent == 0 {
-            sign * (mantissa / 8.0) * 2.0f32.powi(-6)
-        } else {
-            sign * (1.0 + mantissa / 8.0) * 2.0f32.powi(exponent - 7)
-        }
-    };
-    let mut mismatches = 0usize;
-    let mut max_rel = 0.0f32;
-    for (index, (&a, &b)) in fused.iter().zip(reference.iter()).enumerate() {
-        if a != b {
-            mismatches += 1;
-            let (fa, fb) = (decode(a), decode(b));
-            let rel = (fa - fb).abs() / fb.abs().max(2.0f32.powi(-6));
-            max_rel = max_rel.max(rel);
-            // Accumulation-order differences may move a value across one
-            // E4M3 rounding boundary (12.5% relative); anything larger is a
-            // real epilogue mismatch.
-            assert!(
-                rel <= 0.13,
-                "fused E4M3 {fa} differs from reference {fb} at {index} (codes {a:#04x} vs {b:#04x})"
-            );
-        }
-    }
-    let mismatch_fraction = mismatches as f64 / (M * N) as f64;
-    assert!(
-        mismatch_fraction < 0.02,
-        "{mismatches} of {} E4M3 codes differ ({mismatch_fraction:.4}), max rel {max_rel}",
-        M * N
+    assert_eq!(
+        fused, reference,
+        "FC1 FP8 bytes differ with the same mainloop schedule"
     );
 }
 
@@ -2985,6 +3006,8 @@ fn bf16_bits(tensor: &Tensor) -> Vec<u16> {
 fn fixed_width_layer_norm_quant_matches_generic_kernel_bitwise() {
     const SCALE: f32 = 0.0371;
     let backend = CudaBackend::new(0).unwrap();
+    let _kernel_scope =
+        crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
     // 1024 takes the fixed-width kernel; 1536 and 768 exercise the generic fallback.
     for cols in [1024usize, 1536, 768] {
         for rows in [256usize, 512, 1, 3, 255] {
@@ -3036,6 +3059,8 @@ fn fixed_width_layer_norm_quant_matches_generic_kernel_bitwise() {
 fn fixed_width_residual_layer_norm_quant_matches_generic_kernel_bitwise() {
     const SCALE: f32 = 0.0371;
     let backend = CudaBackend::new(0).unwrap();
+    let _kernel_scope =
+        crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
     for cols in [1024usize, 1536] {
         for rows in [256usize, 512, 1, 3, 255] {
             for family in 0..6 {
@@ -3136,6 +3161,8 @@ fn vectorized_vision_qkv_rope_matches_scalar_kernel_bitwise() {
     const DIM: usize = 64;
     const WIDTH: usize = 3 * HEADS * DIM;
     let backend = CudaBackend::new(0).unwrap();
+    let _kernel_scope =
+        crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
     for seq in [256usize, 512] {
         let positions: Vec<u32> = (0..seq as u32).flat_map(|s| [s / 16, s % 16]).collect();
         let pos_ids = upload_u32(&backend, &positions);
@@ -3213,6 +3240,8 @@ fn vectorized_vision_qkv_rope_matches_scalar_kernel_bitwise() {
 #[test]
 fn vec8_bias_gelu_quant_matches_packed4_kernel_bitwise() {
     let backend = CudaBackend::new(0).unwrap();
+    let _kernel_scope =
+        crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
     // Every finite BF16 bit pattern as input, rotated per case so each pattern
     // meets several bias values; FP8 bytes must equal the packed-4 kernel's.
     let finite = |bits: u16| if bits & 0x7f80 == 0x7f80 { 0 } else { bits };
@@ -3277,4 +3306,74 @@ fn upload_u32(backend: &CudaBackend, values: &[u32]) -> CudaBuffer {
     let buffer = CudaBuffer::alloc(bytes.len(), backend.device_id()).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer
+}
+
+#[test]
+fn static_fp8_specializations_are_scoped() {
+    let backend = CudaBackend::new(0).unwrap();
+    let initial = unsafe { ffi::apxinf_set_static_fp8_specializations(0) };
+    assert_eq!(initial, 0);
+    {
+        let _enabled =
+            crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), true);
+        let enabled = i32::from(backend.context().caps().sm == 110);
+        {
+            let _generic =
+                crate::kernels::specialization::StaticFp8KernelScope::new(backend.context(), false);
+            assert_eq!(unsafe { ffi::apxinf_set_static_fp8_specializations(0) }, 0);
+        }
+        assert_eq!(
+            unsafe { ffi::apxinf_set_static_fp8_specializations(enabled) },
+            enabled
+        );
+    }
+    assert_eq!(unsafe { ffi::apxinf_set_static_fp8_specializations(0) }, 0);
+}
+
+#[test]
+#[ignore = "diagnostic on Thor; optional APXINF_REVIEW_TACTICS database"]
+fn gr00t_fp8_reference_tactics() {
+    use crate::tuning::*;
+    let backend = CudaBackend::new(0).unwrap();
+    let ctx = backend.context();
+    assert_eq!(ctx.caps().sm, 110);
+    if let Ok(path) = std::env::var("APXINF_REVIEW_TACTICS") {
+        let db = TuningDb::from_json_file(std::path::Path::new(&path)).unwrap();
+        let store = db.build_store(ctx.caps(), ctx.library_versions()).unwrap();
+        ctx.install_tuning(TuningSession::inference(store)).unwrap();
+        println!("database={path}");
+    } else {
+        println!("database=none");
+    }
+    for n in [1536, 6144] {
+        let key = GemmTuningKey {
+            op: GemmOp::Fp8Bf16,
+            device: DeviceFingerprint::from(ctx.caps()),
+            m: 41,
+            n,
+            k: 1536,
+            activation_dtype: TuningDType::F8E4M3,
+            weight_dtype: TuningDType::F8E4M3,
+            output_dtype: TuningDType::Bf16,
+            layout: GemmLayout::RowMajor,
+            scale_mode: ScaleMode::PerTensor,
+            epilogue: Epilogue::None,
+            workspace_limit: usize::MAX,
+        };
+        let plan = ctx
+            .gemm_plans()
+            .resolve(
+                ctx,
+                &key,
+                TacticId {
+                    backend: TacticBackend::Vendor,
+                    value: 0,
+                },
+            )
+            .unwrap();
+        println!(
+            "M41/N{n}/K1536 resolved={:?} source={:?}",
+            plan.tactic, plan.source
+        );
+    }
 }

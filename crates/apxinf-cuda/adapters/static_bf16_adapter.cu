@@ -1,6 +1,8 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch policy for static-path BF16 operators.
 
+#include "kernel_specialization_policy.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -414,7 +416,8 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
-  if (!kLegacyScalarElementwise && cols % 8 == 0 && aligned16(projection) &&
+  if (apxinf::cuda::static_fp8_specializations &&
+      !kLegacyScalarElementwise && cols % 8 == 0 && aligned16(projection) &&
       aligned16(residual) && aligned16(output) &&
       (bias == nullptr || aligned16(bias))) {
     const int64_t vectors = count / 8;
@@ -689,7 +692,8 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
   // GR00T vision width: register-resident form, bitwise identical to the
   // generic kernel.
   static const bool generic = std::getenv("APXINF_GENERIC_LAYER_NORM_QUANT") != nullptr;
-  if (cols == 1024 && kThreads == 256 && !generic) {
+  if (apxinf::cuda::static_fp8_specializations &&
+      cols == 1024 && kThreads == 256 && !generic) {
     bias_residual_layer_norm_quant_bf16_e4m3_fixed_kernel<1024><<<rows, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projection),
         static_cast<const __nv_bfloat16*>(projection_bias),
