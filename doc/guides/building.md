@@ -23,6 +23,28 @@ This runs `maturin build --release --features cuda --auditwheel skip` for
 `--features cuda` is required: without it the PI0.5/WallOSS runtimes are not
 compiled in and loading errors at runtime.
 
+**Tuning databases (tactics).** The default GPU build resolves per-board
+tactic JSONs from `configs/tuning/nvidia/<board>/tactics.json` via
+`apxinf._tactics.resolve_pi05_tactics`. L2 policies wire this in
+automatically; L1 bare-handle callers must pass `tactics=` explicitly to
+`ModelRunner.load(...)` or they silently fall back to untuned default GEMM
+keys (see `python/apxinf/AGENTS.md`).
+
+**If `import apxinf_py` fails with `undefined symbol` right after a build
+that reported success, the wheel on disk is stale, not your code.** The CUDA
+kernel cache keys on source mtime plus a hashed `.cmdline` stamp
+(`crates/apxinf-cuda/build_support/nvcc_build.rs:64`,
+`crates/apxinf-cuda/build.rs:240`); restoring `.cu` files with preserved
+timestamps (`cp -p`, `tar -x`, `scp -p`) can leave objects that look fresh to
+Cargo but predate your edit. Confirm with
+`ls -l target/wheel/wheels/apxinf_py-*.whl`, then force a clean kernel
+rebuild:
+
+```bash
+cargo clean -p apxinf-cuda -p apxinf-cuda-new
+just build-py
+```
+
 ## Platform presets
 
 Per-platform build variables live in `configs/platforms/<name>.env`

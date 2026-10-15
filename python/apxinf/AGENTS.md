@@ -15,3 +15,11 @@ policy (`apxinf.policies`), L3 OpenPI-compatible websocket serving
   update `AutoPolicy` docs. `AutoPolicy` picks it up.
 - Tests run with `just test-py` (CPU); GPU-gated tests must skip cleanly
   without a device or checkpoint.
+- **L1 bare-handle callers must pass `tactics` explicitly.** The L2 policy
+  auto-resolves the board's tactic DB via
+  `apxinf._tactics.resolve_pi05_tactics(device, model_variant)`, but a bare
+  `ModelRunner.load(...)` does not — omitting `tactics=` silently falls back
+  to untuned default GEMM keys and breaks numerical parity with the Policy
+  path. On Thor pass
+  `tactics=str(resolve_pi05_tactics("cuda:0", "bf16"))` (or the literal
+  `configs/tuning/nvidia/thor-sm110/tactics.json` for a source checkout).
