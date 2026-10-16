@@ -961,3 +961,81 @@ fn attention_semantics_use_distinct_native_registries() {
         .summary()
         .starts_with("custom-segmented-attention "));
 }
+
+#[test]
+fn direct_norm_graph_retains_tensor_storage() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = tensor(0, vec![2, 128], &[1.0; 256]);
+    let weight = tensor(0, vec![128], &[1.0; 128]);
+    let owner = std::sync::Arc::downgrade(weight.storage().as_gpu().unwrap().owner().unwrap());
+    let mut output = tensor(0, vec![2, 128], &[0.0; 256]);
+    let graph = crate::capture(&ctx, || {
+        rms_norm(&ctx, RmsNormArgs::new(&input, &weight, &mut output, 1e-6))
+    })
+    .unwrap();
+    drop(input);
+    drop(weight);
+    assert!(
+        owner.upgrade().is_some(),
+        "captured norm released its weight"
+    );
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0; 256]);
+    drop(graph);
+    assert!(
+        owner.upgrade().is_none(),
+        "destroyed graph leaked its weight"
+    );
+}
+
+#[test]
+fn direct_rope_graph_retains_tensor_storage() {
+    let ctx = CudaContext::new(0).unwrap();
+    let qkv = tensor(
+        0,
+        vec![1, 12],
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+    );
+    let owner = std::sync::Arc::downgrade(qkv.storage().as_gpu().unwrap().owner().unwrap());
+    let mut q = tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let mut k = tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let mut v = tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let graph = crate::capture(&ctx, || {
+        rope(
+            &ctx,
+            RopeArgs {
+                semantic: RopeSemantic::SplitQkvRope,
+                qkv: &qkv,
+                bias: None,
+                q: &mut q,
+                k: &mut k,
+                v: &mut v,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: 4,
+                theta: 10_000.0,
+                position_offset: 0,
+                kv_output_offset: 0,
+            },
+        )
+    })
+    .unwrap();
+    drop(qkv);
+    assert!(
+        owner.upgrade().is_some(),
+        "captured RoPE released its input"
+    );
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&q), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(values(&k), vec![5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(values(&v), vec![9.0, 10.0, 11.0, 12.0]);
+    drop(graph);
+    assert!(
+        owner.upgrade().is_none(),
+        "destroyed graph leaked its input"
+    );
+}
