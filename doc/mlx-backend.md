@@ -201,6 +201,11 @@ For example, cast-before-affine and cast-after-affine norms cannot share a fused
 candidate just because both are called RMSNorm. The compatibility adapter's
 existing Backend methods do not define the native models' layer arithmetic.
 
+MLX-format affine checkpoints store packed weights as U32, which core `DType`
+does not represent. Load them with `apxinf_mlx::load_safetensors` over
+`apxinf_loader::safetensors::safetensors_files`, not through `Tensor`. The
+family owns the key map, group size, bit width and every shape check.
+
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
 its pinned reference. No implicit CPU fallback, reduced precision or changed
