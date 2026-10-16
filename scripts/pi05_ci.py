@@ -138,6 +138,7 @@ def validate(args: argparse.Namespace) -> int:
                     raise ValueError(f"frozen reference/baseline {key} differs")
         if baseline.get("autotune") is not False:
             raise ValueError("autotune must be disabled in the approved baseline")
+        require_graph(baseline)
         prepared_recipes(baseline)
         calibration = cell["calibration"]["sha256"] if cell.get("calibration") else None
         if (baseline.get("precision"), baseline.get("calibration_sha256")) != (cell["precision"], calibration):
@@ -189,6 +190,13 @@ def runtime_fingerprint(receipt: dict) -> dict[str, str]:
     return fingerprint
 
 
+def require_graph(record: dict) -> None:
+    if not record.get("cases") or any(row.get("execution_mode") != "graph" for row in record["cases"]):
+        raise ValueError("graph execution must be recorded for every input")
+    if "shape_switch" in record and record["shape_switch"].get("execution_mode") != "graph":
+        raise ValueError("graph execution must be recorded for the shape return")
+
+
 def prepared_recipes(record: dict) -> dict:
     cache = record.get("recipe_cache")
     if not isinstance(cache, dict) or not isinstance(cache.get("after"), dict):
@@ -226,6 +234,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
         raise ValueError("invalid performance receipt")
     if any(record.get("autotune") is not False for record in (baseline, actual, latency)):
         raise ValueError("autotune must be disabled in baseline, accuracy and performance receipts")
+    for record in (baseline, actual, latency):
+        require_graph(record)
     prepared_recipes(baseline)
     if prepared_recipes(actual) != prepared_recipes(latency):
         raise ValueError("accuracy and performance recipe caches differ")

@@ -300,7 +300,8 @@ def benchmark_suite(args):
             raise ValueError("invalid benchmark output")
         samples = _time_loop(call, args.warmup, args.samples)
         rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
-                     "first_call_ms": first_ms, "latency_ms": samples, "statistics": _stats(samples)})
+                     "first_call_ms": first_ms, "latency_ms": samples, "statistics": _stats(samples),
+                     "execution_mode": model.execution_mode()})
         print(f"L1 {entry['name']}: {_stats(samples)}", flush=True)
     # This is one shape-first event, separate from the stationary warm samples.
     model.infer(load_case(args.suite_dir, source))
@@ -313,7 +314,8 @@ def benchmark_suite(args):
     write_json(args.out, {
         "schema": "apxinf.pi05.performance.v2", "engine": "apxinf", "layer": "l1",
         "shape_switch": {"from": source["name"], "from_input_sha256": source["sha256"],
-                         "to": target["name"], "to_input_sha256": target["sha256"], "latency_ms": switch_ms},
+                         "to": target["name"], "to_input_sha256": target["sha256"], "latency_ms": switch_ms,
+                         "execution_mode": model.execution_mode()},
         "revision": args.revision, "hardware": args.hardware, "precision": precision,
         "suite_sha256": sha256(args.suite_dir / "manifest.json"),
         "checkpoint_sha256": sha256(args.model_dir / "model.safetensors"),

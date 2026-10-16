@@ -325,7 +325,11 @@ caches for baseline, accuracy and performance, and matching caches for candidate
 accuracy and performance. Aggregation also verifies the preparation receipt's
 source, extension, inputs, checkpoint, configuration, precision, runtime libraries
 and resulting cache against the candidate. A baseline built from empty-cache
-fallbacks, a missing receipt or tuning during measurement cannot qualify. The
+fallbacks, a missing receipt or tuning during measurement cannot qualify.
+Every measured input and shape return also records the native runner's
+`execution_mode()`. Baseline and candidate receipts must report `graph`; eager
+fallback, runtime-managed and missing modes are rejected. The query runs outside
+the timed warm sample loop. Old receipts require a new run. The
 baseline and candidate may have different algorithm selections; their own caches
 must remain fixed during measurement. A nonempty cache alone does not prove that
 every operator has an optimized implementation; measured budgets and operator

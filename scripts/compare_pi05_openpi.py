@@ -306,6 +306,9 @@ class ApxInfModel:
             num_flow_steps=manifest["num_flow_steps"], flow_start_time=1.0,
         )
 
+    def execution_mode(self) -> str:
+        return self.model.execution_mode()
+
     def infer(self, case: dict[str, np.ndarray]) -> np.ndarray:
         images = np.stack([image_to_uint8_hwc(view) for view in case["images"]])
         tokens = np.asarray(case["token_ids"], dtype=np.uint32)
@@ -350,6 +353,8 @@ def collect(root: Path, manifest: dict[str, Any], model: Any,
         actions = checked_infer(model, load_case(root, entry), (manifest["horizon"], 32))
         rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
                      "actions": actions.tolist()})
+        if engine == "apxinf":
+            rows[-1]["execution_mode"] = model.execution_mode()
         print(f"{engine}: {entry['name']} {actions.shape}", flush=True)
     repeat = stability(model, root, manifest, rows, stability_repeats)
     if engine == "apxinf":

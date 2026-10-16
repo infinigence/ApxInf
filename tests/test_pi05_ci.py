@@ -384,15 +384,15 @@ class MatrixTest(unittest.TestCase):
                    "stability": {"repeats": 2, "revisit_max_abs": 0,
                                  "cases": [{"name": item["name"], "repeat_max_abs": 0} for item in entries]},
                    "cases": [{"name": item["name"], "input_sha256": item["sha256"],
-                              "actions": np.ones((2, 32)).tolist()} for item in entries]}
+                              "actions": np.ones((2, 32)).tolist(), "execution_mode": "graph"} for item in entries]}
         parity.write_json(output / f"{cell['id']}.json", receipt)
         parity.write_json(output / f"{cell['id']}.preparation.json", dict(receipt, autotune=True))
         parity.write_json(output / f"{cell['id']}.performance.json", dict(receipt,
             schema="apxinf.pi05.performance.v2", layer="l1", warmup=1, samples=2,
             cases=[{"name": item["name"], "input_sha256": item["sha256"],
-                    "first_call_ms": 20, "latency_ms": [10, 11]} for item in entries],
+                    "first_call_ms": 20, "latency_ms": [10, 11], "execution_mode": "graph"} for item in entries],
             shape_switch={"from": "other", "from_input_sha256": other["sha256"],
-                          "to": "one", "to_input_sha256": entry["sha256"], "latency_ms": 25}))
+                          "to": "one", "to_input_sha256": entry["sha256"], "latency_ms": 25, "execution_mode": "graph"}))
         parity.write_json(suite / "baseline.json", receipt)
         parity.write_json(suite / "reference.json", dict(receipt, engine="openpi"))
         for key, name in (("suite", "manifest.json"), ("reference", "reference.json"), ("baseline", "baseline.json")):
@@ -602,6 +602,19 @@ class MatrixTest(unittest.TestCase):
         self.assertNotEqual(original, parity.recipe_fingerprint(left))
         self.assertIsNone(parity.recipe_fingerprint(None))
 
+    def test_eager_fallback_cannot_qualify_graph_budget(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        reference = ci.read_json(suite / "reference.json")
+        baseline = ci.read_json(suite / "baseline.json")
+        candidate = ci.read_json(self.root / "thor" / f"{cell['id']}.json")
+        latency = ci.read_json(self.root / "thor" / f"{cell['id']}.performance.json")
+        for record in (baseline, candidate, latency):
+            record["cases"][0]["execution_mode"] = "eager"
+            with self.assertRaisesRegex(ValueError, "graph execution"):
+                ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+            record["cases"][0]["execution_mode"] = "graph"
+
     def test_daily_gate_rejects_tuning_during_measurement(self):
         cell = self.bank["cells"][0]
         suite = Path(cell["suite"]["path"]).parent
@@ -665,6 +678,8 @@ class MatrixTest(unittest.TestCase):
         (self.root / "config.json").write_text("{}")
         calls, options = [], []
         class Model:
+            def execution_mode(self):
+                return "graph"
             def __init__(self, *args, **kwargs):
                 options.append(kwargs)
             def infer(self, case):
