@@ -3,9 +3,9 @@
 use apxinf_core::{Backend, Error, Result, Tensor};
 
 #[cfg(feature = "cuda")]
-use super::backend::{kernels, RuntimeBackend};
+use crate::walloss::backend::{kernels, RuntimeBackend};
 
-use super::{encode_e4m3, E4M3_MAX};
+use crate::walloss::fp8::{encode_e4m3, E4M3_MAX};
 
 #[derive(Debug)]
 pub struct DynamicFp8LinearWeights {
@@ -143,7 +143,7 @@ mod tests {
         {
             for input in 0..2 {
                 let decoded =
-                    crate::walloss::decode_e4m3(values[output * 16 + input]) * scales[output];
+                    crate::walloss::fp8::decode_e4m3(values[output * 16 + input]) * scales[output];
                 assert!((decoded - expected[input]).abs() < expected[input].abs() * 0.05);
             }
         }
