@@ -2,7 +2,10 @@ use crate::ffi;
 use apxinf_core::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::{c_void, CStr, CString},
+    os::unix::ffi::OsStrExt,
+    path::Path,
     ptr::NonNull,
     rc::Rc,
 };
@@ -822,6 +825,63 @@ fn own_many(stream: &Stream, raw: &mut [ffi::Handle]) -> Result<Vec<Array>> {
                 return Err(e);
             }
         }
+    }
+    Ok(out)
+}
+
+/// Reads SafeTensors files into evaluated arrays attributed to `stream`.
+///
+/// MLX reads each file once on its CPU device, without a host staging copy.
+/// Tensor names must be unique across files, and every tensor must have a
+/// bridge dtype; MLX-format affine checkpoints store packed weights as U32.
+/// Checkpoint keys, shapes and quantization belong to the model family. Bytes
+/// read count as uploads, and each file is one evaluation boundary.
+pub fn load_safetensors<P: AsRef<Path>>(
+    stream: &Stream,
+    files: &[P],
+) -> Result<HashMap<String, Array>> {
+    struct Loaded(NonNull<c_void>);
+    impl Drop for Loaded {
+        fn drop(&mut self) {
+            unsafe { ffi::apx_mlx_safetensors_free(self.0.as_ptr()) }
+        }
+    }
+    let mut out = HashMap::new();
+    for file in files {
+        let file = file.as_ref();
+        let label = |e: Error| error(format!("SafeTensors {}: {e}", file.display()));
+        let path = CString::new(file.as_os_str().as_bytes())
+            .map_err(|_| error("NUL in SafeTensors path"))?;
+        let mut raw = std::ptr::null_mut();
+        let mut count = 0;
+        check(unsafe { ffi::apx_mlx_safetensors_load(path.as_ptr(), &mut raw, &mut count) })
+            .map_err(label)?;
+        let loaded = Loaded(NonNull::new(raw).ok_or_else(|| error("null SafeTensors load"))?);
+        let mut arrays = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut name = std::ptr::null();
+            let mut handle = std::ptr::null_mut();
+            check(unsafe {
+                ffi::apx_mlx_safetensors_entry(loaded.0.as_ptr(), index, &mut name, &mut handle)
+            })
+            .map_err(label)?;
+            let name = unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
+            let array = unsafe { Array::own(stream.clone(), handle) }
+                .map_err(|e| label(error(format!("tensor `{name}`: {e}"))))?;
+            if out.contains_key(&name) {
+                return Err(label(error(format!("duplicate tensor `{name}`"))));
+            }
+            arrays.push(array.clone());
+            out.insert(name, array);
+        }
+        stream.eval(&arrays).map_err(label)?;
+        let bytes = arrays
+            .iter()
+            .map(|a| a.numel() * a.dtype().size_in_bytes())
+            .sum::<usize>();
+        stream.record(|c| c.uploads_bytes = c.uploads_bytes.saturating_add(bytes));
     }
     Ok(out)
 }

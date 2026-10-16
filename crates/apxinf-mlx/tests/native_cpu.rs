@@ -249,6 +249,98 @@ fn unsupported_metal_index_is_rejected_before_native_access() {
     }
 }
 
+fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], &[u8])]) {
+    let mut offset = 0;
+    let entries = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| {
+            let entry = format!(
+                r#""{name}":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+                offset + bytes.len()
+            );
+            offset += bytes.len();
+            entry
+        })
+        .collect::<Vec<_>>();
+    let header = format!("{{{}}}", entries.join(","));
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(header.as_bytes());
+    for (_, _, _, bytes) in tensors {
+        file.extend_from_slice(bytes);
+    }
+    std::fs::write(path, file).unwrap();
+}
+
+#[test]
+fn affine_checkpoint_shards_load_once_and_reject_ambiguous_files() -> Result<()> {
+    let s = Stream::cpu()?;
+    let dir = std::env::temp_dir().join(format!("apxinf-mlx-safetensors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data: Vec<f32> = (0..512).map(|i| ((i % 23) as f32 - 11.) / 16.).collect();
+    let w = Array::from_f32(&s, &[8, 64], &data)?.cast(D::BF16)?;
+    let [qw, scales, biases] = w.quantize(64, 4)?;
+    assert_eq!((qw.dtype(), qw.shape()), (D::U32, &[8, 8][..]));
+    let (qw_b, scales_b, biases_b) = (qw.to_bytes()?, scales.to_bytes()?, biases.to_bytes()?);
+    let norm = 0.5f32.to_le_bytes();
+    let (first, second) = (dir.join("a.safetensors"), dir.join("b.safetensors"));
+    write_safetensors(
+        &first,
+        &[
+            ("l.weight", "U32", &[8, 8], &qw_b),
+            ("l.scales", "BF16", &[8, 1], &scales_b),
+        ],
+    );
+    write_safetensors(
+        &second,
+        &[
+            ("l.biases", "BF16", &[8, 1], &biases_b),
+            ("norm", "F32", &[1], &norm),
+        ],
+    );
+    let before = s.counters();
+    let loaded = apxinf_mlx::load_safetensors(&s, &[&first, &second])?;
+    let after = s.counters();
+    assert_eq!(loaded.len(), 4);
+    assert_eq!(after.eval_calls - before.eval_calls, 2);
+    assert_eq!(
+        after.uploads_bytes - before.uploads_bytes,
+        qw_b.len() + scales_b.len() + biases_b.len() + norm.len()
+    );
+    assert_eq!(loaded["l.weight"].dtype(), D::U32);
+    assert_eq!(loaded["l.weight"].to_bytes()?, qw_b);
+    assert_eq!(loaded["norm"].to_f32_vec()?, [0.5]);
+    let x = Array::from_f32(&s, &[2, 64], &data[..128])?.cast(D::BF16)?;
+    let expected = x.quantized_matmul(&qw, &scales, &biases, true, 64, 4)?;
+    let actual = x.quantized_matmul(
+        &loaded["l.weight"],
+        &loaded["l.scales"],
+        &loaded["l.biases"],
+        true,
+        64,
+        4,
+    )?;
+    assert_eq!(actual.to_bytes()?, expected.to_bytes()?);
+
+    let fail = |files: &[&std::path::Path]| {
+        apxinf_mlx::load_safetensors(&s, files)
+            .unwrap_err()
+            .to_string()
+    };
+    let duplicate = dir.join("duplicate.safetensors");
+    write_safetensors(&duplicate, &[("l.scales", "BF16", &[8, 1], &scales_b)]);
+    assert!(fail(&[&first, &duplicate]).contains("duplicate tensor `l.scales`"));
+    let wide = dir.join("wide.safetensors");
+    write_safetensors(&wide, &[("step", "I64", &[1], &7i64.to_le_bytes())]);
+    assert!(fail(&[&wide]).contains("tensor `step`"));
+    let truncated = dir.join("truncated.safetensors");
+    let bytes = std::fs::read(&second).unwrap();
+    std::fs::write(&truncated, &bytes[..bytes.len() - 2]).unwrap();
+    assert!(fail(&[&truncated]).contains("truncated.safetensors"));
+    assert!(fail(&[&dir.join("missing.safetensors")]).contains("missing.safetensors"));
+    std::fs::remove_dir_all(&dir).unwrap();
+    Ok(())
+}
+
 fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
     for (a, e) in actual.iter().zip(expected) {

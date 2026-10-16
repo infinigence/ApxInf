@@ -4,12 +4,15 @@
 #include <mlx/fast.h>
 #include <mlx/version.h>
 #include <mlx/memory.h>
+#include <algorithm>
 #include <mlx/linalg.h>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 namespace mx = mlx::core;
 namespace {
 thread_local std::string last_error;
@@ -132,6 +135,13 @@ int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t sha
 void apx_mlx_compile_free(void* p){delete static_cast<F*>(p);}
 int apx_mlx_compile_call(void* p,const void* const* inputs,size_t n,void** outputs,size_t count){TRY auto result=(*static_cast<F*>(p))(arrays(inputs,n));publish(result,outputs,count);CATCH}
 int apx_mlx_quantize(void* s,const void* input,int32_t group,int32_t bits,void** outputs){TRY auto result=mx::quantize(*static_cast<const A*>(input),group,bits,"affine",std::nullopt,*static_cast<S*>(s));publish(result,outputs,3);CATCH}
+// Lazy MLX Load arrays in name order; MLX reads on its CPU device when evaluated.
+using Loaded=std::vector<std::pair<std::string,A>>;
+int apx_mlx_safetensors_load(const char* path,void** out,size_t* count){TRY
+ auto entries=std::make_unique<Loaded>();for(auto& item:mx::load_safetensors(std::string(path)).first)entries->emplace_back(item.first,item.second);
+ std::sort(entries->begin(),entries->end(),[](const auto& a,const auto& b){return a.first<b.first;});*count=entries->size();*out=entries.release();CATCH}
+int apx_mlx_safetensors_entry(const void* p,size_t i,const char** name,void** out){TRY const auto& entry=static_cast<const Loaded*>(p)->at(i);*out=new A(entry.second);*name=entry.first.c_str();CATCH}
+void apx_mlx_safetensors_free(void* p){delete static_cast<Loaded*>(p);}
 int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
  std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}

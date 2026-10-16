@@ -7,8 +7,8 @@ mod backend;
 mod ffi;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{
-    clear_cache, memory_stats, reset_peak_memory, Array, Compiled, MemoryStats, MetalKernel,
-    MlxDType, Stream, StreamCounters, TemplateArg,
+    clear_cache, load_safetensors, memory_stats, reset_peak_memory, Array, Compiled, MemoryStats,
+    MetalKernel, MlxDType, Stream, StreamCounters, TemplateArg,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use backend::MlxBackend;
