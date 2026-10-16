@@ -29,10 +29,10 @@ template<class T>A upload(const uint8_t* bytes,size_t len,mx::Shape sh,mx::Dtype
 extern "C" {
 const char* apx_mlx_error(void){return last_error.c_str();}
 int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
- if(std::string(mx::version())!="0.31.2")throw std::runtime_error("linked MLX runtime differs from pinned 0.31.2 SDK");
+ if(std::string(mx::version())!="0.32.3")throw std::runtime_error("linked MLX runtime differs from pinned 0.32.3 SDK");
  mx::Device d(gpu?mx::Device::gpu:mx::Device::cpu,index);
  if(!mx::is_available(d))throw std::runtime_error("requested MLX device unavailable");
- // Reuse MLX's thread-local device stream: MLX 0.31.2 has no individual
+ // Reuse MLX's thread-local device stream: MLX 0.32.3 has no individual
  // stream-destruction API, so new_stream per model would retain global queues.
  *out=new S(mx::default_stream(d));CATCH}
 void apx_mlx_stream_free(void* p){delete static_cast<S*>(p);}
@@ -85,7 +85,7 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 26:return mx::less_equal(a.at(0),a.at(1),s);
  case 27:return mx::where(a.at(0),a.at(1),a.at(2),s);
  case 28:return mx::zeros(shape(ints+1,nints-1),dtype(i(0)),s);
- case 29:return mx::fast::scaled_dot_product_attention(a.at(0),a.at(1),a.at(2),f(0),i(0)?"causal":"",a.size()>3?std::optional<A>(a[3]):std::nullopt,std::nullopt,s);
+ case 29:return mx::fast::scaled_dot_product_attention(a.at(0),a.at(1),a.at(2),f(0),i(0)?"causal":"",a.size()>3?std::optional<A>(a[3]):std::nullopt,std::nullopt,false,s);
  case 30:return mx::fast::rope(a.at(0),i(0),i(1)!=0,f(0),f(1),a.at(1),std::nullopt,s);
  case 31:return mx::quantized_matmul(a.at(0),a.at(1),a.at(2),a.at(3),i(0)!=0,i(1),i(2),"affine",s);
  case 32:{size_t rank=i(0);if(nints!=2+2*rank)throw std::invalid_argument("strides rank mismatch");mx::Strides strides;for(size_t j=0;j<rank;++j)strides.push_back(i(1+rank+j));return mx::as_strided(a.at(0),shape(ints+1,rank),strides,i(1+2*rank),s);}
