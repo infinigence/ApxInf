@@ -68,6 +68,18 @@ extern "C" {
         bits: i32,
         outputs: *mut Handle,
     ) -> i32;
+    pub fn apx_mlx_safetensors_load(
+        path: *const c_char,
+        out: *mut Handle,
+        count: *mut usize,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_entry(
+        loaded: *const c_void,
+        index: usize,
+        name: *mut *const c_char,
+        array: *mut Handle,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_free(loaded: Handle);
     pub fn apx_mlx_metal_new(
         name: *const c_char,
         source: *const c_char,

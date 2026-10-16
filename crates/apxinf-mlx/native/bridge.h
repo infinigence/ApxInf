@@ -23,6 +23,9 @@ int apx_mlx_compile_new(apx_mlx_callback callback, void* context, size_t outputs
 void apx_mlx_compile_free(void* compiled);
 int apx_mlx_compile_call(void* compiled, const void* const* inputs, size_t count, void** outputs, size_t output_count);
 int apx_mlx_quantize(void* stream, const void* input, int32_t group, int32_t bits, void** outputs);
+int apx_mlx_safetensors_load(const char* path, void** out, size_t* count);
+int apx_mlx_safetensors_entry(const void* loaded, size_t index, const char** name, void** array);
+void apx_mlx_safetensors_free(void* loaded);
 int apx_mlx_metal_new(const char* name, const char* source, const char* header, const char* const* inputs, size_t input_count, const char* const* outputs, size_t output_count, void** out);
 void apx_mlx_metal_free(void* kernel);
 int apx_mlx_metal_call(void* stream, void* kernel, const void* const* inputs, size_t input_count, const int32_t* shapes, const size_t* ranks, const int32_t* dtypes, size_t output_count, const int32_t* grid, const int32_t* group, const char* const* template_names, const int32_t* template_kinds, const int32_t* template_values, size_t template_count, void** outputs);
