@@ -155,9 +155,7 @@ fn gemm_dense(
             weight.dtype()
         )));
     }
-    if activation.dtype() == DType::BF16 {
-        crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
-    }
+    crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), activation.dtype())?;
     let mut args = GemmArgs::new(activation, weight, &mut output);
     args.policy = policies.gemm.clone();
@@ -173,6 +171,7 @@ fn gemm_tf32(
     weight: &Tensor,
 ) -> Result<Tensor> {
     use crate::pi05::backend::ops::{GemmMath, WeightVersion};
+    crate::pi05::model::calibration::observe_bf16_activation(input, weight)?;
     let mut output = ctx.allocate_output(
         Shape::new(vec![input.shape().dims()[0], weight.shape().dims()[1]]),
         DType::F32,

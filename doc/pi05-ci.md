@@ -19,9 +19,9 @@ results, **not approved baselines**.
 
 | Build / hardware / precision | Real, 1 / 2 / 3 views | Constructed, 1 / 2 / 3 views | Total |
 | --- | --- | --- | --- |
-| Maintained TF32 repair / Thor BF16 | 7/8, 8/8, 8/8 | 11/13, 8/13, 12/13 | 54/63 |
-| Same Thor build / FP8, original calibration | 0/8, 5/8, 5/8 | 1/13, 0/13, 0/13 | 11/63 |
-| Maintained upload/vision/projector repair, before RGB and TF32 / Orin BF16 | 7/8, 8/8, 8/8 | 9/13, 8/13, 11/13 | 51/63 |
+| Maintained TF32 and split-K repair / Thor BF16 | 7/8, 8/8, 8/8 | 11/13, 8/13, 12/13 | 54/63 |
+| Maintained TF32 build / FP8, original calibration | 0/8, 5/8, 5/8 | 1/13, 0/13, 0/13 | 11/63 |
+| Maintained TF32 and split-K repair / Orin BF16 | 6/8, 8/8, 8/8 | 9/13, 8/13, 10/13 | 49/63 |
 | Same Orin build / INT8 | 0/8, 6/8, 4/8 | 1/13, 0/13, 0/13 | 11/63 |
 | Complete private arithmetic diagnostic / Thor BF16 | 8/8, 8/8, 8/8 | 13/13, 13/13, 13/13 | 63/63 |
 | Complete private arithmetic diagnostic / Orin BF16 | 7/8, 8/8, 8/8 | 10/13, 8/13, 9/13 | 50/63 |
@@ -52,14 +52,34 @@ acceptance; the aggregator rejects that mismatch.
   Filtering BF16 partial reductions to compute precision passes the actual GPU
   RED/GREEN test and six existing GEMM regressions. The two-view private
   diagnostic improves from 8/13 to 9/13; white-image relative L2 falls from
-  0.290 to 0.052 and still fails. Full maintained-model and paired performance
-  qualification of this latest repair is running.
+  0.290 to 0.052 and still fails. The full maintained matrix is recorded above;
+  Orin paired performance qualification is still running.
+- After that fix, Orin's first vision FC2 difference is attributable to the
+  **reference's** reduced-precision BF16 partial sums. With frozen identical
+  inputs/weights, disabling PyTorch's `allow_bf16_reduced_precision_reduction`
+  makes FC2 bitwise equal to ApxInf. An independent FP64 calculation also shows
+  lower error for ApxInf. Whole-model white and camera-gray diagnostics then
+  pass, but zero-noise cases still fail. The same reference flag changes none
+  of the four Thor outputs. Original reference receipts remain unchanged;
+  choosing a different arithmetic profile requires explicit bank qualification.
+- FP32 frontend and TF32 auxiliary projections bypassed six calibration
+  observation sites. Restoring observation at those GEMMs passes a small
+  checkpoint-free CUDA RED/GREEN regression on both Thor and Orin. The observer
+  already supports FP32 tensors. All 63 Thor outputs remain bitwise unchanged
+  with observation inactive; paired performance regression is pending.
+- The original FP8 calibration used seven synthetic inputs with horizon 10.
+  Its metadata does not qualify it for the horizon-50 acceptance matrix.
+  A new calibration factor uses four separate real observations, disjoint from
+  evaluation, across 1–3 views. It is an unapproved experiment and does not
+  replace the existing profile or reference. Keeping only the FP8 flow state
+  in FP32 leaves the 1/2-view pass counts unchanged (6/42); that isolated change
+  does not resolve quantization failures.
 - A separate Thor action-down difference comes from **FP32 reduction order**:
   several split-K candidates match OpenPI while the selected unsplit candidate
   differs in 287 BF16 elements. FP64 differs from both. This is distinct from
   Orin's reduced-precision partial sums and does not justify a provider override.
 - Remaining maintained BF16 failures include zero-noise gradients, black and
-  white images, distinct camera gray levels and a one-view real observation.
+  white images, distinct camera gray levels and one-view real observations.
   Some fail only an individual timestep. FP8/INT8 failures also remain unresolved;
   they are not waived as out-of-distribution inputs or accepted by replacing
   reference outputs.
@@ -68,14 +88,15 @@ acceptance; the aggregator rejects that mismatch.
 
 Paired measurements use 30 warmups and 50 samples, with baseline, candidate and
 baseline revisit. They retain shared desktop clients and are diagnostic, not
-exclusive-run budgets. Latest maintained Thor TF32 measurements are:
+exclusive-run budgets. Latest maintained Thor split-K measurements, against the preceding TF32 build, are:
 
 | Views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
 | --- | --- | --- |
-| 1 | 59.208 / 59.346 / 59.226 ms | 65.236 / 64.680 / 65.276 ms |
-| 2 | 70.630 / 69.663 / 70.482 ms | 75.909 / 76.310 / 75.740 ms |
-| 3 | 86.921 / 87.067 / 86.600 ms | 91.150 / 91.411 / 91.057 ms |
+| 1 | 59.266 / 59.281 / 59.286 ms | 64.652 / 64.599 / 64.673 ms |
+| 2 | 69.572 / 70.305 / 69.479 ms | 76.346 / 76.305 / 76.183 ms |
+| 3 | 87.064 / 84.686 / 86.322 ms | 91.028 / 91.291 / 91.061 ms |
 
+The two-view T10 increase is approximately 1% and remains unresolved.
 The complete private Thor arithmetic repair adds approximately 9–11 ms; its
 performance debt prevents acceptance. The maintained Orin repair through RGB
 normalization was compared with `35bcbf59`, including earlier INT8 repairs:
