@@ -44,8 +44,8 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
+    /// their own variants. Other families migrate separately.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -552,11 +552,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "d3-cuda"
             | "smolvla"
             | "smolvla_libero"
-    ) || (matches!(device, Device::Metal(_))
-        && matches!(
-            model_name,
-            "qwen3" | "metal_qwen3" | "qwen3-mlx" | "minicpm5" | "metal_minicpm5" | "minicpm5-mlx"
-        ))
+    ) || matches!(device, Device::Metal(_))
 }
 
 #[cfg(feature = "cuda")]
@@ -625,6 +621,31 @@ fn select_cuda_tuning_database_path(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "mlx"))]
+    #[test]
+    fn image_variants_reach_device_admission_without_mlx() {
+        for family in ["qwen_image", "metal_qwen_image", "qwen_image-mlx"] {
+            for variant in ["auto", "reference"] {
+                let options = LoadOptions {
+                    model_name: Some(family.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                )
+                .err()
+                .expect("MLX is unavailable");
+                assert!(
+                    matches!(error, Error::UnsupportedDevice(Device::Metal(0))),
+                    "{family}/{variant}: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cuda_recipe_tuning_is_explicit_and_independent_of_directory() {
         let mut options = LoadOptions::default();
@@ -686,17 +707,39 @@ mod tests {
             "minicpm5",
             "metal_minicpm5",
             "minicpm5-mlx",
+            "llama",
+            "qwen3_vl",
+            "qwen_image",
+            "metal_qwen_image",
+            "qwen_image-mlx",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
         }
-        assert!(!supports_model_variant("llama", Device::Metal(0)));
-        assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+    }
+
+    #[test]
+    fn metal_variants_do_not_bypass_family_registration() {
+        for family in ["llama", "qwen3_vl", "test_missing_metal_family"] {
+            let options = LoadOptions {
+                model_name: Some(family.into()),
+                model_variant: Some("auto".into()),
+                ..LoadOptions::default()
+            };
+            assert!(matches!(
+                AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                ),
+                Err(Error::UnsupportedDevice(Device::Metal(0)))
+            ));
+        }
     }
 
     #[test]
