@@ -624,14 +624,22 @@ fn run_decide(
 
     let output = model
         .decide(DecisionInput::text(&tokens, candidate_count))
+        .and_then(|output| output.into_single())
         .map_err(|error| format!("Decision failed: {error}"))?;
 
     let selected = output
         .selected()
         .map_err(|error| format!("Invalid decision output: {error}"))?;
+    let token = |score: &apxinf_model::DecisionScore| {
+        score
+            .token_id
+            .map_or_else(|| "-".to_owned(), |id| id.to_string())
+    };
     println!(
         "selected: {}  token_id: {}  probability: {:.8}",
-        selected.code, selected.token_id, selected.probability
+        selected.code,
+        token(selected),
+        selected.probability
     );
     println!();
     println!("top-5:");
@@ -640,7 +648,9 @@ fn run_decide(
     for score in top.iter().take(5) {
         println!(
             "  {:<20}  token_id={:>6}  probability={:.8}",
-            score.code, score.token_id, score.probability
+            score.code,
+            token(score),
+            score.probability
         );
     }
     Ok(())
