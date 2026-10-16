@@ -428,11 +428,12 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
     let m = activation.shape().dims()[activation.ndim() - 2];
     let k = activation.shape().dims()[activation.ndim() - 1];
     let n = weight.shape().dims()[weight.ndim() - 1];
-    let output = CudaBuffer::alloc_zeros(
+    // beta is zero, so the output needs no initial value. Use the active
+    // workspace to keep allocation and default-stream memset out of capture.
+    let output = crate::workspace::output_buffer(
+        ctx,
         output_shape.numel() * activation.dtype().size_in_bytes(),
-        ctx.device_id(),
-    )
-    .map_err(Error::Cuda)?;
+    )?;
     let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
     ctx.cublas()
@@ -697,5 +698,54 @@ mod addmv_graph_tests {
             actual,
             vec![bf16::from_f32(1.0 + (k - 1) as f32 / 4096.0).to_f32(); n]
         );
+    }
+}
+
+#[cfg(test)]
+mod matmul_capture_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn fp32_matmul_captures_and_replays_updated_input() {
+        let ctx = CudaContext::new(0).unwrap();
+        let input = crate::transfers::to_cuda(
+            &Tensor::from_f32(vec![3, 2], &[1., 2., 3., 4., 5., 6.]).unwrap(),
+            0,
+        )
+        .unwrap();
+        let weight =
+            crate::transfers::to_cuda(&Tensor::from_f32(vec![2, 2], &[1., 2., 3., 4.]).unwrap(), 0)
+                .unwrap();
+        let workspace = crate::workspace::GraphWorkspace::new(4096, 0).unwrap();
+        let invoke = || matmul(&ctx, &input, &weight);
+        let warm = crate::workspace::prepare_with_workspace(&workspace, invoke).unwrap();
+        ctx.synchronize().unwrap();
+        let read = |tensor: &Tensor| {
+            crate::transfers::to_cpu(tensor)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap()
+        };
+        let expected = [7., 10., 15., 22., 23., 34.];
+        assert_eq!(read(&warm), expected);
+        crate::graph::begin(&ctx, crate::graph::CaptureMode::ThreadLocal).unwrap();
+        let result = crate::workspace::with_workspace(&workspace, invoke);
+        if result.is_err() {
+            crate::graph::abort(&ctx);
+        }
+        let output = result.unwrap();
+        let graph = crate::graph::end(&ctx).unwrap();
+        for scale in [1., 2., -1., 1.] {
+            let values: Vec<_> = [1., 2., 3., 4., 5., 6.].map(|v| v * scale).to_vec();
+            crate::transfers::copy_cpu_to_cuda(
+                &Tensor::from_f32(vec![3, 2], &values).unwrap(),
+                &input,
+            )
+            .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(read(&output), expected.map(|v| v * scale));
+        }
     }
 }

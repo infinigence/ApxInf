@@ -82,6 +82,31 @@ changing reference outputs, weakening per-step checks, or promoting a native
 change. Earlier adapter results above predate the FP32 convolution-boundary
 correction and remain historical diagnostic evidence.
 
+A later BF16 factor combining unfolded norms and staged GeGLU passes all
+24 real-image observations, but only 22/39 constructed inputs; the maintained
+control passes 23/39. On two-view black images with zero noise, cosine worsens
+from 0.865164 to 0.554220. This candidate is rejected. Passing the real subset
+cannot waive a constructed-input failure. The official selected-parameter
+conversion also rounds checkpoint values to BF16 before restoring selected
+parameters to FP32; loading their original FP32 checkpoint values is a different
+numerical experiment. Correcting that distinction alone does not repair the
+five selected failing/control cases.
+
+A separate generic FP32 `gemm::matmul` defect was reproduced with a small CUDA
+graph test: allocating and zeroing its output during capture raises CUDA error
+900. Its output now uses the existing graph workspace; cuBLAS uses beta zero,
+so no initial output value is needed. The test fails before this allocation
+change and passes afterward, including graph replay with changed input values.
+The maintained PI05 BF16/INT8 paths do not call this generic FP32 helper. All
+63 BF16 and 24 INT8 frozen outputs remain bitwise identical on Orin after the
+change; this is a capture repair, not a repair of the numerical failures above.
+A separate stock INT8 run uses two frozen real inputs per view, 30 warmups and
+50 samples per input, with alternating version order. Across 1–3 views the six
+P50/P95 changes are within 0.44% in magnitude. First-call and shape-return
+outliers require counterbalanced checks; the shared desktop environment does
+not establish accepted performance budgets. Private FP32 pipeline timings are
+recorded separately from stock PI05 and official precision qualification.
+
 The activity auditor must be validated on the actual driver. Orin R39 CUDA
 clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
 checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
