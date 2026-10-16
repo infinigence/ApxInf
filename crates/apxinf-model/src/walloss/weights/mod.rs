@@ -1,11 +1,24 @@
 //! Checkpoint mapping for the Walloss dual-stream execution graph.
 
+#[cfg(feature = "cuda")]
+mod device;
+#[cfg(feature = "cuda")]
+mod fp8;
+
+#[cfg(feature = "cuda")]
+pub use device::DynamicFp8LinearWeights;
+#[cfg(feature = "cuda")]
+pub use fp8::{
+    WallossDynamicFp8LayerWeights, WallossDynamicFp8VisionBlockWeights,
+    WallossDynamicFp8VisionWeights, WallossDynamicFp8Weights,
+};
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use apxinf_core::{Backend, DType, Error, Result, Tensor};
 
-use super::WallossConfig;
+use crate::walloss::WallossConfig;
 
 pub struct WallossWeights {
     pub token_embedding: Tensor,

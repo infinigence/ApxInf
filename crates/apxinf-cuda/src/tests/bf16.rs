@@ -21,30 +21,31 @@ impl crate::kernels::gemm::Bf16ActivationObserver for CountingObserver {
 }
 
 #[test]
-fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
+fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order_for_rectangular_views() {
     const VIEWS: usize = 2;
-    const IMAGE_SIZE: usize = 8;
+    const IMAGE_HEIGHT: usize = 8;
+    const IMAGE_WIDTH: usize = 12;
     const PATCH_SIZE: usize = 2;
     const TEMPORAL_PATCH_SIZE: usize = 2;
     const MERGE_SIZE: usize = 2;
-    const GRID_SIZE: usize = IMAGE_SIZE / PATCH_SIZE;
-    const GROUPS_PER_SIDE: usize = GRID_SIZE / MERGE_SIZE;
-    const PATCH_ROWS: usize = VIEWS * GRID_SIZE * GRID_SIZE;
+    const GROUPS_H: usize = IMAGE_HEIGHT / PATCH_SIZE / MERGE_SIZE;
+    const GROUPS_W: usize = IMAGE_WIDTH / PATCH_SIZE / MERGE_SIZE;
+    const PATCH_ROWS: usize = VIEWS * (IMAGE_HEIGHT / PATCH_SIZE) * (IMAGE_WIDTH / PATCH_SIZE);
     const PATCH_WIDTH: usize = 3 * TEMPORAL_PATCH_SIZE * PATCH_SIZE * PATCH_SIZE;
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_72];
     const STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
 
     let backend = CudaBackend::new(0).unwrap();
-    let nhwc = (0..VIEWS * IMAGE_SIZE * IMAGE_SIZE * 3)
+    let nhwc = (0..VIEWS * IMAGE_HEIGHT * IMAGE_WIDTH * 3)
         .map(|index| (index * 17 % 256) as u8)
         .collect::<Vec<_>>();
     let mut expected = vec![bf16::ZERO; PATCH_ROWS * PATCH_WIDTH];
     for view in 0..VIEWS {
-        for group_y in 0..GROUPS_PER_SIDE {
-            for group_x in 0..GROUPS_PER_SIDE {
+        for group_y in 0..GROUPS_H {
+            for group_x in 0..GROUPS_W {
                 for merge_y in 0..MERGE_SIZE {
                     for merge_x in 0..MERGE_SIZE {
-                        let row = ((((view * GROUPS_PER_SIDE + group_y) * GROUPS_PER_SIDE
+                        let row = ((((view * GROUPS_H + group_y) * GROUPS_W
                             + group_x)
                             * MERGE_SIZE
                             + merge_y)
@@ -56,7 +57,7 @@ fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
                                     for dx in 0..PATCH_SIZE {
                                         let y = (group_y * MERGE_SIZE + merge_y) * PATCH_SIZE + dy;
                                         let x = (group_x * MERGE_SIZE + merge_x) * PATCH_SIZE + dx;
-                                        let source = ((view * IMAGE_SIZE + y) * IMAGE_SIZE + x) * 3
+                                        let source = ((view * IMAGE_HEIGHT + y) * IMAGE_WIDTH + x) * 3
                                             + channel;
                                         let column = (((channel * TEMPORAL_PATCH_SIZE + temporal)
                                             * PATCH_SIZE
@@ -79,11 +80,11 @@ fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
 
     let mut nchw = vec![0u8; nhwc.len()];
     for view in 0..VIEWS {
-        for y in 0..IMAGE_SIZE {
-            for x in 0..IMAGE_SIZE {
+        for y in 0..IMAGE_HEIGHT {
+            for x in 0..IMAGE_WIDTH {
                 for channel in 0..3 {
-                    let source = ((view * IMAGE_SIZE + y) * IMAGE_SIZE + x) * 3 + channel;
-                    let destination = ((view * 3 + channel) * IMAGE_SIZE + y) * IMAGE_SIZE + x;
+                    let source = ((view * IMAGE_HEIGHT + y) * IMAGE_WIDTH + x) * 3 + channel;
+                    let destination = ((view * 3 + channel) * IMAGE_HEIGHT + y) * IMAGE_WIDTH + x;
                     nchw[destination] = nhwc[source];
                 }
             }
@@ -104,7 +105,8 @@ fn normalized_temporal_merged_rgb_preprocessing_matches_reference_order() {
             &input,
             &output,
             VIEWS,
-            IMAGE_SIZE,
+            IMAGE_HEIGHT,
+            IMAGE_WIDTH,
             PATCH_SIZE,
             TEMPORAL_PATCH_SIZE,
             MERGE_SIZE,
@@ -267,6 +269,7 @@ fn temporal_merged_rescale_matches_float64_reference_at_bf16_boundary() {
         &input,
         &output,
         1,
+        16,
         16,
         1,
         2,
