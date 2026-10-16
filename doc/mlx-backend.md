@@ -130,7 +130,7 @@ chat options containing `tools` enable this behavior automatically. MiniCPM's
 
 ## Native dependency and ABI
 
-The implemented bridge wraps the **MLX 0.31.2** C++ SDK with a small C ABI.
+The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
 `MLX_ROOT` identifies the matching `include/mlx/` and `lib/` distribution;
 headers are checked at build time and the linked version at stream construction.
 Do not combine arbitrary system headers with another wheel's library. A wheel
@@ -200,6 +200,17 @@ normalization rounding, attention masking, weight packing and fused selection.
 For example, cast-before-affine and cast-after-affine norms cannot share a fused
 candidate just because both are called RMSNorm. The compatibility adapter's
 existing Backend methods do not define the native models' layer arithmetic.
+
+MLX-format affine checkpoints store packed weights as U32, which core `DType`
+does not represent. Load them with `apxinf_mlx::load_safetensors` over
+`apxinf_loader::safetensors::safetensors_files`, not through `Tensor`, and
+keep only the keys the family uses. The family owns the key map, group size,
+bit width and every shape check.
+
+This native loader depends on the pinned MLX 0.32.3 SDK upgrade, including its
+lazy payload-read error propagation. Matching function signatures in 0.31.2
+do not establish that guarantee. Native CPU regression tests cover failure
+after header validation, before payload evaluation completes.
 
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with

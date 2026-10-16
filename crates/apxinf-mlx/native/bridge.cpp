@@ -4,11 +4,14 @@
 #include <mlx/fast.h>
 #include <mlx/version.h>
 #include <mlx/memory.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 namespace mx = mlx::core;
 namespace {
 thread_local std::string last_error;
@@ -28,10 +31,10 @@ template<class T>A upload(const uint8_t* bytes,size_t len,mx::Shape sh,mx::Dtype
 extern "C" {
 const char* apx_mlx_error(void){return last_error.c_str();}
 int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
- if(std::string(mx::version())!="0.31.2")throw std::runtime_error("linked MLX runtime differs from pinned 0.31.2 SDK");
+ if(std::string(mx::version())!="0.32.3")throw std::runtime_error("linked MLX runtime differs from pinned 0.32.3 SDK");
  mx::Device d(gpu?mx::Device::gpu:mx::Device::cpu,index);
  if(!mx::is_available(d))throw std::runtime_error("requested MLX device unavailable");
- // Reuse MLX's thread-local device stream: MLX 0.31.2 has no individual
+ // Reuse MLX's thread-local device stream: MLX 0.32.3 has no individual
  // stream-destruction API, so new_stream per model would retain global queues.
  *out=new S(mx::default_stream(d));CATCH}
 void apx_mlx_stream_free(void* p){delete static_cast<S*>(p);}
@@ -84,7 +87,7 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 26:return mx::less_equal(a.at(0),a.at(1),s);
  case 27:return mx::where(a.at(0),a.at(1),a.at(2),s);
  case 28:return mx::zeros(shape(ints+1,nints-1),dtype(i(0)),s);
- case 29:return mx::fast::scaled_dot_product_attention(a.at(0),a.at(1),a.at(2),f(0),i(0)?"causal":"",a.size()>3?std::optional<A>(a[3]):std::nullopt,std::nullopt,s);
+ case 29:return mx::fast::scaled_dot_product_attention(a.at(0),a.at(1),a.at(2),f(0),i(0)?"causal":"",a.size()>3?std::optional<A>(a[3]):std::nullopt,std::nullopt,false,s);
  case 30:return mx::fast::rope(a.at(0),i(0),i(1)!=0,f(0),f(1),a.at(1),std::nullopt,s);
  case 31:return mx::quantized_matmul(a.at(0),a.at(1),a.at(2),a.at(3),i(0)!=0,i(1),i(2),"affine",s);
  case 32:{size_t rank=i(0);if(nints!=2+2*rank)throw std::invalid_argument("strides rank mismatch");mx::Strides strides;for(size_t j=0;j<rank;++j)strides.push_back(i(1+rank+j));return mx::as_strided(a.at(0),shape(ints+1,rank),strides,i(1+2*rank),s);}
@@ -108,6 +111,13 @@ int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t sha
 void apx_mlx_compile_free(void* p){delete static_cast<F*>(p);}
 int apx_mlx_compile_call(void* p,const void* const* inputs,size_t n,void** outputs,size_t count){TRY auto result=(*static_cast<F*>(p))(arrays(inputs,n));publish(result,outputs,count);CATCH}
 int apx_mlx_quantize(void* s,const void* input,int32_t group,int32_t bits,void** outputs){TRY auto result=mx::quantize(*static_cast<const A*>(input),group,bits,"affine",std::nullopt,*static_cast<S*>(s));publish(result,outputs,3);CATCH}
+// Lazy MLX Load arrays in name order; MLX reads on its CPU device when evaluated.
+using Loaded=std::vector<std::pair<std::string,A>>;
+int apx_mlx_safetensors_load(const char* path,void** out,size_t* count){TRY
+ auto entries=std::make_unique<Loaded>();for(auto& item:mx::load_safetensors(std::string(path)).first)entries->emplace_back(item.first,item.second);
+ std::sort(entries->begin(),entries->end(),[](const auto& a,const auto& b){return a.first<b.first;});*count=entries->size();*out=entries.release();CATCH}
+int apx_mlx_safetensors_entry(const void* p,size_t i,const char** name,void** out){TRY const auto& entry=static_cast<const Loaded*>(p)->at(i);*out=new A(entry.second);*name=entry.first.c_str();CATCH}
+void apx_mlx_safetensors_free(void* p){delete static_cast<Loaded*>(p);}
 int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
  std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
