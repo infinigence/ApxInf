@@ -7,6 +7,7 @@ pub mod d3;
 pub mod debug;
 mod generation_config;
 pub mod gr00t;
+pub mod image;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -34,6 +35,7 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use debug::{DebugCapture, DebugConfig};
+pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
