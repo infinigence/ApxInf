@@ -25,6 +25,37 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
+    let (variant, draft) = admit(options)?;
+    let native = backend
+        .as_any()
+        .downcast_ref::<MlxBackend>()
+        .ok_or(Error::Contract("MiniCPM5 requires the native MLX backend"))?
+        .clone();
+    if native.device() != device {
+        return Err(Error::DeviceMismatch {
+            expected: device,
+            got: native.device(),
+        });
+    }
+    let directory = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .ok_or(Error::Contract("checkpoint file has no parent"))?
+    };
+    let config = Config::from_json(&std::fs::read_to_string(directory.join("config.json"))?)?;
+    let (map, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
+    let weights = weights::Weights::load(&config, native.stream(), map)?;
+    let target = MiniCpm5::new(config, weights, native, variant)?;
+    if let Some(draft) = draft {
+        Ok(LoadedModel::text(Box::new(DSpark::load(target, draft)?)))
+    } else {
+        Ok(LoadedModel::text(Box::new(target)))
+    }
+}
+
+/// Device-independent option admission. DSpark also returns its draft asset.
+fn admit(options: &LoadOptions) -> Result<(Variant, Option<&Path>)> {
     if !matches!(
         options.precision,
         ModelPrecision::Auto | ModelPrecision::Bf16
@@ -56,35 +87,42 @@ pub fn load(
             options
                 .assets
                 .get("draft")
-                .ok_or(Error::Contract("missing MiniCPM5 DSpark draft asset"))?,
+                .ok_or(Error::Contract("missing MiniCPM5 DSpark draft asset"))?
+                .as_path(),
         )
     } else {
         None
     };
-    let native = backend
-        .as_any()
-        .downcast_ref::<MlxBackend>()
-        .ok_or(Error::Contract("MiniCPM5 requires the native MLX backend"))?
-        .clone();
-    if native.device() != device {
-        return Err(Error::DeviceMismatch {
-            expected: device,
-            got: native.device(),
-        });
+    Ok((variant, draft))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn options(variant: Option<&str>, assets: &[&str]) -> LoadOptions {
+        LoadOptions {
+            model_variant: variant.map(str::to_owned),
+            assets: assets.iter().map(|&n| (n.into(), n.into())).collect(),
+            ..LoadOptions::default()
+        }
     }
-    let directory = if path.is_dir() {
-        path
-    } else {
-        path.parent()
-            .ok_or(Error::Contract("checkpoint file has no parent"))?
-    };
-    let config = Config::from_json(&std::fs::read_to_string(directory.join("config.json"))?)?;
-    let (map, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
-    let weights = weights::Weights::load(&config, native.stream(), map)?;
-    let target = MiniCpm5::new(config, weights, native, variant)?;
-    if let Some(draft) = draft {
-        Ok(LoadedModel::text(Box::new(DSpark::load(target, draft)?)))
-    } else {
-        Ok(LoadedModel::text(Box::new(target)))
+
+    #[test]
+    fn admission_needs_no_device_or_checkpoint() {
+        assert_eq!(admit(&options(None, &[])).unwrap().0, Variant::Compiled);
+        assert_eq!(
+            admit(&options(Some("bf16-public"), &[])).unwrap().0,
+            Variant::Public
+        );
+        assert!(admit(&options(Some("mixed-w8"), &[])).is_err());
+        assert!(admit(&options(None, &["draft"])).is_err());
+        assert!(admit(&options(Some("dspark"), &[])).is_err());
+        assert!(admit(&options(Some("dspark"), &["drafter"])).is_err());
+        assert!(admit(&options(Some("dspark"), &["draft", "extra"])).is_err());
+        let dspark = options(Some("dspark"), &["draft"]);
+        let (variant, draft) = admit(&dspark).unwrap();
+        assert_eq!(variant, Variant::DSpark);
+        assert_eq!(draft, Some(Path::new("draft")));
     }
 }
