@@ -306,7 +306,8 @@ chunk and action step; hashing a known failing baseline does not qualify it.
 Linux ARM64 runners need Git, Bash, flock, realpath, Rust/Cargo, the supported
 CUDA toolchain, `nvpmodel`, `jetson_clocks`, Thor's `nvidia-smi` or Orin's
 `tegrastats`/`stdbuf`, and a Python environment
-with `scripts/requirements-pi05-ci.txt`. The wrapper builds `apxinf-py` with
+with `scripts/requirements-pi05-ci.txt` (NumPy and Pillow; Pillow is also needed
+by the CPU benchmark-import tests). The wrapper builds `apxinf-py` with
 `cuda,extension-module` against that Python. CUDA builds need the repository's
 native-kernel dependencies and may take substantially longer than inference.
 The GPU job's 90-minute timeout is an operational cap, not a latency budget:
