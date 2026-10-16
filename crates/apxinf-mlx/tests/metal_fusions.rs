@@ -233,3 +233,56 @@ fn gated_delta_recurrence_matches_host_reference() -> Result<()> {
         .is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn half_split_rope_rotates_leading_pairs_and_copies_the_rest() -> Result<()> {
+    use apxinf_mlx::fusions::HalfSplitRope;
+    let s = Stream::metal(0)?;
+    let (heads, len, width, rotary) = (2, 5, 8, 4);
+    let x = Array::from_f32(
+        &s,
+        &[1, heads, len, width],
+        &data(heads * len * width, 13, 0.25),
+    )?
+    .cast(D::BF16)?;
+    let xv = x.to_f32_vec()?;
+    let positions = Array::from_i32(&s, &[1, len], &[0, 1, 2, 3, 3000])?;
+    let inv = [1f32, 0.01];
+    let inv_freq = Array::from_f32(&s, &[rotary / 2], &inv)?;
+    let out = HalfSplitRope::new(&s, rotary)?.call(&x, &positions, &inv_freq)?;
+    assert_eq!((out.shape(), out.dtype()), (x.shape(), D::BF16));
+    let mut expected = xv.clone();
+    for h in 0..heads {
+        for (t, pos) in [0f32, 1., 2., 3., 3000.].into_iter().enumerate() {
+            let base = (h * len + t) * width;
+            for i in 0..rotary / 2 {
+                let (c, s) = ((pos * inv[i]).cos(), (pos * inv[i]).sin());
+                let (a, b) = (xv[base + i], xv[base + i + rotary / 2]);
+                expected[base + i] = a * c - b * s;
+                expected[base + i + rotary / 2] = b * c + a * s;
+            }
+        }
+    }
+    let expected = Array::from_f32(&s, &[expected.len()], &expected)?
+        .cast(D::BF16)?
+        .to_f32_vec()?;
+    let actual = out.to_f32_vec()?;
+    assert_within(&actual, &expected, 1. / 64., 1e-3);
+    for h in 0..heads {
+        for t in 0..len {
+            let base = (h * len + t) * width;
+            assert_eq!(
+                &actual[base + rotary..base + width],
+                &xv[base + rotary..base + width]
+            );
+        }
+    }
+    let rope = HalfSplitRope::new(&s, rotary)?;
+    assert!(rope
+        .call(&x, &positions.reshape(&[len, 1])?, &inv_freq)
+        .is_err());
+    assert!(rope.call(&x, &positions, &inv_freq.cast(D::BF16)?).is_err());
+    assert!(HalfSplitRope::new(&s, 3).is_err());
+    Ok(())
+}
