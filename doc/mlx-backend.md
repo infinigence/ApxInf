@@ -130,6 +130,32 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+### Implemented image selection
+
+[`metal_qwen_image`](../crates/apxinf-model/src/metal_qwen_image/README.md)
+runs Qwen-Image-2.1 text-to-image from the mflux 4-bit
+export (affine Q4 DiT, BF16 text encoder, F32 VAE decoder) and follows the
+mflux f0bf9cf0 txt2img path with `--low-ram`. The export has no top-level
+`config.json`; detection reads the transformer index. The family admits 40
+linear steps at guidance 1, batch 1, and sides that are multiples of 16. It
+returns RGB8 through `ImageRuntime`; the CLI writes binary PPM, so no image
+codec dependency is added.
+
+- Loading reads the tokenizer, checks every text-encoder tensor header, and
+  loads the DiT and VAE decoder with complete key, shape and dtype checks.
+- A request reads the text encoder one layer at a time and frees each layer.
+  The DiT computes the text-prefix K/V once and then runs one compiled image
+  forward per step. It is released before the tiled VAE decode (512 px tiles,
+  128 px overlap) and read again by the next request, as `--low-ram` does.
+- The checkpoint weights are under the Qwen Research License, which permits
+  non-commercial use only. APXinf ships no weights.
+
+```sh
+cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4bit \
+  --width 1024 --height 576 --seed 42 --prompt 'A lighthouse at dusk' \
+  --output lighthouse.ppm
+```
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.

@@ -359,6 +359,24 @@ impl AutoModel {
             }
         }
         let config_path = model_dir.join("config.json");
+        // mflux image exports have no top-level config.json; the single-stream
+        // text projection in the transformer index identifies Qwen-Image-2.1.
+        let transformer_index = model_dir.join("transformer/model.safetensors.index.json");
+        if !config_path.is_file() && transformer_index.is_file() {
+            let raw = std::fs::read_to_string(&transformer_index).map_err(|error| {
+                Error::Other(format!("read {}: {error}", transformer_index.display()))
+            })?;
+            let index: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+                Error::Other(format!("parse {}: {error}", transformer_index.display()))
+            })?;
+            let weights = index.get("weight_map");
+            if ["txt_in.text_norm.weight", "modulation.layers.1.weight"]
+                .iter()
+                .all(|name| weights.and_then(|map| map.get(name)).is_some())
+            {
+                return Ok("qwen_image".to_owned());
+            }
+        }
         let raw = std::fs::read_to_string(&config_path)
             .map_err(|error| Error::Other(format!("read {}: {error}", config_path.display())))?;
         let config: serde_json::Value = serde_json::from_str(&raw)
@@ -812,6 +830,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(AutoModel::detect_model_name(&directory).unwrap(), "d3");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mflux_qwen_image_export_is_detected_without_config_json() {
+        let directory = temporary_directory("qwen-image-detection");
+        std::fs::create_dir(directory.join("transformer")).unwrap();
+        std::fs::write(
+            directory.join("transformer/model.safetensors.index.json"),
+            r#"{"weight_map":{"txt_in.text_norm.weight":"0.safetensors",
+                "modulation.layers.1.weight":"1.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "qwen_image"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
