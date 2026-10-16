@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -447,8 +448,12 @@ def compare_results(root: Path, reference: dict[str, Any], actual: dict[str, Any
             raise ValueError("result suite/schema mismatch")
         if [row["name"] for row in result["cases"]] != [row["name"] for row in manifest["cases"]]:
             raise ValueError("result cases differ from manifest")
-    if reference["checkpoint_sha256"] != actual["checkpoint_sha256"]:
-        raise ValueError("reference and candidate loaded different checkpoint weights")
+    for key in ("checkpoint_sha256", "config_sha256"):
+        value = reference.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"reference {key} missing or invalid")
+        if actual.get(key) != value:
+            raise ValueError(f"reference and candidate {key} differ")
     rows = []
     for entry, left, right in zip(manifest["cases"], reference["cases"], actual["cases"], strict=True):
         if left["input_sha256"] != entry["sha256"] or right["input_sha256"] != entry["sha256"]:

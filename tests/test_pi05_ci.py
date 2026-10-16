@@ -68,7 +68,7 @@ class ReceiptTest(unittest.TestCase):
             "horizon": 2, "num_flow_steps": 10,
         })
         self.receipt = {"schema": parity.SCHEMA, "suite_sha256": parity.sha256(self.root / "manifest.json"),
-                        "checkpoint_sha256": "b" * 64, "cases": [{"name": "one",
+                        "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64, "cases": [{"name": "one",
                         "input_sha256": entry["sha256"], "actions": np.ones((2, 32)).tolist()}]}
 
     def compare(self, actual):
@@ -81,7 +81,7 @@ class ReceiptTest(unittest.TestCase):
         self.assertFalse(self.compare(actual)[0]["passed"])
 
     def test_changed_receipts(self):
-        for key in ("schema", "suite_sha256", "checkpoint_sha256"):
+        for key in ("schema", "suite_sha256", "checkpoint_sha256", "config_sha256"):
             actual = copy.deepcopy(self.receipt)
             actual[key] = "changed"
             with self.assertRaises(ValueError):
@@ -90,6 +90,14 @@ class ReceiptTest(unittest.TestCase):
             actual = dict(self.receipt, cases=actual_cases)
             with self.assertRaises(ValueError):
                 self.compare(actual)
+
+    def test_missing_model_identity_is_rejected_even_when_outputs_match(self):
+        for key in ("checkpoint_sha256", "config_sha256"):
+            for value in (None, "", "invalid"):
+                with self.subTest(key=key, value=value):
+                    record = dict(self.receipt, **{key: value})
+                    with self.assertRaises(ValueError):
+                        parity.compare_results(self.root, record, record, LIMITS)
 
     def test_input_tampering(self):
         (self.root / "cases/one.npz").write_bytes(b"changed")
