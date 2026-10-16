@@ -116,7 +116,7 @@ fn l3_geglu_bf16(ctx: &Context, input: &Tensor) -> Result<Tensor> {
     }
     let mut output =
         ctx.allocate_output(Shape::new(vec![shape[0], shape[1] / 2]), DType::BF16)?;
-    let args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Geglu, input, &mut output);
+    let args = ops::PointwiseArgs::new(ops::PointwiseSemantic::GegluStagedBf16, input, &mut output);
     ops::pointwise(ctx, args)?;
     Ok(output)
 }

@@ -51,6 +51,20 @@ parameters are RED, and restoration is GREEN. This proves the operator cases;
 current-source full-model and performance acceptance remain pending.
 Norm/RoPE graph storage retention also has two actual GPU RED/GREEN regressions.
 
+The staged BF16 RoPE semantic retains frequency, sin/cos and product rounding;
+GPU reference tests cover eight geometries/positions, bias, KV offsets, replay
+and changed inputs. Removing product staging fails the independent reference.
+PI05 BF16 and INT8 explicitly select this semantic.
+
+The staged BF16 GeGLU semantic rounds GELU before multiplying by the up
+projection. Orin CUDA 12.6 tests cover scalar/packed-2/packed-4, widths
+8192/16384, prefix lengths through 968 and action length 50. The unrounded
+control fails; the staged path and changed-input graph replay pass. BF16
+composes the existing GEMM with this pointwise semantic; INT8 selects the same
+pointwise semantic after quantized projection. This does not yet qualify the
+full model or establish performance parity with the prior fused candidate.
+All changes still require the complete board/precision/view acceptance below.
+
 ### Historical numerical evidence
 
 The following real-image results describe the pre-migration implementation at

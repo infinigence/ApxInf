@@ -6,13 +6,13 @@ use crate::pi05::backend::{
         adaptive_rms_norm as l3_adaptive_rms_norm, bias_residual as l3_bias_residual,
         bias_residual_layer_norm as l3_bias_residual_layer_norm,
         bias_residual_rms_norm as l3_bias_residual_rms_norm, gemm as l3_gemm,
-        gemm_geglu as l3_gemm_geglu, layer_norm as l3_layer_norm,
+        layer_norm as l3_layer_norm,
         pointwise as l3_pointwise, rms_norm as l3_rms_norm,
         reserve_prefix as l3_reserve_prefix, rope as l3_rope, AttentionArgs, GatherArgs,
         AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs, GemmGegluArgs,
+        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs,
         LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic, RmsNormArgs,
-        RopeArgs, RopeSemantic, WeightVersion,
+        RopeArgs, RopeSemantic,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -181,15 +181,12 @@ fn gemm_geglu_bf16(
             canonical_weight.dtype()
         )));
     }
-    crate::pi05::model::calibration::observe_bf16_activation(
-        activation,
-        canonical_weight,
-    )?;
+    let projected = gemm_bf16(ctx, policies, activation, canonical_weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
-    let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output)
-        .with_immutable_weight(WeightVersion::new(1));
-    gemm.policy = policies.gemm.clone();
-    l3_gemm_geglu(ctx, GemmGegluArgs { gemm })?;
+    l3_pointwise(
+        ctx,
+        PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &projected, &mut output),
+    )?;
     Ok(output)
 }
 

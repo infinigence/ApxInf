@@ -1119,3 +1119,32 @@ fn staged_rope_rejects_invalid_bindings() {
     .unwrap_err();
     assert!(error.to_string().contains("must not overlap"));
 }
+
+#[test]
+fn staged_geglu_rejects_invalid_bindings() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f16_tensor(0, vec![1, 8], &[1.0; 8]);
+    let mut output = f16_tensor(0, vec![1, 4], &[0.0; 4]);
+    let error = pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output)).unwrap_err();
+    assert!(error.to_string().contains("requires BF16"));
+    let input = tensor(0, vec![1, 8], &[1.0; 8]);
+    let mut output = apxinf_core::Tensor::from_raw_parts(apxinf_core::Shape::new(vec![1, 4]), input.dtype(), input.device(), input.storage().clone());
+    let error = pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output)).unwrap_err();
+    assert!(error.to_string().contains("must not overlap"));
+}
+
+#[test]
+fn direct_pointwise_graph_retains_tensor_storage() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = tensor(0, vec![1, 8], &[0.0; 8]);
+    let owner = std::sync::Arc::downgrade(input.storage().as_gpu().unwrap().owner().unwrap());
+    let mut output = tensor(0, vec![1, 4], &[1.0; 4]);
+    let graph = crate::capture(&ctx, || pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output))).unwrap();
+    drop(input);
+    assert!(owner.upgrade().is_some(), "captured pointwise released its input");
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![0.0; 4]);
+    drop(graph);
+    assert!(owner.upgrade().is_none(), "destroyed graph leaked its input");
+}

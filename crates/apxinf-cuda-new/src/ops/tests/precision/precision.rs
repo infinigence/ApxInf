@@ -855,3 +855,59 @@ fn staged_bf16_rope_matches_torch() {
         }
     }
 }
+
+#[path = "staged_geglu_torch_fixture.rs"]
+mod staged_geglu_fixture;
+
+#[test]
+fn staged_bf16_geglu_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (rows, cols) in [
+        (2, 7),
+        (2, 6),
+        (2, 8),
+        (50, 8192),
+        (264, 16384),
+        (712, 16384),
+        (968, 16384),
+    ] {
+        let mut input = Vec::with_capacity(rows * cols * 2);
+        let mut expected = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for pattern in [staged_geglu_fixture::GATE, staged_geglu_fixture::UP] {
+                input.extend((0..cols).map(|col| pattern[(row * cols + col) % pattern.len()]));
+            }
+            expected.extend((0..cols).map(|col| {
+                half::bf16::from_bits(staged_geglu_fixture::OUTPUT[(row * cols + col) % 16])
+                    .to_f32()
+            }));
+        }
+        let input = bf16_bits_tensor(0, vec![rows, cols * 2], &input);
+        let mut output = zeros_tensor(0, vec![rows, cols], DType::BF16);
+        let mut launch = || {
+            pointwise(
+                &ctx,
+                PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output),
+            )
+        };
+        launch().unwrap();
+        ctx.synchronize().unwrap();
+        let graph = crate::capture(&ctx, launch).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            super::framework::values(&output),
+            expected,
+            "rows={rows} cols={cols}"
+        );
+        crate::CudaBuffer::from_tensor(&input)
+            .unwrap()
+            .copy_from_host(&vec![0; rows * cols * 4])
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(super::framework::values(&output)
+            .iter()
+            .all(|value| *value == 0.0));
+    }
+}

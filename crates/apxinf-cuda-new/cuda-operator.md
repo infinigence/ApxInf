@@ -191,3 +191,36 @@ a multiple of four, at most 256, and the rotary dimension equals the head dimens
 
 In-place BF16 partial temporal/height/width rotary embedding. The supported
 rotary dimension is 64 with pair sections 11/11/10 and explicit device positions.
+
+## Pointwise
+
+<!-- l3-operator:pointwise_geglu -->
+### `PointwiseSemantic::Geglu`
+
+Contiguous `[rows, 2 * cols]` gate/up input to `[rows, cols]` output:
+`gelu_tanh(gate) * up`. F16 and BF16 preserve FP32 activation intermediates;
+F16-to-E4M3 additionally supports an explicit output scale. The direct adapter
+selects scalar or aligned vector kernels and does not persist recipes.
+
+<!-- l3-operator:pointwise_geglu_staged_bf16 -->
+### `PointwiseSemantic::GegluStagedBf16`
+
+BF16 input/output only. Computes `BF16(BF16(gelu_tanh(gate)) * up)`;
+input and output must not overlap. Scalar, packed-2 and packed-4 kernels share
+this rounding contract. Fixed Torch fixtures cover those paths and PI0.5
+widths 8192/16384, eager/captured execution, and changed-input replay.
+
+<!-- l3-operator:pointwise_bias_activation -->
+### `PointwiseSemantic::BiasActivation`
+
+F16/BF16 `[rows, cols]` input with optional `[cols]` bias, followed by the
+explicitly selected None, GELU-tanh, GELU-erf or SiLU activation. A call with
+neither bias nor activation is rejected.
+
+<!-- l3-operator:pointwise_euler_update -->
+### `PointwiseSemantic::EulerUpdate`
+
+F16/BF16 state and velocity `[rows, cols]`, output `state + dt * velocity`.
+The finite step size is a dynamic binding. Pointwise captures retain their
+input/output storage until the graph is destroyed; no preparation or tuning
+runs during capture.

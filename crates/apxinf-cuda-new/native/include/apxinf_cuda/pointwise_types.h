@@ -21,6 +21,7 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_GEGLU = 0,
   APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION = 1,
   APXINF_POINTWISE_SEMANTIC_EULER_UPDATE = 2,
+  APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 = 3,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -31,7 +32,7 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
 } apxinf_pointwise_activation_t;
 
-#define APXINF_POINTWISE_SPEC_VERSION 1u
+#define APXINF_POINTWISE_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
