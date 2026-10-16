@@ -10,6 +10,89 @@ fn int(value: usize, what: &'static str) -> Result<TemplateArg> {
         .map_err(|_| Error::Contract(what))
 }
 
+fn check_index_extent(
+    rows: usize,
+    columns: usize,
+    max_index: usize,
+    what: &'static str,
+) -> Result<()> {
+    rows.checked_mul(columns)
+        .and_then(|extent| extent.checked_sub(1))
+        .filter(|&last| last <= max_index)
+        .ok_or(Error::Contract(what))?;
+    Ok(())
+}
+
+fn check_q4_decode(total: usize, words: usize, row0: usize, rows: usize) -> Result<usize> {
+    let width = words
+        .checked_mul(8)
+        .ok_or(Error::Contract("Q4 decode width overflows usize"))?;
+    if width == 0 || width % 64 != 0 || rows == 0 || rows % 32 != 0 {
+        return Err(Error::Contract(
+            "Q4 decode requires K a multiple of 64 and a row range of whole 32-row blocks",
+        ));
+    }
+    let end = row0
+        .checked_add(rows)
+        .filter(|&end| end <= total)
+        .ok_or(Error::Contract("Q4 decode row range exceeds the weight"))?;
+    int(rows, "Q4 decode rows exceed i32")?;
+    int(width, "Q4 decode width exceeds i32")?;
+    int(row0, "Q4 decode row offset exceeds i32")?;
+    check_index_extent(
+        end,
+        words,
+        u32::MAX as usize,
+        "Q4 decode packed weight index exceeds u32",
+    )?;
+    check_index_extent(
+        end,
+        width / 64,
+        u32::MAX as usize,
+        "Q4 decode scale/bias index exceeds u32",
+    )?;
+    check_index_extent(
+        width,
+        rows,
+        u32::MAX as usize,
+        "Q4 decode output index before vector division exceeds u32",
+    )?;
+    Ok(width)
+}
+
+fn check_split_gemm(padded: usize, tokens: usize, width: usize, half: usize) -> Result<usize> {
+    let full = half
+        .checked_mul(2)
+        .ok_or(Error::Contract("split GEMM output width overflows usize"))?;
+    if padded == 0
+        || padded % 64 != 0
+        || tokens == 0
+        || tokens > padded
+        || padded - tokens >= 64
+        || width == 0
+        || width % 16 != 0
+        || half == 0
+        || half % 64 != 0
+        || [padded, width, full]
+            .iter()
+            .any(|&value| i32::try_from(value).is_err())
+    {
+        return Err(Error::Contract(
+            "split GEMM requires P = T rounded up to 64, K a multiple of 16 \
+             and NW a multiple of 64",
+        ));
+    }
+    for (rows, columns, what) in [
+        (padded, width, "split GEMM input index exceeds i32"),
+        (width, half, "split GEMM weight index exceeds i32"),
+        (tokens, half, "split GEMM low output index exceeds i32"),
+        (tokens, full, "split GEMM high output index exceeds i32"),
+    ] {
+        check_index_extent(rows, columns, i32::MAX as usize, what)?;
+    }
+    Ok(full)
+}
+
 /// Where the affine expression `scale * q + bias` is evaluated before the
 /// result is stored as FP16.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,20 +146,14 @@ impl Q4TransposeDecode {
         let [total, words] = *weight.shape() else {
             return Err(Error::Contract("Q4 decode weight must be rank 2"));
         };
-        let k = words * 8;
+        let k = check_q4_decode(total, words, row0, rows)?;
         if weight.dtype() != MlxDType::U32
-            || k == 0
-            || k % 64 != 0
             || [scales, biases]
                 .iter()
                 .any(|a| a.shape() != [total, k / 64] || a.dtype() != MlxDType::BF16)
-            || rows == 0
-            || rows % 32 != 0
-            || row0.checked_add(rows).map_or(true, |end| end > total)
         {
             return Err(Error::Contract(
-                "Q4 decode requires U32 [N, K/8] with BF16 [N, K/64] scales and biases, \
-                 K a multiple of 64, and a row range of whole 32-row blocks",
+                "Q4 decode requires U32 [N, K/8] with BF16 [N, K/64] scales and biases",
             ));
         }
         // SAFETY: each 256-thread group decodes a 32-row by 64-column block:
@@ -93,9 +170,9 @@ impl Q4TransposeDecode {
                 [k / 64 * 256, rows / 32, 1],
                 [256, 1, 1],
                 &[
-                    ("N", int(rows, "Q4 decode rows exceed i32")?),
-                    ("K", int(k, "Q4 decode width exceeds i32")?),
-                    ("R0", int(row0, "Q4 decode row offset exceeds i32")?),
+                    ("N", TemplateArg::Int(rows as i32)),
+                    ("K", TemplateArg::Int(k as i32)),
+                    ("R0", TemplateArg::Int(row0 as i32)),
                 ],
             )?
         };
@@ -194,39 +271,24 @@ impl SplitF16Gemm {
         })
     }
 
-    fn check(x: &Array, tokens: usize, weight: &Array) -> Result<(usize, usize, usize)> {
+    fn check(x: &Array, tokens: usize, weight: &Array) -> Result<(usize, usize, usize, usize)> {
         let [1, padded, k] = *x.shape() else {
             return Err(Error::Contract("split GEMM input must be [1, P, K]"));
         };
         let [wk, half] = *weight.shape() else {
             return Err(Error::Contract("split GEMM weight must be [K, NW]"));
         };
-        if x.dtype() != MlxDType::F16
-            || weight.dtype() != MlxDType::F16
-            || padded == 0
-            || padded % 64 != 0
-            || tokens == 0
-            || tokens > padded
-            || padded - tokens >= 64
-            || k == 0
-            || k % 16 != 0
-            || wk != k
-            || half == 0
-            || half % 64 != 0
-            || [padded, k, half * 2]
-                .iter()
-                .any(|&v| i32::try_from(v).is_err())
-        {
+        if x.dtype() != MlxDType::F16 || weight.dtype() != MlxDType::F16 || wk != k {
             return Err(Error::Contract(
-                "split GEMM requires FP16 [1, P, K] with P = T rounded up to 64, \
-                 K a multiple of 16 and an FP16 [K, NW] weight with NW a multiple of 64",
+                "split GEMM requires FP16 [1, P, K] input and FP16 [K, NW] weight",
             ));
         }
-        Ok((padded, k, half))
+        let full = check_split_gemm(padded, tokens, k, half)?;
+        Ok((padded, k, half, full))
     }
 
     pub fn low(&self, x: &Array, tokens: usize, weight: &Array) -> Result<Array> {
-        let (padded, k, half) = Self::check(x, tokens, weight)?;
+        let (padded, k, half, _) = Self::check(x, tokens, weight)?;
         // SAFETY: each 128-thread group owns a 64 x 64 output tile at rows
         // `64 * group.y < P` and columns `64 * group.x < NW`. A, B loads index
         // rows < P of x and rows < K, columns < NW of the weight, with K a
@@ -250,7 +312,7 @@ impl SplitF16Gemm {
     }
 
     pub fn high(&self, weight: &Array, low: &Array, x: &Array, tokens: usize) -> Result<Array> {
-        let (padded, k, half) = Self::check(x, tokens, weight)?;
+        let (padded, k, half, full) = Self::check(x, tokens, weight)?;
         if low.shape() != [1, tokens, half] || low.dtype() != MlxDType::BF16 {
             return Err(Error::Contract(
                 "split GEMM high half requires the BF16 [1, T, NW] low result",
@@ -263,17 +325,172 @@ impl SplitF16Gemm {
         let out = unsafe {
             self.high.call(
                 &[weight.clone(), low.clone(), x.clone()],
-                &[(&[1, tokens, half * 2], MlxDType::BF16)],
+                &[(&[1, tokens, full], MlxDType::BF16)],
                 [half / 64 * 128, padded / 64, 1],
                 [128, 1, 1],
                 &[
                     ("T", TemplateArg::Int(tokens as i32)),
                     ("K", TemplateArg::Int(k as i32)),
                     ("NW", TemplateArg::Int(half as i32)),
-                    ("N", TemplateArg::Int((half * 2) as i32)),
+                    ("N", TemplateArg::Int(full as i32)),
                 ],
             )?
         };
         Ok(out.into_iter().next().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_index_extent, check_q4_decode, check_split_gemm};
+    use apxinf_core::{Error, Result};
+
+    fn assert_contract_error(result: Result<usize>) {
+        assert!(matches!(result, Err(Error::Contract(_))), "{result:?}");
+    }
+
+    #[test]
+    fn index_extent_checks_products_and_inclusive_last_index() {
+        assert!(check_index_extent(2, 4, 7, "extent").is_ok());
+        for (rows, columns, limit) in [(2, 4, 6), (0, 4, 7), (4, 0, 7), (usize::MAX, 2, usize::MAX)]
+        {
+            assert!(matches!(
+                check_index_extent(rows, columns, limit, "extent"),
+                Err(Error::Contract("extent"))
+            ));
+        }
+    }
+
+    #[test]
+    fn q4_decode_rejects_reported_output_wrap_before_vector_division() {
+        assert_contract_error(check_q4_decode(65_536, 8_200, 0, 65_536));
+    }
+
+    #[test]
+    fn q4_decode_rejects_source_wrap_with_nonzero_row_offset() {
+        assert_contract_error(check_q4_decode(536_870_913, 8, 536_870_881, 32));
+        assert_contract_error(check_q4_decode(1_073_741_856, 64, 1_073_741_824, 32));
+    }
+
+    #[test]
+    fn q4_decode_checks_rust_arithmetic() {
+        for words in [usize::MAX / 8 + 1, usize::MAX / 8 + 9] {
+            assert_contract_error(check_q4_decode(32, words, 0, 32));
+        }
+        assert_contract_error(check_q4_decode(usize::MAX, 8, usize::MAX - 15, 32));
+    }
+
+    #[test]
+    fn q4_decode_accepts_unsigned_index_boundaries() {
+        assert_eq!(check_q4_decode(65_536, 8_192, 0, 65_536).unwrap(), 65_536);
+        assert_eq!(
+            check_q4_decode(536_870_912, 8, 536_870_880, 32).unwrap(),
+            64
+        );
+    }
+
+    #[test]
+    fn q4_decode_rejects_invalid_geometry() {
+        for (total, words, row0, rows) in [
+            (32, 0, 0, 32),
+            (32, 1, 0, 32),
+            (32, 8, 0, 0),
+            (64, 8, 0, 48),
+            (64, 8, 33, 32),
+            (32, 1 << 28, 0, 32),
+            (1 << 31, 8, 0, 1 << 31),
+            ((1 << 31) + 32, 8, 1 << 31, 32),
+        ] {
+            assert_contract_error(check_q4_decode(total, words, row0, rows));
+        }
+    }
+
+    #[test]
+    fn q4_decode_accepts_normal_and_clef_shapes() {
+        for (total, width) in [(96, 128), (8_192, 4_096), (4_096, 4_096), (4_096, 12_288)] {
+            assert_eq!(check_q4_decode(total, width / 8, 0, total).unwrap(), width);
+            for row0 in [0, total / 2] {
+                let rows = if total == 96 { 32 } else { total / 2 };
+                assert_eq!(
+                    check_q4_decode(total, width / 8, row0, rows).unwrap(),
+                    width
+                );
+            }
+        }
+        assert_eq!(check_q4_decode(33, 8, 1, 32).unwrap(), 64);
+    }
+
+    #[test]
+    fn split_gemm_rejects_reported_high_output_wrap() {
+        assert_contract_error(check_split_gemm(32_832, 32_769, 16, 32_768));
+    }
+
+    #[test]
+    fn split_gemm_rejects_input_wrap() {
+        assert_contract_error(check_split_gemm(128, 65, 16_777_232, 64));
+    }
+
+    #[test]
+    fn split_gemm_rejects_weight_wrap() {
+        assert_contract_error(check_split_gemm(64, 1, 16_777_232, 128));
+    }
+
+    #[test]
+    fn split_gemm_rejects_low_output_wrap() {
+        assert_contract_error(check_split_gemm(65_600, 65_537, 16, 32_768));
+    }
+
+    #[test]
+    fn split_gemm_checks_rust_arithmetic() {
+        for half in [usize::MAX / 2 + 1, usize::MAX / 2 + 65] {
+            assert_contract_error(check_split_gemm(64, 1, 16, half));
+        }
+    }
+
+    #[test]
+    fn split_gemm_accepts_signed_index_boundaries() {
+        for (padded, tokens, width, half) in [
+            (128, 65, 16_777_216, 64),
+            (64, 1, 16_777_216, 128),
+            (32_768, 32_768, 16, 32_768),
+        ] {
+            assert_eq!(
+                check_split_gemm(padded, tokens, width, half).unwrap(),
+                half * 2
+            );
+        }
+    }
+
+    #[test]
+    fn split_gemm_rejects_invalid_geometry() {
+        for (padded, tokens, width, half) in [
+            (0, 0, 16, 64),
+            (32, 1, 16, 64),
+            (64, 0, 16, 64),
+            (64, 65, 16, 64),
+            (128, 64, 16, 64),
+            (64, 1, 0, 64),
+            (64, 1, 8, 64),
+            (64, 1, 16, 0),
+            (64, 1, 16, 32),
+            (1 << 31, 1 << 31, 16, 64),
+            (64, 1, 1 << 31, 64),
+            (64, 1, 16, 1 << 30),
+        ] {
+            assert_contract_error(check_split_gemm(padded, tokens, width, half));
+        }
+    }
+
+    #[test]
+    fn split_gemm_accepts_normal_and_clef_shapes() {
+        for (width, half) in [(16, 64), (4_096, 4_096), (4_096, 2_048), (12_288, 2_048)] {
+            for tokens in 1usize..=4_096 {
+                let padded = tokens.div_ceil(64) * 64;
+                assert_eq!(
+                    check_split_gemm(padded, tokens, width, half).unwrap(),
+                    half * 2
+                );
+            }
+        }
     }
 }
