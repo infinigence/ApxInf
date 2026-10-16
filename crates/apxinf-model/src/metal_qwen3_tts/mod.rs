@@ -29,14 +29,30 @@ pub struct QwenTts {
     ops: Ops,
 }
 
+/// The predictor MLP selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// The EngineTailor predictor MLP kernels (default).
+    Fused,
+    /// The reference SwiGLU composition of the parity path.
+    Reference,
+}
+
 /// Device-independent option admission, checked before the checkpoint is read.
-fn admit(options: &LoadOptions) -> Result<()> {
-    if !matches!(options.model_variant.as_deref(), None | Some("auto"))
-        || !matches!(
-            options.precision,
-            ModelPrecision::Auto | ModelPrecision::Bf16
-        )
-        || options.text_weight_dtype.is_some()
+fn admit(options: &LoadOptions) -> Result<Variant> {
+    let variant = match options.model_variant.as_deref() {
+        None | Some("auto") => Variant::Fused,
+        Some("reference") => Variant::Reference,
+        Some(_) => {
+            return Err(Error::Contract(
+                "Qwen3-TTS MLX variants are `auto` (fused predictor MLP) and `reference`",
+            ))
+        }
+    };
+    if !matches!(
+        options.precision,
+        ModelPrecision::Auto | ModelPrecision::Bf16
+    ) || options.text_weight_dtype.is_some()
         || options.config.is_some()
         || options.synthetic.is_some()
         || options.calibration_path.is_some()
@@ -46,11 +62,11 @@ fn admit(options: &LoadOptions) -> Result<()> {
         || !options.assets.is_empty()
     {
         return Err(Error::Contract(
-            "Qwen3-TTS MLX loads the BF16 checkpoint as stored; variants, CUDA tuning, \
+            "Qwen3-TTS MLX loads the BF16 checkpoint as stored; CUDA tuning, \
              calibration, synthetic weights and auxiliary assets are unsupported",
         ));
     }
-    Ok(())
+    Ok(variant)
 }
 
 pub fn load(
@@ -62,7 +78,7 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
-    admit(options)?;
+    let variant = admit(options)?;
     let native = backend
         .as_any()
         .downcast_ref::<MlxBackend>()
@@ -90,7 +106,7 @@ pub fn load(
     let stream = native.stream().clone();
     let ops = Ops::new(&stream)?;
     let (talker, predictor) = weights::Talker::load(&stream, path)?;
-    let model = Model::new(talker, predictor, &ops)?;
+    let model = Model::new(talker, predictor, &ops, variant == Variant::Fused)?;
     let decoder = codec::Decoder::new(weights::Codec::load(&stream, path)?, &ops)?;
     Ok(LoadedModel::Speech(Box::new(QwenTts {
         config,
@@ -291,7 +307,12 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert!(admit(&LoadOptions::default()).is_ok());
+        assert_eq!(admit(&LoadOptions::default()).unwrap(), Variant::Fused);
+        let reference = LoadOptions {
+            model_variant: Some("reference".into()),
+            ..LoadOptions::default()
+        };
+        assert_eq!(admit(&reference).unwrap(), Variant::Reference);
         for options in [
             LoadOptions {
                 model_variant: Some("int8".into()),

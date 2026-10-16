@@ -22,6 +22,9 @@ feat/clef-g20-engine 6edc065c6ffd12bc347e5d06d77b5a000eb87e9d.
 
 The metal_qwen3_tts cast boundaries follow the EngineTailor Qwen3-TTS MLX
 parity path, source 282adc1dc5af4c48ffd17ea2f41e75cc5a24b7ee.
+The SwiGLU GEMV kernels derive from the EngineTailor Qwen3-TTS predictor MLP
+frontier, candidate SHA-256
+944fd18dd4d1723763aead7927cfde505c1c0ae8e513e49e74657613d2364892.
 
 The gated delta recurrence and the half-split rotary embedding kernel adapt
 MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.

@@ -33,6 +33,13 @@ and geometry fail at load.
 - `ops.rs` holds the parity arithmetic: FP32 SiLU before the BF16 cast, and
   the reference's compiled GELU and RoPE.
 
+Variants: the default `auto` runs the five code predictor MLPs on
+`apxinf_mlx::fusions::SwigluMlpGemv`, the EngineTailor predictor MLP frontier
+944fd18d. Its reduction order differs from MLX matmul. On Apple M4 it
+measured +1.66% over the parity path (eight utterances, p = 0.013) with
+identical codes and waveforms. `reference` keeps the parity path's composed
+SwiGLU everywhere.
+
 Verification status: CPU tests cover configuration admission, voices,
 languages and dialects. Codes and waveforms against the reference, repeated
 requests, memory and latency are measured on Apple M4 and reported in the PR;

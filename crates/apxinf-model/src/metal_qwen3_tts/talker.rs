@@ -4,6 +4,7 @@ use super::config::{EPS, HEADS, HEAD_DIM, KV_HEADS, ROPE_THETA};
 use super::ops::Ops;
 use super::weights::{Attention, Layer, Mlp, Predictor, Talker};
 use apxinf_core::Result;
+use apxinf_mlx::fusions::{SwigluMlpGemv, SwigluWeights};
 use apxinf_mlx::{Array, MlxDType};
 
 /// mlx_lm `KVCache`: storage grows in steps of 256 positions.
@@ -82,6 +83,9 @@ pub struct Model {
     /// Rotary inverse frequencies `[64]` FP32, computed once like the reference.
     inv_freq: Array,
     scale: f32,
+    /// The EngineTailor predictor MLP kernels with each layer's packed
+    /// weights; `None` runs the reference SwiGLU composition.
+    predictor_mlp: Option<(SwigluMlpGemv, Vec<SwigluWeights>)>,
 }
 
 fn heads(x: &Array, n: usize) -> Result<Array> {
@@ -92,15 +96,27 @@ fn heads(x: &Array, n: usize) -> Result<Array> {
 }
 
 impl Model {
-    pub fn new(talker: Talker, predictor: Predictor, ops: &Ops) -> Result<Self> {
+    pub fn new(talker: Talker, predictor: Predictor, ops: &Ops, fused_mlp: bool) -> Result<Self> {
         let inv_freq = ops.inv_freq(HEAD_DIM, ROPE_THETA)?;
         inv_freq.eval()?;
+        let predictor_mlp = if fused_mlp {
+            let kernel = SwigluMlpGemv::new(ops.stream())?;
+            let weights = predictor
+                .layers
+                .iter()
+                .map(|l| kernel.prepare(&l.mlp.gate.weight, &l.mlp.up.weight, &l.mlp.down.weight))
+                .collect::<Result<Vec<_>>>()?;
+            Some((kernel, weights))
+        } else {
+            None
+        };
         Ok(Self {
             talker,
             predictor,
             ops: ops.clone(),
             inv_freq,
             scale: (HEAD_DIM as f64).powf(-0.5) as f32,
+            predictor_mlp,
         })
     }
 
@@ -140,6 +156,7 @@ impl Model {
         a.o.apply(&out.transpose(&order)?.reshape(&[b, l, HEADS * HEAD_DIM])?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layer(
         &self,
         layer: &Layer,
@@ -148,6 +165,7 @@ impl Model {
         sin: &Array,
         mask: Option<&Array>,
         cache: &mut KvCache,
+        fused: Option<(&SwigluMlpGemv, &SwigluWeights)>,
     ) -> Result<Array> {
         let h = x.add(&self.attention(
             &layer.attention,
@@ -157,7 +175,12 @@ impl Model {
             mask,
             cache,
         )?)?;
-        h.add(&self.mlp(&layer.mlp, &h.fast_rms_norm(&layer.post_norm, EPS)?)?)
+        let y = h.fast_rms_norm(&layer.post_norm, EPS)?;
+        let y = match fused {
+            Some((kernel, weights)) => kernel.call(&y, weights)?,
+            None => self.mlp(&layer.mlp, &y)?,
+        };
+        h.add(&y)
     }
 
     /// Positions `[offset, offset + L)` as FP32 `[1, L]`.
@@ -197,7 +220,7 @@ impl Model {
             .transpose()?;
         let mut x = embeds.clone();
         for (layer, cache) in self.talker.layers.iter().zip(cache.iter_mut()) {
-            x = self.layer(layer, &x, &cos, &sin, mask.as_ref(), cache)?;
+            x = self.layer(layer, &x, &cos, &sin, mask.as_ref(), cache, None)?;
         }
         let hidden = x.fast_rms_norm(&self.talker.norm, EPS)?;
         Ok((self.talker.codec_head.apply(&hidden)?, hidden))
@@ -230,8 +253,9 @@ impl Model {
             .then(|| self.ops.causal_mask(l, x.dtype()))
             .transpose()?;
         let mut x = x;
-        for (layer, cache) in p.layers.iter().zip(cache.iter_mut()) {
-            x = self.layer(layer, &x, &cos, &sin, mask.as_ref(), cache)?;
+        for (i, (layer, cache)) in p.layers.iter().zip(cache.iter_mut()).enumerate() {
+            let fused = self.predictor_mlp.as_ref().map(|(k, w)| (k, &w[i]));
+            x = self.layer(layer, &x, &cos, &sin, mask.as_ref(), cache, fused)?;
         }
         p.heads[group].apply(&x.fast_rms_norm(&p.norm, EPS)?)
     }
