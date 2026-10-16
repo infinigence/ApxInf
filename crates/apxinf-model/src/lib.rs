@@ -25,6 +25,7 @@ pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
+pub mod speech;
 pub mod vla;
 mod walloss;
 
@@ -36,6 +37,7 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use debug::{DebugCapture, DebugConfig};
+pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};

@@ -17,6 +17,7 @@ use crate::llm_trait::{
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
+use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
@@ -94,6 +95,7 @@ pub enum LoadedModel {
     },
     Vla(Box<dyn VlaRuntime>),
     Decision(Box<dyn DecisionRuntime>),
+    Speech(Box<dyn SpeechRuntime>),
 }
 
 impl LoadedModel {
@@ -109,6 +111,7 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(&mut **model),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -117,6 +120,7 @@ impl LoadedModel {
             Self::Vla(model) => Ok(&**model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
         }
     }
 
@@ -125,6 +129,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(&mut **model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -137,6 +142,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.code_names()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -145,6 +151,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -157,6 +164,7 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(model.capabilities()),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -172,6 +180,9 @@ impl LoadedModel {
             )),
             Self::Decision(_) => Err(Error::Other(
                 "decision models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Speech(_) => Err(Error::Other(
+                "speech models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -215,7 +226,21 @@ impl LoadedModel {
             }
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
+    }
+
+    pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
+        match self {
+            Self::Speech(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not speech".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
+        }
+    }
+
+    pub fn synthesize(&mut self, request: &SpeechRequest<'_>) -> Result<GeneratedAudio> {
+        self.speech_mut()?.synthesize(request)
     }
 
     pub fn reset(&mut self) -> Result<()> {
