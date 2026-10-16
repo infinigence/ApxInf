@@ -92,6 +92,12 @@ parameters to FP32; loading their original FP32 checkpoint values is a different
 numerical experiment. Correcting that distinction alone does not repair the
 five selected failing/control cases.
 
+On five selected two-view inputs, the complete private BF16 control passes
+5/5 (four outputs are bitwise equal to official). Removing its staged GeGLU,
+RoPE rounding, or unfolded norms reduces passes to 2/5, 1/5, or 2/5 respectively.
+These interventions show that several numerical boundaries matter together;
+they do not qualify the private implementation for maintained deployment.
+
 A separate generic FP32 `gemm::matmul` defect was reproduced with a small CUDA
 graph test: allocating and zeroing its output during capture raises CUDA error
 900. Its output now uses the existing graph workspace; cuBLAS uses beta zero,
@@ -102,8 +108,10 @@ The maintained PI05 BF16/INT8 paths do not call this generic FP32 helper. All
 change; this is a capture repair, not a repair of the numerical failures above.
 A separate stock INT8 run uses two frozen real inputs per view, 30 warmups and
 50 samples per input, with alternating version order. Across 1–3 views the six
-P50/P95 changes are within 0.44% in magnitude. First-call and shape-return
-outliers require counterbalanced checks; the shared desktop environment does
+P50/P95 changes are within 0.44% in magnitude, including reversed-order checks
+of one and three views (1,000 timed samples in total). The initial first-call
+outlier does not recur; three-view shape return remains 0.66–0.78% slower in
+both pairs. This residual is recorded, and the shared desktop environment does
 not establish accepted performance budgets. Private FP32 pipeline timings are
 recorded separately from stock PI05 and official precision qualification.
 
