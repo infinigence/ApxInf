@@ -1,10 +1,7 @@
-//! Fixed-input GR00T N1.7 model-core benchmark.
-//!
-//! The input directory is produced by NVIDIA's official processor. Timing
-//! begins with those preprocessed host tensors and ends after action D2H.
+//! GR00T model-core benchmark with deterministic in-memory inputs.
 
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use apxinf_core::{Device, Tensor};
@@ -14,12 +11,9 @@ use apxinf_model::{
 use half::bf16;
 use serde_json::Value;
 
-const FIXTURE_SCHEMA: &str = "apxinf.gr00t-n1.7.preprocessed-fixture.v1";
-
 struct Arguments {
     checkpoint: PathBuf,
-    backbone: PathBuf,
-    fixture: PathBuf,
+    views: usize,
     precision: ModelPrecision,
     device: usize,
     warmup: usize,
@@ -30,7 +24,7 @@ struct Arguments {
     autotune: bool,
 }
 
-struct Fixture {
+struct Inputs {
     pixel_values: Tensor,
     grid: Vec<[u32; 3]>,
     token_ids: Vec<u32>,
@@ -41,15 +35,10 @@ struct Fixture {
     name: String,
 }
 
-struct TensorEntry {
-    path: PathBuf,
-    shape: Vec<usize>,
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_arguments()?;
-    let fixture = load_fixture(&args.fixture)?;
-    let mut options = LoadOptions {
+    let input = generated_inputs(&args)?;
+    let options = LoadOptions {
         model_name: Some("gr00t".into()),
         precision: args.precision,
         calibration_path: args.calibration.clone(),
@@ -57,26 +46,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         autotune: args.autotune,
         ..LoadOptions::default()
     };
-    options
-        .assets
-        .insert("backbone".into(), args.backbone.clone());
-
     let load_started = Instant::now();
     let model = AutoModel::load_model(Device::Cuda(args.device), &args.checkpoint, &options)?;
     let load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
     let observation = Observation {
-        vision: VisionObservation::Patches(fixture.pixel_values),
-        token_ids: fixture.token_ids,
-        state: Some(fixture.state),
+        vision: VisionObservation::Patches(input.pixel_values),
+        token_ids: input.token_ids,
+        state: Some(input.state),
         action_mask: None,
     };
     let metadata = VlaMetadata {
-        attention_mask: Some(&fixture.attention_mask),
-        image_grid_thw: Some(&fixture.grid),
-        embodiment_id: Some(fixture.embodiment_id),
+        attention_mask: Some(&input.attention_mask),
+        image_grid_thw: Some(&input.grid),
+        embodiment_id: Some(input.embodiment_id),
         planning: None,
     };
-    let request = VlaRequest::provided_with_metadata(&observation, &fixture.noise, metadata);
+    let request = VlaRequest::provided_with_metadata(&observation, &input.noise, metadata);
 
     for _ in 0..args.warmup {
         black_box(model.infer_host_f32(&request)?);
@@ -89,35 +74,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let [horizon, action_dim] = model.vla()?.action_shape();
+    let mut first_output: Option<Vec<f32>> = None;
     let mut samples = Vec::with_capacity(args.iterations);
     let mut last_output = Vec::new();
     for _ in 0..args.iterations {
         let started = Instant::now();
         last_output = model.infer_host_f32(&request)?;
         samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+        if last_output.len() != horizon * action_dim || last_output.iter().any(|v| !v.is_finite()) {
+            return Err("model returned an invalid action shape or non-finite actions".into());
+        }
+        if let Some(first) = &first_output {
+            if first != &last_output {
+                return Err("identical benchmark inputs produced different actions".into());
+            }
+        } else {
+            first_output = Some(last_output.clone());
+        }
         black_box(&last_output);
     }
     let summary = latency_summary(&samples)?;
-    let [horizon, action_dim] = model.vla()?.action_shape();
     let report = serde_json::json!({
         "schema": "apxinf.gr00t-n1.7.benchmark.v2",
-        "fixture": fixture.name,
+        "input_profile": input.name,
         "checkpoint": args.checkpoint,
-        "backbone": args.backbone,
         "device": args.device,
         "precision": precision_name(args.precision),
         "execution": execution,
-        "timing_boundary": "official-processor tensors through synchronized model core and action D2H",
+        "timing_boundary": "constructed host tensors through synchronized model core and action D2H",
         "warmup": args.warmup,
         "iterations": args.iterations,
         "load_ms": load_ms,
         "latency_ms": summary,
         "input": {
             "pixel_values": observation_shape(&observation),
-            "image_grid_thw": fixture.grid,
+            "image_grid_thw": input.grid,
             "token_count": observation.token_ids.len(),
             "state": observation.state.as_ref().map(|value| value.shape().dims()),
-            "embodiment_id": fixture.embodiment_id,
+            "embodiment_id": input.embodiment_id,
         },
         "output": {
             "shape": [horizon, action_dim],
@@ -145,9 +140,9 @@ fn observation_shape(observation: &Observation) -> &[usize] {
 
 fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     let values = std::env::args().collect::<Vec<_>>();
-    if !(5..=12).contains(&values.len()) {
+    if !(4..=11).contains(&values.len()) {
         return Err(format!(
-            "usage: {} <checkpoint> <backbone> <fixture> <bf16|fp8|int8> [device=0] [warmup=10] [iterations=50] [calibration|-] [tactics|-] [output|-] [--autotune]",
+            "usage: {} <model-dir> <views:1|2> <bf16|fp8|int8> [device=0] [warmup=10] [iterations=50] [calibration|-] [tactics|-] [output|-] [--autotune]",
             values.first().map(String::as_str).unwrap_or("gr00t_bench")
         )
         .into());
@@ -169,17 +164,17 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
             .filter(|value| value.as_str() != "-")
             .map(PathBuf::from)
     };
-    let precision = match values[4].as_str() {
+    let precision = match values[3].as_str() {
         "bf16" => ModelPrecision::Bf16,
         "fp8" => ModelPrecision::Fp8,
         "int8" => ModelPrecision::W8A8,
         value => return Err(format!("invalid precision {value:?}; expected bf16|fp8|int8").into()),
     };
-    let iterations = integer(7, 50, "iteration count")?;
+    let iterations = integer(6, 50, "iteration count")?;
     if iterations == 0 {
         return Err("iteration count must be non-zero".into());
     }
-    let autotune = match values.get(11).map(String::as_str) {
+    let autotune = match values.get(10).map(String::as_str) {
         None => false,
         Some("--autotune") => true,
         Some(value) => {
@@ -188,150 +183,65 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     };
     Ok(Arguments {
         checkpoint: PathBuf::from(&values[1]),
-        backbone: PathBuf::from(&values[2]),
-        fixture: PathBuf::from(&values[3]),
+        views: integer(2, 2, "view count")?,
         precision,
-        device: integer(5, 0, "CUDA device")?,
-        warmup: integer(6, 10, "warmup count")?,
+        device: integer(4, 0, "CUDA device")?,
+        warmup: integer(5, 10, "warmup count")?,
         iterations,
-        calibration: optional_path(8),
-        tactics: optional_path(9),
-        output: optional_path(10),
+        calibration: optional_path(7),
+        tactics: optional_path(8),
+        output: optional_path(9),
         autotune,
     })
 }
 
-fn load_fixture(root: &Path) -> Result<Fixture, Box<dyn std::error::Error>> {
-    let manifest: Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
-    let schema = string(&manifest, "schema")?;
-    if schema != FIXTURE_SCHEMA {
-        return Err(format!("unsupported fixture schema {schema:?}").into());
+/// Match the published 256-patch/view workload without external input files.
+fn generated_inputs(args: &Arguments) -> Result<Inputs, Box<dyn std::error::Error>> {
+    if !(1..=2).contains(&args.views) {
+        return Err("views must be 1 or 2".into());
     }
-    let pixels = entry(root, &manifest, "pixel_values", "bfloat16")?;
-    let grid = entry(root, &manifest, "image_grid_thw", "uint32")?;
-    let tokens = entry(root, &manifest, "token_ids", "uint32")?;
-    let mask = entry(root, &manifest, "attention_mask", "uint8")?;
-    let state = entry(root, &manifest, "state", "bfloat16")?;
-    let noise = entry(root, &manifest, "noise", "bfloat16")?;
-    if grid.shape.len() != 2 || grid.shape[1] != 3 {
-        return Err(format!("image_grid_thw must be [images, 3], got {:?}", grid.shape).into());
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(args.checkpoint.join("config.json"))?)?;
+    let cosmos: Value = serde_json::from_slice(&std::fs::read(
+        args.checkpoint.join("assets/cosmos/config.json"),
+    )?)?;
+    let dimension = |key: &str, default| config[key].as_u64().unwrap_or(default) as usize;
+    let state_dim = dimension("max_state_dim", 132);
+    let action_dim = dimension("max_action_dim", 132);
+    let horizon = dimension("action_horizon", 40);
+    let image_token = cosmos["image_token_id"].as_u64().unwrap_or(151655) as u32;
+    let start = cosmos["vision_start_token_id"].as_u64().unwrap_or(151652) as u32;
+    let end = cosmos["vision_end_token_id"].as_u64().unwrap_or(151653) as u32;
+    let vision = &cosmos["vision_config"];
+    if vision["patch_size"].as_u64().unwrap_or(16) != 16
+        || vision["temporal_patch_size"].as_u64().unwrap_or(2) != 2
+        || vision["spatial_merge_size"].as_u64().unwrap_or(2) != 2
+    {
+        return Err("benchmark profile requires patch=16, temporal=2, spatial merge=2".into());
     }
-    let grid = read_u32(&grid)?
-        .chunks_exact(3)
-        .map(|row| [row[0], row[1], row[2]])
+    let mut token_ids = vec![42; 24];
+    for _ in 0..args.views {
+        token_ids.push(start);
+        token_ids.extend(std::iter::repeat_n(image_token, 64));
+        token_ids.push(end);
+    }
+    // Bounded deterministic nonzero pixels avoid constant-zero arithmetic.
+    let pixels: Vec<bf16> = (0..args.views * 256 * 1536)
+        .map(|i| bf16::from_f32(((i * 17 % 251) as f32 - 125.0) / 125.0))
         .collect();
-    Ok(Fixture {
-        pixel_values: read_bf16(&pixels)?,
-        grid,
-        token_ids: read_u32(&tokens)?,
-        attention_mask: read_u8(&mask)?,
-        state: read_bf16(&state)?,
-        noise: read_bf16(&noise)?,
-        embodiment_id: usize::try_from(
-            manifest
-                .get("embodiment_id")
-                .and_then(Value::as_u64)
-                .ok_or("fixture embodiment_id must be an integer")?,
+    Ok(Inputs {
+        pixel_values: Tensor::from_bf16(vec![args.views * 256, 1536], &pixels)?,
+        grid: vec![[1, 16, 16]; args.views],
+        attention_mask: vec![1; token_ids.len()],
+        token_ids,
+        state: Tensor::from_bf16(vec![1, 1, state_dim], &vec![bf16::ZERO; state_dim])?,
+        noise: Tensor::from_bf16(
+            vec![1, horizon, action_dim],
+            &vec![bf16::ZERO; horizon * action_dim],
         )?,
-        name: string(&manifest, "fixture")?.to_owned(),
+        embodiment_id: 2,
+        name: format!("synthetic-libero-{}-view-v1", args.views),
     })
-}
-
-fn entry(
-    root: &Path,
-    manifest: &Value,
-    name: &str,
-    dtype: &str,
-) -> Result<TensorEntry, Box<dyn std::error::Error>> {
-    let value = manifest
-        .get("tensors")
-        .and_then(|tensors| tensors.get(name))
-        .ok_or_else(|| format!("fixture is missing tensors.{name}"))?;
-    if string(value, "dtype")? != dtype {
-        return Err(format!("fixture tensor {name} must have dtype {dtype}").into());
-    }
-    let shape = value
-        .get("shape")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("fixture tensor {name} has no shape"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| format!("invalid {name} shape"))
-        })
-        .map(|value| {
-            value.and_then(|value| usize::try_from(value).map_err(|error| error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(TensorEntry {
-        path: root.join(string(value, "file")?),
-        shape,
-    })
-}
-
-fn read_bf16(entry: &TensorEntry) -> Result<Tensor, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(&entry.path)?;
-    let expected = elements(&entry.shape)?
-        .checked_mul(std::mem::size_of::<u16>())
-        .ok_or("fixture tensor byte size overflow")?;
-    if bytes.len() != expected {
-        return Err(format!(
-            "{} has {} bytes, expected {expected} for {:?}",
-            entry.path.display(),
-            bytes.len(),
-            entry.shape
-        )
-        .into());
-    }
-    let values = bytes
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
-        .collect::<Vec<_>>();
-    Ok(Tensor::from_bf16(entry.shape.clone(), &values)?)
-}
-
-fn read_u32(entry: &TensorEntry) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(&entry.path)?;
-    let expected = elements(&entry.shape)?
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or("fixture tensor byte size overflow")?;
-    if bytes.len() != expected {
-        return Err(format!(
-            "{} has {} bytes, expected {expected} for {:?}",
-            entry.path.display(),
-            bytes.len(),
-            entry.shape
-        )
-        .into());
-    }
-    let values = bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect::<Vec<_>>();
-    Ok(values)
-}
-
-fn read_u8(entry: &TensorEntry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let values = std::fs::read(&entry.path)?;
-    let expected = elements(&entry.shape)?;
-    if values.len() != expected {
-        return Err(format!(
-            "{} has {} bytes, expected {expected} for {:?}",
-            entry.path.display(),
-            values.len(),
-            entry.shape
-        )
-        .into());
-    }
-    Ok(values)
-}
-
-fn elements(shape: &[usize]) -> Result<usize, Box<dyn std::error::Error>> {
-    shape
-        .iter()
-        .try_fold(1usize, |count, value| count.checked_mul(*value))
-        .ok_or_else(|| "fixture tensor size overflow".into())
 }
 
 fn latency_summary(samples: &[f64]) -> Result<Value, Box<dyn std::error::Error>> {
@@ -362,11 +272,4 @@ fn precision_name(precision: ModelPrecision) -> &'static str {
         ModelPrecision::Fp8 => "fp8",
         ModelPrecision::W8A8 => "int8",
     }
-}
-
-fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Box<dyn std::error::Error>> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("fixture field {field:?} must be a string").into())
 }

@@ -24,21 +24,16 @@ Two layers, matching the serving stack's shells:
 There is no L0 (π0-FAST exposes no patch-level entry point — the runtime takes
 RGB) and no L3 (the websocket server is the PI0.5 stack).
 
-Frames come from ``--frames`` — an ``.npz`` carrying ``base_<variant>`` /
-``wrist_<variant>`` / ``state`` / ``task``, as
-``devlocal/pi0-fast/scripts/collect_frames.py`` writes — or, when it is omitted,
-from deterministic synthetic frames sized by the checkpoint. Every dimension is
-the checkpoint's ``config.json``: π0-FAST has no synthetic weights and no shape
-overrides, so ``--model-dir`` is required.
+By default, inputs are deterministic synthetic images and state sized by the
+checkpoint. ``--frames`` optionally supplies recorded LIBERO observations for
+the original prefix/per-token fit, which needs distinct decode lengths.
 
-    # L1/L2 latency on synthetic frames
-    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \\
+    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \
         --state-key observation/state
 
-    # fixed cost vs per-step cost over real LIBERO frames
-    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \\
-        --state-key observation/state --mode ar \\
-        --frames devlocal/pi0-fast/results/raw/libero_frames.npz
+    python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \
+        --state-key observation/state --mode ar --frames /path/to/libero_frames.npz
+
 """
 
 from __future__ import annotations
@@ -52,6 +47,7 @@ import sys
 import time
 
 import numpy as np
+from _benchmark import provenance
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
@@ -119,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--precision",
         default="auto",
-        help="runtime precision; π0-FAST runs bf16, so `auto` is the normal value",
+        help="runtime precision: auto, bf16 or fp8 (requires calibration)",
     )
     p.add_argument(
         "--state-key",
@@ -134,6 +130,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action-dim", type=int, help="override the checkpoint's deploy action width")
     p.add_argument("--action-horizon", type=int, help="override the checkpoint's action horizon")
 
+    p.add_argument("--calibration", type=pathlib.Path, help="FP8 activation calibration")
+    p.add_argument("--tactics", type=pathlib.Path)
+    p.add_argument("--autotune", action="store_true")
     # Input workload.
     p.add_argument("--prompt", default=DEFAULT_PROMPT, help="task string (synthetic frames)")
     p.add_argument(
@@ -168,11 +167,18 @@ def parse_args() -> argparse.Namespace:
         help="also time L1 with no stop token (the full max_action_tokens budget)",
     )
     p.add_argument("--out", type=pathlib.Path)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.frames_count < 1 or args.samples < 1 or args.warmup < 0 or args.repeats < 1:
+        p.error("frames-count, samples and repeats must be positive; warmup >= 0")
+    if args.autotune and args.tactics is None:
+        p.error("--autotune requires an explicit --tactics output path")
+    if args.survey < 1 or (args.frames_limit is not None and args.frames_limit < 1):
+        p.error("survey and frames-limit must be positive")
+    return args
 
 
 def _load_frames(path, variant: str, limit) -> list[dict]:
-    """Read the ``base_*/wrist_*/state/task`` frames ``collect_frames.py`` writes."""
+    """Read recorded ``base_*/wrist_*/state/task`` frames."""
     data = np.load(path, allow_pickle=True)
     keys = set(data.files)
 
@@ -313,7 +319,7 @@ def _run_ar(call, observations, survey: int, repeats: int) -> dict:
     return {"survey": table, "fit": fit}
 
 
-def main() -> None:
+def main(policy_loader=None) -> None:
     args = parse_args()
     layers = _parse_layers(args.layer)
     image_keys = (
@@ -326,6 +332,9 @@ def main() -> None:
 
     options = {
         "precision": args.precision,
+        "calibration": str(args.calibration) if args.calibration else None,
+        "tactics": str(args.tactics) if args.tactics else None,
+        "autotune": args.autotune,
         "device": args.device,
         "state_key": args.state_key,
         "prompt_key": args.prompt_key,
@@ -334,7 +343,9 @@ def main() -> None:
     }
     if image_keys is not None:
         options["image_keys"] = image_keys
-    policy = AutoPolicy.from_pretrained(
+    if args.autotune:
+        args.tactics.parent.mkdir(parents=True, exist_ok=True)
+    policy = (policy_loader or AutoPolicy.from_pretrained)(
         args.model_dir, **{name: value for name, value in options.items() if value is not None}
     )
     handle = policy.model
@@ -363,7 +374,10 @@ def main() -> None:
         "model_dir": str(args.model_dir),
         "layers": layers,
         "mode": args.mode,
+        "input_source": "recorded" if args.frames is not None else "synthetic",
         "frames": str(args.frames) if args.frames is not None else "synthetic",
+        "seed": args.seed,
+        "warmup": args.warmup,
         "frame_count": len(observations),
         "workload": {
             "state_dim": int(policy.metadata["state_dim"]),
@@ -444,6 +458,7 @@ def main() -> None:
             f"r2={fit['r2']:.4f}"
         )
 
+    result["provenance"] = provenance(_REPO_ROOT, args.model_dir, calibration=args.calibration, tactics=args.tactics)
     policy.close()
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
