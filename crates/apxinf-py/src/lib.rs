@@ -307,6 +307,7 @@ impl DecisionRunner {
         let output = self
             .model
             .decide(DecisionInput::text(ids, candidate_count))
+            .and_then(|output| output.into_single())
             .map_err(runtime_err)?;
         Python::with_gil(|py| {
             let score_dicts: Vec<PyObject> = output
