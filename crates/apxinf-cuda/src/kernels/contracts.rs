@@ -148,7 +148,7 @@ pub(super) fn bf16_output(ctx: &CudaContext, rows: usize, cols: usize) -> Result
 }
 
 pub(super) fn f16_output(ctx: &CudaContext, rows: usize, cols: usize) -> Result<CudaBuffer> {
-    crate::workspace::output_buffer(
+    crate::workspace::output_buffer_uninitialized(
         ctx,
         rows.checked_mul(cols)
             .and_then(|elements| elements.checked_mul(DType::F16.size_in_bytes()))

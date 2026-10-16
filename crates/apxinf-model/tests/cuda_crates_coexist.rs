@@ -7,8 +7,10 @@
 //! symbol sets ever collide again, this binary fails to link — the failure
 //! mode is a build error, which is exactly where we want it.
 //!
-//! Both crates are optional dependencies, so this binary can only compile when
-//! the `cuda` feature pulls them in — the same gate `qwen_drive_loading.rs` uses.
+//! Both crates are optional dependencies that `cuda` enables together, so
+//! gating on `cuda` is enough to have both in the link. If they are ever split
+//! back apart, the first reference here fails as an unresolved crate — again a
+//! build error, which is where we want it.
 #![cfg(feature = "cuda")]
 
 #[test]

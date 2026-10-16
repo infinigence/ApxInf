@@ -8,6 +8,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
@@ -221,17 +223,14 @@ cudaError_t run_interleaved_geglu(
   Gemm gemm;
   auto can = gemm.can_implement(args);
   if (can != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "sm89 geglu can_implement failed m=%d n=%d k=%d status=%d\n", m, n, k, int(can));
     return cudaErrorInvalidValue;
   }
   auto workspace = gemm.get_workspace_size(args);
   if (workspace != 0) {
-    std::fprintf(stderr, "sm89 geglu workspace nonzero m=%d n=%d k=%d workspace=%zu\n", m, n, k, workspace);
     return cudaErrorInvalidValue;
   }
   auto launched = gemm(args, nullptr, stream);
   if (launched != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "sm89 geglu launch failed m=%d n=%d k=%d status=%d\n", m, n, k, int(launched));
     return cudaErrorUnknown;
   }
   return cudaGetLastError();

@@ -12,6 +12,18 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE
+#define CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE \
+    static_cast<cublasLtMatmulDescAttributes_t>(26)
+#endif
+#ifndef CUBLASLT_MATMUL_DESC_D_SCALE_POINTER
+#define CUBLASLT_MATMUL_DESC_D_SCALE_POINTER \
+    static_cast<cublasLtMatmulDescAttributes_t>(20)
+#endif
+#ifndef CUDA_R_8F_E4M3
+#define CUDA_R_8F_E4M3 static_cast<cudaDataType_t>(5)
+#endif
+
 extern "C" cudaError_t apxinf_static_evict_l2(
     void* buffer, size_t bytes, uint32_t seed, cudaStream_t stream);
 

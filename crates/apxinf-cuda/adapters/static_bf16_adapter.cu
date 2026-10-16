@@ -11,6 +11,12 @@
 #include <cstdint>
 #include <cstdint>
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ float2 __bfloat1622float2(__nv_bfloat162 value) {
+    return make_float2(__bfloat162float(value.x), __bfloat162float(value.y));
+}
+#endif
+
 namespace {
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/reduction.cuh"
@@ -82,6 +88,51 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_bf16(
         static_cast<const uint8_t*>(images), static_cast<__nv_bfloat16*>(patches),
         views, image_size, patch_size);
   }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_f16(
+    const void* images, void* patches, int views, int image_size,
+    int patch_size, int layout, cudaStream_t stream) {
+  if (views <= 0 || image_size <= 0 || patch_size <= 0 ||
+      image_size % patch_size != 0 || (layout != 0 && layout != 1))
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(views) * 3 * image_size * image_size;
+  if (layout == 0) {
+    rgb_u8_to_patches_f16_kernel<true><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<half*>(patches),
+        views, image_size, patch_size);
+  } else {
+    rgb_u8_to_patches_f16_kernel<false><<<blocks_for(count), kThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(images), static_cast<half*>(patches),
+        views, image_size, patch_size);
+  }
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_pixel_shuffle_4_bf16(
+    const void* input, void* output, int views, int tokens_per_view, int width,
+    cudaStream_t stream) {
+  if (views <= 0 || tokens_per_view <= 0 || tokens_per_view % 16 != 0 || width <= 0)
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(views) * (tokens_per_view / 16) *
+                        static_cast<int64_t>(width) * 16;
+  pixel_shuffle_4_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<__nv_bfloat16*>(output), views, tokens_per_view, width);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_pixel_shuffle_4_f16(
+    const void* input, void* output, int views, int tokens_per_view, int width,
+    cudaStream_t stream) {
+  if (views <= 0 || tokens_per_view <= 0 || tokens_per_view % 16 != 0 || width <= 0)
+    return cudaErrorInvalidValue;
+  const int64_t count = static_cast<int64_t>(views) * (tokens_per_view / 16) *
+                        static_cast<int64_t>(width) * 16;
+  pixel_shuffle_4_f16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const half*>(input), static_cast<half*>(output),
+      views, tokens_per_view, width);
   return cudaGetLastError();
 }
 
@@ -311,6 +362,18 @@ extern "C" cudaError_t apxinf_static_swiglu_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_swiglu_f16(
+    const void* gate_up, void* output, int rows, int inner,
+    cudaStream_t stream) {
+  const int64_t count = static_cast<int64_t>(rows) * inner;
+  if (gate_up == nullptr || output == nullptr || rows <= 0 || inner <= 0)
+    return cudaErrorInvalidValue;
+  swiglu_f16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const half*>(gate_up), static_cast<half*>(output),
+      rows, inner);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_swiglu_quant_f16_e4m3(
     const void* gate_up, const void* bias, void* output,
     int rows, int inner, float scale, cudaStream_t stream) {
@@ -432,6 +495,20 @@ extern "C" cudaError_t apxinf_static_rms_norm_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_rms_norm_f16(
+    const void* input, const void* weight, void* output,
+    int rows, int cols, float eps, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t shared_bytes = static_cast<size_t>(cols) * sizeof(float);
+  rms_norm_f16_kernel<<<rows, kThreads, shared_bytes, stream>>>(
+      static_cast<const half*>(input), static_cast<const half*>(weight),
+      static_cast<half*>(output), cols, rows, eps);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_static_rms_norm_quant_bf16_e4m3(
     const void* input, const void* weight, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
@@ -478,6 +555,20 @@ extern "C" cudaError_t apxinf_static_layer_norm_bf16(
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<const __nv_bfloat16*>(bias),
       static_cast<__nv_bfloat16*>(output), rows, cols, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_layer_norm_f16(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  layer_norm_f16_kernel<<<rows, kThreads, 0, stream>>>(
+      static_cast<const half*>(input), static_cast<const half*>(weight),
+      static_cast<const half*>(bias), static_cast<half*>(output),
+      rows, cols, eps);
   return cudaGetLastError();
 }
 
@@ -640,6 +731,20 @@ extern "C" cudaError_t apxinf_static_bias_gelu_bf16_packed8(
   bias_gelu_bf16_packed8_kernel<<<blocks, threads, 0, stream>>>(
       static_cast<const Bf16Pairx8*>(input), static_cast<const Bf16Pairx8*>(bias),
       static_cast<Bf16Pairx8*>(output), octet_count, cols / 8);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t apxinf_static_bias_gelu_f16(
+    const void* input, const void* bias, void* output,
+    int rows, int cols, cudaStream_t stream) {
+  if (input == nullptr || bias == nullptr || output == nullptr ||
+      rows <= 0 || cols <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  bias_gelu_f16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+      static_cast<const half*>(input), static_cast<const half*>(bias),
+      static_cast<half*>(output), rows, cols);
   return cudaGetLastError();
 }
 

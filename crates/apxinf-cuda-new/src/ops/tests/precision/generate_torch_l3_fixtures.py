@@ -71,9 +71,22 @@ def geglu(a: torch.Tensor, b: torch.Tensor, alpha: float,
             output_scale).to(torch.float32)
 
 
+def generate_split_geglu() -> None:
+    split_values = torch.tensor([-2, -1, -0.5, 0, 0.5, 1, 2, 4], dtype=torch.float32)
+    arrays = [rust_array("SPLIT_GEGLU_VALUES", "u8", bytes_(split_values.to(torch.float8_e4m3fn)), 8)]
+    for name, alpha, output_scale in [("UNIT", 1.0, 1.0), ("SCALED", 0.75, 1.25)]:
+        gate = split_values[:, None] * alpha
+        up = split_values[None, :] * alpha
+        expected = (torch.nn.functional.gelu(gate, approximate="tanh") * up / output_scale)
+        expected = expected.to(torch.float8_e4m3fn).float()
+        arrays.append(rust_array(f"SPLIT_GEGLU_{name}", "f32", f32_bits(expected), 8))
+    Path(__file__).with_name("torch_split_geglu_fixtures.rs").write_text("\n".join(arrays))
+
+
 def main() -> None:
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
+    generate_split_geglu()
     generator = torch.Generator(device="cpu").manual_seed(0x5EED_C0DE)
     raw_a = torch.randn((M, K), generator=generator) * 0.75
     raw_b = torch.randn((K, N), generator=generator) * 0.50

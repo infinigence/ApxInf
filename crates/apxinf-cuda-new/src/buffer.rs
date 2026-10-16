@@ -93,7 +93,7 @@ impl CudaBuffer {
     pub fn alloc_zeros_async(
         num_bytes: usize,
         device: usize,
-        stream: crate::CudaStream,
+        stream: &crate::CudaStream,
     ) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;
         unsafe {
@@ -131,6 +131,23 @@ impl CudaBuffer {
     /// Zero-fill the buffer on device, without a host staging allocation.
     pub fn zero(&self) -> Result<(), String> {
         unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len)) }
+    }
+
+    /// Enqueue a zero-fill on `stream`.
+    ///
+    /// Unlike [`Self::zero`], this operation participates in CUDA Graph
+    /// capture and preserves ordering with kernels submitted to the stream.
+    pub fn zero_async(&self, stream: &crate::CudaStream) -> Result<(), String> {
+        if stream.device() != self.device {
+            return Err(format!(
+                "CUDA buffer is on device {}, but zero stream targets device {}",
+                self.device,
+                stream.device()
+            ));
+        }
+        stream.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(self.ptr, 0, self.len, stream.handle()))
+        })
     }
 
     /// Raw device pointer for crate-internal launch code.

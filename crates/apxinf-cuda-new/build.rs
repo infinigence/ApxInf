@@ -3,6 +3,10 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "../apxinf-cuda/build_support/nvcc_build.rs"]
+mod nvcc_build;
+#[path = "../apxinf-cuda/aot/link.rs"]
+mod aot;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
 #[path = "build_support/cuda_arch.rs"]
@@ -22,6 +26,8 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          constexpr uint64_t kDeviceFeatureNativeFp8 = UINT64_C(1) << 0;\n\
          constexpr uint64_t kDeviceFeatureCutlassSm100 = UINT64_C(1) << 1;\n\
          constexpr uint64_t kDeviceFeatureFa2 = UINT64_C(1) << 2;\n\
+         constexpr uint64_t kDeviceFeatureCutlassSm89Bf16Geglu = UINT64_C(1) << 3;\n\
+         constexpr uint64_t kDeviceFeatureCutlassSm87W8A8 = UINT64_C(1) << 4;\n\
          struct CompiledTarget { int sm; uint64_t features; };\n\
          constexpr CompiledTarget kCompiledTargets[] = {\n",
     );
@@ -39,8 +45,14 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          }\n\
          }  // namespace apxinf::gemm\n",
     );
-    std::fs::write(&path, header)
-        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    // Rewrite only when the content actually changed: every adapter that
+    // includes this header is a dependency in its `.d` file, so bumping the
+    // mtime on an unchanged header would force the object cache to rebuild all
+    // of them on every run.
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(header.as_str()) {
+        std::fs::write(&path, header)
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
     path
 }
 
@@ -54,6 +66,20 @@ fn rerun_tree(root: &Path) {
             rerun_tree(&path);
         } else {
             println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn rerun_paths(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rerun_paths(&path, files);
+        } else {
+            files.push(path);
         }
     }
 }
@@ -83,20 +109,52 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     let staged = out.join("fa2-direct-e4m3-patched");
+    let patch = native
+        .join("patches")
+        .join("fa2-direct-e4m3-output.patch");
+    // Re-staging rewrites every file in the tree, which bumps the mtime of the
+    // patched sources the E4M3 translation units depend on. Skip it when the
+    // exact source tree and patch that produced the current staging are
+    // unchanged, so the object cache survives a rebuild that only touched Rust.
+    let stamp = out.join("fa2-direct-e4m3-patched.stamp");
+    let mut fingerprint = 0x6c62272e07bb014262b821756295c58du128;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            fingerprint ^= u128::from(*byte);
+            fingerprint = fingerprint.wrapping_mul(0x0000000001000000000000000000013b);
+        }
+    };
+    let mut files = Vec::new();
+    rerun_paths(&fa2_root.join("flash_attn"), &mut files);
+    files.sort_unstable();
+    for file in &files {
+        feed(file.to_string_lossy().as_bytes());
+        feed(&std::fs::read(file).unwrap_or_else(|error| {
+            panic!("read FA2 staging input {}: {error}", file.display())
+        }));
+    }
+    feed(&std::fs::read(&patch).unwrap_or_else(|error| {
+        panic!("read FA2 patch {}: {error}", patch.display())
+    }));
+    let key = format!("{fingerprint:032x}");
+    if staged.is_dir()
+        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str())
+    {
+        return staged;
+    }
     if staged.exists() {
         std::fs::remove_dir_all(&staged)
             .unwrap_or_else(|error| panic!("remove {}: {error}", staged.display()));
     }
     copy_tree(&fa2_root.join("flash_attn"), &staged.join("flash_attn"));
-    let patch = native
-        .join("patches")
-        .join("fa2-direct-e4m3-output.patch");
     let mut command = Command::new("patch");
     command
         .current_dir(&staged)
         .args(["--batch", "--forward", "-p0", "-i"])
         .arg(&patch);
     run(&mut command, "apply FA2 direct-E4M3 patch");
+    std::fs::write(&stamp, &key)
+        .unwrap_or_else(|error| panic!("write {}: {error}", stamp.display()));
     staged
 }
 
@@ -123,11 +181,18 @@ fn run(command: &mut Command, action: &str) {
 }
 
 fn main() {
+    // Whether the shape-specialized Qwen3.8 NVFP4 dense SwiGLU AOT object was
+    // linked into this build. Selection code reads it through
+    // `apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT`; a cfg would not cross the
+    // crate boundary, so the capability is a `pub const` instead.
+    println!("cargo:rustc-check-cfg=cfg(apxinf_qwen38_dense_swiglu_aot)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_decode)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH_CUTLASS");
     println!("cargo:rerun-if-env-changed=APXINF_KERNEL_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=APXINF_CUDA_AOT_MANIFEST");
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
@@ -185,7 +250,29 @@ fn main() {
         .join(", ");
     println!("cargo:warning=GEMM targets: {target_summary}");
 
-    let id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
+    let aot_manifest = env::var_os("APXINF_CUDA_AOT_MANIFEST").map(PathBuf::from);
+    let qwen38_aot = if selection.targets.iter().any(|target| target.sm() == 110) {
+        aot_manifest.as_ref().and_then(|path| {
+            let aot_root = manifest.join("../apxinf-cuda/aot");
+            aot::Bundle::load_required(
+                &aot_root,
+                &aot_root.join("qwen38.json"),
+                path,
+                &["qwen38-dense-swiglu-nvfp4"],
+                &target,
+                "sm_110",
+                &bundled_nvcc,
+            )
+        })
+    } else {
+        None
+    };
+    // Surface the capability so runtime selection is a compile-time constant.
+    if qwen38_aot.is_some() {
+        println!("cargo:rustc-cfg=apxinf_qwen38_dense_swiglu_aot");
+    }
+
+    let mut id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
         gemm_fingerprint::build_id(
             &native,
             &target,
@@ -195,6 +282,22 @@ fn main() {
                 .map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())),
         )
     });
+    // The AOT object is an external artifact: swapping bundles leaves the
+    // sources, arch and toolkit untouched, so its fingerprint has to enter the
+    // build id or the object cache serves the previously linked `.o`.
+    //
+    // `Bundle::fingerprint` is a serialized JSON document, so it carries quotes
+    // and cannot go into the build id verbatim -- the assert below rejects
+    // them. Fold it into a digest, the way `apxinf-cuda` does with the same
+    // field.
+    if let Some(bundle) = &qwen38_aot {
+        let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+        for byte in bundle.fingerprint.as_bytes() {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(0x0000000001000000000000000000013b);
+        }
+        id = format!("{id}-aot-{hash:032x}");
+    }
     let attention_id = attention_fingerprint::build_id(
         &native,
         &target,
@@ -231,8 +334,14 @@ fn main() {
         "attention/providers/custom.cu",
         "elementwise/execution.cpp",
         "linear_attention/execution.cpp",
-        "rope/execution.cpp",
+        "attn_helpers/execution.cpp",
         "reduction/execution.cpp",
+        "sampling.cu",
+        "norm.cu",
+        "pointwise.cu",
+        "rope.cu",
+        "gather.cu",
+        "quantization.cu",
     ]
     .map(|source| adapters.join(source))
     .to_vec();
@@ -247,6 +356,26 @@ fn main() {
     let fa2_compat_root = native.join("kernels/fa2_compat");
     let attention_kernel_root = native.join("kernels/attention");
     let mut cutlass_sources = Vec::new();
+    let mut cutlass_sm87_sources = Vec::new();
+    let mut cutlass_sm89_sources = Vec::new();
+    if selection
+        .targets
+        .iter()
+        .any(|target| target.cutlass_arch == "sm_87")
+    {
+        cutlass_sm87_sources.push(cutlass_root.join("ops/gemm").join("gemm_i8_bf16_sm80.cu"));
+    }
+    if selection
+        .targets
+        .iter()
+        .any(|target| target.cutlass_arch == "sm_89")
+    {
+        cutlass_sm89_sources.push(
+            cutlass_root
+                .join("ops/gemm")
+                .join("gemm_bf16_geglu_sm89.cu"),
+        );
+    }
     if selection
         .targets
         .iter()
@@ -263,14 +392,27 @@ fn main() {
             ]
             .map(|source| operators.join(source)),
         );
+        if qwen38_aot.is_some() {
+            cutlass_sources.push(operators.join("gemm_nvfp4_swiglu_aot_sm100.cu"));
+        }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources
-            .push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+    } else {
+        // The descriptor-side wrapper is part of the stable ABI on every CUDA
+        // target, but the generated Cake kernel itself requires Blackwell.
+        // Keep non-Blackwell builds linkable and report unsupported at launch.
+        generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_stub.cpp"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
+    // The allocation-free FA2 decode ABI is a stub that returns
+    // APXINF_STATUS_UNSUPPORTED unless FA2 was compiled in; surface that so a
+    // dependent crate can select the fallback without a runtime failure path.
+    if has_fa2 {
+        println!("cargo:rustc-cfg=apxinf_fa2_decode");
+    }
     let mut fa2_sources = Vec::new();
     if has_fa2 {
         generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
@@ -280,12 +422,19 @@ fn main() {
                 "fa2_decode_splitkv.cu",
                 "flash_attn/flash_fwd_hdim128_bf16_sm80.cu",
                 "flash_attn/flash_fwd_hdim256_bf16_sm80.cu",
+                "flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu",
             ]
             .map(|source| fa2_root.join(source)),
         );
         fa2_sources.extend(
-            ["fa2_fwd_hdim128_extra.cu", "fa2_fwd_hdim256_extra.cu"]
-                .map(|source| attention_kernel_root.join(source)),
+            [
+                "fa2_fwd_hdim96_f16.cu",
+                "fa2_fwd_hdim96_bf16.cu",
+                "fa2_fwd_hdim128_extra.cu",
+                "fa2_fwd_hdim256_extra.cu",
+                "fa2_fwd_split_hdim256_f16.cu",
+            ]
+            .map(|source| attention_kernel_root.join(source)),
         );
     }
     let mut fa2_e4m3_sources = Vec::new();
@@ -299,12 +448,14 @@ fn main() {
                 .map(|source| attention_kernel_root.join(source)),
         );
     }
-    let patched_fa2_root = (!fa2_e4m3_sources.is_empty())
-        .then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let patched_fa2_root =
+        (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
     assert!(
         generic_sources
             .iter()
             .chain(&cutlass_sources)
+            .chain(&cutlass_sm87_sources)
+            .chain(&cutlass_sm89_sources)
             .chain(&fa2_sources)
             .chain(&fa2_e4m3_sources)
             .all(|path| path.is_file()),
@@ -324,6 +475,8 @@ fn main() {
         cutlass_root.join("tools/util/include"),
     ];
     let has_cutlass = !cutlass_sources.is_empty();
+    let has_cutlass_sm87 = !cutlass_sm87_sources.is_empty();
+    let has_cutlass_sm89 = !cutlass_sm89_sources.is_empty();
     let generic_codegen = gencode_args(
         selection
             .targets
@@ -337,6 +490,20 @@ fn main() {
             .filter(|target| is_cutlass_sm100_family(&target.cutlass_arch))
             .map(|target| target.cutlass_arch.clone()),
     );
+    let cutlass_sm89_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| target.cutlass_arch == "sm_89")
+            .map(|target| target.cutlass_arch.clone()),
+    );
+    let cutlass_sm87_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| target.cutlass_arch == "sm_87")
+            .map(|target| target.cutlass_arch.clone()),
+    );
     let fa2_codegen = gencode_args(
         selection
             .targets
@@ -345,27 +512,39 @@ fn main() {
             .map(|target| target.nvcc_arch.clone()),
     );
     let mut objects = Vec::new();
+    let workers = nvcc_build::parallelism();
+    let mut jobs: Vec<nvcc_build::CompileJob> = Vec::new();
     for (index, source) in generic_sources
         .drain(..)
-        .map(|source| (source, false, false, false))
+        .map(|source| (source, false, false, false, false, false))
         .chain(
             cutlass_sources
                 .into_iter()
-                .map(|source| (source, true, false, false)),
+                .map(|source| (source, true, false, false, false, false)),
+        )
+        .chain(
+            cutlass_sm87_sources
+                .into_iter()
+                .map(|source| (source, false, true, false, false, false)),
+        )
+        .chain(
+            cutlass_sm89_sources
+                .into_iter()
+                .map(|source| (source, false, false, true, false, false)),
         )
         .chain(
             fa2_sources
                 .into_iter()
-                .map(|source| (source, false, true, false)),
+                .map(|source| (source, false, false, false, true, false)),
         )
         .chain(
             fa2_e4m3_sources
                 .into_iter()
-                .map(|source| (source, false, false, true)),
+                .map(|source| (source, false, false, false, false, true)),
         )
         .enumerate()
     {
-        let (source, is_cutlass, is_fa2, is_fa2_e4m3) = source;
+        let (source, is_cutlass, is_cutlass_sm87, is_cutlass_sm89, is_fa2, is_fa2_e4m3) = source;
         let object = out.join(format!(
             "gemm-{index}-{}.o",
             source.file_stem().unwrap().to_string_lossy()
@@ -378,11 +557,24 @@ fn main() {
             .arg(&object)
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
-            .arg(format!("-I{}", out.display()))
-            .arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""))
-            .arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
+            .arg(format!("-I{}", out.display()));
+        // The build IDs fold a whole-tree fingerprint, so they change on any
+        // kernel edit. Only the two tuning-key translation units read them;
+        // putting them on every command line would invalidate the whole object
+        // cache whenever one source file moves.
+        if source.file_name().is_some_and(|name| name == "tuning_key.cpp") {
+            if source.to_string_lossy().contains("/gemm/") {
+                command.arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""));
+            } else {
+                command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
+            }
+        }
         command.args(if is_cutlass || is_fa2_e4m3 {
             &cutlass_codegen
+        } else if is_cutlass_sm87 {
+            &cutlass_sm87_codegen
+        } else if is_cutlass_sm89 {
+            &cutlass_sm89_codegen
         } else if is_fa2 {
             &fa2_codegen
         } else {
@@ -395,13 +587,33 @@ fn main() {
             command.arg("-DAPXINF_GEMM_CUTLASS=1");
             command.arg("-DAPXINF_ATTENTION_CUTLASS=1");
         }
+        if qwen38_aot.is_some() {
+            command.arg("-DAPXINF_QWEN38_DENSE_SWIGLU_AOT=1");
+            command.arg(format!(
+                "-I{}",
+                qwen38_aot
+                    .as_ref()
+                    .unwrap()
+                    .kernel("qwen38-dense-swiglu-nvfp4")
+                    .header
+                    .parent()
+                    .unwrap()
+                    .display()
+            ));
+        }
+        if has_cutlass_sm89 {
+            command.arg("-DAPXINF_GEMM_CUTLASS_SM89=1");
+        }
+        if has_cutlass_sm87 {
+            command.arg("-DAPXINF_GEMM_CUTLASS_SM87_W8A8=1");
+        }
         if has_fa2 {
             command.arg("-DAPXINF_ATTENTION_FA2=1");
         }
         if !cutlass_codegen.is_empty() {
             command.arg("-DAPXINF_ATTENTION_FA2_E4M3=1");
         }
-        if is_cutlass {
+        if is_cutlass || is_cutlass_sm87 || is_cutlass_sm89 {
             command.args(["--expt-relaxed-constexpr", "--expt-extended-lambda"]);
             for include in &cutlass_includes {
                 command.arg(format!("-I{}", include.display()));
@@ -429,19 +641,19 @@ fn main() {
                 "-U__CUDA_NO_HALF2_OPERATORS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             ]);
+            // The runtime never enables these FA2 feature axes. Keep the
+            // legacy compile-time pruning so every compiled specialization
+            // matches the contract and split-KV does not instantiate an
+            // unused combinatorial kernel set. The shared constant makes the
+            // exact compile policy part of the Attention build fingerprint.
+            command.args(attention_fingerprint::FA2_FIXED_FEATURE_DEFINES);
             command.arg(if is_fa2_e4m3 {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2_direct_e4m3"
             } else {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2"
             });
             if is_fa2_e4m3 {
-                command.args([
-                    "-DAPXINF_FA2_DIRECT_E4M3=1",
-                    "-DFLASHATTENTION_DISABLE_DROPOUT",
-                    "-DFLASHATTENTION_DISABLE_ALIBI",
-                    "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                    "-DFLASHATTENTION_DISABLE_LOCAL",
-                ]);
+                command.arg("-DAPXINF_FA2_DIRECT_E4M3=1");
             }
             command.arg(format!("-I{}", fa2_compat_root.display()));
             if is_fa2_e4m3 {
@@ -456,8 +668,30 @@ fn main() {
             command.arg(format!("-I{}", fa2_root.display()));
             command.arg(format!("-I{}", cutlass_root.join("include").display()));
         }
-        run(&mut command, &format!("compile {}", source.display()));
+        // Skip the compile when a previous run produced a current object: the
+        // recorded command line is identical and every dependency is older.
+        // The misses join the worker pool after the loop.
+        let stem = source.file_stem().unwrap().to_string_lossy().to_string();
+        let deps = out.join(format!("gemm-{index}-{stem}.d"));
+        let stamp = out.join(format!("gemm-{index}-{stem}.cmdline"));
+        let cmdline = nvcc_build::describe_command(&command);
+        if nvcc_build::object_is_current(&object, &deps, &stamp, &cmdline) {
+            objects.push(object);
+            continue;
+        }
+        command.arg("-MD").arg("-MF").arg(&deps);
+        jobs.push(nvcc_build::CompileJob {
+            command,
+            action: format!("compile {}", source.display()),
+            stamp,
+            cmdline,
+        });
         objects.push(object);
+    }
+    nvcc_build::run_parallel(jobs, workers);
+
+    if let Some(bundle) = &qwen38_aot {
+        objects.push(bundle.kernel("qwen38-dense-swiglu-nvfp4").object.clone());
     }
 
     let archive = out.join("libapxinf_gemm_native.a");
@@ -468,6 +702,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    if let Some(bundle) = &qwen38_aot {
+        bundle.link_runtime(&out);
+    }
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

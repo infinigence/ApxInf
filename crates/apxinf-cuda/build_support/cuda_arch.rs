@@ -128,6 +128,15 @@ fn validate_arch_name(arch: &str) -> Result<&str, String> {
     Ok(arch)
 }
 
+fn cuda_include_arg(nvcc: &Path) -> String {
+    let include = nvcc
+        .ancestors()
+        .nth(2)
+        .map(|root| root.join("include"))
+        .unwrap_or_else(|| PathBuf::from("include"));
+    format!("-I{}", include.display())
+}
+
 fn cutlass_arch_for(nvcc_arch: &str) -> String {
     if is_cutlass_sm100_family(nvcc_arch) && !nvcc_arch.ends_with('a') {
         format!("{nvcc_arch}a")
@@ -171,6 +180,7 @@ fn detect_compute_capabilities(
 
     let compile = Command::new(nvcc)
         .args(["-std=c++17", "-O0"])
+        .arg(cuda_include_arg(nvcc))
         .arg(&source)
         .arg("-o")
         .arg(&executable)
@@ -234,6 +244,7 @@ fn validate_nvcc_arch(nvcc: &Path, out_dir: &Path, arch: &str) -> Result<(), Str
 
     let output = Command::new(nvcc)
         .arg("-c")
+        .arg(cuda_include_arg(nvcc))
         .arg(&source)
         .arg("-o")
         .arg(&object)

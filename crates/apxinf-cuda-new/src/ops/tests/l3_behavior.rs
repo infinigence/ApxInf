@@ -5,10 +5,106 @@
 //! resource lifetime, binding rule, or capture behavior not already covered by
 //! the shared framework tests.
 
-use super::framework::{tensor, values};
+use super::framework::{f16_tensor, tensor, values, zeros_tensor};
 use super::*;
 use crate::CudaContext;
 use half::bf16;
+
+#[test]
+fn pointwise_exact_gelu_runs_on_all_bf16_vector_paths() {
+    let ctx = CudaContext::new(0).unwrap();
+    for cols in [3, 2, 4] {
+        let input = tensor(0, vec![1, cols], &vec![1.0; cols]);
+        let bias = tensor(0, vec![cols], &vec![0.0; cols]);
+        let mut output = tensor(0, vec![1, cols], &vec![0.0; cols]);
+        let mut args = PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
+        args.bias = Some(&bias);
+        args.activation = PointwiseActivation::GeluExact;
+        pointwise(&ctx, args).unwrap();
+        ctx.synchronize().unwrap();
+        for actual in values(&output) {
+            assert!((actual - 0.83984375).abs() < 1e-6, "cols={cols}: {actual}");
+        }
+    }
+}
+
+#[test]
+fn quantization_rejects_packed_fp4_input() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let input = zeros_tensor(0, vec![1, 16], DType::E2M1Pair);
+    for (semantic, dtype) in [
+        (QuantizationSemantic::FixedScaleE4m3, DType::F8E4M3),
+        (QuantizationSemantic::RowwiseE4m3, DType::F8E4M3),
+        (QuantizationSemantic::CastF16ToBf16, DType::BF16),
+        (QuantizationSemantic::CastBf16ToF32, DType::F32),
+        (QuantizationSemantic::CastF32ToBf16, DType::BF16),
+        (QuantizationSemantic::SliceColumnsBf16, DType::BF16),
+        (QuantizationSemantic::RowwiseI8, DType::I8),
+    ] {
+        let mut output = zeros_tensor(0, vec![1, 16], dtype);
+        let error = quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("requires F16 or BF16")
+                || error.to_string().contains("dtype disagrees"),
+            "{semantic:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn quantization_casts_bf16_to_f32_exactly() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let source = [1.0, -2.5, 0.125, 65_536.0];
+    let input = tensor(0, vec![1, source.len()], &source);
+    let mut output = zeros_tensor(0, vec![1, source.len()], DType::F32);
+    quantization(
+        &ctx,
+        QuantizationArgs::new(QuantizationSemantic::CastBf16ToF32, &input, &mut output),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    let buffer = crate::CudaBuffer::from_tensor(&output).unwrap();
+    let mut bytes = vec![0u8; source.len() * 4];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    let actual = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, source);
+}
+
+#[test]
+fn quantization_casts_f32_to_bf16_with_rounding() {
+    use apxinf_core::{DType, Shape};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let source = [1.0f32, -2.5, 0.1, 65_536.0];
+    let bytes = unsafe {
+        std::slice::from_raw_parts(source.as_ptr().cast::<u8>(), std::mem::size_of_val(&source))
+    };
+    let buffer = crate::CudaBuffer::alloc(bytes.len(), 0).unwrap();
+    buffer.copy_from_host(bytes).unwrap();
+    let input = buffer
+        .as_tensor(Shape::new(vec![1, source.len()]), DType::F32)
+        .unwrap();
+    let mut output = zeros_tensor(0, vec![1, source.len()], DType::BF16);
+    quantization(
+        &ctx,
+        QuantizationArgs::new(QuantizationSemantic::CastF32ToBf16, &input, &mut output),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    let expected = source
+        .iter()
+        .map(|value| bf16::from_f32(*value).to_f32())
+        .collect::<Vec<_>>();
+    assert_eq!(values(&output), expected);
+}
 
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
@@ -18,6 +114,40 @@ fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let buffer = crate::CudaBuffer::alloc(bytes.len(), device).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer
+}
+
+#[test]
+fn gather_replace_rows_preserves_unmapped_rows() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = tensor(0, vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let replacement = tensor(0, vec![1, 2], &[7.0, 8.0]);
+    let row_map = u32_buffer(0, &[u32::MAX, 0, u32::MAX]);
+    let mut output = zeros_tensor(0, vec![3, 2], apxinf_core::DType::BF16);
+    let mut args = GatherArgs::new(GatherSemantic::ReplaceRows, &input, &mut output);
+    args.replacement = Some(&replacement);
+    args.row_map = Some(&row_map);
+    gather(&ctx, args).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0, 2.0, 7.0, 8.0, 5.0, 6.0]);
+}
+
+#[test]
+fn multimodal_rope_rejects_unimplemented_section_layouts() {
+    let ctx = CudaContext::new(0).unwrap();
+    let mut data = zeros_tensor(0, vec![1, 1, 256], apxinf_core::DType::BF16);
+    let positions = zeros_tensor(0, vec![1, 3], apxinf_core::DType::I32);
+    let error = multimodal_rope(
+        &ctx,
+        MultimodalRopeArgs {
+            data: &mut data,
+            positions: &positions,
+            rotary_dim: 64,
+            sections: [10, 11, 11],
+            theta: 1_000_000.0,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("validated d3-mini"), "{error}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -240,6 +370,80 @@ fn gemm_bias_has_its_own_semantic_api() {
     let expected = [3.5, 2.5, 4.0, 2.0, 3.5, 2.5, 4.0, 2.0];
     for (actual, expected) in values(&out).iter().zip(expected) {
         assert!((*actual - expected).abs() < 0.01);
+    }
+}
+
+#[test]
+fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, tokens, heads, head_dim) = (2, 256, 16, 72);
+    let elements = batch * tokens * heads * head_dim;
+    let mut packed_values = Vec::with_capacity(3 * elements);
+    let mut expected = Vec::with_capacity(elements);
+    for batch_index in 0..batch {
+        for token in 0..tokens {
+            for plane in 0..3 {
+                for head in 0..heads {
+                    for dimension in 0..head_dim {
+                        packed_values.push(match plane {
+                            0 => 0.25,
+                            1 => 0.5,
+                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32
+                                / 32.0,
+                        });
+                    }
+                }
+            }
+            for head in 0..heads {
+                for dimension in 0..head_dim {
+                    expected.push(
+                        ((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0,
+                    );
+                }
+            }
+        }
+    }
+    let qkv = f16_tensor(0, vec![batch, tokens, 3, heads, head_dim], &packed_values);
+    let mut out = f16_tensor(0, vec![batch, tokens, heads, head_dim], &vec![0.0; elements]);
+    let normalized = super::attention_contracts::normalize_packed_qkv(
+        &ctx,
+        PackedQkvAttentionArgs::new(&qkv, &mut out),
+    )
+    .unwrap();
+    assert!(normalized.bindings.decode_meta.is_null());
+    assert_eq!(normalized.spec.dynamic_decode, 0);
+    assert!(normalized.resources.is_empty());
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    prepare_with_session(&session, || {
+        let mut args = PackedQkvAttentionArgs::new(&qkv, &mut out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        packed_qkv_attention(&ctx, args)
+    })
+    .unwrap();
+    let eager = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+    for (actual, reference) in eager.iter().zip(&expected) {
+        assert!((actual - reference).abs() < 0.002, "{actual} != {reference}");
+    }
+    let graph = crate::capture(&ctx, || {
+        with_session(&session, || {
+            let mut args = PackedQkvAttentionArgs::new(&qkv, &mut out);
+            args.policy.online_tune = false;
+            args.policy.cache_dir = Some(String::new());
+            packed_qkv_attention(&ctx, args)
+        })
+    })
+    .unwrap();
+    let sentinel: Vec<_> = (0..elements)
+        .flat_map(|_| half::f16::from_f32(-123.0).to_bits().to_ne_bytes())
+        .collect();
+    let output = crate::CudaBuffer::from_tensor(&out).unwrap();
+    for _ in 0..2 {
+        output.copy_from_host(&sentinel).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let replayed = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+        assert_eq!(replayed, eager);
     }
 }
 
@@ -534,6 +738,57 @@ fn kv_cache_decode_meta_rejects_non_decode_queries() {
         KvCacheAttentionArgs::new(&query, &key, &value, &mut out).with_decode_meta(&decode_meta);
     let error = kv_cache_attention(&ctx, args).unwrap_err();
     assert!(error.to_string().contains("batch-1"), "{error}");
+}
+
+#[test]
+fn allocation_free_fa2_decode_matches_attention_contract() {
+    let ctx = CudaContext::new(0).unwrap();
+    let query_values: Vec<_> = (0..24 * 256)
+        .map(|index| ((index * 7 % 31) as f32 - 15.0) / 32.0)
+        .collect();
+    for key_tokens in [128, 2048, 2176] {
+        let cache_values = 4 * key_tokens * 256;
+        let key_values: Vec<_> = (0..cache_values)
+            .map(|index| ((index * 5 % 29) as f32 - 14.0) / 32.0)
+            .collect();
+        let value_values: Vec<_> = (0..cache_values)
+            .map(|index| ((index * 11 % 37) as f32 - 18.0) / 32.0)
+            .collect();
+        let query = tensor(0, vec![1, 1, 24, 256], &query_values);
+        let key = tensor(0, vec![1, key_tokens, 4, 256], &key_values);
+        let value = tensor(0, vec![1, key_tokens, 4, 256], &value_values);
+        let mut reference = tensor(0, vec![1, 1, 24, 256], &vec![0.0; 24 * 256]);
+        let direct = tensor(0, vec![1, 1, 24, 256], &vec![0.0; 24 * 256]);
+        let workspace = zeros_tensor(
+            0,
+            vec![decode_attention_workspace_bytes().div_ceil(4)],
+            apxinf_core::DType::F32,
+        );
+
+        let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut reference);
+        args.valid_key_tokens = key_tokens;
+        args.query_start = key_tokens - 1;
+        args.policy.online_tune = true;
+        args.policy.allow_fallback = false;
+        kv_cache_attention(&ctx, args).unwrap();
+        decode_attention(
+            &ctx,
+            &query,
+            &key,
+            &value,
+            &direct,
+            &workspace,
+            key_tokens,
+            1.0 / 256.0f32.sqrt(),
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            values(&direct),
+            values(&reference),
+            "key_tokens={key_tokens}"
+        );
+    }
 }
 
 #[test]

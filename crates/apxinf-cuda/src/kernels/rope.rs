@@ -194,6 +194,16 @@ pub fn apply(
                 pos_offset,
                 ctx.stream().handle(),
             ),
+            DType::F16 => ffi::apxinf_rope_f16(
+                gpu_ptr(input)?,
+                out_buf.ptr(),
+                head_dim as u32,
+                n_heads as u32,
+                seq_len as u32,
+                rope_theta,
+                pos_offset,
+                ctx.stream().handle(),
+            ),
             dtype => return unsupported_dtype("rope", dtype),
         };
         ffi::check_cuda(res).map_err(Error::Cuda)?;
@@ -294,6 +304,53 @@ pub fn rms_norm_apply_mrope_qk(
         pos_ids,
         256,
     )
+}
+
+/// Apply the half-split RoPE convention used by SmolVLA cross-attention.
+pub fn apply_half_split_f16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    pos_offset: u32,
+) -> Result<Tensor> {
+    let device_id = ctx.device_id();
+    let dims = input.shape().dims();
+    let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
+    let out_buf = output_buffer(ctx, input.size_in_bytes())?;
+
+    require_finite("RoPE", &[rope_theta])?;
+    if input.dtype() != DType::F16
+        || head_dim % 2 != 0
+        || rope_theta <= 0.0
+        || dims != [seq_len, n_heads, head_dim]
+    {
+        return Err(Error::Other(
+            "half-split FP16 RoPE received invalid shape or dtype".into(),
+        ));
+    }
+
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_rope_half_split_f16(
+            gpu_ptr(input)?,
+            out_buf.ptr(),
+            head_dim as u32,
+            n_heads as u32,
+            seq_len as u32,
+            rope_theta,
+            pos_offset,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        input.dtype(),
+        device_id,
+        out_buf,
+    ))
 }
 
 /// The same RMSNorm + mRoPE contract with an explicit 128- or 256-thread launch.

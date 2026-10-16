@@ -51,7 +51,7 @@ int launch_provider(Execution& execution, CutlassState& state) {
 
 }  // namespace
 
-size_t cutlass_resource_requirements(const Spec& spec) {
+size_t cutlass_resource_requirements(const Spec& spec, int) {
   const uint64_t rounded_query =
       (static_cast<uint64_t>(spec.query_tokens) + 127) / 128 * 128;
   const uint64_t elements = static_cast<uint64_t>(spec.batch) *

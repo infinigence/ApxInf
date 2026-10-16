@@ -428,11 +428,13 @@ pub fn matmul(ctx: &CudaContext, activation: &Tensor, weight: &Tensor) -> Result
     let m = activation.shape().dims()[activation.ndim() - 2];
     let k = activation.shape().dims()[activation.ndim() - 1];
     let n = weight.shape().dims()[weight.ndim() - 1];
-    // beta is zero, so the output needs no initial value. Use the active
-    // workspace to keep allocation and default-stream memset out of capture.
-    let output = crate::workspace::output_buffer(
+    // beta is zero; avoid allocation and initialization during capture.
+    let output = crate::workspace::output_buffer_uninitialized(
         ctx,
-        output_shape.numel() * activation.dtype().size_in_bytes(),
+        output_shape
+            .numel()
+            .checked_mul(activation.dtype().size_in_bytes())
+            .ok_or_else(|| Error::Other("GEMM output size overflow".into()))?,
     )?;
     let activation_buffer = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
     let weight_buffer = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;

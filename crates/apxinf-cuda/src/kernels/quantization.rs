@@ -258,6 +258,47 @@ pub fn slice_columns_bf16(ctx: &CudaContext, input: &Tensor, output_cols: usize)
     ))
 }
 
+pub fn slice_columns_f16(ctx: &CudaContext, input: &Tensor, output_cols: usize) -> Result<Tensor> {
+    if input.dtype() != DType::F16 {
+        return Err(Error::DTypeMismatch {
+            expected: DType::F16,
+            got: input.dtype(),
+        });
+    }
+    let shape = input.shape().dims();
+    if shape.len() != 2 || shape[0] == 0 || output_cols == 0 || output_cols > shape[1] {
+        return Err(Error::Other(format!(
+            "FP16 column slice expects [rows,input_cols] with 0 < output_cols <= input_cols, got {shape:?} -> {output_cols}"
+        )));
+    }
+    if output_cols == shape[1] {
+        return Ok(input.clone());
+    }
+    let (rows, input_cols) = (shape[0], shape[1]);
+    let output = output_buffer(
+        ctx,
+        rows.checked_mul(output_cols)
+            .and_then(|elements| elements.checked_mul(DType::F16.size_in_bytes()))
+            .ok_or_else(|| Error::Other("FP16 column slice size overflow".into()))?,
+    )?;
+    crate::transfers::copy_tensor_2d_to_buffer(
+        ctx,
+        input,
+        &output,
+        0,
+        output_cols * DType::F16.size_in_bytes(),
+        input_cols * DType::F16.size_in_bytes(),
+        output_cols * DType::F16.size_in_bytes(),
+        rows,
+    )?;
+    Ok(make_gpu_tensor(
+        apxinf_core::Shape::new(vec![rows, output_cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// Convert an FP16 GEMM result into the BF16 WallOSS residual stream.
 pub fn cast_f16_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     if input.dtype() != DType::F16 {
@@ -279,6 +320,32 @@ pub fn cast_f16_bf16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     Ok(make_gpu_tensor(
         input.shape().clone(),
         DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+/// Convert a BF16 activation to FP16 for Xavier tensor-core GEMMs.
+pub fn cast_bf16_f16(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
+    if input.dtype() != DType::BF16 {
+        return Err(Error::DTypeMismatch {
+            expected: DType::BF16,
+            got: input.dtype(),
+        });
+    }
+    let output = output_buffer(ctx, input.numel() * DType::F16.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_cast_bf16_f16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            input.numel() as i64,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        input.shape().clone(),
+        DType::F16,
         ctx.device_id(),
         output,
     ))

@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use super::types::CudaStream;
 
 unsafe extern "C" {
-    pub(crate) fn apxinf_gdn_conv_prepare_flashinfer(
+    pub(crate) fn apxinf_gdn_conv_prepare(
         input: *const c_void,
         weight: *const c_void,
         window: *mut c_void,
@@ -42,6 +42,18 @@ unsafe extern "C" {
         epsilon: f32,
         stream: CudaStream,
     ) -> i32;
+    pub(crate) fn apxinf_gdn_gated_norm_quantize(
+        input: *const c_void,
+        gate: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        quantized: *mut c_void,
+        rows: i64,
+        fp16_input: i32,
+        epsilon: f32,
+        input_scale: f32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_gdn_causal_conv_step(
         window: *mut c_void,
         input: *const c_void,
@@ -57,7 +69,7 @@ unsafe extern "C" {
         count: i64,
         stream: CudaStream,
     ) -> i32;
-    pub(crate) fn apxinf_gdn_prepare_flashinfer(
+    pub(crate) fn apxinf_gdn_prepare_prefill(
         fused: *const c_void,
         q_out: *mut c_void,
         k_out: *mut c_void,
@@ -72,7 +84,7 @@ unsafe extern "C" {
         epsilon: f32,
         stream: CudaStream,
     ) -> i32;
-    pub(crate) fn apxinf_flashinfer_gdn_prefill(
+    pub(crate) fn apxinf_gdn_prefill(
         q: *const c_void,
         k: *const c_void,
         v: *const c_void,
@@ -89,7 +101,7 @@ unsafe extern "C" {
         scale: f32,
         stream: CudaStream,
     ) -> i32;
-    pub(crate) fn apxinf_flashinfer_gdn_workspace_bytes(
+    pub(crate) fn apxinf_gdn_prefill_workspace_bytes(
         v_heads: i64,
         num_seqs: i64,
     ) -> i64;

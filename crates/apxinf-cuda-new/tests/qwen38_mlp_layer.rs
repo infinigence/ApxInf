@@ -233,7 +233,7 @@ fn mlp_block(
             ops::ScaleLayout::GemmAtom,
         )?;
     } else {
-        ops::rms_norm(ctx, residual, norm_weight, &scratch.normalized, 1e-6)?;
+        ops::mlp::rms_norm(ctx, residual, norm_weight, &scratch.normalized, 1e-6)?;
         ops::nvfp4_quantize_activation(
             ctx,
             &scratch.normalized,

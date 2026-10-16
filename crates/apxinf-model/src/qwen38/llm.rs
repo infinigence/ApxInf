@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::{ops, CapturedGraph, CudaBuffer, CudaContext};
+use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
 use crate::accelerator::create_backend;
@@ -18,20 +18,23 @@ use super::{backend, model, model_runner, weights};
 /// Qwen3.8-27B-NVFP4. Batch 1, text only, BF16 KV cache.
 ///
 /// Execution policy is fixed: batched FlashInfer-GDN prefill, CUDA-graph
-/// decode (per-layer GDN graphs + per-layer MLP graphs) and split-KV FA2
-/// decode attention -- the validated configuration. The kernel harness keeps
-/// its own switches for A/B comparison.
+/// decode (one phase per layer -- MLP only for a full-attention layer, mixer
+/// plus MLP for a GDN layer) and split-KV FA2 decode attention -- the
+/// validated configuration. The kernel harness keeps its own switches for A/B
+/// comparison.
 pub struct Qwen38 {
     ctx: CudaContext,
     backend: Arc<dyn Backend>,
     model: weights::Model,
     scratch: model::Scratch,
     prefill: Option<model::PrefillScratch>,
-    prefill_session: Option<ops::ExecutionSession>,
+    /// The prepared prefill session, with the token count it was prepared for.
+    /// Executions bind the GEMM shapes of that traversal, so a different count
+    /// cannot replay them.
+    prefill_session: Option<(usize, ops::ExecutionSession)>,
     gdn_states: Vec<model::GdnState>,
     kv_caches: Vec<model::KvCache>,
-    mlp_graphs: Option<Vec<CapturedGraph>>,
-    gdn_graphs: Option<Vec<Option<CapturedGraph>>>,
+    decode_phases: Option<Vec<PreparedPhase>>,
     position: usize,
     kv_capacity: usize,
 }
@@ -56,31 +59,7 @@ impl Qwen38 {
         // caller's environment. An explicit environment value still wins, for
         // kernel diagnostics — but that run leaves the validated
         // configuration. TODO(cuda-new): promote to per-call arguments.
-        for (key, value) in [
-            // Tiled GDN prefill conv path, tile 64 (report 05/23).
-            ("APXINF_GDN_PREFILL_TILED", "1"),
-            ("APXINF_GDN_PREFILL_TILE", "64"),
-            // cuBLASLt native-NVFP4 candidates for the block-scaled GEMMs
-            // (report 06).
-            ("APXINF_GEMM_CUBLASLT_NVFP4", "1"),
-            // 16-byte vectorized elementwise kernels (report 08).
-            ("APXINF_QWEN38_VECTOR_ELEMENTWISE", "1"),
-            // Paired-channel conv decode kernel (report 23).
-            ("APXINF_GDN_CONV_PAIR", "1"),
-            // The shared-activation FP8 GEMV variant lost its A/B (report 25).
-            ("APXINF_FP8_GEMV_SHARED", "0"),
-            // Native fp8x2 pair quantization, part of the D3 contract
-            // (reports 30/62).
-            ("APXINF_FP8_NATIVE_PAIR", "1"),
-            // Five-warp-group FlashInfer prepare reduction (report 11).
-            ("APXINF_GDN_PREPARE_PARALLEL", "5"),
-            // Single split for the split-KV FA2 decode kernel (report 47).
-            ("APXINF_FA2_DECODE_SPLITS", "1"),
-        ] {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-            }
-        }
+        model_runner::apply_validated_kernel_defaults();
 
         let ctx = CudaContext::new(ordinal).map_err(Error::Cuda)?;
         let backend = create_backend(device)?;
@@ -106,19 +85,15 @@ impl Qwen38 {
             prefill_session: None,
             gdn_states,
             kv_caches,
-            mlp_graphs: None,
-            gdn_graphs: None,
+            decode_phases: None,
             position: 0,
             kv_capacity: capacity,
         })
     }
 
     fn ensure_graphs(&mut self) {
-        if self.mlp_graphs.is_none() {
-            self.mlp_graphs = Some(model_runner::capture_mlp_graphs(&self.ctx, &self.model, &mut self.scratch));
-        }
-        if self.gdn_graphs.is_none() {
-            self.gdn_graphs = Some(model_runner::capture_gdn_graphs(
+        if self.decode_phases.is_none() {
+            self.decode_phases = Some(model_runner::capture_decode_phases(
                 &self.ctx,
                 &self.model,
                 &mut self.scratch,
@@ -138,6 +113,18 @@ impl Qwen38 {
             self.prefill = Some(model::PrefillScratch::new(&self.ctx, needed));
             // Executions bind the scratch addresses, so a new scratch means
             // the prepared session no longer matches.
+            self.prefill_session = None;
+        }
+        // Addresses are not the only binding: the prepared GEMMs carry the row
+        // count of the traversal that prepared them, and `needed` rounds up to
+        // CHUNK, so two different token counts share one scratch. Replaying
+        // under a different count misses the execution cache, which a
+        // non-preparation traversal cannot refill.
+        if self
+            .prefill_session
+            .as_ref()
+            .is_some_and(|(prepared, _)| *prepared != tokens)
+        {
             self.prefill_session = None;
         }
     }
@@ -196,7 +183,7 @@ impl LlmTrait for Qwen38 {
                 model::prefill_logits(ctx, model, prefill, scratch, count);
                 Ok(())
             };
-            if let Some(session) = self.prefill_session.as_ref() {
+            if let Some((_, session)) = self.prefill_session.as_ref() {
                 ops::with_session(session, || {
                     forward(
                         &self.ctx,
@@ -220,7 +207,12 @@ impl LlmTrait for Qwen38 {
                         &self.scratch,
                     )
                 })?;
-                self.prefill_session = Some(session);
+                // Reported here, not after the branch: the preparation
+                // traversal is the one that sub-allocates, and every later
+                // `with_session` resets the arena offset without the cached
+                // executions re-allocating, so the figure would read as zero.
+                model_runner::report_session("prefill", &session);
+                self.prefill_session = Some((count, session));
             }
             self.ctx.synchronize().map_err(Error::Cuda)?;
             self.position = token_ids.len();
@@ -234,15 +226,14 @@ impl LlmTrait for Qwen38 {
             let position = start + offset;
             model_runner::set_token(&self.scratch, token as i32);
             model_runner::set_position(&self.scratch, position);
-            model_runner::decode_step_with_mlp_graphs(
+            model_runner::decode_step_with_phases(
                 &self.ctx,
                 &self.model,
                 &mut self.scratch,
                 &mut self.gdn_states,
                 &mut self.kv_caches,
                 position,
-                self.mlp_graphs.as_ref().unwrap(),
-                self.gdn_graphs.as_deref(),
+                self.decode_phases.as_ref().unwrap(),
             );
         }
         self.ctx.synchronize().map_err(Error::Cuda)?;

@@ -124,6 +124,60 @@ __global__ void rope_bf16_kernel(
     output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }
 
+__global__ void rope_f16_kernel(
+    const half* input, half* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float rope_theta, uint32_t pos_offset)
+{
+    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_idx = blockIdx.y;
+    uint32_t seq_idx  = blockIdx.z;
+    if (pair_idx >= head_dim / 2) return;
+
+    uint32_t pos = seq_idx + pos_offset;
+    float freq = 1.0f / powf(rope_theta, 2.0f * (float)pair_idx / (float)head_dim);
+    float angle = (float)pos * freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    uint32_t base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    uint32_t idx0 = base + 2 * pair_idx;
+    uint32_t idx1 = base + 2 * pair_idx + 1;
+
+    float x0 = __half2float(input[idx0]);
+    float x1 = __half2float(input[idx1]);
+    output[idx0] = __float2half(x0 * cos_val - x1 * sin_val);
+    output[idx1] = __float2half(x0 * sin_val + x1 * cos_val);
+}
+
+__global__ void rope_half_split_f16_kernel(
+    const half* input, half* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float rope_theta, uint32_t pos_offset)
+{
+    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_idx = blockIdx.y;
+    uint32_t seq_idx  = blockIdx.z;
+    if (pair_idx >= head_dim / 2) return;
+
+    uint32_t pos = seq_idx + pos_offset;
+    float frequency = 1.0f / powf(
+        rope_theta, 2.0f * static_cast<float>(pair_idx) /
+                         static_cast<float>(head_dim));
+    float angle = static_cast<float>(pos) * frequency;
+    float sine;
+    float cosine;
+    sincosf(angle, &sine, &cosine);
+
+    uint32_t base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    uint32_t first = base + pair_idx;
+    uint32_t second = base + head_dim / 2 + pair_idx;
+    float x0 = __half2float(input[first]);
+    float x1 = __half2float(input[second]);
+    output[first] = __float2half(x0 * cosine - x1 * sine);
+    output[second] = __float2half(x0 * sine + x1 * cosine);
+}
+
 
 
 // ── RoPE Batched (bf16) — half-split pairs ────────────────────────────────

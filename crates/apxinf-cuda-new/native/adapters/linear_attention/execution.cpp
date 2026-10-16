@@ -10,6 +10,7 @@
 #include "../../kernels/custom/gdn_ops.h"
 #include "../../kernels/flashinfer_gdn/flashinfer_gdn.h"
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -69,6 +70,29 @@ extern "C" apxinf_status_t apxinf_gdn_gated_norm(
   });
 }
 
+extern "C" apxinf_status_t apxinf_gdn_gated_norm_quantize(
+    const void* input, const void* gate, const void* weight, void* output,
+    void* quantized, int64_t rows, int32_t fp16_input, float epsilon,
+    float input_scale,
+    apxinf_cuda_stream_t stream) {
+  return abi_boundary([&] {
+    if (input == nullptr || gate == nullptr || weight == nullptr ||
+        output == nullptr || quantized == nullptr || !extent(rows) ||
+        (fp16_input != 0 && fp16_input != 1) ||
+        !std::isfinite(epsilon) || epsilon <= 0.0F ||
+        !std::isfinite(input_scale) || input_scale <= 0.0F ||
+        !std::isfinite(1.0F / input_scale)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid GDN norm quantization arguments");
+    }
+    check(apxinf::cuda_new::gdn_ops::gdn_gated_norm_quantize(
+              input, gate, weight, output, quantized,
+              static_cast<int>(rows), fp16_input != 0, epsilon, input_scale,
+              static_cast<cudaStream_t>(stream)),
+          "GDN norm quantization");
+  });
+}
+
 extern "C" apxinf_status_t apxinf_gdn_causal_conv_step(
     void* window, const void* input, const void* weight, void* output,
     int64_t channels, int64_t kernel_width, apxinf_cuda_stream_t stream) {
@@ -101,7 +125,7 @@ extern "C" apxinf_status_t apxinf_gdn_widen_f16_to_bf16(
   });
 }
 
-extern "C" apxinf_status_t apxinf_gdn_prepare_flashinfer(
+extern "C" apxinf_status_t apxinf_gdn_prepare_prefill(
     const void* fused, void* q_out, void* k_out, void* v_out, const void* g,
     void* alpha, int64_t tokens, int64_t row_width, int64_t k_heads,
     int64_t v_heads, int64_t dim, float epsilon, apxinf_cuda_stream_t stream) {
@@ -113,7 +137,7 @@ extern "C" apxinf_status_t apxinf_gdn_prepare_flashinfer(
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "invalid GDN FlashInfer preparation arguments");
     }
-    check(apxinf::cuda_new::gdn_ops::gdn_prepare_flashinfer(
+    check(apxinf::cuda_new::gdn_ops::gdn_prepare_prefill(
               fused, q_out, k_out, v_out, g, alpha, static_cast<int>(tokens),
               static_cast<int>(row_width), static_cast<int>(k_heads),
               static_cast<int>(v_heads), static_cast<int>(dim), epsilon,
@@ -122,7 +146,7 @@ extern "C" apxinf_status_t apxinf_gdn_prepare_flashinfer(
   });
 }
 
-extern "C" apxinf_status_t apxinf_gdn_conv_prepare_flashinfer(
+extern "C" apxinf_status_t apxinf_gdn_conv_prepare(
     const void* input, const void* weight, void* window, void* q_out,
     void* k_out, void* v_out, const void* decay, void* alpha,
     int64_t tokens, int64_t k_heads, int64_t v_heads, float epsilon,
@@ -135,7 +159,7 @@ extern "C" apxinf_status_t apxinf_gdn_conv_prepare_flashinfer(
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "invalid fused GDN convolution preparation arguments");
     }
-    check(apxinf::cuda_new::gdn_ops::gdn_conv_prepare_flashinfer(
+    check(apxinf::cuda_new::gdn_ops::gdn_conv_prepare(
               input, weight, window, q_out, k_out, v_out, decay, alpha,
               static_cast<int>(tokens), static_cast<int>(k_heads),
               static_cast<int>(v_heads), epsilon,
@@ -144,7 +168,7 @@ extern "C" apxinf_status_t apxinf_gdn_conv_prepare_flashinfer(
   });
 }
 
-extern "C" apxinf_status_t apxinf_flashinfer_gdn_prefill(
+extern "C" apxinf_status_t apxinf_gdn_prefill(
     const void* q, const void* k, const void* v, void* out,
     const void* gate_log, const void* beta, const void* cu_seqlens,
     void* state, void* tensor_map_workspace, int64_t tokens, int64_t q_heads,
@@ -169,7 +193,7 @@ extern "C" apxinf_status_t apxinf_flashinfer_gdn_prefill(
   });
 }
 
-extern "C" int64_t apxinf_flashinfer_gdn_workspace_bytes(int64_t v_heads,
+extern "C" int64_t apxinf_gdn_prefill_workspace_bytes(int64_t v_heads,
                                                          int64_t num_seqs) {
   if (v_heads <= 0 || num_seqs <= 0) return 0;
   return static_cast<int64_t>(apxinf::cuda_new::flashinfer_gdn::

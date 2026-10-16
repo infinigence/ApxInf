@@ -120,6 +120,12 @@ extern "C" {
         count: i64,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_cast_bf16_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn apxinf_token_sampling_workspace_sizes(
         vocab_size: u32,
@@ -531,6 +537,15 @@ extern "C" {
         layout: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_rgb_u8_to_patches_f16(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        image_size: i32,
+        patch_size: i32,
+        layout: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_rgb_u8_to_temporal2_merge2_rect_bf16(
         rgb: *const c_void,
         patches: *mut c_void,
@@ -564,6 +579,22 @@ extern "C" {
         image_size: i32,
         patch_size: i32,
         layout: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_pixel_shuffle_4_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        views: i32,
+        tokens_per_view: i32,
+        width: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_pixel_shuffle_4_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        views: i32,
+        tokens_per_view: i32,
+        width: i32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
@@ -607,6 +638,14 @@ extern "C" {
     ) -> cudaError_t;
 
     pub fn apxinf_static_bias_gelu_bf16_packed8(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_bias_gelu_f16(
         input: *const c_void,
         bias: *const c_void,
         output: *mut c_void,
@@ -694,6 +733,13 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_swiglu_bf16(
+        gate_up: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        inner: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_swiglu_f16(
         gate_up: *const c_void,
         output: *mut c_void,
         rows: i32,
@@ -800,6 +846,15 @@ extern "C" {
         eps: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_rms_norm_f16(
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_rms_norm_quant_bf16_e4m3(
         input: *const c_void,
         weight: *const c_void,
@@ -811,6 +866,16 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_layer_norm_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_layer_norm_f16(
         input: *const c_void,
         weight: *const c_void,
         bias: *const c_void,
@@ -1127,8 +1192,36 @@ extern "C" {
         pos_offset: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_rope_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        head_dim: u32,
+        n_heads: u32,
+        seq_len: u32,
+        rope_theta: f32,
+        pos_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+
+    pub fn apxinf_rope_half_split_f16(
+        input: *const c_void,
+        output: *mut c_void,
+        head_dim: u32,
+        n_heads: u32,
+        seq_len: u32,
+        theta: f32,
+        pos_offset: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 
     pub fn apxinf_add_f32(
+        a: *const c_void,
+        b: *const c_void,
+        output: *mut c_void,
+        count: u32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_add_f16(
         a: *const c_void,
         b: *const c_void,
         output: *mut c_void,
@@ -1197,6 +1290,13 @@ extern "C" {
     ) -> cudaError_t;
 
     pub fn apxinf_scale_f32(
+        input: *const c_void,
+        output: *mut c_void,
+        count: u32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_scale_f16(
         input: *const c_void,
         output: *mut c_void,
         count: u32,

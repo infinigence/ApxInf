@@ -2,7 +2,7 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 
-use super::contracts::{gpu_ptr, require_buffers};
+use super::contracts::{gpu_ptr, make_gpu_tensor, require_buffers};
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;
 use crate::ffi;
@@ -292,6 +292,144 @@ pub fn rgb_u8_to_patches_bf16(
         ))
         .map_err(Error::Cuda)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rgb_u8_to_patches_f16(
+    ctx: &CudaContext,
+    images: &CudaBuffer,
+    patches: &Tensor,
+    views: usize,
+    image_size: usize,
+    patch_size: usize,
+    layout: ImageLayout,
+) -> Result<()> {
+    if views == 0 || image_size == 0 || patch_size == 0 || image_size % patch_size != 0 {
+        return Err(Error::Other(
+            "invalid static inference FP16 image preprocessing shape".into(),
+        ));
+    }
+    let expected_bytes = views * 3 * image_size * image_size;
+    let side = image_size / patch_size;
+    let expected_shape = [views * side * side, 3 * patch_size * patch_size];
+    if images.device() != ctx.device_id()
+        || images.len() != expected_bytes
+        || patches.dtype() != DType::F16
+        || patches.shape().dims() != expected_shape
+    {
+        return Err(Error::Other(format!(
+            "static inference FP16 raw image/preprocessed patch mismatch: image bytes {}, patches {} {:?}",
+            images.len(),
+            patches.dtype(),
+            patches.shape().dims()
+        )));
+    }
+    let layout = match layout {
+        ImageLayout::Nhwc => 0,
+        ImageLayout::Nchw => 1,
+    };
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_rgb_u8_to_patches_f16(
+            images.ptr(),
+            gpu_ptr(patches)?,
+            views as i32,
+            image_size as i32,
+            patch_size as i32,
+            layout,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
+pub fn pixel_shuffle_4_bf16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    tokens_per_view: usize,
+) -> Result<Tensor> {
+    let input_shape = input.shape().dims();
+    if input.dtype() != DType::BF16
+        || input_shape.len() != 2
+        || tokens_per_view == 0
+        || input_shape[0] % tokens_per_view != 0
+        || tokens_per_view % 16 != 0
+    {
+        return Err(Error::Other(
+            "BF16 pixel-shuffle-4 input/token shape mismatch".into(),
+        ));
+    }
+    let views = input_shape[0] / tokens_per_view;
+    let output_rows = views * tokens_per_view / 16;
+    let output_columns = input_shape[1]
+        .checked_mul(16)
+        .ok_or_else(|| Error::Other("BF16 pixel-shuffle output width overflow".into()))?;
+    let output_elements = output_rows
+        .checked_mul(output_columns)
+        .ok_or_else(|| Error::Other("BF16 pixel-shuffle output size overflow".into()))?;
+    let output =
+        crate::workspace::output_buffer(ctx, output_elements * DType::BF16.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_pixel_shuffle_4_bf16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            views as i32,
+            tokens_per_view as i32,
+            input_shape[1] as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        vec![output_rows, output_columns].into(),
+        DType::BF16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
+pub fn pixel_shuffle_4_f16(
+    ctx: &CudaContext,
+    input: &Tensor,
+    tokens_per_view: usize,
+) -> Result<Tensor> {
+    let input_shape = input.shape().dims();
+    if input.dtype() != DType::F16
+        || input_shape.len() != 2
+        || tokens_per_view == 0
+        || input_shape[0] % tokens_per_view != 0
+        || tokens_per_view % 16 != 0
+    {
+        return Err(Error::Other(
+            "FP16 pixel-shuffle-4 input/token shape mismatch".into(),
+        ));
+    }
+    let views = input_shape[0] / tokens_per_view;
+    let output_rows = views * tokens_per_view / 16;
+    let output_columns = input_shape[1]
+        .checked_mul(16)
+        .ok_or_else(|| Error::Other("FP16 pixel-shuffle output width overflow".into()))?;
+    let output_elements = output_rows
+        .checked_mul(output_columns)
+        .ok_or_else(|| Error::Other("FP16 pixel-shuffle output size overflow".into()))?;
+    let output =
+        crate::workspace::output_buffer(ctx, output_elements * DType::F16.size_in_bytes())?;
+    unsafe {
+        ffi::check_cuda(ffi::apxinf_static_pixel_shuffle_4_f16(
+            gpu_ptr(input)?,
+            output.ptr(),
+            views as i32,
+            tokens_per_view as i32,
+            input_shape[1] as i32,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        vec![output_rows, output_columns].into(),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
 }
 /// Fused static inference image preprocessing into FP32 patch-major layout.
 ///

@@ -49,16 +49,12 @@ pub fn upload_fp32_as_bf16(
         _prevent_leak: Some(std::sync::Arc::new(buf)),
     };
     let device = Device::Cuda(device_id);
-    // SAFETY: `buf` is retained by `_prevent_leak`, belongs to `device`, and
-    // contains exactly one BF16 element for every element in `shape`.
-    Ok(unsafe {
-        Tensor::from_raw_parts_unchecked(
-            shape,
-            DType::BF16,
-            device,
-            Storage::Gpu { device, handle },
-        )
-    })
+    Ok(Tensor::from_raw_parts(
+        shape,
+        DType::BF16,
+        device,
+        Storage::Gpu { device, handle },
+    ))
 }
 
 /// Download a bf16 GPU tensor and upcast to fp32 on host.

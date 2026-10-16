@@ -148,6 +148,13 @@ pub fn add(ctx: &CudaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
                 count,
                 ctx.stream().handle(),
             ),
+            DType::F16 => ffi::apxinf_add_f16(
+                gpu_ptr(a)?,
+                gpu_ptr(b)?,
+                out_buf.ptr(),
+                count,
+                ctx.stream().handle(),
+            ),
             dtype => return unsupported_dtype("add", dtype),
         };
         ffi::check_cuda(res).map_err(Error::Cuda)?;
@@ -227,6 +234,68 @@ pub fn concat_columns_bf16(ctx: &CudaContext, tensors: &[&Tensor]) -> Result<Ten
     ))
 }
 
+/// Concatenate equally tall FP16 matrices along their column dimension.
+pub fn concat_columns_f16(ctx: &CudaContext, tensors: &[&Tensor]) -> Result<Tensor> {
+    let first = tensors
+        .first()
+        .ok_or_else(|| Error::Other("column concatenation requires at least one tensor".into()))?;
+    let (rows, first_cols) = matrix_shape(first, "column concatenation")?;
+    if first.dtype() != DType::F16 || rows == 0 || first_cols == 0 {
+        return Err(Error::Other(
+            "column concatenation requires non-empty FP16 matrices".into(),
+        ));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    let mut total_cols = 0usize;
+    for tensor in tensors {
+        let (tensor_rows, tensor_cols) = matrix_shape(tensor, "column concatenation")?;
+        if tensor.dtype() != DType::F16 || tensor_rows != rows || tensor_cols == 0 {
+            return Err(Error::Other(
+                "column concatenation requires equally tall, non-empty FP16 matrices".into(),
+            ));
+        }
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+        total_cols = total_cols
+            .checked_add(tensor_cols)
+            .ok_or_else(|| Error::Other("column concatenation width overflow".into()))?;
+    }
+    let row_bytes = total_cols
+        .checked_mul(DType::F16.size_in_bytes())
+        .ok_or_else(|| Error::Other("column concatenation row size overflow".into()))?;
+    let output = output_buffer(
+        ctx,
+        rows.checked_mul(row_bytes)
+            .ok_or_else(|| Error::Other("column concatenation output size overflow".into()))?,
+    )?;
+    let mut column_offset = 0usize;
+    for tensor in tensors {
+        let tensor_cols = tensor.shape().dims()[1];
+        let tensor_row_bytes = tensor_cols * DType::F16.size_in_bytes();
+        crate::transfers::copy_tensor_2d_to_buffer(
+            ctx,
+            tensor,
+            &output,
+            column_offset * DType::F16.size_in_bytes(),
+            row_bytes,
+            tensor_row_bytes,
+            tensor_row_bytes,
+            rows,
+        )?;
+        column_offset += tensor_cols;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![rows, total_cols]),
+        DType::F16,
+        ctx.device_id(),
+        output,
+    ))
+}
+
 /// Element-wise multiply on CUDA. Dispatches on dtype.
 pub fn mul(ctx: &CudaContext, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let device_id = ctx.device_id();
@@ -282,6 +351,13 @@ pub fn scale(ctx: &CudaContext, input: &Tensor, scale_factor: f32) -> Result<Ten
                 ctx.stream().handle(),
             ),
             DType::BF16 => ffi::apxinf_scale_bf16(
+                gpu_ptr(input)?,
+                out_buf.ptr(),
+                count,
+                scale_factor,
+                ctx.stream().handle(),
+            ),
+            DType::F16 => ffi::apxinf_scale_f16(
                 gpu_ptr(input)?,
                 out_buf.ptr(),
                 count,
@@ -372,9 +448,11 @@ pub fn concat_rows_bf16(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> R
     let (first_rows, cols) = matrix_shape(first, "row concatenation")?;
     let (second_rows, second_cols) = matrix_shape(second, "row concatenation")?;
     if first.dtype() != DType::BF16 || second.dtype() != DType::BF16 || cols != second_cols {
-        return Err(Error::Other(
-            "static inference BF16 row concatenation requires matrices with equal widths".into(),
-        ));
+        return Err(Error::Other(format!(
+            "static inference BF16 row concatenation requires matrices with equal widths, got {:?} and {:?}",
+            first.shape().dims(),
+            second.shape().dims()
+        )));
     }
     let output = bf16_output(ctx, first_rows + second_rows, cols)?;
     unsafe {
@@ -724,9 +802,11 @@ pub fn concat_rows_f16(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> Re
     let (first_rows, cols) = matrix_shape(first, "row concatenation")?;
     let (second_rows, second_cols) = matrix_shape(second, "row concatenation")?;
     if first.dtype() != DType::F16 || second.dtype() != DType::F16 || cols != second_cols {
-        return Err(Error::Other(
-            "static inference row concatenation expects FP16 matrices with equal widths".into(),
-        ));
+        return Err(Error::Other(format!(
+            "static inference row concatenation expects FP16 matrices with equal widths, got {:?} and {:?}",
+            first.shape().dims(),
+            second.shape().dims()
+        )));
     }
     let output = f16_output(ctx, first_rows + second_rows, cols)?;
     unsafe {

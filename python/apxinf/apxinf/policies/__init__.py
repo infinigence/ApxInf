@@ -39,7 +39,14 @@ from .base import (
 from .registry import available_policies, get_policy, register_policy
 
 # Concrete model policies (importing registers them under their model_type).
-from .impls import Pi05Policy, Pi0FastPolicy, Gr00tPolicy, QwenDrivePolicy, WallossPolicy
+from .impls import (
+    Pi05Policy,
+    Pi0FastPolicy,
+    Gr00tPolicy,
+    QwenDrivePolicy,
+    SmolVlaPolicy,
+    WallossPolicy,
+)
 
 __all__ = [
     "Policy",
@@ -57,5 +64,6 @@ __all__ = [
     "Pi0FastPolicy",
     "Gr00tPolicy",
     "QwenDrivePolicy",
+    "SmolVlaPolicy",
     "WallossPolicy",
 ]

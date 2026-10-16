@@ -340,6 +340,19 @@ pub trait VlaRuntime {
     /// already owns the backend.
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>>;
 
+    /// Run inference, return host actions, and report model-local phase timings.
+    ///
+    /// This is diagnostic-only and optional; unsupported families return an
+    /// explicit error rather than degrading to a misleading total-only profile.
+    fn infer_host_f32_profiled(
+        &self,
+        _request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, f64>)> {
+        Err(Error::Other(
+            "this VLA runtime does not expose phase profiling".into(),
+        ))
+    }
+
     /// Discrete action-token output shape for autoregressive token VLAs.
     ///
     /// A runtime whose deployable output is a token sequence (π0-FAST) returns
