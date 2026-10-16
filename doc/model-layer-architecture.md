@@ -151,10 +151,12 @@ separately migrated; do not rename or import them as part of an unrelated port.
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
 The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
-parses its variants locally; the common loader does not infer quantization from
-a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
-and implementing family-local parsing/validation; registration alone is not
+names, and for every Metal request. Metal admission reaches only a registered
+`metal_` factory, and each MLX family parses its variants locally; the common
+loader does not infer quantization from a shared CUDA precision choice. A new
+Metal family needs no central admission edit. Supporting it for a new non-Metal
+family requires updating that admission check and implementing family-local
+parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
