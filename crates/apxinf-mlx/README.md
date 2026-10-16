@@ -86,6 +86,19 @@ or requested log-probability. It normalizes NaN/infinity according to the core
 contract, selects on device, and reads one token scalar. Other sampling options,
 normal generation and CUDA-style capture explicitly return unsupported.
 
+## Checkpoint arrays
+
+`load_safetensors` reads the tensors that a name filter keeps from one or more
+SafeTensors files (for example the list from
+`apxinf_loader::safetensors::safetensors_files`) into evaluated arrays. Other
+tensors are never read. MLX reads on its CPU device; there is no host staging
+copy.
+This covers MLX-format affine checkpoints, whose packed weights are U32 and
+have no core `DType`. Duplicate names across files, tensors without a bridge
+dtype and truncated files fail with the file and tensor name. Bytes read count
+as uploads. The model family still validates every key, shape, dtype and
+quantization parameter before use.
+
 ## Custom kernels
 
 `MetalKernel` is the private-source building primitive. Its call is unsafe
