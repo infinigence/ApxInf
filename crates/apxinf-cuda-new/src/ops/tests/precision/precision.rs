@@ -1173,6 +1173,34 @@ fn bf16_layer_norm_preserves_vectorized_statistics() {
 }
 
 #[test]
+fn bf16_gemm_preserves_f32_split_k_reduction() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, n, k) = (512, 1152, 1152);
+    let a = tensor(0, vec![m, k], &vec![1.0; m * k]);
+    let mut weights = vec![-1.0; k * n];
+    weights[..k / 2 * n].fill(1.0);
+    weights[..n].fill(1.0 / 256.0);
+    let b = tensor(0, vec![k, n], &weights);
+    let bias = tensor(0, vec![n], &vec![1.0; n]);
+    // Exact dyadic dot product: 575 + 1/256 - 576. A BF16 split-K
+    // partial sum loses the small term before cancellation and bias.
+    for biased in [false, true] {
+        let mut output = zeros_tensor(0, vec![m, n], DType::BF16);
+        let args = GemmArgs::new(&a, &b, &mut output);
+        let (semantic, extra, expected) = if biased {
+            (
+                super::contracts::Semantic::GemmBias,
+                Some(&bias),
+                1.0 / 256.0,
+            )
+        } else {
+            (super::contracts::Semantic::Gemm, None, -1.0 + 1.0 / 256.0)
+        };
+        validate_all_candidates(&ctx, args, semantic, extra, &vec![expected; m * n]).unwrap();
+    }
+}
+
+#[test]
 fn bf16_gemm_bias_preserves_accumulation() {
     for (dtype, alpha, scale) in [
         (DType::BF16, 1.0, 1.0),

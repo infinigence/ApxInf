@@ -2,59 +2,83 @@
 
 This PR prepares the CI tools and workflows. It does **not** register runners,
 enable GPU dispatch, or change branch protection. An incomplete board matrix,
-missing asset, uncalibrated performance or shape-switch budget, or failed preflight cannot pass.
+missing asset, uncalibrated budget, failed preflight or numerical failure cannot pass.
 
 ## Acceptance status
 
-**Not accepted / not online.** The shared-board harness is implemented. The
-branch now incorporates upstream's direct cuda-new PI05 migration (`#88`).
-Merged-source GPU acceptance is still incomplete; results from the old backend
-do not qualify the current implementation.
-The merge preserves explicit INT8 language normalization and its conservative
-allocation-schedule reservation. BF16 now keeps its normalization explicit;
-FP8 retains its folded weight recipe.
+**Not accepted / not online.** CPU contracts and the shared-board harness are
+implemented. Final-source GPU qualification and performance budgets remain
+incomplete. The PR stays a draft until the required matrix below passes.
 
-### Latest verification (2026-10-17)
+### Verified results (2026-10-17)
 
-The complete private BF16 repair passes all **63/63** Thor cases: 8 real
-observations and 13 diagnostic inputs for each of 1–3 views. All action steps
-pass the unchanged limits. **60/63** outputs are bitwise OpenPI; the three
-21-token gradient cases have relative L2 of 0.01748, 0.00847 and 0.00526.
-Both processes load the same CUDA library hashes. Captured execution, repeated
-calls and A→other inputs→A checks pass. These are fixed-observation action
-chunks, not closed-loop trials or task-success measurements.
+Each numerical run covers eight real observations and thirteen constructed
+diagnostics per view: 63 cases per board/precision. The existing limits apply
+to the whole chunk and every action timestep. Counts below are diagnostic
+results, **not approved baselines**.
 
-This private result still depends on staged Attention, ordered patch projection
-and an action-down provider control. It is **not** maintained-path acceptance.
-The action-down experiment checks all eight cuBLASLt configurations: the chosen
-rank 4 has no split-K reduction and differs from OpenPI in 287 BF16 elements;
-ranks 0/1/3 use three-way split-K and match. A double-precision oracle differs
-from both results. This is reduction-order sensitivity, not evidence of a
-wrong dtype or a broken cuBLASLt candidate. Do not encode a provider override
-in model code to hide it.
+| Build / hardware / precision | Real, 1 / 2 / 3 views | Constructed, 1 / 2 / 3 views | Total |
+| --- | --- | --- | --- |
+| Maintained TF32 repair / Thor BF16 | 7/8, 8/8, 8/8 | 11/13, 8/13, 12/13 | 54/63 |
+| Same Thor build / FP8, original calibration | 0/8, 5/8, 5/8 | 1/13, 0/13, 0/13 | 11/63 |
+| Maintained upload/vision/projector repair, before RGB and TF32 / Orin BF16 | 7/8, 8/8, 8/8 | 9/13, 8/13, 11/13 | 51/63 |
+| Same Orin build / INT8 | 0/8, 6/8, 4/8 | 1/13, 0/13, 0/13 | 11/63 |
+| Complete private arithmetic diagnostic / Thor BF16 | 8/8, 8/8, 8/8 | 13/13, 13/13, 13/13 | 63/63 |
+| Complete private arithmetic diagnostic / Orin BF16 | 7/8, 8/8, 8/8 | 10/13, 8/13, 9/13 | 50/63 |
 
-The FP32 auxiliary-projection repair now has a public `GemmMath::Tf32` contract,
-a separate exact recipe key, prepared resource accounting and mutable-weight
-capture tests. Six GPU regressions pass on Orin CUDA 12.6, including the original
-GEMM and BF16 bias tests. Replacing only the private TF32 adapter with that safe
-interface preserves four difficult full-model outputs bitwise on Thor. The
-normal maintained build passes **54/63** Thor inputs (real **7/8, 8/8, 8/8**;
-diagnostics **11/13, 8/13, 12/13**). Its remaining failures require the other
-repairs above; paired performance is still running. The complete private repair
-on Orin also still fails five two-view diagnostics while passing all eight
-real observations; Thor results do not qualify Orin.
+The private Thor result uses staged Attention, ordered patch projection and an
+action-down provider control. It is not a maintained execution path. Its 60/63
+bitwise outputs, unchanged limits, graph execution and zero repeated/revisited
+drift establish diagnostic evidence only. Both engines load identical CUDA
+library digests. The three non-bitwise cases also pass every timestep. Earlier
+Thor runs with different loaded cuBLAS libraries are ineligible for formal
+acceptance; the aggregator rejects that mismatch.
+
+### Numerical findings and remaining work
+
+- Maintained fixes cover timestep generation, unfolded normalization, staged
+  BF16 RoPE/GeGLU, FP32 frontend boundaries, Welford LayerNorm, bias before BF16
+  rounding, vision Attention arithmetic, RGB reciprocal multiplication and
+  pageable-upload completion. Independent GPU negative controls exercise these
+  boundaries. Fixtures use synthetic inputs rather than checkpoint captures.
+- FP32 auxiliary projections now explicitly request `GemmMath::Tf32`; storage,
+  accumulation, resources, graph lifetime and recipe identity remain in the
+  safe CUDA operator layer. Replacing the private TF32 adapter preserves four
+  difficult Thor outputs bitwise. This alone does not fix the full model.
+- Orin's private white/gradient traces first diverge at the first vision output
+  projection; input, LayerNorm, QKV and Attention are bitwise equal. The selected
+  cuBLASLt candidate uses in-place split-K reduction in BF16. An independent
+  cancellation case loses `0.99609375` despite requesting FP32 accumulation.
+  Filtering BF16 partial reductions to compute precision passes the actual GPU
+  RED/GREEN test and six existing GEMM regressions. The two-view private
+  diagnostic improves from 8/13 to 9/13; white-image relative L2 falls from
+  0.290 to 0.052 and still fails. Full maintained-model and paired performance
+  qualification of this latest repair is running.
+- A separate Thor action-down difference comes from **FP32 reduction order**:
+  several split-K candidates match OpenPI while the selected unsplit candidate
+  differs in 287 BF16 elements. FP64 differs from both. This is distinct from
+  Orin's reduced-precision partial sums and does not justify a provider override.
+- Remaining maintained BF16 failures include zero-noise gradients, black and
+  white images, distinct camera gray levels and a one-view real observation.
+  Some fail only an individual timestep. FP8/INT8 failures also remain unresolved;
+  they are not waived as out-of-distribution inputs or accepted by replacing
+  reference outputs.
+
+### Performance evidence
 
 Paired measurements use 30 warmups and 50 samples, with baseline, candidate and
-baseline revisit. The complete private Thor repair has a clear performance debt:
+baseline revisit. They retain shared desktop clients and are diagnostic, not
+exclusive-run budgets. Latest maintained Thor TF32 measurements are:
 
 | Views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
 | --- | --- | --- |
-| 1 | 59.285 / 70.447 / 59.253 ms | 65.318 / 74.492 / 65.339 ms |
-| 2 | 70.774 / 80.872 / 70.564 ms | 75.985 / 85.228 / 75.989 ms |
-| 3 | 86.481 / 96.983 / 86.627 ms | 91.025 / 100.009 / 91.015 ms |
+| 1 | 59.208 / 59.346 / 59.226 ms | 65.236 / 64.680 / 65.276 ms |
+| 2 | 70.630 / 69.663 / 70.482 ms | 75.909 / 76.310 / 75.740 ms |
+| 3 | 86.921 / 87.067 / 86.600 ms | 91.150 / 91.411 / 91.057 ms |
 
-The maintained repair through RGB normalization was also compared with
-`35bcbf59` on Orin, including all earlier INT8 repairs:
+The complete private Thor arithmetic repair adds approximately 9–11 ms; its
+performance debt prevents acceptance. The maintained Orin repair through RGB
+normalization was compared with `35bcbf59`, including earlier INT8 repairs:
 
 | Precision / views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
 | --- | --- | --- |
@@ -65,233 +89,11 @@ The maintained repair through RGB normalization was also compared with
 | BF16 / 2 | 193.462 / 194.783 / 193.534 ms | 184.900 / 185.395 / 183.873 ms |
 | BF16 / 3 | 213.846 / 214.584 / 215.670 ms | 228.423 / 229.880 / 230.703 ms |
 
-Small increases and baseline drift are retained, not waived. Desktops remained
-active; these measurements do not establish exclusive-run budgets. FP8/INT8
-accuracy failures remain unresolved. The PR remains unaccepted and offline.
-
-### Current migration baseline
-
-A normal build of `35bcbf59` on Orin (CUDA 13.2), with tuning disabled and an
-empty cuda-new recipe cache, produced the following BF16 results against the
-unchanged official reference and whole-chunk plus every-action-step limits:
-
-| Inputs | 1 view | 2 views | 3 views |
-| --- | --- | --- | --- |
-| Eight real observations | 4/8 | 8/8 | 8/8 |
-| Thirteen constructed diagnostics | 8/13 | 7/13 | 8/13 |
-
-These counts are failures, not accepted baselines. For example, two-view
-black-image/zero-noise cosine is 0.8761 with relative L2 0.4824; white-image/
-normal-noise maximum absolute error is 0.4997. Repeated and revisited BF16
-outputs are identical in this run. Stability does not imply reference accuracy.
-The empty-cache run uses fallback execution and cannot establish a prepared
-production recipe's performance budget.
-
-The timestep repair at `4027e85b` matches all 10,240 official embedding values
-bitwise in a direct CPU comparison. Its complete Orin GPU pass counts remain unchanged from the migration baseline:
-43/63 BF16 and 11/24 INT8 real inputs (0/8, 6/8, 5/8 across views).
-Thus exact timestep embeddings alone do not resolve the full-model failures.
-
-The BF16 normalization candidate preserves each raw checkpoint offset until
-precision conversion, rounds it to BF16 before adding one in FP32, and keeps
-that FP32 scale separate from the projection weights. Reconstructing an offset
-from an already-added scale loses the reference result for four of 75,776 real
-language-normalization parameters. A CPU regression covers those boundaries.
-FP8/INT8 retain their existing scale conversions in this change.
-
-The existing cuda-new RMS interfaces now accept FP32 parameters with BF16
-activations. Independent Torch operator fixtures cover widths 7/1024/2048,
-zero rows, optional bias, fused residual and gated residual. On Orin CUDA 12.6,
-the unsupported original is RED, the extension is GREEN, intentionally rounded
-parameters are RED, and restoration is GREEN. This proves the operator cases;
-current-source full-model and performance acceptance remain pending.
-Norm/RoPE graph storage retention also has two actual GPU RED/GREEN regressions.
-
-The staged BF16 RoPE semantic retains frequency, sin/cos and product rounding;
-GPU reference tests cover eight geometries/positions, bias, KV offsets, replay
-and changed inputs. Removing product staging fails the independent reference.
-PI05 BF16 and INT8 explicitly select this semantic.
-
-The staged BF16 GeGLU semantic rounds GELU before multiplying by the up
-projection. Orin CUDA 12.6 tests cover scalar/packed-2/packed-4, widths
-8192/16384, prefix lengths through 968 and action length 50. The unrounded
-control fails; the staged path and changed-input graph replay pass. BF16
-composes the existing GEMM with this pointwise semantic; INT8 selects the same
-pointwise semantic after quantized projection. This does not yet qualify the
-full model or establish performance parity with the prior fused candidate.
-The existing Pointwise/Gather families also support the FP32 frontend boundaries:
-RGB normalization, projection bias before position, auxiliary activation and
-Euler updates. Independent GPU tests cover 1–3 views, both image layouts,
-changed-input replay, storage retention and cancellation-sensitive addition order.
-Forcing Euler multiply/add into one FMA causes the regression to fail. The mixed
-FP32 model integration is still a separate, unaccepted candidate.
-
-A prepared-cache two-view Orin pilot compares the combined normalization/RoPE/
-GeGLU repairs (`bc2cbb18`) with `35bcbf59`, excluding the FP32 model candidate.
-Each uses its own fixed recipe cache, 30 warmups and 50 samples per input:
-
-| BF16 input | Baseline P50 | Candidate P50 | Baseline revisit P50 |
-| --- | --- | --- | --- |
-| T10 gradient / normal noise | 193.58 ms | 194.77 ms | 193.74 ms |
-| T200 gradient / normal noise | 181.63 ms | 184.11 ms | 181.41 ms |
-
-The approximately 0.6–1.5% steady regression remains unresolved; first-call and
-shape-return timings are recorded separately. Both implementations pass only
-7/13 diagnostic inputs against the official limits. These shared-desktop results
-are diagnostic, not formal hardware acceptance or calibrated gate budgets.
-
-All changes still require the complete board/precision/view acceptance below.
-
-### Current Thor and candidate diagnostics
-
-The committed `8a197969` build was tested on Thor with the canonical checkpoint,
-pinned same-board OpenPI and unchanged FP8 calibration. With prepared per-cell
-recipes, BF16 passes 44/63 cases and FP8 passes 11/63. The limits apply to the
-whole chunk and each action step. Both matrices therefore remain unaccepted.
-
-The maintained-API candidate adds mixed FP32 frontend operations, Welford
-LayerNorm, bias-before-BF16-rounding Linear projections, vision Attention
-arithmetic, and reciprocal-multiply RGB normalization. The latest Thor BF16
-run passes **53/63**: real observations **6/8, 8/8, 8/8** and constructed
-diagnostics **11/13, 8/13, 12/13** across 1–3 views. These results include
-whole-chunk and every-action-step limits; several failures occur only at a step.
-Failures cover one-view gradient/zero-noise, black/zero-noise and two real
-observations; two-view black/normal-noise, gradient/zero-noise, black/zero-noise,
-white/normal-noise and camera-gray; and three-view white/normal-noise.
-Two-view black/zero-noise has cosine 0.958535 and relative L2 0.313097;
-white/normal-noise has relative L2 0.082584. Correcting one arithmetic boundary
-can increase the full-model error while other boundaries still differ.
-
-Independent actual GPU negative controls verify LayerNorm, Linear, vision
-Attention, RGB normalization and upload completion. LayerNorm uses synthetic
-LCG inputs and independent Torch CUDA outputs, without checkpoint parameters.
-The RGB fixture covers all 256 byte values: division and reciprocal
-multiplication differ for 111 values in FP32, and the latter matches Torch CUDA.
-An alternating-input graph test reproduces a pageable host-to-device upload
-race; waiting for the upload stream fixes it without synchronizing the entire
-device. The repaired path also passes the supported BF16 operator subset.
-
-Frozen black/white traces match OpenPI bitwise through all 27 vision blocks,
-post-normalization, multimodal projection, and first language-layer
-normalization, QKV and RoPE. The first remaining difference is language
-Attention. Matched-input experiments require BF16 score/probability staging
-and the physical masked camera slots to reproduce the official operation.
-A private implementation passes 61/63 cases, but adds approximately 8–10 ms
-and is not a maintained or accepted execution path. A later gradient trace
-matches every vision and language block; its first action residual divergence
-is caused by a single BF16 gate value affected by FP32 conditioning GEMM
-accumulation order. Correcting that projection alone does not qualify the
-whole model. Private trace hooks and experiment libraries are excluded from
-the product. No reference output or tolerance has been replaced to pass.
-
-The loaded-library audit also found that earlier Thor diagnostic comparisons
-used different cuBLAS/cuBLASLt/runtime binaries in OpenPI and ApxInf. They are
-not eligible as a same-runtime acceptance bank; the maintained aggregator
-already rejects this mismatch. An isolated CUDA 13.2 reference capture retains
-the gradient sample's original full output bitwise, so library mismatch alone
-does not explain that failure. Library identity, GEMM layout and handle settings
-must be controlled independently during further experiments. Original captures
-are retained, not overwritten. Setting LD_LIBRARY_PATH alone does not prove
-which library was loaded; verify the receipt digests.
-
-The earlier Welford/Linear candidate P50 measurements use 30 warmups and 50
-samples, with the original
-baseline revisited after the candidate. These remain shared-desktop diagnostics:
-
-| Views / tokens | Baseline | Candidate | Baseline revisit |
-| --- | --- | --- | --- |
-| 1 / 10 | 61.13 ms | 59.41 ms | 61.32 ms |
-| 1 / 200 | 66.65 ms | 64.80 ms | 66.91 ms |
-| 2 / 10 | 71.91 ms | 69.65 ms | 71.85 ms |
-| 2 / 200 | 77.63 ms | 75.99 ms | 77.44 ms |
-| 3 / 10 | 86.19 ms | 86.17 ms | 87.84 ms |
-| 3 / 200 | 91.39 ms | 90.68 ms | 92.48 ms |
-
-The 3-view baseline drifts, so these values cannot establish its final budget.
-A separate before/candidate/revisit measurement isolates the subsequent
-multimodal projector change: 1-view T10 is 59.121/59.123/59.108 ms; 2-view T10 is
-70.087/70.482/70.229 ms; 3-view T200 is 90.667/91.062/90.834 ms. Small increases
-remain unresolved; these measurements do not establish a no-regression claim.
-
-Earlier INT8 repairs also completed paired 1–3-view performance measurements:
-T10 P50 baseline/candidate/revisit is 87.138/87.537/87.398 ms,
-127.609/128.136/127.648 ms and 166.811/167.209/166.806 ms. Small repeatable
-increases are not waived. That INT8 candidate passes only 0/8, 6/8 and 4/8 real
-observations. The subsequent Orin mixed-FP32/Welford/Linear candidate passes
-48/63 BF16 cases and 11/63 INT8 cases (real 0/8, 7/8, 4/8; diagnostics 0/39).
-That snapshot precedes the vision Attention and multimodal projector repairs.
-The subsequent upload/vision/projector candidate (before RGB correction)
-passes 51/63 Orin BF16 cases: real 7/8, 8/8, 8/8 and diagnostics 9/13, 8/13,
-11/13. INT8 passes 11/63: real 0/8, 6/8, 4/8 and diagnostics 1/13, 0/13,
-0/13. Complete final-source accuracy and paired
-performance qualification, including INT8, are still required.
-
-### Historical numerical evidence
-
-The following real-image results describe the pre-migration implementation at
-`e811c4f6`, using the historical limits below. They are not current-head results:
-
-| Board / precision | 1 view | 2 views | 3 views |
-| --- | --- | --- | --- |
-| Thor BF16 | 6/8 | 8/8 | 8/8 |
-| Thor existing FP8 calibration | 0/8 | 4/8 | 4/8 |
-| Orin BF16 | 7/8 | 8/8 | 8/8 |
-| Orin INT8 | 0/8 | 6/8 | 4/8 |
-
-The eight observations come from two official DROID episodes. The third exterior
-camera is explicitly mapped to the third model slot for shape coverage. These
-are fixed-observation implementation diagnostics, not normalized DROID-policy
-or closed-loop success evaluations. The additional 13 constructed cases per
-view cover separate image, noise and token-length factors, including T200.
-
-Controlled Orin BF16 experiments establish that multiple numerical boundaries
-matter together: FP32 patch/auxiliary computations, staged BF16 RoPE/GeGLU,
-unfolded normalization, and reduction/GEMM conventions. An unfolded-norm plus
-staged-GeGLU subset passes all 24 real observations but fails 17 of 39 constructed
-cases. It is insufficient as a repair. The complete private candidate passes
-all 63 inputs and every action step; 57 outputs are bitwise official. These
-private adapters are not shipped or substituted for the official reference.
-
-Replacing that complete candidate's language RoPE with a table-based device
-operator preserves all 63 outputs bitwise. The inverse-frequency buffer must
-first undergo the reference's BF16 conversion. A subsequent norm/time rewrite
-initially fails four cases with a different FP32 reduction schedule; changing
-only that schedule restores all 63 outputs bitwise. Independent GPU operator
-fixtures and deliberate incorrect-rounding controls support these findings.
-Time embeddings can be generated internally using FP64 periods and sequential
-FP32 timesteps: all 10,240 values match the pinned reference on Orin. These
-experiments identify semantics to carry into current interfaces; they do not
-prove that the newly merged runtime already implements them.
-
-INT8 diagnostic adapters still fail full-model comparison after correcting
-weight packing, scale division, patch dtype and flow-rounding conventions.
-Some operator discrepancies disappear without fixing complete action chunks.
-FP8 calibration with additional observations improves the historical real-image
-count to 16/24 but still fails real and constructed cases. Neither quantized
-path has an approved replacement reference or a relaxed gate.
-
-### Performance and infrastructure evidence
-
-The earlier INT8 capture-allocation repair has 1,000 paired timed calls:
-P50/P95 changes are within 0.437%, but the three-view shape return remains
-15–17 ms (0.66–0.78%) slower in both orders. This residual is not waived.
-The private RoPE replacement has 900 timed calls across 1–3 views and short/long
-tokens: steady-state P50/P95 improve, while some first calls increase by
-4–17 ms beyond both controls. Norm replacement performance is evaluated
-separately. All these measurements retain their original source and extension
-identities and do not establish current-head performance.
-
-Shared desktop clients remain on Orin, and Thor also has external GPU services.
-An exclusive maintenance window, current-source matrix and measured budgets
-are required for formal acceptance. The harness never stops other users' jobs.
-
-The merged source passes 32 PI05 Rust CPU tests and module-boundary checks.
-The CI suite has 41 CPU tests. Real-process tests cover normal/repeated
-cancellation, an unresponsive worker and a blocked activity auditor. Cancellation
-uses a dedicated exception: `InterruptedError` can be swallowed as a retryable
-syscall interruption inside subprocess selectors, delaying worker cleanup.
-
-No runners, dispatch variable or branch-protection rule have been enabled.
+Small increases, shape-return costs and baseline drift are retained, not waived.
+Final-source BF16/FP8/INT8 accuracy, stability, performance and hosted aggregation
+must all be accepted before rollout. CPU CI currently has 45 passing tests,
+including real-process cancellation, repeated cancellation, unresponsive-worker
+and blocked-auditor cleanup. No online configuration has been enabled.
 
 ## Scope
 

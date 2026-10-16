@@ -26,6 +26,7 @@ impl WeightVersion {
 #[derive(Clone, Debug)]
 pub struct GemmPolicy {
     /// Accumulation precision is part of the GEMM key, not a candidate detail.
+    /// BF16 partial sums must retain FP32 precision through split-K reduction.
     pub accumulation_dtype: DType,
     pub workspace_limit: usize,
     pub online_tune: bool,

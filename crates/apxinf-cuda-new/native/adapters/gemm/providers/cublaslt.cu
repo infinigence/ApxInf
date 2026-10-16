@@ -233,6 +233,19 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
   }
+  if (spec.a_dtype == APXINF_DTYPE_BF16 &&
+      spec.accumulation_dtype == APXINF_DTYPE_F32) {
+    // In-place/output-type split-K rounds partial sums to BF16. Preserve the
+    // declared FP32 accumulation through the reduction, including bias.
+    const uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    status = cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+        &reduction, sizeof(reduction));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatmulPreferenceDestroy(preference);
+      check_cublas(status);
+    }
+  }
   cublasLtMatmulHeuristicResult_t candidates[8]{};
   int candidate_count = 0;
   status = cublasLtMatmulAlgoGetHeuristic(

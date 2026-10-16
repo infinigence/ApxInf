@@ -39,6 +39,12 @@ equality across GPU architectures or library versions.
 `tf32_gemm_validates_contract_and_replays_changed_weights` covers resource
 accounting and mutable-weight graph replay.
 
+BF16 GEMM's FP32 accumulation policy also covers split-K partial sums.
+Candidates must not reduce those partial sums in BF16 before the epilogue.
+`bf16_gemm_preserves_f32_split_k_reduction` checks all candidates with an
+independent, exactly representable cancellation case, with and without bias.
+This does not require identical FP32 reduction order across candidates.
+
 Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
 <!-- l3-operator:gemm -->
