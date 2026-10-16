@@ -911,3 +911,142 @@ fn staged_bf16_geglu_matches_torch() {
             .all(|value| *value == 0.0));
     }
 }
+
+#[path = "f32_frontend_torch_fixture.rs"]
+mod f32_frontend_fixture;
+
+#[test]
+fn f32_pointwise_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f32_tensor(0, vec![2, 7], f32_frontend_fixture::INPUT);
+    let bias = f32_tensor(0, vec![7], f32_frontend_fixture::BIAS);
+    for (activation, expected) in [
+        (PointwiseActivation::None, f32_frontend_fixture::NONE),
+        (PointwiseActivation::Gelu, f32_frontend_fixture::GELU),
+        (PointwiseActivation::GeluExact, f32_frontend_fixture::EXACT),
+        (PointwiseActivation::Silu, f32_frontend_fixture::SILU),
+    ] {
+        let mut output = zeros_tensor(0, vec![2, 7], DType::F32);
+        let graph = crate::capture(&ctx, || {
+            let mut args =
+                PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
+            args.bias = Some(&bias);
+            args.activation = activation;
+            pointwise(&ctx, args)
+        })
+        .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        for (actual, expected) in super::framework::f32_values(&output).iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 2e-6,
+                "{activation:?}: {actual} != {expected}"
+            );
+        }
+    }
+    let state = f32_tensor(0, vec![1, 2], &[1.0, -1.0]);
+    let velocity = f32_tensor(0, vec![1, 2], &[-10.0, 10.0]);
+    let mut output = zeros_tensor(0, vec![1, 2], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, &state, &mut output);
+        args.secondary = Some(&velocity);
+        args.dt = 0.1;
+        pointwise(&ctx, args)
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [0.0, 0.0],
+        "Euler must not fuse multiply and add"
+    );
+}
+
+#[test]
+fn f32_gather_preserves_patch_and_bias_boundaries() {
+    let ctx = CudaContext::new(0).unwrap();
+    for views in 1..=3 {
+        let mut expected = Vec::new();
+        let image_nchw: Vec<u8> = (0..views * 3 * 16 * 16).map(|i| (i % 256) as u8).collect();
+        for view in 0..views {
+            for py in 0..8 {
+                for px in 0..8 {
+                    for channel in 0..3 {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let pixel = image_nchw
+                                    [(view * 3 + channel) * 256 + (py * 2 + dy) * 16 + px * 2 + dx];
+                                expected.push((pixel as f32 / 255.0) * 2.0 - 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for nhwc in [false, true] {
+            let mut image = image_nchw.clone();
+            if nhwc {
+                for view in 0..views {
+                    for pixel in 0..256 {
+                        for channel in 0..3 {
+                            image[(view * 256 + pixel) * 3 + channel] =
+                                image_nchw[(view * 3 + channel) * 256 + pixel];
+                        }
+                    }
+                }
+            }
+            let images = crate::CudaBuffer::alloc(image.len(), 0).unwrap();
+            images.copy_from_host(&image).unwrap();
+            let mut output = zeros_tensor(0, vec![views * 64, 12], DType::F32);
+            let graph = crate::capture(&ctx, || {
+                gather(
+                    &ctx,
+                    GatherArgs::rgb_to_patches(
+                        &images,
+                        &mut output,
+                        GatherPatchGeometry {
+                            views,
+                            image_size: 16,
+                            patch_size: 2,
+                            nhwc,
+                        },
+                    ),
+                )
+            })
+            .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(super::framework::f32_values(&output), expected);
+            images.copy_from_host(&vec![0; image.len()]).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert!(super::framework::f32_values(&output)
+                .iter()
+                .all(|value| *value == -1.0));
+        }
+    }
+    let input = f32_tensor(0, vec![2, 2], &[1e8, -1e8, 1e8, -1e8]);
+    let owner = std::sync::Arc::downgrade(input.storage().as_gpu().unwrap().owner().unwrap());
+    let bias = f32_tensor(0, vec![2], &[-1e8, 1e8]);
+    let position = f32_tensor(0, vec![1, 2], &[1.0, -1.0]);
+    let mut output = zeros_tensor(0, vec![2, 2], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        let mut args = GatherArgs::new(GatherSemantic::BiasPosition, &input, &mut output);
+        args.bias = Some(&bias);
+        args.position = Some(&position);
+        args.tokens_per_view = 1;
+        gather(&ctx, args)
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(super::framework::f32_values(&output), [1.0, -1.0, 1.0, -1.0]);
+    drop(input);
+    assert!(owner.upgrade().is_some());
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(super::framework::f32_values(&output), [1.0, -1.0, 1.0, -1.0]);
+    drop(graph);
+    assert!(owner.upgrade().is_none());
+}

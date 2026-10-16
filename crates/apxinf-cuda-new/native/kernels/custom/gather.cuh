@@ -3,12 +3,16 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 #include <stdint.h>
 
 namespace apxinf::gather::kernels {
 
 template <class T>
 __device__ float to_float(T value);
+
+template <>
+__device__ inline float to_float(float value) { return value; }
 
 template <>
 __device__ inline float to_float(__half value) {
@@ -22,6 +26,9 @@ __device__ inline float to_float(__nv_bfloat16 value) {
 
 template <class T>
 __device__ T from_float(float value);
+
+template <>
+__device__ inline float from_float(float value) { return value; }
 
 template <>
 __device__ inline __half from_float(float value) {
@@ -73,10 +80,16 @@ __global__ void bias_position(const T* projection, const T* bias,
   for (; index < count; index += stride) {
     const int col = static_cast<int>(index % cols);
     const int token = static_cast<int>((index / cols) % tokens_per_view);
-    float value = to_float(projection[index]) +
-                  to_float(position[static_cast<int64_t>(token) * cols + col]);
-    if (bias != nullptr) value += to_float(bias[col]);
-    output[index] = from_float<T>(value);
+    if constexpr (std::is_same_v<T, float>) {
+      float value = projection[index];
+      if (bias != nullptr) value = __fadd_rn(value, bias[col]);
+      output[index] = __fadd_rn(value, position[static_cast<int64_t>(token) * cols + col]);
+    } else {
+      float value = to_float(projection[index]) +
+                    to_float(position[static_cast<int64_t>(token) * cols + col]);
+      if (bias != nullptr) value += to_float(bias[col]);
+      output[index] = from_float<T>(value);
+    }
   }
 }
 
@@ -112,9 +125,14 @@ __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
                  x) * 3 + channel
               : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) *
                         image_size + x;
-    const float normalized =
-        (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
-    patches[output_index] = from_float<T>(normalized);
+    if constexpr (std::is_same_v<T, float>) {
+      const float unit = __fdiv_rn(static_cast<float>(images[input_index]), 255.0f);
+      patches[output_index] = __fsub_rn(__fmul_rn(unit, 2.0f), 1.0f);
+    } else {
+      const float normalized =
+          (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+      patches[output_index] = from_float<T>(normalized);
+    }
   }
 }
 

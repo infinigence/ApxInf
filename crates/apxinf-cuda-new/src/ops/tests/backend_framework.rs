@@ -379,7 +379,7 @@ fn f16_values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-fn f32_values(tensor: &Tensor) -> Vec<f32> {
+pub(super) fn f32_values(tensor: &Tensor) -> Vec<f32> {
     assert_eq!(tensor.dtype(), DType::F32);
     let buffer = CudaBuffer::from_tensor(tensor).unwrap();
     let mut bytes = vec![0; buffer.len()];

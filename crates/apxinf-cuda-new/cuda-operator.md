@@ -224,3 +224,16 @@ F16/BF16 state and velocity `[rows, cols]`, output `state + dt * velocity`.
 The finite step size is a dynamic binding. Pointwise captures retain their
 input/output storage until the graph is destroyed; no preparation or tuning
 runs during capture.
+
+### FP32 frontend extensions
+
+`PointwiseSemantic::BiasActivation` and `EulerUpdate` additionally accept F32
+bindings with matching input/output/bias/secondary dtypes. FP32 Euler preserves
+separate rounded multiply and add. Other pointwise F32 combinations fail.
+
+`GatherSemantic::RgbToPatches` and `BiasPosition` additionally accept F32 output.
+RGB input is uint8 NHWC/NCHW; division, scaling and subtraction round in F32.
+Bias-position requires matching F32 operands and evaluates projection plus bias
+before adding position. Existing F16/BF16 arithmetic is unchanged. These direct
+paths capture without tuning, retain tensor storage, and cover all RGB values,
+1–3 views, both image layouts and changed-input replay in GPU tests.

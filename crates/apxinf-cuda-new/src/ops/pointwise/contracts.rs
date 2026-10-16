@@ -94,19 +94,23 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn input_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Pointwise input currently supports F16 and BF16")),
+        _ => Err(invalid(
+            "Pointwise input currently supports F32, F16 and BF16",
+        )),
     }
 }
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
         _ => Err(invalid(
-            "Pointwise output currently supports F16, BF16, and E4M3",
+            "Pointwise output currently supports F32, F16, BF16, and E4M3",
         )),
     }
 }
@@ -173,6 +177,16 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let output_dtype = args.out.dtype();
     if semantic == PointwiseSemantic::GegluStagedBf16 && input_dtype != DType::BF16 {
         return Err(invalid("staged GeGLU requires BF16 tensors"));
+    }
+    if input_dtype == DType::F32
+        && !matches!(
+            semantic,
+            PointwiseSemantic::BiasActivation | PointwiseSemantic::EulerUpdate
+        )
+    {
+        return Err(invalid(
+            "F32 Pointwise supports bias-activation and Euler update",
+        ));
     }
     let quantized_geglu = matches!(semantic, PointwiseSemantic::Geglu)
         && input_dtype == DType::F16

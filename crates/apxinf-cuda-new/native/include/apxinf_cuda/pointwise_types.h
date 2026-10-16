@@ -32,7 +32,7 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
 } apxinf_pointwise_activation_t;
 
-#define APXINF_POINTWISE_SPEC_VERSION 2u
+#define APXINF_POINTWISE_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;

@@ -37,10 +37,13 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
       spec.semantic > APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && spec.output_dtype != spec.dtype) ||
       (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 &&
        spec.dtype != APXINF_DTYPE_BF16) ||
+      (spec.dtype == APXINF_DTYPE_F32 &&
+       spec.semantic != APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION &&
+       spec.semantic != APXINF_POINTWISE_SEMANTIC_EULER_UPDATE) ||
       spec.activation > APXINF_POINTWISE_ACTIVATION_GELU_EXACT ||
       spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
@@ -303,7 +306,9 @@ extern "C" apxinf_status_t apxinf_pointwise_launch(
       return;
     }
     apxinf::framework::check_cuda(
-        spec->dtype == APXINF_DTYPE_BF16
+        spec->dtype == APXINF_DTYPE_F32
+            ? launch<float>(*spec, *bindings)
+            : spec->dtype == APXINF_DTYPE_BF16
             ? launch_bf16(*spec, *bindings)
             : launch<__half>(*spec, *bindings));
   });

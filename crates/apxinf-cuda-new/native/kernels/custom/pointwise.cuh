@@ -3,11 +3,15 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace apxinf::pointwise::kernels {
 
 template <class T>
 __device__ float to_float(T value);
+
+template <>
+__device__ inline float to_float(float value) { return value; }
 
 template <>
 __device__ inline float to_float(__half value) {
@@ -21,6 +25,9 @@ __device__ inline float to_float(__nv_bfloat16 value) {
 
 template <class T>
 __device__ T from_float(float value);
+
+template <>
+__device__ inline float from_float(float value) { return value; }
 
 template <>
 __device__ inline __half from_float(float value) {
@@ -96,8 +103,12 @@ __global__ void euler_update(const T* state, const T* velocity, T* output,
   int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   for (; index < count; index += stride) {
-    output[index] = from_float<T>(to_float(state[index]) +
-                                  dt * to_float(velocity[index]));
+    if constexpr (std::is_same_v<T, float>) {
+      output[index] = __fadd_rn(state[index], __fmul_rn(dt, velocity[index]));
+    } else {
+      output[index] = from_float<T>(to_float(state[index]) +
+                                    dt * to_float(velocity[index]));
+    }
   }
 }
 
