@@ -5,6 +5,7 @@
 #include <mlx/version.h>
 #include <mlx/memory.h>
 #include <algorithm>
+#include <mlx/linalg.h>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
@@ -96,8 +97,18 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 35:return mx::max(a.at(0),i(0),true,s);
  case 36:return mx::equal(a.at(0),a.at(1),s);
  case 37:return mx::nan_to_num(a.at(0),f(0),f(1),f(2),s);
- case 38:return mx::fast::rms_norm(a.at(0),a.at(1),f(0),s);
+ case 38:return mx::fast::rms_norm(a.at(0),a.size()>1?std::optional<A>(a[1]):std::nullopt,f(0),s);
  case 39:return mx::dequantize(a.at(0),a.at(1),a.at(2),i(0),i(1),"affine",std::nullopt,std::nullopt,s);
+ case 40:return mx::erf(a.at(0),s);
+ case 41:return mx::logaddexp(a.at(0),a.at(1),s);
+ case 42:{size_t n=1;auto w=i(0)?std::optional<A>(a.at(n++)):std::nullopt;auto b=i(1)?std::optional<A>(a.at(n++)):std::nullopt;if(n!=a.size())throw std::invalid_argument("layer_norm operand count mismatch");return mx::fast::layer_norm(a.at(0),w,b,f(0),s);}
+ case 43:return mx::conv1d(a.at(0),a.at(1),i(0),i(1),i(2),i(3),s);
+ case 44:return mx::abs(a.at(0),s);
+ case 45:return mx::maximum(a.at(0),a.at(1),s);
+ case 46:return mx::minimum(a.at(0),a.at(1),s);
+ case 47:return mx::addmm(a.at(0),a.at(1),a.at(2),f(0),f(1),s);
+ case 48:return mx::linalg::norm(a.at(0),std::vector<int>(iv.begin()+1,iv.end()),i(0)!=0,s);
+ case 49:return mx::softmax(a.at(0),i(0),i(1)!=0,s);
  default:throw std::invalid_argument("unknown MLX bridge operation");}}();
  *out=new A(std::move(result));CATCH}
 int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t shapeless,void** out){TRY
@@ -121,8 +132,9 @@ void apx_mlx_safetensors_free(void* p){delete static_cast<Loaded*>(p);}
 int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
  std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
-int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,int32_t templ,void** outputs){TRY
+int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,const char* const* tnames,const int32_t* tkinds,const int32_t* tvalues,size_t nt,void** outputs){TRY
  std::vector<mx::Shape> shapes;std::vector<mx::Dtype> types;size_t offset=0;for(size_t j=0;j<no;++j){shapes.push_back(shape(dims+offset,ranks[j]));offset+=ranks[j];types.push_back(dtype(dtypes[j]));}
- std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;if(templ>=0)templates.push_back({"T",dtype(templ)});
+ // Template kinds: 0 dtype code, 1 int, 2 bool.
+ std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;for(size_t j=0;j<nt;++j){switch(tkinds[j]){case 0:templates.push_back({tnames[j],dtype(tvalues[j])});break;case 1:templates.push_back({tnames[j],int(tvalues[j])});break;case 2:templates.push_back({tnames[j],tvalues[j]!=0});break;default:throw std::invalid_argument("unknown Metal template kind");}}
  auto result=(*static_cast<K*>(kernel))(arrays(inputs,ni),shapes,types,{grid[0],grid[1],grid[2]},{group[0],group[1],group[2]},templates,std::nullopt,false,*static_cast<S*>(stream));publish(result,outputs,no);CATCH}
 }
