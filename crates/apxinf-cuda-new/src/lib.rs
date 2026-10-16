@@ -31,24 +31,16 @@ pub use stream::CudaStream;
 
 pub mod ops;
 
-/// Whether this build linked the shape-specialized Qwen3.8 NVFP4 dense SwiGLU
-/// AOT object (`crates/apxinf-cuda/aot/qwen38.json`, exported through the
-/// bundle named by `APXINF_CUDA_AOT_MANIFEST` at build time).
+/// Whether the SM110 native NVFP4 GEMM+SwiGLU implementation is available.
 ///
-/// When `false`, the C ABI `apxinf_gemm_nvfp4_dense_swiglu_aot` is a stub that
-/// returns `APXINF_STATUS_UNSUPPORTED`, so callers must take the generic path
-/// instead.
-///
-/// This is a compile-time constant: `build.rs` sets the internal
-/// `apxinf_qwen38_dense_swiglu_aot` cfg, which a dependent crate cannot observe
-/// directly (cfgs do not cross crate boundaries), so it is folded into a
-/// `pub const` that any dependent crate can branch on with zero runtime cost.
-pub const QWEN38_DENSE_SWIGLU_AOT: bool = cfg!(apxinf_qwen38_dense_swiglu_aot);
+/// The name describes the mathematical operator rather than its current model
+/// consumer. Unsupported targets use the unfused GEMM + SwiGLU fallback.
+pub const NVFP4_GEMM_SWIGLU: bool = cfg!(apxinf_nvfp4_gemm_swiglu);
 
 /// Whether this build compiled the allocation-free FA2 decode kernel
 /// (`apxinf_decode_attention`). When `false` that ABI returns
 /// `APXINF_STATUS_UNSUPPORTED`, so callers must use the generic attention path.
 ///
-/// Like [`QWEN38_DENSE_SWIGLU_AOT`], this is a zero-cost compile-time constant
+/// Like [`NVFP4_GEMM_SWIGLU`], this is a zero-cost compile-time constant
 /// carrying a build-time cfg across the crate boundary.
 pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);

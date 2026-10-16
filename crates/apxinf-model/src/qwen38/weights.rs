@@ -126,11 +126,11 @@ fn load_fused_gate_up(
     );
 
     // Shape- and capability-driven, not env-gated: the interleaved copy exists
-    // only for the AOT-exported FC1 kernel, which is linked into the build or
-    // not. Building it unconditionally would waste host time and device memory
-    // on builds where the op is a stub. The shape check lives at the call site
-    // (`nvfp4_mlp_rows`); here the checkpoint always supplies the tensors.
-    let fused_fc1 = apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT.then(|| {
+    // only when the native FC1 kernel is compiled. Building it unconditionally
+    // would waste host time and device memory on builds where the op is a stub.
+    // The shape check lives at the call site (`nvfp4_mlp_rows`); here the
+    // checkpoint always supplies the tensors.
+    let fused_fc1 = apxinf_cuda_new::NVFP4_GEMM_SWIGLU.then(|| {
         let gate_weight = cpu_bytes(&tensors[&format!("{prefix}.gate_proj.weight")]);
         let up_weight = cpu_bytes(&tensors[&format!("{prefix}.up_proj.weight")]);
         let bytes_per_row = HIDDEN / 2;

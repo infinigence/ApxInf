@@ -101,7 +101,7 @@ unsafe extern "C" {
         row_major_scales: i32,
         stream: CudaStream,
     ) -> i32;
-    pub(crate) fn apxinf_gemm_nvfp4_dense_swiglu_aot(
+    pub(crate) fn apxinf_gemm_nvfp4_swiglu(
         activation: *const c_void,
         weight: *const c_void,
         activation_scales: *const c_void,
@@ -111,10 +111,6 @@ unsafe extern "C" {
         alpha: *const c_void,
         input_global_scale: *const c_void,
         down_inverse_global_scale: *const c_void,
-        tile_groups: *const c_void,
-        tile_limits: *const c_void,
-        token_map: *const c_void,
-        tile_count: *const c_void,
         rows: i64,
         n: i64,
         k: i64,

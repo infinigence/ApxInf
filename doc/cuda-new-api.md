@@ -30,7 +30,7 @@ use apxinf_cuda_new::{
     // compiled into this build, so the model layer can branch between the
     // specialized and generic paths (cfgs do not cross crate boundaries, hence
     // the pub const re-export)
-    QWEN38_DENSE_SWIGLU_AOT, FA2_DECODE,
+    NVFP4_GEMM_SWIGLU, FA2_DECODE,
 };
 use apxinf_cuda_new::ops;   // all operators live under ops::
 ```
@@ -264,11 +264,10 @@ nvfp4_quantize_swiglu(ctx, fused, packed, scales, input_scale, block_size, layou
 
 pub enum ScaleLayout { RowMajor, GemmAtom }   // which scale layout to emit: GEMV reads RowMajor, GEMM reads GemmAtom
 
-nvfp4_dense_swiglu_aot(ctx, activation, activation_scales, weight, weight_scales,
-                       output, output_scales, alpha, input_global_scale,
-                       down_inverse_global_scale, tile_groups, tile_limits,
-                       token_map, tile_count)
-    // shape-specialized FC1+SwiGLU+requantize AOT path; availability: §6 QWEN38_DENSE_SWIGLU_AOT
+nvfp4_gemm_swiglu(ctx, activation, activation_scales, weight, weight_scales,
+                  output, output_scales, alpha, input_global_scale,
+                  down_inverse_global_scale)
+    // fixed NVFP4 GEMM+SwiGLU+requantize path; availability: §6 NVFP4_GEMM_SWIGLU
 ```
 
 ### 4.6 Host helpers (no GPU work)
@@ -342,7 +341,7 @@ dependents can branch:
 
 | Constant | `true` means | When `false` |
 |---|---|---|
-| `QWEN38_DENSE_SWIGLU_AOT` | this build linked the Qwen3.8 NVFP4 dense SwiGLU AOT object | `ops::nvfp4_dense_swiglu_aot` returns UNSUPPORTED; take the generic path |
+| `NVFP4_GEMM_SWIGLU` | the SM110 native NVFP4 GEMM + SwiGLU implementation was compiled | `ops::nvfp4_gemm_swiglu` returns UNSUPPORTED; take the generic path |
 | `FA2_DECODE` | the allocation-free FA2 decode kernel was compiled | `ops::decode_attention` returns UNSUPPORTED; use `kv_cache_attention` |
 
 ---
