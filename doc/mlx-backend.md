@@ -128,6 +128,29 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+### Implemented speech selection
+
+[`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
+non-streaming, the checkpoint's voices and languages, an optional style
+instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
+It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
+cast seams) operation by operation, so a seed reproduces that path's codes and
+waveform. The CLI `speak` command writes 32-bit float WAV.
+
+- Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
+  logits by inverse CDF, where 0.31.2 used Gumbel-max.
+- As in mlx-audio, the waveform decoder's transformer uses a full causal mask;
+  the checkpoint's `sliding_window` of 72 frames is not applied.
+- The checkpoint ships no `tokenizer.json`; the family builds the tokenizer
+  from `vocab.json` and `merges.txt` as Transformers 5 does.
+
+```sh
+cargo run --features mlx -- speak --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --voice Vivian --language English --seed 46 \
+  --text 'Hello, could you close the window for me? Thank you.' --output hello.wav
+```
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
