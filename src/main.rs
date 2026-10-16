@@ -169,6 +169,10 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// Family-local implementation variant; unsupported choices are rejected by its loader
+        #[arg(long)]
+        model_variant: Option<String>,
+
         /// Text to speak
         #[arg(short, long)]
         text: String,
@@ -305,6 +309,7 @@ fn main() {
         Commands::Speak {
             model,
             model_name,
+            model_variant,
             text,
             voice,
             language,
@@ -321,7 +326,14 @@ fn main() {
                 seed,
             };
             let result = parse_device(&device).and_then(|device| {
-                run_speak(&model, model_name.as_deref(), device, &request, &output)
+                run_speak(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
             });
             if let Err(error) = result {
                 eprintln!("{error}");
@@ -729,6 +741,7 @@ fn run_generate(
 fn run_speak(
     model_dir: &PathBuf,
     model_name_override: Option<&str>,
+    model_variant: Option<&str>,
     device: Device,
     request: &SpeechRequest<'_>,
     output: &PathBuf,
@@ -740,6 +753,7 @@ fn run_speak(
     };
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
         ..LoadOptions::default()
     };
     eprintln!("Loading {model_name} from {:?}...", model_dir);

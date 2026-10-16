@@ -377,3 +377,38 @@ fn interleaved_qk_norm_rope_matches_composed_operators() -> Result<()> {
         .is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn swiglu_gemv_matches_composed_parity_swiglu() -> Result<()> {
+    use apxinf_mlx::fusions::SwigluMlpGemv;
+    let s = Stream::metal(0)?;
+    let weight = |rows: usize, k: usize, period: usize| -> Result<Array> {
+        Array::from_f32(&s, &[rows, k], &data(rows * k, period, 0.002))?.cast(D::BF16)
+    };
+    let (gate, up, down) = (
+        weight(3072, 1024, 61)?,
+        weight(3072, 1024, 53)?,
+        weight(1024, 3072, 47)?,
+    );
+    let mlp = SwigluMlpGemv::new(&s)?;
+    let w = mlp.prepare(&gate, &up, &down)?;
+    for rows in [1, 2] {
+        let x =
+            Array::from_f32(&s, &[1, rows, 1024], &data(rows * 1024, 37, 0.05))?.cast(D::BF16)?;
+        let out = mlp.call(&x, &w)?;
+        assert_eq!((out.shape(), out.dtype()), (&[1, rows, 1024][..], D::BF16));
+        // FP32 SiLU of the BF16 gate, rounded, times up; then down.
+        let g = x.matmul(&gate.transpose(&[1, 0])?)?.cast(D::F32)?;
+        let one = Array::scalar(&s, 1., D::F32)?;
+        let silu = g.div(&one.add(&g.neg()?.exp()?)?)?.cast(D::BF16)?;
+        let act = silu.mul(&x.matmul(&up.transpose(&[1, 0])?)?)?;
+        let expected = act.matmul(&down.transpose(&[1, 0])?)?.to_f32_vec()?;
+        assert_within(&out.to_f32_vec()?, &expected, 0.02, 0.02);
+    }
+    assert!(mlp
+        .call(&Array::zeros(&s, &[1, 3, 1024], D::BF16)?, &w)
+        .is_err());
+    assert!(mlp.prepare(&gate.cast(D::F32)?, &up, &down).is_err());
+    Ok(())
+}

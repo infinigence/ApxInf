@@ -138,7 +138,9 @@ non-streaming, the checkpoint's voices and languages, an optional style
 instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
 It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
 cast seams) operation by operation, so a seed reproduces that path's codes and
-waveform. The CLI `speak` command writes 32-bit float WAV.
+waveform. The CLI `speak` command writes 32-bit float WAV. The default
+`auto` variant runs the code predictor MLPs on the EngineTailor `SwigluMlpGemv`
+kernels; `--model-variant reference` keeps the composed parity SwiGLU.
 
 - Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
   logits by inverse CDF, where 0.31.2 used Gumbel-max.
