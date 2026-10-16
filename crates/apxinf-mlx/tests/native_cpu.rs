@@ -272,6 +272,44 @@ fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], &
 }
 
 #[test]
+fn safetensors_late_payload_failure_is_not_published() -> Result<()> {
+    let stream = Stream::cpu()?;
+    let file = std::env::temp_dir().join(format!(
+        "apxinf-mlx-late-read-{}.safetensors",
+        std::process::id()
+    ));
+    let payload = [1.0f32, 2.0, 3.0, 4.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    write_safetensors(&file, &[("weight", "F32", &[4], &payload)]);
+    let header_end = std::fs::metadata(&file)?.len() - payload.len() as u64;
+    let before = stream.counters();
+    let predicate_called = Cell::new(false);
+    let result = apxinf_mlx::load_safetensors(&stream, &[&file], |name| {
+        assert_eq!(name, "weight");
+        assert!(!predicate_called.replace(true));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(header_end)
+            .unwrap();
+        true
+    });
+    std::fs::remove_file(&file)?;
+    assert!(predicate_called.get());
+    let failure = result
+        .expect_err("a failed payload read must not publish checkpoint arrays")
+        .to_string();
+    assert!(failure.contains(file.file_name().unwrap().to_str().unwrap()));
+    assert!(failure.contains("read"));
+    assert_eq!(stream.counters().uploads_bytes, before.uploads_bytes);
+    assert_eq!(stream.counters().eval_calls, before.eval_calls + 1);
+    Ok(())
+}
+
+#[test]
 fn affine_checkpoint_shards_load_once_and_reject_ambiguous_files() -> Result<()> {
     let s = Stream::cpu()?;
     let dir = std::env::temp_dir().join(format!("apxinf-mlx-safetensors-{}", std::process::id()));
