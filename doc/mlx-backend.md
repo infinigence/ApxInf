@@ -237,6 +237,11 @@ does not represent. Load them with `apxinf_mlx::load_safetensors` over
 keep only the keys the family uses. The family owns the key map, group size,
 bit width and every shape check.
 
+This native loader depends on the pinned MLX 0.32.3 SDK upgrade, including its
+lazy payload-read error propagation. Matching function signatures in 0.31.2
+do not establish that guarantee. Native CPU regression tests cover failure
+after header validation, before payload evaluation completes.
+
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
 its pinned reference. No implicit CPU fallback, reduced precision or changed
