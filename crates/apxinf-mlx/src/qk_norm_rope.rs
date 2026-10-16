@@ -1,6 +1,6 @@
 //! Fixed Q/K normalization and RoPE fusion from EngineTailor (MIT).
 //! Copyright 2026 Haiyan Qin. Source: candidate_metal_qk_norm_rope.py.
-use crate::{Array, MetalKernel, MlxDType, Stream};
+use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 
 /// One BF16 decode row, 16 query heads, 8 key heads, width 128, epsilon 1e-6.
@@ -68,7 +68,7 @@ impl QkNormRope {
                 ],
                 [24 * 256, 1, 1],
                 [256, 1, 1],
-                Some(MlxDType::BF16),
+                &[("T", TemplateArg::DType(MlxDType::BF16))],
             )?
         };
         let k = out.pop().unwrap();
