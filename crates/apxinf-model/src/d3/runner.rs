@@ -9,7 +9,7 @@ use crate::d3::backend::read_f32;
 use crate::d3::model::{
     forward_multimodal_device, forward_text_device, write_text_inputs, D3Policies, D3TextScratch,
 };
-use crate::d3::runtime::{
+use crate::decision::{
     DecisionAnswer, DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore,
 };
 use crate::d3::vision::D3VisionScratch;
