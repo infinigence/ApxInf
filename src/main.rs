@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
-    LoadOptions, SamplingMode,
+    AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
+    LlmInput, LoadOptions, SamplingMode,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use clap::{Parser, Subcommand};
@@ -159,6 +159,45 @@ enum Commands {
         tuning_dir: Option<PathBuf>,
     },
 
+    /// Generate an image from a text prompt and write it as binary PPM
+    GenerateImage {
+        /// Path to the image model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Text prompt
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Image width in pixels
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+
+        /// Image height in pixels
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+
+        /// Noise seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Denoising steps; families reject counts they do not support
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+
+        /// Output file (binary PPM, P6)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -259,6 +298,32 @@ fn main() {
                 autotune,
                 tuning_dir.as_ref(),
             ) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::GenerateImage {
+            model,
+            model_name,
+            prompt,
+            width,
+            height,
+            seed,
+            steps,
+            output,
+            device,
+        } => {
+            let request = ImageRequest {
+                prompt: &prompt,
+                width,
+                height,
+                seed,
+                steps,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_generate_image(&model, model_name.as_deref(), device, &request, &output)
+            });
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -555,6 +620,40 @@ fn run_generate(
     println!();
     println!();
     println!("{}", output.profile.summary());
+    Ok(())
+}
+
+fn run_generate_image(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    device: Device,
+    request: &ImageRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let image = model
+        .generate_image(request)
+        .map_err(|error| format!("Image generation failed: {error}"))?;
+    eprintln!("Generated in {:.2}s", started.elapsed().as_secs_f64());
+    let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+    ppm.extend_from_slice(&image.rgb);
+    std::fs::write(output, ppm)
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
     Ok(())
 }
 

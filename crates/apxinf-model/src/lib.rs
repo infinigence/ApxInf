@@ -14,6 +14,8 @@ pub mod llm_trait;
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen_image;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;

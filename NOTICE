@@ -27,9 +27,12 @@ Copyright (c) 2025 Prince Canuma. MIT License.
 The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h.
 Copyright (c) 2024 Apple Inc. MIT License.
 
-The interleaved Q/K normalization and rotary embedding kernel adapts mflux,
-revision f0bf9cf0506a2ae15115af1c72e3dc0093e41597.
+The interleaved Q/K normalization and rotary embedding kernel and the
+metal_qwen_image text-to-image pipeline adapt mflux, revision
+f0bf9cf0506a2ae15115af1c72e3dc0093e41597.
 Copyright (c) 2026 Filip Strand. MIT License.
+The mflux Qwen-Image-2.1 model files adapt the Qwen Team and Hugging Face
+QwenImage21 reference. Apache License 2.0.
 
 The DSpark adaptation also derives from mlx-dspark, revision
 d6042f38f0aa7dd3e03a2a406111d725056d45a3.
