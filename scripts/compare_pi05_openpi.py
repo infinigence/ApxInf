@@ -283,13 +283,14 @@ class OpenPiModel:
 
 class ApxInfModel:
     def __init__(self, checkpoint: Path, manifest: dict[str, Any], device: str,
-                 precision: str, calibration: Path | None, *, autotune: bool = False):
+                 precision: str, calibration: Path | None, *, autotune: bool = False, tactics: Path | None = None):
         import apxinf_py
 
         self.model = apxinf_py.ModelRunner.load(
             "pi05", str(checkpoint / "model.safetensors"), device=device,
             model_variant={"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[precision],
             calibration=str(calibration) if calibration else None, autotune=autotune,
+            tactics=str(tactics) if tactics else None,
             config_json=(checkpoint / "config.json").read_text(),
             action_horizon=manifest["horizon"], num_views=len(manifest["image_keys"]),
             num_flow_steps=manifest["num_flow_steps"], flow_start_time=1.0,
@@ -380,7 +381,7 @@ def run_apxinf(args: argparse.Namespace) -> None:
 
     manifest = load_suite(args.suite_dir)
     model = ApxInfModel(args.checkpoint_dir, manifest, args.device,
-                        args.precision, args.calibration, autotune=args.autotune)
+                        args.precision, args.calibration, autotune=args.autotune, tactics=args.tactics)
     collect(args.suite_dir, manifest, model, "apxinf", {
         "precision": args.precision, "autotune": args.autotune,
         "config_sha256": sha256(args.checkpoint_dir / "config.json"),
@@ -499,6 +500,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         elif name == "apxinf":
             command.add_argument("--precision", choices=("bf16", "fp8", "int8"), default="fp8")
             command.add_argument("--calibration", type=Path)
+            command.add_argument("--tactics", type=Path, help="explicit native recipe directory")
             command.add_argument("--autotune", action="store_true",
                                  help="tune missing native recipes during preparation; disabled in daily CI")
             command.add_argument("--revision", required=True)

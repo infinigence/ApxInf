@@ -614,11 +614,11 @@ class MatrixTest(unittest.TestCase):
                 return np.ones((2, 32), np.float32)
         args = SimpleNamespace(model_dir=self.root, layer="l1", out=self.root / "bench.json",
             suite_dir=suite, warmup=1, samples=2, model_variant="bf16", calibration=None,
-            device="cuda:0", revision=SHA, hardware="thor", autotune=True)
+            device="cuda:0", revision=SHA, hardware="thor", autotune=True, tactics=self.root / "recipes")
         with patch.dict(sys.modules, {"apxinf_py": SimpleNamespace(__file__=str(extension))}), patch.object(
                 parity, "ApxInfModel", Model), patch.object(parity, "cuda_runtime_libraries", return_value={}):
             bench.benchmark_suite(args)
-        self.assertEqual(options, [{"autotune": True}])
+        self.assertEqual(options, [{"autotune": True, "tactics": args.tactics}])
         self.assertEqual(calls, [2, 2, 2, 2, 3, 3, 3, 3, 3, 2])
         receipt = ci.read_json(args.out)
         self.assertEqual(receipt["shape_switch"]["from"], "other")

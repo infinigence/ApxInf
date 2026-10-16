@@ -286,7 +286,7 @@ def benchmark_suite(args):
     precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}[args.model_variant]
     model = ApxInfModel(args.model_dir, manifest, args.device, precision,
                         pathlib.Path(args.calibration) if args.calibration else None,
-                        autotune=args.autotune)
+                        autotune=args.autotune, tactics=args.tactics)
     rows = []
     for entry in manifest["cases"]:
         case = load_case(args.suite_dir, entry)
