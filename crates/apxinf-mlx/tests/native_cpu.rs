@@ -370,3 +370,89 @@ fn depthwise_causal_conv1d_matches_shifted_weighted_sums() -> Result<()> {
     assert!(input.conv1d(&weight, 1, 0, 1, 0).is_err());
     Ok(())
 }
+
+fn bits(a: &Array) -> Result<Vec<u32>> {
+    Ok(a.to_f32_vec()?.iter().map(|v| v.to_bits()).collect())
+}
+
+#[test]
+fn seeded_noise_matches_mlx_threefry() -> Result<()> {
+    // Expected bits from MLX Python 0.31.2 and 0.32.3 on the CPU device:
+    // mx.random.normal([2, 3], key=mx.random.key(42)).
+    let s = Stream::cpu()?;
+    let key = Array::random_key(&s, 42)?;
+    assert_eq!((key.dtype(), key.shape()), (D::U32, &[2][..]));
+    let x = Array::random_normal(&[2, 3], D::F32, &key)?;
+    assert_eq!(
+        bits(&x)?,
+        [0x3f1cbd6d, 0x3f8fb0fc, 0x3f91941b, 0xbf500f3b, 0xbf63f190, 0x3e0142e6]
+    );
+    // A seed above 2^32 uses both key words.
+    let wide = Array::random_normal(&[3], D::F32, &Array::random_key(&s, (1 << 40) + 7)?)?;
+    assert_eq!(bits(&wide)?, [0xbf3e8d89, 0xbfb36082, 0x3d9b1cba]);
+    // The same key gives the same samples; a different key does not.
+    assert_eq!(
+        bits(&Array::random_normal(&[2, 3], D::F32, &key)?)?,
+        bits(&x)?
+    );
+    let other = Array::random_normal(&[2, 3], D::F32, &Array::random_key(&s, 43)?)?;
+    assert_ne!(bits(&other)?, bits(&x)?);
+    assert!(Array::random_normal(&[2], D::F32, &x).is_err());
+    Ok(())
+}
+
+#[test]
+fn image_operators_follow_mlx_semantics() -> Result<()> {
+    // Expected bits from MLX Python 0.32.3 on the CPU device.
+    let s = Stream::cpu()?;
+    let input = Array::arange(&s, 0., 24., 1., D::F32)?
+        .reshape(&[1, 3, 4, 2])?
+        .div(&Array::scalar(&s, 8., D::F32)?)?
+        .sub(&Array::scalar(&s, 1., D::F32)?)?;
+    let weight = Array::arange(&s, 0., 54., 1., D::F32)?
+        .reshape(&[3, 3, 3, 2])?
+        .div(&Array::scalar(&s, 16., D::F32)?)?
+        .sub(&Array::scalar(&s, 1., D::F32)?)?;
+    let same = input.conv2d(&weight, [1, 1], [1, 1], [1, 1], 1)?;
+    assert_eq!(same.shape(), [1, 3, 4, 3]);
+    assert_eq!(
+        &bits(&same)?[..6],
+        [0x3fb00000, 0xbfb80000, 0xc0880000, 0x40020000, 0xbf000000, 0xc0420000]
+    );
+    let strided = input.conv2d(&weight, [2, 1], [1, 0], [1, 1], 1)?;
+    assert_eq!(strided.shape(), [1, 2, 2, 3]);
+    assert_eq!(
+        bits(&strided)?,
+        [
+            0x40020000, 0xbf000000, 0xc0420000, 0x3f980000, 0x40020000, 0x40380000, 0xc0a00000,
+            0x40bf0000, 0x41878000, 0xc0df0000, 0x40ec0000, 0x41adc000
+        ]
+    );
+    assert!(input.conv2d(&weight, [0, 1], [1, 1], [1, 1], 1).is_err());
+
+    let grid = Array::from_f32(&s, &[2, 2], &[1., 2., 3., 4.])?;
+    assert_eq!(
+        grid.repeat(2, 1)?.to_f32_vec()?,
+        [1., 1., 2., 2., 3., 3., 4., 4.]
+    );
+    assert_eq!(grid.repeat(2, 0)?.shape(), [4, 2]);
+    let t = Array::from_f32(&s, &[5], &[-3., -0.5, 0., 0.25, 2.])?;
+    assert_eq!(
+        bits(&t.tanh()?)?,
+        [0xbf7ebbe9, 0xbeec9a9f, 0x0, 0x3e7acbf5, 0x3f76ca83]
+    );
+    assert_eq!(
+        bits(&Array::from_f32(&s, &[3], &[0., 2., 9.])?.sqrt()?)?,
+        [0x0, 0x3fb504f3, 0x40400000]
+    );
+    // mx.clip(x / 2 + 0.5, 0, 1) for BF16 x keeps BF16.
+    let x = Array::from_f32(&s, &[3], &[-3., 0.25, 2.])?.cast(D::BF16)?;
+    let scalar = |v| Array::scalar(&s, v, D::BF16);
+    let image = x
+        .div(&scalar(2.)?)?
+        .add(&scalar(0.5)?)?
+        .clip(&scalar(0.)?, &scalar(1.)?)?;
+    assert_eq!(image.dtype(), D::BF16);
+    assert_eq!(image.to_f32_vec()?, [0., 0.625, 1.]);
+    Ok(())
+}

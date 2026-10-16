@@ -568,6 +568,66 @@ impl Array {
     pub fn softmax_with(&self, axis: i32, precise: bool) -> Result<Self> {
         self.stream().op(49, &[self], &[axis, precise as i32], &[])
     }
+    pub fn tanh(&self) -> Result<Self> {
+        self.unary(50)
+    }
+    pub fn sqrt(&self) -> Result<Self> {
+        self.unary(51)
+    }
+    /// MLX `clip` with array bounds; pass scalars in the operand's dtype to
+    /// match MLX Python's scalar promotion.
+    pub fn clip(&self, min: &Self, max: &Self) -> Result<Self> {
+        self.stream().op(52, &[self, min, max], &[], &[])
+    }
+    /// MLX `repeat` along one axis: each element is repeated `repeats` times.
+    pub fn repeat(&self, repeats: usize, axis: i32) -> Result<Self> {
+        let repeats = i32::try_from(repeats).map_err(|_| error("repeat count exceeds i32"))?;
+        self.stream().op(54, &[self], &[repeats, axis], &[])
+    }
+    /// MLX `conv2d`: input `[N, H, W, C_in]`, weight `[C_out, KH, KW, C_in / groups]`.
+    pub fn conv2d(
+        &self,
+        weight: &Self,
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [
+            stride[0],
+            stride[1],
+            padding[0],
+            padding[1],
+            dilation[0],
+            dilation[1],
+            groups,
+        ]
+        .iter()
+        .map(|&v| i32::try_from(v).map_err(|_| error("conv2d parameter exceeds i32")))
+        .collect::<Result<Vec<_>>>()?;
+        if [p[0], p[1], p[4], p[5], p[6]].contains(&0) {
+            return Err(error("conv2d stride, dilation and groups must be positive"));
+        }
+        self.stream().op(53, &[self, weight], &p, &[])
+    }
+    /// The MLX threefry PRNG key for `seed`, as `mx.random.key(seed)`.
+    pub fn random_key(stream: &Stream, seed: u64) -> Result<Self> {
+        stream.op(
+            55,
+            &[],
+            &[seed as u32 as i32, (seed >> 32) as u32 as i32],
+            &[],
+        )
+    }
+    /// Standard normal samples from `key`, as `mx.random.normal(shape, dtype, key=key)`.
+    pub fn random_normal(shape: &[usize], dtype: MlxDType, key: &Self) -> Result<Self> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        let mut p = vec![dtype as i32];
+        p.extend(dims(shape)?);
+        key.stream().op(56, &[key], &p, &[])
+    }
     /// MLX `conv1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
     pub fn conv1d(
         &self,
