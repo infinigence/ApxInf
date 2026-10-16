@@ -145,8 +145,10 @@ codec dependency is added.
   loads the DiT and VAE decoder with complete key, shape and dtype checks.
 - A request reads the text encoder one layer at a time and frees each layer.
   The DiT computes the text-prefix K/V once and then runs one compiled image
-  forward per step. It is released before the tiled VAE decode (512 px tiles,
-  128 px overlap) and read again by the next request, as `--low-ram` does.
+  forward per step; its image-token projections use the MPP GEMM where a
+  load-time probe shows bit-identical results to quantized matmul. The DiT
+  is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
+  read again by the next request, as `--low-ram` does.
 - The checkpoint weights are under the Qwen Research License, which permits
   non-commercial use only. APXinf ships no weights.
 
