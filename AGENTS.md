@@ -56,8 +56,9 @@ If you have no suitable device, write "not verified" — never "pass".
 When adding a family or changing precision/preparation, read
 [Model Layer Architecture](doc/reference/model-layer-architecture.md#current-module-names-and-responsibilities)
 and [Adding a New Model](doc/guides/adding-a-new-model.md). Use the
-`model-port-workflow` skill for a full port. Historical Session/Network
-names in `doc/archive/` are not integration APIs.
+`model-port-workflow` skill for a full port and the `model-parity` skill
+whenever you compare outputs across builds or against a reference.
+Historical Session/Network names in `doc/archive/` are not integration APIs.
 
 ## Review
 

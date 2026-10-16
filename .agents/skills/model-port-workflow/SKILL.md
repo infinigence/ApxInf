@@ -146,7 +146,8 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    suffix is frozen replay data, not a universal user-prompt requirement.
 8. Verify operators, transformations, intermediate checkpoints, eager and
    captured inference, host-transfer audit, public serving/policy integration,
-   and requested performance. Prove that tensor computation between public
+   and requested performance; follow the `model-parity` skill for reference and
+   build comparisons. Prove that tensor computation between public
    input upload and public output transfer stays on GPU, and verify eager versus
    captured parity, repeated replay, changed-input propagation, stable
    addresses, and capture-safe workspace use. For a VLA, verify the whole-model
