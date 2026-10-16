@@ -9,6 +9,10 @@ use apxinf_mlx::{Array, Compiled, MlxDType};
 use std::rc::Rc;
 
 const EPS: f32 = 1e-6;
+/// Smallest image-token count that uses the MPP GEMM. MLX quantized matmul
+/// switches to another reduction for small output grids (observed on M4 at
+/// 64 tokens), where MPP no longer reproduces it.
+pub const MPP_MIN_TOKENS: usize = 1024;
 
 pub struct Dit {
     w: Transformer,
@@ -38,12 +42,14 @@ impl Dit {
         })
     }
 
-    /// `nn.QuantizedLinear`. Image tokens in multiples of 64 decode the
-    /// weight per call and use the probe-selected MPP GEMM. Full-image parity
-    /// requires separate qualification for the selected device and profile.
+    /// `nn.QuantizedLinear`. At least `MPP_MIN_TOKENS` image tokens in a
+    /// multiple of 64 decode the weight per call and use the probe-selected
+    /// MPP GEMM. Full-image parity requires separate qualification for the
+    /// selected device and profile.
     fn project(&self, w: &Q4, x: &Array, image: bool) -> Result<Array> {
+        let tokens = x.shape()[1];
         match &self.gemm {
-            Some(gemm) if image && x.shape()[1] % 64 == 0 => {
+            Some(gemm) if image && tokens.is_multiple_of(64) && tokens >= MPP_MIN_TOKENS => {
                 gemm.call(x, &w.weight.dequantize(&w.scales, &w.biases, 64, 4)?)
             }
             _ => w.apply(x),
