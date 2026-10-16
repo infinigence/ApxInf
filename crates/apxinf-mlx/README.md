@@ -98,7 +98,7 @@ An integer template is a specialization fact: each distinct value builds and
 caches a separate Metal pipeline the first time it is used.
 
 The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
-`SplitF16Gemm` and `GatedDeltaRecurrence`. They decode affine Q4 group-64
+`SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
 weights to FP16 for one call only; they keep no decoded weight resident.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
