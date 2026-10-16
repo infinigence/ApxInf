@@ -103,3 +103,9 @@ The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
 weights to FP16 for one call only; they keep no decoded weight resident.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
+
+`InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
+per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the
+`[B, L, H * D]` to `[B, H, L, D]` layout change in one kernel.
+`Array::random_key` and `Array::random_normal` expose the MLX threefry
+generator, so seeded noise matches `mx.random.normal(..., key=mx.random.key(seed))`.
