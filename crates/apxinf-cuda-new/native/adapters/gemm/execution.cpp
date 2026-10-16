@@ -30,7 +30,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 6 ||
+  if (spec.version != 7 || spec.math > APXINF_GEMM_MATH_TF32 ||
       spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
@@ -59,6 +59,15 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.output_alignment < apxinf::gemm::dtype_bytes(spec.output_dtype)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "GEMM binding violates dtype alignment");
+  }
+  if (spec.math == APXINF_GEMM_MATH_TF32 &&
+      (spec.a_dtype != APXINF_DTYPE_F32 ||
+       spec.b_dtype != APXINF_DTYPE_F32 ||
+       spec.output_dtype != APXINF_DTYPE_F32 ||
+       spec.quantization != APXINF_GEMM_QUANT_NONE ||
+       spec.semantic != APXINF_GEMM_SEMANTIC_GEMM)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "TF32 requires plain FP32 GEMM inputs and output");
   }
   if ((spec.a_dtype == APXINF_DTYPE_I8 ||
        spec.b_dtype == APXINF_DTYPE_I8) &&
@@ -282,6 +291,10 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
                     "null GEMM execution argument");
     }
     apxinf::gemm::Spec normalized_spec{};
+    // Check the common header before reading fields added in this ABI version.
+    if (spec->version != 7) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec version");
+    }
     static_cast<apxinf_gemm_spec_t&>(normalized_spec) = *spec;
     validate_spec(normalized_spec);
     validate_policy(*policy);
@@ -657,6 +670,9 @@ extern "C" apxinf_status_t apxinf_gemm_test_validate_candidates(
                     "invalid candidate validation arguments");
     }
     apxinf::gemm::Spec normalized{};
+    if (spec->version != 7) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec version");
+    }
     static_cast<apxinf_gemm_spec_t&>(normalized) = *spec;
     validate_spec(normalized);
     validate_policy(*policy);
@@ -683,6 +699,9 @@ extern "C" apxinf_status_t apxinf_gemm_test_seed_recipe(
                     "invalid test recipe seed arguments");
     }
     apxinf::gemm::Spec normalized{};
+    if (spec->version != 7) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec version");
+    }
     static_cast<apxinf_gemm_spec_t&>(normalized) = *spec;
     validate_spec(normalized);
     const Recipe recipe{provider_id, implementation_id,

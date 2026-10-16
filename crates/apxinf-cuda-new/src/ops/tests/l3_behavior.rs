@@ -44,8 +44,8 @@ fn quantization_rejects_packed_fp4_input() {
         (QuantizationSemantic::RowwiseI8, DType::I8),
     ] {
         let mut output = zeros_tensor(0, vec![1, 16], dtype);
-        let error = quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output))
-            .unwrap_err();
+        let error =
+            quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output)).unwrap_err();
         assert!(
             error.to_string().contains("requires F16 or BF16")
                 || error.to_string().contains("dtype disagrees"),
@@ -388,23 +388,24 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
                         packed_values.push(match plane {
                             0 => 0.25,
                             1 => 0.5,
-                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32
-                                / 32.0,
+                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32 / 32.0,
                         });
                     }
                 }
             }
             for head in 0..heads {
                 for dimension in 0..head_dim {
-                    expected.push(
-                        ((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0,
-                    );
+                    expected.push(((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0);
                 }
             }
         }
     }
     let qkv = f16_tensor(0, vec![batch, tokens, 3, heads, head_dim], &packed_values);
-    let mut out = f16_tensor(0, vec![batch, tokens, heads, head_dim], &vec![0.0; elements]);
+    let mut out = f16_tensor(
+        0,
+        vec![batch, tokens, heads, head_dim],
+        &vec![0.0; elements],
+    );
     let normalized = super::attention_contracts::normalize_packed_qkv(
         &ctx,
         PackedQkvAttentionArgs::new(&qkv, &mut out),
@@ -421,9 +422,15 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         packed_qkv_attention(&ctx, args)
     })
     .unwrap();
-    let eager = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+    let eager = crate::transfers::to_cpu(&out)
+        .unwrap()
+        .to_f32_vec()
+        .unwrap();
     for (actual, reference) in eager.iter().zip(&expected) {
-        assert!((actual - reference).abs() < 0.002, "{actual} != {reference}");
+        assert!(
+            (actual - reference).abs() < 0.002,
+            "{actual} != {reference}"
+        );
     }
     let graph = crate::capture(&ctx, || {
         with_session(&session, || {
@@ -442,7 +449,10 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         output.copy_from_host(&sentinel).unwrap();
         graph.replay().unwrap();
         ctx.synchronize().unwrap();
-        let replayed = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+        let replayed = crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(replayed, eager);
     }
 }
@@ -1125,11 +1135,24 @@ fn staged_geglu_rejects_invalid_bindings() {
     let ctx = CudaContext::new(0).unwrap();
     let input = f16_tensor(0, vec![1, 8], &[1.0; 8]);
     let mut output = f16_tensor(0, vec![1, 4], &[0.0; 4]);
-    let error = pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output)).unwrap_err();
+    let error = pointwise(
+        &ctx,
+        PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("requires BF16"));
     let input = tensor(0, vec![1, 8], &[1.0; 8]);
-    let mut output = apxinf_core::Tensor::from_raw_parts(apxinf_core::Shape::new(vec![1, 4]), input.dtype(), input.device(), input.storage().clone());
-    let error = pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output)).unwrap_err();
+    let mut output = apxinf_core::Tensor::from_raw_parts(
+        apxinf_core::Shape::new(vec![1, 4]),
+        input.dtype(),
+        input.device(),
+        input.storage().clone(),
+    );
+    let error = pointwise(
+        &ctx,
+        PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("must not overlap"));
 }
 
@@ -1139,12 +1162,72 @@ fn direct_pointwise_graph_retains_tensor_storage() {
     let input = tensor(0, vec![1, 8], &[0.0; 8]);
     let owner = std::sync::Arc::downgrade(input.storage().as_gpu().unwrap().owner().unwrap());
     let mut output = tensor(0, vec![1, 4], &[1.0; 4]);
-    let graph = crate::capture(&ctx, || pointwise(&ctx, PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output))).unwrap();
+    let graph = crate::capture(&ctx, || {
+        pointwise(
+            &ctx,
+            PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output),
+        )
+    })
+    .unwrap();
     drop(input);
-    assert!(owner.upgrade().is_some(), "captured pointwise released its input");
+    assert!(
+        owner.upgrade().is_some(),
+        "captured pointwise released its input"
+    );
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
     assert_eq!(values(&output), vec![0.0; 4]);
     drop(graph);
-    assert!(owner.upgrade().is_none(), "destroyed graph leaked its input");
+    assert!(
+        owner.upgrade().is_none(),
+        "destroyed graph leaked its input"
+    );
+}
+
+#[test]
+fn tf32_gemm_validates_contract_and_replays_changed_weights() {
+    use super::framework::f32_tensor;
+    let ctx = CudaContext::new(0).unwrap();
+    let (k, n) = (1024, 32);
+    let input = f32_tensor(0, vec![1, k], &vec![0.5; k]);
+    let weight = f32_tensor(0, vec![k, n], &vec![0.25; k * n]);
+    let mut output = zeros_tensor(0, vec![1, n], apxinf_core::DType::F32);
+    let mut args = GemmArgs::new(&input, &weight, &mut output);
+    args.math = GemmMath::Tf32;
+    args.policy.workspace_limit = 4 * 1024 * 1024;
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
+    assert!(
+        gemm(&ctx, args).is_err(),
+        "the packed weight must count against the resource limit"
+    );
+    let session = ExecutionSession::with_capacity(16 * 1024 * 1024, 0).unwrap();
+    let mut run = || {
+        let mut args = GemmArgs::new(&input, &weight, &mut output);
+        args.math = GemmMath::Tf32;
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    prepare_with_session(&session, &mut run).unwrap();
+    let graph = crate::capture(&ctx, || with_session(&session, &mut run)).unwrap();
+    let buffer = crate::CudaBuffer::from_tensor(&weight).unwrap();
+    for value in [0.25f32, -0.5, 0.25] {
+        let bytes: Vec<_> = (0..k * n).flat_map(|_| value.to_ne_bytes()).collect();
+        buffer.copy_from_host(&bytes).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = crate::transfers::to_cpu(&output)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        assert_eq!(actual, vec![0.5 * value * k as f32; n]);
+    }
+    let bf16_input = tensor(0, vec![1, k], &vec![0.5; k]);
+    let mut args = GemmArgs::new(&bf16_input, &weight, &mut output);
+    args.math = GemmMath::Tf32;
+    assert!(gemm(&ctx, args)
+        .unwrap_err()
+        .to_string()
+        .contains("TF32 requires"));
 }

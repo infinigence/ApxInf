@@ -14,6 +14,61 @@ The merge preserves explicit INT8 language normalization and its conservative
 allocation-schedule reservation. BF16 now keeps its normalization explicit;
 FP8 retains its folded weight recipe.
 
+### Latest verification (2026-10-17)
+
+The complete private BF16 repair passes all **63/63** Thor cases: 8 real
+observations and 13 diagnostic inputs for each of 1–3 views. All action steps
+pass the unchanged limits. **60/63** outputs are bitwise OpenPI; the three
+21-token gradient cases have relative L2 of 0.01748, 0.00847 and 0.00526.
+Both processes load the same CUDA library hashes. Captured execution, repeated
+calls and A→other inputs→A checks pass. These are fixed-observation action
+chunks, not closed-loop trials or task-success measurements.
+
+This private result still depends on staged Attention, ordered patch projection
+and an action-down provider control. It is **not** maintained-path acceptance.
+The action-down experiment checks all eight cuBLASLt configurations: the chosen
+rank 4 has no split-K reduction and differs from OpenPI in 287 BF16 elements;
+ranks 0/1/3 use three-way split-K and match. A double-precision oracle differs
+from both results. This is reduction-order sensitivity, not evidence of a
+wrong dtype or a broken cuBLASLt candidate. Do not encode a provider override
+in model code to hide it.
+
+The FP32 auxiliary-projection repair now has a public `GemmMath::Tf32` contract,
+a separate exact recipe key, prepared resource accounting and mutable-weight
+capture tests. Six GPU regressions pass on Orin CUDA 12.6, including the original
+GEMM and BF16 bias tests. Replacing only the private TF32 adapter with that safe
+interface preserves four difficult full-model outputs bitwise on Thor. The
+normal maintained build passes **54/63** Thor inputs (real **7/8, 8/8, 8/8**;
+diagnostics **11/13, 8/13, 12/13**). Its remaining failures require the other
+repairs above; paired performance is still running. The complete private repair
+on Orin also still fails five two-view diagnostics while passing all eight
+real observations; Thor results do not qualify Orin.
+
+Paired measurements use 30 warmups and 50 samples, with baseline, candidate and
+baseline revisit. The complete private Thor repair has a clear performance debt:
+
+| Views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
+| --- | --- | --- |
+| 1 | 59.285 / 70.447 / 59.253 ms | 65.318 / 74.492 / 65.339 ms |
+| 2 | 70.774 / 80.872 / 70.564 ms | 75.985 / 85.228 / 75.989 ms |
+| 3 | 86.481 / 96.983 / 86.627 ms | 91.025 / 100.009 / 91.015 ms |
+
+The maintained repair through RGB normalization was also compared with
+`35bcbf59` on Orin, including all earlier INT8 repairs:
+
+| Precision / views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
+| --- | --- | --- |
+| INT8 / 1 | 87.278 / 87.838 / 87.370 ms | 104.671 / 105.161 / 104.560 ms |
+| INT8 / 2 | 127.739 / 127.739 / 127.465 ms | 144.322 / 144.863 / 144.835 ms |
+| INT8 / 3 | 166.664 / 167.214 / 166.770 ms | 184.138 / 183.959 / 183.584 ms |
+| BF16 / 1 | 131.264 / 131.839 / 131.616 ms | 130.719 / 131.579 / 131.363 ms |
+| BF16 / 2 | 193.462 / 194.783 / 193.534 ms | 184.900 / 185.395 / 183.873 ms |
+| BF16 / 3 | 213.846 / 214.584 / 215.670 ms | 228.423 / 229.880 / 230.703 ms |
+
+Small increases and baseline drift are retained, not waived. Desktops remained
+active; these measurements do not establish exclusive-run budgets. FP8/INT8
+accuracy failures remain unresolved. The PR remains unaccepted and offline.
+
 ### Current migration baseline
 
 A normal build of `35bcbf59` on Orin (CUDA 13.2), with tuning disabled and an

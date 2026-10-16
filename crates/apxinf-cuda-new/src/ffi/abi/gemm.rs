@@ -7,6 +7,7 @@ use super::types::{CudaStream, Runtime};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Spec {
     pub version: u32,
+    pub math: u32,
     pub semantic: u32,
     pub a_dtype: u32,
     pub b_dtype: u32,
@@ -64,11 +65,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
-    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
-        rows: i64,
-        k: i64,
-        sf_vec_size: u32,
-    ) -> u64;
+    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
         source_row_major: *const c_void,
         destination: *mut c_void,

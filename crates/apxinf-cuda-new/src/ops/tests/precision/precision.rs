@@ -438,11 +438,9 @@ fn torch_validation_requires_the_l3_output_shape() {
         &[1.0; 7],
     )
     .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Torch validation output does not match")
-    );
+    assert!(error
+        .to_string()
+        .contains("Torch validation output does not match"));
 }
 
 #[test]
@@ -908,11 +906,9 @@ fn staged_bf16_geglu_matches_torch() {
             .unwrap();
         graph.replay().unwrap();
         ctx.synchronize().unwrap();
-        assert!(
-            super::framework::values(&output)
-                .iter()
-                .all(|value| *value == 0.0)
-        );
+        assert!(super::framework::values(&output)
+            .iter()
+            .all(|value| *value == 0.0));
     }
 }
 
@@ -1035,11 +1031,9 @@ fn f32_gather_preserves_patch_and_bias_boundaries() {
             images.copy_from_host(&vec![0; image.len()]).unwrap();
             graph.replay().unwrap();
             ctx.synchronize().unwrap();
-            assert!(
-                super::framework::f32_values(&output)
-                    .iter()
-                    .all(|value| *value == -1.0)
-            );
+            assert!(super::framework::f32_values(&output)
+                .iter()
+                .all(|value| *value == -1.0));
         }
     }
     let input = f32_tensor(0, vec![2, 2], &[1e8, -1e8, 1e8, -1e8]);
@@ -1327,6 +1321,44 @@ fn bf16_attention_preserves_softmax_rounding() {
                     "changed-value replay: batch={batch}, iteration={iteration}, index={index}, value={value}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn tf32_gemm_all_candidates_match_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (m, k, n) in [(1, 1024, 1024), (1, 1024, 3072), (50, 1024, 32)] {
+        let a: Vec<_> = (0..m * k)
+            .map(|i| ((i * 17 % 97) as f32 - 48.0) / 64.0)
+            .collect();
+        let b: Vec<_> = (0..k * n)
+            .map(|i| ((i * 31 % 89) as f32 - 44.0) / 64.0)
+            .collect();
+        let expected: Vec<_> = (0..m * n)
+            .map(|i| {
+                (0..k)
+                    .map(|j| a[i / n * k + j] as f64 * b[j * n + i % n] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        let input = f32_tensor(0, vec![m, k], &a);
+        let weight = f32_tensor(0, vec![k, n], &b);
+        let mut output = zeros_tensor(0, vec![m, n], DType::F32);
+        for immutable in [false, true] {
+            let mut args = GemmArgs::new(&input, &weight, &mut output);
+            args.math = GemmMath::Tf32;
+            if immutable {
+                args = args.with_immutable_weight(WeightVersion::new(0));
+            }
+            validate_all_candidates(
+                &ctx,
+                args,
+                super::contracts::Semantic::Gemm,
+                None,
+                &expected,
+            )
+            .unwrap();
         }
     }
 }

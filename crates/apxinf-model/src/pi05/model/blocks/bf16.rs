@@ -165,6 +165,26 @@ fn gemm_dense(
     Ok(output)
 }
 
+/// The reference permits TF32 only for the FP32 auxiliary projections.
+fn gemm_tf32(
+    ctx: &Context,
+    policies: &L3Policies,
+    input: &Tensor,
+    weight: &Tensor,
+) -> Result<Tensor> {
+    use crate::pi05::backend::ops::{GemmMath, WeightVersion};
+    let mut output = ctx.allocate_output(
+        Shape::new(vec![input.shape().dims()[0], weight.shape().dims()[1]]),
+        DType::F32,
+    )?;
+    let mut args =
+        GemmArgs::new(input, weight, &mut output).with_immutable_weight(WeightVersion::new(0));
+    args.math = GemmMath::Tf32;
+    args.policy = policies.gemm.clone();
+    l3_gemm(ctx, args)?;
+    Ok(output)
+}
+
 fn linear_bf16(
     ctx: &Context,
     policies: &L3Policies,
@@ -983,7 +1003,7 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
-            let hidden = gemm_dense(
+            let hidden = gemm_tf32(
                 self.ctx(),
                 &self.policies,
                 time_embedding,
@@ -995,7 +1015,7 @@ pub(in crate::pi05::model) mod backbone {
                 self.weights.time_mlp_in.bias.as_ref(),
                 PointwiseActivation::Silu,
             )?;
-            let output = gemm_dense(
+            let output = gemm_tf32(
                 self.ctx(),
                 &self.policies,
                 &hidden,
@@ -1010,7 +1030,7 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         fn modulation(&self, conditioning: &Tensor, weights: &F32LinearWeights) -> Result<Tensor> {
-            let projected = gemm_dense(self.ctx(), &self.policies, conditioning, &weights.weight)?;
+            let projected = gemm_tf32(self.ctx(), &self.policies, conditioning, &weights.weight)?;
             let modulation = bias_activation(
                 self.ctx(),
                 &projected,
@@ -1070,7 +1090,7 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 BF16 prefix/modulation depth mismatch".into(),
                 ));
             }
-            let hidden = gemm_dense(
+            let hidden = gemm_tf32(
                 self.ctx(),
                 &self.policies,
                 state,
@@ -1114,7 +1134,7 @@ pub(in crate::pi05::model) mod backbone {
                 Error::Other("π0.5 action expert must contain at least one layer".into())
             })?;
             let hidden = cast(self.ctx(), &hidden, DType::F32)?;
-            let velocity = gemm_dense(
+            let velocity = gemm_tf32(
                 self.ctx(),
                 &self.policies,
                 &hidden,

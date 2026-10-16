@@ -11,6 +11,7 @@ struct CublasState {
   size_t workspace_bytes = 0;
   void* dequant_a = nullptr;
   void* dequant_b = nullptr;
+  void* packed_weight = nullptr;
 
   ~CublasState() {
     release_resources();
@@ -21,15 +22,31 @@ struct CublasState {
     if (workspace != nullptr) cudaFree(workspace);
     if (dequant_a != nullptr) cudaFree(dequant_a);
     if (dequant_b != nullptr) cudaFree(dequant_b);
+    if (packed_weight != nullptr) cudaFree(packed_weight);
     workspace = nullptr;
     dequant_a = nullptr;
     dequant_b = nullptr;
+    packed_weight = nullptr;
     common.release();
   }
 };
 
 CublasState& provider(Execution& state) {
   return *static_cast<CublasState*>(state.provider_state);
+}
+
+size_t packed_weight_bytes(const Spec& spec) {
+  return spec.math == APXINF_GEMM_MATH_TF32 && spec.m == 1
+             ? static_cast<size_t>(spec.k * spec.n) * sizeof(float)
+             : 0;
+}
+
+void pack_weight(const Spec& spec, const apxinf_gemm_bindings_t& bindings,
+                 void* destination) {
+  check_cuda(apxinf::cuda_new::custom::unpack_gemm(
+      bindings.b, destination, APXINF_DTYPE_F32, APXINF_DTYPE_F32,
+      spec.n, spec.k, APXINF_GEMM_LAYOUT_NK,
+      static_cast<cudaStream_t>(bindings.stream)));
 }
 
 bool needs_safe_dequantization(const Spec& spec) {
@@ -59,7 +76,7 @@ size_t dequantization_resource_requirements(const Spec& spec) {
 }  // namespace
 
 size_t cublas_resource_requirements(const Spec& spec) {
-  return dequantization_resource_requirements(spec) +
+  return packed_weight_bytes(spec) + dequantization_resource_requirements(spec) +
          vendor::common_resource_requirements(cublas_compute_spec(spec), false) +
          4 * 1024 * 1024;
 }
@@ -77,12 +94,22 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
   check_cublas(cublasCreate(&resources->handle));
-  check_cublas(cublasSetMathMode(resources->handle, CUBLAS_PEDANTIC_MATH));
+  check_cublas(cublasSetMathMode(
+      resources->handle, state.spec.math == APXINF_GEMM_MATH_TF32
+                             ? CUBLAS_TF32_TENSOR_OP_MATH
+                             : CUBLAS_PEDANTIC_MATH));
+  if (const size_t bytes = packed_weight_bytes(state.spec); bytes != 0) {
+    check_cuda(cudaMalloc(&resources->packed_weight, bytes));
+    if (state.spec.b_is_immutable) {
+      pack_weight(state.spec, state.bindings, resources->packed_weight);
+    }
+  }
   resources->workspace_bytes = 4 * 1024 * 1024;
   check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   state.resource_bytes =
       resources->common.resource_bytes + resources->workspace_bytes +
-      dequantization_resource_requirements(state.spec);
+      dequantization_resource_requirements(state.spec) +
+      packed_weight_bytes(state.spec);
   state.provider_state = resources.release();
 }
 
@@ -153,14 +180,35 @@ cudaError_t launch_cublas(Execution& state) {
   check_cublas(cublasSetStream(resources.handle, stream));
   check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
                                   resources.workspace_bytes));
+  cublasOperation_t transpose = CUBLAS_OP_N;
+  int leading_weight = compute_spec.n;
+  if (resources.packed_weight != nullptr) {
+    if (!spec.b_is_immutable) pack_weight(spec, bindings, resources.packed_weight);
+    weight = resources.packed_weight;
+    transpose = CUBLAS_OP_T;
+    leading_weight = compute_spec.k;
+  }
+  if (resources.packed_weight != nullptr) {
+    check_cublas(cublasSgemm(
+        resources.handle, transpose, CUBLAS_OP_N, compute_spec.n,
+        compute_spec.m, compute_spec.k, &alpha,
+        static_cast<const float*>(weight), leading_weight,
+        static_cast<const float*>(activation), compute_spec.k, &beta,
+        static_cast<float*>(projection), compute_spec.n));
+    return vendor::launch_postprocess(compute_spec, resources.common, bindings,
+                                     projection);
+  }
+  const cublasComputeType_t compute_type =
+      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
+      : spec.math == APXINF_GEMM_MATH_TF32 ? CUBLAS_COMPUTE_32F_FAST_TF32
+                                         : CUBLAS_COMPUTE_32F;
   check_cublas(cublasGemmEx(
-      resources.handle, CUBLAS_OP_N, CUBLAS_OP_N, compute_spec.n,
+      resources.handle, transpose, CUBLAS_OP_N, compute_spec.n,
       compute_spec.m, compute_spec.k,
       alpha_pointer, weight, operand_type,
-      compute_spec.n, activation, operand_type,
+      leading_weight, activation, operand_type,
       compute_spec.k, beta_pointer, projection, data_type, compute_spec.n,
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
-                                              : CUBLAS_COMPUTE_32F,
+      compute_type,
       CUBLAS_GEMM_DEFAULT));
   return vendor::launch_postprocess(compute_spec, resources.common, bindings,
                                     projection);

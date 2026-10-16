@@ -45,8 +45,14 @@ typedef enum {
   APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL = 4,
 } apxinf_gemm_semantic_t;
 
+typedef enum {
+  APXINF_GEMM_MATH_IEEE = 0,
+  APXINF_GEMM_MATH_TF32 = 1,
+} apxinf_gemm_math_t;
+
 typedef struct {
   uint32_t version;
+  uint32_t math;
   uint32_t semantic;
   uint32_t a_dtype;
   uint32_t b_dtype;

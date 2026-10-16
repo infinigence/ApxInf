@@ -30,6 +30,15 @@ GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the fi
 
 Block-scale tensors must be in the layout the candidate reads, which is **not** a plain `[rows, K/block_size]` array. Build them once with `ops::nvfp4_pack_block_scales` into a buffer sized by `ops::nvfp4_scale_buffer_bytes`; the layout depends only on `block_size`, so the result stays valid when the autotuner selects a different configuration.
 
+`GemmArgs.math` defaults to `GemmMath::Ieee`. Plain FP32 `gemm` may explicitly
+select `GemmMath::Tf32`, permitting TF32 input multiplication with FP32
+accumulation and output. This arithmetic choice is part of the Spec and recipe
+key; it is rejected for quantized or fused calls. It does not promise bitwise
+equality across GPU architectures or library versions.
+`tf32_gemm_all_candidates_match_reference` checks independent exact products;
+`tf32_gemm_validates_contract_and_replays_changed_weights` covers resource
+accounting and mutable-weight graph replay.
+
 Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
 <!-- l3-operator:gemm -->

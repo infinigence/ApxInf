@@ -26,9 +26,12 @@ operation, which rounds the projection before bias.
 The BF16 MLP helper remains available as
 `ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
 signature and is used by the Qwen integration tests.
-GEMM Spec version 6 combines NVFP4 block-scale bindings with the
-`GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
-across these incompatible layouts.
+GEMM Spec version 7 records the explicit FP32 multiplication mode in addition
+to NVFP4 block scales and fused semantics. Earlier specs are rejected.
+`GemmMath::Tf32` is opt-in for plain FP32 GEMM; default arithmetic is unchanged.
+The cuBLAS candidate prepares its workspace and any vector-weight packing before
+capture. Mutable weights are repacked on each enqueue; immutable weights may be
+packed once during preparation. Both allocations count against the resource limit.
 
 ## Operator Layers: L3 to L0
 

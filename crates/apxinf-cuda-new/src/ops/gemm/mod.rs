@@ -7,7 +7,7 @@ mod gemm_geglu;
 mod gemm_gelu;
 mod nvfp4_scales;
 
-pub use contracts::{GemmArgs, GemmPolicy, GemmQuantization, WeightVersion};
+pub use contracts::{GemmArgs, GemmMath, GemmPolicy, GemmQuantization, WeightVersion};
 pub use gemm::gemm;
 pub use gemm_bias::{gemm_bias, GemmBiasArgs};
 pub use gemm_bias_residual::{gemm_bias_residual, GemmBiasResidualArgs};
