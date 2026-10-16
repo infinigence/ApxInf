@@ -19,7 +19,8 @@ model-specific examples and historical evidence link back to it.
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
 and [callable preparation contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
-describe implemented code. WallOSS/GR00T and LLM/VLM retain their own organization;
+describe implemented code. WallOSS uses the same split with per-request image
+grids ([WallOSS](walloss.md)); GR00T and LLM/VLM retain their own organization;
 read the coverage table before assuming identical readiness or config support.
 
 Qwen-Drive follows the same `model/`, `model_runner/`, `weights/` separation as a

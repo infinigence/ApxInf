@@ -2,10 +2,11 @@
 
 use apxinf_core::{Backend, Result, Tensor};
 
-use super::weights::bf16_to_device;
+use super::bf16_to_device;
+use super::device::DynamicFp8LinearWeights;
 use super::{
-    DynamicFp8LinearWeights, WallossActionWeights, WallossLayerWeights, WallossVisionBlockWeights,
-    WallossVisionWeights, WallossWeights,
+    WallossActionWeights, WallossLayerWeights, WallossVisionBlockWeights, WallossVisionWeights,
+    WallossWeights,
 };
 
 pub struct WallossDynamicFp8Weights {

@@ -22,9 +22,12 @@ class _FakeModel:
 
 class _FakeNativeModel(_FakeModel):
     accepts_rgb_u8 = True
+    patch_size = 14
 
-    def infer_rgb(self, rgb_u8, layout, token_ids, noise=None, action_mask=None):
-        self.call = (rgb_u8, layout, token_ids, noise, action_mask)
+    def infer_rgb(
+        self, rgb_u8, layout, token_ids, noise=None, action_mask=None, image_grid_thw=None
+    ):
+        self.call = (rgb_u8, layout, token_ids, noise, action_mask, image_grid_thw)
         return np.zeros((10, 26), dtype=np.float32)
 
 
@@ -59,8 +62,9 @@ class _FakeImageProcessor:
     min_pixels = 56 * 56
     max_pixels = 14 * 14 * 4 * 1280
 
-    def __call__(self, images):
+    def __call__(self, images, resolutions=None):
         assert [image.shape for image in images] == [(256, 256, 3)] * 2
+        assert list(resolutions) == [-1, -1]
         return {
             "image_grid_thw": np.asarray([[1, 18, 18], [1, 18, 18]]),
             "pixel_values": np.zeros((648, 1176), np.float32),
@@ -357,8 +361,10 @@ def test_policy_calls_native_rgb_contract_when_processor_opts_in():
     noise = np.zeros((10, 26), dtype=np.float32)
     policy.infer({}, noise=noise)
 
-    rgb_u8, layout, token_ids, passed_noise, action_mask = model.call
+    rgb_u8, layout, token_ids, passed_noise, action_mask, grids = model.call
     assert rgb_u8.shape == (2, 252, 252, 3)
+    np.testing.assert_array_equal(grids, [[1, 18, 18]] * 2)
+    assert grids.dtype == np.uint32
     assert rgb_u8.dtype == np.uint8
     assert layout == "nhwc"
     assert token_ids.shape == (313,)
@@ -378,6 +384,8 @@ def test_processor_builds_fixed_walloss_contract(state_bins, midpoint):
     processor.action_horizon = 10
     processor.action_dim = 26
     processor.state_bins = state_bins
+    processor.native_rgb = False
+    processor.resolutions = (-1, -1)
     processor.tokenizer = _FakeTokenizer()
     processor.image_processor = _FakeImageProcessor()
     processor.image_pad_token_id = 99
@@ -508,3 +516,60 @@ def test_walloss_state_bins_precedence(tmp_path, monkeypatch, override, expected
 
     assert captured["state_bins"] == expected
     assert policy.metadata["state_bins"] == expected
+
+
+def _write_processor_config(path):
+    (path / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "image_processor_type": "Qwen2VLImageProcessor",
+                "min_pixels": 3136,
+                "max_pixels": 12845056,
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        ("", {}),
+        ("resolution:\n  face_view: 448\n", {"face_view": 448}),
+        (
+            "resolution:\n  face_view: 448\ndata:\n  resolution:\n    face_view: 256\n",
+            {"face_view": 256},
+        ),
+        ("data: null\nresolution:\n  face_view: -1\n", {"face_view": -1}),
+    ],
+)
+def test_training_resolution_reads_data_section_first(tmp_path, document, expected):
+    from apxinf.policies.impls.walloss import _training_resolution
+
+    if document:
+        (tmp_path / "config.yml").write_text(document)
+    assert _training_resolution(tmp_path) == expected
+
+
+def test_image_processor_applies_training_resolution_then_smart_resize(tmp_path):
+    from apxinf.policies.impls.walloss import _WallossImageProcessor
+
+    _write_processor_config(tmp_path)
+    processor = _WallossImageProcessor(tmp_path)
+    camera = np.zeros((480, 640, 3), dtype=np.uint8)
+    square = np.zeros((256, 256, 3), dtype=np.uint8)
+
+    # Longer side to 448 keeps the aspect: 640x480 -> 448x336 (both multiples of 28).
+    resized = processor.resize([camera, camera], [448, 448])
+    assert resized["rgb_u8"].shape == (2, 336, 448, 3)
+    np.testing.assert_array_equal(resized["image_grid_thw"], [[1, 24, 32]] * 2)
+    # -1 means no training resolution: smart_resize the raw image (256 -> 252).
+    resized = processor.resize([square], [-1])
+    np.testing.assert_array_equal(resized["image_grid_thw"], [[1, 18, 18]])
+    # 256 inputs upsampled to a 448 training resolution.
+    resized = processor.resize([square] * 3, [448] * 3)
+    np.testing.assert_array_equal(resized["image_grid_thw"], [[1, 32, 32]] * 3)
+    with pytest.raises(ValueError, match="must match"):
+        processor.resize([camera, square], [448, 448])

@@ -634,13 +634,14 @@ extern "C" cudaError_t apxinf_static_rgb_u8_to_patches_e4m3(
 }
 
 extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
-    const void* images, void* patches, int views, int image_size,
-    int patch_size, int temporal_patch_size, int merge_size, int layout,
+    const void* images, void* patches, int views, int image_height,
+    int image_width, int patch_size, int temporal_patch_size, int merge_size,
+    int layout,
     double rescale_factor, float mean0, float mean1, float mean2,
     float std0, float std1, float std2,
     cudaStream_t stream) {
   if (images == nullptr || patches == nullptr || views <= 0 ||
-      image_size <= 0 || patch_size <= 0 || temporal_patch_size <= 0 ||
+      image_height <= 0 || image_width <= 0 || patch_size <= 0 || temporal_patch_size <= 0 ||
       merge_size <= 0 || (layout != 0 && layout != 1) ||
       !std::isfinite(rescale_factor) || !(rescale_factor > 0.0f) ||
       !std::isfinite(mean0) || !std::isfinite(mean1) ||
@@ -654,12 +655,13 @@ extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
   constexpr int64_t kMaxKernelIndex = std::numeric_limits<int64_t>::max();
   const int64_t patch_merge =
       static_cast<int64_t>(patch_size) * merge_size;
-  if (patch_merge > image_size || image_size % patch_merge != 0) {
+  if (patch_merge > image_height || image_height % patch_merge != 0 ||
+      patch_merge > image_width || image_width % patch_merge != 0) {
     return cudaErrorInvalidValue;
   }
 
-  const int64_t grid_size64 = image_size / patch_size;
-  const int64_t rows_per_view64 = grid_size64 * grid_size64;
+  const int64_t rows_per_view64 =
+      static_cast<int64_t>(image_height / patch_size) * (image_width / patch_size);
   const int64_t patch_area64 =
       static_cast<int64_t>(patch_size) * patch_size;
   if (rows_per_view64 > kMaxKernelInt || patch_area64 > kMaxKernelInt) {
@@ -678,13 +680,12 @@ extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
     return cudaErrorInvalidValue;
   }
   const int64_t pixels_per_view64 =
-      static_cast<int64_t>(image_size) * image_size;
+      static_cast<int64_t>(image_height) * image_width;
   if (pixels_per_view64 > kMaxKernelIndex / 3 ||
       views > kMaxKernelIndex / (3 * pixels_per_view64)) {
     return cudaErrorInvalidValue;
   }
 
-  const int grid_size = static_cast<int>(grid_size64);
   const int patch_width = static_cast<int>(patch_width64);
   const int64_t count = patch_rows64 * patch_width64;
   constexpr int threads = 256;
@@ -696,13 +697,13 @@ extern "C" cudaError_t apxinf_rgb_u8_to_normalized_temporal_merged_patches_bf16(
   if (layout == 0) {
     rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel<true><<<blocks, threads, 0, stream>>>(
         static_cast<const uint8_t*>(images),
-        static_cast<__nv_bfloat16*>(patches), views, image_size, patch_size,
+        static_cast<__nv_bfloat16*>(patches), views, image_height, image_width, patch_size,
         temporal_patch_size, merge_size, rescale_factor, mean0, mean1, mean2,
         std0, std1, std2);
   } else {
     rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel<false><<<blocks, threads, 0, stream>>>(
         static_cast<const uint8_t*>(images),
-        static_cast<__nv_bfloat16*>(patches), views, image_size, patch_size,
+        static_cast<__nv_bfloat16*>(patches), views, image_height, image_width, patch_size,
         temporal_patch_size, merge_size, rescale_factor, mean0, mean1, mean2,
         std0, std1, std2);
   }
