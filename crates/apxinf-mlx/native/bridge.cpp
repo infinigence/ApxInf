@@ -109,6 +109,13 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 47:return mx::addmm(a.at(0),a.at(1),a.at(2),f(0),f(1),s);
  case 48:return mx::linalg::norm(a.at(0),std::vector<int>(iv.begin()+1,iv.end()),i(0)!=0,s);
  case 49:return mx::softmax(a.at(0),i(0),i(1)!=0,s);
+ case 50:return mx::tanh(a.at(0),s);
+ case 51:return mx::sqrt(a.at(0),s);
+ case 52:return mx::clip(a.at(0),a.at(1),a.at(2),s);
+ case 53:return mx::conv2d(a.at(0),a.at(1),{i(0),i(1)},{i(2),i(3)},{i(4),i(5)},i(6),s);
+ case 54:return mx::repeat(a.at(0),i(0),i(1),s);
+ case 55:return mx::random::key((uint64_t(uint32_t(i(1)))<<32)|uint64_t(uint32_t(i(0))));
+ case 56:return mx::random::normal(shape(ints+1,nints-1),dtype(i(0)),std::nullopt,std::nullopt,a.at(0),s);
  default:throw std::invalid_argument("unknown MLX bridge operation");}}();
  *out=new A(std::move(result));CATCH}
 int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t shapeless,void** out){TRY
