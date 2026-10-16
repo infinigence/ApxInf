@@ -58,6 +58,12 @@ bool fp8_f32_projection_forced() {
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
+  // Rounding the projection before bias loses cancellation terms in Linear.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+      spec.a_dtype == APXINF_DTYPE_BF16 &&
+      spec.quantization == APXINF_GEMM_QUANT_NONE) {
+    return APXINF_DTYPE_F32;
+  }
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_dtype == APXINF_DTYPE_E4M3) {
@@ -215,8 +221,11 @@ cudaError_t launch_postprocess(const Spec& spec,
               spec.a_dtype == APXINF_DTYPE_E4M3 &&
               spec.output_dtype == APXINF_DTYPE_E4M3
           ? APXINF_DTYPE_F16
-          : has_row_channel_scales(spec) ? spec.output_dtype
-                                         : resources.projection_dtype;
+          : has_row_channel_scales(spec)
+                ? spec.output_dtype
+                : spec.a_dtype == APXINF_DTYPE_BF16
+                      ? APXINF_DTYPE_BF16
+                      : resources.projection_dtype;
   apxinf::cuda_new::custom::finish<<<blocks, 256, 0,
                                  static_cast<cudaStream_t>(bindings.stream)>>>(
       projection, resources.projection_dtype, bindings.output,

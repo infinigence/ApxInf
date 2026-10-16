@@ -143,16 +143,21 @@ cudaError_t launch_cublas(Execution& state) {
                 : resources.common.projection_dtype == APXINF_DTYPE_F16
                       ? CUDA_R_16F
                       : CUDA_R_16BF;
+  const cudaDataType_t operand_type =
+      compute_spec.a_dtype == APXINF_DTYPE_I8
+          ? CUDA_R_8I
+          : compute_spec.a_dtype == APXINF_DTYPE_BF16 &&
+                    resources.common.unpack_a == nullptr
+                ? CUDA_R_16BF
+                : data_type;
   check_cublas(cublasSetStream(resources.handle, stream));
   check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
                                   resources.workspace_bytes));
   check_cublas(cublasGemmEx(
       resources.handle, CUBLAS_OP_N, CUBLAS_OP_N, compute_spec.n,
       compute_spec.m, compute_spec.k,
-      alpha_pointer, weight,
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
-      compute_spec.n, activation,
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
+      alpha_pointer, weight, operand_type,
+      compute_spec.n, activation, operand_type,
       compute_spec.k, beta_pointer, projection, data_type, compute_spec.n,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                               : CUBLAS_COMPUTE_32F,

@@ -438,9 +438,11 @@ fn torch_validation_requires_the_l3_output_shape() {
         &[1.0; 7],
     )
     .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("Torch validation output does not match"));
+    assert!(
+        error
+            .to_string()
+            .contains("Torch validation output does not match")
+    );
 }
 
 #[test]
@@ -906,9 +908,11 @@ fn staged_bf16_geglu_matches_torch() {
             .unwrap();
         graph.replay().unwrap();
         ctx.synchronize().unwrap();
-        assert!(super::framework::values(&output)
-            .iter()
-            .all(|value| *value == 0.0));
+        assert!(
+            super::framework::values(&output)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 }
 
@@ -963,6 +967,9 @@ fn f32_pointwise_matches_torch() {
     );
 }
 
+#[path = "rgb_normalization_torch_fixture.rs"]
+mod rgb_normalization_fixture;
+
 #[test]
 fn f32_gather_preserves_patch_and_bias_boundaries() {
     let ctx = CudaContext::new(0).unwrap();
@@ -977,7 +984,9 @@ fn f32_gather_preserves_patch_and_bias_boundaries() {
                             for dx in 0..2 {
                                 let pixel = image_nchw
                                     [(view * 3 + channel) * 256 + (py * 2 + dy) * 16 + px * 2 + dx];
-                                expected.push((pixel as f32 / 255.0) * 2.0 - 1.0);
+                                expected.push(f32::from_bits(
+                                    rgb_normalization_fixture::RGB_NORMALIZED_BITS[pixel as usize],
+                                ));
                             }
                         }
                     }
@@ -1017,13 +1026,20 @@ fn f32_gather_preserves_patch_and_bias_boundaries() {
             .unwrap();
             graph.replay().unwrap();
             ctx.synchronize().unwrap();
-            assert_eq!(super::framework::f32_values(&output), expected);
+            let actual = super::framework::f32_values(&output);
+            assert_eq!(
+                actual.iter().zip(&expected).position(|(a, b)| a != b),
+                None,
+                "RGB normalization differs: views={views} nhwc={nhwc}"
+            );
             images.copy_from_host(&vec![0; image.len()]).unwrap();
             graph.replay().unwrap();
             ctx.synchronize().unwrap();
-            assert!(super::framework::f32_values(&output)
-                .iter()
-                .all(|value| *value == -1.0));
+            assert!(
+                super::framework::f32_values(&output)
+                    .iter()
+                    .all(|value| *value == -1.0)
+            );
         }
     }
     let input = f32_tensor(0, vec![2, 2], &[1e8, -1e8, 1e8, -1e8]);
@@ -1041,12 +1057,276 @@ fn f32_gather_preserves_patch_and_bias_boundaries() {
     .unwrap();
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
-    assert_eq!(super::framework::f32_values(&output), [1.0, -1.0, 1.0, -1.0]);
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [1.0, -1.0, 1.0, -1.0]
+    );
     drop(input);
     assert!(owner.upgrade().is_some());
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
-    assert_eq!(super::framework::f32_values(&output), [1.0, -1.0, 1.0, -1.0]);
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [1.0, -1.0, 1.0, -1.0]
+    );
     drop(graph);
     assert!(owner.upgrade().is_none());
+}
+
+#[path = "layer_norm_torch_fixture.rs"]
+mod layer_norm_fixture;
+
+#[test]
+fn bf16_layer_norm_preserves_vectorized_statistics() {
+    let ctx = CudaContext::new(0).unwrap();
+    for &(seed, expected_bits) in layer_norm_fixture::CASES {
+        let mut state = seed;
+        let values: Vec<f32> = (0..3 * 1152)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (((state >> 16) & 1023) as i32 - 512) as f32
+            })
+            .collect();
+        let input_bits: Vec<u16> = values[..1152]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 256.0 - 2.5).to_bits())
+            .collect();
+        let weight_bits: Vec<u16> = values[1152..2304]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 1024.0 + 1.0).to_bits())
+            .collect();
+        let bias_bits: Vec<u16> = values[2304..]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 2048.0).to_bits())
+            .collect();
+        for rows in [1, 256, 512, 768] {
+            let input = bf16_bits_tensor(0, vec![rows, 1152], &input_bits.repeat(rows));
+            let weight = bf16_bits_tensor(0, vec![1152], &weight_bits);
+            let bias = bf16_bits_tensor(0, vec![1152], &bias_bits);
+            let zero = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let mut output = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let mut hidden = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let expected: Vec<_> = expected_bits
+                .repeat(rows)
+                .into_iter()
+                .map(|bits| half::bf16::from_bits(bits).to_f32())
+                .collect();
+            layer_norm(
+                &ctx,
+                LayerNormArgs::new(&input, &weight, &bias, &mut output, 1e-6),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b),
+                None,
+                "LayerNorm statistics rows={rows}"
+            );
+            bias_residual_layer_norm(
+                &ctx,
+                BiasResidualLayerNormArgs::new(
+                    &input,
+                    None,
+                    &zero,
+                    &weight,
+                    &bias,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b),
+                None,
+                "fused LayerNorm statistics rows={rows}"
+            );
+            let graph = crate::capture(&ctx, || {
+                layer_norm(
+                    &ctx,
+                    LayerNormArgs::new(&input, &weight, &bias, &mut output, 1e-6),
+                )
+            })
+            .unwrap();
+            crate::CudaBuffer::from_tensor(&input)
+                .unwrap()
+                .copy_from_host(&vec![0; rows * 1152 * 2])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let expected_bias: Vec<_> = bias_bits
+                .repeat(rows)
+                .into_iter()
+                .map(|bits| half::bf16::from_bits(bits).to_f32())
+                .collect();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected_bias)
+                    .position(|(a, b)| a != b),
+                None,
+                "changed-input replay rows={rows}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bf16_gemm_bias_preserves_accumulation() {
+    for (dtype, alpha, scale) in [
+        (DType::BF16, 1.0, 1.0),
+        (DType::BF16, 0.5, 0.5),
+        (DType::F32, 1.0, 1.0),
+        (DType::F32, 0.5, 0.5),
+    ] {
+        for tune in [false, true] {
+            let ctx = CudaContext::new(0).unwrap();
+            let mut input = vec![0.0; 16];
+            input[..2].fill(1.0);
+            let mut weights = vec![0.0; 16 * 16];
+            weights[..16].fill(1.0);
+            weights[16..32].fill(1.0 / 256.0);
+            let a = tensor(0, vec![1, 16], &input);
+            let b = tensor(0, vec![16, 16], &weights);
+            let bias = tensor(0, vec![16], &[-alpha; 16]);
+            let mut output = zeros_tensor(0, vec![1, 16], dtype);
+            let mut run = || {
+                let mut gemm = GemmArgs::new(&a, &b, &mut output);
+                gemm.alpha = alpha;
+                gemm.output_scale = scale;
+                gemm.policy.online_tune = tune;
+                gemm.policy.cache_dir = Some(String::new());
+                gemm_bias(&ctx, GemmBiasArgs { gemm, bias: &bias })
+            };
+            let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+            prepare_with_session(&session, &mut run).unwrap();
+            let graph = crate::capture(&ctx, || with_session(&session, run)).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let values = |output: &Tensor| {
+                if dtype == DType::F32 {
+                    super::framework::f32_values(output)
+                } else {
+                    super::framework::values(output)
+                }
+            };
+            // Exact product is 1 + 1/256; rounding before bias loses 1/256.
+            assert_eq!(
+                values(&output),
+                vec![1.0 / 256.0; 16],
+                "bias before rounding"
+            );
+            crate::CudaBuffer::from_tensor(&a)
+                .unwrap()
+                .copy_from_host(&[0; 32])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(values(&output), vec![-1.0; 16], "changed-input replay");
+        }
+    }
+}
+
+#[test]
+fn bf16_attention_preserves_softmax_rounding() {
+    // Independent CUDA PyTorch 2.9.1 SDPA FLASH_ATTENTION fixture. Inputs are
+    // exact multiples of 1/32; the reference uses the public FP32 scale.
+    let expected = [
+        (68162, 0x3ccf),
+        (117255, 0x3d27),
+        (154872, 0x3d8e),
+        (164821, 0x3be2),
+        (209109, 0xbab6),
+        (209110, 0x3cbc),
+        (209125, 0x3bad),
+        (209135, 0xbd34),
+        (209138, 0x3ad1),
+        (209141, 0x3b6d),
+        (209144, 0xbd32),
+        (241201, 0x394d),
+        (241205, 0x3ba3),
+        (241220, 0xbb93),
+        (241227, 0x3bee),
+        (241232, 0xbbd2),
+    ];
+    let elements = 256 * 16 * 72;
+    let mut state = 37u32;
+    let source: Vec<_> = (0..3 * elements)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (((state >> 16) % 65) as f32 - 32.0) / 32.0
+        })
+        .collect();
+    for batch in [1, 2, 3] {
+        let ctx = CudaContext::new(0).unwrap();
+        let shape = vec![batch, 256, 16, 72];
+        let q = tensor(0, shape.clone(), &source[..elements].repeat(batch));
+        let k = tensor(
+            0,
+            shape.clone(),
+            &source[elements..2 * elements].repeat(batch),
+        );
+        let v = tensor(0, shape.clone(), &source[2 * elements..].repeat(batch));
+        let mut output = zeros_tensor(0, shape, DType::BF16);
+        let mut run = || {
+            let mut args = AttentionArgs::new(&q, &k, &v, &mut output);
+            args.policy.allow_fallback = false;
+            args.policy.cache_dir = Some(String::new());
+            attention(&ctx, args)
+        };
+        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+        prepare_with_session(&session, &mut run).unwrap();
+        let graph = crate::capture(&ctx, || with_session(&session, run)).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = super::framework::values(&output);
+        for view in 0..batch {
+            for (index, value) in expected {
+                assert_eq!(
+                    actual[view * elements + index],
+                    half::bf16::from_bits(value).to_f32(),
+                    "Softmax rounding"
+                );
+            }
+        }
+        let original: Vec<u8> = source[2 * elements..]
+            .repeat(batch)
+            .iter()
+            .flat_map(|&x| half::bf16::from_f32(x).to_bits().to_ne_bytes())
+            .collect();
+        let values_buffer = crate::CudaBuffer::from_tensor(&v).unwrap();
+        for iteration in 0..32 {
+            values_buffer.copy_from_host(&original).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let restored = super::framework::values(&output);
+            for view in 0..batch {
+                for (index, value) in expected {
+                    assert_eq!(
+                        restored[view * elements + index],
+                        half::bf16::from_bits(value).to_f32(),
+                        "restore before replay batch={batch} iteration={iteration}"
+                    );
+                }
+            }
+            values_buffer
+                .copy_from_host(&vec![0; batch * elements * 2])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let replayed = super::framework::values(&output);
+            if let Some((index, value)) = replayed.iter().enumerate().find(|(_, x)| **x != 0.0) {
+                panic!(
+                    "changed-value replay: batch={batch}, iteration={iteration}, index={index}, value={value}"
+                );
+            }
+        }
+    }
 }

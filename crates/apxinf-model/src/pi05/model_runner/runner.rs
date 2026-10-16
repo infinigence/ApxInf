@@ -15,8 +15,7 @@ use crate::vla::{
 
 use super::prepare::CapturedGraph;
 use crate::pi05::backend::{
-    self, ops, transfers, Context, DeviceBuffer, ExecutionSession,
-    ImageLayout as KernelImageLayout,
+    self, ops, transfers, Context, DeviceBuffer, ExecutionSession, ImageLayout as KernelImageLayout,
 };
 use crate::pi05::model::ModelVariant;
 use crate::pi05::Pi05Config;
@@ -343,10 +342,13 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let dtype = self.model.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
-        let patches = backend::to_device(&self.backend, &Tensor::zeros(
-            patch_shape(&self.config),
-            self.model.captured_patch_dtype(raw_rgb),
-        ))?;
+        let patches = backend::to_device(
+            &self.backend,
+            &Tensor::zeros(
+                patch_shape(&self.config),
+                self.model.captured_patch_dtype(raw_rgb),
+            ),
+        )?;
         let noise = backend::to_device(
             &self.backend,
             &Tensor::zeros(noise_shape(&self.config), dtype),
@@ -452,7 +454,8 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let raw_rgb = spec.image_layout.is_some();
 
-        let (graph, fallback_reason) = select_graph(policy, || capture(&patches, &token_ids, &noise))?;
+        let (graph, fallback_reason) =
+            select_graph(policy, || capture(&patches, &token_ids, &noise))?;
         if let Some(reason) = &fallback_reason {
             eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
         }
@@ -667,6 +670,7 @@ fn normalize_tensor(
     }
     let values = tensor.to_f32_vec()?;
     let converted = match dtype {
+        DType::F32 => Tensor::from_f32(shape, &values)?,
         DType::F16 => Tensor::from_f16(
             shape,
             &values.into_iter().map(f16::from_f32).collect::<Vec<_>>(),

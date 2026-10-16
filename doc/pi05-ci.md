@@ -87,6 +87,79 @@ are diagnostic, not formal hardware acceptance or calibrated gate budgets.
 
 All changes still require the complete board/precision/view acceptance below.
 
+### Current Thor and candidate diagnostics
+
+The committed `8a197969` build was tested on Thor with the canonical checkpoint,
+pinned same-board OpenPI and unchanged FP8 calibration. With prepared per-cell
+recipes, BF16 passes 44/63 cases and FP8 passes 11/63. The limits apply to the
+whole chunk and each action step. Both matrices therefore remain unaccepted.
+
+The maintained-API candidate adds mixed FP32 frontend operations, Welford
+LayerNorm, bias-before-BF16-rounding Linear projections, vision Attention
+arithmetic, and reciprocal-multiply RGB normalization. The latest Thor BF16
+run passes **53/63**: real observations **6/8, 8/8, 8/8** and constructed
+diagnostics **11/13, 8/13, 12/13** across 1–3 views. These results include
+whole-chunk and every-action-step limits; several failures occur only at a step.
+Failures cover one-view gradient/zero-noise, black/zero-noise and two real
+observations; two-view black/normal-noise, gradient/zero-noise, black/zero-noise,
+white/normal-noise and camera-gray; and three-view white/normal-noise.
+Two-view black/zero-noise has cosine 0.958535 and relative L2 0.313097;
+white/normal-noise has relative L2 0.082584. Correcting one arithmetic boundary
+can increase the full-model error while other boundaries still differ.
+
+Independent actual GPU negative controls verify LayerNorm, Linear, vision
+Attention, RGB normalization and upload completion. LayerNorm uses synthetic
+LCG inputs and independent Torch CUDA outputs, without checkpoint parameters.
+The RGB fixture covers all 256 byte values: division and reciprocal
+multiplication differ for 111 values in FP32, and the latter matches Torch CUDA.
+An alternating-input graph test reproduces a pageable host-to-device upload
+race; waiting for the upload stream fixes it without synchronizing the entire
+device. The repaired path also passes the supported BF16 operator subset.
+
+Frozen black/white traces match OpenPI bitwise through all 27 vision blocks,
+post-normalization, multimodal projection, and first language-layer
+normalization, QKV and RoPE. The first remaining difference is language
+Attention. Matched-input experiments require BF16 score/probability staging
+and the physical masked camera slots to reproduce the official operation.
+A private implementation passes 61/63 cases, but adds approximately 8–10 ms
+and is not a maintained or accepted execution path. A later gradient trace
+matches every vision and language block; its first action residual divergence
+is caused by a single BF16 gate value affected by FP32 conditioning GEMM
+accumulation order. Correcting that projection alone does not qualify the
+whole model. Private trace hooks and experiment libraries are excluded from
+the product. No reference output or tolerance has been replaced to pass.
+
+The earlier Welford/Linear candidate P50 measurements use 30 warmups and 50
+samples, with the original
+baseline revisited after the candidate. These remain shared-desktop diagnostics:
+
+| Views / tokens | Baseline | Candidate | Baseline revisit |
+| --- | --- | --- | --- |
+| 1 / 10 | 61.13 ms | 59.41 ms | 61.32 ms |
+| 1 / 200 | 66.65 ms | 64.80 ms | 66.91 ms |
+| 2 / 10 | 71.91 ms | 69.65 ms | 71.85 ms |
+| 2 / 200 | 77.63 ms | 75.99 ms | 77.44 ms |
+| 3 / 10 | 86.19 ms | 86.17 ms | 87.84 ms |
+| 3 / 200 | 91.39 ms | 90.68 ms | 92.48 ms |
+
+The 3-view baseline drifts, so these values cannot establish its final budget.
+A separate before/candidate/revisit measurement isolates the subsequent
+multimodal projector change: 1-view T10 is 59.121/59.123/59.108 ms; 2-view T10 is
+70.087/70.482/70.229 ms; 3-view T200 is 90.667/91.062/90.834 ms. Small increases
+remain unresolved; these measurements do not establish a no-regression claim.
+
+Earlier INT8 repairs also completed paired 1–3-view performance measurements:
+T10 P50 baseline/candidate/revisit is 87.138/87.537/87.398 ms,
+127.609/128.136/127.648 ms and 166.811/167.209/166.806 ms. Small repeatable
+increases are not waived. That INT8 candidate passes only 0/8, 6/8 and 4/8 real
+observations. The subsequent Orin mixed-FP32/Welford/Linear candidate passes
+48/63 BF16 cases and 11/63 INT8 cases (real 0/8, 7/8, 4/8; diagnostics 0/39).
+That snapshot precedes the vision Attention and multimodal projector repairs.
+The subsequent upload/vision/projector candidate (before RGB correction)
+passes 51/63 Orin BF16 cases: real 7/8, 8/8, 8/8 and diagnostics 9/13, 8/13,
+11/13. INT8 remains under test. Complete final-source accuracy and paired
+performance qualification, including INT8, are still required.
+
 ### Historical numerical evidence
 
 The following real-image results describe the pre-migration implementation at

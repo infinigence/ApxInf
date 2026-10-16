@@ -2,17 +2,15 @@
 
 use crate::pi05::backend::{
     ops::{
-        attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
-        adaptive_rms_norm as l3_adaptive_rms_norm, bias_residual as l3_bias_residual,
-        bias_residual_layer_norm as l3_bias_residual_layer_norm,
-        bias_residual_rms_norm as l3_bias_residual_rms_norm, gemm as l3_gemm,
-        layer_norm as l3_layer_norm,
-        pointwise as l3_pointwise, rms_norm as l3_rms_norm,
-        reserve_prefix as l3_reserve_prefix, rope as l3_rope, AttentionArgs, GatherArgs,
-        AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs,
-        LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic, RmsNormArgs,
-        RopeArgs, RopeSemantic,
+        adaptive_rms_norm as l3_adaptive_rms_norm, attention as l3_attention,
+        bias_residual as l3_bias_residual, bias_residual_layer_norm as l3_bias_residual_layer_norm,
+        bias_residual_rms_norm as l3_bias_residual_rms_norm, concat_rows as l3_concat_rows,
+        gather as l3_gather, gemm as l3_gemm, layer_norm as l3_layer_norm,
+        pointwise as l3_pointwise, reserve_prefix as l3_reserve_prefix, rms_norm as l3_rms_norm,
+        rope as l3_rope, AdaptiveRmsNormArgs, AttentionArgs, BiasResidualArgs,
+        BiasResidualLayerNormArgs, BiasResidualRmsNormArgs, GatherArgs, GatherPatchGeometry,
+        GatherSemantic, GemmArgs, LayerNormArgs, PointwiseActivation, PointwiseArgs,
+        PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -67,19 +65,14 @@ fn layer_bf16(
     Ok(output)
 }
 
-fn adaptive_rms_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    style: &Tensor,
-    eps: f32,
-) -> Result<Tensor> {
+fn adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32) -> Result<Tensor> {
     let cols = input
         .shape()
         .dims()
         .last()
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
-    let style = bf16_vector_prefix(style, 2 * cols)?;
+    let style = vector_prefix(style, 2 * cols)?;
     let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
     l3_adaptive_rms_norm(
         ctx,
@@ -88,13 +81,13 @@ fn adaptive_rms_bf16(
     Ok(output)
 }
 
-fn bias_activation_bf16(
+fn bias_activation(
     ctx: &Context,
     input: &Tensor,
     bias: Option<&Tensor>,
     activation: PointwiseActivation,
 ) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    let mut output = ctx.allocate_output(input.shape().clone(), input.dtype())?;
     let mut args = PointwiseArgs::new(PointwiseSemantic::BiasActivation, input, &mut output);
     args.bias = bias;
     args.activation = activation;
@@ -102,13 +95,8 @@ fn bias_activation_bf16(
     Ok(output)
 }
 
-fn euler_update_bf16(
-    ctx: &Context,
-    state: &Tensor,
-    velocity: &Tensor,
-    dt: f32,
-) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(state.shape().clone(), DType::BF16)?;
+fn euler_update(ctx: &Context, state: &Tensor, velocity: &Tensor, dt: f32) -> Result<Tensor> {
+    let mut output = ctx.allocate_output(state.shape().clone(), state.dtype())?;
     let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, state, &mut output);
     args.secondary = Some(velocity);
     args.dt = dt;
@@ -116,14 +104,14 @@ fn euler_update_bf16(
     Ok(output)
 }
 
-fn add_position_bf16(
+fn add_position(
     ctx: &Context,
     projection: &Tensor,
     bias: Option<&Tensor>,
     position: &Tensor,
     tokens_per_view: usize,
 ) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let mut output = ctx.allocate_output(projection.shape().clone(), projection.dtype())?;
     let mut args = GatherArgs::new(GatherSemantic::BiasPosition, projection, &mut output);
     args.bias = bias;
     args.position = Some(position);
@@ -132,7 +120,22 @@ fn add_position_bf16(
     Ok(output)
 }
 
-fn gemm_bf16(
+fn cast(ctx: &Context, input: &Tensor, dtype: DType) -> Result<Tensor> {
+    use crate::pi05::backend::ops::{quantization, QuantizationArgs, QuantizationSemantic};
+    if input.dtype() == dtype {
+        return Ok(input.clone());
+    }
+    let semantic = match (input.dtype(), dtype) {
+        (DType::BF16, DType::F32) => QuantizationSemantic::CastBf16ToF32,
+        (DType::F32, DType::BF16) => QuantizationSemantic::CastF32ToBf16,
+        _ => return Err(Error::Other("unsupported PI0.5 dense-stream cast".into())),
+    };
+    let mut output = ctx.allocate_output(input.shape().clone(), dtype)?;
+    quantization(ctx, QuantizationArgs::new(semantic, input, &mut output))?;
+    Ok(output)
+}
+
+fn gemm_dense(
     ctx: &Context,
     policies: &L3Policies,
     activation: &Tensor,
@@ -140,8 +143,8 @@ fn gemm_bf16(
 ) -> Result<Tensor> {
     let a = activation.shape().dims();
     let b = weight.shape().dims();
-    if activation.dtype() != DType::BF16
-        || weight.dtype() != DType::BF16
+    if !matches!(activation.dtype(), DType::BF16 | DType::F32)
+        || weight.dtype() != activation.dtype()
         || a.len() != 2
         || b.len() != 2
         || a[1] != b[0]
@@ -152,11 +155,37 @@ fn gemm_bf16(
             weight.dtype()
         )));
     }
-    crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
-    let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+    if activation.dtype() == DType::BF16 {
+        crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
+    }
+    let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), activation.dtype())?;
     let mut args = GemmArgs::new(activation, weight, &mut output);
     args.policy = policies.gemm.clone();
     l3_gemm(ctx, args)?;
+    Ok(output)
+}
+
+fn linear_bf16(
+    ctx: &Context,
+    policies: &L3Policies,
+    input: &Tensor,
+    weights: &Bf16LinearWeights,
+) -> Result<Tensor> {
+    use crate::pi05::backend::ops::{gemm_bias, GemmBiasArgs};
+    let Some(bias) = weights.bias.as_ref() else {
+        return gemm_dense(ctx, policies, input, &weights.weight);
+    };
+    crate::pi05::model::calibration::observe_bf16_activation(input, &weights.weight)?;
+    let mut output = ctx.allocate_output(
+        Shape::new(vec![
+            input.shape().dims()[0],
+            weights.weight.shape().dims()[1],
+        ]),
+        DType::BF16,
+    )?;
+    let mut gemm = GemmArgs::new(input, &weights.weight, &mut output);
+    gemm.policy = policies.gemm.clone();
+    gemm_bias(ctx, GemmBiasArgs { gemm, bias })?;
     Ok(output)
 }
 
@@ -181,7 +210,7 @@ fn gemm_geglu_bf16(
             canonical_weight.dtype()
         )));
     }
-    let projected = gemm_bf16(ctx, policies, activation, canonical_weight)?;
+    let projected = gemm_dense(ctx, policies, activation, canonical_weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
     l3_pointwise(
         ctx,
@@ -225,19 +254,13 @@ fn mqa_bf16(
     let key = CudaBuffer::from_tensor(key)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let value = CudaBuffer::from_tensor(value)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let query4 = query.reshape(Shape::new(vec![1, q[0], q[1], q[2]]))?;
@@ -288,10 +311,7 @@ fn split_qkv_bias_bf16(
     head_dim: usize,
 ) -> Result<QkvTensors> {
     let shape = qkv.shape().dims();
-    if qkv.dtype() != DType::BF16
-        || shape.len() != 2
-        || shape[1] != 3 * heads * head_dim
-    {
+    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != 3 * heads * head_dim {
         return Err(Error::Other(
             "PI0.5 BF16 vision QKV shape/dtype mismatch".into(),
         ));
@@ -340,10 +360,7 @@ fn split_qkv_rope_bf16(
             "PI0.5 BF16 rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
     let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
     let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
@@ -390,10 +407,7 @@ fn split_qkv_rope_into_cache_bf16(
             "PI0.5 BF16 cached rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let mut key_cache = key_cache.clone();
     let mut value_cache = value_cache.clone();
     l3_rope(
@@ -416,13 +430,13 @@ fn split_qkv_rope_into_cache_bf16(
     Ok(q)
 }
 
-fn bf16_vector_prefix(tensor: &Tensor, elements: usize) -> Result<Tensor> {
+fn vector_prefix(tensor: &Tensor, elements: usize) -> Result<Tensor> {
     let bytes = elements
-        .checked_mul(DType::BF16.size_in_bytes())
-        .ok_or_else(|| Error::Other("PI0.5 BF16 vector size overflow".into()))?;
+        .checked_mul(tensor.dtype().size_in_bytes())
+        .ok_or_else(|| Error::Other("PI0.5 modulation vector size overflow".into()))?;
     CudaBuffer::from_tensor(tensor)
         .and_then(|buffer| buffer.view(0, bytes))
-        .and_then(|buffer| buffer.as_tensor(Shape::new(vec![elements]), DType::BF16))
+        .and_then(|buffer| buffer.as_tensor(Shape::new(vec![elements]), tensor.dtype()))
         .map_err(Error::Cuda)
 }
 
@@ -507,7 +521,7 @@ fn adaptive_gate_residual_rms_bf16(
         .last()
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 AdaRMS input has no columns".into()))?;
-    let norm_style = bf16_vector_prefix(norm_style, 2 * cols)?;
+    let norm_style = vector_prefix(norm_style, 2 * cols)?;
     let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
     crate::pi05::backend::ops::ada_gate_residual_rms_norm(
@@ -562,7 +576,7 @@ fn language_layer_bf16_with_policies(
     rope_theta: f32,
 ) -> Result<Bf16LanguageLayerOutput> {
     let normalized = rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
-    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
+    let qkv = gemm_dense(ctx, policies, &normalized, &weights.qkv.weight)?;
     let qkv = split_qkv_rope_bf16(
         ctx,
         &qkv,
@@ -583,7 +597,7 @@ fn language_layer_bf16_with_policies(
     }
     let attention = mqa_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
-    let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
+    let projected = gemm_dense(ctx, policies, &attention, &weights.output.weight)?;
     let fused = bias_residual_rms_bf16(
         ctx,
         &projected,
@@ -593,9 +607,8 @@ fn language_layer_bf16_with_policies(
         rms_eps,
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
-    let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
-    let hidden =
-        bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let projected = gemm_dense(ctx, policies, &activated, &weights.down.weight)?;
+    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -658,7 +671,7 @@ fn action_layer_bf16_with_policies(
         Some(value) => value.clone(),
         None => adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps)?,
     };
-    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
+    let qkv = gemm_dense(ctx, policies, &normalized, &weights.qkv.weight)?;
     let q = split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
@@ -684,7 +697,7 @@ fn action_layer_bf16_with_policies(
         input.shape().dims()[0],
         config.num_heads * config.head_dim,
     ])?;
-    let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
+    let projected = gemm_dense(ctx, policies, &attention, &weights.output.weight)?;
     let fused = adaptive_gate_residual_rms_bf16(
         ctx,
         &projected,
@@ -694,7 +707,7 @@ fn action_layer_bf16_with_policies(
         rms_eps,
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
-    let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
+    let projected = gemm_dense(ctx, policies, &activated, &weights.down.weight)?;
     let fused = adaptive_gate_residual_rms_bf16(
         ctx,
         &projected,
@@ -734,8 +747,8 @@ fn vision_patch_embed_bf16_with_policies(
     patches: &Tensor,
     patches_per_view: usize,
 ) -> Result<Tensor> {
-    let projection = gemm_bf16(ctx, policies, patches, &weights.weight)?;
-    add_position_bf16(
+    let projection = gemm_dense(ctx, policies, patches, &weights.weight)?;
+    add_position(
         ctx,
         &projection,
         weights.bias.as_ref(),
@@ -784,29 +797,24 @@ fn vision_layer_bf16_with_policies(
         &weights.norm1.bias,
         layer_norm_eps,
     )?;
-    let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
-    let qkv = split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
+    let qkv = linear_bf16(ctx, policies, &normalized, &weights.qkv)?;
+    let qkv = split_qkv_bias_bf16(ctx, &qkv, None, heads, head_dim)?;
     let attention = mha_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
-    let projection = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
+    let projection = linear_bf16(ctx, policies, &attention, &weights.output)?;
     let fused = bias_residual_layer_bf16(
         ctx,
         &projection,
-        weights.output.bias.as_ref(),
+        None,
         input,
         &weights.norm2.weight,
         &weights.norm2.bias,
         layer_norm_eps,
     )?;
-    let activation = gemm_bf16(ctx, policies, &fused.normalized, &weights.fc1.weight)?;
-    let activation = bias_activation_bf16(
-        ctx,
-        &activation,
-        weights.fc1.bias.as_ref(),
-        PointwiseActivation::Gelu,
-    )?;
-    let projection = gemm_bf16(ctx, policies, &activation, &weights.fc2.weight)?;
-    bias_residual_bf16(ctx, &projection, weights.fc2.bias.as_ref(), &fused.hidden)
+    let activation = linear_bf16(ctx, policies, &fused.normalized, &weights.fc1)?;
+    let activation = bias_activation(ctx, &activation, None, PointwiseActivation::Gelu)?;
+    let projection = linear_bf16(ctx, policies, &activation, &weights.fc2)?;
+    bias_residual_bf16(ctx, &projection, None, &fused.hidden)
 }
 
 trait QkvViews {
@@ -878,20 +886,20 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         pub fn encode_vision(&self, patches: &Tensor) -> Result<Tensor> {
-            if patches.dtype() != DType::BF16 {
-                return Err(Error::DTypeMismatch {
-                    expected: DType::BF16,
-                    got: patches.dtype(),
-                });
-            }
-            let mut hidden = vision_patch_embed_bf16_with_policies(
+            let projected = gemm_dense(
                 self.ctx(),
                 &self.policies,
-                &self.weights.patch_embedding,
-                &self.weights.position_embedding,
                 patches,
+                &self.weights.patch_embedding.weight,
+            )?;
+            let embedded = add_position(
+                self.ctx(),
+                &projected,
+                self.weights.patch_embedding.bias.as_ref(),
+                &self.weights.position_embedding,
                 self.config.patches_per_view(),
             )?;
+            let mut hidden = cast(self.ctx(), &embedded, DType::BF16)?;
             for layer in &self.weights.vision_layers {
                 hidden = vision_layer_bf16_with_policies(
                     self.ctx(),
@@ -911,17 +919,11 @@ pub(in crate::pi05::model) mod backbone {
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
             )?;
-            let projected = gemm_bf16(
+            linear_bf16(
                 self.ctx(),
                 &self.policies,
                 &hidden,
-                &self.weights.multimodal_projector.weight,
-            )?;
-            bias_activation_bf16(
-                self.ctx(),
-                &projected,
-                self.weights.multimodal_projector.bias.as_ref(),
-                PointwiseActivation::None,
+                &self.weights.multimodal_projector,
             )
         }
 
@@ -981,25 +983,25 @@ pub(in crate::pi05::model) mod backbone {
         }
 
         fn conditioning(&self, time_embedding: &Tensor) -> Result<Tensor> {
-            let hidden = gemm_bf16(
+            let hidden = gemm_dense(
                 self.ctx(),
                 &self.policies,
                 time_embedding,
                 &self.weights.time_mlp_in.weight,
             )?;
-            let hidden = bias_activation_bf16(
+            let hidden = bias_activation(
                 self.ctx(),
                 &hidden,
                 self.weights.time_mlp_in.bias.as_ref(),
                 PointwiseActivation::Silu,
             )?;
-            let output = gemm_bf16(
+            let output = gemm_dense(
                 self.ctx(),
                 &self.policies,
                 &hidden,
                 &self.weights.time_mlp_out.weight,
             )?;
-            bias_activation_bf16(
+            bias_activation(
                 self.ctx(),
                 &output,
                 self.weights.time_mlp_out.bias.as_ref(),
@@ -1007,9 +1009,9 @@ pub(in crate::pi05::model) mod backbone {
             )
         }
 
-        fn modulation(&self, conditioning: &Tensor, weights: &Bf16LinearWeights) -> Result<Tensor> {
-            let projected = gemm_bf16(self.ctx(), &self.policies, conditioning, &weights.weight)?;
-            let modulation = bias_activation_bf16(
+        fn modulation(&self, conditioning: &Tensor, weights: &F32LinearWeights) -> Result<Tensor> {
+            let projected = gemm_dense(self.ctx(), &self.policies, conditioning, &weights.weight)?;
+            let modulation = bias_activation(
                 self.ctx(),
                 &projected,
                 weights.bias.as_ref(),
@@ -1068,18 +1070,19 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 BF16 prefix/modulation depth mismatch".into(),
                 ));
             }
-            let hidden = gemm_bf16(
+            let hidden = gemm_dense(
                 self.ctx(),
                 &self.policies,
                 state,
                 &self.weights.action_in.weight,
             )?;
-            let mut hidden = bias_activation_bf16(
+            let hidden = bias_activation(
                 self.ctx(),
                 &hidden,
                 self.weights.action_in.bias.as_ref(),
                 PointwiseActivation::None,
             )?;
+            let mut hidden = cast(self.ctx(), &hidden, DType::BF16)?;
             let mut attention_normalized = None;
             for index in 0..self.config.action_expert.depth {
                 let layer = &self.weights.action_layers[index];
@@ -1110,19 +1113,20 @@ pub(in crate::pi05::model) mod backbone {
             let hidden = attention_normalized.ok_or_else(|| {
                 Error::Other("π0.5 action expert must contain at least one layer".into())
             })?;
-            let velocity = gemm_bf16(
+            let hidden = cast(self.ctx(), &hidden, DType::F32)?;
+            let velocity = gemm_dense(
                 self.ctx(),
                 &self.policies,
                 &hidden,
                 &self.weights.action_out.weight,
             )?;
-            let velocity = bias_activation_bf16(
+            let velocity = bias_activation(
                 self.ctx(),
                 &velocity,
                 self.weights.action_out.bias.as_ref(),
                 PointwiseActivation::None,
             )?;
-            euler_update_bf16(self.ctx(), state, &velocity, dt)
+            euler_update(self.ctx(), state, &velocity, dt)
         }
 
         pub fn denoise_step(
@@ -1196,7 +1200,7 @@ impl crate::pi05::model::PrepareBlocks for backbone::Bf16Blocks {
         })
     }
     fn raw_patch_dtype(&self) -> apxinf_core::DType {
-        apxinf_core::DType::BF16
+        apxinf_core::DType::F32
     }
     fn preprocess(
         &self,

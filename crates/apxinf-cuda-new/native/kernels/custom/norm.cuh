@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace apxinf::norm::kernels {
 
@@ -141,12 +142,80 @@ __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
   }
 }
 
+// Four-lane online Welford with a fixed four-warp merge order. BF16
+// affine output follows the FP32 statistics without an intermediate cast.
+// This order matches PyTorch 2.9's vectorized LayerNorm reduction.
+struct WelfordMoments {
+  float mean;
+  float sigma;
+  float count;
+};
+__device__ WelfordMoments combine_moments(WelfordMoments b, WelfordMoments a) {
+  float delta = b.mean - a.mean;
+  float count = a.count + b.count;
+  if (count == 0.0f) return {0.0f, 0.0f, 0.0f};
+  float reciprocal = 1.0f / count;
+  float na = a.count * reciprocal;
+  float nb = b.count * reciprocal;
+  return {na * a.mean + nb * b.mean,
+          a.sigma + b.sigma + delta * delta * a.count * nb, count};
+}
+
+template <class T>
+__device__ void vectorized_layer_norm_row(const T* input, const T* weight,
+                                         const T* bias, T* output, int cols,
+                                         float eps) {
+  __shared__ WelfordMoments warp_values[4];
+  __shared__ float mean, inverse;
+  if (threadIdx.x < 128) {
+    WelfordMoments wd{0.0f, 0.0f, 0.0f};
+    for (int vector = threadIdx.x; vector < cols / 4; vector += 128) {
+#pragma unroll
+      for (int item = 0; item < 4; ++item) {
+        float value = to_float(input[vector * 4 + item]);
+        float delta = value - wd.mean;
+        float count = wd.count + 1.0f;
+        float next_mean = wd.mean + delta * (1.0f / count);
+        wd = {next_mean, wd.sigma + delta * (value - next_mean), count};
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      WelfordMoments other{__shfl_down_sync(0xffffffff, wd.mean, offset),
+          __shfl_down_sync(0xffffffff, wd.sigma, offset),
+          __shfl_down_sync(0xffffffff, wd.count, offset)};
+      wd = combine_moments(wd, other);
+    }
+    if (threadIdx.x % 32 == 0) warp_values[threadIdx.x / 32] = wd;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    auto left = combine_moments(warp_values[0], warp_values[2]);
+    auto right = combine_moments(warp_values[1], warp_values[3]);
+    auto wd = combine_moments(left, right);
+    mean = wd.mean;
+    inverse = rsqrtf(wd.sigma / static_cast<float>(cols) + eps);
+  }
+  __syncthreads();
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    output[col] = from_float<T>(
+        to_float(weight[col]) * (inverse * (to_float(input[col]) - mean)) +
+        to_float(bias[col]));
+  }
+}
+
 template <class T>
 __global__ void layer_norm(const T* input, const T* weight, const T* bias,
                            T* output, int rows, int cols, float eps) {
   __shared__ float scratch[32];
   const int row = blockIdx.x;
   if (row >= rows) return;
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    if (cols % 4 == 0) {
+      vectorized_layer_norm_row(input + static_cast<int64_t>(row) * cols,
+          weight, bias, output + static_cast<int64_t>(row) * cols, cols, eps);
+      return;
+    }
+  }
   float sum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x)
     sum += to_float(input[static_cast<int64_t>(row) * cols + col]);
@@ -273,6 +342,14 @@ __global__ void bias_residual_layer_norm(const T* projection,
     const T rounded = from_float<T>(value);
     hidden[index] = rounded;
     sum += to_float(rounded);
+  }
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    if (cols % 4 == 0) {
+      __syncthreads();
+      vectorized_layer_norm_row(hidden + static_cast<int64_t>(row) * cols,
+          norm_weight, norm_bias, normalized + static_cast<int64_t>(row) * cols, cols, eps);
+      return;
+    }
   }
   const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
   float variance_sum = 0.0f;

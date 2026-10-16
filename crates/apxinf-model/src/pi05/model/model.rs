@@ -62,10 +62,7 @@ pub(in crate::pi05) fn build_int8_dynamic_model_with_policies(
         backend, config, weights, policies,
     )?)))
 }
-pub fn upload_time_embeddings_bf16(
-    config: &Pi05Config,
-    context: &Context,
-) -> Result<Vec<Tensor>> {
+pub fn upload_time_embeddings_bf16(config: &Pi05Config, context: &Context) -> Result<Vec<Tensor>> {
     crate::pi05::math::flow_timesteps(config.flow_start_time, config.num_flow_steps)
         .map(|time| {
             let values = sinusoidal_time_embedding(
@@ -73,14 +70,11 @@ pub fn upload_time_embeddings_bf16(
                 config.action_expert.width,
                 config.time_min_period,
                 config.time_max_period,
+            );
+            backend::to_device(
+                context,
+                &Tensor::from_f32(vec![1, config.action_expert.width], &values)?,
             )
-            .into_iter()
-            .map(half::bf16::from_f32)
-            .collect::<Vec<_>>();
-            backend::to_device(context, &Tensor::from_bf16(
-                vec![1, config.action_expert.width],
-                &values,
-            )?)
         })
         .collect()
 }
@@ -105,7 +99,28 @@ pub fn upload_time_embeddings_fp8_static(
         .collect()
 }
 
-pub use upload_time_embeddings_bf16 as upload_time_embeddings_int8_dynamic;
+pub fn upload_time_embeddings_int8_dynamic(
+    config: &Pi05Config,
+    context: &Context,
+) -> Result<Vec<Tensor>> {
+    crate::pi05::math::flow_timesteps(config.flow_start_time, config.num_flow_steps)
+        .map(|time| {
+            let values = sinusoidal_time_embedding(
+                time,
+                config.action_expert.width,
+                config.time_min_period,
+                config.time_max_period,
+            )
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect::<Vec<_>>();
+            backend::to_device(
+                context,
+                &Tensor::from_bf16(vec![1, config.action_expert.width], &values)?,
+            )
+        })
+        .collect()
+}
 
 use crate::pi05::backend::DeviceBuffer;
 use apxinf_core::{DType, Error};
@@ -146,7 +161,8 @@ impl ModelVariant {
     pub(in crate::pi05) fn input_dtype(&self) -> DType {
         match self {
             Self::Fp8Static { .. } => DType::F16,
-            Self::Bf16 { .. } | Self::Int8Dynamic { .. } => DType::BF16,
+            Self::Bf16 { .. } => DType::F32,
+            Self::Int8Dynamic { .. } => DType::BF16,
         }
     }
 

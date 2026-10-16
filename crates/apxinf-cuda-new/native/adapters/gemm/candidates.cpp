@@ -340,10 +340,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
   static const ImplementationRegistry gemm_bias_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 2, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},

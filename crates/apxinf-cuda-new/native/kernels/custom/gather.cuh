@@ -126,7 +126,8 @@ __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
               : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) *
                         image_size + x;
     if constexpr (std::is_same_v<T, float>) {
-      const float unit = __fdiv_rn(static_cast<float>(images[input_index]), 255.0f);
+      // Match scalar FP32 normalization: multiply by the rounded reciprocal.
+      const float unit = __fmul_rn(static_cast<float>(images[input_index]), 1.0f / 255.0f);
       patches[output_index] = __fsub_rn(__fmul_rn(unit, 2.0f), 1.0f);
     } else {
       const float normalized =

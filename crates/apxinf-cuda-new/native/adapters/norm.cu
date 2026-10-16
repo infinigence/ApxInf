@@ -263,6 +263,8 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   const int cols = static_cast<int>(spec.cols);
   const int64_t count = spec.rows * spec.cols;
   auto stream = static_cast<cudaStream_t>(bindings.stream);
+  const int layer_threads =
+      std::is_same_v<T, __nv_bfloat16> && cols % 4 == 0 ? 128 : kThreads;
 
   switch (spec.semantic) {
     case APXINF_NORM_SEMANTIC_RMS:
@@ -270,7 +272,7 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
           input, weight, normalized, rows, cols, bindings.eps);
       break;
     case APXINF_NORM_SEMANTIC_LAYER:
-      kernels::layer_norm<T><<<rows, kThreads, 0, stream>>>(
+      kernels::layer_norm<T><<<rows, layer_threads, 0, stream>>>(
           input, weight, norm_bias, normalized, rows, cols, bindings.eps);
       break;
     case APXINF_NORM_SEMANTIC_ADAPTIVE_RMS:
@@ -288,7 +290,7 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
           bindings.eps);
       break;
     case APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_LAYER:
-      kernels::bias_residual_layer_norm<T><<<rows, kThreads, 0, stream>>>(
+      kernels::bias_residual_layer_norm<T><<<rows, layer_threads, 0, stream>>>(
           input, bias, residual, weight, norm_bias, hidden, normalized, rows,
           cols, bindings.eps);
       break;
