@@ -203,8 +203,9 @@ existing Backend methods do not define the native models' layer arithmetic.
 
 MLX-format affine checkpoints store packed weights as U32, which core `DType`
 does not represent. Load them with `apxinf_mlx::load_safetensors` over
-`apxinf_loader::safetensors::safetensors_files`, not through `Tensor`. The
-family owns the key map, group size, bit width and every shape check.
+`apxinf_loader::safetensors::safetensors_files`, not through `Tensor`, and
+keep only the keys the family uses. The family owns the key map, group size,
+bit width and every shape check.
 
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
