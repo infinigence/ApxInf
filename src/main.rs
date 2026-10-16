@@ -134,15 +134,20 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
-        /// Input prompt
-        #[arg(short, long)]
-        prompt: String,
+        /// Input prompt, scored over the package code table
+        #[arg(short, long, required_unless_present = "request")]
+        prompt: Option<String>,
+
+        /// JSON file with a schema request {"state", "questions"}, for models
+        /// that encode their own prompt
+        #[arg(long, conflicts_with_all = ["prompt", "system", "candidates"])]
+        request: Option<PathBuf>,
 
         /// System prompt for chat mode
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cuda[:N])
+        /// Device to run inference on (cuda[:N] or metal[:N])
         #[arg(short, long, default_value = "cuda:0")]
         device: String,
 
@@ -236,6 +241,7 @@ fn main() {
             model,
             model_name,
             prompt,
+            request,
             system,
             device,
             candidates,
@@ -249,16 +255,23 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(error) = run_decide(
-                &model,
-                model_name.as_deref(),
-                &prompt,
-                system.as_deref(),
-                device,
-                candidates,
-                autotune,
-                tuning_dir.as_ref(),
-            ) {
+            let result = match (request, prompt) {
+                (Some(request), _) => {
+                    run_decide_schema(&model, model_name.as_deref(), &request, device)
+                }
+                (None, Some(prompt)) => run_decide(
+                    &model,
+                    model_name.as_deref(),
+                    &prompt,
+                    system.as_deref(),
+                    device,
+                    candidates,
+                    autotune,
+                    tuning_dir.as_ref(),
+                ),
+                (None, None) => Err("decide needs --prompt or --request".into()),
+            };
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -402,6 +415,74 @@ mod device_tests {
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
     }
+
+    #[test]
+    fn decide_takes_a_prompt_or_a_schema_request() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["apxinf", "decide", "--model", "/m"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let cli = parse(&["--request", "/r.json", "--device", "metal"]).unwrap();
+        let Commands::Decide {
+            prompt, request, ..
+        } = cli.command
+        else {
+            panic!("expected decide command");
+        };
+        assert_eq!(
+            (prompt, request),
+            (None, Some(std::path::PathBuf::from("/r.json")))
+        );
+        assert!(parse(&["--prompt", "p"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--prompt", "p", "--request", "/r.json"]).is_err());
+        assert!(parse(&["--request", "/r.json", "--candidates", "2"]).is_err());
+    }
+}
+
+fn run_decide_schema(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    request: &PathBuf,
+    device: Device,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(request)
+        .map_err(|error| format!("Failed to read {request:?}: {error}"))?;
+    let schema =
+        apxinf_model::DecisionSchema::from_json(&text).map_err(|error| error.to_string())?;
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        ..LoadOptions::default()
+    };
+    println!("Loading {model_name} from {:?}...", model_dir);
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    println!("Model ready.");
+    println!();
+    let output = model
+        .decide(DecisionInput::Schema(&schema))
+        .map_err(|error| format!("Decision failed: {error}"))?;
+    for answer in &output.answers {
+        let selected = answer
+            .selected()
+            .map_err(|error| format!("Invalid decision output: {error}"))?;
+        println!(
+            "{}: selected {}  probability {:.8}",
+            answer.question_id.as_deref().unwrap_or("-"),
+            selected.code,
+            selected.probability
+        );
+        for score in &answer.scores {
+            println!("  {:<20}  probability={:.8}", score.code, score.probability);
+        }
+    }
+    Ok(())
 }
 
 fn run_generate(
