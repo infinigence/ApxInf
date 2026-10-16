@@ -380,6 +380,34 @@ fn interleaved_qk_norm_rope_matches_composed_operators() -> Result<()> {
 
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
+fn mpp_bf16_gemm_reproduces_mlx_quantized_matmul_bitwise() -> Result<()> {
+    use apxinf_mlx::fusions::MppBf16GemmNt;
+    let s = Stream::metal(0)?;
+    let gemm = MppBf16GemmNt::new(&s)?;
+    // The three Qwen-Image block projection shapes (K, N) at two token counts.
+    for (k, n) in [(4096, 4096), (4096, 12288), (12288, 4096)] {
+        let w = Array::from_f32(&s, &[n, k], &data(n * k, 61, 0.003))?.cast(D::BF16)?;
+        let [qw, scales, biases] = w.quantize(64, 4)?;
+        let dense = qw.dequantize(&scales, &biases, 64, 4)?;
+        for m in [64, 192] {
+            let x = Array::from_f32(&s, &[1, m, k], &data(m * k, 53, 0.02))?.cast(D::BF16)?;
+            let out = gemm.call(&x, &dense)?;
+            assert_eq!((out.shape(), out.dtype()), (&[1, m, n][..], D::BF16));
+            let reference = x.quantized_matmul(&qw, &scales, &biases, true, 64, 4)?;
+            assert_eq!(out.to_bytes()?, reference.to_bytes()?, "K {k} N {n} M {m}");
+        }
+    }
+    let x = Array::zeros(&s, &[1, 96, 4096], D::BF16)?;
+    let w = Array::zeros(&s, &[64, 4096], D::BF16)?;
+    assert!(gemm.call(&x, &w).is_err());
+    assert!(gemm
+        .call(&x.slice_axis(1, 0, 64)?, &w.cast(D::F32)?)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
 fn swiglu_gemv_matches_composed_parity_swiglu() -> Result<()> {
     use apxinf_mlx::fusions::SwigluMlpGemv;
     let s = Stream::metal(0)?;

@@ -28,6 +28,12 @@ exposed.
   modulation row, then runs one compiled image-token forward per step against
   that cache, as mflux does. `ops.rs` keeps MLX `nn.silu` and
   `nn.gelu_approx` as shapeless compiled functions.
+- Image-token block projections decode Q4 to BF16 per call and use the
+  MetalPerformancePrimitives GEMM when the token count is a multiple of 64
+  (EngineTailor GEMM frontier 427d48fc). Loading enables it only when a probe
+  shows that it compiles and reproduces MLX quantized matmul bit for bit, so
+  the image does not depend on the path; otherwise, and for the text prefix,
+  projections use quantized matmul.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
   overlap, and blends tiles on the host.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and

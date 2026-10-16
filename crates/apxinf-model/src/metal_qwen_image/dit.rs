@@ -2,9 +2,9 @@
 //! once per prompt and caches each block's post-RoPE K/V; every denoise step
 //! then runs one compiled image-token forward against that cache.
 use super::ops::Ops;
-use super::weights::{Block, Transformer, DIM, HEADS, HEAD_DIM};
+use super::weights::{Block, Transformer, DIM, HEADS, HEAD_DIM, Q4};
 use apxinf_core::Result;
-use apxinf_mlx::fusions::InterleavedQkNormRope;
+use apxinf_mlx::fusions::{InterleavedQkNormRope, MppBf16GemmNt};
 use apxinf_mlx::{Array, Compiled, MlxDType};
 use std::rc::Rc;
 
@@ -16,6 +16,8 @@ pub struct Dit {
     /// `Qwen21Timesteps._freqs`, `[1, 128]` FP32.
     freqs: Array,
     ops: Ops,
+    /// The image-token GEMM, when it reproduces MLX quantized matmul here.
+    gemm: Option<Rc<MppBf16GemmNt>>,
 }
 
 /// Per-block post-RoPE text K/V, `[1, 32, T, 128]` BF16 each.
@@ -24,7 +26,7 @@ pub struct TextCache {
 }
 
 impl Dit {
-    pub fn new(w: Transformer, ops: &Ops) -> Result<Self> {
+    pub fn new(w: Transformer, ops: &Ops, gemm: Option<Rc<MppBf16GemmNt>>) -> Result<Self> {
         let stream = ops.stream();
         let freqs = super::tables::timestep_frequencies(128);
         Ok(Self {
@@ -32,7 +34,19 @@ impl Dit {
             qk: InterleavedQkNormRope::new(stream)?,
             freqs: Array::from_f32(stream, &[1, 128], &freqs)?,
             ops: ops.clone(),
+            gemm,
         })
+    }
+
+    /// `nn.QuantizedLinear`. Image tokens in multiples of 64 decode the
+    /// weight per call and use the MPP GEMM, which gives the same bits.
+    fn project(&self, w: &Q4, x: &Array, image: bool) -> Result<Array> {
+        match &self.gemm {
+            Some(gemm) if image && x.shape()[1] % 64 == 0 => {
+                gemm.call(x, &w.weight.dequantize(&w.scales, &w.biases, 64, 4)?)
+            }
+            _ => w.apply(x),
+        }
     }
 
     /// `Qwen21TimeTextEmbed` for FP32 timestep rows `[2]`: BF16 `[2, 4096]`.
@@ -84,34 +98,35 @@ impl Dit {
         x: &Array,
         cos: &Array,
         sin: &Array,
+        image: bool,
     ) -> Result<(Array, Array, Array)> {
         let tokens = x.shape()[1];
         let (q, k) = self.qk.call(
-            &b.to_q.apply(x)?,
-            &b.to_k.apply(x)?,
+            &self.project(&b.to_q, x, image)?,
+            &self.project(&b.to_k, x, image)?,
             &b.norm_q,
             &b.norm_k,
             cos,
             sin,
             HEADS,
         )?;
-        let v = b
-            .to_v
-            .apply(x)?
+        let v = self
+            .project(&b.to_v, x, image)?
             .reshape(&[1, tokens, HEADS, HEAD_DIM])?
             .transpose(&[0, 2, 1, 3])?;
         Ok((q, k, v))
     }
 
-    fn attention_output(&self, b: &Block, o: &Array) -> Result<Array> {
+    fn attention_output(&self, b: &Block, o: &Array, image: bool) -> Result<Array> {
         let tokens = o.shape()[2];
         let o = o.transpose(&[0, 2, 1, 3])?.reshape(&[1, tokens, DIM])?;
-        b.to_out.apply(&o)
+        self.project(&b.to_out, &o, image)
     }
 
-    fn mlp(&self, b: &Block, x: &Array) -> Result<Array> {
-        let gated = self.ops.silu(&b.gate.apply(x)?)?.mul(&b.proj.apply(x)?)?;
-        b.out.apply(&gated)
+    fn mlp(&self, b: &Block, x: &Array, image: bool) -> Result<Array> {
+        let gate = self.ops.silu(&self.project(&b.gate, x, image)?)?;
+        let gated = gate.mul(&self.project(&b.proj, x, image)?)?;
+        self.project(&b.out, &gated, image)
     }
 
     /// One block over the image tokens (`text_kv = Some`) or the causal text
@@ -133,7 +148,8 @@ impl Dit {
         let (scale1, gate1) = half(mod1)?;
         let (scale2, gate2) = half(mod2)?;
         let x = self.modulate(h, &scale1)?;
-        let (q, k, v) = self.attention_inputs(b, &x, cos, sin)?;
+        let image = text_kv.is_some();
+        let (q, k, v) = self.attention_inputs(b, &x, cos, sin, image)?;
         let scale = (HEAD_DIM as f64).powf(-0.5) as f32;
         let (o, cached) = match text_kv {
             Some((key_text, value_text)) => {
@@ -146,9 +162,9 @@ impl Dit {
                 (o, Some((k.contiguous()?, v.contiguous()?)))
             }
         };
-        let o = self.attention_output(b, &o)?;
+        let o = self.attention_output(b, &o, image)?;
         let h = h.add(&gate1.tanh()?.mul(&o)?)?;
-        let y = self.mlp(b, &self.modulate(&h, &scale2)?)?;
+        let y = self.mlp(b, &self.modulate(&h, &scale2)?, image)?;
         Ok((h.add(&gate2.tanh()?.mul(&y)?)?, cached))
     }
 
