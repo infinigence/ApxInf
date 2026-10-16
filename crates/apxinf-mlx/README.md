@@ -87,9 +87,11 @@ normal generation and CUDA-style capture explicitly return unsupported.
 
 ## Checkpoint arrays
 
-`load_safetensors` reads one or more SafeTensors files (for example the list
-from `apxinf_loader::safetensors::safetensors_files`) into evaluated arrays.
-MLX reads each file once on its CPU device; there is no host staging copy.
+`load_safetensors` reads the tensors that a name filter keeps from one or more
+SafeTensors files (for example the list from
+`apxinf_loader::safetensors::safetensors_files`) into evaluated arrays. Other
+tensors are never read. MLX reads on its CPU device; there is no host staging
+copy.
 This covers MLX-format affine checkpoints, whose packed weights are U32 and
 have no core `DType`. Duplicate names across files, tensors without a bridge
 dtype and truncated files fail with the file and tensor name. Bytes read count
