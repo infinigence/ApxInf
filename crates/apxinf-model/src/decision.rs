@@ -1,4 +1,4 @@
-//! Model-neutral decision API.
+//! Model-neutral decision API, shared by decision families (d3, metal_clef).
 
 use std::fmt;
 
@@ -7,12 +7,6 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 
 use crate::llm_trait::{ImageInput, LlmCapabilities};
-
-/// Safe defaults for the d3 text CUDA Graph profile cache. The full public
-/// Decision Index contains many distinct prompt lengths; leaving this cache
-/// unbounded can exhaust a 24 GiB GPU before the run completes.
-pub const D3_DEFAULT_TEXT_PROFILE_LIMIT: usize = 12;
-pub const D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET: usize = 30_000;
 
 /// One complete request. A runtime accepts the forms it documents and returns
 /// an error for the others.

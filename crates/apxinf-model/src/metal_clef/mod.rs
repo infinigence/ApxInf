@@ -8,7 +8,7 @@ mod weights;
 
 pub use config::{Config, MAX_INPUT_TOKENS};
 
-use crate::d3::{
+use crate::decision::{
     DecisionAnswer, DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
 };
 use crate::llm_trait::LlmCapabilities;
