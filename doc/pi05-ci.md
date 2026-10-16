@@ -129,6 +129,16 @@ accumulation order. Correcting that projection alone does not qualify the
 whole model. Private trace hooks and experiment libraries are excluded from
 the product. No reference output or tolerance has been replaced to pass.
 
+The loaded-library audit also found that earlier Thor diagnostic comparisons
+used different cuBLAS/cuBLASLt/runtime binaries in OpenPI and ApxInf. They are
+not eligible as a same-runtime acceptance bank; the maintained aggregator
+already rejects this mismatch. An isolated CUDA 13.2 reference capture retains
+the gradient sample's original full output bitwise, so library mismatch alone
+does not explain that failure. Library identity, GEMM layout and handle settings
+must be controlled independently during further experiments. Original captures
+are retained, not overwritten. Setting LD_LIBRARY_PATH alone does not prove
+which library was loaded; verify the receipt digests.
+
 The earlier Welford/Linear candidate P50 measurements use 30 warmups and 50
 samples, with the original
 baseline revisited after the candidate. These remain shared-desktop diagnostics:
@@ -157,7 +167,8 @@ observations. The subsequent Orin mixed-FP32/Welford/Linear candidate passes
 That snapshot precedes the vision Attention and multimodal projector repairs.
 The subsequent upload/vision/projector candidate (before RGB correction)
 passes 51/63 Orin BF16 cases: real 7/8, 8/8, 8/8 and diagnostics 9/13, 8/13,
-11/13. INT8 remains under test. Complete final-source accuracy and paired
+11/13. INT8 passes 11/63: real 0/8, 6/8, 4/8 and diagnostics 1/13, 0/13,
+0/13. Complete final-source accuracy and paired
 performance qualification, including INT8, are still required.
 
 ### Historical numerical evidence
