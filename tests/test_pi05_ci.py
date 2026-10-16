@@ -125,6 +125,16 @@ class ReceiptTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             parity.image_to_uint8_hwc(image.astype(np.int32))
 
+    def test_native_loader_forwards_autotune(self):
+        (self.root / "config.json").write_text("{}")
+        options = []
+        runner = SimpleNamespace(load=lambda *args, **kwargs: options.append(kwargs))
+        with patch.dict(sys.modules, {"apxinf_py": SimpleNamespace(ModelRunner=runner)}):
+            for enabled in (False, True):
+                parity.ApxInfModel(self.root, parity.load_suite(self.root), "cuda:0", "bf16", None,
+                                  autotune=enabled)
+        self.assertEqual([entry["autotune"] for entry in options], [False, True])
+
     def test_accuracy_keeps_first_output_and_stability_is_separate(self):
         class ChangingModel:
             calls = 0
@@ -364,7 +374,7 @@ class MatrixTest(unittest.TestCase):
             "horizon": 2, "num_flow_steps": 10,
         })
         receipt = {"schema": parity.SCHEMA, "suite_sha256": parity.sha256(suite / "manifest.json"),
-                   "engine": "apxinf", "revision": SHA, "precision": cell["precision"],
+                   "engine": "apxinf", "revision": SHA, "precision": cell["precision"], "autotune": False,
                    "hardware": cell["hardware"], "calibration_sha256": None,
                    "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64,
                    "extension_sha256": "d" * 64,
@@ -534,6 +544,21 @@ class MatrixTest(unittest.TestCase):
         parity.write_json(path, changed, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
 
+    def test_daily_gate_rejects_tuning_during_measurement(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        reference = ci.read_json(suite / "reference.json")
+        baseline = ci.read_json(suite / "baseline.json")
+        candidate = ci.read_json(self.root / "thor" / f"{cell['id']}.json")
+        latency = ci.read_json(self.root / "thor" / f"{cell['id']}.performance.json")
+        for record in (baseline, candidate, latency):
+            for invalid in (True, None):
+                record["autotune"] = invalid
+                with self.assertRaisesRegex(ValueError, "autotune must be disabled"):
+                    ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+            record["autotune"] = False
+        self.assertTrue(ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)["passed"])
+
     def test_runtime_drift_and_missing_provenance_cannot_pass(self):
         cell = self.bank["cells"][0]
         suite = Path(cell["suite"]["path"]).parent
@@ -580,19 +605,20 @@ class MatrixTest(unittest.TestCase):
         extension.write_bytes(b"fixture")
         (self.root / "model.safetensors").write_bytes(b"fixture weights")
         (self.root / "config.json").write_text("{}")
-        calls = []
+        calls, options = [], []
         class Model:
             def __init__(self, *args, **kwargs):
-                pass
+                options.append(kwargs)
             def infer(self, case):
                 calls.append(len(case["token_ids"]))
                 return np.ones((2, 32), np.float32)
         args = SimpleNamespace(model_dir=self.root, layer="l1", out=self.root / "bench.json",
             suite_dir=suite, warmup=1, samples=2, model_variant="bf16", calibration=None,
-            device="cuda:0", revision=SHA, hardware="thor")
+            device="cuda:0", revision=SHA, hardware="thor", autotune=True)
         with patch.dict(sys.modules, {"apxinf_py": SimpleNamespace(__file__=str(extension))}), patch.object(
                 parity, "ApxInfModel", Model), patch.object(parity, "cuda_runtime_libraries", return_value={}):
             bench.benchmark_suite(args)
+        self.assertEqual(options, [{"autotune": True}])
         self.assertEqual(calls, [2, 2, 2, 2, 3, 3, 3, 3, 3, 2])
         receipt = ci.read_json(args.out)
         self.assertEqual(receipt["shape_switch"]["from"], "other")

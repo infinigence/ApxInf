@@ -285,7 +285,8 @@ def benchmark_suite(args):
     source, target = shape_switch_pair(args.suite_dir, manifest)
     precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}[args.model_variant]
     model = ApxInfModel(args.model_dir, manifest, args.device, precision,
-                        pathlib.Path(args.calibration) if args.calibration else None)
+                        pathlib.Path(args.calibration) if args.calibration else None,
+                        autotune=args.autotune)
     rows = []
     for entry in manifest["cases"]:
         case = load_case(args.suite_dir, entry)
@@ -319,7 +320,7 @@ def benchmark_suite(args):
         "calibration_sha256": sha256(pathlib.Path(args.calibration)) if args.calibration else None,
         "extension_sha256": sha256(pathlib.Path(apxinf_py.__file__)),
         "runtime_libraries": cuda_runtime_libraries(),
-        "warmup": args.warmup, "samples": args.samples, "cases": rows,
+        "warmup": args.warmup, "samples": args.samples, "autotune": args.autotune, "cases": rows,
     }, force=True)
 
 

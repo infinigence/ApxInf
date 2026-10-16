@@ -136,6 +136,8 @@ def validate(args: argparse.Namespace) -> int:
             for key in ("checkpoint", "config"):
                 if record.get(f"{key}_sha256") != cell[key]["sha256"]:
                     raise ValueError(f"frozen reference/baseline {key} differs")
+        if baseline.get("autotune") is not False:
+            raise ValueError("autotune must be disabled in the approved baseline")
         calibration = cell["calibration"]["sha256"] if cell.get("calibration") else None
         if (baseline.get("precision"), baseline.get("calibration_sha256")) != (cell["precision"], calibration):
             raise ValueError("frozen baseline precision or calibration differs")
@@ -192,6 +194,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
         raise ValueError("suite/cell view count differs")
     if latency.get("schema") != "apxinf.pi05.performance.v2" or latency.get("layer") != "l1":
         raise ValueError("invalid performance receipt")
+    if any(record.get("autotune") is not False for record in (baseline, actual, latency)):
+        raise ValueError("autotune must be disabled in baseline, accuracy and performance receipts")
     candidate_runtime = runtime_fingerprint(actual)
     if runtime_fingerprint(reference) != candidate_runtime:
         raise ValueError("official reference CUDA runtime differs from candidate")

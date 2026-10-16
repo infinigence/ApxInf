@@ -8,10 +8,32 @@ missing asset, uncalibrated performance or shape-switch budget, or failed prefli
 
 **Not accepted / not online.** The shared-board harness is implemented. The
 branch now incorporates upstream's direct cuda-new PI05 migration (`#88`).
-Merged-source GPU accuracy, stability and performance require fresh validation;
-results from the old backend do not qualify the current implementation.
+Merged-source GPU acceptance is still incomplete; results from the old backend
+do not qualify the current implementation.
 The merge preserves explicit INT8 language normalization and its conservative
 allocation-schedule reservation. BF16/FP8 retain their folded weight recipes.
+
+### Current migration baseline
+
+A normal build of `35bcbf59` on Orin (CUDA 13.2), with tuning disabled and an
+empty cuda-new recipe cache, produced the following BF16 results against the
+unchanged official reference and whole-chunk plus every-action-step limits:
+
+| Inputs | 1 view | 2 views | 3 views |
+| --- | --- | --- | --- |
+| Eight real observations | 4/8 | 8/8 | 8/8 |
+| Thirteen constructed diagnostics | 8/13 | 7/13 | 8/13 |
+
+These counts are failures, not accepted baselines. For example, two-view
+black-image/zero-noise cosine is 0.8761 with relative L2 0.4824; white-image/
+normal-noise maximum absolute error is 0.4997. Repeated and revisited BF16
+outputs are identical in this run. Stability does not imply reference accuracy.
+The empty-cache run uses fallback execution and cannot establish a prepared
+production recipe's performance budget.
+
+The timestep repair at `4027e85b` matches all 10,240 official embedding values
+bitwise in a direct CPU comparison. Its GPU matrix and paired performance are
+pending; this isolated result does not establish a full-model numerical repair.
 
 ### Historical numerical evidence
 
@@ -73,7 +95,7 @@ An exclusive maintenance window, current-source matrix and measured budgets
 are required for formal acceptance. The harness never stops other users' jobs.
 
 The merged source passes 32 PI05 Rust CPU tests and module-boundary checks.
-The CI suite has 39 CPU tests. Real-process tests cover normal/repeated
+The CI suite has 41 CPU tests. Real-process tests cover normal/repeated
 cancellation, an unresponsive worker and a blocked activity auditor. Cancellation
 uses a dedicated exception: `InterruptedError` can be swallowed as a retryable
 syscall interruption inside subprocess selectors, delaying worker cleanup.
@@ -236,6 +258,16 @@ boards in the recorded diagnostics. Different approved reference/runtime recipes
 remain explicit per-board bank assets; never silently replace a golden.
 Installed toolkit version alone is insufficient.
 Old receipts without these fields must be rerun before gate acceptance.
+
+The suite benchmark and accuracy CLI forward `--autotune` explicitly to the
+native loader and record its value. Use it only in a separate preparation run;
+then collect accuracy and latency with tuning disabled. The daily evaluator
+requires `autotune: false` in the baseline, accuracy and performance receipts.
+An absent field or a tuning-enabled diagnostic cannot qualify the gate.
+Disabling tuning does not establish that optimized recipes exist: a fresh
+cuda-new cache can select fallback kernels. Record the prepared recipe directory
+and its provenance when calibrating a bank, and keep it fixed during paired
+measurements. Empty-cache results do not qualify a prepared-cache budget.
 
 Calibrate sample and warmup counts using repeated independent runs: verify
 warmup convergence, estimate per-case variation and tail behavior, and test
