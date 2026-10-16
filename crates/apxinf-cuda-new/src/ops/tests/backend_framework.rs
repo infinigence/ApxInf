@@ -1162,34 +1162,37 @@ fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
 }
 
 #[test]
-fn execution_session_reuses_one_native_execution_across_forward_traversals() {
+fn prepared_phase_reuses_one_native_execution_across_decode_steps() {
     let ctx = CudaContext::new(0).unwrap();
     let a = tensor(0, vec![2, 3], &[1.0; 6]);
     let b = tensor(0, vec![3, 4], &[1.0; 12]);
     let mut out = tensor(0, vec![2, 4], &[0.0; 8]);
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
-
     super::execution::reset_execution_create_count();
-    prepare_with_session(&session, || {
-        let mut args = GemmArgs::new(&a, &b, &mut out);
-        args.policy.online_tune = false;
-        gemm(&ctx, args)
-    })
+    let phase = crate::PreparedPhase::prepare(
+        &ctx,
+        ExecutionSession::with_capacity(4096, 0).unwrap(),
+        || {
+            let mut args = GemmArgs::new(&a, &b, &mut out);
+            args.policy.online_tune = false;
+            gemm(&ctx, args)
+        },
+    )
     .unwrap();
     assert_eq!(super::execution::execution_create_count(), 1);
     super::execution::reset_execution_sync_count();
 
-    for _ in 0..2 {
-        with_session(&session, || {
-            let mut args = GemmArgs::new(&a, &b, &mut out);
-            args.policy.online_tune = false;
-            gemm(&ctx, args)
-        })
-        .unwrap();
+    for _ in 0..256 {
+        phase
+            .run_eager(|| {
+                let mut args = GemmArgs::new(&a, &b, &mut out);
+                args.policy.online_tune = false;
+                gemm(&ctx, args)
+            })
+            .unwrap();
     }
 
-    // The first public L3 traversal creates provider resources and performs the
-    // one explicit enqueue. Repeating it must hit the session Execution.
+    // A decode-length traversal must keep hitting the same prepared execution;
+    // it cannot grow a pointer-keyed cache on every token.
     assert_eq!(super::execution::execution_create_count(), 1);
     assert_eq!(super::execution::execution_sync_count(), 0);
     assert!(values(&out).iter().all(|&value| value == 3.0));

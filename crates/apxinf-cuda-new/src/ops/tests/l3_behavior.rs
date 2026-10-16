@@ -642,20 +642,60 @@ fn kv_cache_graph_replays_all_positions_with_one_capacity_spec() {
     let value = tensor(0, vec![1, key_capacity, 1, head_dim], &value_values);
     let mut out = tensor(0, vec![1, 1, 1, head_dim], &vec![0.0; head_dim]);
     let decode_meta = KvCacheDecodeMeta::new(0, key_capacity).unwrap();
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
-
-    prepare_with_session(&session, || {
-        let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
-            .with_decode_meta(&decode_meta);
-        args.valid_key_tokens = 1;
-        args.query_start = 0;
-        args.policy.online_tune = false;
-        kv_cache_attention(&ctx, args)
-    })
+    let mut phase = crate::PreparedPhase::prepare(
+        &ctx,
+        ExecutionSession::with_capacity(4096, 0).unwrap(),
+        || {
+            let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
+                .with_decode_meta(&decode_meta);
+            args.valid_key_tokens = 1;
+            args.query_start = 0;
+            args.policy.online_tune = false;
+            kv_cache_attention(&ctx, args)
+        },
+    )
     .unwrap();
 
-    let graph = crate::capture(&ctx, || {
-        with_session(&session, || {
+    // Planned eager and Graph replay consume the same fixed capacity Spec.
+    // Only the contents of the fixed-address decode metadata change.
+    for valid_key_tokens in 1..=key_capacity {
+        phase
+            .run_eager(|| {
+                let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
+                    .with_decode_meta(&decode_meta);
+                args.valid_key_tokens = valid_key_tokens;
+                args.query_start = valid_key_tokens - 1;
+                args.policy.online_tune = false;
+                kv_cache_attention(&ctx, args)
+            })
+            .unwrap();
+        ctx.synchronize().unwrap();
+        let expected = kv_cache_attention_reference(
+            &query_values,
+            &key_values,
+            &value_values,
+            1,
+            1,
+            valid_key_tokens,
+            key_capacity,
+            1,
+            1,
+            head_dim,
+            valid_key_tokens - 1,
+            1.0 / (head_dim as f32).sqrt(),
+            true,
+        );
+        let actual = values(&out);
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (*actual - expected).abs() < 0.03 + 0.02 * expected.abs(),
+                "step-{valid_key_tokens} eager output {index} is {actual}, expected {expected}"
+            );
+        }
+    }
+
+    phase
+        .capture(&ctx, || {
             let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out)
                 .with_decode_meta(&decode_meta);
             args.valid_key_tokens = 1;
@@ -663,8 +703,7 @@ fn kv_cache_graph_replays_all_positions_with_one_capacity_spec() {
             args.policy.online_tune = false;
             kv_cache_attention(&ctx, args)
         })
-    })
-    .unwrap();
+        .unwrap();
 
     // This crosses every old power-of-two bucket boundary, including 7/8/9,
     // and reaches valid_len == key_capacity without preparing or capturing
@@ -674,7 +713,7 @@ fn kv_cache_graph_replays_all_positions_with_one_capacity_spec() {
         decode_meta
             .update(valid_key_tokens, valid_key_tokens - 1)
             .unwrap();
-        graph.replay().unwrap();
+        phase.replay().unwrap();
         ctx.synchronize().unwrap();
         let expected = kv_cache_attention_reference(
             &query_values,
