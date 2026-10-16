@@ -113,6 +113,12 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 54:return mx::repeat(a.at(0),i(0),i(1),s);
  case 55:return mx::random::key((uint64_t(uint32_t(i(1)))<<32)|uint64_t(uint32_t(i(0))));
  case 56:return mx::random::normal(shape(ints+1,nints-1),dtype(i(0)),std::nullopt,std::nullopt,a.at(0),s);
+ case 57:return mx::argpartition(a.at(0),i(0),i(1),s);
+ case 58:return mx::put_along_axis(a.at(0),a.at(1),a.at(2),i(0),s);
+ case 59:{auto rank=size_t(i(0));if(nints!=1+2*rank||a.at(0).ndim()!=rank)throw std::invalid_argument("pad rank mismatch");std::vector<int> axes(rank);for(size_t k=0;k<rank;++k)axes[k]=int(k);return mx::pad(a[0],axes,shape(ints+1,rank),shape(ints+1+rank,rank),a.at(1),"constant",s);}
+ case 60:return mx::conv_transpose1d(a.at(0),a.at(1),i(0),i(1),i(2),i(3),i(4),s);
+ case 61:return mx::random::split(a.at(0),2,s);
+ case 62:return mx::random::categorical(a.at(0),i(0),a.at(1),s);
  default:throw std::invalid_argument("unknown MLX bridge operation");}}();
  *out=new A(std::move(result));CATCH}
 int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t shapeless,void** out){TRY
