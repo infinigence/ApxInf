@@ -131,9 +131,10 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Gather currently supports F16 and BF16")),
+        _ => Err(invalid("Gather currently supports F32, F16 and BF16")),
     }
 }
 
@@ -185,6 +186,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Gather column count exceeds the CUDA kernel range"))?;
     let dtype = args.out.dtype();
+    if dtype == DType::F32
+        && !matches!(
+            args.semantic,
+            GatherSemantic::BiasPosition | GatherSemantic::RgbToPatches
+        )
+    {
+        return Err(invalid("F32 Gather supports bias-position and RGB patches"));
+    }
     let count = rows
         .checked_mul(cols)
         .ok_or_else(|| invalid("Gather size overflow"))?;
@@ -435,6 +444,21 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     let output_buffer = typed_buffer(ctx, args.out, dtype, count)?;
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
+    if dtype == DType::F32 {
+        let start = output as usize;
+        let end = start
+            .checked_add(output_buffer.len())
+            .ok_or_else(|| invalid("Gather output address overflow"))?;
+        for other in &storage {
+            let other_start = other.ptr() as usize;
+            let other_end = other_start
+                .checked_add(other.len())
+                .ok_or_else(|| invalid("Gather binding address overflow"))?;
+            if start < other_end && other_start < end {
+                return Err(invalid("F32 Gather output must not overlap its inputs"));
+            }
+        }
+    }
     storage.push(output_buffer);
 
     let geometry = args.patches.unwrap_or(PatchGeometry {

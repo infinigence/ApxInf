@@ -106,7 +106,10 @@ pub(crate) fn copy_host_to_device(
             source.as_ptr().cast(),
             source.len(),
             ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-        ))
+        ))?;
+        // A pageable H2D copy may return after host staging, before device DMA.
+        // Complete this upload before callers launch on a nonblocking stream.
+        ffi::check_cuda(ffi::cudaStreamSynchronize(std::ptr::null_mut()))
     }
 }
 
@@ -129,4 +132,65 @@ pub(crate) fn copy_device_to_host(
         ))?;
     }
     Ok(destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{pointwise, PointwiseArgs, PointwiseSemantic};
+    use apxinf_core::{DType, Shape};
+
+    #[test]
+    fn pageable_upload_precedes_nonblocking_graph_replay() {
+        let ctx = crate::CudaContext::new(0).unwrap();
+        // The production three-camera BF16 activation size exercises pageable
+        // DMA staging, which a scalar upload does not cover.
+        let elements = 3 * 256 * 1152;
+        let shape = Shape::new(vec![3 * 256, 1152]);
+        let input_buffer = CudaBuffer::alloc(elements * 2, 0).unwrap();
+        let output_buffer = CudaBuffer::alloc(elements * 2, 0).unwrap();
+        let input = input_buffer.as_tensor(shape.clone(), DType::BF16).unwrap();
+        let mut output = output_buffer.as_tensor(shape.clone(), DType::BF16).unwrap();
+        let bias_buffer = CudaBuffer::alloc(1152 * 2, 0).unwrap();
+        bias_buffer.zero_async(ctx.stream()).unwrap();
+        let bias = bias_buffer
+            .as_tensor(Shape::new(vec![1152]), DType::BF16)
+            .unwrap();
+        let graph = crate::capture(&ctx, || {
+            let mut args =
+                PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
+            args.bias = Some(&bias);
+            pointwise(&ctx, args)
+        })
+        .unwrap();
+        for tensor_copy in [false, true] {
+            for iteration in 0..32 {
+                let expected = if iteration % 2 == 0 {
+                    0x3f80u16
+                } else {
+                    0xbf80u16
+                };
+                let bytes = expected.to_ne_bytes().repeat(elements);
+                if tensor_copy {
+                    let source =
+                        Tensor::from_raw(shape.clone(), DType::BF16, Device::Cpu, bytes).unwrap();
+                    copy_cpu_to_cuda(&source, &input).unwrap();
+                } else {
+                    input_buffer.copy_from_host(&bytes).unwrap();
+                }
+                graph.replay().unwrap();
+                ctx.synchronize().unwrap();
+                let mut actual = vec![0; elements * 2];
+                output_buffer.copy_to_host(&mut actual).unwrap();
+                if let Some((index, value)) = actual
+                    .chunks_exact(2)
+                    .enumerate()
+                    .map(|(index, bytes)| (index, u16::from_ne_bytes([bytes[0], bytes[1]])))
+                    .find(|(_, value)| *value != expected)
+                {
+                    panic!("upload/replay ordering: tensor_copy={tensor_copy}, iteration={iteration}, index={index}, expected={expected:#x}, actual={value:#x}");
+                }
+            }
+        }
+    }
 }

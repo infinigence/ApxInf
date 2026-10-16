@@ -26,6 +26,7 @@ impl WeightVersion {
 #[derive(Clone, Debug)]
 pub struct GemmPolicy {
     /// Accumulation precision is part of the GEMM key, not a candidate detail.
+    /// BF16 partial sums must retain FP32 precision through split-K reduction.
     pub accumulation_dtype: DType,
     pub workspace_limit: usize,
     pub online_tune: bool,
@@ -50,6 +51,16 @@ impl Default for GemmPolicy {
     }
 }
 
+/// Arithmetic permitted for FP32 operands. Storage and accumulation stay FP32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GemmMath {
+    #[default]
+    Ieee = 0,
+    /// Permit TF32 input multiplication with FP32 accumulation.
+    Tf32 = 1,
+}
+
 /// Parameters common to the GEMM semantic operators.
 ///
 /// Additional operands belong to their semantic operator Args instead of this
@@ -60,6 +71,7 @@ pub struct GemmArgs<'a> {
     /// Canonical row-major output `[M, N]`. GEMM mutates this tensor.
     pub out: &'a mut Tensor,
     pub quantization: GemmQuantization<'a>,
+    pub math: GemmMath,
     pub alpha: f32,
     pub output_scale: f32,
     pub policy: GemmPolicy,
@@ -127,6 +139,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            math: GemmMath::Ieee,
         }
     }
 
@@ -149,6 +162,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            math: GemmMath::Ieee,
         }
     }
 
@@ -175,6 +189,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy,
             weight_version: None,
+            math: GemmMath::Ieee,
         }
     }
 
@@ -211,6 +226,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            math: GemmMath::Ieee,
         }
     }
 }
@@ -366,13 +382,7 @@ pub(crate) fn normalize_bias_residual<'a>(
     bias: Option<&'a Tensor>,
     residual: &'a Tensor,
 ) -> Result<Normalized> {
-    normalize_fused(
-        ctx,
-        args,
-        Semantic::GemmBiasResidual,
-        bias,
-        Some(residual),
-    )
+    normalize_fused(ctx, args, Semantic::GemmBiasResidual, bias, Some(residual))
 }
 
 fn normalize_fused<'a>(
@@ -386,6 +396,15 @@ fn normalize_fused<'a>(
     let b_shape = args.b.shape().dims();
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(invalid("GEMM requires rank-2 tensors"));
+    }
+    if args.math == GemmMath::Tf32
+        && (args.a.dtype() != DType::F32
+            || args.b.dtype() != DType::F32
+            || args.out.dtype() != DType::F32
+            || !matches!(args.quantization, GemmQuantization::None)
+            || semantic != Semantic::Gemm)
+    {
+        return Err(invalid("TF32 requires plain FP32 GEMM inputs and output"));
     }
     let nvfp4 = matches!(args.quantization, GemmQuantization::Nvfp4 { .. });
     // Public storage is deliberately canonical and candidate-independent.
@@ -422,10 +441,7 @@ fn normalize_fused<'a>(
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
-    let needs_bias = matches!(
-        semantic,
-        Semantic::GemmBias | Semantic::GemmBiasGelu
-    );
+    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu);
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
         return Err(invalid("fused operands do not match the semantic operator"));
@@ -482,9 +498,7 @@ fn normalize_fused<'a>(
             if args.a.dtype() != DType::E2M1Pair || args.b.dtype() != DType::E2M1Pair {
                 return Err(invalid("NVFP4 GEMM requires two packed E2M1 tensors"));
             }
-            if a_block_scales.dtype() != DType::F8E4M3
-                || b_block_scales.dtype() != DType::F8E4M3
-            {
+            if a_block_scales.dtype() != DType::F8E4M3 || b_block_scales.dtype() != DType::F8E4M3 {
                 // The kernel reads these as unsigned E4M3. For the non-negative
                 // values a scale tensor holds, that encoding is bit-identical
                 // to signed E4M3, so the checkpoint bytes pass through as-is.
@@ -573,7 +587,11 @@ fn normalize_fused<'a>(
                 output_bytes,
                 &buffer,
                 bytes,
-                if slot == 0 { "A block scale" } else { "B block scale" },
+                if slot == 0 {
+                    "A block scale"
+                } else {
+                    "B block scale"
+                },
             )?;
             if slot == 0 {
                 bindings.a_block_scales = buffer.ptr();
@@ -637,7 +655,8 @@ fn normalize_fused<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 6,
+            version: 7,
+            math: args.math as u32,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,

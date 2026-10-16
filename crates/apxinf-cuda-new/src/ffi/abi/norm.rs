@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 
-use super::types::Runtime;
 pub(crate) use super::types::CudaStream;
+use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 1;
+pub(crate) const SPEC_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -12,6 +12,7 @@ pub(crate) struct Spec {
     pub semantic: u32,
     pub dtype: u32,
     pub output_dtype: u32,
+    pub parameter_dtype: u32,
     pub has_bias: u32,
     pub input_alignment: u32,
     pub weight_alignment: u32,

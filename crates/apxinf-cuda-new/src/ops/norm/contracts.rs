@@ -179,6 +179,26 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
             "BiasThenResidual is a BF16-only semantic because its intermediate rounding is part of the contract",
         ));
     }
+    let parameter_dtype = args
+        .weight
+        .or(args.norm_style)
+        .or(args.gate_style)
+        .map_or(dtype, Tensor::dtype);
+    if parameter_dtype != dtype
+        && !(dtype == DType::BF16
+            && parameter_dtype == DType::F32
+            && matches!(
+                semantic,
+                Semantic::Rms
+                    | Semantic::BiasResidualRms
+                    | Semantic::AdaptiveRms
+                    | Semantic::AdaGateResidualRms
+            ))
+    {
+        return Err(invalid(
+            "FP32 Norm parameters require a BF16 RMS normalization semantic",
+        ));
+    }
     let count = rows
         .checked_mul(cols)
         .ok_or_else(|| invalid("Norm size overflow"))?;
@@ -217,13 +237,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let mut storage = Vec::new();
     let bind_vector = |tensor: Option<&Tensor>,
                        required: bool,
+                       vector_dtype: DType,
                        elements: usize,
                        label: &str,
                        storage: &mut Vec<CudaBuffer>|
      -> Result<(*const std::ffi::c_void, u32)> {
         match tensor {
             Some(tensor) => {
-                let buffer = tensor_storage(ctx, tensor, dtype, elements)?;
+                let buffer = tensor_storage(ctx, tensor, vector_dtype, elements)?;
                 let pointer = buffer.ptr() as *const std::ffi::c_void;
                 let alignment = alignment_of(buffer.ptr() as usize);
                 storage.push(buffer);
@@ -239,10 +260,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let input_alignment = alignment_of(input_buffer.ptr() as usize);
     storage.push(input_buffer);
 
-    let (bias, bias_alignment) = bind_vector(args.bias, false, cols, "bias", &mut storage)?;
+    let (bias, bias_alignment) = bind_vector(args.bias, false, dtype, cols, "bias", &mut storage)?;
     let (residual, residual_alignment) = bind_vector(
         args.residual,
         semantic.reads_residual(),
+        dtype,
         count,
         "residual",
         &mut storage,
@@ -250,6 +272,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (weight, weight_alignment) = bind_vector(
         args.weight,
         semantic.reads_weight(),
+        parameter_dtype,
         cols,
         "weight",
         &mut storage,
@@ -257,6 +280,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (norm_bias, norm_bias_alignment) = bind_vector(
         args.norm_bias,
         semantic.reads_norm_bias(),
+        parameter_dtype,
         cols,
         "norm_bias",
         &mut storage,
@@ -267,6 +291,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (norm_style, norm_style_alignment) = bind_vector(
         args.norm_style,
         semantic.reads_norm_style(),
+        parameter_dtype,
         norm_style_elements,
         "norm_style",
         &mut storage,
@@ -277,6 +302,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (gate_style, gate_style_alignment) = bind_vector(
         args.gate_style,
         semantic.reads_gate_style(),
+        parameter_dtype,
         gate_style_elements,
         "gate_style",
         &mut storage,
@@ -337,6 +363,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         semantic: semantic.code(),
         dtype: dtype_value,
         output_dtype: output_dtype_code(output_dtype)?,
+        parameter_dtype: if parameter_dtype == DType::F32 {
+            0
+        } else {
+            dtype_value
+        },
         has_bias: u32::from(!bias.is_null()),
         input_alignment,
         weight_alignment,

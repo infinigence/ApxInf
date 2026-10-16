@@ -10,6 +10,9 @@ pub const FA2_FIXED_FEATURE_DEFINES: &[&str] = &[
     "-DFLASHATTENTION_DISABLE_LOCAL",
 ];
 
+// BF16 head dimension 96 preserves the reference Softmax arithmetic boundaries.
+pub const FA2_BF16_HDIM96_FLAGS: &[&str] = &["-DUNFUSE_FMA", "--prec-div=true"];
+
 const INPUT_TREES: &[&str] = &[
     "adapters/attention",
     "framework",
@@ -69,7 +72,10 @@ pub fn build_id<'a>(
         hash_bytes(&mut hash, value.as_bytes());
         hash_bytes(&mut hash, &[0]);
     }
-    for define in FA2_FIXED_FEATURE_DEFINES {
+    for define in FA2_FIXED_FEATURE_DEFINES
+        .iter()
+        .chain(FA2_BF16_HDIM96_FLAGS)
+    {
         hash_bytes(&mut hash, define.as_bytes());
         hash_bytes(&mut hash, &[0]);
     }

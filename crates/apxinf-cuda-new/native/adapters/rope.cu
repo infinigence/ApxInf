@@ -64,6 +64,7 @@ bool valid_alignment(uint32_t alignment) {
 
 bool applies_rope(uint32_t semantic) {
   return semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE ||
+         semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE_STAGED_BF16 ||
          semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE ||
          semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL ||
          semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE;
@@ -71,7 +72,7 @@ bool applies_rope(uint32_t semantic) {
 
 void validate_spec(const apxinf_rope_spec_t& spec) {
   if (spec.version != APXINF_ROPE_SPEC_VERSION ||
-      spec.semantic > APXINF_ROPE_SEMANTIC_PARTIAL_MROPE ||
+      spec.semantic > APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE_STAGED_BF16 ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.has_bias > 1 || spec.tokens <= 0 || spec.tokens > INT32_MAX ||
       spec.q_heads == 0 || spec.kv_heads == 0 || spec.head_dim == 0 ||
@@ -84,6 +85,11 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
       !valid_alignment(spec.kv_alignment) ||
       !valid_alignment(spec.position_alignment)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE Spec");
+  }
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE_STAGED_BF16 &&
+      spec.dtype != APXINF_DTYPE_BF16) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "staged rotary arithmetic requires BF16 tensors");
   }
   if (spec.semantic != APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
       spec.semantic != APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
@@ -212,6 +218,17 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
           bindings.theta, bindings.position_offset, bindings.kv_output_offset);
       break;
     }
+    case APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE_STAGED_BF16:
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        const dim3 grid(static_cast<unsigned>(tokens),
+                        static_cast<unsigned>(q_heads + 2 * kv_heads));
+        kernels::split_qkv_rope<T, true><<<grid, rope_threads(head_dim), 0, stream>>>(
+            qkv, bias, q, kv_k, kv_v, tokens, q_heads, kv_heads, head_dim,
+            bindings.theta, bindings.position_offset, bindings.kv_output_offset);
+      } else {
+        return cudaErrorInvalidValue;
+      }
+      break;
     case APXINF_ROPE_SEMANTIC_SPLIT_QKV_BIAS:
       kernels::split_qkv_bias<T><<<tokens, 256, 0, stream>>>(
           qkv, bias, q, kv_k, kv_v, tokens, q_heads * head_dim);

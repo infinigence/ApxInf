@@ -4,7 +4,8 @@ use super::contracts::{normalize, RawArgs, Semantic};
 use super::launch;
 use crate::CudaContext;
 
-/// Inputs for ordinary RMS normalization.
+/// Inputs for ordinary RMS normalization. BF16 activations also accept an
+/// FP32 weight; normalization and multiplication stay FP32 until output rounding.
 pub struct RmsNormArgs<'a> {
     pub input: &'a Tensor,
     pub weight: &'a Tensor,
@@ -38,6 +39,8 @@ impl<'a> LayerNormArgs<'a> {
 }
 
 /// Inputs for adaptive RMS normalization. `norm_style` is `[2 * cols]`.
+/// BF16 activations accept FP32 scale/shift, preserving both in FP32 through
+/// `normalized * (1 + scale) + shift` before the final BF16 cast.
 pub struct AdaptiveRmsNormArgs<'a> {
     pub input: &'a Tensor,
     pub norm_style: &'a Tensor,
@@ -67,6 +70,8 @@ impl<'a> BiasResidualArgs<'a> {
     }
 }
 
+/// Bias/residual activations retain their dtype; BF16 activations may use an
+/// FP32 normalization weight. The hidden sum is rounded before normalization.
 pub struct BiasResidualRmsNormArgs<'a> {
     pub input: &'a Tensor,
     pub bias: Option<&'a Tensor>,
@@ -120,6 +125,10 @@ impl<'a> AdaGateResidualArgs<'a> {
     }
 }
 
+/// Fuses gated residual addition and adaptive RMS normalization.
+/// With BF16 activations and FP32 styles, round the gate and gated projection
+/// to BF16 separately before adding the residual; normalize the BF16 hidden
+/// result with FP32 scale/shift. Both styles must have the same dtype.
 pub struct AdaGateResidualRmsNormArgs<'a> {
     pub input: &'a Tensor,
     pub residual: &'a Tensor,

@@ -155,20 +155,22 @@ mod linear {
         }
         let (input_dim, output_dim) = (dims[0], dims[1]);
         let values = tensor.to_f32_vec()?;
-        let mut quantized = vec![0i8; input_dim * output_dim];
         let mut scales = vec![0.0f32; output_dim];
-        for output in 0..output_dim {
-            let mut maximum = 0.0f32;
-            for input in 0..input_dim {
-                maximum = maximum.max(values[input * output_dim + output].abs());
+        for row in values.chunks_exact(output_dim) {
+            for (maximum, value) in scales.iter_mut().zip(row) {
+                *maximum = maximum.max(value.abs());
             }
-            let scale = (maximum / 127.0).max(1.0e-12);
-            scales[output] = scale;
-            for input in 0..input_dim {
-                let value = (values[input * output_dim + output] / scale)
-                    .round()
-                    .clamp(-128.0, 127.0);
-                quantized[input * output_dim + output] = value as i8;
+        }
+        for scale in &mut scales {
+            *scale = (*scale / 127.0).max(1.0e-12);
+        }
+        let mut quantized = vec![0i8; input_dim * output_dim];
+        for (input, output) in values
+            .chunks_exact(output_dim)
+            .zip(quantized.chunks_exact_mut(output_dim))
+        {
+            for ((value, scale), quantized) in input.iter().zip(&scales).zip(output) {
+                *quantized = (*value / *scale).round().clamp(-128.0, 127.0) as i8;
             }
         }
         Ok((quantized, scales, input_dim, output_dim))
@@ -199,6 +201,36 @@ mod linear {
             assert_eq!(quantized, vec![42, -127, 85, 0, 127, 127]);
             assert!((scales[0] - 3.0 / 127.0).abs() < 1.0e-7);
             assert!((scales[1] - 10.0 / 127.0).abs() < 1.0e-7);
+        }
+
+        #[test]
+        fn contiguous_quantization_preserves_column_reference_bits() {
+            for (rows, cols) in [(1usize, 1usize), (3, 2), (7, 257), (31, 33)] {
+                let values: Vec<f32> = (0..rows * cols)
+                    .map(|i| {
+                        if i % cols == 0 {
+                            0.0
+                        } else {
+                            ((i * 17 % 103) as f32 - 51.0) / 2.0
+                        }
+                    })
+                    .collect();
+                let tensor = Tensor::from_f32(vec![rows, cols], &values).unwrap();
+                let (actual, scales, _, _) = quantize_output_channels(&tensor).unwrap();
+                for col in 0..cols {
+                    let maximum = (0..rows).fold(0.0f32, |maximum, row| {
+                        maximum.max(values[row * cols + col].abs())
+                    });
+                    let scale = (maximum / 127.0).max(1.0e-12);
+                    assert_eq!(scales[col].to_bits(), scale.to_bits());
+                    for row in 0..rows {
+                        let expected = (values[row * cols + col] / scale)
+                            .round()
+                            .clamp(-128.0, 127.0) as i8;
+                        assert_eq!(actual[row * cols + col], expected);
+                    }
+                }
+            }
         }
 
         #[test]
@@ -320,7 +352,7 @@ impl Int8DynamicWeights {
                 .iter()
                 .map(|layer| Int8DynamicDeviceLanguageLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
+            language_final_norm_scale: bf16_to_device(&weights.language_final_norm.scale()?, backend)?,
             action_layers: weights
                 .action_layers
                 .iter()
@@ -363,7 +395,7 @@ impl Int8DynamicDeviceVisionBlock {
 impl Int8DynamicDeviceLanguageLayer {
     fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
-            input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
+            input_norm_scale: bf16_to_device(&weights.input_norm.scale()?, backend)?,
             qkv: Int8DynamicLinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -373,7 +405,7 @@ impl Int8DynamicDeviceLanguageLayer {
                 backend,
             )?,
             output: Int8DynamicLinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
+            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm.scale()?, backend)?,
             gate_up: Int8DynamicLinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

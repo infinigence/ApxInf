@@ -33,9 +33,12 @@ typedef enum {
   APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL = 3,
   /* In-place partial interleaved temporal/height/width rotary embedding. */
   APXINF_ROPE_SEMANTIC_PARTIAL_MROPE = 4,
+  /* BF16 inverse frequency, sin/cos, bias sum and rotary products are rounded
+     separately before the final BF16 sum. */
+  APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE_STAGED_BF16 = 5,
 } apxinf_rope_semantic_t;
 
-#define APXINF_ROPE_SPEC_VERSION 3u
+#define APXINF_ROPE_SPEC_VERSION 4u
 
 typedef struct {
   uint32_t version;

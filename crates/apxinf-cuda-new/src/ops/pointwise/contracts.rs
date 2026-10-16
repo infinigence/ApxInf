@@ -9,6 +9,8 @@ use crate::{CudaBuffer, CudaContext};
 pub enum PointwiseSemantic {
     /// `input [rows, 2 * cols]` -> `output [rows, cols]`.
     Geglu,
+    /// BF16 GELU output is rounded before multiplication by the up projection.
+    GegluStagedBf16,
     BiasActivation,
     EulerUpdate,
 }
@@ -17,6 +19,7 @@ impl PointwiseSemantic {
     fn code(self) -> u32 {
         match self {
             Self::Geglu => 0,
+            Self::GegluStagedBf16 => 3,
             Self::BiasActivation => 1,
             Self::EulerUpdate => 2,
         }
@@ -91,19 +94,23 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn input_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Pointwise input currently supports F16 and BF16")),
+        _ => Err(invalid(
+            "Pointwise input currently supports F32, F16 and BF16",
+        )),
     }
 }
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
         _ => Err(invalid(
-            "Pointwise output currently supports F16, BF16, and E4M3",
+            "Pointwise output currently supports F32, F16, BF16, and E4M3",
         )),
     }
 }
@@ -168,6 +175,19 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         .map_err(|_| invalid("Pointwise column count exceeds the CUDA kernel range"))?;
     let input_dtype = args.input.dtype();
     let output_dtype = args.out.dtype();
+    if semantic == PointwiseSemantic::GegluStagedBf16 && input_dtype != DType::BF16 {
+        return Err(invalid("staged GeGLU requires BF16 tensors"));
+    }
+    if input_dtype == DType::F32
+        && !matches!(
+            semantic,
+            PointwiseSemantic::BiasActivation | PointwiseSemantic::EulerUpdate
+        )
+    {
+        return Err(invalid(
+            "F32 Pointwise supports bias-activation and Euler update",
+        ));
+    }
     let quantized_geglu = matches!(semantic, PointwiseSemantic::Geglu)
         && input_dtype == DType::F16
         && output_dtype == DType::F8E4M3;
@@ -179,12 +199,15 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let count = rows
         .checked_mul(cols)
         .ok_or_else(|| invalid("Pointwise size overflow"))?;
-    if quantized_geglu {
+    if quantized_geglu || semantic == PointwiseSemantic::GegluStagedBf16 {
         i32::try_from(count)
             .map_err(|_| invalid("F16-to-E4M3 GeGLU element count exceeds kernel range"))?;
     }
     // GeGLU consumes a gate and an up half per output element.
-    let input_count = if matches!(semantic, PointwiseSemantic::Geglu) {
+    let input_count = if matches!(
+        semantic,
+        PointwiseSemantic::Geglu | PointwiseSemantic::GegluStagedBf16
+    ) {
         count
             .checked_mul(2)
             .ok_or_else(|| invalid("Pointwise size overflow"))?
@@ -192,6 +215,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         count
     };
 
+    if semantic == PointwiseSemantic::GegluStagedBf16
+        && args.input.shape().dims() != [rows, cols * 2]
+    {
+        return Err(invalid("staged GeGLU requires input [rows, 2 * cols]"));
+    }
     if !args.dt.is_finite() {
         return Err(invalid("Pointwise dt must be finite"));
     }
@@ -206,9 +234,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         ));
     }
     if quantized_geglu && cols % 2 != 0 {
-        return Err(invalid(
-            "F16-to-E4M3 GeGLU requires an even output width",
-        ));
+        return Err(invalid("F16-to-E4M3 GeGLU requires an even output width"));
     }
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Pointwise semantic does not take a bias"));
@@ -288,6 +314,13 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
             ));
         }
     }
+    if semantic == PointwiseSemantic::GegluStagedBf16
+        && storage_ranges_overlap(input as usize, input_count * 2, output as usize, count * 2)?
+    {
+        return Err(invalid(
+            "staged GeGLU input and output storage must not overlap",
+        ));
+    }
     storage.push(output_buffer);
 
     let spec = abi::Spec {
@@ -321,4 +354,22 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         bindings,
         storage,
     })
+}
+
+#[cfg(test)]
+impl PointwiseSemantic {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Geglu,
+        Self::GegluStagedBf16,
+        Self::BiasActivation,
+        Self::EulerUpdate,
+    ];
+    pub(crate) fn doc_id(self) -> &'static str {
+        match self {
+            Self::Geglu => "pointwise_geglu",
+            Self::GegluStagedBf16 => "pointwise_geglu_staged_bf16",
+            Self::BiasActivation => "pointwise_bias_activation",
+            Self::EulerUpdate => "pointwise_euler_update",
+        }
+    }
 }

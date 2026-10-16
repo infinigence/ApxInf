@@ -573,6 +573,15 @@ __global__ void bias_activation_bf16_packed4_kernel(
   }
 }
 
+template <bool Staged>
+__device__ __forceinline__ float geglu_activation(float value) {
+  const float activated = gelu_tanh(value);
+  if constexpr (Staged)
+    return __bfloat162float(__float2bfloat16_rn(activated));
+  return activated;
+}
+
+template <bool Staged = false>
 __global__ void geglu_bf16_kernel(
     const __nv_bfloat16* gate_up, __nv_bfloat16* output,
     int rows, int inner) {
@@ -585,7 +594,7 @@ __global__ void geglu_bf16_kernel(
     const __nv_bfloat16* row_input =
         gate_up + static_cast<int64_t>(row) * 2 * inner;
     output[index] = __float2bfloat16(
-        gelu_tanh(__bfloat162float(row_input[col])) *
+        geglu_activation<Staged>(__bfloat162float(row_input[col])) *
         __bfloat162float(row_input[inner + col]));
   }
 }
@@ -605,6 +614,7 @@ __global__ void swiglu_bf16_kernel(
   }
 }
 
+template <bool Staged = false>
 __global__ void geglu_bf16_packed2_kernel(
     const __nv_bfloat16* gate_up, __nv_bfloat16* output,
     int rows, int inner) {
@@ -624,11 +634,12 @@ __global__ void geglu_bf16_packed2_kernel(
     reinterpret_cast<__nv_bfloat162*>(
         output + static_cast<int64_t>(row) * inner)[col_pair] =
         __floats2bfloat162_rn(
-            gelu_tanh(__bfloat162float(gate.x)) * __bfloat162float(up.x),
-            gelu_tanh(__bfloat162float(gate.y)) * __bfloat162float(up.y));
+            geglu_activation<Staged>(__bfloat162float(gate.x)) * __bfloat162float(up.x),
+            geglu_activation<Staged>(__bfloat162float(gate.y)) * __bfloat162float(up.y));
   }
 }
 
+template <bool Staged = false>
 __global__ void geglu_bf16_packed4_kernel(
     const __nv_bfloat16* gate_up, __nv_bfloat16* output,
     int rows, int inner) {
@@ -648,14 +659,14 @@ __global__ void geglu_bf16_packed4_kernel(
     reinterpret_cast<Bf16x4*>(
         output + static_cast<int64_t>(row) * inner)[col_quad] = Bf16x4{
         __floats2bfloat162_rn(
-            gelu_tanh(__bfloat162float(gate.low.x)) *
+            geglu_activation<Staged>(__bfloat162float(gate.low.x)) *
                 __bfloat162float(up.low.x),
-            gelu_tanh(__bfloat162float(gate.low.y)) *
+            geglu_activation<Staged>(__bfloat162float(gate.low.y)) *
                 __bfloat162float(up.low.y)),
         __floats2bfloat162_rn(
-            gelu_tanh(__bfloat162float(gate.high.x)) *
+            geglu_activation<Staged>(__bfloat162float(gate.high.x)) *
                 __bfloat162float(up.high.x),
-            gelu_tanh(__bfloat162float(gate.high.y)) *
+            geglu_activation<Staged>(__bfloat162float(gate.high.y)) *
                 __bfloat162float(up.high.y)),
     };
   }

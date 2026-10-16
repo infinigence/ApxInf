@@ -1,0 +1,4 @@
+# Daily GPU CI uses the board's release-built apxinf_py extension, not OpenPI.
+numpy>=1.24,<3
+# bench_pi05 imports the pure-Python image processors during CPU tests.
+Pillow>=9.0

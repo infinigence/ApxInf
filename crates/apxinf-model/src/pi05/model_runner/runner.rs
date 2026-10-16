@@ -15,8 +15,7 @@ use crate::vla::{
 
 use super::prepare::CapturedGraph;
 use crate::pi05::backend::{
-    self, ops, transfers, Context, DeviceBuffer, ExecutionSession,
-    ImageLayout as KernelImageLayout,
+    self, ops, transfers, Context, DeviceBuffer, ExecutionSession, ImageLayout as KernelImageLayout,
 };
 use crate::pi05::model::ModelVariant;
 use crate::pi05::Pi05Config;
@@ -343,10 +342,13 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let dtype = self.model.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
-        let patches = backend::to_device(&self.backend, &Tensor::zeros(
-            patch_shape(&self.config),
-            self.model.captured_patch_dtype(raw_rgb),
-        ))?;
+        let patches = backend::to_device(
+            &self.backend,
+            &Tensor::zeros(
+                patch_shape(&self.config),
+                self.model.captured_patch_dtype(raw_rgb),
+            ),
+        )?;
         let noise = backend::to_device(
             &self.backend,
             &Tensor::zeros(noise_shape(&self.config), dtype),
@@ -452,7 +454,8 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let raw_rgb = spec.image_layout.is_some();
 
-        let (graph, fallback_reason) = select_graph(policy, || capture(&patches, &token_ids, &noise))?;
+        let (graph, fallback_reason) =
+            select_graph(policy, || capture(&patches, &token_ids, &noise))?;
         if let Some(reason) = &fallback_reason {
             eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
         }
@@ -667,6 +670,7 @@ fn normalize_tensor(
     }
     let values = tensor.to_f32_vec()?;
     let converted = match dtype {
+        DType::F32 => Tensor::from_f32(shape, &values)?,
         DType::F16 => Tensor::from_f16(
             shape,
             &values.into_iter().map(f16::from_f32).collect::<Vec<_>>(),
@@ -796,16 +800,34 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CUDA and APXINF_PI05_TEST_CHECKPOINT"]
+    #[ignore = "requires CUDA"]
     fn rgb_calibration_reuses_prepared_eager_traversal() {
-        let path =
-            std::env::var("APXINF_PI05_TEST_CHECKPOINT").expect("fixed real checkpoint required");
+        use crate::auto::SyntheticWeights;
+
+        let config = Pi05Config {
+            num_views: 1,
+            vision_depth: 1,
+            language: crate::pi05::GemmaVariantConfig {
+                depth: 2,
+                ..crate::pi05::GemmaVariantConfig::GEMMA_2B
+            },
+            action_expert: crate::pi05::GemmaVariantConfig {
+                depth: 2,
+                ..crate::pi05::GemmaVariantConfig::GEMMA_300M
+            },
+            vocab_size: 16,
+            action_horizon: 2,
+            num_flow_steps: 2,
+            ..Pi05Config::default()
+        };
         let backend = Arc::new(Context::new(0).unwrap());
         let runner = load_model_runner(
-            Path::new(&path),
+            Path::new("."),
             backend,
             &LoadOptions {
                 model_variant: Some("bf16".into()),
+                config: Some(config),
+                synthetic: Some(SyntheticWeights { seed: 7 }),
                 ..LoadOptions::default()
             },
         )
@@ -819,16 +841,23 @@ mod tests {
             state: None,
             action_mask: None,
         };
-        let noise = Tensor::zeros(noise_shape(&runner.config), DType::F32);
-        let records = runner
-            .calibration_amax(&VlaRequest::provided(&observation, &noise))
-            .unwrap();
+        let noise = Tensor::from_f32(
+            noise_shape(&runner.config),
+            &vec![0.25; runner.config.action_horizon * runner.config.action_dim],
+        )
+        .unwrap();
+        let request = VlaRequest::provided(&observation, &noise);
+        let records = runner.calibration_amax(&request).unwrap();
         let expected = crate::pi05::Pi05CalibrationPlan::for_config(&runner.config)
             .sites()
             .len();
-        assert_eq!(expected, 256);
+        assert_eq!(expected, 24);
         assert_eq!(records.len(), expected);
         assert!(records.values().all(|amax| amax.is_finite()));
+        // FP32 patch and auxiliary inputs belong to the same BF16 model plan.
+        assert_eq!(records["vision.patch_input"], 1.0);
+        assert!(records["action.input"] >= 0.25);
+        assert_eq!(runner.calibration_amax(&request).unwrap(), records);
     }
 
     #[test]

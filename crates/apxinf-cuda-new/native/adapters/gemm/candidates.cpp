@@ -29,6 +29,10 @@ bool supports_vendor(const Spec& spec) {
            spec.accumulation_dtype == APXINF_DTYPE_F32));
 }
 
+bool supports_cublaslt(const Spec& spec) {
+  return spec.math == APXINF_GEMM_MATH_IEEE && supports_vendor(spec);
+}
+
 bool supports_native_fp8(const Spec& spec) {
   return supports_vendor(spec) && spec.a_dtype == APXINF_DTYPE_E4M3 &&
          spec.k % 16 == 0 && spec.n % 16 == 0;
@@ -326,8 +330,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-gelu-bias",
@@ -340,11 +344,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
   static const ImplementationRegistry gemm_bias_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 2, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+      {kProviderCublasLt, 1, 3, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8-bias",
@@ -357,8 +361,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-bias-residual",
@@ -371,8 +375,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue",
@@ -409,8 +413,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 2, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+      {kProviderCublasLt, 1, 3, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+geglu",

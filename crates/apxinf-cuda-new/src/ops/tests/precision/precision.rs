@@ -283,8 +283,12 @@ fn attention_f16_action_cache_uses_fa2() {
     let normalized = super::normalize_kv_cache_attention(&ctx, args).unwrap();
     let execution = super::attention_execution::prepare(&ctx, normalized).unwrap();
     assert!(
-        execution.summary().starts_with("flash-attention-2-split-kv ")
-            || execution.summary().starts_with("flash-attention-2-kv-cache "),
+        execution
+            .summary()
+            .starts_with("flash-attention-2-split-kv ")
+            || execution
+                .summary()
+                .starts_with("flash-attention-2-kv-cache "),
         "unexpected F16 action KV-cache provider: {}",
         execution.summary()
     );
@@ -680,6 +684,705 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
                 &ctx,
                 args,
                 super::contracts::Semantic::GemmGeglu,
+                None,
+                &expected,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[path = "adaptive_norm_torch_fixture.rs"]
+mod adaptive_norm_fixture;
+
+#[test]
+fn mixed_precision_rms_norm_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for case in adaptive_norm_fixture::CASES {
+        let shape = vec![2, case.width];
+        let input = bf16_bits_tensor(0, shape.clone(), case.input);
+        let residual = bf16_bits_tensor(0, shape.clone(), case.residual);
+        let style_values = [case.scale, case.shift].concat();
+        let style = f32_tensor(0, vec![2 * case.width], &style_values);
+        let gate_values = [vec![0.0; 2 * case.width], case.gate.to_vec()].concat();
+        let gate = f32_tensor(0, vec![3 * case.width], &gate_values);
+        let weight_values: Vec<_> = case.scale.iter().map(|value| 1.0 + value).collect();
+        let weight = f32_tensor(0, vec![case.width], &weight_values);
+        let mut output = zeros_tensor(0, shape.clone(), DType::BF16);
+        let mut hidden = zeros_tensor(0, shape, DType::BF16);
+        let check = |tensor: &Tensor, expected: &[u16]| {
+            let buffer = crate::CudaBuffer::from_tensor(tensor).unwrap();
+            let mut bytes = vec![0u8; buffer.len()];
+            buffer.copy_to_host(&mut bytes).unwrap();
+            let actual: Vec<_> = bytes
+                .chunks_exact(2)
+                .map(|word| u16::from_ne_bytes([word[0], word[1]]))
+                .collect();
+            assert_eq!(actual, expected, "width={}", case.width);
+        };
+        rms_norm(&ctx, RmsNormArgs::new(&input, &weight, &mut output, 1e-6)).unwrap();
+        ctx.synchronize().unwrap();
+        check(&output, case.rms);
+        let bias = bf16_bits_tensor(0, vec![case.width], case.bias);
+        for (bias, expected_hidden, expected_norm) in [
+            (None, case.residual_hidden, case.residual_rms),
+            (Some(&bias), case.bias_hidden, case.bias_rms),
+        ] {
+            bias_residual_rms_norm(
+                &ctx,
+                BiasResidualRmsNormArgs::new(
+                    &input,
+                    bias,
+                    &residual,
+                    &weight,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            check(&hidden, expected_hidden);
+            check(&output, expected_norm);
+        }
+        adaptive_rms_norm(
+            &ctx,
+            AdaptiveRmsNormArgs::new(&input, &style, &mut output, 1e-6),
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        check(&output, case.adaptive);
+        let graph = crate::capture(&ctx, || {
+            ada_gate_residual_rms_norm(
+                &ctx,
+                AdaGateResidualRmsNormArgs::new(
+                    &input,
+                    &residual,
+                    &style,
+                    &gate,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+        })
+        .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        check(&hidden, case.hidden);
+        check(&output, case.gated);
+    }
+}
+
+#[path = "staged_rope_torch_fixture.rs"]
+mod staged_rope_fixture;
+
+#[test]
+fn staged_bf16_rope_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for case in staged_rope_fixture::CASES {
+        let input = bf16_bits_tensor(0, vec![2, 3 * case.dim], case.input);
+        let bias =
+            (!case.bias.is_empty()).then(|| bf16_bits_tensor(0, vec![3 * case.dim], case.bias));
+        let mut q = zeros_tensor(0, vec![2, 1, case.dim], DType::BF16);
+        let mut k = zeros_tensor(0, vec![4, 1, case.dim], DType::BF16);
+        let mut v = zeros_tensor(0, vec![4, 1, case.dim], DType::BF16);
+        let mut launch = || {
+            rope(
+                &ctx,
+                RopeArgs {
+                    semantic: RopeSemantic::SplitQkvRopeStagedBf16,
+                    qkv: &input,
+                    bias: bias.as_ref(),
+                    q: &mut q,
+                    k: &mut k,
+                    v: &mut v,
+                    q_heads: 1,
+                    kv_heads: 1,
+                    head_dim: case.dim,
+                    theta: 10_000.0,
+                    position_offset: case.position,
+                    kv_output_offset: 1,
+                },
+            )
+        };
+        launch().unwrap();
+        ctx.synchronize().unwrap();
+        let graph = crate::capture(&ctx, launch).unwrap();
+        let check = |q: &Tensor, k: &Tensor, v: &Tensor, scale: f32| {
+            for (tensor, words, padded) in
+                [(q, case.q, false), (k, case.k, true), (v, case.v, true)]
+            {
+                let mut expected = vec![0.0; if padded { case.dim } else { 0 }];
+                expected.extend(
+                    words
+                        .iter()
+                        .map(|word| half::bf16::from_bits(*word).to_f32() * scale),
+                );
+                if padded {
+                    expected.extend(vec![0.0; case.dim]);
+                }
+                assert_eq!(
+                    super::framework::values(tensor),
+                    expected,
+                    "dim={} position={}",
+                    case.dim,
+                    case.position
+                );
+            }
+        };
+        check(&q, &k, &v, 1.0);
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        check(&q, &k, &v, 1.0);
+        if bias.is_none() {
+            let doubled: Vec<_> = case
+                .input
+                .iter()
+                .flat_map(|word| {
+                    half::bf16::from_f32(half::bf16::from_bits(*word).to_f32() * 2.0)
+                        .to_bits()
+                        .to_ne_bytes()
+                })
+                .collect();
+            crate::CudaBuffer::from_tensor(&input)
+                .unwrap()
+                .copy_from_host(&doubled)
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            check(&q, &k, &v, 2.0);
+        }
+    }
+}
+
+#[path = "staged_geglu_torch_fixture.rs"]
+mod staged_geglu_fixture;
+
+#[test]
+fn staged_bf16_geglu_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (rows, cols) in [
+        (2, 7),
+        (2, 6),
+        (2, 8),
+        (50, 8192),
+        (264, 16384),
+        (712, 16384),
+        (968, 16384),
+    ] {
+        let mut input = Vec::with_capacity(rows * cols * 2);
+        let mut expected = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for pattern in [staged_geglu_fixture::GATE, staged_geglu_fixture::UP] {
+                input.extend((0..cols).map(|col| pattern[(row * cols + col) % pattern.len()]));
+            }
+            expected.extend((0..cols).map(|col| {
+                half::bf16::from_bits(staged_geglu_fixture::OUTPUT[(row * cols + col) % 16])
+                    .to_f32()
+            }));
+        }
+        let input = bf16_bits_tensor(0, vec![rows, cols * 2], &input);
+        let mut output = zeros_tensor(0, vec![rows, cols], DType::BF16);
+        let mut launch = || {
+            pointwise(
+                &ctx,
+                PointwiseArgs::new(PointwiseSemantic::GegluStagedBf16, &input, &mut output),
+            )
+        };
+        launch().unwrap();
+        ctx.synchronize().unwrap();
+        let graph = crate::capture(&ctx, launch).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            super::framework::values(&output),
+            expected,
+            "rows={rows} cols={cols}"
+        );
+        crate::CudaBuffer::from_tensor(&input)
+            .unwrap()
+            .copy_from_host(&vec![0; rows * cols * 4])
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(super::framework::values(&output)
+            .iter()
+            .all(|value| *value == 0.0));
+    }
+}
+
+#[path = "f32_frontend_torch_fixture.rs"]
+mod f32_frontend_fixture;
+
+#[test]
+fn f32_pointwise_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f32_tensor(0, vec![2, 7], f32_frontend_fixture::INPUT);
+    let bias = f32_tensor(0, vec![7], f32_frontend_fixture::BIAS);
+    for (activation, expected) in [
+        (PointwiseActivation::None, f32_frontend_fixture::NONE),
+        (PointwiseActivation::Gelu, f32_frontend_fixture::GELU),
+        (PointwiseActivation::GeluExact, f32_frontend_fixture::EXACT),
+        (PointwiseActivation::Silu, f32_frontend_fixture::SILU),
+    ] {
+        let mut output = zeros_tensor(0, vec![2, 7], DType::F32);
+        let graph = crate::capture(&ctx, || {
+            let mut args =
+                PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
+            args.bias = Some(&bias);
+            args.activation = activation;
+            pointwise(&ctx, args)
+        })
+        .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        for (actual, expected) in super::framework::f32_values(&output).iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 2e-6,
+                "{activation:?}: {actual} != {expected}"
+            );
+        }
+    }
+    let state = f32_tensor(0, vec![1, 2], &[1.0, -1.0]);
+    let velocity = f32_tensor(0, vec![1, 2], &[-10.0, 10.0]);
+    let mut output = zeros_tensor(0, vec![1, 2], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, &state, &mut output);
+        args.secondary = Some(&velocity);
+        args.dt = 0.1;
+        pointwise(&ctx, args)
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [0.0, 0.0],
+        "Euler must not fuse multiply and add"
+    );
+}
+
+#[path = "rgb_normalization_torch_fixture.rs"]
+mod rgb_normalization_fixture;
+
+#[test]
+fn f32_gather_preserves_patch_and_bias_boundaries() {
+    let ctx = CudaContext::new(0).unwrap();
+    for views in 1..=3 {
+        let mut expected = Vec::new();
+        let image_nchw: Vec<u8> = (0..views * 3 * 16 * 16).map(|i| (i % 256) as u8).collect();
+        for view in 0..views {
+            for py in 0..8 {
+                for px in 0..8 {
+                    for channel in 0..3 {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let pixel = image_nchw
+                                    [(view * 3 + channel) * 256 + (py * 2 + dy) * 16 + px * 2 + dx];
+                                expected.push(f32::from_bits(
+                                    rgb_normalization_fixture::RGB_NORMALIZED_BITS[pixel as usize],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for nhwc in [false, true] {
+            let mut image = image_nchw.clone();
+            if nhwc {
+                for view in 0..views {
+                    for pixel in 0..256 {
+                        for channel in 0..3 {
+                            image[(view * 256 + pixel) * 3 + channel] =
+                                image_nchw[(view * 3 + channel) * 256 + pixel];
+                        }
+                    }
+                }
+            }
+            let images = crate::CudaBuffer::alloc(image.len(), 0).unwrap();
+            images.copy_from_host(&image).unwrap();
+            let mut output = zeros_tensor(0, vec![views * 64, 12], DType::F32);
+            let graph = crate::capture(&ctx, || {
+                gather(
+                    &ctx,
+                    GatherArgs::rgb_to_patches(
+                        &images,
+                        &mut output,
+                        GatherPatchGeometry {
+                            views,
+                            image_size: 16,
+                            patch_size: 2,
+                            nhwc,
+                        },
+                    ),
+                )
+            })
+            .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let actual = super::framework::f32_values(&output);
+            assert_eq!(
+                actual.iter().zip(&expected).position(|(a, b)| a != b),
+                None,
+                "RGB normalization differs: views={views} nhwc={nhwc}"
+            );
+            images.copy_from_host(&vec![0; image.len()]).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert!(super::framework::f32_values(&output)
+                .iter()
+                .all(|value| *value == -1.0));
+        }
+    }
+    let input = f32_tensor(0, vec![2, 2], &[1e8, -1e8, 1e8, -1e8]);
+    let owner = std::sync::Arc::downgrade(input.storage().as_gpu().unwrap().owner().unwrap());
+    let bias = f32_tensor(0, vec![2], &[-1e8, 1e8]);
+    let position = f32_tensor(0, vec![1, 2], &[1.0, -1.0]);
+    let mut output = zeros_tensor(0, vec![2, 2], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        let mut args = GatherArgs::new(GatherSemantic::BiasPosition, &input, &mut output);
+        args.bias = Some(&bias);
+        args.position = Some(&position);
+        args.tokens_per_view = 1;
+        gather(&ctx, args)
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [1.0, -1.0, 1.0, -1.0]
+    );
+    drop(input);
+    assert!(owner.upgrade().is_some());
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::framework::f32_values(&output),
+        [1.0, -1.0, 1.0, -1.0]
+    );
+    drop(graph);
+    assert!(owner.upgrade().is_none());
+}
+
+#[path = "layer_norm_torch_fixture.rs"]
+mod layer_norm_fixture;
+
+#[test]
+fn bf16_layer_norm_preserves_vectorized_statistics() {
+    let ctx = CudaContext::new(0).unwrap();
+    for &(seed, expected_bits) in layer_norm_fixture::CASES {
+        let mut state = seed;
+        let values: Vec<f32> = (0..3 * 1152)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (((state >> 16) & 1023) as i32 - 512) as f32
+            })
+            .collect();
+        let input_bits: Vec<u16> = values[..1152]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 256.0 - 2.5).to_bits())
+            .collect();
+        let weight_bits: Vec<u16> = values[1152..2304]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 1024.0 + 1.0).to_bits())
+            .collect();
+        let bias_bits: Vec<u16> = values[2304..]
+            .iter()
+            .map(|&v| half::bf16::from_f32(v / 2048.0).to_bits())
+            .collect();
+        for rows in [1, 256, 512, 768] {
+            let input = bf16_bits_tensor(0, vec![rows, 1152], &input_bits.repeat(rows));
+            let weight = bf16_bits_tensor(0, vec![1152], &weight_bits);
+            let bias = bf16_bits_tensor(0, vec![1152], &bias_bits);
+            let zero = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let mut output = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let mut hidden = tensor(0, vec![rows, 1152], &vec![0.0; rows * 1152]);
+            let expected: Vec<_> = expected_bits
+                .repeat(rows)
+                .into_iter()
+                .map(|bits| half::bf16::from_bits(bits).to_f32())
+                .collect();
+            layer_norm(
+                &ctx,
+                LayerNormArgs::new(&input, &weight, &bias, &mut output, 1e-6),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b),
+                None,
+                "LayerNorm statistics rows={rows}"
+            );
+            bias_residual_layer_norm(
+                &ctx,
+                BiasResidualLayerNormArgs::new(
+                    &input,
+                    None,
+                    &zero,
+                    &weight,
+                    &bias,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b),
+                None,
+                "fused LayerNorm statistics rows={rows}"
+            );
+            let graph = crate::capture(&ctx, || {
+                layer_norm(
+                    &ctx,
+                    LayerNormArgs::new(&input, &weight, &bias, &mut output, 1e-6),
+                )
+            })
+            .unwrap();
+            crate::CudaBuffer::from_tensor(&input)
+                .unwrap()
+                .copy_from_host(&vec![0; rows * 1152 * 2])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let expected_bias: Vec<_> = bias_bits
+                .repeat(rows)
+                .into_iter()
+                .map(|bits| half::bf16::from_bits(bits).to_f32())
+                .collect();
+            assert_eq!(
+                super::framework::values(&output)
+                    .iter()
+                    .zip(&expected_bias)
+                    .position(|(a, b)| a != b),
+                None,
+                "changed-input replay rows={rows}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bf16_gemm_preserves_f32_split_k_reduction() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, n, k) = (512, 1152, 1152);
+    let a = tensor(0, vec![m, k], &vec![1.0; m * k]);
+    let mut weights = vec![-1.0; k * n];
+    weights[..k / 2 * n].fill(1.0);
+    weights[..n].fill(1.0 / 256.0);
+    let b = tensor(0, vec![k, n], &weights);
+    let bias = tensor(0, vec![n], &vec![1.0; n]);
+    // Exact dyadic dot product: 575 + 1/256 - 576. A BF16 split-K
+    // partial sum loses the small term before cancellation and bias.
+    for biased in [false, true] {
+        let mut output = zeros_tensor(0, vec![m, n], DType::BF16);
+        let args = GemmArgs::new(&a, &b, &mut output);
+        let (semantic, extra, expected) = if biased {
+            (
+                super::contracts::Semantic::GemmBias,
+                Some(&bias),
+                1.0 / 256.0,
+            )
+        } else {
+            (super::contracts::Semantic::Gemm, None, -1.0 + 1.0 / 256.0)
+        };
+        validate_all_candidates(&ctx, args, semantic, extra, &vec![expected; m * n]).unwrap();
+    }
+}
+
+#[test]
+fn bf16_gemm_bias_preserves_accumulation() {
+    for (dtype, alpha, scale) in [
+        (DType::BF16, 1.0, 1.0),
+        (DType::BF16, 0.5, 0.5),
+        (DType::F32, 1.0, 1.0),
+        (DType::F32, 0.5, 0.5),
+    ] {
+        for tune in [false, true] {
+            let ctx = CudaContext::new(0).unwrap();
+            let mut input = vec![0.0; 16];
+            input[..2].fill(1.0);
+            let mut weights = vec![0.0; 16 * 16];
+            weights[..16].fill(1.0);
+            weights[16..32].fill(1.0 / 256.0);
+            let a = tensor(0, vec![1, 16], &input);
+            let b = tensor(0, vec![16, 16], &weights);
+            let bias = tensor(0, vec![16], &[-alpha; 16]);
+            let mut output = zeros_tensor(0, vec![1, 16], dtype);
+            let mut run = || {
+                let mut gemm = GemmArgs::new(&a, &b, &mut output);
+                gemm.alpha = alpha;
+                gemm.output_scale = scale;
+                gemm.policy.online_tune = tune;
+                gemm.policy.cache_dir = Some(String::new());
+                gemm_bias(&ctx, GemmBiasArgs { gemm, bias: &bias })
+            };
+            let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+            prepare_with_session(&session, &mut run).unwrap();
+            let graph = crate::capture(&ctx, || with_session(&session, run)).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let values = |output: &Tensor| {
+                if dtype == DType::F32 {
+                    super::framework::f32_values(output)
+                } else {
+                    super::framework::values(output)
+                }
+            };
+            // Exact product is 1 + 1/256; rounding before bias loses 1/256.
+            assert_eq!(
+                values(&output),
+                vec![1.0 / 256.0; 16],
+                "bias before rounding"
+            );
+            crate::CudaBuffer::from_tensor(&a)
+                .unwrap()
+                .copy_from_host(&[0; 32])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(values(&output), vec![-1.0; 16], "changed-input replay");
+        }
+    }
+}
+
+#[test]
+fn bf16_attention_preserves_softmax_rounding() {
+    // Independent CUDA PyTorch 2.9.1 SDPA FLASH_ATTENTION fixture. Inputs are
+    // exact multiples of 1/32; the reference uses the public FP32 scale.
+    let expected = [
+        (68162, 0x3ccf),
+        (117255, 0x3d27),
+        (154872, 0x3d8e),
+        (164821, 0x3be2),
+        (209109, 0xbab6),
+        (209110, 0x3cbc),
+        (209125, 0x3bad),
+        (209135, 0xbd34),
+        (209138, 0x3ad1),
+        (209141, 0x3b6d),
+        (209144, 0xbd32),
+        (241201, 0x394d),
+        (241205, 0x3ba3),
+        (241220, 0xbb93),
+        (241227, 0x3bee),
+        (241232, 0xbbd2),
+    ];
+    let elements = 256 * 16 * 72;
+    let mut state = 37u32;
+    let source: Vec<_> = (0..3 * elements)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (((state >> 16) % 65) as f32 - 32.0) / 32.0
+        })
+        .collect();
+    for batch in [1, 2, 3] {
+        let ctx = CudaContext::new(0).unwrap();
+        let shape = vec![batch, 256, 16, 72];
+        let q = tensor(0, shape.clone(), &source[..elements].repeat(batch));
+        let k = tensor(
+            0,
+            shape.clone(),
+            &source[elements..2 * elements].repeat(batch),
+        );
+        let v = tensor(0, shape.clone(), &source[2 * elements..].repeat(batch));
+        let mut output = zeros_tensor(0, shape, DType::BF16);
+        let mut run = || {
+            let mut args = AttentionArgs::new(&q, &k, &v, &mut output);
+            args.policy.allow_fallback = false;
+            args.policy.cache_dir = Some(String::new());
+            attention(&ctx, args)
+        };
+        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+        prepare_with_session(&session, &mut run).unwrap();
+        let graph = crate::capture(&ctx, || with_session(&session, run)).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = super::framework::values(&output);
+        for view in 0..batch {
+            for (index, value) in expected {
+                assert_eq!(
+                    actual[view * elements + index],
+                    half::bf16::from_bits(value).to_f32(),
+                    "Softmax rounding"
+                );
+            }
+        }
+        let original: Vec<u8> = source[2 * elements..]
+            .repeat(batch)
+            .iter()
+            .flat_map(|&x| half::bf16::from_f32(x).to_bits().to_ne_bytes())
+            .collect();
+        let values_buffer = crate::CudaBuffer::from_tensor(&v).unwrap();
+        for iteration in 0..32 {
+            values_buffer.copy_from_host(&original).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let restored = super::framework::values(&output);
+            for view in 0..batch {
+                for (index, value) in expected {
+                    assert_eq!(
+                        restored[view * elements + index],
+                        half::bf16::from_bits(value).to_f32(),
+                        "restore before replay batch={batch} iteration={iteration}"
+                    );
+                }
+            }
+            values_buffer
+                .copy_from_host(&vec![0; batch * elements * 2])
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let replayed = super::framework::values(&output);
+            if let Some((index, value)) = replayed.iter().enumerate().find(|(_, x)| **x != 0.0) {
+                panic!(
+                    "changed-value replay: batch={batch}, iteration={iteration}, index={index}, value={value}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tf32_gemm_all_candidates_match_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (m, k, n) in [(1, 1024, 1024), (1, 1024, 3072), (50, 1024, 32)] {
+        let a: Vec<_> = (0..m * k)
+            .map(|i| ((i * 17 % 97) as f32 - 48.0) / 64.0)
+            .collect();
+        let b: Vec<_> = (0..k * n)
+            .map(|i| ((i * 31 % 89) as f32 - 44.0) / 64.0)
+            .collect();
+        let expected: Vec<_> = (0..m * n)
+            .map(|i| {
+                (0..k)
+                    .map(|j| a[i / n * k + j] as f64 * b[j * n + i % n] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        let input = f32_tensor(0, vec![m, k], &a);
+        let weight = f32_tensor(0, vec![k, n], &b);
+        let mut output = zeros_tensor(0, vec![m, n], DType::F32);
+        for immutable in [false, true] {
+            let mut args = GemmArgs::new(&input, &weight, &mut output);
+            args.math = GemmMath::Tf32;
+            if immutable {
+                args = args.with_immutable_weight(WeightVersion::new(0));
+            }
+            validate_all_candidates(
+                &ctx,
+                args,
+                super::contracts::Semantic::Gemm,
                 None,
                 &expected,
             )
