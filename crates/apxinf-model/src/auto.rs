@@ -7,7 +7,7 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
