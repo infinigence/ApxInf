@@ -317,6 +317,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
