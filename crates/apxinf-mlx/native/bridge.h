@@ -28,7 +28,7 @@ int apx_mlx_safetensors_entry(const void* loaded, size_t index, const char** nam
 void apx_mlx_safetensors_free(void* loaded);
 int apx_mlx_metal_new(const char* name, const char* source, const char* header, const char* const* inputs, size_t input_count, const char* const* outputs, size_t output_count, void** out);
 void apx_mlx_metal_free(void* kernel);
-int apx_mlx_metal_call(void* stream, void* kernel, const void* const* inputs, size_t input_count, const int32_t* shapes, const size_t* ranks, const int32_t* dtypes, size_t output_count, const int32_t* grid, const int32_t* group, int32_t template_dtype, void** outputs);
+int apx_mlx_metal_call(void* stream, void* kernel, const void* const* inputs, size_t input_count, const int32_t* shapes, const size_t* ranks, const int32_t* dtypes, size_t output_count, const int32_t* grid, const int32_t* group, const char* const* template_names, const int32_t* template_kinds, const int32_t* template_values, size_t template_count, void** outputs);
 #ifdef __cplusplus
 }
 #endif
