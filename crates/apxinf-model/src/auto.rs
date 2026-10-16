@@ -11,6 +11,7 @@ use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
+use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
 use crate::llm_trait::{
     GeneratedToken, GenerationOutput, GenerationRequest, LlmCapabilities, LlmInput, LlmTrait,
 };
@@ -95,6 +96,7 @@ pub enum LoadedModel {
     },
     Vla(Box<dyn VlaRuntime>),
     Decision(Box<dyn DecisionRuntime>),
+    Image(Box<dyn ImageRuntime>),
     Speech(Box<dyn SpeechRuntime>),
 }
 
@@ -111,6 +113,7 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(&mut **model),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
@@ -120,6 +123,7 @@ impl LoadedModel {
             Self::Vla(model) => Ok(&**model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
         }
     }
@@ -129,6 +133,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(&mut **model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -142,6 +147,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.code_names()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -151,6 +157,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -164,6 +171,7 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(model.capabilities()),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
@@ -180,6 +188,9 @@ impl LoadedModel {
             )),
             Self::Decision(_) => Err(Error::Other(
                 "decision models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Image(_) => Err(Error::Other(
+                "image models do not use autoregressive generation defaults".into(),
             )),
             Self::Speech(_) => Err(Error::Other(
                 "speech models do not use autoregressive generation defaults".into(),
@@ -226,8 +237,23 @@ impl LoadedModel {
             }
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
+    }
+
+    pub fn image_mut(&mut self) -> Result<&mut dyn ImageRuntime> {
+        match self {
+            Self::Image(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not image".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
+        }
+    }
+
+    pub fn generate_image(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
+        self.image_mut()?.generate(request)
     }
 
     pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
@@ -236,6 +262,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not speech".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
         }
     }
 
