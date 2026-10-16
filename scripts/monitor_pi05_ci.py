@@ -82,6 +82,14 @@ def validate_receipt(receipt: dict) -> None:
         raise ValueError("foreign GPU client or compiler during run")
 
 
+class MonitorCancelled(Exception):
+    """Cancellation must propagate through subprocess selectors.
+
+    InterruptedError is reserved for interrupted syscalls and may be swallowed
+    by selectors while an activity auditor is blocked.
+    """
+
+
 def monitor(args: argparse.Namespace) -> int:
     auditor = Path(os.environ["APXINF_CI_ACTIVITY_AUDIT"])
     digest = hashlib.sha256(auditor.read_bytes()).hexdigest()
@@ -91,7 +99,7 @@ def monitor(args: argparse.Namespace) -> int:
     child = None
     status = 1
     def interrupted(signum, _frame):
-        raise InterruptedError(f"activity monitor interrupted by signal {signum}")
+        raise MonitorCancelled(f"activity monitor interrupted by signal {signum}")
     handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         def sample() -> dict:
@@ -113,7 +121,7 @@ def monitor(args: argparse.Namespace) -> int:
         # Numerical/performance failures are separate from environment validity.
         receipt["passed"] = True
         validate_receipt(receipt)
-    except (ValueError, OSError, KeyError, ET.ParseError, subprocess.SubprocessError) as error:
+    except (MonitorCancelled, ValueError, OSError, KeyError, ET.ParseError, subprocess.SubprocessError) as error:
         receipt["passed"] = False
         receipt["error"] = str(error)
         status = 1

@@ -258,11 +258,21 @@ class ActivityTest(unittest.TestCase):
     def test_repeated_cancellation_still_kills_unresponsive_process(self):
         self._monitor_cancellation(True)
 
-    def _monitor_cancellation(self, ignore_term):
+    @unittest.skipUnless(os.name == "posix", "CI workers use POSIX process groups")
+    def test_cancellation_interrupts_blocked_activity_audit(self):
+        self._monitor_cancellation(False, block_audit=True)
+
+    def _monitor_cancellation(self, ignore_term, block_audit=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auditor = root / "auditor"
-            auditor.write_text(f"#!{sys.executable}\nimport json, time\n"
+            audited, audit_ready = root / "audited", root / "audit-ready"
+            slow_sample = (
+                f"from pathlib import Path\nimport os\np = Path({str(audited)!r})\n"
+                f"if p.exists():\n Path({str(audit_ready)!r}).write_text(str(os.getpid())); time.sleep(60)\n"
+                "else: p.touch()\n"
+            ) if block_audit else ""
+            auditor.write_text(f"#!{sys.executable}\nimport json, time\n" + slow_sample +
                 "print(json.dumps({'time': time.time(), 'processes': []}))\n")
             auditor.chmod(0o755)
             ready, stopped, output = (root / name for name in ("ready", "stopped", "activity.json"))
@@ -280,11 +290,15 @@ class ActivityTest(unittest.TestCase):
                 while not ready.exists() and monitor.poll() is None and time.monotonic() < deadline:
                     time.sleep(.01)
                 self.assertTrue(ready.exists(), "monitored child did not start")
+                if block_audit:
+                    while not audit_ready.exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(audit_ready.exists(), "activity auditor did not block")
                 monitor.terminate()
                 if ignore_term:
                     time.sleep(.1)
                     monitor.send_signal(activity.signal.SIGINT)
-                self.assertNotEqual(monitor.wait(timeout=15), 0)
+                self.assertNotEqual(monitor.wait(timeout=8 if block_audit else 15), 0)
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(ready.read_text()), 0)
                 if not ignore_term:
@@ -296,6 +310,11 @@ class ActivityTest(unittest.TestCase):
                 if monitor.poll() is None:
                     monitor.kill()
                 monitor.wait()
+                if audit_ready.exists():
+                    try:
+                        os.kill(int(audit_ready.read_text()), activity.signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 if ready.exists():
                     try:
                         os.killpg(int(ready.read_text()), activity.signal.SIGKILL)

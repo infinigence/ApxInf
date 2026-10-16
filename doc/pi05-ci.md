@@ -6,129 +6,79 @@ missing asset, uncalibrated performance or shape-switch budget, or failed prefli
 
 ## Acceptance status
 
-**Not accepted / not online.** The shared-board harness and CPU contracts are
-implemented; model precision and performance qualification remain open.
-Current real-image diagnostics contain eight observations projected to each
-view count. Whole-chunk and per-action-step checks give:
+**Not accepted / not online.** The shared-board harness is implemented. The
+branch now incorporates upstream's direct cuda-new PI05 migration (`#88`).
+Merged-source GPU accuracy, stability and performance require fresh validation;
+results from the old backend do not qualify the current implementation.
+The merge preserves explicit INT8 language normalization and its conservative
+allocation-schedule reservation. BF16/FP8 retain their folded weight recipes.
+
+### Historical numerical evidence
+
+The following real-image results describe the pre-migration implementation at
+`e811c4f6`, using the historical limits below. They are not current-head results:
 
 | Board / precision | 1 view | 2 views | 3 views |
 | --- | --- | --- | --- |
-| Thor maintained BF16 | 6/8 | 8/8 | 8/8 |
+| Thor BF16 | 6/8 | 8/8 | 8/8 |
 | Thor existing FP8 calibration | 0/8 | 4/8 | 4/8 |
-| Orin maintained BF16 | 7/8 | 8/8 | 8/8 |
-| Orin maintained INT8 | 0/8 | 6/8 | 4/8 |
+| Orin BF16 | 7/8 | 8/8 | 8/8 |
+| Orin INT8 | 0/8 | 6/8 | 4/8 |
 
-These results use the historical comparison limits described below. They are
-fixed-observation implementation diagnostics, not policy-success evaluations
-or an approved deployment bank. The images come from two official DROID
-episodes; the third exterior camera is explicitly mapped to the third model
-slot for shape coverage. DROID state normalization is not claimed.
+The eight observations come from two official DROID episodes. The third exterior
+camera is explicitly mapped to the third model slot for shape coverage. These
+are fixed-observation implementation diagnostics, not normalized DROID-policy
+or closed-loop success evaluations. The additional 13 constructed cases per
+view cover separate image, noise and token-length factors, including T200.
 
-Private complete BF16 controls can match the official outputs, but their
-maintained operator integration has failed full precision checks and first-call
-or warm-performance qualification. They have not been promoted. The maintained
-INT8 learned-norm packing and allocation-schedule fixes have passed prior paired
-performance regression checks; no new numerical prototype inherits that acceptance.
+Controlled Orin BF16 experiments establish that multiple numerical boundaries
+matter together: FP32 patch/auxiliary computations, staged BF16 RoPE/GeGLU,
+unfolded normalization, and reduction/GEMM conventions. An unfolded-norm plus
+staged-GeGLU subset passes all 24 real observations but fails 17 of 39 constructed
+cases. It is insufficient as a repair. The complete private candidate passes
+all 63 inputs and every action step; 57 outputs are bitwise official. These
+private adapters are not shipped or substituted for the official reference.
 
-Independent INT8 interventions identify differences in CPU/GPU weight packing,
-GeGLU rounding and language RMS parameter/reduction conventions. The expanded
-adapter using CPU F32 weight quantization, native GeGLU and post-RMS conventions
-agrees with native on 1/8, 7/8 and 8/8 inputs, including every action step.
-Remaining one-view errors include relative L2 of 0.548, so three successful
-selected cases do not establish correctness. A forced FlashAttention factor
-still fails two of the three selected cases. These are private diagnostic
-adapters, not official quantized OpenPI or approved references. FP8 calibration
-on four different observations improves real-image passes to 16/24 with a
-pooled profile, but still fails one-view and constructed diagnostics. Those
-profiles are unapproved.
+Replacing that complete candidate's language RoPE with a table-based device
+operator preserves all 63 outputs bitwise. The inverse-frequency buffer must
+first undergo the reference's BF16 conversion. A subsequent norm/time rewrite
+initially fails four cases with a different FP32 reduction schedule; changing
+only that schedule restores all 63 outputs bitwise. Independent GPU operator
+fixtures and deliberate incorrect-rounding controls support these findings.
+Time embeddings can be generated internally using FP64 periods and sequential
+FP32 timesteps: all 10,240 values match the pinned reference on Orin. These
+experiments identify semantics to carry into current interfaces; they do not
+prove that the newly merged runtime already implements them.
 
-A same-input check at 38 captured language RMS sites also found 660 activation
-scale-bit differences and 14 INT8 code differences between the native row
-quantizer and the diagnostic adapter. Correctly rounded F32 scale division
-eliminates both differences without changing the official chunk outputs.
-Changing only that adapter convention reduces the two worst one-view relative
-L2 errors from 0.548/0.249 to 0.217/0.123; both still fail. A successful operator
-comparison does not qualify the full model or authorize replacing an official
-golden. These findings concern the diagnostic reference, not a promoted native
-kernel repair or a performance claim.
+INT8 diagnostic adapters still fail full-model comparison after correcting
+weight packing, scale division, patch dtype and flow-rounding conventions.
+Some operator discrepancies disappear without fixing complete action chunks.
+FP8 calibration with additional observations improves the historical real-image
+count to 16/24 but still fails real and constructed cases. Neither quantized
+path has an approved replacement reference or a relaxed gate.
 
-The diagnostic adapter also inserted a BF16 bias rounding into an originally
-FP32 patch convolution. Official architecture dtype checks confirm that the
-patch input, weight, bias, output and position parameters use FP32. Correcting
-that boundary makes the first vision input and QKV bitwise equal to native on
-two selected observations. A native position-rounding candidate matched the
-incorrect adapter and was rejected; its operator timing is not evidence of a
-valid model repair. Subsequent attention/residual/activation differences and
-full-model qualification remain unresolved. Neither these diagnostic adapters
-nor any shared native-operator injection replace the official reference.
+### Performance and infrastructure evidence
 
-A fresh original Orin INT8 three-view control completes all eight observations
-without OOM, with bitwise-identical outputs and zero measured repeat/revisit
-drift. This does not establish the cause of the earlier private-candidate
-control OOM. Two repeats are a diagnostic count, not an approved stability
-protocol.
+The earlier INT8 capture-allocation repair has 1,000 paired timed calls:
+P50/P95 changes are within 0.437%, but the three-view shape return remains
+15–17 ms (0.66–0.78%) slower in both orders. This residual is not waived.
+The private RoPE replacement has 900 timed calls across 1–3 views and short/long
+tokens: steady-state P50/P95 improve, while some first calls increase by
+4–17 ms beyond both controls. Norm replacement performance is evaluated
+separately. All these measurements retain their original source and extension
+identities and do not establish current-head performance.
 
-Flow-rounding factors also fail to resolve the remaining errors. With the
-corrected diagnostic adapter, the two selected INT8 relative L2 errors are
-0.276/0.222; rounding initial noise gives 0.264/0.208, and additionally rounding
-each latent update gives 0.288/0.226. All remain failures. An independent
-unquantized BF16 experiment preserves every official control bitwise and tests
-all eight one-view observations. The control and all three rounding factors
-still pass only 7/8 including per-action-step checks. The failed observation's
-whole-chunk relative L2 rises from 0.045 to 0.051 with latent rounding and to
-0.055 with velocity rounding. These tests exclude flow rounding alone as a
-sufficient explanation or repair on the tested inputs. They do not authorize
-changing reference outputs, weakening per-step checks, or promoting a native
-change. Earlier adapter results above predate the FP32 convolution-boundary
-correction and remain historical diagnostic evidence.
+Shared desktop clients remain on Orin, and Thor also has external GPU services.
+An exclusive maintenance window, current-source matrix and measured budgets
+are required for formal acceptance. The harness never stops other users' jobs.
 
-A later BF16 factor combining unfolded norms and staged GeGLU passes all
-24 real-image observations, but only 22/39 constructed inputs; the maintained
-control passes 23/39. On two-view black images with zero noise, cosine worsens
-from 0.865164 to 0.554220. This candidate is rejected. Passing the real subset
-cannot waive a constructed-input failure. The official selected-parameter
-conversion also rounds checkpoint values to BF16 before restoring selected
-parameters to FP32; loading their original FP32 checkpoint values is a different
-numerical experiment. Correcting that distinction alone does not repair the
-five selected failing/control cases.
+The merged source passes 32 PI05 Rust CPU tests and module-boundary checks.
+The CI suite has 39 CPU tests. Real-process tests cover normal/repeated
+cancellation, an unresponsive worker and a blocked activity auditor. Cancellation
+uses a dedicated exception: `InterruptedError` can be swallowed as a retryable
+syscall interruption inside subprocess selectors, delaying worker cleanup.
 
-On five selected two-view inputs, the complete private BF16 control passes
-5/5 (four outputs are bitwise equal to official). Removing its staged GeGLU,
-RoPE rounding, or unfolded norms reduces passes to 2/5, 1/5, or 2/5 respectively.
-These interventions show that several numerical boundaries matter together;
-they do not qualify the private implementation for maintained deployment.
-
-A separate generic FP32 `gemm::matmul` defect was reproduced with a small CUDA
-graph test: allocating and zeroing its output during capture raises CUDA error
-900. Its output now uses the existing graph workspace; cuBLAS uses beta zero,
-so no initial output value is needed. The test fails before this allocation
-change and passes afterward, including graph replay with changed input values.
-The maintained PI05 BF16/INT8 paths do not call this generic FP32 helper. All
-63 BF16 and 24 INT8 frozen outputs remain bitwise identical on Orin after the
-change; this is a capture repair, not a repair of the numerical failures above.
-A separate stock INT8 run uses two frozen real inputs per view, 30 warmups and
-50 samples per input, with alternating version order. Across 1–3 views the six
-P50/P95 changes are within 0.44% in magnitude, including reversed-order checks
-of one and three views (1,000 timed samples in total). The initial first-call
-outlier does not recur; three-view shape return remains 0.66–0.78% slower in
-both pairs. This residual is recorded, and the shared desktop environment does
-not establish accepted performance budgets. Private FP32 pipeline timings are
-recorded separately from stock PI05 and official precision qualification.
-
-The activity auditor must be validated on the actual driver. Orin R39 CUDA
-clients retain `/dev/nvgpu/igpu0/ctrl` and anonymous GPU channel descriptors;
-checking only legacy `/dev/nvhost-gpu` paths misses them. The current Orin has
-persistent Xorg/GNOME GPU clients, which the corrected auditor rejects. A
-headless maintenance window and fresh environment/performance qualification
-are required before accepting this board as an exclusive GPU worker. This PR
-does not stop desktop services or interrupt developers.
-
-Before rollout, complete the production-representative input bank, approve
-numerical/stability/per-case performance budgets from measurements, qualify
-all twelve board/precision/view cells, and replay every maintained numerical
-repair through the same accuracy and paired performance protocols. Detailed
-experiment snapshots and raw receipts remain in the ignored development
-artifact directory; rejected probes are not product dependencies.
+No runners, dispatch variable or branch-protection rule have been enabled.
 
 ## Scope
 
