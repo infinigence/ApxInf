@@ -43,6 +43,9 @@ pub(crate) type VisionResidualNormMatmul<'a> = dyn Fn(&str, &Tensor, &Tensor, &T
 pub(crate) type VisionBiasResidual<'a> =
     dyn Fn(&str, &Tensor, &Tensor, &Tensor) -> Result<Tensor> + 'a;
 
+/// Start an overlapped L2 prefetch of named backbone weights.
+pub(crate) type VisionPrefetch<'a> = dyn Fn(&[&str]) -> Result<()> + 'a;
+
 fn fused_vision_mlp_residual_norm_shape_supported(
     n_patches: usize,
     hidden: usize,
@@ -165,6 +168,7 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    prefetch: Option<&VisionPrefetch<'_>>,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
     allow_cached_residual_layer_norm: bool,
@@ -185,6 +189,7 @@ pub(crate) fn forward_with_prepared_positions_and_matmul(
         segmented_attention,
         concat_quant,
         residual_norm_matmul,
+        prefetch,
         true,
         allow_gr00t_fused_mlp_residual_norm,
         bias_residual,
@@ -208,6 +213,7 @@ fn forward_impl(
     segmented_attention: Option<&VisionSegmentedAttention<'_>>,
     concat_quant: Option<&VisionConcatQuant<'_>>,
     residual_norm_matmul: Option<&VisionResidualNormMatmul<'_>>,
+    prefetch: Option<&VisionPrefetch<'_>>,
     allow_gr00t_fused_qkv_rope: bool,
     allow_gr00t_fused_mlp_residual_norm: bool,
     bias_residual: Option<&VisionBiasResidual<'_>>,
@@ -325,6 +331,14 @@ fn forward_impl(
     // the materialized BF16 residual. Keeping both tensors preserves the
     // legacy BF16 round-trip while removing one launch at each boundary.
     let mut prepared_norm1: Option<Tensor> = None;
+    // cand-14: stream the next vision GEMM's weights into L2 while the
+    // DRAM-light split/RoPE/attention and norm kernels run.
+    let prefetch_names = |names: &[&str]| -> Result<()> {
+        match prefetch {
+            Some(prefetch) => prefetch(names),
+            None => Ok(()),
+        }
+    };
     for (i, blk) in w.blocks.iter().enumerate() {
         let _blk_range = crate::profiling::trace::range(&format!("vision_block_{i}"));
         // pre-attn LayerNorm
@@ -351,6 +365,10 @@ fn forward_impl(
                 Error::Other(format!("vision block {i} QKV matmul failed: {error}"))
             })?
         };
+        prefetch_names(&[
+            &format!("backbone.vision.blocks.{i}.output"),
+            &format!("backbone.vision.blocks.{i}.fc1"),
+        ])?;
         // Split Q/K/V: qkv is [N, 3072] = [N, 3, 1024] interleaved as
         // (q[N,0:1024], k[N,1024:2048], v[N,2048:3072]). Reshape to
         // [N, 3, n_heads, head_dim] then split.

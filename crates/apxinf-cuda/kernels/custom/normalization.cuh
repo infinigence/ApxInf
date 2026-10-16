@@ -344,6 +344,56 @@ __global__ void layer_norm_quant_bf16_e4m3_kernel(
   }
 }
 
+// Fixed-width form of layer_norm_quant_bf16_e4m3_kernel for 256-thread
+// blocks. Thread t keeps the columns it owns in the generic kernel
+// (t + 256 * k) in registers instead of shared memory and issues all row
+// loads before the first reduction. Accumulation order, reduction tree,
+// barriers and rounding points are those of the generic kernel, so outputs
+// are bitwise identical.
+template <int kCols>
+__global__ void __launch_bounds__(256) layer_norm_quant_bf16_e4m3_fixed_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_fp8_e4m3* output,
+    int rows, float eps, float inverse_scale) {
+  static_assert(kCols % 256 == 0, "width must be a multiple of the block size");
+  constexpr int kPerThread = kCols / 256;
+  __shared__ float scratch[16];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int offset = row * kCols;
+  float x[kPerThread];
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k)
+    x[k] = __bfloat162float(input[offset + threadIdx.x + k * 256]);
+
+  float sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) sum += x[k];
+  const float mean = block_sum_parallel_unsafe(sum, scratch) / kCols;
+
+  float variance_sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    const float centered = x[k] - mean;
+    variance_sum += centered * centered;
+  }
+  // Finish reading the previous reduction before reusing scratch.
+  __syncthreads();
+  const float inverse_std =
+      rsqrtf(block_sum_parallel_unsafe(variance_sum, scratch) / kCols + eps);
+
+#pragma unroll
+  for (int k = 0; k < kPerThread; ++k) {
+    const int col = threadIdx.x + k * 256;
+    float value = (x[k] - mean) * inverse_std;
+    value = value * __bfloat162float(weight[col]) + __bfloat162float(bias[col]);
+    // Match the previous LayerNorm-then-quantize rounding contract.
+    value = __bfloat162float(__float2bfloat16(value));
+    value = fminf(448.0f, fmaxf(-448.0f, value * inverse_scale));
+    output[offset + col] = static_cast<__nv_fp8_e4m3>(value);
+  }
+}
+
 __global__ void layer_norm_quant_f16_e4m3_kernel(
     const half* input, const half* weight, const half* bias,
     __nv_fp8_e4m3* output, int rows, int cols, float eps,

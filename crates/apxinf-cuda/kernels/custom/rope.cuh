@@ -507,6 +507,100 @@ __global__ void build_vision_rotation_table_f32_kernel(
     rotation_table[linear] = make_float2(cosine, sine);
 }
 
+// Precomputed-table form of qkv_split_bias_vision_rope_bf16_kernel with
+// kPairs consecutive rotary pairs per thread and vector loads/stores. Per
+// element it computes the same expressions with the same rounding points;
+// the rotation's FMA contraction is pinned to the form nvcc generated for the
+// scalar kernel. Requires (head_dim / 2) % kPairs == 0 and vector-aligned
+// pointers.
+template <int kPairs>
+struct VisionRopeBf16Vec;
+
+template <>
+struct alignas(4) VisionRopeBf16Vec<2> {
+  __nv_bfloat16 v[2];
+};
+
+template <>
+struct alignas(8) VisionRopeBf16Vec<4> {
+  __nv_bfloat16 v[4];
+};
+
+template <int kPairs>
+struct alignas(8 * kPairs) VisionRopeRotVec {
+  float2 v[kPairs];
+};
+
+template <int kPairs>
+__global__ void qkv_split_bias_vision_rope_bf16_vec_kernel(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* bias,
+    __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const float2* rotation_table) {
+  using Vec = VisionRopeBf16Vec<kPairs>;
+  const uint32_t half = head_dim / 2;
+  const uint32_t groups = half / kPairs;
+  const uint64_t linear = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const uint64_t total = (uint64_t)seq_len * n_heads * groups;
+  if (linear >= total) return;
+  const uint32_t pair0 = (uint32_t)(linear % groups) * kPairs;
+  const uint64_t token_head = linear / groups;
+  const uint32_t head_idx = (uint32_t)(token_head % n_heads);
+  const uint32_t seq_idx = (uint32_t)(token_head / n_heads);
+  const uint32_t width = n_heads * head_dim;
+  const uint64_t qkv_row = (uint64_t)seq_idx * 3 * width;
+  const uint32_t head_col = head_idx * head_dim;
+  const uint64_t out_base = ((uint64_t)seq_idx * n_heads + head_idx) * head_dim;
+  auto load = [](const __nv_bfloat16* p) {
+    return *reinterpret_cast<const Vec*>(p);
+  };
+  const Vec q0r = load(qkv + qkv_row + head_col + pair0),
+            q1r = load(qkv + qkv_row + head_col + half + pair0);
+  const Vec k0r = load(qkv + qkv_row + width + head_col + pair0),
+            k1r = load(qkv + qkv_row + width + head_col + half + pair0);
+  const Vec v0r = load(qkv + qkv_row + 2 * width + head_col + pair0),
+            v1r = load(qkv + qkv_row + 2 * width + head_col + half + pair0);
+  const Vec bq0 = load(bias + head_col + pair0),
+            bq1 = load(bias + head_col + half + pair0);
+  const Vec bk0 = load(bias + width + head_col + pair0),
+            bk1 = load(bias + width + head_col + half + pair0);
+  const Vec bv0 = load(bias + 2 * width + head_col + pair0),
+            bv1 = load(bias + 2 * width + head_col + half + pair0);
+  const VisionRopeRotVec<kPairs> rot =
+      *reinterpret_cast<const VisionRopeRotVec<kPairs>*>(
+          rotation_table + (size_t)seq_idx * half + pair0);
+  Vec q0o, q1o, k0o, k1o, v0o, v1o;
+#pragma unroll
+  for (int j = 0; j < kPairs; ++j) {
+    // Match split_qkv_bias_bf16's intermediate output rounding exactly.
+    const float q0 = __bfloat162float(__float2bfloat16(
+        __bfloat162float(q0r.v[j]) + __bfloat162float(bq0.v[j])));
+    const float q1 = __bfloat162float(__float2bfloat16(
+        __bfloat162float(q1r.v[j]) + __bfloat162float(bq1.v[j])));
+    const float k0 = __bfloat162float(__float2bfloat16(
+        __bfloat162float(k0r.v[j]) + __bfloat162float(bk0.v[j])));
+    const float k1 = __bfloat162float(__float2bfloat16(
+        __bfloat162float(k1r.v[j]) + __bfloat162float(bk1.v[j])));
+    const float c = rot.v[j].x, s = rot.v[j].y;
+    // Contraction pinned to the form nvcc generated for the scalar kernel.
+    q0o.v[j] = __float2bfloat16(__fmaf_rn(q0, c, -__fmul_rn(q1, s)));
+    q1o.v[j] = __float2bfloat16(__fmaf_rn(q0, s, __fmul_rn(q1, c)));
+    k0o.v[j] = __float2bfloat16(__fmaf_rn(k0, c, -__fmul_rn(k1, s)));
+    k1o.v[j] = __float2bfloat16(__fmaf_rn(k0, s, __fmul_rn(k1, c)));
+    v0o.v[j] = __float2bfloat16(__bfloat162float(v0r.v[j]) + __bfloat162float(bv0.v[j]));
+    v1o.v[j] = __float2bfloat16(__bfloat162float(v1r.v[j]) + __bfloat162float(bv1.v[j]));
+  }
+  auto store = [](__nv_bfloat16* p, const Vec& x) {
+    *reinterpret_cast<Vec*>(p) = x;
+  };
+  store(q_out + out_base + pair0, q0o);
+  store(q_out + out_base + half + pair0, q1o);
+  store(k_out + out_base + pair0, k0o);
+  store(k_out + out_base + half + pair0, k1o);
+  store(v_out + out_base + pair0, v0o);
+  store(v_out + out_base + half + pair0, v1o);
+}
+
 // Fuse the vision QKV layout split, bias and 2D RoPE.  The explicit BF16
 // rounding before rotation preserves the established two-kernel contract:
 // split_qkv_bias_bf16 writes BF16 Q/K/V, then rope reads those BF16 values.

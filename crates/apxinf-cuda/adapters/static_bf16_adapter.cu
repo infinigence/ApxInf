@@ -1,14 +1,16 @@
 // Copyright 2026 apxinf contributors.
 // Stable C ABI and CUDA launch policy for static-path BF16 operators.
 
+#include "kernel_specialization_policy.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
-#include <cstdint>
 #include <cstdint>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -31,6 +33,14 @@ namespace {
 
 int blocks_for(int64_t count) {
   return static_cast<int>((count + kThreads - 1) / kThreads);
+}
+
+// cand-12: force the scalar elementwise kernel for bitwise A/B testing.
+const bool kLegacyScalarElementwise =
+    std::getenv("APXINF_LEGACY_SCALAR_ELEMENTWISE") != nullptr;
+
+bool aligned16(const void* pointer) {
+  return reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
 }
 // A load-ahead CTA reads the whole projection/residual row before writing
 // hidden. The __restrict__ specialization also requires both output ranges
@@ -406,6 +416,18 @@ extern "C" cudaError_t apxinf_static_bias_residual_bf16(
     const void* projection, const void* bias, const void* residual,
     void* output, int rows, int cols, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
+  if (apxinf::cuda::static_fp8_specializations &&
+      !kLegacyScalarElementwise && cols % 8 == 0 && aligned16(projection) &&
+      aligned16(residual) && aligned16(output) &&
+      (bias == nullptr || aligned16(bias))) {
+    const int64_t vectors = count / 8;
+    bias_residual_bf16_packed8_kernel<<<blocks_for(vectors), kThreads, 0, stream>>>(
+        static_cast<const Bf16Pack8*>(projection),
+        static_cast<const Bf16Pack8*>(bias),
+        static_cast<const Bf16Pack8*>(residual),
+        static_cast<Bf16Pack8*>(output), vectors, cols / 8);
+    return cudaGetLastError();
+  }
   bias_residual_bf16_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(projection),
       static_cast<const __nv_bfloat16*>(bias),
@@ -652,7 +674,44 @@ extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_bf16(
   return cudaGetLastError();
 }
 
+extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3_generic(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    float scale, cudaStream_t stream);
+
 extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
+    const void* projection, const void* projection_bias,
+    const void* residual, const void* norm_weight, const void* norm_bias,
+    void* hidden, void* normalized, int rows, int cols, float eps,
+    float scale, cudaStream_t stream) {
+  if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
+      norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
+      rows <= 0 || cols <= 0 || !std::isfinite(scale) || scale <= 0.0f)
+    return cudaErrorInvalidValue;
+  // GR00T vision width: register-resident form, bitwise identical to the
+  // generic kernel.
+  static const bool generic = std::getenv("APXINF_GENERIC_LAYER_NORM_QUANT") != nullptr;
+  if (apxinf::cuda::static_fp8_specializations &&
+      cols == 1024 && kThreads == 256 && !generic) {
+    bias_residual_layer_norm_quant_bf16_e4m3_fixed_kernel<1024><<<rows, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projection),
+        static_cast<const __nv_bfloat16*>(projection_bias),
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(norm_weight),
+        static_cast<const __nv_bfloat16*>(norm_bias),
+        static_cast<__nv_bfloat16*>(hidden),
+        static_cast<__nv_fp8_e4m3*>(normalized), rows, eps, 1.0f / scale);
+    return cudaGetLastError();
+  }
+  return apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3_generic(
+      projection, projection_bias, residual, norm_weight, norm_bias, hidden,
+      normalized, rows, cols, eps, scale, stream);
+}
+
+// Generic kernel for any width; also the bitwise reference for the
+// fixed-width specialization in tests.
+extern "C" cudaError_t apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3_generic(
     const void* projection, const void* projection_bias,
     const void* residual, const void* norm_weight, const void* norm_bias,
     void* hidden, void* normalized, int rows, int cols, float eps,

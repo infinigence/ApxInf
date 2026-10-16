@@ -15,10 +15,12 @@ pub mod gdn_policy;
 pub mod gemm;
 pub mod linear_attention;
 pub mod norm;
+pub mod prefetch;
 pub mod preprocess;
 pub mod quantization;
 pub mod rope;
 pub mod sampling;
+pub mod specialization;
 
 pub use crate::workspace::GraphWorkspace;
 

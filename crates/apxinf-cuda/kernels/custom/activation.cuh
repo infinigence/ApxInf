@@ -258,6 +258,47 @@ __global__ void bias_gelu_quant_bf16_e4m3_packed4_kernel(
   }
 }
 
+// Eight columns per thread on a (column-chunk, row) grid: 16-byte input,
+// bias and 8-byte output accesses, and no 64-bit `index % cols` per element
+// group. Per element it computes exactly the packed4 kernel's expressions.
+// Requires cols % 8 == 0, 16-byte aligned input/bias and 8-byte aligned output.
+struct alignas(16) BiasGeluQuantBf16x8 {
+  __nv_bfloat162 v[4];
+};
+
+__global__ void bias_gelu_quant_bf16_e4m3_vec8_kernel(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    __nv_fp8_e4m3* output, int cols, float inverse_scale) {
+  const int groups_per_row = cols / 8;
+  const int group = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group >= groups_per_row) return;
+  const int64_t row_group =
+      static_cast<int64_t>(blockIdx.y) * groups_per_row + group;
+  const BiasGeluQuantBf16x8 x = reinterpret_cast<const BiasGeluQuantBf16x8*>(input)[row_group];
+  const BiasGeluQuantBf16x8 b = reinterpret_cast<const BiasGeluQuantBf16x8*>(bias)[group];
+  uint32_t packed[2];
+#pragma unroll
+  for (int q = 0; q < 2; ++q) {
+    const __nv_bfloat162 xl = x.v[2 * q], xh = x.v[2 * q + 1];
+    const __nv_bfloat162 bl = b.v[2 * q], bh = b.v[2 * q + 1];
+    const float y0 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(xl.x) + __bfloat162float(bl.x))));
+    const float y1 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(xl.y) + __bfloat162float(bl.y))));
+    const float y2 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(xh.x) + __bfloat162float(bh.x))));
+    const float y3 = __bfloat162float(__float2bfloat16(gelu_tanh(
+        __bfloat162float(xh.y) + __bfloat162float(bh.y))));
+    const __nv_fp8x2_e4m3 first(make_float2(
+        y0 * inverse_scale, y1 * inverse_scale));
+    const __nv_fp8x2_e4m3 second(make_float2(
+        y2 * inverse_scale, y3 * inverse_scale));
+    packed[q] = static_cast<uint32_t>(first.__x) |
+                (static_cast<uint32_t>(second.__x) << 16);
+  }
+  reinterpret_cast<uint2*>(output)[row_group] = make_uint2(packed[0], packed[1]);
+}
+
 __global__ void bias_silu_quant_f16_e4m3_kernel(
     const half* input, const half* bias, __nv_fp8_e4m3* output,
     int64_t count, int cols, float inverse_scale) {

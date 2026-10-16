@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use super::cuda::{cudaError_t, cudaStream_t};
 
 extern "C" {
+    pub fn apxinf_set_static_fp8_specializations(enabled: i32) -> i32;
     pub fn apxinf_sinusoidal_embedding_bf16(
         positions: *const c_void,
         output: *mut c_void,
@@ -12,6 +13,14 @@ extern "C" {
         dim: i32,
         scale: f32,
         frequency_step: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_l2_bulk_prefetch(
+        base: *const c_void,
+        bytes: u64,
+        chunk: u32,
+        blocks: u32,
+        threads: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_relu_bf16(
@@ -325,6 +334,17 @@ extern "C" {
         scale: f32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub fn apxinf_static_layer_norm_quant_bf16_e4m3_generic(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
     pub fn apxinf_static_layer_norm_quant_f16_e4m3(
         input: *const c_void,
         weight: *const c_void,
@@ -346,6 +366,15 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_bias_gelu_quant_bf16_e4m3(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_bias_gelu_quant_packed4_bf16_e4m3(
         input: *const c_void,
         bias: *const c_void,
         output: *mut c_void,
@@ -924,6 +953,20 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
     pub fn apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3(
+        projection: *const c_void,
+        projection_bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        scale: f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_static_bias_residual_layer_norm_quant_bf16_e4m3_generic(
         projection: *const c_void,
         projection_bias: *const c_void,
         residual: *const c_void,
@@ -1694,6 +1737,18 @@ extern "C" {
     ) -> cudaError_t;
 
     pub fn apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+        qkv: *const c_void,
+        bias: *const c_void,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        v_out: *mut c_void,
+        head_dim: u32,
+        n_heads: u32,
+        seq_len: u32,
+        rotation_table: *const c_void,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
         qkv: *const c_void,
         bias: *const c_void,
         q_out: *mut c_void,

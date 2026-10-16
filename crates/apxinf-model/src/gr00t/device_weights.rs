@@ -96,6 +96,34 @@ pub(super) trait DeviceLinearWeights: Debug {
         ))
     }
 
+    /// Device weight tensor(s) streamed by this projection's forward (empty
+    /// when the precision does not opt into L2 prefetch).
+    fn l2_prefetch_tensors(&self, _as_self_attention_input: bool) -> Vec<&Tensor> {
+        Vec::new()
+    }
+
+    /// Prepare an exact fused self-attention Q|K|V projection on the query
+    /// weights (`self`) from its key/value siblings, when the precision has
+    /// one. Default: no fused path.
+    fn prepare_exact_self_qkv(
+        &mut self,
+        _key: &Self,
+        _value: &Self,
+        _backend: &RuntimeBackend,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Run the prepared exact fused self-attention Q|K|V projection with bias,
+    /// returning `[tokens, 3 * hidden]` BF16, or `None` when unavailable.
+    fn forward_exact_self_qkv(
+        &self,
+        _input: &Self::ReusableInput,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// Return a private exact-shape FC2 projection + bias + residual fusion
     /// when this precision provides one. All generic/default implementations
     /// retain the established projection followed by pointwise fallback.

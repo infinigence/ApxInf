@@ -292,6 +292,8 @@ pub use plan::{PlanSource, PreparedGemmPlan};
 pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused};
 #[doc(hidden)]
 pub use fp8::gemm_fp8_bias_then_residual_bf16_m41 as fp8_bias_then_residual_bf16_m41;
+#[doc(hidden)]
+pub use fp8::gemm_fp8_self_qkv_bf16_m41 as fp8_self_qkv_bf16_m41;
 #[cfg(test)]
 pub(crate) use fp8::prepare_cublaslt_fp8_gemm;
 pub use fp8::{
