@@ -53,7 +53,7 @@ acceptance; the aggregator rejects that mismatch.
   RED/GREEN test and six existing GEMM regressions. The two-view private
   diagnostic improves from 8/13 to 9/13; white-image relative L2 falls from
   0.290 to 0.052 and still fails. The full maintained matrix is recorded above;
-  Orin paired performance qualification is still running.
+  Orin paired performance diagnostics are recorded below.
 - After that fix, Orin's first vision FC2 difference is attributable to the
   **reference's** reduced-precision BF16 partial sums. With frozen identical
   inputs/weights, disabling PyTorch's `allow_bf16_reduced_precision_reduction`
@@ -66,13 +66,18 @@ acceptance; the aggregator rejects that mismatch.
   observation sites. Restoring observation at those GEMMs passes a small
   checkpoint-free CUDA RED/GREEN regression on both Thor and Orin. The observer
   already supports FP32 tensors. All 63 Thor outputs remain bitwise unchanged
-  with observation inactive; paired performance regression is pending.
+  with observation inactive. Paired measurements across all three views show
+  no clear steady-state slowdown (maximum P50 increase 0.016 ms). Three
+  independent two-view repeats also overlap in first-call latency, while
+  shape-return tails remain higher in some candidate runs (1.078–1.146 s
+  versus 1.058–1.082 s); these shared-desktop results are not accepted budgets.
 - The original FP8 calibration used seven synthetic inputs with horizon 10.
   Its metadata does not qualify it for the horizon-50 acceptance matrix.
   A new calibration factor uses four separate real observations, disjoint from
   evaluation, across 1–3 views. It is an unapproved experiment and does not
-  replace the existing profile or reference. Keeping only the FP8 flow state
-  in FP32 leaves the 1/2-view pass counts unchanged (6/42); that isolated change
+  replace the existing profile or reference. On fifteen pilot inputs, the
+  original profile passes 2/15 and the new one passes 0/15; the new profile is
+  rejected. Keeping only the FP8 flow state in FP32 leaves the 1/2-view pass counts unchanged (6/42); that isolated change
   does not resolve quantization failures.
 - A separate Thor action-down difference comes from **FP32 reduction order**:
   several split-K candidates match OpenPI while the selected unsplit candidate
@@ -97,24 +102,32 @@ exclusive-run budgets. Latest maintained Thor split-K measurements, against the 
 | 3 | 87.064 / 84.686 / 86.322 ms | 91.028 / 91.291 / 91.061 ms |
 
 The two-view T10 increase is approximately 1% and remains unresolved.
-The complete private Thor arithmetic repair adds approximately 9–11 ms; its
-performance debt prevents acceptance. The maintained Orin repair through RGB
-normalization was compared with `35bcbf59`, including earlier INT8 repairs:
+The complete private Thor arithmetic repair adds approximately 9–11 ms. A
+single-factor measurement attributes about 8–9 ms to staged Attention; unrolling
+its softmax saves about 1.65 ms in the full two-view model. This remains private
+performance debt. Latest maintained Orin measurements include TF32 and split-K
+repairs, against `35bcbf59`, including earlier INT8 repairs:
 
 | Precision / views | T10 baseline / repair / revisit P50 | T200 baseline / repair / revisit P50 |
 | --- | --- | --- |
-| INT8 / 1 | 87.278 / 87.838 / 87.370 ms | 104.671 / 105.161 / 104.560 ms |
-| INT8 / 2 | 127.739 / 127.739 / 127.465 ms | 144.322 / 144.863 / 144.835 ms |
-| INT8 / 3 | 166.664 / 167.214 / 166.770 ms | 184.138 / 183.959 / 183.584 ms |
-| BF16 / 1 | 131.264 / 131.839 / 131.616 ms | 130.719 / 131.579 / 131.363 ms |
-| BF16 / 2 | 193.462 / 194.783 / 193.534 ms | 184.900 / 185.395 / 183.873 ms |
-| BF16 / 3 | 213.846 / 214.584 / 215.670 ms | 228.423 / 229.880 / 230.703 ms |
+| INT8 / 1 | 87.346 / 87.762 / 87.327 ms | 104.473 / 105.242 / 104.649 ms |
+| INT8 / 2 | 127.663 / 127.995 / 127.536 ms | 144.173 / 144.856 / 144.544 ms |
+| INT8 / 3 | 166.969 / 167.020 / 166.634 ms | 183.842 / 183.700 / 183.487 ms |
+| BF16 / 1 | 131.422 / 134.144 / 131.621 ms | 130.595 / 131.038 / 130.480 ms |
+| BF16 / 2 | 193.621 / 195.532 / 193.958 ms | 185.045 / 183.063 / 185.442 ms |
+| BF16 / 3 | 217.307 / 218.723 / 216.186 ms | 231.073 / 229.380 / 230.616 ms |
 
 Small increases, shape-return costs and baseline drift are retained, not waived.
 Final-source BF16/FP8/INT8 accuracy, stability, performance and hosted aggregation
-must all be accepted before rollout. CPU CI currently has 45 passing tests,
+must all be accepted before rollout. CPU CI currently has 46 passing tests,
 including real-process cancellation, repeated cancellation, unresponsive-worker
-and blocked-auditor cleanup. No online configuration has been enabled.
+and blocked-auditor cleanup. The standalone comparator also rejects missing,
+invalid or mismatched checkpoint/config identities. Replaying 252 saved GPU
+outputs preserves every case verdict. Thor CUDA library tests pass 101 tests
+with two ignored; the wider integration suite stops on missing external Qwen
+reference tensors. Orin has twelve failures in Thor-specific provider tests,
+so the full cross-model CUDA suite is not reported as passing. No online
+configuration has been enabled.
 
 ## Scope
 
