@@ -104,3 +104,13 @@ because arbitrary source can perform out-of-bounds access. Public fusions belong
 in this crate with complete shape/dtype/index guards and provenance. A source
 kernel and compile success alone do not establish numerical or performance
 acceptance; model and hardware qualification remain separate.
+
+Kernel templates take dtype, integer and boolean arguments (`TemplateArg`).
+An integer template is a specialization fact: each distinct value builds and
+caches a separate Metal pipeline the first time it is used.
+
+The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
+`SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
+weights to FP16 for one call only; they keep no decoded weight resident.
+Their tests compare each kernel with MLX operators or a host reference on
+small shapes. They do not qualify the Clef model.
