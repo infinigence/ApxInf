@@ -39,7 +39,8 @@ impl Dit {
     }
 
     /// `nn.QuantizedLinear`. Image tokens in multiples of 64 decode the
-    /// weight per call and use the MPP GEMM, which gives the same bits.
+    /// weight per call and use the probe-selected MPP GEMM. Full-image parity
+    /// requires separate qualification for the selected device and profile.
     fn project(&self, w: &Q4, x: &Array, image: bool) -> Result<Array> {
         match &self.gemm {
             Some(gemm) if image && x.shape()[1] % 64 == 0 => {

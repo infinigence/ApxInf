@@ -12,10 +12,23 @@ revision `c78c0880dfa969d42a406e6abfadc2375bfa118d`: affine Q4/group-64 DiT
 decoder. The weights are under the Qwen Research License, which permits
 non-commercial use only; APXinf ships no weights.
 
-The family admits batch one, 40 linear steps at guidance 1, and sides that are
-multiples of 16 up to the RoPE table limit. Empty prompts, other step counts,
-negative prompts, true CFG, editing, ControlNet and LoRA are rejected or not
-exposed.
+The family admits batch one, 40 linear steps at guidance 1, and positive sides
+that are multiples of 16 up to the RoPE table limit of 32768 pixels. Both
+variants also require `(width / 16) * (height / 16) <= 174762` image tokens.
+This is the MLP projection's signed-32-bit flattened-index limit:
+`tokens * 12288 - 1 <= i32::MAX`. It also bounds the Q/K fusion grid and keeps
+the existing FP32 scheduler's terminal rescale finite and nonzero. These are
+execution bounds, not a memory-capacity or output-quality guarantee. Admission
+checks the dimensions and checked token product before any request device work.
+512 x 512, 1024 x 576 and the default 1024 x 1024 remain admitted; squares with
+sides 8192, 16384 or 32768 are rejected. Empty prompts, other step counts,
+negative prompts, true CFG, editing, ControlNet and LoRA are rejected or not exposed.
+
+`model_variant=auto`, also the default when omitted, retains the existing MPP
+selection and optimization target. `model_variant=reference` skips the MPP
+probe and uses MLX quantized matmul for all Q4 projections. It changes neither
+checkpoint interpretation nor the schedule, text encoder, compilation or VAE.
+Select it from the CLI with `generate-image --model-variant reference`.
 
 - `weights.rs` checks every DiT and VAE decoder key, dtype and shape at load.
   For the text encoder it checks every tensor header at load and reads one
@@ -31,9 +44,12 @@ exposed.
 - Image-token block projections decode Q4 to BF16 per call and use the
   MetalPerformancePrimitives GEMM when the token count is a multiple of 64
   (EngineTailor GEMM frontier 427d48fc). Loading enables it only when a probe
-  shows that it compiles and reproduces MLX quantized matmul bit for bit, so
-  the image does not depend on the path; otherwise, and for the text prefix,
-  projections use quantized matmul.
+  shows that it compiles and matches MLX quantized matmul bit for bit for the
+  synthetic `(M, K, N) = (64, 4096, 128)` inputs. That single probe does not
+  qualify checkpoint weights, other projection shapes or whole-image equality.
+  This optimization still needs independent device/runtime and workload
+  qualification. In `reference`, when the probe fails, for unaligned image
+  token counts, and for the text prefix, projections use quantized matmul.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
   overlap, and blends tiles on the host.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and

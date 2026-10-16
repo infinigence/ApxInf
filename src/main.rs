@@ -169,6 +169,10 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
+        /// Family execution variant (Qwen-Image: auto or reference)
+        #[arg(long)]
+        model_variant: Option<String>,
+
         /// Text prompt
         #[arg(short, long)]
         prompt: String,
@@ -305,6 +309,7 @@ fn main() {
         Commands::GenerateImage {
             model,
             model_name,
+            model_variant,
             prompt,
             width,
             height,
@@ -321,7 +326,14 @@ fn main() {
                 steps,
             };
             let result = parse_device(&device).and_then(|device| {
-                run_generate_image(&model, model_name.as_deref(), device, &request, &output)
+                run_generate_image(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
             });
             if let Err(error) = result {
                 eprintln!("{error}");
@@ -411,7 +423,7 @@ mod truncation_tests {
 
 #[cfg(test)]
 mod device_tests {
-    use super::{parse_device, Cli, Commands};
+    use super::{parse_device, run_generate_image, Cli, Commands, ImageRequest};
     use apxinf_core::Device;
     use clap::Parser;
 
@@ -466,6 +478,83 @@ mod device_tests {
         };
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
+    }
+
+    #[test]
+    fn image_cli_accepts_reference_variant() {
+        let result = Cli::try_parse_from([
+            "apxinf",
+            "generate-image",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "a red bicycle",
+            "--output",
+            "image.ppm",
+            "--model-variant",
+            "reference",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("reference variant rejected: {error}"));
+        let Commands::GenerateImage {
+            model_variant,
+            width,
+            height,
+            steps,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate-image command");
+        };
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!((width, height, steps), (1024, 1024, 40));
+    }
+
+    #[test]
+    fn image_cli_preserves_default_and_auto_variants() {
+        for variant in [None, Some("auto")] {
+            let mut arguments = vec![
+                "apxinf",
+                "generate-image",
+                "--model",
+                "/checkpoint",
+                "--prompt",
+                "a red bicycle",
+                "--output",
+                "image.ppm",
+            ];
+            if let Some(variant) = variant {
+                arguments.extend(["--model-variant", variant]);
+            }
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Commands::GenerateImage { model_variant, .. } = cli.command else {
+                panic!("expected generate-image command");
+            };
+            assert_eq!(model_variant.as_deref(), variant);
+        }
+    }
+
+    #[test]
+    fn image_command_forwards_variant_to_loader_before_checkpoint_io() {
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 512,
+            height: 512,
+            seed: 7,
+            steps: 40,
+        };
+        let error = run_generate_image(
+            &"/missing-qwen-image-checkpoint".into(),
+            Some("qwen_image"),
+            Some("reference"),
+            Device::Cpu,
+            &request,
+            &"/unused-image.ppm".into(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("model qwen_image does not yet support model_variant"),
+            "{error}"
+        );
     }
 }
 
@@ -729,6 +818,7 @@ fn run_generate(
 fn run_generate_image(
     model_dir: &PathBuf,
     model_name_override: Option<&str>,
+    model_variant: Option<&str>,
     device: Device,
     request: &ImageRequest<'_>,
     output: &PathBuf,
@@ -740,6 +830,7 @@ fn run_generate_image(
     };
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
         ..LoadOptions::default()
     };
     eprintln!("Loading {model_name} from {:?}...", model_dir);
