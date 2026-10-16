@@ -401,7 +401,10 @@ inference; a developer who takes the GPU meanwhile causes exit 75.
 The trusted wrapper also polls GPU device users and compiler processes during
 inference. A foreign process invalidates the run and stops only the CI process
 group. The hosted aggregate requires `activity.json` and checks its raw samples;
-a green summary cannot override interference or missing coverage. Sampling does
+a green summary cannot override interference or missing coverage. SIGINT/SIGTERM
+cancellation saves a failed receipt and terminates the monitored process group;
+repeated cancellation cannot interrupt that cleanup. A child that ignores
+SIGTERM is killed after a five-second grace period. Sampling does
 not prove that no sub-second interference occurred; developers must still use
 the lock and coordinate a quiet measurement window.
 

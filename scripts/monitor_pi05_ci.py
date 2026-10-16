@@ -90,6 +90,9 @@ def monitor(args: argparse.Namespace) -> int:
     receipt = {"schema": SCHEMA, "auditor_sha256": digest, "samples": [], "passed": False}
     child = None
     status = 1
+    def interrupted(signum, _frame):
+        raise InterruptedError(f"activity monitor interrupted by signal {signum}")
+    handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         def sample() -> dict:
             value = json.loads(subprocess.check_output([str(auditor)], text=True, timeout=15))
@@ -111,16 +114,22 @@ def monitor(args: argparse.Namespace) -> int:
         receipt["passed"] = True
         validate_receipt(receipt)
     except (ValueError, OSError, KeyError, ET.ParseError, subprocess.SubprocessError) as error:
+        receipt["passed"] = False
         receipt["error"] = str(error)
         status = 1
     finally:
+        # Repeated runner cancellation must not interrupt process-group cleanup.
+        for sig in handlers:
+            signal.signal(sig, signal.SIG_IGN)
         if child is not None and child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
             try:
-                child.wait(timeout=10)
+                child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
         args.output.write_text(json.dumps(receipt, indent=2) + "\n")
     return status
 

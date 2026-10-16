@@ -250,6 +250,58 @@ class ActivityTest(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(receipt["group"], 0)
 
+    @unittest.skipUnless(os.name == "posix", "CI workers use POSIX process groups")
+    def test_monitor_cancellation_terminates_own_process_and_saves_failure(self):
+        self._monitor_cancellation(False)
+
+    @unittest.skipUnless(os.name == "posix", "CI workers use POSIX process groups")
+    def test_repeated_cancellation_still_kills_unresponsive_process(self):
+        self._monitor_cancellation(True)
+
+    def _monitor_cancellation(self, ignore_term):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auditor = root / "auditor"
+            auditor.write_text(f"#!{sys.executable}\nimport json, time\n"
+                "print(json.dumps({'time': time.time(), 'processes': []}))\n")
+            auditor.chmod(0o755)
+            ready, stopped, output = (root / name for name in ("ready", "stopped", "activity.json"))
+            handler = ("signal.SIG_IGN" if ignore_term else
+                f"lambda *_: (Path({str(stopped)!r}).touch(), sys.exit(0))")
+            command = ("import os, signal, sys, time; from pathlib import Path; "
+                f"signal.signal(signal.SIGTERM, {handler}); "
+                f"Path({str(ready)!r}).write_text(str(os.getpid())); time.sleep(60)")
+            environment = {**os.environ, "APXINF_CI_ACTIVITY_AUDIT": str(auditor),
+                "APXINF_CI_ACTIVITY_AUDIT_SHA256": hashlib.sha256(auditor.read_bytes()).hexdigest()}
+            monitor = activity.subprocess.Popen([sys.executable, activity.__file__, "monitor",
+                "--output", str(output), "--", sys.executable, "-c", command], env=environment)
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and monitor.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(ready.exists(), "monitored child did not start")
+                monitor.terminate()
+                if ignore_term:
+                    time.sleep(.1)
+                    monitor.send_signal(activity.signal.SIGINT)
+                self.assertNotEqual(monitor.wait(timeout=15), 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(ready.read_text()), 0)
+                if not ignore_term:
+                    self.assertTrue(stopped.exists(), "child did not receive termination")
+                receipt = ci.read_json(output)
+                self.assertFalse(receipt["passed"])
+                self.assertIn("signal", receipt["error"])
+            finally:
+                if monitor.poll() is None:
+                    monitor.kill()
+                monitor.wait()
+                if ready.exists():
+                    try:
+                        os.killpg(int(ready.read_text()), activity.signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
 
 class MatrixTest(unittest.TestCase):
     def setUp(self):
