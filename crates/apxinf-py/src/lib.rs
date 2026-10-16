@@ -42,8 +42,9 @@ use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation,
-    Pi05Config, SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionAnswer, DecisionInput, DecisionSchema, ImageLayout, LoadOptions,
+    LoadedModel, ModelPrecision, Observation, Pi05Config, SyntheticWeights, VisionObservation,
+    VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -240,8 +241,26 @@ impl PackedRgbU8 {
     }
 }
 
-/// Decision model runner (d3-mini, etc.). Loads via `AutoModel` and exposes a
-/// single `decide(token_ids, candidate_count)` method that returns scored codes.
+fn decision_answer_to_python<'py>(
+    py: Python<'py>,
+    answer: &DecisionAnswer,
+) -> PyResult<Bound<'py, PyDict>> {
+    let scores = PyList::empty_bound(py);
+    for score in &answer.scores {
+        let score_dict = PyDict::new_bound(py);
+        score_dict.set_item("code", &score.code)?;
+        score_dict.set_item("token_id", score.token_id)?;
+        score_dict.set_item("probability", score.probability)?;
+        scores.append(score_dict)?;
+    }
+    let result = PyDict::new_bound(py);
+    result.set_item("selected_index", answer.selected_index)?;
+    result.set_item("scores", scores)?;
+    Ok(result)
+}
+
+/// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
+/// encoded-prompt and schema requests through the same model handle.
 #[pyclass(unsendable)]
 pub struct DecisionRunner {
     model: LoadedModel,
@@ -253,8 +272,8 @@ pub struct DecisionRunner {
 impl DecisionRunner {
     /// Load a decision model checkpoint.
     ///
-    /// * `model_path` — directory containing decision_config.json and tokenizer.json.
-    /// * `device` — `cuda:N` (default `cuda:0`). d3 is CUDA-only.
+    /// * `model_path` — checkpoint directory detected by `AutoModel`.
+    /// * `device` — defaults to `cuda:0`; Clef requires `metal:N` and `mlx` support.
     /// * `autotune` — tune missing GEMM recipes from the first request.
     /// * `tuning_dir` — directory to persist tuning recipes.
     #[staticmethod]
@@ -309,22 +328,25 @@ impl DecisionRunner {
             .decide(DecisionInput::text(ids, candidate_count))
             .and_then(|output| output.into_single())
             .map_err(runtime_err)?;
+        Python::with_gil(|py| Ok(decision_answer_to_python(py, &output)?.into()))
+    }
+
+    fn decide_schema(&mut self, request_json: &str) -> PyResult<PyObject> {
+        let schema = DecisionSchema::from_json(request_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let output = self
+            .model
+            .decide(DecisionInput::Schema(&schema))
+            .map_err(runtime_err)?;
         Python::with_gil(|py| {
-            let score_dicts: Vec<PyObject> = output
-                .scores
-                .iter()
-                .map(|score| {
-                    let d = PyDict::new_bound(py);
-                    d.set_item("code", &score.code).unwrap();
-                    d.set_item("token_id", score.token_id).unwrap();
-                    d.set_item("probability", score.probability).unwrap();
-                    d.into()
-                })
-                .collect();
-            let scores = PyList::new_bound(py, &score_dicts);
+            let answers = PyList::empty_bound(py);
+            for answer in &output.answers {
+                let answer_dict = decision_answer_to_python(py, answer)?;
+                answer_dict.set_item("question_id", &answer.question_id)?;
+                answers.append(answer_dict)?;
+            }
             let result = PyDict::new_bound(py);
-            result.set_item("selected_index", output.selected_index)?;
-            result.set_item("scores", scores)?;
+            result.set_item("answers", answers)?;
             Ok(result.into())
         })
     }
@@ -1970,6 +1992,229 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod decision {
+        use super::*;
+        use apxinf_model::{
+            DecisionAnswer, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
+            LlmCapabilities,
+        };
+
+        const REQUEST: &str = include_str!("../../../tests/fixtures/decision/schema.json");
+
+        struct StubDecisionRuntime {
+            schema: Option<DecisionSchema>,
+            output: Option<apxinf_core::Result<DecisionOutput>>,
+        }
+
+        impl DecisionRuntime for StubDecisionRuntime {
+            fn capabilities(&self) -> LlmCapabilities {
+                LlmCapabilities::TEXT_ONLY
+            }
+
+            fn decide(&mut self, input: DecisionInput<'_>) -> apxinf_core::Result<DecisionOutput> {
+                match (&self.schema, input) {
+                    (Some(expected), DecisionInput::Schema(schema)) => {
+                        assert_eq!(schema, expected);
+                        assert_eq!(
+                            schema
+                                .questions
+                                .iter()
+                                .map(|question| question.id.as_str())
+                                .collect::<Vec<_>>(),
+                            ["zeta", "alpha"]
+                        );
+                    }
+                    (
+                        None,
+                        DecisionInput::Encoded {
+                            token_ids,
+                            image,
+                            candidate_count,
+                        },
+                    ) => {
+                        assert_eq!(token_ids, [17, 42]);
+                        assert!(image.is_none());
+                        assert_eq!(candidate_count, 2);
+                    }
+                    _ => panic!("wrong decision input form"),
+                }
+                self.output.take().expect("unexpected inference call")
+            }
+
+            fn code_names(&self) -> &[String] {
+                &[]
+            }
+
+            fn token_ids(&self) -> &[u32] {
+                &[]
+            }
+        }
+
+        fn runner(schema: bool, output: apxinf_core::Result<DecisionOutput>) -> DecisionRunner {
+            DecisionRunner {
+                model: LoadedModel::Decision(Box::new(StubDecisionRuntime {
+                    schema: schema.then(|| DecisionSchema::from_json(REQUEST).unwrap()),
+                    output: Some(output),
+                })),
+                device: Device::Cpu,
+                model_path: PathBuf::from("/unused-checkpoint"),
+            }
+        }
+
+        fn schema_output() -> DecisionOutput {
+            DecisionOutput {
+                answers: vec![
+                    DecisionAnswer {
+                        question_id: Some("zeta".into()),
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "go".into(),
+                                token_id: None,
+                                probability: 0.25,
+                            },
+                            DecisionScore {
+                                code: "stay".into(),
+                                token_id: None,
+                                probability: 0.75,
+                            },
+                        ],
+                    },
+                    DecisionAnswer {
+                        question_id: Some("alpha".into()),
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "low".into(),
+                                token_id: None,
+                                probability: 0.125,
+                            },
+                            DecisionScore {
+                                code: "medium".into(),
+                                token_id: None,
+                                probability: 0.5,
+                            },
+                            DecisionScore {
+                                code: "high".into(),
+                                token_id: None,
+                                probability: 0.375,
+                            },
+                        ],
+                    },
+                ],
+            }
+        }
+
+        #[test]
+        fn schema_dispatch_preserves_question_order_and_scores() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(py, runner(true, Ok(schema_output()))).unwrap();
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("request_json", REQUEST).unwrap();
+                let result = runner
+                    .bind(py)
+                    .call_method("decide_schema", (), Some(&kwargs))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'answers': [\n\
+                        {'question_id': 'zeta', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'go', 'token_id': None, 'probability': 0.25},\n\
+                            {'code': 'stay', 'token_id': None, 'probability': 0.75}]},\n\
+                        {'question_id': 'alpha', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'low', 'token_id': None, 'probability': 0.125},\n\
+                            {'code': 'medium', 'token_id': None, 'probability': 0.5},\n\
+                            {'code': 'high', 'token_id': None, 'probability': 0.375}]}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn encoded_decision_keeps_existing_output() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let output = DecisionOutput {
+                    answers: vec![DecisionAnswer {
+                        question_id: None,
+                        selected_index: 1,
+                        scores: vec![
+                            DecisionScore {
+                                code: "A".into(),
+                                token_id: Some(101),
+                                probability: 0.25,
+                            },
+                            DecisionScore {
+                                code: "B".into(),
+                                token_id: Some(102),
+                                probability: 0.75,
+                            },
+                        ],
+                    }],
+                };
+                let runner = Py::new(py, runner(false, Ok(output))).unwrap();
+                let token_ids = vec![17u32, 42].into_pyarray_bound(py);
+                let result = runner
+                    .bind(py)
+                    .call_method1("decide", (token_ids, 2))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'selected_index': 1, 'scores': [\n\
+                        {'code': 'A', 'token_id': 101, 'probability': 0.25},\n\
+                        {'code': 'B', 'token_id': 102, 'probability': 0.75}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn schema_errors_reach_python() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(
+                    py,
+                    runner(
+                        true,
+                        Err(apxinf_core::Error::Other(
+                            "schema rejected by runtime".into(),
+                        )),
+                    ),
+                )
+                .unwrap();
+                for invalid in [
+                    "not JSON",
+                    r#"{"state": {}, "questions": {}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice"}, "q": {"type": "score"}}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice", "unknown": true}}}"#,
+                ] {
+                    let error = runner
+                        .bind(py)
+                        .call_method1("decide_schema", (invalid,))
+                        .unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+                    assert!(error.to_string().contains("decision request:"), "{error}");
+                }
+                let error = runner
+                    .bind(py)
+                    .call_method1("decide_schema", (REQUEST,))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyRuntimeError>(py), "{error}");
+                assert!(
+                    error.to_string().contains("schema rejected by runtime"),
+                    "{error}"
+                );
+            });
+        }
+    }
 
     #[test]
     fn parses_device_forms() {
