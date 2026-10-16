@@ -33,8 +33,9 @@ The empty-cache run uses fallback execution and cannot establish a prepared
 production recipe's performance budget.
 
 The timestep repair at `4027e85b` matches all 10,240 official embedding values
-bitwise in a direct CPU comparison. Its GPU matrix and paired performance are
-pending; this isolated result does not establish a full-model numerical repair.
+bitwise in a direct CPU comparison. Its complete Orin GPU pass counts remain unchanged from the migration baseline:
+43/63 BF16 and 11/24 INT8 real inputs (0/8, 6/8, 5/8 across views).
+Thus exact timestep embeddings alone do not resolve the full-model failures.
 
 The BF16 normalization candidate preserves each raw checkpoint offset until
 precision conversion, rounds it to BF16 before adding one in FP32, and keeps
@@ -63,6 +64,27 @@ control fails; the staged path and changed-input graph replay pass. BF16
 composes the existing GEMM with this pointwise semantic; INT8 selects the same
 pointwise semantic after quantized projection. This does not yet qualify the
 full model or establish performance parity with the prior fused candidate.
+The existing Pointwise/Gather families also support the FP32 frontend boundaries:
+RGB normalization, projection bias before position, auxiliary activation and
+Euler updates. Independent GPU tests cover 1–3 views, both image layouts,
+changed-input replay, storage retention and cancellation-sensitive addition order.
+Forcing Euler multiply/add into one FMA causes the regression to fail. The mixed
+FP32 model integration is still a separate, unaccepted candidate.
+
+A prepared-cache two-view Orin pilot compares the combined normalization/RoPE/
+GeGLU repairs (`bc2cbb18`) with `35bcbf59`, excluding the FP32 model candidate.
+Each uses its own fixed recipe cache, 30 warmups and 50 samples per input:
+
+| BF16 input | Baseline P50 | Candidate P50 | Baseline revisit P50 |
+| --- | --- | --- | --- |
+| T10 gradient / normal noise | 193.58 ms | 194.77 ms | 193.74 ms |
+| T200 gradient / normal noise | 181.63 ms | 184.11 ms | 181.41 ms |
+
+The approximately 0.6–1.5% steady regression remains unresolved; first-call and
+shape-return timings are recorded separately. Both implementations pass only
+7/13 diagnostic inputs against the official limits. These shared-desktop results
+are diagnostic, not formal hardware acceptance or calibrated gate budgets.
+
 All changes still require the complete board/precision/view acceptance below.
 
 ### Historical numerical evidence
