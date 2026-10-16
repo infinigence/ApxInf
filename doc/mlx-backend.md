@@ -130,7 +130,7 @@ chat options containing `tools` enable this behavior automatically. MiniCPM's
 
 ## Native dependency and ABI
 
-The implemented bridge wraps the **MLX 0.31.2** C++ SDK with a small C ABI.
+The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
 `MLX_ROOT` identifies the matching `include/mlx/` and `lib/` distribution;
 headers are checked at build time and the linked version at stream construction.
 Do not combine arbitrary system headers with another wheel's library. A wheel

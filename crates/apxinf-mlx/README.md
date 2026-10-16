@@ -1,6 +1,6 @@
 # Native MLX backend
 
-This crate adapts the MLX **0.31.2** C++ API to owned Rust arrays and the ApxInf
+This crate adapts the MLX **0.32.3** C++ API to owned Rust arrays and the ApxInf
 public tensor/sampling boundary. Metal models use its native array API directly. It contains no Python interpreter or external model provider.
 The `native` feature requires Apple Silicon macOS; the default empty feature set
 does not discover or link an MLX SDK.
@@ -53,9 +53,10 @@ environment variable, even `MLX_DISABLE_COMPILE=0`, matching MLX's presence rule
 The bridge never changes the process-wide compile mode to force availability.
 Callback errors and panics become Rust errors, and C++ exceptions are contained
 inside the bridge. A model still owns transaction boundaries and invalidation.
-The pinned [public C++ compile overload](https://github.com/ml-explore/mlx/blob/v0.31.2/mlx/compile.cpp#L1131-L1157)
+The pinned [public C++ compile overload](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/compile.cpp#L1237-L1264)
 owns the captured callable through a shared pointer whose deleter erases its
-compiler-cache entry. Dropping a Rust `Compiled` uses that ownership path;
+entry from the compiler cache of the thread that created it. Dropping a Rust
+`Compiled` uses that ownership path;
 the bridge does not clear other functions' compiler caches.
 
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
