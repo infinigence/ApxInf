@@ -289,15 +289,31 @@ remain explicit per-board bank assets; never silently replace a golden.
 Installed toolkit version alone is insufficient.
 Old receipts without these fields must be rerun before gate acceptance.
 
-The suite benchmark and accuracy CLI forward `--autotune` explicitly to the
-native loader and record its value. Use it only in a separate preparation run;
-then collect accuracy and latency with tuning disabled. The daily evaluator
-requires `autotune: false` in the baseline, accuracy and performance receipts.
-An absent field or a tuning-enabled diagnostic cannot qualify the gate.
-Disabling tuning does not establish that optimized recipes exist: a fresh
-cuda-new cache can select fallback kernels. Record the prepared recipe directory
-and its provenance when calibrating a bank, and keep it fixed during paired
-measurements. Empty-cache results do not qualify a prepared-cache budget.
+The suite benchmark and accuracy CLI forward `--autotune` and `--tactics`
+explicitly to the native loader. The v6 daily runner creates an isolated recipe
+directory per cell and first runs the entire suite with tuning enabled. A fresh
+process then collects accuracy/stability with tuning disabled; another process
+measures performance against the same directory. Preparation has its own output
+receipt and is excluded from latency sampling. Use a new output directory for
+each run; an existing per-cell recipe directory is rejected.
+
+Receipts hash sorted relative filenames and contents of persisted `*.recipe`
+files before and after inference. The evaluator requires nonempty, unchanged
+caches for baseline, accuracy and performance, and matching caches for candidate
+accuracy and performance. Aggregation also verifies the preparation receipt's
+source, extension, inputs, checkpoint, configuration, precision, runtime libraries
+and resulting cache against the candidate. A baseline built from empty-cache
+fallbacks, a missing receipt or tuning during measurement cannot qualify. The
+baseline and candidate may have different algorithm selections; their own caches
+must remain fixed during measurement. A nonempty cache alone does not prove that
+every operator has an optimized implementation; measured budgets and operator
+coverage review remain necessary.
+
+A shared Orin diagnostic confirmed why this matters: a 1-view empty-cache BF16
+run measured about 2.05/3.23 seconds for T10/T200. A separately prepared 2-view
+baseline measured about 194/182 milliseconds. These are different view counts,
+so they are evidence of a configuration problem, not a paired speedup claim.
+Neither diagnostic defines the formal performance budget.
 
 Calibrate sample and warmup counts using repeated independent runs: verify
 warmup convergence, estimate per-case variation and tail behavior, and test

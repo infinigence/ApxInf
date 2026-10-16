@@ -274,7 +274,7 @@ def _run_l3(host, port, model_variant, prompt, warmup, samples):
 
 def benchmark_suite(args):
     """Use the existing warmup/time-loop/statistics protocol on frozen L1 inputs."""
-    from compare_pi05_openpi import ApxInfModel, cuda_runtime_libraries, load_case, load_suite, sha256, shape_switch_pair, write_json
+    from compare_pi05_openpi import ApxInfModel, cuda_runtime_libraries, load_case, load_suite, recipe_fingerprint, sha256, shape_switch_pair, write_json
     import apxinf_py
 
     if args.model_dir is None or args.layer != "l1" or args.out is None:
@@ -284,6 +284,7 @@ def benchmark_suite(args):
     manifest = load_suite(args.suite_dir)
     source, target = shape_switch_pair(args.suite_dir, manifest)
     precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}[args.model_variant]
+    recipes_before = recipe_fingerprint(args.tactics)
     model = ApxInfModel(args.model_dir, manifest, args.device, precision,
                         pathlib.Path(args.calibration) if args.calibration else None,
                         autotune=args.autotune, tactics=args.tactics)
@@ -321,6 +322,7 @@ def benchmark_suite(args):
         "extension_sha256": sha256(pathlib.Path(apxinf_py.__file__)),
         "runtime_libraries": cuda_runtime_libraries(),
         "warmup": args.warmup, "samples": args.samples, "autotune": args.autotune, "cases": rows,
+        "recipe_cache": {"before": recipes_before, "after": recipe_fingerprint(args.tactics)},
     }, force=True)
 
 

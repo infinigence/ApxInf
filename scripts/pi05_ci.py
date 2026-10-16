@@ -16,7 +16,7 @@ from compare_pi05_openpi import compare_results, load_suite, sha256, shape_switc
 from monitor_pi05_ci import validate_receipt
 
 
-SCHEMA = "apxinf.pi05.ci.v5"
+SCHEMA = "apxinf.pi05.ci.v6"
 PRECISIONS = {"thor": ("bf16", "fp8"), "orin": ("bf16", "int8")}
 LIMIT_KEYS = {"min_cosine", "max_relative_l2", "max_abs", "zero_max_abs"}
 
@@ -138,6 +138,7 @@ def validate(args: argparse.Namespace) -> int:
                     raise ValueError(f"frozen reference/baseline {key} differs")
         if baseline.get("autotune") is not False:
             raise ValueError("autotune must be disabled in the approved baseline")
+        prepared_recipes(baseline)
         calibration = cell["calibration"]["sha256"] if cell.get("calibration") else None
         if (baseline.get("precision"), baseline.get("calibration_sha256")) != (cell["precision"], calibration):
             raise ValueError("frozen baseline precision or calibration differs")
@@ -188,6 +189,35 @@ def runtime_fingerprint(receipt: dict) -> dict[str, str]:
     return fingerprint
 
 
+def prepared_recipes(record: dict) -> dict:
+    cache = record.get("recipe_cache")
+    if not isinstance(cache, dict) or not isinstance(cache.get("after"), dict):
+        raise ValueError("prepared recipe cache receipt missing")
+    result = cache["after"]
+    if (type(result.get("files")) is not int or result["files"] < 1
+            or not re.fullmatch(r"[0-9a-f]{64}", result.get("sha256", ""))):
+        raise ValueError("empty or invalid recipe cache")
+    if record.get("autotune") is not True and cache.get("before") != result:
+        raise ValueError("recipe cache changed during measurement")
+    return result
+
+
+def validate_preparation(preparation: dict, actual: dict) -> None:
+    if preparation.get("autotune") is not True:
+        raise ValueError("recipe preparation must enable autotune")
+    for key in ("revision", "hardware", "precision", "checkpoint_sha256", "config_sha256",
+                "calibration_sha256", "extension_sha256", "suite_sha256"):
+        if preparation.get(key) != actual.get(key):
+            raise ValueError(f"recipe preparation {key} differs from accuracy receipt")
+    if runtime_fingerprint(preparation) != runtime_fingerprint(actual):
+        raise ValueError("recipe preparation CUDA runtime differs")
+    if prepared_recipes(preparation) != prepared_recipes(actual):
+        raise ValueError("prepared recipe cache differs from accuracy receipt")
+    if [(row["name"], row["input_sha256"]) for row in preparation["cases"]] != [
+            (row["name"], row["input_sha256"]) for row in actual["cases"]]:
+        raise ValueError("recipe preparation cases differ")
+
+
 def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
              actual: dict, revision: str, latency: dict) -> dict:
     if len(load_suite(suite)["image_keys"]) != cell["views"]:
@@ -196,6 +226,9 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
         raise ValueError("invalid performance receipt")
     if any(record.get("autotune") is not False for record in (baseline, actual, latency)):
         raise ValueError("autotune must be disabled in baseline, accuracy and performance receipts")
+    prepared_recipes(baseline)
+    if prepared_recipes(actual) != prepared_recipes(latency):
+        raise ValueError("accuracy and performance recipe caches differ")
     candidate_runtime = runtime_fingerprint(actual)
     if runtime_fingerprint(reference) != candidate_runtime:
         raise ValueError("official reference CUDA runtime differs from candidate")
@@ -288,15 +321,21 @@ def run(args: argparse.Namespace) -> int:
             baseline = read_json(asset(root, cell["baseline"]))
             calibration = asset(root, cell["calibration"]) if cell.get("calibration") else None
             output = args.output_dir / f"{cell['id']}.json"
+            recipes = args.output_dir / "recipes" / cell["id"]
+            recipes.mkdir(parents=True, exist_ok=False)
+            preparation_output = args.output_dir / f"{cell['id']}.preparation.json"
             command = [str(args.python), str(Path(__file__).with_name("compare_pi05_openpi.py")),
                        "apxinf", "--suite-dir", str(suite), "--checkpoint-dir", str(checkpoint),
                        "--precision", cell["precision"], "--hardware", args.hardware,
-                       "--revision", args.revision, "--stability-repeats", str(cell["stability_repeats"]),
-                       "--output", str(output), "--force"]
+                       "--revision", args.revision, "--tactics", str(recipes)]
             if calibration:
                 command.extend(("--calibration", str(calibration)))
-            subprocess.run(command, check=True)
+            subprocess.run(command + ["--autotune", "--stability-repeats", "0",
+                                      "--output", str(preparation_output)], check=True)
+            subprocess.run(command + ["--stability-repeats", str(cell["stability_repeats"]),
+                                      "--output", str(output)], check=True)
             actual = read_json(output)
+            validate_preparation(read_json(preparation_output), actual)
             latency_output = args.output_dir / f"{cell['id']}.performance.json"
             protocol = cell["performance_protocol"]
             benchmark = [str(args.python), str(Path(__file__).with_name("bench_pi05.py")),
@@ -304,7 +343,7 @@ def run(args: argparse.Namespace) -> int:
                          "--model-variant", {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[cell["precision"]],
                          "--revision", args.revision, "--hardware", args.hardware,
                          "--warmup", str(protocol["warmup"]), "--samples", str(protocol["samples"]),
-                         "--out", str(latency_output)]
+                         "--out", str(latency_output), "--tactics", str(recipes)]
             if calibration:
                 benchmark.extend(("--calibration", str(calibration)))
             subprocess.run(benchmark, check=True)
@@ -362,6 +401,8 @@ def aggregate(args: argparse.Namespace) -> int:
             for name in ("reference", "baseline"):
                 if sha256(evidence / f"{name}.json") != cell[name]["sha256"]:
                     raise ValueError("artifact golden output digest differs")
+            validate_preparation(read_json(path.parent / f"{cell['id']}.preparation.json"),
+                                 read_json(path.parent / f"{cell['id']}.json"))
             result = evaluate(cell, evidence, read_json(evidence / "reference.json"),
                               read_json(evidence / "baseline.json"),
                               read_json(path.parent / f"{cell['id']}.json"), args.revision,

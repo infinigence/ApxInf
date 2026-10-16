@@ -378,6 +378,7 @@ class MatrixTest(unittest.TestCase):
                    "hardware": cell["hardware"], "calibration_sha256": None,
                    "checkpoint_sha256": "b" * 64, "config_sha256": "c" * 64,
                    "extension_sha256": "d" * 64,
+                   "recipe_cache": {phase: {"files": 1, "sha256": "f" * 64} for phase in ("before", "after")},
                    "runtime_libraries": {name: {"path": f"/fixture/{name}.so", "sha256": "e" * 64}
                                          for name in ("libcuda", "libcudart", "libcublas", "libcublasLt")},
                    "stability": {"repeats": 2, "revisit_max_abs": 0,
@@ -385,6 +386,7 @@ class MatrixTest(unittest.TestCase):
                    "cases": [{"name": item["name"], "input_sha256": item["sha256"],
                               "actions": np.ones((2, 32)).tolist()} for item in entries]}
         parity.write_json(output / f"{cell['id']}.json", receipt)
+        parity.write_json(output / f"{cell['id']}.preparation.json", dict(receipt, autotune=True))
         parity.write_json(output / f"{cell['id']}.performance.json", dict(receipt,
             schema="apxinf.pi05.performance.v2", layer="l1", warmup=1, samples=2,
             cases=[{"name": item["name"], "input_sha256": item["sha256"],
@@ -543,6 +545,62 @@ class MatrixTest(unittest.TestCase):
         changed["cases"][0]["latency_ms"] = [100, 100]
         parity.write_json(path, changed, force=True)
         self.assertEqual(ci.aggregate(self.args()), 1)
+
+    def test_recipe_cache_must_be_prepared_and_unchanged(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        reference = ci.read_json(suite / "reference.json")
+        baseline = ci.read_json(suite / "baseline.json")
+        candidate = ci.read_json(self.root / "thor" / f"{cell['id']}.json")
+        latency = ci.read_json(self.root / "thor" / f"{cell['id']}.performance.json")
+        for invalid in (None, {"before": None, "after": None},
+                        {"before": {"files": 0, "sha256": "a" * 64},
+                         "after": {"files": 0, "sha256": "a" * 64}}):
+            candidate["recipe_cache"] = invalid
+            with self.assertRaisesRegex(ValueError, "recipe cache"):
+                ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+
+    def test_recipe_drift_and_preparation_mismatch_are_rejected(self):
+        cell = self.bank["cells"][0]
+        suite = Path(cell["suite"]["path"]).parent
+        reference = ci.read_json(suite / "reference.json")
+        baseline = ci.read_json(suite / "baseline.json")
+        candidate = ci.read_json(self.root / "thor" / f"{cell['id']}.json")
+        latency = ci.read_json(self.root / "thor" / f"{cell['id']}.performance.json")
+        for record in (baseline, candidate, latency):
+            original = copy.deepcopy(record["recipe_cache"])
+            record["recipe_cache"]["after"]["sha256"] = "a" * 64
+            with self.assertRaisesRegex(ValueError, "recipe cache changed"):
+                ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+            record["recipe_cache"] = original
+        latency["recipe_cache"] = {phase: {"files": 2, "sha256": "a" * 64}
+                                   for phase in ("before", "after")}
+        with self.assertRaisesRegex(ValueError, "recipe caches differ"):
+            ci.evaluate(cell, suite, reference, baseline, candidate, SHA, latency)
+        preparation = dict(copy.deepcopy(candidate), autotune=True)
+        ci.validate_preparation(preparation, candidate)
+        preparation["extension_sha256"] = "b" * 64
+        with self.assertRaisesRegex(ValueError, "preparation extension_sha256"):
+            ci.validate_preparation(preparation, candidate)
+        path = self.root / "thor" / f"{cell['id']}.preparation.json"
+        parity.write_json(path, preparation, force=True)
+        with self.assertRaisesRegex(ValueError, "preparation extension_sha256"):
+            ci.aggregate(self.args())
+
+    def test_recipe_fingerprint_tracks_names_and_contents_not_location(self):
+        left, right = self.root / "left", self.root / "right"
+        for directory in (left, right):
+            directory.mkdir()
+            (directory / "op.recipe").write_bytes(b"recipe one")
+        original = parity.recipe_fingerprint(left)
+        self.assertEqual(original, parity.recipe_fingerprint(right))
+        (right / "unfinished.tmp").write_bytes(b"not a committed recipe")
+        self.assertEqual(original, parity.recipe_fingerprint(right))
+        (right / "op.recipe").rename(right / "other.recipe")
+        self.assertNotEqual(original, parity.recipe_fingerprint(right))
+        (left / "op.recipe").write_bytes(b"recipe two")
+        self.assertNotEqual(original, parity.recipe_fingerprint(left))
+        self.assertIsNone(parity.recipe_fingerprint(None))
 
     def test_daily_gate_rejects_tuning_during_measurement(self):
         cell = self.bank["cells"][0]

@@ -38,6 +38,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def recipe_fingerprint(path: Path | None) -> dict[str, Any] | None:
+    """Hash persisted exact-key recipes, independently of their directory location."""
+    if path is None:
+        return None
+    files = {str(file.relative_to(path)): sha256(file)
+             for file in sorted(path.rglob("*.recipe")) if file.is_file()}
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    return {"files": len(files), "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 def cuda_runtime_libraries() -> dict[str, dict[str, str]]:
     """Record the loaded DSOs, rather than infer them from the installed toolkit."""
     maps = Path("/proc/self/maps")
@@ -332,17 +342,22 @@ def stability(model: Any, root: Path, manifest: dict[str, Any], rows: list[dict]
 
 def collect(root: Path, manifest: dict[str, Any], model: Any,
             engine: str, metadata: dict[str, Any], *, force: bool,
-            output: Path | None = None, stability_repeats: int = 0) -> None:
+            output: Path | None = None, stability_repeats: int = 0,
+            tactics: Path | None = None) -> None:
+    recipes_before = recipe_fingerprint(tactics)
     rows = []
     for entry in manifest["cases"]:
         actions = checked_infer(model, load_case(root, entry), (manifest["horizon"], 32))
         rows.append({"name": entry["name"], "input_sha256": entry["sha256"],
                      "actions": actions.tolist()})
         print(f"{engine}: {entry['name']} {actions.shape}", flush=True)
+    repeat = stability(model, root, manifest, rows, stability_repeats)
+    if engine == "apxinf":
+        metadata["recipe_cache"] = {"before": recipes_before, "after": recipe_fingerprint(tactics)}
     write_json(output or root / f"{engine}.json", {
         "schema": SCHEMA, "engine": engine, "suite_sha256": sha256(root / "manifest.json"),
         **metadata, "runtime_libraries": cuda_runtime_libraries(), "cases": rows,
-        "stability": stability(model, root, manifest, rows, stability_repeats),
+        "stability": repeat,
     }, force=force)
 
 
@@ -389,7 +404,7 @@ def run_apxinf(args: argparse.Namespace) -> None:
         "calibration_sha256": sha256(args.calibration) if args.calibration else None,
         "revision": args.revision, "hardware": args.hardware,
         "extension_sha256": sha256(Path(apxinf_py.__file__)),
-    }, force=args.force, output=args.output, stability_repeats=args.stability_repeats)
+    }, force=args.force, output=args.output, stability_repeats=args.stability_repeats, tactics=args.tactics)
 
 
 def metrics(reference: np.ndarray, actual: np.ndarray) -> dict[str, float | None]:
