@@ -23,13 +23,14 @@ use ops::Ops;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use weights::{Decoder, TextEncoderFiles, Transformer, LATENT};
+use weights::{Decoder, TextEncoderFiles, Transformer, LATENT, MLP};
 
 /// The only schedule this family has validated: 40 linear steps, guidance 1.
 pub const STEPS: usize = 40;
 /// Pixels per latent; the RoPE tables cover 2048 latent rows or columns.
 const SCALE: usize = 16;
 const MAX_SIDE: usize = 2048 * SCALE;
+const MAX_IMAGE_TOKENS: usize = (i32::MAX as usize + 1) / MLP;
 
 pub struct QwenImage {
     dir: PathBuf,
@@ -39,7 +40,7 @@ pub struct QwenImage {
     transformer: Option<Transformer>,
     decoder: Decoder,
     ops: Ops,
-    /// Present when the MPP GEMM reproduces MLX quantized matmul on this device.
+    /// Present in auto mode when the synthetic MPP probe matches quantized matmul.
     gemm: Option<Rc<MppBf16GemmNt>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
@@ -48,12 +49,13 @@ pub struct QwenImage {
 
 /// Device-independent option admission, checked before the checkpoint is read.
 fn admit(options: &LoadOptions) -> Result<()> {
-    if !matches!(options.model_variant.as_deref(), None | Some("auto"))
-        || !matches!(
-            options.precision,
-            ModelPrecision::Auto | ModelPrecision::Bf16
-        )
-        || options.text_weight_dtype.is_some()
+    if !matches!(
+        options.model_variant.as_deref(),
+        None | Some("auto" | "reference")
+    ) || !matches!(
+        options.precision,
+        ModelPrecision::Auto | ModelPrecision::Bf16
+    ) || options.text_weight_dtype.is_some()
         || options.config.is_some()
         || options.synthetic.is_some()
         || options.calibration_path.is_some()
@@ -63,8 +65,8 @@ fn admit(options: &LoadOptions) -> Result<()> {
         || !options.assets.is_empty()
     {
         return Err(Error::Contract(
-            "Qwen-Image MLX loads the mflux 4-bit checkpoint as stored; variants, CUDA \
-             tuning, calibration, synthetic weights and auxiliary assets are unsupported",
+            "Qwen-Image MLX loads the mflux 4-bit checkpoint as stored; only auto and reference \
+             variants are supported, without CUDA tuning, calibration, synthetic weights or auxiliary assets",
         ));
     }
     Ok(())
@@ -108,16 +110,19 @@ pub fn load(
         transformer: Some(transformer),
         decoder,
         ops: Ops::new(&stream)?,
-        gemm: exact_gemm(&stream).map(Rc::new),
+        gemm: if options.model_variant.as_deref() == Some("reference") {
+            None
+        } else {
+            probed_gemm(&stream).map(Rc::new)
+        },
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
     })))
 }
 
-/// The MPP GEMM, if this device compiles it and it reproduces MLX quantized
-/// matmul bit for bit on a block-shaped probe. Image outputs do not depend on
-/// the choice; otherwise image projections use quantized matmul.
-fn exact_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
+/// Enables MPP after a bit-identical synthetic (64, 4096, 128) probe.
+/// This does not qualify other shapes, checkpoint weights or image outputs.
+fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
     let probe = || -> Result<Option<MppBf16GemmNt>> {
         let gemm = MppBf16GemmNt::new(stream)?;
         let values = |n: usize, period: usize| -> Vec<f32> {
@@ -160,6 +165,12 @@ fn admit_request(request: &ImageRequest<'_>) -> Result<()> {
             ));
         }
     }
+    (request.width / SCALE)
+        .checked_mul(request.height / SCALE)
+        .filter(|&tokens| tokens <= MAX_IMAGE_TOKENS)
+        .ok_or(Error::Contract(
+            "Qwen-Image area exceeds the MLP flattened i32 execution bound",
+        ))?;
     if request.steps != STEPS {
         return Err(Error::Contract(
             "Qwen-Image supports exactly 40 denoising steps",
@@ -283,6 +294,101 @@ impl ImageRuntime for QwenImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_variant_admission_needs_no_device() {
+        for variant in [None, Some("auto"), Some("reference")] {
+            assert!(
+                admit(&LoadOptions {
+                    model_variant: variant.map(str::to_owned),
+                    ..LoadOptions::default()
+                })
+                .is_ok(),
+                "rejected {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_execution_bounds_need_no_device() {
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 1024,
+            height: 1024,
+            seed: 7,
+            steps: STEPS,
+        };
+        for (width, height) in [
+            (16, 16),
+            (512, 512),
+            (1024, 576),
+            (1024, 1024),
+            (32768, 16),
+            (16, 32768),
+            (1824, 24528),
+            (24528, 1824),
+            (26880, 1664),
+        ] {
+            assert!(
+                admit_request(&ImageRequest {
+                    width,
+                    height,
+                    ..request
+                })
+                .is_ok(),
+                "rejected {width}x{height}"
+            );
+        }
+        for (width, height) in [
+            (8192, 8192),
+            (16384, 16384),
+            (32768, 32768),
+            (1824, 24544),
+            (24544, 1824),
+            (26880, 1680),
+            (usize::MAX, usize::MAX),
+            (usize::MAX - 15, 16),
+            (16, usize::MAX - 15),
+        ] {
+            assert!(
+                admit_request(&ImageRequest {
+                    width,
+                    height,
+                    ..request
+                })
+                .is_err(),
+                "accepted execution-invalid {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_schedules_remain_finite_and_decreasing_on_cpu() {
+        let stream = Stream::cpu().unwrap();
+        let ops = Ops::new(&stream).unwrap();
+        for (width, height) in [
+            (16, 16),
+            (512, 512),
+            (1024, 576),
+            (1024, 1024),
+            (1824, 24528),
+            (26880, 1664),
+        ] {
+            let schedule = sigmas(&ops, width, height, STEPS)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap();
+            assert_eq!(schedule.len(), STEPS + 1);
+            assert_eq!(schedule[0], 1.0);
+            assert!((schedule[STEPS - 1] - 0.02).abs() < 1e-6);
+            assert_eq!(schedule[STEPS], 0.0);
+            assert!(schedule.iter().all(|sigma| sigma.is_finite()));
+            assert!(
+                schedule.windows(2).all(|pair| pair[0] > pair[1]),
+                "nondecreasing schedule for {width}x{height}: {schedule:?}"
+            );
+        }
+    }
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
