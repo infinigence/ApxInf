@@ -338,6 +338,8 @@ fn affine_checkpoint_shards_load_once_and_reject_ambiguous_files() -> Result<()>
     assert!(fail(&[&truncated]).contains("truncated.safetensors"));
     assert!(fail(&[&dir.join("missing.safetensors")]).contains("missing.safetensors"));
     std::fs::remove_dir_all(&dir).unwrap();
+    Ok(())
+}
 
 fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
