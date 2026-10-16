@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
     AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
-    LoadOptions, SamplingMode,
+    LoadOptions, SamplingMode, SpeechRequest,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use clap::{Parser, Subcommand};
@@ -159,6 +159,45 @@ enum Commands {
         tuning_dir: Option<PathBuf>,
     },
 
+    /// Synthesize speech from text and write it as 32-bit float WAV
+    Speak {
+        /// Path to the speech model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Text to speak
+        #[arg(short, long)]
+        text: String,
+
+        /// Voice name (families list the voices they support)
+        #[arg(long)]
+        voice: String,
+
+        /// Language name, or "auto"
+        #[arg(long, default_value = "auto")]
+        language: String,
+
+        /// Optional speaking-style instruction
+        #[arg(long, default_value = "")]
+        instruction: String,
+
+        /// Sampling seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Output WAV file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -259,6 +298,32 @@ fn main() {
                 autotune,
                 tuning_dir.as_ref(),
             ) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Speak {
+            model,
+            model_name,
+            text,
+            voice,
+            language,
+            instruction,
+            seed,
+            output,
+            device,
+        } => {
+            let request = SpeechRequest {
+                text: &text,
+                voice: &voice,
+                language: &language,
+                instruction: &instruction,
+                seed,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_speak(&model, model_name.as_deref(), device, &request, &output)
+            });
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -659,6 +724,102 @@ fn run_generate(
     }
     println!("{}", output.profile.summary());
     Ok(())
+}
+
+fn run_speak(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    device: Device,
+    request: &SpeechRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let audio = model
+        .synthesize(request)
+        .map_err(|error| format!("Speech synthesis failed: {error}"))?;
+    let seconds = audio.samples.len() as f64 / audio.channels as f64 / audio.sample_rate as f64;
+    eprintln!(
+        "Synthesized {seconds:.2}s of audio in {:.2}s{}",
+        started.elapsed().as_secs_f64(),
+        if audio.complete {
+            ""
+        } else {
+            " (stopped at the length limit)"
+        }
+    );
+    std::fs::write(output, float_wav(&audio))
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+/// RIFF WAVE with IEEE float samples (format 3), so samples are stored exactly.
+fn float_wav(audio: &apxinf_model::GeneratedAudio) -> Vec<u8> {
+    let data = (audio.samples.len() * 4) as u32;
+    let channels = audio.channels as u16;
+    let mut out = Vec::with_capacity(44 + data as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&3u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&audio.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(audio.sample_rate * 4 * channels as u32).to_le_bytes());
+    out.extend_from_slice(&(4 * channels).to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data.to_le_bytes());
+    for sample in &audio.samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::float_wav;
+    use apxinf_model::GeneratedAudio;
+
+    #[test]
+    fn float_wav_header_describes_the_samples() {
+        let audio = GeneratedAudio {
+            sample_rate: 24000,
+            channels: 1,
+            samples: vec![0.5, -0.25, 1.0],
+            complete: true,
+        };
+        let wav = float_wav(&audio);
+        let u32_at = |i: usize| u32::from_le_bytes(wav[i..i + 4].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(wav[i..i + 2].try_into().unwrap());
+        assert_eq!(
+            (&wav[0..4], &wav[8..16], &wav[36..40]),
+            (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..])
+        );
+        assert_eq!(
+            (u32_at(4), u16_at(20), u16_at(22), u32_at(24)),
+            (36 + 12, 3, 1, 24000)
+        );
+        assert_eq!(
+            (u32_at(28), u16_at(32), u16_at(34), u32_at(40)),
+            (96000, 4, 32, 12)
+        );
+        assert_eq!(f32::from_le_bytes(wav[48..52].try_into().unwrap()), -0.25);
+    }
 }
 
 fn run_decide(
