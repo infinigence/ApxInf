@@ -31,9 +31,9 @@ mod walloss;
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
 pub use d3::{
-    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig, DecisionInput,
-    DecisionOutput, DecisionRuntime, DecisionScore, D3_DEFAULT_TEXT_PROFILE_LIMIT,
-    D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
+    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig, DecisionAnswer,
+    DecisionInput, DecisionOutput, DecisionQuestion, DecisionRuntime, DecisionSchema,
+    DecisionScore, D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
