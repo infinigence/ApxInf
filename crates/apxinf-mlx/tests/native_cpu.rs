@@ -456,3 +456,94 @@ fn image_operators_follow_mlx_semantics() -> Result<()> {
     assert_eq!(image.to_f32_vec()?, [0., 0.625, 1.]);
     Ok(())
 }
+
+#[test]
+fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
+    // Expected values from MLX Python 0.32.3 on the CPU device.
+    let s = Stream::cpu()?;
+    let words = |a: &Array| -> Result<Vec<u32>> {
+        Ok(a.to_bytes()?
+            .chunks(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect())
+    };
+    // mx.random.seed(42) sets the state to key(42); each global random call
+    // consumes split(state).second and keeps split(state).first.
+    let (next, sub) = Array::random_split(&Array::random_key(&s, 42)?)?;
+    assert_eq!(words(&next)?, [2465931498, 3679230171]);
+    assert_eq!(words(&sub)?, [255383827, 267815257]);
+    let logits = Array::arange(&s, 0., 8., 1., D::F32)?
+        .mul(&Array::scalar(&s, 0.37, D::F32)?)?
+        .sub(&Array::scalar(&s, 1.1, D::F32)?)?
+        .reshape(&[1, 8])?;
+    let first = logits.categorical(-1, &sub)?;
+    assert_eq!((first.dtype(), first.shape()), (D::U32, &[1][..]));
+    assert_eq!(words(&first)?, [7]);
+    // The second global call: mx.random.seed(42); categorical(); categorical().
+    let (_, sub) = Array::random_split(&next)?;
+    assert_eq!(words(&logits.categorical(-1, &sub)?)?, [5]);
+    // Rows of a 2D logits array take the Gumbel-max path.
+    let rows = Array::arange(&s, 0., 10., 1., D::F32)?
+        .mul(&Array::scalar(&s, 0.5, D::F32)?)?
+        .reshape(&[2, 5])?;
+    assert_eq!(
+        words(&rows.categorical(-1, &Array::random_key(&s, 7)?)?)?,
+        [3, 4]
+    );
+    assert!(logits.categorical(-1, &logits).is_err());
+
+    // Top-k masking as mlx-audio applies it: argpartition, then -inf writes.
+    let x = Array::from_f32(&s, &[8], &[3., -1., 7., 7., 0.5, 2., -4., 9.])?;
+    let order = x.neg()?.argpartition(2, -1)?;
+    assert_eq!(words(&order)?, [7, 2, 3, 0, 1, 5, 6, 4]);
+    let masked = x.reshape(&[1, 8])?.put_along_axis(
+        &order.slice(&[3], &[8])?.reshape(&[1, 5])?,
+        &Array::scalar(&s, f32::NEG_INFINITY, D::F32)?,
+        -1,
+    )?;
+    assert_eq!(
+        masked.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            7.,
+            7.,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            9.
+        ]
+    );
+
+    let z = Array::arange(&s, 0., 6., 1., D::F32)?.reshape(&[1, 3, 2])?;
+    let padded = z.pad(&[0, 2, 0], &[0, 0, 0])?;
+    assert_eq!(padded.shape(), [1, 5, 2]);
+    assert_eq!(
+        padded.to_f32_vec()?,
+        [0., 0., 0., 0., 0., 1., 2., 3., 4., 5.]
+    );
+    assert!(z.pad(&[0, 2], &[0, 0]).is_err());
+
+    // mx.conv_transpose1d(arange(6)/4 - 0.5 as [1, 3, 2], arange(32)/8 - 1 as [4, 4, 2], stride=2).
+    let input = z
+        .div(&Array::scalar(&s, 4., D::F32)?)?
+        .sub(&Array::scalar(&s, 0.5, D::F32)?)?;
+    let weight = Array::arange(&s, 0., 32., 1., D::F32)?
+        .reshape(&[4, 4, 2])?
+        .div(&Array::scalar(&s, 8., D::F32)?)?
+        .sub(&Array::scalar(&s, 1., D::F32)?)?;
+    let up = input.conv_transpose1d(&weight, 2, 0, 1, 0, 1)?;
+    assert_eq!(up.shape(), [1, 8, 4]);
+    assert_eq!(
+        bits(&up)?,
+        [
+            0x3f380000, 0xbd000000, 0xbf480000, 0xbfc40000, 0x3f080000, 0xbe600000, 0xbf780000,
+            0xbfdc0000, 0x3e000000, 0xbec00000, 0xbf600000, 0xbfb00000, 0x0, 0xbf000000,
+            0xbf800000, 0xbfc00000, 0xbfa00000, 0x3e800000, 0x3fe00000, 0x40500000, 0xbf600000,
+            0x3f200000, 0x40080000, 0x40680000, 0xbf080000, 0x3f380000, 0x3ffc0000, 0x404e0000,
+            0xbe600000, 0x3f840000, 0x40120000, 0x40620000
+        ]
+    );
+    assert!(input.conv_transpose1d(&weight, 0, 0, 1, 0, 1).is_err());
+    Ok(())
+}
