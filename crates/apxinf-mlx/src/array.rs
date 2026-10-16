@@ -628,6 +628,68 @@ impl Array {
         p.extend(dims(shape)?);
         key.stream().op(56, &[key], &p, &[])
     }
+    /// Two keys from `key`, as `mx.random.split(key)`: the next state and the
+    /// subkey that MLX's global key sequence hands to one random call.
+    pub fn random_split(key: &Self) -> Result<(Self, Self)> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        let both = key.stream().op(61, &[key], &[], &[])?;
+        let row = |i: usize| both.slice(&[i, 0], &[i + 1, 2])?.reshape(&[2]);
+        Ok((row(0)?, row(1)?))
+    }
+    /// One sample index per row along `axis` from unnormalized log
+    /// probabilities, as `mx.random.categorical(logits, axis, key=key)`; uint32.
+    pub fn categorical(&self, axis: i32, key: &Self) -> Result<Self> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        self.stream().op(62, &[self, key], &[axis], &[])
+    }
+    /// MLX `argpartition`: indices whose element `kth` is in sorted position,
+    /// with smaller elements before it and larger ones after, along `axis`.
+    pub fn argpartition(&self, kth: usize, axis: i32) -> Result<Self> {
+        let kth = i32::try_from(kth).map_err(|_| error("argpartition kth exceeds i32"))?;
+        self.stream().op(57, &[self], &[kth, axis], &[])
+    }
+    /// MLX `put_along_axis`: a copy with `values` written at `indices` along `axis`.
+    pub fn put_along_axis(&self, indices: &Self, values: &Self, axis: i32) -> Result<Self> {
+        self.stream().op(58, &[self, indices, values], &[axis], &[])
+    }
+    /// MLX constant `pad` with zeros: `low[d]` and `high[d]` elements before
+    /// and after axis `d`.
+    pub fn pad(&self, low: &[usize], high: &[usize]) -> Result<Self> {
+        let rank = self.shape().len();
+        if low.len() != rank || high.len() != rank {
+            return Err(error("pad widths must cover every axis"));
+        }
+        let mut p = vec![rank as i32];
+        p.extend(dims(low)?);
+        p.extend(dims(high)?);
+        let zero = Self::zeros(self.stream(), &[], self.dtype())?;
+        self.stream().op(59, &[self, &zero], &p, &[])
+    }
+    /// MLX `conv_transpose1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
+    pub fn conv_transpose1d(
+        &self,
+        weight: &Self,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [stride, padding, dilation, output_padding, groups]
+            .iter()
+            .map(|&v| i32::try_from(v).map_err(|_| error("conv_transpose1d parameter exceeds i32")))
+            .collect::<Result<Vec<_>>>()?;
+        if p[0] == 0 || p[2] == 0 || p[4] == 0 {
+            return Err(error(
+                "conv_transpose1d stride, dilation and groups must be positive",
+            ));
+        }
+        self.stream().op(60, &[self, weight], &p, &[])
+    }
     /// MLX `conv1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
     pub fn conv1d(
         &self,
