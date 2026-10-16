@@ -137,7 +137,9 @@ runs Qwen-Image-2.1 text-to-image from the mflux 4-bit
 export (affine Q4 DiT, BF16 text encoder, F32 VAE decoder) and follows the
 mflux f0bf9cf0 txt2img path with `--low-ram`. The export has no top-level
 `config.json`; detection reads the transformer index. The family admits 40
-linear steps at guidance 1, batch 1, and sides that are multiples of 16. It
+linear steps at guidance 1, batch 1, and positive sides that are multiples of
+16 up to 32768, with at most 174762 image tokens. The family README derives
+this execution bound; it is not a memory-capacity guarantee. The family
 returns RGB8 through `ImageRuntime`; the CLI writes binary PPM, so no image
 codec dependency is added.
 
@@ -145,8 +147,11 @@ codec dependency is added.
   loads the DiT and VAE decoder with complete key, shape and dtype checks.
 - A request reads the text encoder one layer at a time and frees each layer.
   The DiT computes the text-prefix K/V once and then runs one compiled image
-  forward per step; its image-token projections use the MPP GEMM where a
-  load-time probe shows bit-identical results to quantized matmul. The DiT
+  forward per step. The default `auto` variant retains MPP GEMM selection
+  for aligned image-token projections after a load-time synthetic probe.
+  Matching that probe does not qualify all weights, shapes or image outputs.
+  `model_variant=reference` skips MPP and uses quantized matmul for all Q4
+  projections, without changing the scheduler or other execution paths. The DiT
   is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
   read again by the next request, as `--low-ram` does.
 - The checkpoint weights are under the Qwen Research License, which permits
@@ -157,6 +162,9 @@ cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4
   --width 1024 --height 576 --seed 42 --prompt 'A lighthouse at dusk' \
   --output lighthouse.ppm
 ```
+
+Add `--model-variant reference` to select the quantized-matmul reference path.
+Omitting it or using `--model-variant auto` preserves the optimization target.
 
 ### Implemented speech selection
 

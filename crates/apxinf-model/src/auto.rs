@@ -655,6 +655,31 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "mlx"))]
+    #[test]
+    fn image_variants_reach_device_admission_without_mlx() {
+        for family in ["qwen_image", "metal_qwen_image", "qwen_image-mlx"] {
+            for variant in ["auto", "reference"] {
+                let options = LoadOptions {
+                    model_name: Some(family.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                )
+                .err()
+                .expect("MLX is unavailable");
+                assert!(
+                    matches!(error, Error::UnsupportedDevice(Device::Metal(0))),
+                    "{family}/{variant}: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cuda_recipe_tuning_is_explicit_and_independent_of_directory() {
         let mut options = LoadOptions::default();
@@ -780,6 +805,9 @@ mod tests {
             "minicpm5-mlx",
             "llama",
             "qwen3_vl",
+            "qwen_image",
+            "metal_qwen_image",
+            "qwen_image-mlx",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
@@ -815,6 +843,25 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn metal_variants_do_not_bypass_family_registration() {
+        for family in ["llama", "qwen3_vl", "test_missing_metal_family"] {
+            let options = LoadOptions {
+                model_name: Some(family.into()),
+                model_variant: Some("auto".into()),
+                ..LoadOptions::default()
+            };
+            assert!(matches!(
+                AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                ),
+                Err(Error::UnsupportedDevice(Device::Metal(0)))
+            ));
+        }
     }
 
     #[test]
