@@ -41,7 +41,14 @@ __device__ inline __nv_bfloat16 from_float(float value) {
 // k/v pointers refer to.
 //
 // Launch: grid (tokens, q_heads + 2 * kv_heads), block >= head_dim / 2.
-template <class T>
+template <bool Staged>
+__device__ __forceinline__ float rope_product(float a, float b) {
+  if constexpr (Staged)
+    return __bfloat162float(__float2bfloat16_rn(a * b));
+  return a * b;
+}
+
+template <class T, bool Staged = false>
 __global__ void split_qkv_rope(const T* qkv, const T* bias, T* q, T* k, T* v,
                                int tokens, int q_heads, int kv_heads,
                                int head_dim, float theta, int position_offset,
@@ -55,9 +62,16 @@ __global__ void split_qkv_rope(const T* qkv, const T* bias, T* q, T* k, T* v,
   const int kv_width = kv_heads * head_dim;
   const int fused_width = q_width + 2 * kv_width;
   const int position = position_offset + token;
-  const float frequency = powf(theta, -static_cast<float>(pair) / half_dim);
+  float frequency = powf(theta, -static_cast<float>(pair) / half_dim);
+  if constexpr (Staged) {
+    frequency = __bfloat162float(__float2bfloat16_rn(1.0f / powf(theta, static_cast<float>(pair) / half_dim)));
+  }
   float sine, cosine;
   sincosf(position * frequency, &sine, &cosine);
+  if constexpr (Staged) {
+    sine = __bfloat162float(__float2bfloat16_rn(sine));
+    cosine = __bfloat162float(__float2bfloat16_rn(cosine));
+  }
 
   if (projection_head < q_heads) {
     const int source = token * fused_width + projection_head * head_dim;
@@ -67,10 +81,14 @@ __global__ void split_qkv_rope(const T* qkv, const T* bias, T* q, T* k, T* v,
       first += to_float(bias[projection_head * head_dim + pair]);
       second += to_float(bias[projection_head * head_dim + half_dim + pair]);
     }
+    if constexpr (Staged) {
+      first = __bfloat162float(__float2bfloat16_rn(first));
+      second = __bfloat162float(__float2bfloat16_rn(second));
+    }
     const int destination = (token * q_heads + projection_head) * head_dim;
-    q[destination + pair] = from_float<T>(first * cosine - second * sine);
+    q[destination + pair] = from_float<T>(rope_product<Staged>(first, cosine) - rope_product<Staged>(second, sine));
     q[destination + half_dim + pair] =
-        from_float<T>(second * cosine + first * sine);
+        from_float<T>(rope_product<Staged>(second, cosine) + rope_product<Staged>(first, sine));
   } else if (projection_head < q_heads + kv_heads) {
     const int head = projection_head - q_heads;
     const int source = token * fused_width + q_width + head * head_dim;
@@ -80,11 +98,15 @@ __global__ void split_qkv_rope(const T* qkv, const T* bias, T* q, T* k, T* v,
       first += to_float(bias[q_width + head * head_dim + pair]);
       second += to_float(bias[q_width + head * head_dim + half_dim + pair]);
     }
+    if constexpr (Staged) {
+      first = __bfloat162float(__float2bfloat16_rn(first));
+      second = __bfloat162float(__float2bfloat16_rn(second));
+    }
     const int destination =
         ((kv_output_offset + token) * kv_heads + head) * head_dim;
-    k[destination + pair] = from_float<T>(first * cosine - second * sine);
+    k[destination + pair] = from_float<T>(rope_product<Staged>(first, cosine) - rope_product<Staged>(second, sine));
     k[destination + half_dim + pair] =
-        from_float<T>(second * cosine + first * sine);
+        from_float<T>(rope_product<Staged>(second, cosine) + rope_product<Staged>(first, sine));
   } else {
     const int head = projection_head - q_heads - kv_heads;
     const int source =

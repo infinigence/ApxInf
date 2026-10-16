@@ -300,7 +300,7 @@ fn l3_split_qkv_rope_bf16(
     ops::rope(
         ctx,
         ops::RopeArgs {
-            semantic: ops::RopeSemantic::SplitQkvRope,
+            semantic: ops::RopeSemantic::SplitQkvRopeStagedBf16,
             qkv,
             bias,
             q: &mut q,
@@ -349,7 +349,7 @@ fn l3_split_qkv_rope_into_cache_bf16(
     ops::rope(
         ctx,
         ops::RopeArgs {
-            semantic: ops::RopeSemantic::SplitQkvRope,
+            semantic: ops::RopeSemantic::SplitQkvRopeStagedBf16,
             qkv,
             bias,
             q: &mut q,

@@ -139,3 +139,55 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+## Fixed RoPE semantics
+
+These operators launch directly and retain bindings for graph lifetime. They
+use RoPE Spec version 4 and do not tune or persist recipes.
+
+<!-- l3-operator:rope_split_qkv -->
+### `rope` / `SplitQkvRope`
+
+Split `[tokens, (q_heads + 2*kv_heads)*head_dim]` F16/BF16 QKV, optionally add
+bias, then rotate Q/K using FP32 frequencies and products before output casting.
+Q is `[tokens, q_heads, head_dim]`; K/V may append at `kv_output_offset`.
+Heads require an even nonzero dimension, positive finite theta and sufficient
+output storage. Existing float-intermediate semantics are preserved.
+
+<!-- l3-operator:rope_split_qkv_bias -->
+### `rope` / `SplitQkvBias`
+
+Split F16/BF16 MHA QKV with optional bias and no rotary operation. Query and KV
+head counts must agree; both offsets are zero.
+
+<!-- l3-operator:rope_split_qkv_staged_bf16 -->
+### `rope` / `SplitQkvRopeStagedBf16`
+
+Use the split/append geometry above with BF16 tensors and disjoint outputs.
+Compute `1 / theta^(2*i/head_dim)` in FP32, round frequency to BF16, compute
+position times frequency in FP32, then round sin/cos to BF16. Round any bias sum
+and each rotary product to BF16 before the final BF16 sum/difference. This
+explicit rounding semantic shares one kernel launch with the split; it does
+not allocate tables or copy intermediate activations to the host.
+
+Independent Torch fixtures cover head dimensions 8/256, positions through 1017,
+optional bias, appended KV rows, eager output and changed-input graph replay.
+`staged_rope_rejects_invalid_bindings` covers dtype and alias rejection.
+
+<!-- l3-operator:rope_decode -->
+### `decode_rope`
+
+Single-token BF16 Q rotation and K/V cache append. The position is read from a
+stable device u32 during execution/replay; the cache capacity is validated.
+
+<!-- l3-operator:rope_axial -->
+### `split_qkv_axial_rope`
+
+BF16 packed MHA QKV with two-axis height/width positions. The head dimension is
+a multiple of four, at most 256, and the rotary dimension equals the head dimension.
+
+<!-- l3-operator:rope_partial_multimodal -->
+### `multimodal_rope`
+
+In-place BF16 partial temporal/height/width rotary embedding. The supported
+rotary dimension is 64 with pair sections 11/11/10 and explicit device positions.

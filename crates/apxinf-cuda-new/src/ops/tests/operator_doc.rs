@@ -40,6 +40,13 @@ fn every_l3_operator_appears_once_in_cuda_operator_doc() {
                 .copied()
                 .map(attention_contracts::Semantic::doc_id),
         )
+        .chain(
+            crate::ops::rope::contracts::RopeSemantic::ALL
+                .iter()
+                .copied()
+                .map(crate::ops::rope::contracts::RopeSemantic::doc_id),
+        )
+        .chain(["rope_decode", "rope_axial", "rope_partial_multimodal"])
         .collect();
     let expected: BTreeSet<_> = expected_ids.iter().copied().collect();
 

@@ -1068,3 +1068,54 @@ fn mixed_precision_norm_rejects_unsupported_parameter_combinations() {
     )
     .is_err());
 }
+
+#[test]
+fn staged_rope_rejects_invalid_bindings() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f16_tensor(0, vec![1, 12], &[1.0; 12]);
+    let mut q = f16_tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let mut k = f16_tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let mut v = f16_tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let error = rope(
+        &ctx,
+        RopeArgs {
+            semantic: RopeSemantic::SplitQkvRopeStagedBf16,
+            qkv: &input,
+            bias: None,
+            q: &mut q,
+            k: &mut k,
+            v: &mut v,
+            q_heads: 1,
+            kv_heads: 1,
+            head_dim: 4,
+            theta: 10_000.0,
+            position_offset: 0,
+            kv_output_offset: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("requires BF16"));
+    let input = tensor(0, vec![1, 12], &[1.0; 12]);
+    let mut q = input.clone();
+    let mut k = tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let mut v = tensor(0, vec![1, 1, 4], &[0.0; 4]);
+    let error = rope(
+        &ctx,
+        RopeArgs {
+            semantic: RopeSemantic::SplitQkvRopeStagedBf16,
+            qkv: &input,
+            bias: None,
+            q: &mut q,
+            k: &mut k,
+            v: &mut v,
+            q_heads: 1,
+            kv_heads: 1,
+            head_dim: 4,
+            theta: 10_000.0,
+            position_offset: 0,
+            kv_output_offset: 0,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must not overlap"));
+}

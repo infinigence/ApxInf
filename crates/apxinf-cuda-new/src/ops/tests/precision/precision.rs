@@ -773,3 +773,85 @@ fn mixed_precision_rms_norm_matches_torch() {
         check(&output, case.gated);
     }
 }
+
+#[path = "staged_rope_torch_fixture.rs"]
+mod staged_rope_fixture;
+
+#[test]
+fn staged_bf16_rope_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for case in staged_rope_fixture::CASES {
+        let input = bf16_bits_tensor(0, vec![2, 3 * case.dim], case.input);
+        let bias =
+            (!case.bias.is_empty()).then(|| bf16_bits_tensor(0, vec![3 * case.dim], case.bias));
+        let mut q = zeros_tensor(0, vec![2, 1, case.dim], DType::BF16);
+        let mut k = zeros_tensor(0, vec![4, 1, case.dim], DType::BF16);
+        let mut v = zeros_tensor(0, vec![4, 1, case.dim], DType::BF16);
+        let mut launch = || {
+            rope(
+                &ctx,
+                RopeArgs {
+                    semantic: RopeSemantic::SplitQkvRopeStagedBf16,
+                    qkv: &input,
+                    bias: bias.as_ref(),
+                    q: &mut q,
+                    k: &mut k,
+                    v: &mut v,
+                    q_heads: 1,
+                    kv_heads: 1,
+                    head_dim: case.dim,
+                    theta: 10_000.0,
+                    position_offset: case.position,
+                    kv_output_offset: 1,
+                },
+            )
+        };
+        launch().unwrap();
+        ctx.synchronize().unwrap();
+        let graph = crate::capture(&ctx, launch).unwrap();
+        let check = |q: &Tensor, k: &Tensor, v: &Tensor, scale: f32| {
+            for (tensor, words, padded) in
+                [(q, case.q, false), (k, case.k, true), (v, case.v, true)]
+            {
+                let mut expected = vec![0.0; if padded { case.dim } else { 0 }];
+                expected.extend(
+                    words
+                        .iter()
+                        .map(|word| half::bf16::from_bits(*word).to_f32() * scale),
+                );
+                if padded {
+                    expected.extend(vec![0.0; case.dim]);
+                }
+                assert_eq!(
+                    super::framework::values(tensor),
+                    expected,
+                    "dim={} position={}",
+                    case.dim,
+                    case.position
+                );
+            }
+        };
+        check(&q, &k, &v, 1.0);
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        check(&q, &k, &v, 1.0);
+        if bias.is_none() {
+            let doubled: Vec<_> = case
+                .input
+                .iter()
+                .flat_map(|word| {
+                    half::bf16::from_f32(half::bf16::from_bits(*word).to_f32() * 2.0)
+                        .to_bits()
+                        .to_ne_bytes()
+                })
+                .collect();
+            crate::CudaBuffer::from_tensor(&input)
+                .unwrap()
+                .copy_from_host(&doubled)
+                .unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            check(&q, &k, &v, 2.0);
+        }
+    }
+}
