@@ -298,7 +298,7 @@ fn affine_checkpoint_shards_load_once_and_reject_ambiguous_files() -> Result<()>
         ],
     );
     let before = s.counters();
-    let loaded = apxinf_mlx::load_safetensors(&s, &[&first, &second])?;
+    let loaded = apxinf_mlx::load_safetensors(&s, &[&first, &second], |_| true)?;
     let after = s.counters();
     assert_eq!(loaded.len(), 4);
     assert_eq!(after.eval_calls - before.eval_calls, 2);
@@ -320,9 +320,16 @@ fn affine_checkpoint_shards_load_once_and_reject_ambiguous_files() -> Result<()>
         4,
     )?;
     assert_eq!(actual.to_bytes()?, expected.to_bytes()?);
+    let before = s.counters();
+    let norm_only = apxinf_mlx::load_safetensors(&s, &[&first, &second], |name| name == "norm")?;
+    assert_eq!(norm_only.keys().collect::<Vec<_>>(), ["norm"]);
+    assert_eq!(
+        s.counters().uploads_bytes - before.uploads_bytes,
+        norm.len()
+    );
 
     let fail = |files: &[&std::path::Path]| {
-        apxinf_mlx::load_safetensors(&s, files)
+        apxinf_mlx::load_safetensors(&s, files, |_| true)
             .unwrap_err()
             .to_string()
     };

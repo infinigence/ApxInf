@@ -829,16 +829,18 @@ fn own_many(stream: &Stream, raw: &mut [ffi::Handle]) -> Result<Vec<Array>> {
     Ok(out)
 }
 
-/// Reads SafeTensors files into evaluated arrays attributed to `stream`.
+/// Reads the tensors of SafeTensors files whose names satisfy `keep` into
+/// evaluated arrays attributed to `stream`. Other tensors are never read.
 ///
-/// MLX reads each file once on its CPU device, without a host staging copy.
-/// Tensor names must be unique across files, and every tensor must have a
-/// bridge dtype; MLX-format affine checkpoints store packed weights as U32.
+/// MLX reads each file on its CPU device, without a host staging copy.
+/// Tensor names must be unique across files, and every kept tensor must have
+/// a bridge dtype; MLX-format affine checkpoints store packed weights as U32.
 /// Checkpoint keys, shapes and quantization belong to the model family. Bytes
 /// read count as uploads, and each file is one evaluation boundary.
 pub fn load_safetensors<P: AsRef<Path>>(
     stream: &Stream,
     files: &[P],
+    keep: impl Fn(&str) -> bool,
 ) -> Result<HashMap<String, Array>> {
     struct Loaded(NonNull<c_void>);
     impl Drop for Loaded {
@@ -868,6 +870,11 @@ pub fn load_safetensors<P: AsRef<Path>>(
             let name = unsafe { CStr::from_ptr(name) }
                 .to_string_lossy()
                 .into_owned();
+            if !keep(&name) {
+                // An unevaluated load reads nothing; release the handle.
+                unsafe { ffi::apx_mlx_array_free(handle) };
+                continue;
+            }
             let array = unsafe { Array::own(stream.clone(), handle) }
                 .map_err(|e| label(error(format!("tensor `{name}`: {e}"))))?;
             if out.contains_key(&name) {
