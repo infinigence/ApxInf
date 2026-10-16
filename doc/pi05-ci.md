@@ -83,11 +83,76 @@ acceptance; the aggregator rejects that mismatch.
   several split-K candidates match OpenPI while the selected unsplit candidate
   differs in 287 BF16 elements. FP64 differs from both. This is distinct from
   Orin's reduced-precision partial sums and does not justify a provider override.
+- The next private Orin zero-noise trace first diverges at action layer 1 QKV;
+  its input, style and normalization are bitwise equal. An independent operator
+  replay reproduces all 50 differing BF16 elements: PyTorch separate Q/K/V
+  projections match OpenPI, while a packed projection matches ApxInf bitwise.
+  Two of eight packed cuBLASLt candidates also match OpenPI. Both original
+  outputs differ from an independent FP64 dot-product oracle. This identifies
+  a shape/algorithm-dependent arithmetic difference, not a packing error or
+  authority to hardcode a model-specific provider.
+- Reference sensitivity is measured separately from implementation error. With
+  the original OpenPI model, changing normalized FP32 patch inputs by one ULP
+  (at most `1.1921e-7`) makes the two-view black/zero-noise diagnostic reach
+  cosine 0.8664 and relative L2 0.5094. Original controls before and after the
+  perturbation are bitwise equal to the saved reference. Across eight real
+  observations per view and both perturbation directions, 13/16 one-view
+  comparisons pass the existing limits; two and three views each pass 16/16.
+  These failures do not coincide with every native failure. This establishes
+  input sensitivity, not an implementation waiver, a new tolerance, or authority
+  to remove failing observations from the bank.
+- Quantization loss is also observable without ApxInf: in a separate OpenPI
+  weight-only experiment, quantizing/dequantizing the language transformer
+  weights per output channel makes a one-view real observation fail the
+  historical INT8 limits (cosine 0.9924, relative L2 0.1255). The two-view
+  black/zero-noise diagnostic reaches cosine -0.1101. Activations, original
+  operators and auxiliary projections remain unchanged, and restoring weights
+  reproduces every saved control bitwise. This is a sensitivity experiment,
+  not an exact emulation or qualification of the native INT8 implementation.
+  A separate activation-only factor quantizes/dequantizes language Linear
+  inputs row-wise with unchanged weights and operators. Two one-view real-image
+  inputs reach cosine 0.8513 and 0.8695; restoring the original computation is
+  bitwise equal to every control. These fixed computation fixtures do not
+  establish deployed policy quality or native INT8 arithmetic equivalence.
+  Separately, 60 native auxiliary-projection factors (input/output, time,
+  modulation, all, and control across two views) resolve none of the selected
+  failures; those private substitutions are rejected.
+- INT8 also retains a distinct RMSNorm preparation difference: it rounds
+  `1 + offset` to BF16, whereas the reference adds one in FP32 after rounding
+  the offset to BF16. A private change reuses the existing BF16-path scale
+  preparation without changing quantized GEMMs. A checkpoint-free test of the
+  actual INT8 language-layer preparation fails before the change and passes
+  afterward on Orin. Reusing unchanged original recipes, the full 63-case
+  comparison resolves three failures but adds two: one-view black/normal noise
+  and two-view `droid-record0-frame000`. Repeats and revisits remain bitwise.
+  The change is not promoted; its performance run was canceled before execution
+  because it failed the numerical regression requirement.
 - Remaining maintained BF16 failures include zero-noise gradients, black and
   white images, distinct camera gray levels and one-view real observations.
   Some fail only an individual timestep. FP8/INT8 failures also remain unresolved;
   they are not waived as out-of-distribution inputs or accepted by replacing
   reference outputs.
+
+### INT8 initialization regression
+
+The CPU quantizer now scans canonical `[input, output]` weights contiguously
+instead of traversing one strided column at a time. Each channel retains its
+original maximum-reduction order, scale, rounding and clipping. A column-wise
+oracle checks quantized bytes and scale bits, including odd shapes and zero
+channels. All four related native tests pass on Orin.
+
+Reusing unchanged recipes, all 63 one-, two- and three-view INT8 outputs are
+bitwise equal to the preceding implementation; repeated and revisited outputs
+also have zero drift. This preserves the existing OpenPI failure set and does
+not qualify the quantized model. Paired model construction takes 93.175 / 34.195 / 92.862 seconds for baseline /
+candidate / baseline revisit. With 30 warmups and 50 samples, one-view T10 P50
+is 87.609 / 87.762 / 87.881 ms and T200 is 105.322 / 105.111 / 105.154 ms.
+There is no clear steady-state regression in this paired diagnostic. T10 P95
+is 87.945 / 87.993 / 87.968 ms; the small tail increase is retained. These shared
+board measurements are not exclusive-run deployment budgets. T10 first-call
+latency is 6.758 / 6.788 / 6.688 seconds; T200 is 7.489 / 7.722 / 7.750 seconds,
+and shape return is 7.614 / 7.801 / 8.067 seconds. The initialization improvement
+does not eliminate those graph/shape-preparation costs.
 
 ### Performance evidence
 
@@ -101,7 +166,22 @@ exclusive-run budgets. Latest maintained Thor split-K measurements, against the 
 | 2 | 69.572 / 70.305 / 69.479 ms | 76.346 / 76.305 / 76.183 ms |
 | 3 | 87.064 / 84.686 / 86.322 ms | 91.028 / 91.291 / 91.061 ms |
 
-The two-view T10 increase is approximately 1% and remains unresolved.
+The two-view T10 increase is approximately 1%. An isolated Attention recipe
+factor recovers it. A general diagnostic change then measures graph-safe
+candidates using CUDA Graph replay instead of eager host submissions. An
+independent host-submission-delay fixture fails with the old tuner and passes
+with the change. The two-view BF16 pilot preserves the failure set and measures
+70.433 / 69.549 / 70.287 ms for baseline / candidate / revisit. The expanded
+Thor BF16/FP8 matrix across all three views adds no failures and resolves one
+two-view FP8 real case. However, full paired performance exposes a three-view
+BF16 T10 regression: 84.694 / 86.398 / 84.783 ms, approximately 2% slower.
+Orin one-view BF16 adds a real-observation failure: whole-chunk cosine remains
+0.99994, but the worst timestep relative L2 increases from 0.0323 to 0.0591,
+above the existing 0.05 limit. The pre-performance regression check stops that
+candidate's Orin timing run. The tuner change is rejected. Its Orin CUDA library
+run passes 90 tests, fails the same twelve unsupported-provider tests as the
+baseline, and ignores two; it introduces no new library-test failures.
+
 The complete private Thor arithmetic repair adds approximately 9–11 ms. A
 single-factor measurement attributes about 8–9 ms to staged Attention; unrolling
 its softmax saves about 1.65 ms in the full two-view model. This remains private
