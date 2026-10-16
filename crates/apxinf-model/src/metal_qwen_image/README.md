@@ -42,21 +42,25 @@ Select it from the CLI with `generate-image --model-variant reference`.
   that cache, as mflux does. `ops.rs` keeps MLX `nn.silu` and
   `nn.gelu_approx` as shapeless compiled functions.
 - Image-token block projections decode Q4 to BF16 per call and use the
-  MetalPerformancePrimitives GEMM when the token count is a multiple of 64
-  (EngineTailor GEMM frontier 427d48fc). Loading enables it only when a probe
-  shows that it compiles and matches MLX quantized matmul bit for bit for the
-  synthetic `(M, K, N) = (64, 4096, 128)` inputs. That single probe does not
-  qualify checkpoint weights, other projection shapes or whole-image equality.
-  This optimization still needs independent device/runtime and workload
-  qualification. In `reference`, when the probe fails, for unaligned image
-  token counts, and for the text prefix, projections use quantized matmul.
+  MetalPerformancePrimitives GEMM when the token count is a multiple of 64 and
+  at least 1024 (EngineTailor GEMM frontier 427d48fc). Loading enables it only
+  when a probe shows that it compiles and matches MLX quantized matmul bit for
+  bit for all three projection shapes at 1024 rows, on seeded device data.
+  Below that size MLX quantized matmul switches to another reduction (observed
+  on M4 at 64 rows), which MPP does not reproduce. The probe does not qualify
+  checkpoint weights, larger token counts or whole-image equality; this
+  optimization still needs device and workload qualification. In `reference`,
+  when the probe fails, below 1024 or for unaligned image token counts, and for
+  the text prefix, projections use quantized matmul.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
   overlap, and blends tiles on the host.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and
   the blending ramp; tests check recorded NumPy digests.
 
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
-and read again by the next request; the VAE decoder stays loaded. This matches
+and read again by the next request; the VAE decoder stays loaded. The MLX
+buffer cache is cleared after text encoding and after the DiT is released, as
+mflux `--low-ram` does; its 1 GB cache limit is not applied. This matches
 the memory profile of the `--low-ram` reference on 16 GB devices.
 
 Verification status: CPU tests cover the tables, admission, RoPE positions,
