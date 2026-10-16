@@ -277,7 +277,7 @@ impl Fp8StaticWeights {
             )?,
             token_embedding: fp16_to_device(&weights.vision.token_embedding, backend)?,
             language_layers,
-            language_final_norm_scale: fp16_to_device(&weights.language_final_norm_scale, backend)?,
+            language_final_norm_scale: fp16_to_device(&weights.language_final_norm.scale()?, backend)?,
             action_layers,
             action_final_modulation: modulation_to_device(&weights.action_final_norm, backend)?,
             action_in: Fp8StaticLinearWeights::from_host(&weights.action_in, backend)?,
@@ -317,7 +317,7 @@ impl Fp8StaticDeviceLanguageLayer {
     fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
         let weights = weights.folded()?;
         Ok(Self {
-            input_norm_scale: fp16_to_device(&weights.input_norm_scale, backend)?,
+            input_norm_scale: fp16_to_device(&weights.input_norm.scale()?, backend)?,
             qkv: Fp8StaticLinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -327,7 +327,7 @@ impl Fp8StaticDeviceLanguageLayer {
                 backend,
             )?,
             output: Fp8StaticLinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: fp16_to_device(&weights.post_attention_norm_scale, backend)?,
+            post_attention_norm_scale: fp16_to_device(&weights.post_attention_norm.scale()?, backend)?,
             gate_up: Fp8StaticLinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

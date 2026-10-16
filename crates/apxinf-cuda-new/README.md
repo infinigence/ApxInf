@@ -8,6 +8,13 @@ Preparation and graph capture have different owners. GEMM and Attention may own 
 - Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
 
 The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
+BF16 `rms_norm`, `bias_residual_rms_norm`, `adaptive_rms_norm` and
+`ada_gate_residual_rms_norm` also
+accept FP32 weights/conditioning without downcasting those parameters. The
+mixed gated form rounds the gate and gated projection to BF16 before residual
+addition, then applies FP32 normalization and affine conditioning. Its Spec
+version 2 records the parameter dtype; the ordinary same-dtype paths retain
+their existing behavior.
 The BF16 MLP helper remains available as
 `ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
 signature and is used by the Qwen integration tests.

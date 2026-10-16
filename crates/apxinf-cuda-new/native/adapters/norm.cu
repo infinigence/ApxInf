@@ -68,10 +68,18 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3 &&
       writes_normalized(spec.semantic);
+  const bool mixed_parameters = spec.dtype == APXINF_DTYPE_BF16 &&
+      spec.output_dtype == APXINF_DTYPE_BF16 &&
+      spec.parameter_dtype == APXINF_DTYPE_F32 &&
+      (spec.semantic == APXINF_NORM_SEMANTIC_RMS ||
+       spec.semantic == APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_RMS ||
+       spec.semantic == APXINF_NORM_SEMANTIC_ADAPTIVE_RMS ||
+       spec.semantic == APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL_RMS);
   if (spec.version != APXINF_NORM_SPEC_VERSION ||
       spec.semantic > APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (spec.output_dtype != spec.dtype && !quantized_output) ||
+      (spec.parameter_dtype != spec.dtype && !mixed_parameters) ||
       spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX || spec.has_bias > 1 ||
       spec.output_scale_is_unit > 1 ||
@@ -203,6 +211,42 @@ cudaError_t launch_quantized_f16(const apxinf_norm_spec_t& spec,
   return cudaGetLastError();
 }
 
+cudaError_t launch_f32_parameters(const apxinf_norm_spec_t& spec,
+                                  const apxinf_norm_bindings_t& bindings) {
+  const auto* input = static_cast<const __nv_bfloat16*>(bindings.input);
+  const auto* residual = static_cast<const __nv_bfloat16*>(bindings.residual);
+  const auto* bias = static_cast<const __nv_bfloat16*>(bindings.bias);
+  const auto* parameters = static_cast<const float*>(
+      reads_weight(spec.semantic) ? bindings.weight : bindings.norm_style);
+  const auto* gate_style = static_cast<const float*>(bindings.gate_style);
+  auto* hidden = static_cast<__nv_bfloat16*>(bindings.hidden);
+  auto* output = static_cast<__nv_bfloat16*>(bindings.normalized);
+  const int rows = static_cast<int>(spec.rows);
+  const int cols = static_cast<int>(spec.cols);
+  auto stream = static_cast<cudaStream_t>(bindings.stream);
+  switch (spec.semantic) {
+    case APXINF_NORM_SEMANTIC_RMS:
+      kernels::rms_norm_f32_parameters<false, false><<<rows, kThreads, 0, stream>>>(
+          input, residual, bias, parameters, gate_style, hidden, output, cols, bindings.eps);
+      break;
+    case APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_RMS:
+      kernels::rms_norm_f32_parameters<false, false, true><<<rows, kThreads, 0, stream>>>(
+          input, residual, bias, parameters, gate_style, hidden, output, cols, bindings.eps);
+      break;
+    case APXINF_NORM_SEMANTIC_ADAPTIVE_RMS:
+      kernels::rms_norm_f32_parameters<true, false><<<rows, kThreads, 0, stream>>>(
+          input, residual, bias, parameters, gate_style, hidden, output, cols, bindings.eps);
+      break;
+    case APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL_RMS:
+      kernels::rms_norm_f32_parameters<true, true><<<rows, kThreads, 0, stream>>>(
+          input, residual, bias, parameters, gate_style, hidden, output, cols, bindings.eps);
+      break;
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
 template <class T>
 cudaError_t launch(const apxinf_norm_spec_t& spec,
                    const apxinf_norm_bindings_t& bindings) {
@@ -281,6 +325,10 @@ extern "C" apxinf_status_t apxinf_norm_launch(
     validate_spec(*spec);
     validate_bindings(*spec, *bindings);
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    if (spec->parameter_dtype == APXINF_DTYPE_F32) {
+      apxinf::framework::check_cuda(launch_f32_parameters(*spec, *bindings));
+      return;
+    }
     apxinf::framework::check_cuda(
         spec->output_dtype == APXINF_DTYPE_E4M3
             ? launch_quantized_f16(*spec, *bindings)

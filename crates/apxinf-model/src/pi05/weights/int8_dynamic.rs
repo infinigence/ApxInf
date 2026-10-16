@@ -320,7 +320,7 @@ impl Int8DynamicWeights {
                 .iter()
                 .map(|layer| Int8DynamicDeviceLanguageLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
+            language_final_norm_scale: bf16_to_device(&weights.language_final_norm.scale()?, backend)?,
             action_layers: weights
                 .action_layers
                 .iter()
@@ -363,7 +363,7 @@ impl Int8DynamicDeviceVisionBlock {
 impl Int8DynamicDeviceLanguageLayer {
     fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
-            input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
+            input_norm_scale: bf16_to_device(&weights.input_norm.scale()?, backend)?,
             qkv: Int8DynamicLinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -373,7 +373,7 @@ impl Int8DynamicDeviceLanguageLayer {
                 backend,
             )?,
             output: Int8DynamicLinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
+            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm.scale()?, backend)?,
             gate_up: Int8DynamicLinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

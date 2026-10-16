@@ -11,7 +11,8 @@ branch now incorporates upstream's direct cuda-new PI05 migration (`#88`).
 Merged-source GPU acceptance is still incomplete; results from the old backend
 do not qualify the current implementation.
 The merge preserves explicit INT8 language normalization and its conservative
-allocation-schedule reservation. BF16/FP8 retain their folded weight recipes.
+allocation-schedule reservation. BF16 now keeps its normalization explicit;
+FP8 retains its folded weight recipe.
 
 ### Current migration baseline
 
@@ -34,6 +35,21 @@ production recipe's performance budget.
 The timestep repair at `4027e85b` matches all 10,240 official embedding values
 bitwise in a direct CPU comparison. Its GPU matrix and paired performance are
 pending; this isolated result does not establish a full-model numerical repair.
+
+The BF16 normalization candidate preserves each raw checkpoint offset until
+precision conversion, rounds it to BF16 before adding one in FP32, and keeps
+that FP32 scale separate from the projection weights. Reconstructing an offset
+from an already-added scale loses the reference result for four of 75,776 real
+language-normalization parameters. A CPU regression covers those boundaries.
+FP8/INT8 retain their existing scale conversions in this change.
+
+The existing cuda-new RMS interfaces now accept FP32 parameters with BF16
+activations. Independent Torch operator fixtures cover widths 7/1024/2048,
+zero rows, optional bias, fused residual and gated residual. On Orin CUDA 12.6,
+the unsupported original is RED, the extension is GREEN, intentionally rounded
+parameters are RED, and restoration is GREEN. This proves the operator cases;
+current-source full-model and performance acceptance remain pending.
+Norm/RoPE graph storage retention also has two actual GPU RED/GREEN regressions.
 
 ### Historical numerical evidence
 

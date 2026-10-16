@@ -210,7 +210,7 @@ impl Bf16Weights {
                 .iter()
                 .map(|layer| Bf16DeviceLanguageLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
+            language_final_norm_scale: backend::to_device(backend, &weights.language_final_norm.bf16_scale()?)?,
             action_layers: weights
                 .action_layers
                 .iter()
@@ -252,9 +252,8 @@ impl Bf16DeviceVisionBlock {
 
 impl Bf16DeviceLanguageLayer {
     fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
-        let weights = weights.folded()?;
         Ok(Self {
-            input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
+            input_norm_scale: backend::to_device(backend, &weights.input_norm.bf16_scale()?)?,
             qkv: Bf16LinearWeights::from_host_parts(
                 &[
                     &weights.attention.q,
@@ -264,7 +263,7 @@ impl Bf16DeviceLanguageLayer {
                 backend,
             )?,
             output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
+            post_attention_norm_scale: backend::to_device(backend, &weights.post_attention_norm.bf16_scale()?)?,
             gate_up: Bf16LinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

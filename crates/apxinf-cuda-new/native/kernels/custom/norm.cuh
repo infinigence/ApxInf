@@ -60,6 +60,62 @@ __device__ __forceinline__ float block_sum_parallel_unsafe(float value,
   return scratch[0];
 }
 
+// BF16 activation boundaries with FP32 affine/conditioning parameters.
+// Keep the four-accumulator reduction and separate rounding operations stable:
+// changing either can move a BF16 output across a rounding boundary.
+template <bool Adaptive, bool Gated, bool Residual = Gated>
+__global__ void rms_norm_f32_parameters(
+    const __nv_bfloat16* input, const __nv_bfloat16* residual,
+    const __nv_bfloat16* bias, const float* parameters, const float* gate_style,
+    __nv_bfloat16* hidden, __nv_bfloat16* output, int cols, float eps) {
+  __shared__ float square_sum;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  if constexpr (Residual) {
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+      float value = __bfloat162float(input[base + col]);
+      if constexpr (Gated) {
+        const float gate = __bfloat162float(
+            __float2bfloat16_rn(gate_style[2 * cols + col]));
+        value = __bfloat162float(__float2bfloat16_rn(__fmul_rn(value, gate)));
+      }
+      value = __fadd_rn(value, __bfloat162float(residual[base + col]));
+      if (bias != nullptr) value = __fadd_rn(value, __bfloat162float(bias[col]));
+      hidden[base + col] = __float2bfloat16_rn(value);
+    }
+    __syncthreads();
+  }
+  const __nv_bfloat16* values = Residual ? hidden : input;
+  if (threadIdx.x < 32) {
+    float sums[4] = {};
+    for (int col = threadIdx.x * 4; col < cols; col += 128) {
+#pragma unroll
+      for (int item = 0; item < 4; ++item) {
+        if (col + item < cols) {
+          const float value = __bfloat162float(values[base + col + item]);
+          sums[item] = __fadd_rn(sums[item], __fmul_rn(value, value));
+        }
+      }
+    }
+    float sum = __fadd_rn(__fadd_rn(__fadd_rn(sums[0], sums[1]), sums[2]), sums[3]);
+    for (int offset = 1; offset < 32; offset *= 2)
+      sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, offset));
+    if (threadIdx.x == 0) square_sum = sum;
+  }
+  __syncthreads();
+  const float inverse = rsqrtf(square_sum / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float normalized = __fmul_rn(__bfloat162float(values[base + col]), inverse);
+    float result;
+    if constexpr (Adaptive) {
+      result = __fadd_rn(__fmul_rn(normalized, __fadd_rn(1.0f, parameters[col])),
+                        parameters[cols + col]);
+    } else {
+      result = __fmul_rn(normalized, parameters[col]);
+    }
+    output[base + col] = __float2bfloat16_rn(result);
+  }
+}
+
 // Every kernel below takes (rows, cols) in that order.  The legacy backend
 // carries two same-named overloads that differ only by `int` versus
 // `uint32_t`, with the row and column arguments swapped between them; the port

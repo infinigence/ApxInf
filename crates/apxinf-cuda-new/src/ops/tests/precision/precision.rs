@@ -283,8 +283,12 @@ fn attention_f16_action_cache_uses_fa2() {
     let normalized = super::normalize_kv_cache_attention(&ctx, args).unwrap();
     let execution = super::attention_execution::prepare(&ctx, normalized).unwrap();
     assert!(
-        execution.summary().starts_with("flash-attention-2-split-kv ")
-            || execution.summary().starts_with("flash-attention-2-kv-cache "),
+        execution
+            .summary()
+            .starts_with("flash-attention-2-split-kv ")
+            || execution
+                .summary()
+                .starts_with("flash-attention-2-kv-cache "),
         "unexpected F16 action KV-cache provider: {}",
         execution.summary()
     );
@@ -685,5 +689,87 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
             )
             .unwrap();
         }
+    }
+}
+
+#[path = "adaptive_norm_torch_fixture.rs"]
+mod adaptive_norm_fixture;
+
+#[test]
+fn mixed_precision_rms_norm_matches_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    for case in adaptive_norm_fixture::CASES {
+        let shape = vec![2, case.width];
+        let input = bf16_bits_tensor(0, shape.clone(), case.input);
+        let residual = bf16_bits_tensor(0, shape.clone(), case.residual);
+        let style_values = [case.scale, case.shift].concat();
+        let style = f32_tensor(0, vec![2 * case.width], &style_values);
+        let gate_values = [vec![0.0; 2 * case.width], case.gate.to_vec()].concat();
+        let gate = f32_tensor(0, vec![3 * case.width], &gate_values);
+        let weight_values: Vec<_> = case.scale.iter().map(|value| 1.0 + value).collect();
+        let weight = f32_tensor(0, vec![case.width], &weight_values);
+        let mut output = zeros_tensor(0, shape.clone(), DType::BF16);
+        let mut hidden = zeros_tensor(0, shape, DType::BF16);
+        let check = |tensor: &Tensor, expected: &[u16]| {
+            let buffer = crate::CudaBuffer::from_tensor(tensor).unwrap();
+            let mut bytes = vec![0u8; buffer.len()];
+            buffer.copy_to_host(&mut bytes).unwrap();
+            let actual: Vec<_> = bytes
+                .chunks_exact(2)
+                .map(|word| u16::from_ne_bytes([word[0], word[1]]))
+                .collect();
+            assert_eq!(actual, expected, "width={}", case.width);
+        };
+        rms_norm(&ctx, RmsNormArgs::new(&input, &weight, &mut output, 1e-6)).unwrap();
+        ctx.synchronize().unwrap();
+        check(&output, case.rms);
+        let bias = bf16_bits_tensor(0, vec![case.width], case.bias);
+        for (bias, expected_hidden, expected_norm) in [
+            (None, case.residual_hidden, case.residual_rms),
+            (Some(&bias), case.bias_hidden, case.bias_rms),
+        ] {
+            bias_residual_rms_norm(
+                &ctx,
+                BiasResidualRmsNormArgs::new(
+                    &input,
+                    bias,
+                    &residual,
+                    &weight,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            check(&hidden, expected_hidden);
+            check(&output, expected_norm);
+        }
+        adaptive_rms_norm(
+            &ctx,
+            AdaptiveRmsNormArgs::new(&input, &style, &mut output, 1e-6),
+        )
+        .unwrap();
+        ctx.synchronize().unwrap();
+        check(&output, case.adaptive);
+        let graph = crate::capture(&ctx, || {
+            ada_gate_residual_rms_norm(
+                &ctx,
+                AdaGateResidualRmsNormArgs::new(
+                    &input,
+                    &residual,
+                    &style,
+                    &gate,
+                    &mut hidden,
+                    &mut output,
+                    1e-6,
+                ),
+            )
+        })
+        .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        check(&hidden, case.hidden);
+        check(&output, case.gated);
     }
 }

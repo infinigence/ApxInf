@@ -1039,3 +1039,32 @@ fn direct_rope_graph_retains_tensor_storage() {
         "destroyed graph leaked its input"
     );
 }
+
+#[test]
+fn mixed_precision_norm_rejects_unsupported_parameter_combinations() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f16_tensor(0, vec![1, 8], &[1.0; 8]);
+    let weight = super::framework::f32_tensor(0, vec![8], &[1.0; 8]);
+    let mut output = f16_tensor(0, vec![1, 8], &[0.0; 8]);
+    assert!(rms_norm(&ctx, RmsNormArgs::new(&input, &weight, &mut output, 1e-6)).is_err());
+
+    let input = tensor(0, vec![1, 8], &[1.0; 8]);
+    let residual = tensor(0, vec![1, 8], &[1.0; 8]);
+    let style = super::framework::f32_tensor(0, vec![16], &[0.1; 16]);
+    let gate = tensor(0, vec![24], &[0.1; 24]);
+    let mut hidden = tensor(0, vec![1, 8], &[0.0; 8]);
+    let mut output = tensor(0, vec![1, 8], &[0.0; 8]);
+    assert!(ada_gate_residual_rms_norm(
+        &ctx,
+        AdaGateResidualRmsNormArgs::new(
+            &input,
+            &residual,
+            &style,
+            &gate,
+            &mut hidden,
+            &mut output,
+            1e-6,
+        )
+    )
+    .is_err());
+}

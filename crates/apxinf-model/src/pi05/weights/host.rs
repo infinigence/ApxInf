@@ -73,27 +73,59 @@ pub struct GemmaMlpWeights {
     pub down: LinearWeights,
 }
 
+/// Preserve Gemma's checkpoint offset until the precision path is selected.
+/// Rounding `1 + offset` and then subtracting one can lose the original value.
+#[derive(Debug, Clone)]
+pub struct GemmaRmsNormWeights {
+    pub offset: Tensor,
+}
+
+impl GemmaRmsNormWeights {
+    fn identity(dims: &[usize]) -> Result<Self> {
+        Ok(Self {
+            offset: Tensor::from_f32(dims.to_vec(), &vec![0.0; dims.iter().product()])?,
+        })
+    }
+
+    pub(super) fn scale(&self) -> Result<Tensor> {
+        add_one(self.offset.clone())
+    }
+
+    /// OpenPI casts the offset to BF16, restores FP32, then adds one.
+    pub(super) fn bf16_scale(&self) -> Result<Tensor> {
+        let values = self
+            .offset
+            .to_f32_vec()?
+            .into_iter()
+            .map(|value| 1.0 + bf16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        Tensor::from_f32(self.offset.shape().dims().to_vec(), &values)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LanguageLayerWeights {
-    /// Final multiplicative scale, after applying Gemma's `1 + weight` rule.
-    pub input_norm_scale: Tensor,
+    pub input_norm: GemmaRmsNormWeights,
     pub attention: GemmaAttentionWeights,
-    pub post_attention_norm_scale: Tensor,
+    pub post_attention_norm: GemmaRmsNormWeights,
     pub mlp: GemmaMlpWeights,
 }
 
 impl LanguageLayerWeights {
-    /// Fold in FP32 for the BF16/FP8 recipes. INT8 keeps explicit normalization:
+    /// Fold in FP32 for the FP8 recipe. BF16 and INT8 keep explicit normalization:
     /// folding can amplify channel outliers before per-output weight quantization.
     pub(super) fn folded(&self) -> Result<Self> {
         let mut layer = self.clone();
-        layer.attention.q = fold_input_scale(layer.attention.q, &self.input_norm_scale)?;
-        layer.attention.k = fold_input_scale(layer.attention.k, &self.input_norm_scale)?;
-        layer.attention.v = fold_input_scale(layer.attention.v, &self.input_norm_scale)?;
-        layer.mlp.gate = fold_input_scale(layer.mlp.gate, &self.post_attention_norm_scale)?;
-        layer.mlp.up = fold_input_scale(layer.mlp.up, &self.post_attention_norm_scale)?;
-        layer.input_norm_scale = ones(self.input_norm_scale.shape().dims())?;
-        layer.post_attention_norm_scale = ones(self.post_attention_norm_scale.shape().dims())?;
+        let input_scale = self.input_norm.scale()?;
+        let post_attention_scale = self.post_attention_norm.scale()?;
+        layer.attention.q = fold_input_scale(layer.attention.q, &input_scale)?;
+        layer.attention.k = fold_input_scale(layer.attention.k, &input_scale)?;
+        layer.attention.v = fold_input_scale(layer.attention.v, &input_scale)?;
+        layer.mlp.gate = fold_input_scale(layer.mlp.gate, &post_attention_scale)?;
+        layer.mlp.up = fold_input_scale(layer.mlp.up, &post_attention_scale)?;
+        layer.input_norm = GemmaRmsNormWeights::identity(self.input_norm.offset.shape().dims())?;
+        layer.post_attention_norm =
+            GemmaRmsNormWeights::identity(self.post_attention_norm.offset.shape().dims())?;
         Ok(layer)
     }
 }
@@ -110,7 +142,7 @@ pub struct ActionLayerWeights {
 pub struct Pi05Weights {
     pub vision: VisionWeights,
     pub language_layers: Vec<LanguageLayerWeights>,
-    pub language_final_norm_scale: Tensor,
+    pub language_final_norm: GemmaRmsNormWeights,
     pub action_layers: Vec<ActionLayerWeights>,
     pub action_final_norm: AdaRmsNormWeights,
     pub action_in: LinearWeights,
@@ -221,10 +253,9 @@ impl Pi05Weights {
         let weights = Self {
             vision,
             language_layers,
-            language_final_norm_scale: add_one(take(
-                &mut tensors,
-                &format!("{language_prefix}.norm.weight"),
-            )?)?,
+            language_final_norm: GemmaRmsNormWeights {
+                offset: take(&mut tensors, &format!("{language_prefix}.norm.weight"))?,
+            },
             action_layers,
             action_final_norm: take_ada_norm(&mut tensors, &format!("{action_prefix}.norm"))?,
             action_in: take_linear(&mut tensors, "action_in_proj", true)?,
@@ -287,9 +318,9 @@ impl Pi05Weights {
         let mut language_layers = Vec::with_capacity(lang.depth);
         for _ in 0..lang.depth {
             language_layers.push(LanguageLayerWeights {
-                input_norm_scale: ones(&[lang.width])?,
+                input_norm: GemmaRmsNormWeights::identity(&[lang.width])?,
                 attention: synthetic_attention(&mut rng, lang)?,
-                post_attention_norm_scale: ones(&[lang.width])?,
+                post_attention_norm: GemmaRmsNormWeights::identity(&[lang.width])?,
                 mlp: synthetic_mlp(&mut rng, lang)?,
             });
         }
@@ -307,7 +338,7 @@ impl Pi05Weights {
         let weights = Self {
             vision,
             language_layers,
-            language_final_norm_scale: ones(&[lang.width])?,
+            language_final_norm: GemmaRmsNormWeights::identity(&[lang.width])?,
             action_layers,
             action_final_norm: synthetic_ada_norm(&mut rng, action.width)?,
             action_in: synthetic_linear(&mut rng, config.action_dim, action.width, true)?,
@@ -411,12 +442,13 @@ fn take_language_layer(
     layer: &str,
 ) -> Result<LanguageLayerWeights> {
     Ok(LanguageLayerWeights {
-        input_norm_scale: add_one(take(tensors, &format!("{layer}.input_layernorm.weight"))?)?,
+        input_norm: GemmaRmsNormWeights {
+            offset: take(tensors, &format!("{layer}.input_layernorm.weight"))?,
+        },
         attention: take_attention(tensors, layer)?,
-        post_attention_norm_scale: add_one(take(
-            tensors,
-            &format!("{layer}.post_attention_layernorm.weight"),
-        )?)?,
+        post_attention_norm: GemmaRmsNormWeights {
+            offset: take(tensors, &format!("{layer}.post_attention_layernorm.weight"))?,
+        },
         mlp: take_mlp(tensors, layer)?,
     })
 }
@@ -793,6 +825,41 @@ mod tests {
     }
 
     #[test]
+    fn gemma_bf16_norm_preserves_offset_rounding_boundary() {
+        let norm = GemmaRmsNormWeights {
+            offset: Tensor::from_f32(
+                vec![4],
+                &[
+                    0.006546069402247667,
+                    1.7695313692092896,
+                    -0.01327512226998806,
+                    3.304742858745158e-05,
+                ],
+            )
+            .unwrap(),
+        };
+        let expected = vec![
+            1.006561279296875,
+            2.7734375,
+            0.98675537109375,
+            1.0000331401824951,
+        ];
+        assert_eq!(norm.bf16_scale().unwrap().to_f32_vec().unwrap(), expected);
+        let reconstructed: Vec<_> = norm
+            .scale()
+            .unwrap()
+            .to_f32_vec()
+            .unwrap()
+            .into_iter()
+            .map(|scale| 1.0 + bf16::from_f32(scale - 1.0).to_f32())
+            .collect();
+        assert!(reconstructed
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| *actual != expected));
+    }
+
+    #[test]
     fn gemma_norm_offset_is_finalized_once() {
         let tensor = Tensor::from_f32(vec![3], &[-0.5, 0.0, 0.5]).unwrap();
         assert_eq!(add_one(tensor).unwrap().as_f32().unwrap(), &[0.5, 1.0, 1.5]);
@@ -823,15 +890,26 @@ mod tests {
         }
         let layer = take_language_layer(&mut tensors, "layer").unwrap();
         assert!(tensors.is_empty());
-        assert_eq!(layer.input_norm_scale.as_f32().unwrap(), &[0.5, 4.]);
+        assert_eq!(
+            layer.input_norm.scale().unwrap().as_f32().unwrap(),
+            &[0.5, 4.]
+        );
         assert_eq!(
             layer.attention.q.weight.as_f32().unwrap(),
             &[1., 3., 2., 4.]
         );
         let folded = layer.folded().unwrap();
-        assert_eq!(folded.input_norm_scale.as_f32().unwrap(), &[1., 1.]);
         assert_eq!(
-            folded.post_attention_norm_scale.as_f32().unwrap(),
+            folded.input_norm.scale().unwrap().as_f32().unwrap(),
+            &[1., 1.]
+        );
+        assert_eq!(
+            folded
+                .post_attention_norm
+                .scale()
+                .unwrap()
+                .as_f32()
+                .unwrap(),
             &[1., 1.]
         );
         for linear in [
