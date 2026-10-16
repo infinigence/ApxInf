@@ -120,23 +120,31 @@ pub fn load(
     })))
 }
 
-/// Enables MPP after a bit-identical synthetic (64, 4096, 128) probe.
-/// This does not qualify other shapes, checkpoint weights or image outputs.
+/// Enables MPP after a bit-identical probe of the three block projection
+/// shapes `(K, N)` at `dit::MPP_MIN_TOKENS` rows, on seeded device data.
+/// This does not qualify checkpoint weights, larger token counts or image outputs.
 fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
     let probe = || -> Result<Option<MppBf16GemmNt>> {
         let gemm = MppBf16GemmNt::new(stream)?;
-        let values = |n: usize, period: usize| -> Vec<f32> {
-            (0..n)
-                .map(|i| ((i * 7 + 3) % period) as f32 / period as f32 - 0.5)
-                .collect()
+        let normal = |shape: &[usize], seed: u64, scale: f32| -> Result<Array> {
+            Array::random_normal(shape, MlxDType::F32, &Array::random_key(stream, seed)?)?
+                .mul(&Array::scalar(stream, scale, MlxDType::F32)?)?
+                .cast(MlxDType::BF16)
         };
-        let (m, k, n) = (64, 4096, 128);
-        let w = Array::from_f32(stream, &[n, k], &values(n * k, 61))?.cast(MlxDType::BF16)?;
-        let [q, scales, biases] = w.quantize(64, 4)?;
-        let x = Array::from_f32(stream, &[1, m, k], &values(m * k, 53))?.cast(MlxDType::BF16)?;
-        let reference = x.quantized_matmul(&q, &scales, &biases, true, 64, 4)?;
-        let out = gemm.call(&x, &q.dequantize(&scales, &biases, 64, 4)?)?;
-        Ok((out.to_bytes()? == reference.to_bytes()?).then_some(gemm))
+        let m = dit::MPP_MIN_TOKENS;
+        for (seed, (k, n)) in [(4096, 4096), (4096, MLP), (MLP, 4096)]
+            .into_iter()
+            .enumerate()
+        {
+            let [q, scales, biases] = normal(&[n, k], 2 * seed as u64, 0.02)?.quantize(64, 4)?;
+            let x = normal(&[1, m, k], 2 * seed as u64 + 1, 1.0)?;
+            let reference = x.quantized_matmul(&q, &scales, &biases, true, 64, 4)?;
+            let out = gemm.call(&x, &q.dequantize(&scales, &biases, 64, 4)?)?;
+            if out.to_bytes()? != reference.to_bytes()? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(gemm))
     };
     match probe() {
         Ok(Some(gemm)) => Some(gemm),
@@ -251,6 +259,9 @@ impl ImageRuntime for QwenImage {
         let (lh, lw) = (height / SCALE, width / SCALE);
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
         let prompt = text::encode(&self.text, &tokens, ops)?;
+        // The text encoder layers are freed; release their cached buffers as
+        // mflux --low-ram does after deleting the encoder.
+        apxinf_mlx::clear_cache()?;
         let key = Array::random_key(stream, request.seed)?;
         let mut latents = Array::random_normal(&[1, lh * lw, LATENT], MlxDType::F32, &key)?
             .cast(MlxDType::BF16)?;
@@ -284,8 +295,10 @@ impl ImageRuntime for QwenImage {
             latents = latents.add(&velocity.cast(MlxDType::BF16)?.mul(&dt)?)?;
             latents.eval()?;
         }
-        // Release the DiT before decoding, as mflux --low-ram does.
+        // Release the DiT and its cached buffers before decoding, as mflux
+        // --low-ram does.
         drop((cache, step));
+        apxinf_mlx::clear_cache()?;
         let rgb = vae::decode(&self.decoder, ops, &latents, width, height)?;
         Ok(GeneratedImage { width, height, rgb })
     }
