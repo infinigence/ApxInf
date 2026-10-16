@@ -60,6 +60,11 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
+`DecisionRuntime` (`decision.rs`) is the shared non-generative decision
+contract. It takes an encoded prompt scored over a package code table (d3) or
+a schema request with named, typed questions that the family encodes itself
+(`metal_clef`), and returns one answer per question.
+
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
 profiles, capacity and retained error. Only successful preparation reports

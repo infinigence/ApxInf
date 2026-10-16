@@ -4,7 +4,7 @@
 //! `truncate=False`): every piece is tokenized separately, without added
 //! special tokens, and question/option spans index the concatenated IDs.
 use super::config::MAX_INPUT_TOKENS;
-use crate::d3::{DecisionQuestion, DecisionSchema};
+use crate::decision::{DecisionQuestion, DecisionSchema};
 use apxinf_core::{Error, Result};
 use apxinf_tokenizer::Tokenizer;
 use serde_json::Value;
