@@ -74,8 +74,8 @@ pub struct Pi05Config {
     pub rms_norm_eps: f32,
     pub layer_norm_eps: f32,
     pub rope_theta: f32,
-    pub time_min_period: f32,
-    pub time_max_period: f32,
+    pub time_min_period: f64,
+    pub time_max_period: f64,
     pub discrete_state_input: bool,
     pub language: GemmaVariantConfig,
     pub action_expert: GemmaVariantConfig,
@@ -163,8 +163,14 @@ impl Pi05Config {
             .get("discrete_state_input")
             .and_then(|x| x.as_bool())
             .unwrap_or(cfg.discrete_state_input);
-        cfg.time_min_period = f32_field(&v, "min_period", cfg.time_min_period);
-        cfg.time_max_period = f32_field(&v, "max_period", cfg.time_max_period);
+        cfg.time_min_period = v
+            .get("min_period")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(cfg.time_min_period);
+        cfg.time_max_period = v
+            .get("max_period")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(cfg.time_max_period);
 
         if let Some(resolution) = v.get("image_resolution").and_then(|x| x.as_array()) {
             if let Some(size) = resolution.first().and_then(|x| x.as_u64()) {

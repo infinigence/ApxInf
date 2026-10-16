@@ -66,9 +66,8 @@ pub fn upload_time_embeddings_bf16(
     config: &Pi05Config,
     context: &Context,
 ) -> Result<Vec<Tensor>> {
-    (0..config.num_flow_steps)
-        .map(|step| {
-            let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
+    crate::pi05::math::flow_timesteps(config.flow_start_time, config.num_flow_steps)
+        .map(|time| {
             let values = sinusoidal_time_embedding(
                 time,
                 config.action_expert.width,
@@ -89,9 +88,8 @@ pub fn upload_time_embeddings_fp8_static(
     config: &Pi05Config,
     context: &Context,
 ) -> Result<Vec<Tensor>> {
-    (0..config.num_flow_steps)
-        .map(|step| {
-            let time = config.flow_start_time * (1.0 - step as f32 / config.num_flow_steps as f32);
+    crate::pi05::math::flow_timesteps(config.flow_start_time, config.num_flow_steps)
+        .map(|time| {
             let values = sinusoidal_time_embedding(
                 time,
                 config.action_expert.width,

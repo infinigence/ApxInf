@@ -11,8 +11,8 @@ use std::f64::consts::TAU;
 pub fn sinusoidal_time_embedding(
     time: f32,
     dimension: usize,
-    min_period: f32,
-    max_period: f32,
+    min_period: f64,
+    max_period: f64,
 ) -> Vec<f32> {
     assert_eq!(dimension % 2, 0);
     let half = dimension / 2;
@@ -24,13 +24,23 @@ pub fn sinusoidal_time_embedding(
         } else {
             i as f64 / (half - 1) as f64
         };
-        let period = min_period as f64 * (max_period as f64 / min_period as f64).powf(fraction);
+        let period = min_period * (max_period / min_period).powf(fraction);
         let phase = time as f64 * TAU / period;
         sin.push(phase.sin() as f32);
         cos.push(phase.cos() as f32);
     }
     sin.extend(cos);
     sin
+}
+
+/// The flow solver updates its float32 time after every denoising step.
+pub(super) fn flow_timesteps(start: f32, steps: usize) -> impl Iterator<Item = f32> {
+    let delta = -start / steps as f32;
+    (0..steps).scan(start, move |time, _| {
+        let current = *time;
+        *time += delta;
+        Some(current)
+    })
 }
 
 /// Match NumPy `digitize(state, linspace(-1, 1, 257)[:-1]) - 1`.
@@ -91,6 +101,41 @@ mod tests {
         let emb = sinusoidal_time_embedding(0.0, 8, 4e-3, 4.0);
         assert_eq!(&emb[..4], &[0.0; 4]);
         assert_eq!(&emb[4..], &[1.0; 4]);
+    }
+
+    #[test]
+    fn timestep_embedding_matches_openpi_reference() {
+        // OpenPI 215abfb, create_sinusoidal_pos_embedding: float64 periods,
+        // float32 output. Include high-frequency and endpoint coordinates.
+        let expected = [
+            (0, -1.6070832e-13f32),
+            (1, -0.78321898),
+            (127, -0.53578031),
+            (511, 1.0),
+            (513, -0.62174594),
+        ];
+        let embedding = sinusoidal_time_embedding(1.0, 1024, 0.004, 4.0);
+        for (index, value) in expected {
+            assert!(
+                (embedding[index] - value).abs() < 1e-7,
+                "coordinate {index}: {} != {value}",
+                embedding[index]
+            );
+        }
+    }
+
+    #[test]
+    fn flow_timesteps_match_openpi_float32_updates() {
+        let expected = [
+            0x3f800000, 0x3f666666, 0x3f4ccccc, 0x3f333332, 0x3f199998, 0x3efffffd, 0x3eccccca,
+            0x3e999997, 0x3e4cccc8, 0x3dccccc3,
+        ];
+        assert_eq!(
+            flow_timesteps(1.0, 10)
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
