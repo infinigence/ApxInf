@@ -20,6 +20,10 @@ The Clef g20 per-call FP16 Q4 decode, row padding, split FP16 GEMM and
 four-value gated delta recurrence kernels derive from EngineTailor
 feat/clef-g20-engine 6edc065c6ffd12bc347e5d06d77b5a000eb87e9d.
 
+The MetalPerformancePrimitives BF16 GEMM kernel derives from the EngineTailor
+Qwen-Image Q4 GEMM campaign frontier, candidate SHA-256
+427d48fc48fddfeac783b448d240acda1a8e94efae85133d056e7ea4471fc886.
+
 The gated delta recurrence and the half-split rotary embedding kernel adapt
 MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
 Copyright (c) 2025 Prince Canuma. MIT License.

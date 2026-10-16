@@ -16,10 +16,12 @@ mod weights;
 use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
-use apxinf_mlx::{Array, MlxBackend, MlxDType};
+use apxinf_mlx::fusions::MppBf16GemmNt;
+use apxinf_mlx::{Array, MlxBackend, MlxDType, Stream};
 use apxinf_tokenizer::Tokenizer;
 use ops::Ops;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use weights::{Decoder, TextEncoderFiles, Transformer, LATENT};
 
@@ -37,6 +39,8 @@ pub struct QwenImage {
     transformer: Option<Transformer>,
     decoder: Decoder,
     ops: Ops,
+    /// Present when the MPP GEMM reproduces MLX quantized matmul on this device.
+    gemm: Option<Rc<MppBf16GemmNt>>,
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
     rope56: (Vec<f32>, Vec<f32>),
@@ -104,9 +108,44 @@ pub fn load(
         transformer: Some(transformer),
         decoder,
         ops: Ops::new(&stream)?,
+        gemm: exact_gemm(&stream).map(Rc::new),
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
     })))
+}
+
+/// The MPP GEMM, if this device compiles it and it reproduces MLX quantized
+/// matmul bit for bit on a block-shaped probe. Image outputs do not depend on
+/// the choice; otherwise image projections use quantized matmul.
+fn exact_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
+    let probe = || -> Result<Option<MppBf16GemmNt>> {
+        let gemm = MppBf16GemmNt::new(stream)?;
+        let values = |n: usize, period: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + 3) % period) as f32 / period as f32 - 0.5)
+                .collect()
+        };
+        let (m, k, n) = (64, 4096, 128);
+        let w = Array::from_f32(stream, &[n, k], &values(n * k, 61))?.cast(MlxDType::BF16)?;
+        let [q, scales, biases] = w.quantize(64, 4)?;
+        let x = Array::from_f32(stream, &[1, m, k], &values(m * k, 53))?.cast(MlxDType::BF16)?;
+        let reference = x.quantized_matmul(&q, &scales, &biases, true, 64, 4)?;
+        let out = gemm.call(&x, &q.dequantize(&scales, &biases, 64, 4)?)?;
+        Ok((out.to_bytes()? == reference.to_bytes()?).then_some(gemm))
+    };
+    match probe() {
+        Ok(Some(gemm)) => Some(gemm),
+        outcome => {
+            let reason = match outcome {
+                Err(e) => e.to_string(),
+                _ => "results differ from quantized matmul".to_owned(),
+            };
+            eprintln!(
+                "Qwen-Image: MPP GEMM not used ({reason}); image projections use quantized matmul"
+            );
+            None
+        }
+    }
 }
 
 /// Request admission, before any device work.
@@ -213,7 +252,7 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let step = dit::Step::new(dit::Dit::new(transformer, ops)?)?;
+        let step = dit::Step::new(dit::Dit::new(transformer, ops, self.gemm.clone())?)?;
         let cache = step.dit().text_cache(
             &prompt,
             &table(&cos[..split], text_len)?,
