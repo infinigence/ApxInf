@@ -518,6 +518,74 @@ impl Array {
         }
         self.stream().op(38, &[self, weight], &[], &[epsilon])
     }
+    /// Stock MLX fused RMSNorm without a weight multiplication.
+    pub fn fast_rms_norm_unweighted(&self, epsilon: f32) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(error("RMSNorm epsilon must be finite and positive"));
+        }
+        self.stream().op(38, &[self], &[], &[epsilon])
+    }
+    /// Stock MLX fused LayerNorm over the last axis, with optional affine terms.
+    pub fn fast_layer_norm(
+        &self,
+        weight: Option<&Self>,
+        bias: Option<&Self>,
+        epsilon: f32,
+    ) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(error("LayerNorm epsilon must be finite and positive"));
+        }
+        let mut a = vec![self];
+        a.extend(weight);
+        a.extend(bias);
+        let flags = [weight.is_some() as i32, bias.is_some() as i32];
+        self.stream().op(42, &a, &flags, &[epsilon])
+    }
+    pub fn erf(&self) -> Result<Self> {
+        self.unary(40)
+    }
+    pub fn abs(&self) -> Result<Self> {
+        self.unary(44)
+    }
+    pub fn logaddexp(&self, b: &Self) -> Result<Self> {
+        self.binary(41, b)
+    }
+    pub fn maximum(&self, b: &Self) -> Result<Self> {
+        self.binary(45, b)
+    }
+    pub fn minimum(&self, b: &Self) -> Result<Self> {
+        self.binary(46, b)
+    }
+    /// `beta * self + alpha * (a @ b)`, rounded once like MLX `addmm`.
+    pub fn addmm(&self, a: &Self, b: &Self, alpha: f32, beta: f32) -> Result<Self> {
+        self.stream().op(47, &[self, a, b], &[], &[alpha, beta])
+    }
+    /// MLX `linalg::norm` (2-norm for vectors) over `axes`.
+    pub fn norm(&self, axes: &[i32], keepdims: bool) -> Result<Self> {
+        self.reduce(48, axes, keepdims)
+    }
+    /// Softmax over one axis; `precise` accumulates in FP32 for low-precision input.
+    pub fn softmax_with(&self, axis: i32, precise: bool) -> Result<Self> {
+        self.stream().op(49, &[self], &[axis, precise as i32], &[])
+    }
+    /// MLX `conv1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
+    pub fn conv1d(
+        &self,
+        weight: &Self,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [stride, padding, dilation, groups]
+            .iter()
+            .map(|&v| i32::try_from(v).map_err(|_| error("conv1d parameter exceeds i32")))
+            .collect::<Result<Vec<_>>>()?;
+        if p[0] == 0 || p[2] == 0 || p[3] == 0 {
+            return Err(error("conv1d stride, dilation and groups must be positive"));
+        }
+        self.stream().op(43, &[self, weight], &p, &[])
+    }
     /// MLX fast attention semantics; model caller owns its numerical contract.
     pub fn sdpa(
         &self,
@@ -783,6 +851,14 @@ unsafe extern "C" fn trace_callback(
 
 /// Prepared custom Metal primitive. Source validity and operand geometry remain
 /// the safe model-neutral wrapper's contract; no Python execution is involved.
+/// Compile-time argument of a custom Metal kernel template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateArg {
+    DType(MlxDType),
+    Int(i32),
+    Bool(bool),
+}
+
 pub struct MetalKernel {
     raw: NonNull<c_void>,
     stream: Stream,
@@ -840,7 +916,7 @@ impl MetalKernel {
         output_specs: &[(&[usize], MlxDType)],
         grid: [usize; 3],
         threadgroup: [usize; 3],
-        template_dtype: Option<MlxDType>,
+        templates: &[(&str, TemplateArg)],
     ) -> Result<Vec<Array>> {
         if inputs.len() != self.input_count || output_specs.len() != self.output_count {
             return Err(error("Metal kernel arity mismatch"));
@@ -860,6 +936,19 @@ impl MetalKernel {
         if g.contains(&0) || tg.contains(&0) {
             return Err(error("zero Metal launch geometry"));
         }
+        let names = templates
+            .iter()
+            .map(|(n, _)| CString::new(*n).map_err(|_| error("NUL in Metal template name")))
+            .collect::<Result<Vec<_>>>()?;
+        let name_ptrs: Vec<_> = names.iter().map(|n| n.as_ptr()).collect();
+        let (kinds, values): (Vec<i32>, Vec<i32>) = templates
+            .iter()
+            .map(|(_, arg)| match *arg {
+                TemplateArg::DType(d) => (0, d as i32),
+                TemplateArg::Int(v) => (1, v),
+                TemplateArg::Bool(v) => (2, v as i32),
+            })
+            .unzip();
         let mut out = vec![std::ptr::null_mut(); self.output_count];
         check(ffi::apx_mlx_metal_call(
             self.stream.raw(),
@@ -872,7 +961,10 @@ impl MetalKernel {
             self.output_count,
             g.as_ptr(),
             tg.as_ptr(),
-            template_dtype.map_or(-1, |d| d as i32),
+            name_ptrs.as_ptr(),
+            kinds.as_ptr(),
+            values.as_ptr(),
+            templates.len(),
             out.as_mut_ptr(),
         ))?;
         own_many(&self.stream, &mut out)
