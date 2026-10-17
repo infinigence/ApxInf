@@ -34,8 +34,12 @@ and geometry fail at load.
   the reference's compiled GELU and RoPE.
 
 Variants: the default `auto` runs the five code predictor MLPs on
-`apxinf_mlx::fusions::SwigluMlpGemv`, the EngineTailor predictor MLP frontier
-944fd18d. Its reduction order differs from MLX matmul. On Apple M4 it
+`apxinf_mlx::fusions::SwigluMlpGemv` only on the measured MLX architecture
+`applegpu_g16g` (M4). Other architectures retain the reference composition
+and report that choice on stderr; a new architecture needs its own numerical
+and timing qualification before default enablement. The fusion is the
+EngineTailor predictor MLP frontier 944fd18d. Its reduction order differs
+from MLX matmul. On Apple M4 it
 measured +1.66% over the parity path (eight utterances, p = 0.013) with
 identical codes and waveforms. `reference` keeps the parity path's composed
 SwiGLU everywhere.
