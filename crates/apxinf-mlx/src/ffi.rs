@@ -90,7 +90,10 @@ extern "C" {
         output_count: usize,
         grid: *const i32,
         group: *const i32,
-        template_dtype: i32,
+        template_names: *const *const c_char,
+        template_kinds: *const i32,
+        template_values: *const i32,
+        template_count: usize,
         outputs: *mut Handle,
     ) -> i32;
 }
