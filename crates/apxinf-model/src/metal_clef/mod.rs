@@ -27,15 +27,22 @@ pub struct ClefRunner {
     network: Network,
 }
 
+/// MLX architectures where C14 passed its qualification and paired latency
+/// gate: the M1 Pro (2026-10-17, median 1.016 x the Python C14 engine over six
+/// blocks; quality on the 164-request at-risk subset). `auto` uses the
+/// reference composition everywhere else.
+const C14_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
+
 /// Device-independent option admission, checked before the checkpoint is read.
-/// `auto` selects the reference until C14 passes its latency gate on a
-/// measured architecture; `c14` is explicit.
-fn admit(options: &LoadOptions) -> Result<Composition> {
-    let composition = match options.model_variant.as_deref() {
-        None | Some("auto" | "reference") => Composition::Reference,
-        Some("c14") => Composition::C14,
+/// Returns the requested composition; `None` is `auto`.
+fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
+    let requested = match options.model_variant.as_deref() {
+        None | Some("auto") => None,
+        Some("reference") => Some(Composition::Reference),
+        Some("c14") => Some(Composition::C14),
+        // Explicit until A04 passes its gates on a measured architecture.
         #[cfg(feature = "coreml")]
-        Some("a04") => Composition::A04,
+        Some("a04") => Some(Composition::A04),
         #[cfg(not(feature = "coreml"))]
         Some("a04") => {
             return Err(Error::Contract(
@@ -65,7 +72,16 @@ fn admit(options: &LoadOptions) -> Result<Composition> {
              calibration, synthetic weights and auxiliary assets are unsupported",
         ));
     }
-    Ok(composition)
+    Ok(requested)
+}
+
+/// `auto` runs C14 only on a qualified architecture.
+fn select(requested: Option<Composition>, architecture: &str) -> Composition {
+    requested.unwrap_or(if C14_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        Composition::C14
+    } else {
+        Composition::Reference
+    })
 }
 
 pub fn load(
@@ -77,7 +93,7 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
-    let composition = admit(options)?;
+    let requested = admit(options)?;
     let native = backend
         .as_any()
         .downcast_ref::<MlxBackend>()
@@ -99,6 +115,15 @@ pub fn load(
     let config = Config::from_json(&read("config.json")?, &read("joint_head_config.json")?)?;
     let tokenizer = Tokenizer::from_file(path.join("tokenizer.json"))?;
     let stream = native.stream().clone();
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    let composition = select(requested, architecture);
+    if requested.is_none() && composition == Composition::Reference {
+        eprintln!(
+            "Clef: C14 is not qualified on {architecture:?}; using the reference composition"
+        );
+    }
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
@@ -183,14 +208,13 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert_eq!(
-            admit(&LoadOptions::default()).unwrap(),
-            Composition::Reference
-        );
+        assert_eq!(admit(&LoadOptions::default()).unwrap(), None);
         for (variant, composition) in [
-            ("auto", Composition::Reference),
-            ("reference", Composition::Reference),
-            ("c14", Composition::C14),
+            ("auto", None),
+            ("reference", Some(Composition::Reference)),
+            ("c14", Some(Composition::C14)),
+            #[cfg(feature = "coreml")]
+            ("a04", Some(Composition::A04)),
         ] {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
@@ -217,6 +241,19 @@ mod tests {
             },
         ] {
             assert!(admit(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn auto_runs_c14_only_on_qualified_architectures() {
+        assert_eq!(select(None, "applegpu_g13s"), Composition::C14);
+        for other in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
+            assert_eq!(select(None, other), Composition::Reference, "{other}");
+        }
+        for architecture in ["applegpu_g13s", "applegpu_g16g"] {
+            for explicit in [Composition::Reference, Composition::C14] {
+                assert_eq!(select(Some(explicit), architecture), explicit);
+            }
         }
     }
 }
