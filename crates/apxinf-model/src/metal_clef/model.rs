@@ -19,7 +19,7 @@ use apxinf_mlx::fusions::{
     padded_rows, GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic,
     Q4TransposeDecode, SplitF16Gemm,
 };
-use apxinf_mlx::{Array, MlxDType, Stream};
+use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
@@ -31,6 +31,26 @@ struct Kernels {
     gemm: SplitF16Gemm,
     recurrence: GatedDeltaRecurrence,
     rope: HalfSplitRope,
+    /// MLX-VLM `_compute_g_beta`, compiled shapeless as there: the fused
+    /// kernel rounds exp/logaddexp differently from eager operations on some
+    /// devices (one decay ulp per layer on the M1 Pro).
+    g_beta: Compiled,
+}
+
+/// `compute_g`: `exp(-exp(A_log) * softplus(a + dt_bias))`; beta: `sigmoid(b)`.
+fn g_beta(args: &[Array]) -> Result<Vec<Array>> {
+    let [a_log, a, b, dt_bias] = args else {
+        unreachable!("g_beta takes four inputs")
+    };
+    let shifted = a.add(dt_bias)?;
+    let softplus = shifted.logaddexp(&scalar(&shifted, 0.0)?)?;
+    let decay = a_log
+        .cast(MlxDType::F32)?
+        .exp()?
+        .neg()?
+        .mul(&softplus)?
+        .exp()?;
+    Ok(vec![decay, b.sigmoid()?])
 }
 
 /// Backbone composition. Both use the four-value recurrence, which reproduces
@@ -129,6 +149,7 @@ impl Network {
             gemm: SplitF16Gemm::new(&stream)?,
             recurrence: GatedDeltaRecurrence::new(&stream)?,
             rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
+            g_beta: Compiled::with_shapeless(&stream, 2, true, g_beta)?,
         };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
@@ -303,17 +324,13 @@ impl Network {
         let k = k
             .fast_rms_norm_unweighted(1e-6)?
             .mul(&scalar(&k, inv_scale)?)?;
-        // compute_g: exp(-exp(A_log) * softplus(a + dt_bias)); beta: sigmoid(b).
-        let shifted = a.add(&g.dt_bias)?;
-        let softplus = shifted.logaddexp(&scalar(&shifted, 0.0)?)?;
-        let decay = g
-            .a_log
-            .cast(MlxDType::F32)?
-            .exp()?
-            .neg()?
-            .mul(&softplus)?
-            .exp()?;
-        let beta = b.sigmoid()?;
+        let [decay, beta] = <[Array; 2]>::try_from(self.kernels.g_beta.call(&[
+            g.a_log.clone(),
+            a,
+            b,
+            g.dt_bias.clone(),
+        ])?)
+        .unwrap();
         let state = Array::zeros(&self.stream, &[1, hv, dv, dk], MlxDType::F32)?;
         let (y, _) = self
             .kernels
