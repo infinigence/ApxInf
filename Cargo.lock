@@ -154,6 +154,7 @@ name = "apxinf-model"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-coreml",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
@@ -161,6 +162,7 @@ dependencies = [
  "apxinf-tokenizer",
  "half",
  "once_cell",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

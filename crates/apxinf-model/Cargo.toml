@@ -7,6 +7,7 @@ license = "Apache-2.0"
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-mlx = { path = "../apxinf-mlx", optional = true }
+apxinf-coreml = { path = "../apxinf-coreml", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
@@ -18,11 +19,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
+[dev-dependencies]
+# Decodes recorded Core ML packages in the Clef A04 device test.
+prost = "0.14"
+
 [features]
 default = []
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
+# Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
+coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.
