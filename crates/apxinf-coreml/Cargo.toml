@@ -1,0 +1,16 @@
+[package]
+name = "apxinf-coreml"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+build = "build.rs"
+[features]
+default = []
+native = []
+[dependencies]
+apxinf-core = { path = "../apxinf-core" }
+half = "2"
+prost = "0.14"
+sha2 = "0.10"
+[build-dependencies]
+cc = "1"
