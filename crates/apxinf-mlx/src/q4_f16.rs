@@ -1,6 +1,6 @@
-//! Per-call FP16 decode of affine Q4 weights and the FP16 GEMM that consumes it.
-//! Adapted from EngineTailor g20 (MIT); see NOTICE. The GEMM fragment layout
-//! follows MLX Steel `mma.h` (MIT, Apple).
+//! Per-call FP16 decode of affine Q4 weights and the FP16 GEMMs that consume it.
+//! Adapted from EngineTailor g20 and C14 (MIT); see NOTICE. The GEMM fragment
+//! layout follows MLX Steel `mma.h` (MIT, Apple).
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 
@@ -180,6 +180,65 @@ impl Q4TransposeDecode {
     }
 }
 
+/// Decodes an affine Q4 group-64 weight `[N, K]` (packed U32 `[N, K / 8]`,
+/// BF16 scales and biases `[N, K / 64]`) into row-major FP16 `[N, K]`, one
+/// packed word per thread: `scale * q + bias` in FP16 with the scale and bias
+/// rounded to FP16 first, the expression of MLX `dequantize` with FP16 scales.
+pub struct Q4RowDecodeF16 {
+    kernel: MetalKernel,
+}
+
+impl Q4RowDecodeF16 {
+    pub fn new(stream: &Stream) -> Result<Self> {
+        Ok(Self {
+            kernel: MetalKernel::new(
+                stream,
+                "apxinf_q4g64_row_decode_f16",
+                &["weight", "scales", "biases"],
+                &["out"],
+                include_str!("../native/q4_row_decode_f16.metal"),
+                "",
+            )?,
+        })
+    }
+
+    pub fn call(&self, weight: &Array, scales: &Array, biases: &Array) -> Result<Array> {
+        let [rows, words] = *weight.shape() else {
+            return Err(Error::Contract("Q4 row decode weight must be rank 2"));
+        };
+        let k = check_q4_decode(rows, words, 0, rows)?;
+        if weight.dtype() != MlxDType::U32
+            || [scales, biases]
+                .iter()
+                .any(|a| a.shape() != [rows, k / 64] || a.dtype() != MlxDType::BF16)
+        {
+            return Err(Error::Contract(
+                "Q4 row decode requires U32 [N, K/8] with BF16 [N, K/64] scales and biases",
+            ));
+        }
+        check_index_extent(
+            rows,
+            k,
+            u32::MAX as usize,
+            "Q4 row decode output index exceeds u32",
+        )?;
+        // SAFETY: one thread per packed word `i < N * K / 8`; it reads word i
+        // and group `i / 8`, both inside the guarded `[N, K/8]` and `[N, K/64]`
+        // inputs (eight words per 64-wide group), and writes two FP16 vectors
+        // at `2 i` and `2 i + 1`, which cover output elements `8 i .. 8 i + 8`.
+        let out = unsafe {
+            self.kernel.call(
+                &[weight.clone(), scales.clone(), biases.clone()],
+                &[(&[rows, k], MlxDType::F16)],
+                [rows * words, 1, 1],
+                [256, 1, 1],
+                &[],
+            )?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+}
+
 /// Number of rows after padding `tokens` up to a multiple of 64.
 pub fn padded_rows(tokens: usize) -> usize {
     tokens.div_ceil(64) * 64
@@ -237,6 +296,28 @@ impl PadRowsF16 {
     }
 }
 
+/// How a 64 x 64 output tile of an FP16 GEMM is split over SIMD groups and
+/// how its K loop is scheduled. Each keeps one FP32 accumulator per output
+/// and rounds it once to BF16; the K reduction order differs between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F16GemmTile {
+    /// Four SIMD groups of 32 x 32 (128 threads) with the next K tile loaded
+    /// ahead (EngineTailor g20).
+    Prefetch,
+    /// Two SIMD groups of 64 x 32 (64 threads), MLX's class-g FP16 tile
+    /// (`bm64 bn64 bk16 wm1 wn2`), with Steel's unpipelined K loop (C14 `s28`).
+    Wm1Wn2,
+}
+
+impl F16GemmTile {
+    fn threads(self) -> usize {
+        match self {
+            F16GemmTile::Prefetch => 128,
+            F16GemmTile::Wm1Wn2 => 64,
+        }
+    }
+}
+
 /// FP16 `[1, P, K] x [K, N]` GEMM with FP32 accumulation and BF16 output, in
 /// two column halves of width `NW`. [`low`](Self::low) computes columns
 /// `[0, NW)`; [`high`](Self::high) computes `[NW, 2 NW)` and copies the low
@@ -246,29 +327,61 @@ impl PadRowsF16 {
 pub struct SplitF16Gemm {
     low: MetalKernel,
     high: MetalKernel,
+    tile: F16GemmTile,
 }
 
 impl SplitF16Gemm {
     pub fn new(stream: &Stream) -> Result<Self> {
+        Self::with_tile(stream, F16GemmTile::Prefetch)
+    }
+
+    pub fn with_tile(stream: &Stream, tile: F16GemmTile) -> Result<Self> {
         let header = include_str!("../native/simdgroup_mma.h");
-        Ok(Self {
-            low: MetalKernel::new(
-                stream,
-                "apxinf_f16_gemm_bf16_tile64",
-                &["x", "weight"],
-                &["out"],
-                include_str!("../native/f16_gemm_bf16.metal"),
-                header,
-            )?,
-            high: MetalKernel::new(
-                stream,
-                "apxinf_f16_gemm_bf16_tile64_high",
-                &["weight", "lo", "x"],
-                &["out"],
-                include_str!("../native/f16_gemm_bf16_high.metal"),
-                header,
-            )?,
-        })
+        let (low, high) = match tile {
+            F16GemmTile::Prefetch => (
+                MetalKernel::new(
+                    stream,
+                    "apxinf_f16_gemm_bf16_tile64",
+                    &["x", "weight"],
+                    &["out"],
+                    include_str!("../native/f16_gemm_bf16.metal"),
+                    header,
+                )?,
+                MetalKernel::new(
+                    stream,
+                    "apxinf_f16_gemm_bf16_tile64_high",
+                    &["weight", "lo", "x"],
+                    &["out"],
+                    include_str!("../native/f16_gemm_bf16_high.metal"),
+                    header,
+                )?,
+            ),
+            F16GemmTile::Wm1Wn2 => {
+                let body = include_str!("../native/f16_gemm_bf16_wn2.metal");
+                (
+                    MetalKernel::new(
+                        stream,
+                        "apxinf_f16_gemm_bf16_wn2",
+                        &["x", "weight"],
+                        &["out"],
+                        &format!("    constexpr int WS = N, OFF = 0;\n{body}"),
+                        header,
+                    )?,
+                    MetalKernel::new(
+                        stream,
+                        "apxinf_f16_gemm_bf16_wn2_high",
+                        &["weight", "lo", "x"],
+                        &["out"],
+                        &format!(
+                            "{}    constexpr int WS = NW, OFF = NW;\n{body}",
+                            include_str!("../native/f16_gemm_bf16_wn2_copy_low.metal")
+                        ),
+                        header,
+                    )?,
+                )
+            }
+        };
+        Ok(Self { low, high, tile })
     }
 
     fn check(x: &Array, tokens: usize, weight: &Array) -> Result<(usize, usize, usize, usize)> {
@@ -289,18 +402,19 @@ impl SplitF16Gemm {
 
     pub fn low(&self, x: &Array, tokens: usize, weight: &Array) -> Result<Array> {
         let (padded, k, half, _) = Self::check(x, tokens, weight)?;
-        // SAFETY: each 128-thread group owns a 64 x 64 output tile at rows
+        let threads = self.tile.threads();
+        // SAFETY: each threadgroup owns a 64 x 64 output tile at rows
         // `64 * group.y < P` and columns `64 * group.x < NW`. A, B loads index
         // rows < P of x and rows < K, columns < NW of the weight, with K a
         // multiple of 16 so every half4 load stays inside a row. Stores are
         // limited to rows < T and columns < NW of `[1, T, NW]`; tiles do not
-        // overlap.
+        // overlap. Both tiles cover their 64 x 64 block with their thread count.
         let out = unsafe {
             self.low.call(
                 &[x.clone(), weight.clone()],
                 &[(&[1, tokens, half], MlxDType::BF16)],
-                [half / 64 * 128, padded / 64, 1],
-                [128, 1, 1],
+                [half / 64 * threads, padded / 64, 1],
+                [threads, 1, 1],
                 &[
                     ("T", TemplateArg::Int(tokens as i32)),
                     ("K", TemplateArg::Int(k as i32)),
@@ -318,21 +432,68 @@ impl SplitF16Gemm {
                 "split GEMM high half requires the BF16 [1, T, NW] low result",
             ));
         }
+        let threads = self.tile.threads();
         // SAFETY: as in `low`, with weight stride NW and stores at columns
         // `NW + col < 2 NW`. Each group also copies 16-byte chunks of rows < T
-        // of its 64 low columns into columns `[0, NW)`; copy and GEMM stores
-        // write disjoint columns, and `lo` is only read.
+        // of its 64 low columns into columns `[0, NW)` (8 threads per row,
+        // rows stepped by the thread count / 8); copy and GEMM stores write
+        // disjoint columns, and `lo` is only read.
         let out = unsafe {
             self.high.call(
                 &[weight.clone(), low.clone(), x.clone()],
                 &[(&[1, tokens, full], MlxDType::BF16)],
-                [half / 64 * 128, padded / 64, 1],
-                [128, 1, 1],
+                [half / 64 * threads, padded / 64, 1],
+                [threads, 1, 1],
                 &[
                     ("T", TemplateArg::Int(tokens as i32)),
                     ("K", TemplateArg::Int(k as i32)),
                     ("NW", TemplateArg::Int(half as i32)),
                     ("N", TemplateArg::Int(full as i32)),
+                ],
+            )?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+}
+
+/// FP16 `[1, P, K] x [K, N]` GEMM with FP32 accumulation and BF16 output
+/// `[1, T, N]`, in one pass: four SIMD groups of 32 x 32 per 64 x 64 tile
+/// with Steel's unpipelined K loop (C14 `s13`). Rows at and after `T` are
+/// padding and are never stored.
+pub struct F16Gemm {
+    kernel: MetalKernel,
+}
+
+impl F16Gemm {
+    pub fn new(stream: &Stream) -> Result<Self> {
+        Ok(Self {
+            kernel: MetalKernel::new(
+                stream,
+                "apxinf_f16_gemm_bf16_steel_loop",
+                &["x", "weight"],
+                &["out"],
+                include_str!("../native/f16_gemm_bf16_steel.metal"),
+                include_str!("../native/simdgroup_mma.h"),
+            )?,
+        })
+    }
+
+    pub fn call(&self, x: &Array, tokens: usize, weight: &Array) -> Result<Array> {
+        let (padded, k, n, _) = SplitF16Gemm::check(x, tokens, weight)?;
+        // SAFETY: as in `SplitF16Gemm::low`: each 128-thread group owns a
+        // 64 x 64 tile at rows `64 * group.y < P` and columns `64 * group.x < N`;
+        // loads stay inside rows < P of x and the `[K, N]` weight, stores
+        // inside rows < T of `[1, T, N]`. The check also bounds `[T, 2 N]`.
+        let out = unsafe {
+            self.kernel.call(
+                &[x.clone(), weight.clone()],
+                &[(&[1, tokens, n], MlxDType::BF16)],
+                [n / 64 * 128, padded / 64, 1],
+                [128, 1, 1],
+                &[
+                    ("T", TemplateArg::Int(tokens as i32)),
+                    ("K", TemplateArg::Int(k as i32)),
+                    ("N", TemplateArg::Int(n as i32)),
                 ],
             )?
         };
