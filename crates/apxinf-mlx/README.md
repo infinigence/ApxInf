@@ -105,6 +105,20 @@ dtype and truncated files fail with the file and tensor name. Bytes read count
 as uploads. The model family still validates every key, shape, dtype and
 quantization parameter before use.
 
+## Device architecture
+
+A Metal `Stream` reads `MetalDeviceCaps` once from MLX's `gpu::device_info`:
+the device name and the `architecture` string that MLX's own Metal dispatch
+reads, for example `applegpu_g13s` on an M1 Pro and `applegpu_g16g` on an M4.
+`generation` and `device_class` are its two digits and final letter; any other
+string leaves them unset. MLX sizes command buffers and GEMM tiles by that
+letter, which is not a product tier: the M1 Pro reports `s`. `MLX_METAL_GPU_ARCH`
+overrides the string for MLX and therefore here; use it only in tests.
+`Stream::metal_caps()` returns `None` for a CPU stream. `MlxBackend::new` prints
+the device and architecture to stderr, as `CudaBackend::new` prints its device.
+The type holds hardware facts only; see the
+[kernel policy rules](../../doc/mlx-backend.md#device-architecture-and-kernel-policy).
+
 ## Custom kernels
 
 `MetalKernel` is the private-source building primitive. Its call is unsafe

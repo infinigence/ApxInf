@@ -234,6 +234,27 @@ Repeated execution uses prepared block/step closures, avoiding per-token
 Rust-to-Python or subprocess calls. Custom Metal kernels are registered once
 during preparation and invoked through the same safe operator boundary.
 
+## Device architecture and kernel policy
+
+Apple GPUs differ in generation, core count and memory bandwidth, so the fastest
+launch geometry or implementation can differ between them, as it does between
+CUDA architecture families. `MetalDeviceCaps`, reached through
+`Stream::metal_caps()`, holds the MLX architecture string and its parsed
+generation and device class. It contains no policy.
+
+A policy that reads these facts lives beside its kernel in `apxinf-mlx`, as
+CUDA launch policies live beside their kernels. A model family branches on
+architecture only for a structural choice, such as which device runs a stage,
+and states the reason. Each architecture's values come from measurement on a
+device of that architecture, recorded with the policy. An unrecognized or
+unmeasured architecture keeps the existing default.
+
+A choice that keeps each output's reduction order and rounding, such as output
+tiling, threadgroup shape or independent column splits, needs the paired timing
+gate on that architecture. A choice that changes reduction order or rounding
+also needs the family's numerical qualification on that architecture. Stock MLX
+output already differs between devices, so references are recorded per device.
+
 ## Tensor ownership and model-specific numerical semantics
 
 `Device::Metal(usize)` is the distinct Metal device identity. Physical device identity and backend
@@ -406,7 +427,7 @@ and avoid per-layer host synchronization introduced only for measurement.
 | Prepared execution | No hot retrace/tune; input rebinding; eager/compiled parity; shape invalidation and bounded memory |
 | Model | Exact checkpoint load, important intermediate tensors, full real-input gate and state regressions |
 | Public path | Registry/CLI or existing binding invocation, real decoded outputs and supported options |
-| Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
+| Performance | Raw paired samples and exact source/environment binding, including the Metal architecture string; no cross-run speedup arithmetic |
 
 Temporary references, captures and reports stay in ignored `devlocal/` per
 [AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
