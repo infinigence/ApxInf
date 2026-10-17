@@ -17,6 +17,7 @@ void apx_mlx_array_free(void* array);
 int apx_mlx_array_info(const void* array, int32_t* shape, size_t capacity, size_t* rank, int32_t* dtype);
 int apx_mlx_array_read(void* stream, const void* array, uint8_t* bytes, size_t len);
 int apx_mlx_eval(void* stream, const void* const* arrays, size_t count);
+int apx_mlx_async_eval(const void* const* arrays, size_t count);
 int apx_mlx_op(void* stream, int32_t op, const void* const* inputs, size_t count, const int32_t* ints, size_t nints, const float* floats, size_t nfloats, void** out);
 typedef int (*apx_mlx_callback)(void*, const void* const*, size_t, void**, size_t);
 int apx_mlx_compile_new(apx_mlx_callback callback, void* context, size_t outputs, int32_t shapeless, void** out);
