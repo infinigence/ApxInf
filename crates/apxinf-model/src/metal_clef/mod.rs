@@ -1,6 +1,8 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
 //! the stock MLX-VLM composition or the EngineTailor C14 composition, and the
 //! BF16 joint schema head. No Python model execution.
+#[cfg(feature = "coreml")]
+mod ane;
 mod config;
 mod encode;
 mod model;
@@ -32,9 +34,17 @@ fn admit(options: &LoadOptions) -> Result<Composition> {
     let composition = match options.model_variant.as_deref() {
         None | Some("auto" | "reference") => Composition::Reference,
         Some("c14") => Composition::C14,
+        #[cfg(feature = "coreml")]
+        Some("a04") => Composition::A04,
+        #[cfg(not(feature = "coreml"))]
+        Some("a04") => {
+            return Err(Error::Contract(
+                "Clef a04 needs the coreml feature (Core ML on the Neural Engine)",
+            ))
+        }
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto, reference and c14 variants",
+                "Clef MLX supports the auto, reference, c14 and a04 variants",
             ))
         }
     };

@@ -44,6 +44,10 @@ pub enum Composition {
     /// causal convolution kernel and the eight-lane recurrence. Its GDN
     /// reduction order differs from MLX-VLM's.
     C14,
+    /// EngineTailor A04: C14 with intermediate MLP columns `[6656, 12288)` on
+    /// the Neural Engine as one INT8 Core ML program per layer.
+    #[cfg(feature = "coreml")]
+    A04,
 }
 
 /// Kernels only the C14 composition uses (EngineTailor `c14.py` names).
@@ -159,6 +163,9 @@ pub struct Network {
     head: Head,
     kernels: Kernels,
     c14: Option<C14Kernels>,
+    /// A04's per-layer Neural Engine programs, in layer order.
+    #[cfg(feature = "coreml")]
+    ane: Vec<super::ane::AneMlp>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
 }
@@ -227,7 +234,7 @@ impl Network {
     pub fn new(
         config: Config,
         stream: Stream,
-        backbone: Backbone,
+        #[cfg_attr(not(feature = "coreml"), allow(unused_mut))] mut backbone: Backbone,
         head: Head,
         composition: Composition,
     ) -> Result<Self> {
@@ -237,8 +244,22 @@ impl Network {
             g_beta: Compiled::with_shapeless(&stream, 2, true, g_beta)?,
         };
         let c14 = match composition {
-            Composition::C14 => Some(C14Kernels::new(&stream)?),
             Composition::Reference => None,
+            _ => Some(C14Kernels::new(&stream)?),
+        };
+        // A04: build each layer's program from the full MLP, then keep only
+        // the GPU share's weights (EngineTailor `create_mlp`).
+        #[cfg(feature = "coreml")]
+        let ane = if composition == Composition::A04 {
+            let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
+            let mut ane = Vec::with_capacity(backbone.layers.len());
+            for layer in &mut backbone.layers {
+                ane.push(super::ane::AneMlp::load(&cache, &layer.mlp)?);
+                layer.mlp = super::ane::gpu_share(&layer.mlp)?;
+            }
+            ane
+        } else {
+            Vec::new()
         };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
@@ -258,6 +279,8 @@ impl Network {
             head,
             kernels,
             c14,
+            #[cfg(feature = "coreml")]
+            ane,
             inv_freq,
         })
     }
@@ -296,21 +319,32 @@ impl Network {
         )?;
         let positions = Array::arange(&self.stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
             .reshape(&[1, tokens])?;
-        for layer in &self.backbone.layers {
+        for (index, layer) in self.backbone.layers.iter().enumerate() {
             let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let r = match &layer.mixer {
                 Mixer::GatedDelta(g) => self.gated_delta(&x, g, tokens)?,
                 Mixer::Attention(a) => self.attention(&x, a, &positions, tokens)?,
             };
             let h1 = h.add(&r)?;
-            let m = self.mlp(&h1.fast_rms_norm(&layer.post_norm, EPS)?, &layer.mlp)?;
+            let m = self.mlp(&h1.fast_rms_norm(&layer.post_norm, EPS)?, &layer.mlp, index)?;
             h = h1.add(&m)?;
         }
         h.fast_rms_norm(&self.backbone.norm, EPS)
     }
 
-    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or C14's MLP.
-    fn mlp(&self, h: &Array, m: &Mlp) -> Result<Array> {
+    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or C14's MLP. In
+    /// A04, `m` is the GPU share and layer `index`'s program adds the rest: the
+    /// tiles are read from the device, the GPU share is enqueued, and the
+    /// Neural Engine predicts while the GPU runs.
+    #[cfg_attr(not(feature = "coreml"), allow(unused_variables))]
+    fn mlp(&self, h: &Array, m: &Mlp, index: usize) -> Result<Array> {
+        #[cfg(feature = "coreml")]
+        if let (Some(c), Some(ane)) = (&self.c14, self.ane.get(index)) {
+            let gpu = c.mlp(h, m)?;
+            let tiles = super::ane::AneMlp::tiles(h)?;
+            self.stream.async_eval(std::slice::from_ref(&gpu))?;
+            return gpu.add(&ane.predict(&self.stream, &tiles, h.shape()[1])?);
+        }
         match &self.c14 {
             Some(c) => c.mlp(h, m),
             None => qmm(&silu(&qmm(h, &m.gate)?)?.mul(&qmm(h, &m.up)?)?, &m.down),

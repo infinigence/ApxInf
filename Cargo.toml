@@ -22,6 +22,8 @@ license = "Apache-2.0"
 default = []
 # Native Apple Metal execution through an explicitly configured MLX C++ SDK.
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "apxinf-model/mlx"]
+# Metal plus Core ML stages on the Apple Neural Engine (for example Clef `a04`).
+coreml = ["mlx", "apxinf-model/coreml"]
 # CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
 # build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
 # CUDA uses libnvToolsExt. Both are handled transparently — see
