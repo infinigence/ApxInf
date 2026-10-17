@@ -31,6 +31,15 @@ fn dims(shape: &[usize]) -> Result<Vec<i32>> {
         .collect()
 }
 
+fn normalize_axis(axis: i32, rank: usize) -> Result<usize> {
+    let rank = i32::try_from(rank).map_err(|_| error("MLX rank exceeds i32"))?;
+    let normalized = if axis < 0 { axis + rank } else { axis };
+    if normalized < 0 || normalized >= rank {
+        return Err(error("axis is outside the array rank"));
+    }
+    Ok(normalized as usize)
+}
+
 /// Process-wide MLX allocator observations, in bytes. This is not per stream,
 /// model, Rust ownership graph, or system resident memory. Cached buffers are
 /// separate from active allocations. Synchronize before lifecycle comparisons.
@@ -655,9 +664,57 @@ impl Array {
         let kth = i32::try_from(kth).map_err(|_| error("argpartition kth exceeds i32"))?;
         self.stream().op(57, &[self], &[kth, axis], &[])
     }
-    /// MLX `put_along_axis`: a copy with `values` written at `indices` along `axis`.
-    pub fn put_along_axis(&self, indices: &Self, values: &Self, axis: i32) -> Result<Self> {
-        self.stream().op(58, &[self, indices, values], &[axis], &[])
+    /// Write values at checked host indices with the given shape along `axis`.
+    /// Negative indices count from the end. Invalid indices fail before upload.
+    /// Arbitrary device index arrays are not accepted: MLX does not bound their writes.
+    pub fn put_along_axis(
+        &self,
+        indices: &[i32],
+        index_shape: &[usize],
+        values: &Self,
+        axis: i32,
+    ) -> Result<Self> {
+        let normalized = normalize_axis(axis, self.shape().len())?;
+        if index_shape.len() != self.shape().len() {
+            return Err(error("index rank must match the source rank"));
+        }
+        let width = i32::try_from(self.shape()[normalized])
+            .map_err(|_| error("indexed dimension exceeds i32"))?;
+        if indices
+            .iter()
+            .any(|&index| index < -width || index >= width)
+        {
+            return Err(error(
+                "put_along_axis index is outside the indexed dimension",
+            ));
+        }
+        let indices = Self::from_i32(self.stream(), index_shape, indices)?;
+        self.stream()
+            .op(58, &[self, &indices, values], &[normalized as i32], &[])
+    }
+    /// Keep the largest `count` values along `axis`, masking the rest with -inf.
+    /// Ties follow MLX argpartition. Generated indices stay on the device.
+    pub fn top_k_mask(&self, count: usize, axis: i32) -> Result<Self> {
+        let normalized = normalize_axis(axis, self.shape().len())?;
+        let width = self.shape()[normalized];
+        if count == 0 || count > width {
+            return Err(error(
+                "top_k_mask count must be between 1 and the axis length",
+            ));
+        }
+        if !matches!(self.dtype(), MlxDType::F32 | MlxDType::F16 | MlxDType::BF16) {
+            return Err(error("top_k_mask requires floating-point values"));
+        }
+        if count == width {
+            return Ok(self.clone());
+        }
+        let order = self.neg()?.argpartition(count - 1, normalized as i32)?;
+        let mut start = vec![0; self.shape().len()];
+        start[normalized] = count;
+        let indices = order.slice(&start, self.shape())?;
+        let masked = Self::scalar(self.stream(), f32::NEG_INFINITY, self.dtype())?;
+        self.stream()
+            .op(58, &[self, &indices, &masked], &[normalized as i32], &[])
     }
     /// MLX constant `pad` with zeros: `low[d]` and `high[d]` elements before
     /// and after axis `d`.

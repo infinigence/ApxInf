@@ -633,11 +633,7 @@ fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
     let x = Array::from_f32(&s, &[8], &[3., -1., 7., 7., 0.5, 2., -4., 9.])?;
     let order = x.neg()?.argpartition(2, -1)?;
     assert_eq!(words(&order)?, [7, 2, 3, 0, 1, 5, 6, 4]);
-    let masked = x.reshape(&[1, 8])?.put_along_axis(
-        &order.slice(&[3], &[8])?.reshape(&[1, 5])?,
-        &Array::scalar(&s, f32::NEG_INFINITY, D::F32)?,
-        -1,
-    )?;
+    let masked = x.reshape(&[1, 8])?.top_k_mask(3, -1)?;
     assert_eq!(
         masked.to_f32_vec()?,
         [
@@ -682,5 +678,104 @@ fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
         ]
     );
     assert!(input.conv_transpose1d(&weight, 0, 0, 1, 0, 1).is_err());
+    Ok(())
+}
+
+#[test]
+fn put_along_axis_rejects_cross_row_indices() -> Result<()> {
+    let stream = Stream::cpu()?;
+    let source = Array::from_f32(&stream, &[2, 2], &[1., 2., 3., 4.])?;
+    let values = Array::from_f32(&stream, &[2, 1], &[99., 88.])?;
+    let counters = stream.counters();
+    for indices in [[2, 1], [-3, 1], [i32::MAX, 1], [i32::MIN, 1]] {
+        let message = source
+            .put_along_axis(&indices, &[2, 1], &values, -1)
+            .err()
+            .expect("invalid indices must be rejected")
+            .to_string();
+        assert!(
+            message.contains("outside the indexed dimension"),
+            "{message}"
+        );
+    }
+    assert_eq!(stream.counters(), counters);
+    for axis in [-3, 2, i32::MIN, i32::MAX] {
+        assert!(source
+            .put_along_axis(&[0, 1], &[2, 1], &values, axis)
+            .is_err());
+    }
+    assert!(source.put_along_axis(&[0, 1], &[2], &values, -1).is_err());
+    assert!(source.put_along_axis(&[0], &[2, 1], &values, -1).is_err());
+    let updated = source.put_along_axis(&[-2, -1], &[2, 1], &values, -1)?;
+    assert_eq!(updated.to_f32_vec()?, [99., 2., 3., 88.]);
+    assert_eq!(source.to_f32_vec()?, [1., 2., 3., 4.]);
+    let empty = Array::zeros(&stream, &[1, 0], D::F32)?;
+    assert!(empty.put_along_axis(&[0], &[1, 1], &values, -1).is_err());
+    let foreign_stream = Stream::cpu()?;
+    let foreign_values = Array::scalar(&foreign_stream, 1., D::F32)?;
+    assert!(source
+        .put_along_axis(&[0], &[1, 1], &foreign_values, -1)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn top_k_mask_preserves_rows_axes_and_compiled_inputs() -> Result<()> {
+    let stream = Stream::cpu()?;
+    let source = Array::from_f32(&stream, &[2, 4], &[1., 4., 3., 2., 8., 5., 6., 7.])?;
+    let masked = source.top_k_mask(2, -1)?;
+    assert_eq!(stream.counters().downloads_bytes, 0);
+    assert_eq!(
+        masked.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            4.,
+            3.,
+            f32::NEG_INFINITY,
+            8.,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            7.
+        ]
+    );
+    assert_eq!(
+        source.top_k_mask(1, 0)?.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            8.,
+            5.,
+            6.,
+            7.
+        ]
+    );
+    assert_eq!(source.top_k_mask(4, 1)?.to_bytes()?, source.to_bytes()?);
+    for count in [0, 5, usize::MAX] {
+        assert!(source.top_k_mask(count, 1).is_err());
+    }
+    for axis in [-3, 2, i32::MIN, i32::MAX] {
+        assert!(source.top_k_mask(1, axis).is_err());
+    }
+    assert!(source.cast(D::I32)?.top_k_mask(1, 1).is_err());
+    assert!(Array::zeros(&stream, &[1, 0], D::F32)?
+        .top_k_mask(1, 1)
+        .is_err());
+    for dtype in [D::F16, D::BF16] {
+        let output = source.cast(dtype)?.top_k_mask(2, 1)?;
+        assert_eq!(output.dtype(), dtype);
+        assert_eq!(output.to_f32_vec()?, masked.to_f32_vec()?);
+    }
+    let compiled = Compiled::new(&stream, 1, |inputs| Ok(vec![inputs[0].top_k_mask(2, -1)?]))?;
+    compiled.prepare(&[source.clone()])?;
+    let changed = source.neg()?;
+    let before = stream.counters();
+    let output = compiled.call_and_eval(&[changed.clone()])?.remove(0);
+    let after = stream.counters();
+    assert_eq!(after.trace_callbacks, before.trace_callbacks);
+    assert_eq!(after.downloads_bytes, before.downloads_bytes);
+    assert_eq!(output.to_bytes()?, changed.top_k_mask(2, -1)?.to_bytes()?);
+    assert_ne!(output.to_f32_vec()?, masked.to_f32_vec()?);
     Ok(())
 }

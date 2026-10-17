@@ -1,7 +1,7 @@
 //! mlx-audio `_sample_token` with the family-owned MLX key sequence.
 //! `mx.random.seed` sets the key; each sample splits it, uses the second key
 //! and keeps the first, exactly as MLX's global sequence does.
-use apxinf_core::Result;
+use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const TEMPERATURE: f64 = 0.9;
@@ -20,14 +20,8 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(stream: &Stream) -> Result<Self> {
-        let s = stream.clone();
-        let top_k = Compiled::new(stream, 1, move |a| {
-            let logprobs = &a[0];
-            let width = logprobs.shape()[1];
-            let order = logprobs.neg()?.argpartition(TOP_K - 1, -1)?;
-            let mask = order.slice(&[0, TOP_K], &[1, width])?;
-            let inf = Array::scalar(&s, f32::NEG_INFINITY, logprobs.dtype())?;
-            Ok(vec![logprobs.put_along_axis(&mask, &inf, -1)?])
+        let top_k = Compiled::new(stream, 1, |inputs| {
+            Ok(vec![inputs[0].top_k_mask(TOP_K, -1)?])
         })?;
         let s = stream.clone();
         let categorical = Compiled::new(stream, 2, move |a| {
@@ -64,13 +58,18 @@ impl Sampler {
             .cast(MlxDType::F32)?
             .slice(&[0, l - 1, 0], &[1, l, width])?
             .reshape(&[1, width])?;
-        let ids = |v: &[u32]| -> Result<Array> {
-            let v: Vec<i32> = v.iter().map(|&t| t as i32).collect();
-            Array::from_i32(&self.stream, &[1, v.len()], &v)
+        let indices = |tokens: &[u32]| -> Result<Vec<i32>> {
+            tokens
+                .iter()
+                .map(|&token| {
+                    i32::try_from(token)
+                        .map_err(|_| Error::Contract("sampling token id exceeds i32"))
+                })
+                .collect()
         };
         if !suppress.is_empty() {
             let inf = self.scalar(f64::NEG_INFINITY)?;
-            x = x.put_along_axis(&ids(suppress)?, &inf, -1)?;
+            x = x.put_along_axis(&indices(suppress)?, &[1, suppress.len()], &inf, -1)?;
         }
         let mut unique: Vec<u32> = history
             .iter()
@@ -80,15 +79,16 @@ impl Sampler {
         unique.sort_unstable();
         unique.dedup();
         if !unique.is_empty() {
-            let index = ids(&unique)?;
-            let selected = x.take(&index.reshape(&[unique.len()])?, -1)?;
+            let token_indices = indices(&unique)?;
+            let index = Array::from_i32(&self.stream, &[unique.len()], &token_indices)?;
+            let selected = x.take(&index, -1)?;
             let penalty = self.scalar(REPETITION_PENALTY)?;
             // where(x < 0, x * p, x / p); 0 <= x selects the division for -0 too.
             let penalized = self
                 .scalar(0.0)?
                 .less_equal(&selected)?
                 .where_select(&selected.div(&penalty)?, &selected.mul(&penalty)?)?;
-            x = x.put_along_axis(&index, &penalized, -1)?;
+            x = x.put_along_axis(&token_indices, &[1, unique.len()], &penalized, -1)?;
         }
         x = x.div(&self.scalar(TEMPERATURE)?)?;
         x = self.top_k.call(&[x])?.remove(0);
@@ -96,5 +96,50 @@ impl Sampler {
         let mut out = self.categorical.call(&[x, key])?;
         self.key = Some(out.pop().unwrap());
         out.pop().unwrap().reshape(&[1, 1])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_sampling_matches_seeded_reference_after_rejection() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let values: Vec<f32> = (0..64).map(|index| index as f32 * 0.11 - 3.1).collect();
+        let logits = Array::from_f32(&stream, &[1, 1, values.len()], &values)?;
+        let mut expected = values;
+        expected[63] = f32::NEG_INFINITY;
+        for token in [12, 62] {
+            expected[token] = if expected[token] < 0.0 {
+                expected[token] * REPETITION_PENALTY as f32
+            } else {
+                expected[token] / REPETITION_PENALTY as f32
+            };
+        }
+        for value in &mut expected {
+            *value /= TEMPERATURE as f32;
+        }
+        let mut ranked: Vec<usize> = (0..expected.len()).collect();
+        ranked.sort_by(|&left, &right| expected[right].total_cmp(&expected[left]));
+        for &index in &ranked[TOP_K..] {
+            expected[index] = f32::NEG_INFINITY;
+        }
+        let expected = Array::from_f32(&stream, &[1, expected.len()], &expected)?;
+        let mut sampler = Sampler::new(&stream)?;
+        for seed in [0, 42, 43] {
+            sampler.seed(seed)?;
+            for invalid in [64, u32::MAX] {
+                assert!(sampler.sample(&logits, &[], &[invalid]).is_err());
+            }
+            let (_, subkey) = Array::random_split(&Array::random_key(&stream, seed)?)?;
+            let reference = expected.categorical(-1, &subkey)?;
+            let actual = sampler.sample(&logits, &[12, 62, 62], &[63])?;
+            assert_eq!(actual.to_bytes()?, reference.to_bytes()?);
+            sampler.seed(seed)?;
+            let repeated = sampler.sample(&logits, &[12, 62], &[63])?;
+            assert_eq!(repeated.to_bytes()?, actual.to_bytes()?);
+        }
+        Ok(())
     }
 }
