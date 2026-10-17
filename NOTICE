@@ -16,10 +16,10 @@ MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
-The Clef g20 per-call FP16 Q4 decode, row padding, split FP16 GEMM and
-four-value gated delta recurrence kernels derive from EngineTailor
+The Clef g20 per-call FP16 Q4 decode, row padding and four-value gated delta
+recurrence kernels derive from EngineTailor
 feat/clef-g20-engine 6edc065c6ffd12bc347e5d06d77b5a000eb87e9d.
-The Clef C14 row decode, Steel-loop and wm1/wn2 FP16 GEMMs, gate GEMM with
+The Clef C14 row decode, Steel-loop and wm1/wn2 split FP16 GEMMs, gate GEMM with
 SwiGLU epilogue, causal depthwise convolution and eight-lane gated delta
 recurrence kernels derive from EngineTailor campaign/clef-flash9b-m1pro
 4030047b, frontier source SHA-256
