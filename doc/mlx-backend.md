@@ -147,10 +147,11 @@ codec dependency is added.
   loads the DiT and VAE decoder with complete key, shape and dtype checks.
 - A request reads the text encoder one layer at a time and frees each layer.
   The DiT computes the text-prefix K/V once and then runs one compiled image
-  forward per step. The default `auto` variant uses the MPP GEMM for image
+  forward per step. On `applegpu_g16g` (M4), the architecture where it was
+  measured faster, the default `auto` variant uses the MPP GEMM for image
   projections of at least 1024 aligned tokens after a load-time probe of the
   three projection shapes at 1024 rows. Matching that probe does not qualify
-  all weights, shapes or image outputs.
+  all weights, shapes or image outputs. Other architectures use quantized matmul.
   `model_variant=reference` skips MPP and uses quantized matmul for all Q4
   projections, without changing the scheduler or other execution paths. The DiT
   is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
