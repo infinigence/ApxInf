@@ -1,6 +1,6 @@
-//! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) with
-//! the EngineTailor g20 execution path or the stock composition, and the BF16
-//! joint schema head. No Python model execution.
+//! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
+//! the stock MLX-VLM composition, and the BF16 joint schema head. No Python
+//! model execution.
 mod config;
 mod encode;
 mod model;
@@ -16,15 +16,9 @@ use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::{Array, MlxBackend, MlxDType};
 use apxinf_tokenizer::Tokenizer;
-use model::{Composition, Network};
+use model::Network;
 use std::path::Path;
 use std::sync::Arc;
-
-/// MLX architectures where the g20 kernels were measured faster than the
-/// stock composition: the M1 Pro (EngineTailor g20, paired complete requests).
-/// The tiles were tuned there; `auto` keeps the reference elsewhere until
-/// g20 is measured and qualified on that architecture.
-const G20_MEASURED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 pub struct ClefRunner {
     tokenizer: Tokenizer,
@@ -32,18 +26,16 @@ pub struct ClefRunner {
 }
 
 /// Device-independent option admission, checked before the checkpoint is read.
-/// Returns the requested composition; `None` is `auto`.
-fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
-    let requested = match options.model_variant.as_deref() {
-        None | Some("auto") => None,
-        Some("g20") => Some(Composition::G20),
-        Some("reference") => Some(Composition::Reference),
-        Some(_) => {
-            return Err(Error::Contract(
-                "Clef MLX supports the auto, g20 and reference variants",
-            ))
-        }
-    };
+/// `reference` is the only composition; `auto` selects it.
+fn admit(options: &LoadOptions) -> Result<()> {
+    if !matches!(
+        options.model_variant.as_deref(),
+        None | Some("auto" | "reference")
+    ) {
+        return Err(Error::Contract(
+            "Clef MLX supports the auto and reference variants",
+        ));
+    }
     if !matches!(
         options.precision,
         ModelPrecision::Auto | ModelPrecision::Bf16
@@ -61,16 +53,7 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
              calibration, synthetic weights and auxiliary assets are unsupported",
         ));
     }
-    Ok(requested)
-}
-
-/// `auto` runs g20 only on a measured architecture.
-fn select(requested: Option<Composition>, architecture: &str) -> Composition {
-    requested.unwrap_or(if G20_MEASURED_ARCHITECTURES.contains(&architecture) {
-        Composition::G20
-    } else {
-        Composition::Reference
-    })
+    Ok(())
 }
 
 pub fn load(
@@ -82,7 +65,7 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
-    let requested = admit(options)?;
+    admit(options)?;
     let native = backend
         .as_any()
         .downcast_ref::<MlxBackend>()
@@ -104,20 +87,11 @@ pub fn load(
     let config = Config::from_json(&read("config.json")?, &read("joint_head_config.json")?)?;
     let tokenizer = Tokenizer::from_file(path.join("tokenizer.json"))?;
     let stream = native.stream().clone();
-    let architecture = stream
-        .metal_caps()
-        .map_or("", |caps| caps.architecture.as_str());
-    let composition = select(requested, architecture);
-    if requested.is_none() && composition == Composition::Reference {
-        eprintln!(
-            "Clef: g20 kernels not measured on {architecture:?}; using the reference composition"
-        );
-    }
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
         tokenizer,
-        network: Network::new(config, stream, backbone, head, composition)?,
+        network: Network::new(config, stream, backbone, head)?,
     })))
 }
 
@@ -197,21 +171,21 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert_eq!(admit(&LoadOptions::default()).unwrap(), None);
-        for (variant, requested) in [
-            ("auto", None),
-            ("g20", Some(Composition::G20)),
-            ("reference", Some(Composition::Reference)),
-        ] {
+        assert!(admit(&LoadOptions::default()).is_ok());
+        for variant in ["auto", "reference"] {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
                 ..LoadOptions::default()
             };
-            assert_eq!(admit(&options).unwrap(), requested, "{variant}");
+            assert!(admit(&options).is_ok(), "{variant}");
         }
         for options in [
             LoadOptions {
                 model_variant: Some("bf16".into()),
+                ..LoadOptions::default()
+            },
+            LoadOptions {
+                model_variant: Some("g20".into()),
                 ..LoadOptions::default()
             },
             LoadOptions {
@@ -224,23 +198,6 @@ mod tests {
             },
         ] {
             assert!(admit(&options).is_err());
-        }
-    }
-
-    #[test]
-    fn auto_runs_g20_only_on_measured_architectures() {
-        assert_eq!(select(None, "applegpu_g13s"), Composition::G20);
-        for unmeasured in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
-            assert_eq!(
-                select(None, unmeasured),
-                Composition::Reference,
-                "{unmeasured}"
-            );
-        }
-        for architecture in ["applegpu_g13s", "applegpu_g16g"] {
-            for explicit in [Composition::G20, Composition::Reference] {
-                assert_eq!(select(Some(explicit), architecture), explicit);
-            }
         }
     }
 }
