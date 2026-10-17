@@ -85,14 +85,19 @@ The weight file uses MILBlob storage version 2:
 
 A `blobFileValue` offset in the program points at the blob's metadata.
 
-**Determinism target.** For the same weights, the writer's protobuf and weight
-file equal coremltools 9.0 output byte for byte. The coremltools output comes
-from `mb.program` followed by `ct.convert(convert_to="mlprogram",
-compute_precision=FLOAT16, minimum_deployment_target=iOS18)`. The
-`userDefined` metadata is excluded from the comparison, because coremltools
-writes the conversion date there. The tests compare against digests of
-recorded coremltools packages. The packages themselves are not committed,
-because they contain checkpoint-derived weights.
+**Equivalence target.** coremltools 9.0 writes protobuf maps in hash order,
+so its `model.mlmodel` cannot be reproduced byte for byte. The reference is
+coremltools 9.0 output from `mb.program` followed by
+`ct.convert(convert_to="mlprogram", compute_precision=FLOAT16,
+minimum_deployment_target=iOS18)`. For the same weights, the writer's output
+matches it in three ways:
+
+- the decoded program, excluding writer metadata and `buildInfo`;
+- the weight file, byte for byte;
+- prediction outputs, bit for bit, on the same device.
+
+The tests use recorded coremltools packages. The packages themselves are not
+committed, because they contain checkpoint-derived weights.
 
 ## Runtime
 
