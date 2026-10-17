@@ -16,6 +16,38 @@ MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
+The Clef g20 per-call FP16 Q4 decode, row padding, split FP16 GEMM and
+four-value gated delta recurrence kernels derive from EngineTailor
+feat/clef-g20-engine 6edc065c6ffd12bc347e5d06d77b5a000eb87e9d.
+
+The MetalPerformancePrimitives BF16 GEMM kernel derives from the EngineTailor
+Qwen-Image Q4 GEMM campaign frontier, candidate SHA-256
+427d48fc48fddfeac783b448d240acda1a8e94efae85133d056e7ea4471fc886.
+
+The metal_qwen3_tts cast boundaries follow the EngineTailor Qwen3-TTS MLX
+parity path, source 282adc1dc5af4c48ffd17ea2f41e75cc5a24b7ee.
+The SwiGLU GEMV kernels derive from the EngineTailor Qwen3-TTS predictor MLP
+frontier, candidate SHA-256
+944fd18dd4d1723763aead7927cfde505c1c0ae8e513e49e74657613d2364892.
+
+The gated delta recurrence and the half-split rotary embedding kernel adapt
+MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
+Copyright (c) 2025 Prince Canuma. MIT License.
+
+The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h.
+Copyright (c) 2024 Apple Inc. MIT License.
+
+The interleaved Q/K normalization and rotary embedding kernel and the
+metal_qwen_image text-to-image pipeline adapt mflux, revision
+f0bf9cf0506a2ae15115af1c72e3dc0093e41597.
+Copyright (c) 2026 Filip Strand. MIT License.
+The mflux Qwen-Image-2.1 model files adapt the Qwen Team and Hugging Face
+QwenImage21 reference. Apache License 2.0.
+
+The metal_qwen3_tts Talker, code predictor, sampling and waveform decoder
+adapt mlx-audio, revision 70f4add32911bab6f869b824864ad9f1e24dcb97.
+Copyright (c) 2025 Prince Canuma and contributors. MIT License.
+
 The DSpark adaptation also derives from mlx-dspark, revision
 d6042f38f0aa7dd3e03a2a406111d725056d45a3.
 Copyright (c) 2026 erahim3. MIT License.
