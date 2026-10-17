@@ -4,6 +4,41 @@
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 
+fn check_index_extents(
+    length: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_width: usize,
+    value_width: usize,
+) -> Result<()> {
+    for (dimensions, what) in [
+        (
+            [length, key_heads, key_width],
+            "gated delta q/k index exceeds u32",
+        ),
+        (
+            [length, value_heads, 1],
+            "gated delta g/beta index exceeds u32",
+        ),
+        (
+            [length, value_heads, value_width],
+            "gated delta v/y index exceeds u32",
+        ),
+        (
+            [value_heads, value_width, key_width],
+            "gated delta state index exceeds u32",
+        ),
+    ] {
+        dimensions
+            .into_iter()
+            .try_fold(1usize, |extent, dimension| extent.checked_mul(dimension))
+            .and_then(|extent| extent.checked_sub(1))
+            .filter(|&last| last <= u32::MAX as usize)
+            .ok_or(Error::Contract(what))?;
+    }
+    Ok(())
+}
+
 /// For each value head and time step `t`, with `S` the `[Dv, Dk]` state:
 /// `S = g_t S`, `S += k_t (beta_t (v_t - S k_t))^T`, `y_t = S q_t`.
 /// Reductions over `Dk` use the selected layout's FP32 order.
@@ -11,6 +46,8 @@ use apxinf_core::{Error, Result};
 /// Inputs: BF16 `q`, `k` `[1, L, Hk, Dk]`, `v` `[1, L, Hv, Dv]`, `beta`
 /// `[1, L, Hv]`; FP32 `g` `[1, L, Hv]` and `state` `[1, Hv, Dv, Dk]`.
 /// Returns BF16 `y` `[1, L, Hv, Dv]` and the FP32 final state.
+/// Both layouts require nonempty flattened extents with a last element index
+/// representable as `u32`, including q/k offsets before packed-word division.
 pub struct GatedDeltaRecurrence {
     kernel: MetalKernel,
     layout: GatedDeltaLayout,
@@ -96,6 +133,7 @@ impl GatedDeltaRecurrence {
                  and Hv a multiple of Hk",
             ));
         }
+        check_index_extents(length, hk, hv, dk, dv)?;
         let steps = Array::from_i32(q.stream(), &[], &[length as i32])?;
         let rows = self.value_rows_per_group();
         // SAFETY: grid z enumerates the Hv value heads, y the Dv / rows value
@@ -146,5 +184,75 @@ impl GatedDeltaRecurrence {
     /// Four SIMD groups per threadgroup along `Dv`.
     fn value_rows_per_threadgroup(&self) -> usize {
         4 * self.value_rows_per_group()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_index_extents;
+    use apxinf_core::Error;
+
+    #[test]
+    fn rejects_each_wrapping_address_family() {
+        for (dimensions, message) in [
+            (
+                [65_537, 1, 1, 65_536, 32],
+                "gated delta q/k index exceeds u32",
+            ),
+            (
+                [65_537, 1, 65_536, 32, 32],
+                "gated delta g/beta index exceeds u32",
+            ),
+            (
+                [65_537, 1, 1, 32, 65_536],
+                "gated delta v/y index exceeds u32",
+            ),
+            (
+                [1, 1, 65_537, 32, 2_048],
+                "gated delta state index exceeds u32",
+            ),
+        ] {
+            let [length, key_heads, value_heads, key_width, value_width] = dimensions;
+            assert!(matches!(
+                check_index_extents(length, key_heads, value_heads, key_width, value_width),
+                Err(Error::Contract(actual)) if actual == message
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_inclusive_last_u32_index() {
+        assert!(check_index_extents(65_536, 1, 1, 65_536, 32).is_ok());
+        assert!(check_index_extents(65_536, 1, 1, 32, 65_536).is_ok());
+        assert!(check_index_extents(1, 1, 65_536, 32, 2_048).is_ok());
+        assert!(check_index_extents(65_536, 1, 65_536, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_and_host_overflow_extents() {
+        for dimensions in [
+            [0, 1, 1, 32, 32],
+            [1, 0, 1, 32, 32],
+            [1, 1, 0, 32, 32],
+            [1, 1, 1, 0, 32],
+            [1, 1, 1, 32, 0],
+            [usize::MAX, 2, 2, 32, 32],
+            [1, 1, usize::MAX, 32, 32],
+        ] {
+            let [length, key_heads, value_heads, key_width, value_width] = dimensions;
+            assert!(
+                check_index_extents(length, key_heads, value_heads, key_width, value_width)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_small_and_clef_profiles() {
+        for length in [1, 5, 37, 4_096] {
+            assert!(check_index_extents(length, 2, 4, 32, 16).is_ok());
+            assert!(check_index_extents(length, 2, 4, 32, 32).is_ok());
+            assert!(check_index_extents(length, 16, 32, 128, 128).is_ok());
+        }
     }
 }
