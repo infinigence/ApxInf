@@ -39,6 +39,12 @@ int apx_mlx_sync(void* p){TRY mx::synchronize(*static_cast<S*>(p));CATCH}
 int apx_mlx_memory_stats(size_t* active,size_t* cache,size_t* peak){TRY *active=mx::get_active_memory();*cache=mx::get_cache_memory();*peak=mx::get_peak_memory();CATCH}
 int apx_mlx_reset_peak_memory(void){TRY mx::reset_peak_memory();CATCH}
 int apx_mlx_clear_cache(void){TRY mx::clear_cache();CATCH}
+// gpu::device_info returns MLX's function-local static map, so both strings
+// live for the process. `architecture` is what MLX's own Metal dispatch reads.
+int apx_mlx_device_info(int32_t index,const char** name,const char** architecture){TRY
+ const auto& info=mx::gpu::device_info(index);
+ *name=std::get<std::string>(info.at("device_name")).c_str();
+ *architecture=std::get<std::string>(info.at("architecture")).c_str();CATCH}
 int apx_mlx_array_new(void*,const int32_t* dims,size_t rank,int32_t dt,const uint8_t* bytes,size_t len,void** out){TRY
  auto sh=shape(dims,rank);size_t count=1;for(auto d:sh){if(d&&count>SIZE_MAX/size_t(d))throw std::overflow_error("shape overflow");count*=d;}
  if(count>SIZE_MAX/mx::size_of(dtype(dt))||count*mx::size_of(dtype(dt))!=len)throw std::invalid_argument("upload byte length mismatch");
