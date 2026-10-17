@@ -85,7 +85,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -105,6 +105,12 @@ lifetimes and are not three names for a model. A single-implementation family
 does not need a precision-dispatch enum. `StepModulation` is computed per-step
 scale/shift/gate data, distinct from learned modulation weights. Keep model
 semantics such as `prefix` and `denoise`; flow steps are not token decode steps.
+
+`ImageRuntime` ([image.rs](../crates/apxinf-model/src/image.rs)) is the shared
+text-to-image contract. A request carries the prompt, size, seed and step count;
+the result is caller-owned row-major RGB8. Each family documents the sizes and
+step counts it supports, rejects others before device work, and keeps guidance,
+scheduler and file encoding out of the request.
 
 `SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
 text-to-speech contract. A request carries the text, voice, language, an optional

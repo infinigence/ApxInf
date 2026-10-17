@@ -88,10 +88,11 @@ CPU/CUDA models do not silently execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
-generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
-selected family parses `model_variant`, so adding a Metal family does not edit
-a central variant list. Explicit
-`--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
+generic model factory. Every registered Metal family receives `model_variant`
+and owns its parsing and validation; the common loader does not restrict this
+option to Qwen3 and MiniCPM5. CPU/CUDA option admission and registry fallback
+remain unchanged. Explicit `--model-name metal_qwen3` and
+`--model-name metal_minicpm5` select these
 implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
 selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 
@@ -129,6 +130,44 @@ The CLI renders the checkpoint chat template with the supplied options.
 Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
+
+### Implemented image selection
+
+[`metal_qwen_image`](../crates/apxinf-model/src/metal_qwen_image/README.md)
+runs Qwen-Image-2.1 text-to-image from the mflux 4-bit
+export (affine Q4 DiT, BF16 text encoder, F32 VAE decoder) and follows the
+mflux f0bf9cf0 txt2img path with `--low-ram`. The export has no top-level
+`config.json`; detection reads the transformer index. The family admits 40
+linear steps at guidance 1, batch 1, and positive sides that are multiples of
+16 up to 32768, with at most 174762 image tokens. The family README derives
+this execution bound; it is not a memory-capacity guarantee. The family
+returns RGB8 through `ImageRuntime`; the CLI writes binary PPM, so no image
+codec dependency is added.
+
+- Loading reads the tokenizer, checks every text-encoder tensor header, and
+  loads the DiT and VAE decoder with complete key, shape and dtype checks.
+- A request reads the text encoder one layer at a time and frees each layer.
+  The DiT computes the text-prefix K/V once and then runs one compiled image
+  forward per step. On `applegpu_g16g` (M4), the architecture where it was
+  measured faster, the default `auto` variant uses the MPP GEMM for image
+  projections of at least 1024 aligned tokens after a load-time probe of the
+  three projection shapes at 1024 rows. Matching that probe does not qualify
+  all weights, shapes or image outputs. Other architectures use quantized matmul.
+  `model_variant=reference` skips MPP and uses quantized matmul for all Q4
+  projections, without changing the scheduler or other execution paths. The DiT
+  is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
+  read again by the next request, as `--low-ram` does.
+- The checkpoint weights are under the Qwen Research License, which permits
+  non-commercial use only. APXinf ships no weights.
+
+```sh
+cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4bit \
+  --width 1024 --height 576 --seed 42 --prompt 'A lighthouse at dusk' \
+  --output lighthouse.ppm
+```
+
+Add `--model-variant reference` to select the quantized-matmul reference path.
+Omitting it or using `--model-variant auto` preserves the optimization target.
 
 ### Implemented speech selection
 
@@ -196,6 +235,27 @@ not convert intermediate arrays to host values or evaluate each primitive.
 Repeated execution uses prepared block/step closures, avoiding per-token
 Rust-to-Python or subprocess calls. Custom Metal kernels are registered once
 during preparation and invoked through the same safe operator boundary.
+
+## Device architecture and kernel policy
+
+Apple GPUs differ in generation, core count and memory bandwidth, so the fastest
+launch geometry or implementation can differ between them, as it does between
+CUDA architecture families. `MetalDeviceCaps`, reached through
+`Stream::metal_caps()`, holds the MLX architecture string and its parsed
+generation and device class. It contains no policy.
+
+A policy that reads these facts lives beside its kernel in `apxinf-mlx`, as
+CUDA launch policies live beside their kernels. A model family branches on
+architecture only for a structural choice, such as which device runs a stage,
+and states the reason. Each architecture's values come from measurement on a
+device of that architecture, recorded with the policy. An unrecognized or
+unmeasured architecture keeps the existing default.
+
+A choice that keeps each output's reduction order and rounding, such as output
+tiling, threadgroup shape or independent column splits, needs the paired timing
+gate on that architecture. A choice that changes reduction order or rounding
+also needs the family's numerical qualification on that architecture. Stock MLX
+output already differs between devices, so references are recorded per device.
 
 ## Tensor ownership and model-specific numerical semantics
 
@@ -369,7 +429,7 @@ and avoid per-layer host synchronization introduced only for measurement.
 | Prepared execution | No hot retrace/tune; input rebinding; eager/compiled parity; shape invalidation and bounded memory |
 | Model | Exact checkpoint load, important intermediate tensors, full real-input gate and state regressions |
 | Public path | Registry/CLI or existing binding invocation, real decoded outputs and supported options |
-| Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
+| Performance | Raw paired samples and exact source/environment binding, including the Metal architecture string; no cross-run speedup arithmetic |
 
 Temporary references, captures and reports stay in ignored `devlocal/` per
 [AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability
