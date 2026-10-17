@@ -5,6 +5,7 @@ members = [
     "crates/apxinf-cuda-new",
     "crates/apxinf-hip",
     "crates/apxinf-mlx",
+    "crates/apxinf-coreml",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
