@@ -178,7 +178,9 @@ It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
 cast seams) operation by operation, so a seed reproduces that path's codes and
 waveform. The CLI `speak` command writes 32-bit float WAV. The default
 `auto` variant runs the code predictor MLPs on the EngineTailor `SwigluMlpGemv`
-kernels; `--model-variant reference` keeps the composed parity SwiGLU.
+kernels only on the measured `applegpu_g16g` architecture. Other architectures
+keep the composed reference until their numerical and timing gates pass.
+`--model-variant reference` keeps the composed parity SwiGLU on every device.
 
 - Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
   logits by inverse CDF, where 0.31.2 used Gumbel-max.

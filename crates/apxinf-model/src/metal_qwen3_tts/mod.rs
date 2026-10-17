@@ -32,8 +32,8 @@ pub struct QwenTts {
 /// The predictor MLP selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Variant {
-    /// The EngineTailor predictor MLP kernels (default).
-    Fused,
+    /// Use the predictor MLP fusion only on measured architectures.
+    Auto,
     /// The reference SwiGLU composition of the parity path.
     Reference,
 }
@@ -41,11 +41,11 @@ enum Variant {
 /// Device-independent option admission, checked before the checkpoint is read.
 fn admit(options: &LoadOptions) -> Result<Variant> {
     let variant = match options.model_variant.as_deref() {
-        None | Some("auto") => Variant::Fused,
+        None | Some("auto") => Variant::Auto,
         Some("reference") => Variant::Reference,
         Some(_) => {
             return Err(Error::Contract(
-                "Qwen3-TTS MLX variants are `auto` (fused predictor MLP) and `reference`",
+                "Qwen3-TTS MLX variants are `auto` (architecture-selected predictor MLP) and `reference`",
             ))
         }
     };
@@ -67,6 +67,10 @@ fn admit(options: &LoadOptions) -> Result<Variant> {
         ));
     }
     Ok(variant)
+}
+
+fn use_predictor_fusion(variant: Variant, architecture: &str) -> bool {
+    variant == Variant::Auto && architecture == "applegpu_g16g"
 }
 
 pub fn load(
@@ -104,9 +108,18 @@ pub fn load(
     )?;
     let tokenizer = Tokenizer::from_qwen2_vocab(path)?;
     let stream = native.stream().clone();
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    let fused = use_predictor_fusion(variant, architecture);
+    if variant == Variant::Auto && !fused {
+        eprintln!(
+            "Qwen3-TTS: predictor fusion not used (not measured on {architecture:?}); using reference SwiGLU"
+        );
+    }
     let ops = Ops::new(&stream)?;
     let (talker, predictor) = weights::Talker::load(&stream, path)?;
-    let model = Model::new(talker, predictor, &ops, variant == Variant::Fused)?;
+    let model = Model::new(talker, predictor, &ops, fused)?;
     let decoder = codec::Decoder::new(weights::Codec::load(&stream, path)?, &ops)?;
     Ok(LoadedModel::Speech(Box::new(QwenTts {
         config,
@@ -306,8 +319,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn automatic_fusion_requires_a_measured_architecture() {
+        let requested = admit(&LoadOptions::default()).unwrap();
+        assert!(use_predictor_fusion(requested, "applegpu_g16g"));
+        assert!(!use_predictor_fusion(Variant::Reference, "applegpu_g16g"));
+        for architecture in [
+            "applegpu_g13s",
+            "applegpu_g14g",
+            "applegpu_g16s",
+            "",
+            "unknown",
+        ] {
+            assert!(!use_predictor_fusion(requested, architecture));
+            assert!(!use_predictor_fusion(Variant::Reference, architecture));
+        }
+    }
+
+    #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert_eq!(admit(&LoadOptions::default()).unwrap(), Variant::Fused);
+        assert_eq!(admit(&LoadOptions::default()).unwrap(), Variant::Auto);
         let reference = LoadOptions {
             model_variant: Some("reference".into()),
             ..LoadOptions::default()
