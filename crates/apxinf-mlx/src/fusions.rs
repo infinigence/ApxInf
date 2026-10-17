@@ -4,8 +4,8 @@ pub use crate::gate_swiglu::F16GateSwiglu;
 pub use crate::gated_delta::{GatedDeltaLayout, GatedDeltaRecurrence};
 pub use crate::half_split_rope::HalfSplitRope;
 pub use crate::q4_f16::{
-    padded_rows, F16Gemm, F16GemmTile, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
-    Q4TransposeDecode, SplitF16Gemm,
+    padded_rows, F16Gemm, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16, Q4TransposeDecode,
+    SplitF16Gemm,
 };
 pub use crate::qk_norm_rope::QkNormRope;
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
