@@ -1,11 +1,13 @@
-//! Clef Flash forward pass: Qwen3.5 hybrid backbone and the BF16 joint schema
-//! head.
+//! Clef Flash forward pass: Qwen3.5 hybrid backbone in the stock or the C14
+//! composition, and the BF16 joint schema head.
 //!
 //! The operator sequence and every rounding point follow the stock reference
 //! (MLX-VLM 0.7.4 backbone, clef_mlx.py head, MLX 0.32.3), including its
 //! compiled functions. The gated-delta recurrence is a Metal kernel with the
-//! MLX-VLM kernel's arithmetic. One request is one lazy graph evaluated once;
-//! no state survives between requests.
+//! MLX-VLM kernel's arithmetic. C14 (EngineTailor layer-stack frontier)
+//! replaces the MLP, the gated-delta projections, convolution and recurrence,
+//! and the attention projections with its own kernels. One request is one lazy
+//! graph evaluated once; no state survives between requests.
 use super::config::Config;
 use super::encode::{Encoded, EncodedQuestion};
 use super::weights::{
@@ -13,7 +15,11 @@ use super::weights::{
     Norm, Q4,
 };
 use apxinf_core::Result;
-use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
+use apxinf_mlx::fusions::{
+    padded_rows, CausalDepthwiseConv, F16GateSwiglu, F16Gemm, GatedDeltaLayout,
+    GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
+    Q4TransposeDecode, SplitF16Gemm,
+};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const EPS: f32 = 1e-6;
@@ -26,6 +32,108 @@ struct Kernels {
     /// kernel rounds exp/logaddexp differently from eager operations on some
     /// devices (one decay ulp per layer on the M1 Pro).
     g_beta: Compiled,
+}
+
+/// Backbone composition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Composition {
+    /// MLX-VLM: Q4 matmuls, MLX convolution, the four-value recurrence.
+    Reference,
+    /// EngineTailor C14: gate GEMM with SwiGLU epilogue, wm1/wn2 split
+    /// projections for the gated delta and attention q/o, one-pass k/v, the
+    /// causal convolution kernel and the eight-lane recurrence. Its GDN
+    /// reduction order differs from MLX-VLM's.
+    C14,
+}
+
+/// Kernels only the C14 composition uses (EngineTailor `c14.py` names).
+struct C14Kernels {
+    pad: PadRowsF16,
+    /// `g18`: projection weights decoded in BF16, transposed to FP16.
+    project_decode: Q4TransposeDecode,
+    /// `r06`: MLP down weight decoded in FP16, transposed.
+    down_decode: Q4TransposeDecode,
+    /// `s22`: MLP gate and up weights decoded row-major.
+    row_decode: Q4RowDecodeF16,
+    /// `a13`: gate GEMM with the SwiGLU epilogue.
+    gate_swiglu: F16GateSwiglu,
+    /// `s28`: split projections (gated delta, attention q and o).
+    split: SplitF16Gemm,
+    /// `s13`: attention k and v in one pass.
+    single: F16Gemm,
+    /// `s31`: gated-delta convolution.
+    conv: CausalDepthwiseConv,
+    /// `s12`: eight value rows per SIMD group.
+    recurrence: GatedDeltaRecurrence,
+}
+
+impl C14Kernels {
+    fn new(stream: &Stream) -> Result<Self> {
+        Ok(Self {
+            pad: PadRowsF16::new(stream)?,
+            project_decode: Q4TransposeDecode::new(stream, Q4DecodeArithmetic::Bf16)?,
+            down_decode: Q4TransposeDecode::new(stream, Q4DecodeArithmetic::F16)?,
+            row_decode: Q4RowDecodeF16::new(stream)?,
+            gate_swiglu: F16GateSwiglu::new(stream)?,
+            split: SplitF16Gemm::new(stream)?,
+            single: F16Gemm::new(stream)?,
+            conv: CausalDepthwiseConv::new(stream)?,
+            recurrence: GatedDeltaRecurrence::with_layout(stream, GatedDeltaLayout::EightLanes)?,
+        })
+    }
+
+    /// `_g20_linear` with the wm1/wn2 GEMM: pad to 64 rows, decode each half
+    /// of the Q4 weight, two GEMMs writing one BF16 output.
+    fn split_linear(&self, x: &Array, q: &Q4) -> Result<Array> {
+        let tokens = x.shape()[1];
+        let half = q.rows() / 2;
+        let h = self.pad.call(x)?;
+        let low = self.split.low(
+            &h,
+            tokens,
+            &self
+                .project_decode
+                .call(&q.weight, &q.scales, &q.biases, 0, half)?,
+        )?;
+        // Built after the low half, listed first, as in C14's dispatch order.
+        let high = self
+            .project_decode
+            .call(&q.weight, &q.scales, &q.biases, half, half)?;
+        self.split.high(&high, &low, &h, tokens)
+    }
+
+    /// `_single_linear`: one full-width decode and one GEMM.
+    fn single_linear(&self, x: &Array, q: &Q4) -> Result<Array> {
+        let weight = self
+            .project_decode
+            .call(&q.weight, &q.scales, &q.biases, 0, q.rows())?;
+        self.single.call(&self.pad.call(x)?, x.shape()[1], &weight)
+    }
+
+    /// `create_mlp`: the row-decoded up weight through an MLX GEMM, the gate
+    /// GEMM with its SwiGLU epilogue, and the transposed down decode.
+    fn mlp(&self, h: &Array, m: &Mlp) -> Result<Array> {
+        let tokens = h.shape()[1];
+        let x = if padded_rows(tokens) == tokens {
+            h.cast(MlxDType::F16)?
+        } else {
+            self.pad.call(h)?
+        };
+        let decode = |q: &Q4| self.row_decode.call(&q.weight, &q.scales, &q.biases);
+        let up = x.matmul(&decode(&m.up)?.transpose(&[1, 0])?)?;
+        let activation = self.gate_swiglu.call(&x, &decode(&m.gate)?, &up)?;
+        let down = self.down_decode.call(
+            &m.down.weight,
+            &m.down.scales,
+            &m.down.biases,
+            0,
+            m.down.rows(),
+        )?;
+        activation
+            .matmul(&down)?
+            .slice_axis(1, 0, tokens)?
+            .cast(MlxDType::BF16)
+    }
 }
 
 /// `compute_g`: `exp(-exp(A_log) * softplus(a + dt_bias))`; beta: `sigmoid(b)`.
@@ -50,6 +158,7 @@ pub struct Network {
     backbone: Backbone,
     head: Head,
     kernels: Kernels,
+    c14: Option<C14Kernels>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
 }
@@ -115,11 +224,21 @@ fn l2_normalize(x: &Array) -> Result<Array> {
 }
 
 impl Network {
-    pub fn new(config: Config, stream: Stream, backbone: Backbone, head: Head) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        stream: Stream,
+        backbone: Backbone,
+        head: Head,
+        composition: Composition,
+    ) -> Result<Self> {
         let kernels = Kernels {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
             rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: Compiled::with_shapeless(&stream, 2, true, g_beta)?,
+        };
+        let c14 = match composition {
+            Composition::C14 => Some(C14Kernels::new(&stream)?),
+            Composition::Reference => None,
         };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
@@ -138,6 +257,7 @@ impl Network {
             backbone,
             head,
             kernels,
+            c14,
             inv_freq,
         })
     }
@@ -189,9 +309,29 @@ impl Network {
         h.fast_rms_norm(&self.backbone.norm, EPS)
     }
 
-    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4.
+    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or C14's MLP.
     fn mlp(&self, h: &Array, m: &Mlp) -> Result<Array> {
-        qmm(&silu(&qmm(h, &m.gate)?)?.mul(&qmm(h, &m.up)?)?, &m.down)
+        match &self.c14 {
+            Some(c) => c.mlp(h, m),
+            None => qmm(&silu(&qmm(h, &m.gate)?)?.mul(&qmm(h, &m.up)?)?, &m.down),
+        }
+    }
+
+    /// A gated-delta `in_proj_qkv`, `in_proj_z` or `out_proj`, or attention
+    /// q/o: C14 splits them in two halves.
+    fn split_projection(&self, x: &Array, q: &Q4) -> Result<Array> {
+        match &self.c14 {
+            Some(c) => c.split_linear(x, q),
+            None => qmm(x, q),
+        }
+    }
+
+    /// Attention k/v: one pass in C14.
+    fn single_projection(&self, x: &Array, q: &Q4) -> Result<Array> {
+        match &self.c14 {
+            Some(c) => c.single_linear(x, q),
+            None => qmm(x, q),
+        }
     }
 
     fn gated_delta(&self, x: &Array, g: &GatedDelta, tokens: usize) -> Result<Array> {
@@ -200,15 +340,22 @@ impl Network {
         let (dk, dv) = (t.linear_key_head_dim, t.linear_value_head_dim);
         let (key_dim, value_dim) = (hk * dk, hv * dv);
         let conv_dim = 2 * key_dim + value_dim;
-        let mixed = qmm(x, &g.qkv)?;
-        let z = qmm(x, &g.z)?.reshape(&[1, tokens, hv, dv])?;
+        let mixed = self.split_projection(x, &g.qkv)?;
+        let z = self
+            .split_projection(x, &g.z)?
+            .reshape(&[1, tokens, hv, dv])?;
         let (b, a) = (qmm(x, &g.b)?, qmm(x, &g.a)?);
-        let state = Array::zeros(
-            &self.stream,
-            &[1, t.linear_conv_kernel_dim - 1, conv_dim],
-            MlxDType::BF16,
-        )?;
-        let conv = silu(&Array::concat(&[&state, &mixed], 1)?.conv1d(&g.conv, 1, 0, 1, conv_dim)?)?;
+        let conv = match &self.c14 {
+            Some(c) => silu(&c.conv.call(&mixed, &g.conv)?)?,
+            None => {
+                let state = Array::zeros(
+                    &self.stream,
+                    &[1, t.linear_conv_kernel_dim - 1, conv_dim],
+                    MlxDType::BF16,
+                )?;
+                silu(&Array::concat(&[&state, &mixed], 1)?.conv1d(&g.conv, 1, 0, 1, conv_dim)?)?
+            }
+        };
         let q = conv
             .slice_axis(2, 0, key_dim)?
             .reshape(&[1, tokens, hk, dk])?;
@@ -233,16 +380,17 @@ impl Network {
         ])?)
         .unwrap();
         let state = Array::zeros(&self.stream, &[1, hv, dv, dk], MlxDType::F32)?;
-        let (y, _) = self
-            .kernels
-            .recurrence
-            .call(&q, &k, &v, &decay, &beta, &state)?;
+        let recurrence = match &self.c14 {
+            Some(c) => &c.recurrence,
+            None => &self.kernels.recurrence,
+        };
+        let (y, _) = recurrence.call(&q, &k, &v, &decay, &beta, &state)?;
         // Gated RMSNorm: (silu(z) in FP32) * norm(y) in FP32, rounded to BF16.
         let normed = y.fast_rms_norm(&g.norm, EPS)?;
         let gated = silu(&z.cast(MlxDType::F32)?)?
             .mul(&normed.cast(MlxDType::F32)?)?
             .cast(MlxDType::BF16)?;
-        qmm(&gated.reshape(&[1, tokens, value_dim])?, &g.out)
+        self.split_projection(&gated.reshape(&[1, tokens, value_dim])?, &g.out)
     }
 
     fn attention(
@@ -254,8 +402,13 @@ impl Network {
     ) -> Result<Array> {
         let t = &self.config.text;
         let (heads, kv, d) = (t.num_attention_heads, t.num_key_value_heads, t.head_dim);
-        let projected = qmm(x, &a.q)?.reshape(&[1, tokens, heads, 2 * d])?;
-        let (keys, values) = (qmm(x, &a.k)?, qmm(x, &a.v)?);
+        let projected = self
+            .split_projection(x, &a.q)?
+            .reshape(&[1, tokens, heads, 2 * d])?;
+        let (keys, values) = (
+            self.single_projection(x, &a.k)?,
+            self.single_projection(x, &a.v)?,
+        );
         let queries = projected.slice_axis(3, 0, d)?;
         let gate = projected
             .slice_axis(3, d, 2 * d)?
@@ -277,7 +430,7 @@ impl Network {
             .sdpa(&keys, &values, (d as f32).powf(-0.5), tokens > 1, None)?
             .transpose(&[0, 2, 1, 3])?
             .reshape(&[1, tokens, heads * d])?;
-        qmm(&out.mul(&gate.sigmoid()?)?, &a.o)
+        self.split_projection(&out.mul(&gate.sigmoid()?)?, &a.o)
     }
 
     /// `torch.nn.MultiheadAttention`, batch first, packed input projection.
