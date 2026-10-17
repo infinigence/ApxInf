@@ -60,6 +60,11 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
+`DecisionRuntime` (`decision.rs`) is the shared non-generative decision
+contract. It takes an encoded prompt scored over a package code table (d3) or
+a schema request with named, typed questions that the family encodes itself
+(`metal_clef`), and returns one answer per question.
+
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
 profiles, capacity and retained error. Only successful preparation reports
@@ -142,6 +147,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Clef Flash / `DecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 4096 tokens; `reference` (the stock MLX-VLM composition), `c14` (EngineTailor layer-stack frontier: gate GEMM with SwiGLU epilogue, wm1/wn2 split projections, causal convolution and eight-lane recurrence; also `auto` on `applegpu_g13s`, the architecture where it passed its quality and paired latency gates; `reference` elsewhere). |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -151,10 +157,12 @@ separately migrated; do not rename or import them as part of an unrelated port.
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
 The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
-parses its variants locally; the common loader does not infer quantization from
-a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
-and implementing family-local parsing/validation; registration alone is not
+names, and for every Metal request. Metal admission reaches only a registered
+`metal_` factory, and each MLX family parses its variants locally; the common
+loader does not infer quantization from a shared CUDA precision choice. A new
+Metal family needs no central admission edit. Supporting it for a new non-Metal
+family requires updating that admission check and implementing family-local
+parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and

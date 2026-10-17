@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference.probabilities.len(),
     );
     let prepare_started = Instant::now();
-    let output = model.decide(input)?;
+    let output = model.decide(input)?.into_single()?;
     let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
     let actual = output
         .scores
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut milliseconds = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let started = Instant::now();
-            let replay = model.decide(input)?;
+            let replay = model.decide(input)?.into_single()?;
             milliseconds.push(started.elapsed().as_secs_f64() * 1_000.0);
             if replay.selected_index != reference.selected_index {
                 return Err("d3 vision replay changed the selected answer".into());
