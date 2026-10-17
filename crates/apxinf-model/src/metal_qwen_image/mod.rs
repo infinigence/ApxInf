@@ -120,10 +120,26 @@ pub fn load(
     })))
 }
 
-/// Enables MPP after a bit-identical probe of the three block projection
-/// shapes `(K, N)` at `dit::MPP_MIN_TOKENS` rows, on seeded device data.
-/// This does not qualify checkpoint weights, larger token counts or image outputs.
+/// MLX architectures where MPP image projections were measured faster than
+/// quantized matmul: the M4 (EngineTailor GEMM frontier 427d48fc and paired
+/// whole-image timing). Other architectures keep quantized matmul until
+/// measured there; the selection is structural, so it stays in this family.
+const MPP_MEASURED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
+
+/// Enables MPP on a measured architecture after a bit-identical probe of the
+/// three block projection shapes `(K, N)` at `dit::MPP_MIN_TOKENS` rows, on
+/// seeded device data. This does not qualify checkpoint weights, larger token
+/// counts or image outputs.
 fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    if !MPP_MEASURED_ARCHITECTURES.contains(&architecture) {
+        eprintln!(
+            "Qwen-Image: MPP GEMM not used (not measured on {architecture:?}); image projections use quantized matmul"
+        );
+        return None;
+    }
     let probe = || -> Result<Option<MppBf16GemmNt>> {
         let gemm = MppBf16GemmNt::new(stream)?;
         let normal = |shape: &[usize], seed: u64, scale: f32| -> Result<Array> {
@@ -450,6 +466,15 @@ mod tests {
         ] {
             assert!(admit_request(&bad).is_err());
         }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn mpp_gemm_is_probed_only_on_measured_architectures() {
+        let stream = Stream::metal(0).unwrap();
+        let architecture = stream.metal_caps().unwrap().architecture.clone();
+        let measured = MPP_MEASURED_ARCHITECTURES.contains(&architecture.as_str());
+        assert_eq!(probed_gemm(&stream).is_some(), measured, "{architecture}");
     }
 
     #[test]
