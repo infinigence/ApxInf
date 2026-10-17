@@ -134,10 +134,10 @@ caches a separate Metal pipeline the first time it is used.
 The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
 `SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope` (g20), and
 `Q4RowDecodeF16`, `F16Gemm`, `F16GateSwiglu`, `CausalDepthwiseConv`, the
-`SplitF16Gemm` tile `F16GemmTile::Wm1Wn2` and the `GatedDeltaLayout::EightLanes`
+wm1/wn2 tile of `SplitF16Gemm` and the `GatedDeltaLayout::EightLanes`
 recurrence (C14). They decode affine Q4 group-64 weights to FP16 for one call
 only; they keep no decoded weight resident. `F16GateSwiglu` includes MLX
-0.32.3's Steel loader, MMA and transform headers as installed (MIT). The tile
-and layout variants change only the reduction order, not the operation.
+0.32.3's Steel loader, MMA and transform headers as installed (MIT). The two
+recurrence layouts change only the reduction order, not the operation.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
