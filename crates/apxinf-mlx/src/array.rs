@@ -1,4 +1,4 @@
-use crate::ffi;
+use crate::{ffi, MetalDeviceCaps};
 use apxinf_core::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
@@ -95,6 +95,15 @@ impl MlxDType {
     }
 }
 
+fn metal_caps(index: i32) -> Result<MetalDeviceCaps> {
+    let (mut name, mut architecture) = (std::ptr::null(), std::ptr::null());
+    check(unsafe { ffi::apx_mlx_device_info(index, &mut name, &mut architecture) })?;
+    // SAFETY: on success both point to NUL-terminated strings in MLX's
+    // process-lifetime device information map.
+    let text = |p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    Ok(MetalDeviceCaps::new(text(name), text(architecture)))
+}
+
 #[derive(Clone)]
 pub struct Stream(Rc<StreamInner>);
 /// Cumulative observations for one logical execution stream and its clones.
@@ -112,6 +121,7 @@ pub struct StreamCounters {
 struct StreamInner {
     raw: NonNull<c_void>,
     metal: Option<usize>,
+    caps: Option<MetalDeviceCaps>,
     counters: Cell<StreamCounters>,
 }
 impl Drop for StreamInner {
@@ -134,14 +144,23 @@ impl Stream {
         let mut raw = std::ptr::null_mut();
         let index_i = i32::try_from(index).map_err(|_| error("device index exceeds i32"))?;
         check(unsafe { ffi::apx_mlx_stream_new(gpu as i32, index_i, &mut raw) })?;
-        Ok(Self(Rc::new(StreamInner {
+        let mut inner = StreamInner {
             raw: NonNull::new(raw).ok_or_else(|| error("null MLX stream"))?,
             metal: gpu.then_some(index),
+            caps: None,
             counters: Cell::new(StreamCounters::default()),
-        })))
+        };
+        if gpu {
+            inner.caps = Some(metal_caps(index_i)?);
+        }
+        Ok(Self(Rc::new(inner)))
     }
     pub fn metal_index(&self) -> Option<usize> {
         self.0.metal
+    }
+    /// Device facts of a Metal stream; `None` for a CPU stream.
+    pub fn metal_caps(&self) -> Option<&MetalDeviceCaps> {
+        self.0.caps.as_ref()
     }
     pub fn counters(&self) -> StreamCounters {
         self.0.counters.get()
