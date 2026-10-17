@@ -4,11 +4,14 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod d3;
+pub mod decision;
 pub mod debug;
 mod generation_config;
 pub mod gr00t;
 pub mod llama;
 pub mod llm_trait;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_clef;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -29,9 +32,12 @@ mod walloss;
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
 pub use d3::{
-    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig, DecisionInput,
-    DecisionOutput, DecisionRuntime, DecisionScore, D3_DEFAULT_TEXT_PROFILE_LIMIT,
-    D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
+    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig,
+    D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
+};
+pub use decision::{
+    DecisionAnswer, DecisionInput, DecisionOutput, DecisionQuestion, DecisionRuntime,
+    DecisionSchema, DecisionScore,
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};

@@ -67,7 +67,59 @@ noise = np.random.default_rng(0).standard_normal(
 action = model.infer_rgb(rgb, "nhwc", tokens, noise)  # -> [horizon, dim] float32
 ```
 
+## Decision requests
+
+`DecisionRunner` supports both encoded-prompt and schema requests on the same
+loaded handle. `decide(token_ids, candidate_count)` keeps the D3 output contract:
+`{"selected_index": int, "scores": [...]}`.
+
+For a schema-only model such as Clef, build with `--features mlx` and use
+`decide_schema(request_json)`:
+
+```python
+import json
+import apxinf_py
+
+runner = apxinf_py.DecisionRunner.load("/path/to/clef", device="metal:0")
+request = {
+    "state": {"signal": "red"},
+    "questions": {
+        "action": {
+            "type": "choice",
+            "instructions": "Choose an action",
+            "criteria": {"go": "Proceed", "stay": "Wait"},
+        }
+    },
+}
+result = runner.decide_schema(json.dumps(request))
+answer = result["answers"][0]
+selected = answer["scores"][answer["selected_index"]]
+```
+
+The JSON request uses the shared `DecisionSchema` parser, which rejects duplicate
+question IDs and unknown fields. The returned `answers` list preserves question
+order. Each answer contains `question_id`, `selected_index`, and `scores` with
+`code`, `token_id`, and `probability`. Schema options have `token_id=None`.
+Scores retain their option order and per-question probabilities. Invalid requests
+raise `ValueError`; model errors raise `RuntimeError`. The loaded family decides
+which input forms it supports. Clef does not accept encoded D3 prompts or tuning
+options.
+
 ## Tests
+
+### CPU binding checks
+
+The Rust unit tests exercise both Python decision methods with a stub
+`DecisionRuntime`, without loading a model or using a GPU. They check schema
+dispatch, question order, grouped probabilities, errors, and the D3 output shape.
+Use a Python interpreter supported by PyO3 0.22 with NumPy installed. Keep
+`extension-module` disabled so the test executable links libpython:
+
+```sh
+PYO3_PYTHON=/path/to/python3.11 cargo test -p apxinf-py --lib
+```
+
+### CUDA smoke tests
 
 Python smoke + L0/L1 consistency tests live in `tests/` and are gated on
 environment variables (they skip cleanly without CUDA / a checkpoint):
@@ -76,11 +128,4 @@ environment variables (they skip cleanly without CUDA / a checkpoint):
 pip install pytest numpy
 APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_MODEL_VARIANT=bf16 \
   pytest crates/apxinf-py/tests
-```
-
-Rust-side unit tests (device/precision/layout parsing, config fallback) need no
-CUDA:
-
-```sh
-cargo test -p apxinf-py
 ```

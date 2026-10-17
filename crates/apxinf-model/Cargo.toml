@@ -7,10 +7,12 @@ license = "Apache-2.0"
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-mlx = { path = "../apxinf-mlx", optional = true }
+apxinf-coreml = { path = "../apxinf-coreml", optional = true }
 apxinf-cuda = { path = "../apxinf-cuda", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
+apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }
 thiserror = "1"
 once_cell = "1"
 half = "2"
@@ -18,9 +20,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
+[dev-dependencies]
+# Decodes recorded Core ML packages in the Clef A04 device test.
+prost = "0.14"
+
 [features]
 default = []
-mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2"]
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
+# Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
+coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
 # Full NVIDIA CUDA inference: links both the legacy (`apxinf-cuda`) and the
 # current (`apxinf-cuda-new`) runtimes and enables every CUDA model family.
 cuda = ["dep:apxinf-cuda", "dep:apxinf-cuda-new"]
