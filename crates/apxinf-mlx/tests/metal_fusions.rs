@@ -126,7 +126,7 @@ fn q4_transpose_decode_matches_mlx_dequantize_in_both_arithmetics() -> Result<()
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
 fn padded_split_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
-    use apxinf_mlx::fusions::{padded_rows, F16GemmTile, PadRowsF16, SplitF16Gemm};
+    use apxinf_mlx::fusions::{padded_rows, PadRowsF16, SplitF16Gemm};
     let s = Stream::metal(0)?;
     let (tokens, k, half) = (70, 64, 64);
     let padded = padded_rows(tokens);
@@ -149,28 +149,25 @@ fn padded_split_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> 
         .matmul(&w.cast(D::F32)?)?
         .cast(D::BF16)?
         .to_f32_vec()?;
-    for tile in [F16GemmTile::Prefetch, F16GemmTile::Wm1Wn2] {
-        let gemm = SplitF16Gemm::with_tile(&s, tile)?;
-        let low = gemm.low(&x, tokens, &w_lo)?;
-        let out = gemm.high(&w_hi, &low, &x, tokens)?;
+    let gemm = SplitF16Gemm::new(&s)?;
+    let low = gemm.low(&x, tokens, &w_lo)?;
+    let out = gemm.high(&w_hi, &low, &x, tokens)?;
+    assert_eq!(
+        (out.shape(), out.dtype()),
+        (&[1, tokens, 2 * half][..], D::BF16)
+    );
+    assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
+    let low_values = low.to_f32_vec()?;
+    let out_values = out.to_f32_vec()?;
+    for t in 0..tokens {
         assert_eq!(
-            (out.shape(), out.dtype()),
-            (&[1, tokens, 2 * half][..], D::BF16)
+            &out_values[t * 2 * half..t * 2 * half + half],
+            &low_values[t * half..(t + 1) * half]
         );
-        assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
-        let low_values = low.to_f32_vec()?;
-        let out_values = out.to_f32_vec()?;
-        for t in 0..tokens {
-            assert_eq!(
-                &out_values[t * 2 * half..t * 2 * half + half],
-                &low_values[t * half..(t + 1) * half],
-                "{tile:?}"
-            );
-        }
-        assert!(gemm.low(&x, 64, &w_lo).is_err());
-        assert!(gemm.low(&h, tokens, &w_lo).is_err());
-        assert!(gemm.high(&w_hi, &out, &x, tokens).is_err());
     }
+    assert!(gemm.low(&x, 64, &w_lo).is_err());
+    assert!(gemm.low(&h, tokens, &w_lo).is_err());
+    assert!(gemm.high(&w_hi, &out, &x, tokens).is_err());
     assert!(pad.call(&h.cast(D::F16)?).is_err());
     Ok(())
 }
