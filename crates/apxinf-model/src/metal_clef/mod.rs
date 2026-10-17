@@ -1,6 +1,6 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
-//! the stock MLX-VLM composition, and the BF16 joint schema head. No Python
-//! model execution.
+//! the stock MLX-VLM composition or the EngineTailor C14 composition, and the
+//! BF16 joint schema head. No Python model execution.
 mod config;
 mod encode;
 mod model;
@@ -16,7 +16,7 @@ use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::{Array, MlxBackend, MlxDType};
 use apxinf_tokenizer::Tokenizer;
-use model::Network;
+use model::{Composition, Network};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,16 +26,18 @@ pub struct ClefRunner {
 }
 
 /// Device-independent option admission, checked before the checkpoint is read.
-/// `reference` is the only composition; `auto` selects it.
-fn admit(options: &LoadOptions) -> Result<()> {
-    if !matches!(
-        options.model_variant.as_deref(),
-        None | Some("auto" | "reference")
-    ) {
-        return Err(Error::Contract(
-            "Clef MLX supports the auto and reference variants",
-        ));
-    }
+/// `auto` selects the reference until C14 passes its latency gate on a
+/// measured architecture; `c14` is explicit.
+fn admit(options: &LoadOptions) -> Result<Composition> {
+    let composition = match options.model_variant.as_deref() {
+        None | Some("auto" | "reference") => Composition::Reference,
+        Some("c14") => Composition::C14,
+        Some(_) => {
+            return Err(Error::Contract(
+                "Clef MLX supports the auto, reference and c14 variants",
+            ))
+        }
+    };
     if !matches!(
         options.precision,
         ModelPrecision::Auto | ModelPrecision::Bf16
@@ -53,7 +55,7 @@ fn admit(options: &LoadOptions) -> Result<()> {
              calibration, synthetic weights and auxiliary assets are unsupported",
         ));
     }
-    Ok(())
+    Ok(composition)
 }
 
 pub fn load(
@@ -65,7 +67,7 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
-    admit(options)?;
+    let composition = admit(options)?;
     let native = backend
         .as_any()
         .downcast_ref::<MlxBackend>()
@@ -91,7 +93,7 @@ pub fn load(
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
         tokenizer,
-        network: Network::new(config, stream, backbone, head)?,
+        network: Network::new(config, stream, backbone, head, composition)?,
     })))
 }
 
@@ -171,13 +173,20 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert!(admit(&LoadOptions::default()).is_ok());
-        for variant in ["auto", "reference"] {
+        assert_eq!(
+            admit(&LoadOptions::default()).unwrap(),
+            Composition::Reference
+        );
+        for (variant, composition) in [
+            ("auto", Composition::Reference),
+            ("reference", Composition::Reference),
+            ("c14", Composition::C14),
+        ] {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
                 ..LoadOptions::default()
             };
-            assert!(admit(&options).is_ok(), "{variant}");
+            assert_eq!(admit(&options).unwrap(), composition, "{variant}");
         }
         for options in [
             LoadOptions {
