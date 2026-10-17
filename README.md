@@ -15,10 +15,58 @@ with an evolving agentic workflow that radically simplifies custom model develop
 The first version of ApxInf ships with highly optimized PI-0.5 VLA model on Jetson Thor &
 Orin devices, and supports BF16, FP8 and INT8 precisions.
 
-ApxInf also supports CUDA text decision inference for `vllm-sr/d3-mini`. See
-the [d3-mini Decision Index reproduction guide](doc/d3-mini-decision-index.md)
-for the validated result and benchmark procedure.
+## What's NEW!
+- [2026/10] 🔥 ApxInf supports Decision 3.0 mini and Qwen3.8-27B with image inference.
+- [2026/10] 🔥 ApxInf supoorts SmolVLA, deployable on Jetson Xavier / Thor / Orin / RTX 4090.
+- [2026/09] 🔥 ApxInf supports PI0-FAST, GR00T-N1.7, Qwen-Drive, Qwen3.8-27B.
+- [2026/09] 🔥 Initial open-source release of ApxInf repo, with PI0.5 support. Backends: Jetson Thor / Orin / RTX 4090.
 
+## Feature Matrix
+<table width="100%" style="width: 100%; table-layout: auto; border-collapse: collapse;">
+  <thead align="center" valign="bottom">
+    <tr>
+      <th style="min-width: 260px;">VLA</th>
+      <th style="min-width: 260px;">VLM</th>
+      <th style="min-width: 260px;">Decision</th>
+      <th style="min-width: 260px;">Hardware</th>
+    </tr>
+  </thead>
+  <tbody valign="top">
+    <tr>
+      <td>
+        <ul style="margin-left: 0; padding-left: 16px;">
+          <li>PI0.5 ✅</li>
+          <li>PI0-FAST ✅</li>
+          <li>GR00T-N1.7 ✅</li>
+          <li>WALL-OSS-0.5 ✅</li>
+          <li>Qwen-Drive ✅</li>
+          <li>SmolVLA ✅</li>
+        </ul>
+      </td>
+      <td>
+        <ul style="margin-left: 0; padding-left: 16px;">
+          <li>Qwen3.8-27B ✅</li>
+          <li>Qwen3-VL ✅</li>
+        </ul>
+      </td>
+      <td>
+        <ul style="margin-left: 0; padding-left: 16px;">
+          <li>Decision 3.0 mini ✅</li>
+        </ul>
+      </td>
+      <td>
+        <ul style="margin-left: 0; padding-left: 16px;">
+          <li>NVIDIA CUDA ✅
+          </li>
+          <li>AMD ROCm
+          </li>
+          <li>Apple Metal
+          </li>
+        </ul>
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Quick start
 
