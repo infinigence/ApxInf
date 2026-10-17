@@ -1,6 +1,6 @@
 # Native MLX backend
 
-This crate adapts the MLX **0.31.2** C++ API to owned Rust arrays and the ApxInf
+This crate adapts the MLX **0.32.3** C++ API to owned Rust arrays and the ApxInf
 public tensor/sampling boundary. Metal models use its native array API directly. It contains no Python interpreter or external model provider.
 The `native` feature requires Apple Silicon macOS; the default empty feature set
 does not discover or link an MLX SDK.
@@ -53,9 +53,10 @@ environment variable, even `MLX_DISABLE_COMPILE=0`, matching MLX's presence rule
 The bridge never changes the process-wide compile mode to force availability.
 Callback errors and panics become Rust errors, and C++ exceptions are contained
 inside the bridge. A model still owns transaction boundaries and invalidation.
-The pinned [public C++ compile overload](https://github.com/ml-explore/mlx/blob/v0.31.2/mlx/compile.cpp#L1131-L1157)
+The pinned [public C++ compile overload](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/compile.cpp#L1237-L1264)
 owns the captured callable through a shared pointer whose deleter erases its
-compiler-cache entry. Dropping a Rust `Compiled` uses that ownership path;
+entry from the compiler cache of the thread that created it. Dropping a Rust
+`Compiled` uses that ownership path;
 the bridge does not clear other functions' compiler caches.
 
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
@@ -85,6 +86,39 @@ or requested log-probability. It normalizes NaN/infinity according to the core
 contract, selects on device, and reads one token scalar. Other sampling options,
 normal generation and CUDA-style capture explicitly return unsupported.
 
+## Checkpoint arrays
+
+`load_safetensors` reads the tensors that a name filter keeps from one or more
+SafeTensors files (for example the list from
+`apxinf_loader::safetensors::safetensors_files`) into evaluated arrays. Other
+tensors are never read. MLX reads on its CPU device; there is no host staging
+copy.
+Native checkpoint loading requires the pinned MLX 0.32.3 runtime. Its CPU lazy
+reader propagates payload-read exceptions; 0.31.2 can report successful
+evaluation after a read fails. The native CPU regression truncates a fixture
+after header validation and requires a filename-labelled load error without
+publishing arrays or recording successful upload bytes.
+
+This covers MLX-format affine checkpoints, whose packed weights are U32 and
+have no core `DType`. Duplicate names across files, tensors without a bridge
+dtype and truncated files fail with the file and tensor name. Bytes read count
+as uploads. The model family still validates every key, shape, dtype and
+quantization parameter before use.
+
+## Device architecture
+
+A Metal `Stream` reads `MetalDeviceCaps` once from MLX's `gpu::device_info`:
+the device name and the `architecture` string that MLX's own Metal dispatch
+reads, for example `applegpu_g13s` on an M1 Pro and `applegpu_g16g` on an M4.
+`generation` and `device_class` are its two digits and final letter; any other
+string leaves them unset. MLX sizes command buffers and GEMM tiles by that
+letter, which is not a product tier: the M1 Pro reports `s`. `MLX_METAL_GPU_ARCH`
+overrides the string for MLX and therefore here; use it only in tests.
+`Stream::metal_caps()` returns `None` for a CPU stream. `MlxBackend::new` prints
+the device and architecture to stderr, as `CudaBackend::new` prints its device.
+The type holds hardware facts only; see the
+[kernel policy rules](../../doc/mlx-backend.md#device-architecture-and-kernel-policy).
+
 ## Custom kernels
 
 `MetalKernel` is the private-source building primitive. Its call is unsafe
@@ -92,3 +126,19 @@ because arbitrary source can perform out-of-bounds access. Public fusions belong
 in this crate with complete shape/dtype/index guards and provenance. A source
 kernel and compile success alone do not establish numerical or performance
 acceptance; model and hardware qualification remain separate.
+
+Kernel templates take dtype, integer and boolean arguments (`TemplateArg`).
+An integer template is a specialization fact: each distinct value builds and
+caches a separate Metal pipeline the first time it is used.
+
+The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
+`SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
+weights to FP16 for one call only; they keep no decoded weight resident.
+Their tests compare each kernel with MLX operators or a host reference on
+small shapes. They do not qualify the Clef model.
+
+`InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
+per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the
+`[B, L, H * D]` to `[B, H, L, D]` layout change in one kernel.
+`Array::random_key` and `Array::random_normal` expose the MLX threefry
+generator, so seeded noise matches `mx.random.normal(..., key=mx.random.key(seed))`.
