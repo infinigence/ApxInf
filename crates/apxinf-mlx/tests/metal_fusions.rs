@@ -126,7 +126,7 @@ fn q4_transpose_decode_matches_mlx_dequantize_in_both_arithmetics() -> Result<()
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
 fn padded_split_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
-    use apxinf_mlx::fusions::{padded_rows, PadRowsF16, SplitF16Gemm};
+    use apxinf_mlx::fusions::{padded_rows, F16GemmTile, PadRowsF16, SplitF16Gemm};
     let s = Stream::metal(0)?;
     let (tokens, k, half) = (70, 64, 64);
     let padded = padded_rows(tokens);
@@ -144,42 +144,161 @@ fn padded_split_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> 
         w.slice(&[0, 0], &[k, half])?.contiguous()?,
         w.slice(&[0, half], &[k, 2 * half])?.contiguous()?,
     );
-    let gemm = SplitF16Gemm::new(&s)?;
-    let low = gemm.low(&x, tokens, &w_lo)?;
-    let out = gemm.high(&w_hi, &low, &x, tokens)?;
-    assert_eq!(
-        (out.shape(), out.dtype()),
-        (&[1, tokens, 2 * half][..], D::BF16)
-    );
     let reference = h
         .cast(D::F32)?
         .matmul(&w.cast(D::F32)?)?
         .cast(D::BF16)?
         .to_f32_vec()?;
-    assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
-    let low_values = low.to_f32_vec()?;
-    let out_values = out.to_f32_vec()?;
-    for t in 0..tokens {
+    for tile in [F16GemmTile::Prefetch, F16GemmTile::Wm1Wn2] {
+        let gemm = SplitF16Gemm::with_tile(&s, tile)?;
+        let low = gemm.low(&x, tokens, &w_lo)?;
+        let out = gemm.high(&w_hi, &low, &x, tokens)?;
         assert_eq!(
-            &out_values[t * 2 * half..t * 2 * half + half],
-            &low_values[t * half..(t + 1) * half]
+            (out.shape(), out.dtype()),
+            (&[1, tokens, 2 * half][..], D::BF16)
         );
+        assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
+        let low_values = low.to_f32_vec()?;
+        let out_values = out.to_f32_vec()?;
+        for t in 0..tokens {
+            assert_eq!(
+                &out_values[t * 2 * half..t * 2 * half + half],
+                &low_values[t * half..(t + 1) * half],
+                "{tile:?}"
+            );
+        }
+        assert!(gemm.low(&x, 64, &w_lo).is_err());
+        assert!(gemm.low(&h, tokens, &w_lo).is_err());
+        assert!(gemm.high(&w_hi, &out, &x, tokens).is_err());
     }
-    assert!(gemm.low(&x, 64, &w_lo).is_err());
-    assert!(gemm.low(&h, tokens, &w_lo).is_err());
-    assert!(gemm.high(&w_hi, &out, &x, tokens).is_err());
     assert!(pad.call(&h.cast(D::F16)?).is_err());
     Ok(())
 }
 
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
-fn gated_delta_recurrence_matches_host_reference() -> Result<()> {
-    use apxinf_mlx::fusions::GatedDeltaRecurrence;
+fn one_pass_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
+    use apxinf_mlx::fusions::{F16Gemm, PadRowsF16};
     let s = Stream::metal(0)?;
-    let (len, hk, dk, hv, dv) = (5, 2, 32, 4, 16);
+    let (tokens, k, n) = (70, 64, 192);
+    let h = Array::from_f32(&s, &[1, tokens, k], &data(tokens * k, 13, 0.125))?.cast(D::BF16)?;
+    let x = PadRowsF16::new(&s)?.call(&h)?;
+    let w = Array::from_f32(&s, &[k, n], &data(k * n, 11, 0.03125))?.cast(D::F16)?;
+    let out = F16Gemm::new(&s)?.call(&x, tokens, &w)?;
+    assert_eq!((out.shape(), out.dtype()), (&[1, tokens, n][..], D::BF16));
+    let reference = h
+        .cast(D::F32)?
+        .matmul(&w.cast(D::F32)?)?
+        .cast(D::BF16)?
+        .to_f32_vec()?;
+    assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
+    assert!(F16Gemm::new(&s)?.call(&h, tokens, &w).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn q4_row_decode_matches_mlx_dequantize_with_f16_scales() -> Result<()> {
+    use apxinf_mlx::fusions::Q4RowDecodeF16;
+    let s = Stream::metal(0)?;
+    let (rows, k) = (96, 192);
+    let w = Array::from_f32(&s, &[rows, k], &data(rows * k, 29, 0.0625))?.cast(D::BF16)?;
+    let [qw, scales, biases] = w.quantize(64, 4)?;
+    let decode = Q4RowDecodeF16::new(&s)?;
+    let out = decode.call(&qw, &scales, &biases)?;
+    assert_eq!((out.shape(), out.dtype()), (&[rows, k][..], D::F16));
+    let expected = qw.dequantize(&scales.cast(D::F16)?, &biases.cast(D::F16)?, 64, 4)?;
+    assert_eq!(out.to_f32_vec()?, expected.to_f32_vec()?);
+    assert!(decode.call(&qw, &scales.cast(D::F16)?, &biases).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn gate_swiglu_matches_fp32_gate_rounded_then_f16_activation() -> Result<()> {
+    use apxinf_mlx::fusions::F16GateSwiglu;
+    let s = Stream::metal(0)?;
+    let (padded, k, n) = (128, 96, 64);
+    let x = Array::from_f32(&s, &[1, padded, k], &data(padded * k, 13, 0.0625))?.cast(D::F16)?;
+    let w = Array::from_f32(&s, &[n, k], &data(n * k, 11, 0.03125))?.cast(D::F16)?;
+    let up = Array::from_f32(&s, &[1, padded, n], &data(padded * n, 17, 0.125))?.cast(D::F16)?;
+    let out = F16GateSwiglu::new(&s)?.call(&x, &w, &up)?;
+    assert_eq!((out.shape(), out.dtype()), (&[1, padded, n][..], D::F16));
+    let gate = x
+        .cast(D::F32)?
+        .matmul(&w.cast(D::F32)?.transpose(&[1, 0])?)?
+        .cast(D::F16)?;
+    let reference = gate.mul(&gate.sigmoid()?)?.mul(&up)?.to_f32_vec()?;
+    assert_within(&out.to_f32_vec()?, &reference, 1. / 256., 1e-3);
+    assert!(F16GateSwiglu::new(&s)?
+        .call(&x.slice(&[0, 0, 0], &[1, 64, k])?.contiguous()?, &w, &up)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn causal_depthwise_conv_matches_mlx_conv_over_zero_history() -> Result<()> {
+    use apxinf_mlx::fusions::CausalDepthwiseConv;
+    let s = Stream::metal(0)?;
+    let (taps, channels) = (4, 96);
+    let conv = CausalDepthwiseConv::new(&s)?;
+    let weight = Array::from_f32(&s, &[channels, taps, 1], &data(channels * taps, 7, 0.25))?
+        .cast(D::BF16)?;
+    for length in [1, 3, 37] {
+        let x = Array::from_f32(
+            &s,
+            &[1, length, channels],
+            &data(length * channels, 19, 0.125),
+        )?
+        .cast(D::BF16)?;
+        let out = conv.call(&x, &weight)?;
+        assert_eq!(out.shape(), x.shape());
+        let history = Array::zeros(&s, &[1, taps - 1, channels], D::BF16)?;
+        let expected = Array::concat(&[&history, &x], 1)?.conv1d(&weight, 1, 0, 1, channels)?;
+        assert_within(&out.to_f32_vec()?, &expected.to_f32_vec()?, 1. / 128., 1e-3);
+    }
+    assert!(conv
+        .call(&Array::zeros(&s, &[1, 5, channels + 1], D::BF16)?, &weight)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn gated_delta_recurrence_matches_host_reference() -> Result<()> {
+    use apxinf_mlx::fusions::{GatedDeltaLayout, GatedDeltaRecurrence};
+    let s = Stream::metal(0)?;
+    for (layout, dv) in [
+        (GatedDeltaLayout::FourValues, 16),
+        (GatedDeltaLayout::EightLanes, 32),
+    ] {
+        recurrence_matches_host_reference(&s, layout, dv)?;
+    }
+    let bad = GatedDeltaRecurrence::with_layout(&s, GatedDeltaLayout::EightLanes)?;
+    let zeros = |shape: &[usize], dtype| Array::zeros(&s, shape, dtype);
+    assert!(bad
+        .call(
+            &zeros(&[1, 2, 2, 32], D::BF16)?,
+            &zeros(&[1, 2, 2, 32], D::BF16)?,
+            &zeros(&[1, 2, 4, 16], D::BF16)?,
+            &zeros(&[1, 2, 4], D::F32)?,
+            &zeros(&[1, 2, 4], D::BF16)?,
+            &zeros(&[1, 4, 16, 32], D::F32)?,
+        )
+        .is_err());
+    Ok(())
+}
+
+fn recurrence_matches_host_reference(
+    s: &Stream,
+    layout: apxinf_mlx::fusions::GatedDeltaLayout,
+    dv: usize,
+) -> Result<()> {
+    use apxinf_mlx::fusions::GatedDeltaRecurrence;
+    let (len, hk, dk, hv) = (5, 2, 32, 4);
     let bf16 = |shape: &[usize], values: Vec<f32>| -> Result<(Array, Vec<f32>)> {
-        let a = Array::from_f32(&s, shape, &values)?.cast(D::BF16)?;
+        let a = Array::from_f32(s, shape, &values)?.cast(D::BF16)?;
         let v = a.to_f32_vec()?;
         Ok((a, v))
     };
@@ -191,10 +310,11 @@ fn gated_delta_recurrence_matches_host_reference() -> Result<()> {
         data(len * hv, 7, 0.1).iter().map(|x| x + 0.5).collect(),
     )?;
     let gv: Vec<f32> = (0..len * hv).map(|i| 0.9 - 0.01 * (i % 5) as f32).collect();
-    let g = Array::from_f32(&s, &[1, len, hv], &gv)?;
+    let g = Array::from_f32(s, &[1, len, hv], &gv)?;
     let sv = data(hv * dv * dk, 31, 0.01);
-    let state = Array::from_f32(&s, &[1, hv, dv, dk], &sv)?;
-    let (y, next) = GatedDeltaRecurrence::new(&s)?.call(&q, &k, &v, &g, &beta, &state)?;
+    let state = Array::from_f32(s, &[1, hv, dv, dk], &sv)?;
+    let recurrence = GatedDeltaRecurrence::with_layout(s, layout)?;
+    let (y, next) = recurrence.call(&q, &k, &v, &g, &beta, &state)?;
 
     let mut st = sv.clone();
     let mut yr = vec![0f32; len * hv * dv];
@@ -212,16 +332,15 @@ fn gated_delta_recurrence_matches_host_reference() -> Result<()> {
             }
         }
     }
-    let rounded = Array::from_f32(&s, &[yr.len()], &yr)?
+    let rounded = Array::from_f32(s, &[yr.len()], &yr)?
         .cast(D::BF16)?
         .to_f32_vec()?;
     assert_within(&y.to_f32_vec()?, &rounded, 1. / 64., 1e-4);
     assert_within(&next.to_f32_vec()?, &st, 1e-4, 1e-5);
-    let bad = GatedDeltaRecurrence::new(&s)?;
-    assert!(bad
+    assert!(recurrence
         .call(&q, &k, &v, &g.cast(D::BF16)?, &beta, &state)
         .is_err());
-    assert!(bad
+    assert!(recurrence
         .call(
             &q,
             &k,
