@@ -60,6 +60,8 @@ int apx_mlx_array_info(const void* p,int32_t* dims,size_t capacity,size_t* rank,
 int apx_mlx_array_read(void* s,const void* p,uint8_t* bytes,size_t len){TRY
  auto a=mx::contiguous(*static_cast<const A*>(p),false,*static_cast<S*>(s));if(a.nbytes()!=len)throw std::invalid_argument("download byte length mismatch");mx::eval(a);mx::synchronize(*static_cast<S*>(s));if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
 int apx_mlx_eval(void* s,const void* const* p,size_t n){TRY mx::eval(arrays(p,n));mx::synchronize(*static_cast<S*>(s));CATCH}
+// Enqueues evaluation and returns; a later eval or read of the same arrays waits for it.
+int apx_mlx_async_eval(const void* const* p,size_t n){TRY mx::async_eval(arrays(p,n));CATCH}
 int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,const int32_t* ints,size_t nints,const float* floats,size_t nfloats,void** out){TRY
  auto s=*static_cast<S*>(stream);auto a=arrays(inputs,count);std::vector<int> iv(ints,ints+nints);
  auto i=[&](size_t n){if(n>=nints)throw std::invalid_argument("missing integer argument");return ints[n];};
