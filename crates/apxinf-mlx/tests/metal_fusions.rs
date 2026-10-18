@@ -193,6 +193,53 @@ fn one_pass_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
     Ok(())
 }
 
+/// The Metal 4 MPP projections (m4a012): the split pair equals the one-pass
+/// GEMM on each half bit for bit, and both match an FP32 reference.
+#[test]
+#[ignore = "requires shared Metal qualification lock and Metal 4 tensors"]
+fn mpp_f16_gemms_split_into_bitwise_halves_and_match_fp32_reference() -> Result<()> {
+    use apxinf_mlx::fusions::{MppF16Gemm, PadRowsF16, SplitMppF16Gemm};
+    let s = Stream::metal(0)?;
+    let (tokens, k, half) = (70, 128, 64);
+    let h = Array::from_f32(&s, &[1, tokens, k], &data(tokens * k, 13, 0.125))?.cast(D::BF16)?;
+    let x = PadRowsF16::new(&s)?.call(&h)?;
+    let w = Array::from_f32(&s, &[k, 2 * half], &data(k * 2 * half, 11, 0.03125))?.cast(D::F16)?;
+    let (w_lo, w_hi) = (
+        w.slice(&[0, 0], &[k, half])?.contiguous()?,
+        w.slice(&[0, half], &[k, 2 * half])?.contiguous()?,
+    );
+    let split = SplitMppF16Gemm::new(&s)?;
+    let low = split.low(&x, tokens, &w_lo)?;
+    let out = split.high(&w_hi, &low, &x, tokens)?;
+    assert_eq!(
+        (out.shape(), out.dtype()),
+        (&[1, tokens, 2 * half][..], D::BF16)
+    );
+    let reference = h
+        .cast(D::F32)?
+        .matmul(&w.cast(D::F32)?)?
+        .cast(D::BF16)?
+        .to_f32_vec()?;
+    assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
+    let one = MppF16Gemm::new(&s)?;
+    let (lo, hi) = (
+        one.call(&x, tokens, &w_lo)?.to_f32_vec()?,
+        one.call(&x, tokens, &w_hi)?.to_f32_vec()?,
+    );
+    let out_values = out.to_f32_vec()?;
+    for t in 0..tokens {
+        let row = &out_values[t * 2 * half..(t + 1) * 2 * half];
+        assert_eq!(&row[..half], &lo[t * half..(t + 1) * half]);
+        assert_eq!(&row[half..], &hi[t * half..(t + 1) * half]);
+    }
+    let narrow = Array::zeros(&s, &[1, 128, 80], D::F16)?;
+    assert!(one
+        .call(&narrow, tokens, &Array::zeros(&s, &[80, 64], D::F16)?)
+        .is_err());
+    assert!(split.high(&w_hi, &out, &x, tokens).is_err());
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
 fn q4_row_decode_matches_mlx_dequantize_with_f16_scales() -> Result<()> {

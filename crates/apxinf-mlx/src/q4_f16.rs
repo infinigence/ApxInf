@@ -341,7 +341,11 @@ impl SplitF16Gemm {
         })
     }
 
-    fn check(x: &Array, tokens: usize, weight: &Array) -> Result<(usize, usize, usize, usize)> {
+    pub(crate) fn check(
+        x: &Array,
+        tokens: usize,
+        weight: &Array,
+    ) -> Result<(usize, usize, usize, usize)> {
         let [1, padded, k] = *x.shape() else {
             return Err(Error::Contract("split GEMM input must be [1, P, K]"));
         };
