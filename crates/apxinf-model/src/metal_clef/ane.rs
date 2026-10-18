@@ -209,6 +209,26 @@ pub fn cache_dir() -> std::path::PathBuf {
         })
 }
 
+/// The little-endian bytes of FP16 values, without a copy (Apple Silicon only).
+fn f16_bytes(values: &[f16]) -> &[u8] {
+    // SAFETY: f16 is a plain 2-byte value without padding, so its storage is valid as bytes; the
+    // `coreml` feature targets little-endian aarch64 macOS only.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+/// FP16 values as writable little-endian bytes.
+fn f16_bytes_mut(values: &mut [f16]) -> &mut [u8] {
+    // SAFETY: as for `f16_bytes`; every byte pattern is a valid f16.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            values.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of_val(values),
+        )
+    }
+}
+
 /// One layer's loaded Neural Engine program.
 pub struct AneMlp {
     model: Model,
@@ -238,21 +258,20 @@ impl AneMlp {
             .reshape(&[tiles, TILE, channels])?
             .transpose(&[0, 2, 1])?
             .cast(MlxDType::F16)?;
-        let values: Vec<f16> = packed
-            .to_bytes()?
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]))
-            .collect();
-        Ok(values
-            .chunks_exact(channels * TILE)
-            .map(<[f16]>::to_vec)
+        let bytes = packed.to_bytes()?;
+        Ok(bytes
+            .chunks_exact(channels * TILE * 2)
+            .map(|tile| {
+                let mut values = vec![f16::ZERO; channels * TILE];
+                f16_bytes_mut(&mut values).copy_from_slice(tile);
+                values
+            })
             .collect())
     }
 
     /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`: rows
     /// times both scales in FP32.
     pub fn predict(&self, stream: &Stream, tiles: &[Vec<f16>], tokens: usize) -> Result<Array> {
-        let bytes = |v: &[f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let mut parts = Vec::with_capacity(tiles.len());
         for (i, tile) in tiles.iter().enumerate() {
             let rows = TILE.min(tokens - i * TILE);
@@ -265,11 +284,11 @@ impl AneMlp {
                 ],
             )?;
             let scale = |v: &[f16]| -> Result<Array> {
-                Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, &bytes(v))?
+                Array::from_bytes(stream, &[TILE, 1], MlxDType::F16, f16_bytes(v))?
                     .slice_axis(0, 0, rows)?
                     .cast(MlxDType::F32)
             };
-            let y = Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, &bytes(&out[0]))?
+            let y = Array::from_bytes(stream, &[HIDDEN, TILE], MlxDType::F16, f16_bytes(&out[0]))?
                 .transpose(&[1, 0])?
                 .slice_axis(0, 0, rows)?
                 .cast(MlxDType::F32)?;

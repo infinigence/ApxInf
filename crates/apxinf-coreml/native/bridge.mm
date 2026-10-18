@@ -3,6 +3,7 @@
 #include "bridge.h"
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -116,16 +117,27 @@ int apx_coreml_predict(void* handle, const char* const* input_names, const uint1
             }
             std::vector<int64_t> strides(rank);
             for (size_t d = 0; d < rank; ++d) strides[d] = array.strides[d].longLongValue;
+            // Rows of the innermost dimension are copied whole when it is unit-stride (the usual case,
+            // with or without padding between rows); other layouts are copied element by element.
+            const int64_t row = rank ? output_shapes[o][rank - 1] : 1;
+            const bool rows_contiguous = rank == 0 || strides[rank - 1] == 1;
+            // Dimensions advanced by the index counter: all but the innermost when whole rows are copied.
+            const size_t outer = rows_contiguous && rank ? rank - 1 : rank;
             __block int status = 0;
             [array getBytesWithHandler:^(const void* bytes, NSInteger size) {
                 const uint16_t* src = (const uint16_t*)bytes;
                 std::vector<int64_t> index(rank, 0);
-                for (size_t n = 0; n < count; ++n) {
+                const size_t step = rows_contiguous ? (size_t)row : 1;
+                for (size_t n = 0; n < count; n += step) {
                     int64_t at = 0;
                     for (size_t d = 0; d < rank; ++d) at += index[d] * strides[d];
-                    if (at < 0 || (at + 1) * 2 > size) { status = -1; return; }
-                    outputs[o][n] = src[at];
-                    for (size_t d = rank; d-- > 0;) {
+                    if (at < 0 || (at + (int64_t)step) * 2 > size) { status = -1; return; }
+                    if (rows_contiguous) {
+                        memcpy(outputs[o] + n, src + at, step * 2);
+                    } else {
+                        outputs[o][n] = src[at];
+                    }
+                    for (size_t d = outer; d-- > 0;) {
                         if (++index[d] < output_shapes[o][d]) break;
                         index[d] = 0;
                     }
