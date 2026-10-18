@@ -1,5 +1,7 @@
 //! Native MLX arrays and backend. Enable `native` with a pinned MLX_ROOT SDK.
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod ane_tiles;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
