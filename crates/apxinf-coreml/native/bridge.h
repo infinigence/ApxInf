@@ -15,6 +15,12 @@ int apx_coreml_predict(void* model, const char* const* input_names, const uint16
                        const int64_t* const* input_shapes, const size_t* input_ranks, size_t input_count,
                        const char* const* output_names, uint16_t* const* outputs, const int64_t* const* output_shapes,
                        const size_t* output_ranks, size_t output_count);
+/* One Core ML batch prediction (predictionsFromBatch) of `batch` items with the same names and shapes:
+   item b's inputs are inputs[b * input_count + i], its outputs outputs[b * output_count + o]. */
+int apx_coreml_predict_batch(void* model, size_t batch, const char* const* input_names, const uint16_t* const* inputs,
+                             const int64_t* const* input_shapes, const size_t* input_ranks, size_t input_count,
+                             const char* const* output_names, uint16_t* const* outputs,
+                             const int64_t* const* output_shapes, const size_t* output_ranks, size_t output_count);
 #ifdef __cplusplus
 }
 #endif
