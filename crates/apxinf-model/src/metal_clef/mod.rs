@@ -185,7 +185,7 @@ mod tests {
                 ..LoadOptions::default()
             },
             LoadOptions {
-                model_variant: Some("g20".into()),
+                model_variant: Some("fast".into()),
                 ..LoadOptions::default()
             },
             LoadOptions {
