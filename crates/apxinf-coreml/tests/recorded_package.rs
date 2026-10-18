@@ -1,5 +1,5 @@
 #![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
-//! Against a recorded coremltools 9.0 package of the Clef A04 MLP program:
+//! Against a recorded coremltools 9.0 package of a Clef int8 MLP program:
 //! the writer reproduces its program and weight file, and on this device the
 //! two compiled programs predict identical bits. The package is not
 //! committed (it holds checkpoint-derived weights); set
@@ -86,8 +86,9 @@ fn scalar(model: &proto::Model, name: &str) -> f16 {
     f16::from_le_bytes([b.values[0], b.values[1]])
 }
 
-/// A04's `_ane_mlp_program` build function.
-fn a04_program(model: &proto::Model, weights: &[u8]) -> Result<apxinf_coreml::Package> {
+/// The int8 MLP program: gate and up int8 convolutions, SiLU in tanh form,
+/// normalized SwiGLU factors and K-split int8 down convolutions.
+fn int8_mlp_program(model: &proto::Model, weights: &[u8]) -> Result<apxinf_coreml::Package> {
     let q = quantized(model, weights);
     let mut b = ProgramBuilder::new();
     let x = b.input("x", &[1, 4096, 1, 512]);
@@ -144,7 +145,7 @@ fn comparable(mut m: proto::Model) -> proto::Model {
 #[ignore = "requires a recorded coremltools package"]
 fn writer_reproduces_the_recorded_program_and_weights() -> Result<()> {
     let (_, model, weights) = reference();
-    let package = a04_program(&model, &weights)?;
+    let package = int8_mlp_program(&model, &weights)?;
     assert_eq!(comparable(package.model.clone()), comparable(model));
     assert!(package.weights == weights, "weight.bin differs");
     Ok(())
@@ -159,7 +160,7 @@ fn written_and_recorded_programs_predict_identical_bits() -> Result<()> {
     std::fs::create_dir_all(&scratch).unwrap();
     let mut cache = ProgramCache::new(scratch.join("cache"));
     let ours = cache.load(
-        &a04_program(&model, &weights)?,
+        &int8_mlp_program(&model, &weights)?,
         ComputeUnits::CpuAndNeuralEngine,
     )?;
     cache.seal();
