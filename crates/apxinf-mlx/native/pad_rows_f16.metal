@@ -1,4 +1,4 @@
-// Adapted from EngineTailor feat/clef-g20-engine 6edc065c (g20). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // Cast T rows of width D to FP16 and zero the padded rows.
 
     const uint i = thread_position_in_grid.x;
