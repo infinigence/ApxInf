@@ -32,6 +32,12 @@ pub struct ClefRunner {
 /// reference composition everywhere else.
 const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
+/// MLX architectures where the GPU composition with MLP columns on the Neural
+/// Engine passed its gates; `auto` prefers it there. None yet: its fidelity,
+/// quality, memory and paired latency gates on the M1 Pro are pending.
+#[cfg(feature = "coreml")]
+const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
+
 /// Device-independent option admission, checked before the checkpoint is read.
 /// Returns the requested composition; `None` is `auto`, which picks the
 /// composition qualified on the device.
@@ -39,17 +45,9 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     let requested = match options.model_variant.as_deref() {
         None | Some("auto") => None,
         Some("reference") => Some(Composition::Reference),
-        #[cfg(feature = "coreml")]
-        Some("a04") => Some(Composition::A04),
-        #[cfg(not(feature = "coreml"))]
-        Some("a04") => {
-            return Err(Error::Contract(
-                "Clef a04 needs the coreml feature (Core ML on the Neural Engine)",
-            ))
-        }
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto, reference and a04 variants",
+                "Clef MLX supports the auto and reference variants",
             ))
         }
     };
@@ -76,6 +74,10 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
 /// `auto` runs an optimized composition only on an architecture where it
 /// qualified.
 fn select(requested: Option<Composition>, architecture: &str) -> Composition {
+    #[cfg(feature = "coreml")]
+    if requested.is_none() && GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        return Composition::GpuAneColumns;
+    }
     requested.unwrap_or(if GPU_QUALIFIED_ARCHITECTURES.contains(&architecture) {
         Composition::Gpu
     } else {

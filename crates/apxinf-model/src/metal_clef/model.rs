@@ -44,10 +44,10 @@ pub enum Composition {
     /// causal convolution kernel and the eight-lane recurrence. Its GDN
     /// reduction order differs from MLX-VLM's.
     Gpu,
-    /// EngineTailor A04: Gpu with intermediate MLP columns `[6656, 12288)` on
+    /// The GPU composition with intermediate MLP columns `[6656, 12288)` on
     /// the Neural Engine as one INT8 Core ML program per layer.
     #[cfg(feature = "coreml")]
-    A04,
+    GpuAneColumns,
 }
 
 /// Kernels only the GPU composition uses.
@@ -163,7 +163,7 @@ pub struct Network {
     head: Head,
     kernels: Kernels,
     gpu: Option<GpuKernels>,
-    /// A04's per-layer Neural Engine programs, in layer order.
+    /// The column split's per-layer Neural Engine programs, in layer order.
     #[cfg(feature = "coreml")]
     ane: Vec<super::ane::AneMlp>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
@@ -247,10 +247,10 @@ impl Network {
             Composition::Reference => None,
             _ => Some(GpuKernels::new(&stream)?),
         };
-        // A04: build each layer's program from the full MLP, then keep only
-        // the GPU share's weights (EngineTailor `create_mlp`).
+        // Column split: build each layer's program from the full MLP, then
+        // keep only the GPU share's weights.
         #[cfg(feature = "coreml")]
-        let ane = if composition == Composition::A04 {
+        let ane = if composition == Composition::GpuAneColumns {
             let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
             let mut ane = Vec::with_capacity(backbone.layers.len());
             for layer in &mut backbone.layers {
@@ -332,10 +332,10 @@ impl Network {
         h.fast_rms_norm(&self.backbone.norm, EPS)
     }
 
-    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or Gpu's MLP. In
-    /// A04, `m` is the GPU share and layer `index`'s program adds the rest: the
-    /// tiles are read from the device, the GPU share is enqueued, and the
-    /// Neural Engine predicts while the GPU runs.
+    /// `Qwen3_5MLP`: `down(swiglu(gate(x), up(x)))` on Q4, or the GPU
+    /// composition's MLP. With the column split, `m` is the GPU share and layer
+    /// `index`'s program adds the rest: the tiles are read from the device, the
+    /// GPU share is enqueued, and the Neural Engine predicts while the GPU runs.
     #[cfg_attr(not(feature = "coreml"), allow(unused_variables))]
     fn mlp(&self, h: &Array, m: &Mlp, index: usize) -> Result<Array> {
         #[cfg(feature = "coreml")]

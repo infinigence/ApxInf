@@ -1,21 +1,20 @@
-//! The Neural Engine share of each Clef MLP in the EngineTailor GPU+ANE
-//! frontier A04 (campaign/clef-flash9b-m1pro fe66a747 `a04.py`, MIT; see
-//! NOTICE). Intermediate columns `[GPU_COLUMNS, 12288)` run as one Core ML
-//! program per layer; the GPU computes the rest with the C14 MLP, and the two
-//! shares are summed on the GPU.
+//! The Neural Engine share of each Clef MLP in the GPU+ANE column
+//! composition. Intermediate columns `[GPU_COLUMNS, 12288)` run as one Core ML
+//! program per layer; the GPU computes the rest with the GPU composition's MLP,
+//! and the two shares are summed on the GPU. Portions adapted from EngineTailor
+//! (MIT); see NOTICE.
 //!
-//! The program follows `_ane_mlp_program`: gate and up as per-row symmetric
-//! INT8 1x1 convolutions, SiLU as `0.5 v (1 + tanh(v / 2))`, gate and up
-//! normalized by their row maxima before the product, down as K-split INT8
-//! convolutions, 512-token tiles. Weights are quantized on the host from the
-//! Q4 checkpoint exactly as the Python helper does.
+//! The program: gate and up as per-row symmetric INT8 1x1 convolutions, SiLU
+//! as `0.5 v (1 + tanh(v / 2))`, gate and up normalized by their row maxima
+//! before the product, down as K-split INT8 convolutions, 512-token tiles.
+//! Weights are quantized on the host from the Q4 checkpoint.
 use super::weights::{Mlp, Q4};
 use apxinf_core::{Error, Result};
 use apxinf_coreml::{ComputeUnits, Model, Operand, Package, ProgramBuilder, ProgramCache};
 use apxinf_mlx::{Array, MlxDType, Stream};
 use half::f16;
 
-/// Hidden width and MLP width of the only geometry A04 was built for.
+/// Hidden width and MLP width of the only geometry this split was built for.
 const HIDDEN: usize = 4096;
 const INTERMEDIATE: usize = 12288;
 /// `12288 - round(12288 * 5632 / 12288 / 256) * 256`: the GPU keeps the first
@@ -76,7 +75,7 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     let n = INTERMEDIATE - GPU_COLUMNS;
     if mlp.gate.rows() != INTERMEDIATE || mlp.down.rows() != HIDDEN {
         return Err(Error::Contract(
-            "Clef A04 needs the 4096 x 12288 MLP geometry",
+            "Clef GPU+ANE needs the 4096 x 12288 MLP geometry",
         ));
     }
     let (qg, sg) = int8_per_row(
@@ -113,7 +112,7 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     );
     if factor_cap < 1.0 {
         return Err(Error::Contract(
-            "Clef A04 down weights need factor scales outside the FP16 range",
+            "Clef GPU+ANE down weights need factor scales outside the FP16 range",
         ));
     }
 
@@ -165,7 +164,7 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
 }
 
 /// The GPU share of `mlp`: gate and up rows and down columns `[0, GPU_COLUMNS)`,
-/// as contiguous Q4 copies (EngineTailor `_MLPView`).
+/// as contiguous Q4 copies.
 pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
     let rows = |q: &Q4| -> Result<Q4> {
         Ok(Q4 {
@@ -222,11 +221,11 @@ impl AneMlp {
         })
     }
 
-    /// `_to_channels_first_tiles`: BF16 `[1, T, 4096]` as FP16 channel-first
-    /// tiles `[1, 4096, 1, 512]`, zero-padded to whole tiles. Evaluates `h`.
+    /// BF16 `[1, T, 4096]` as FP16 channel-first tiles `[1, 4096, 1, 512]`,
+    /// zero-padded to whole tiles. Evaluates `h`.
     pub fn tiles(h: &Array) -> Result<Vec<Vec<f16>>> {
         let [1, tokens, channels] = *h.shape() else {
-            return Err(Error::Contract("Clef A04 tiles take [1, T, 4096]"));
+            return Err(Error::Contract("Clef GPU+ANE tiles take [1, T, 4096]"));
         };
         let tiles = tokens.div_ceil(TILE);
         let padded = if tiles * TILE > tokens {
@@ -250,8 +249,8 @@ impl AneMlp {
             .collect())
     }
 
-    /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`
-    /// (`_from_channels_first_gpu`): rows times both scales in FP32.
+    /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`: rows
+    /// times both scales in FP32.
     pub fn predict(&self, stream: &Stream, tiles: &[Vec<f16>], tokens: usize) -> Result<Array> {
         let bytes = |v: &[f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let mut parts = Vec::with_capacity(tiles.len());
@@ -303,13 +302,13 @@ mod tests {
         assert_eq!(&q[4..], &[0; 4]);
     }
 
-    /// A-K: every layer's program from the Q4 checkpoint matches a package
-    /// that the EngineTailor A04 engine compiled with coremltools 9.0: the
+    /// Every layer's program from the Q4 checkpoint matches a package that a
+    /// coremltools 9.0 reference build of the column split compiled: the
     /// same weight file bytes and the same decoded program (writer metadata
     /// and `buildInfo` excluded).
     #[test]
-    #[ignore = "requires the Clef checkpoint, recorded A04 packages and a Metal device"]
-    fn layer_programs_match_the_recorded_a04_packages() {
+    #[ignore = "requires the Clef checkpoint, recorded packages and a Metal device"]
+    fn column_programs_match_the_recorded_packages() {
         use sha2::{Digest, Sha256};
         use std::collections::HashMap;
         let var = |n: &str| std::env::var(n).unwrap_or_else(|_| panic!("set {n}"));
@@ -322,7 +321,7 @@ mod tests {
         let backbone =
             super::super::weights::Backbone::load(&config, &stream, &checkpoint).unwrap();
         let mut recorded = HashMap::new();
-        for entry in std::fs::read_dir(var("APXINF_A04_RECORDED")).unwrap() {
+        for entry in std::fs::read_dir(var("APXINF_CLEF_COLUMNS_RECORDED")).unwrap() {
             let dir = entry.unwrap().path().join("Data/com.apple.CoreML");
             if let Ok(weights) = std::fs::read(dir.join("weights/weight.bin")) {
                 recorded.insert(Sha256::digest(&weights).to_vec(), dir);
@@ -354,7 +353,7 @@ mod tests {
         assert_eq!(
             matched,
             backbone.layers.len(),
-            "layers matching a recorded A04 package"
+            "layers matching a recorded package"
         );
     }
 
