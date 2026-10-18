@@ -1,5 +1,5 @@
-// Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
-// One packed word (eight weights) per thread, [N, K] FP16 out, MLX affine_dequantize with FP16 scales (s22).
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
+// One packed word (eight weights) per thread, [N, K] FP16 out, MLX affine_dequantize with FP16 scales.
     const uint i = thread_position_in_grid.x;
     const uint packed = weight[i];
     const uint group = i / 8;

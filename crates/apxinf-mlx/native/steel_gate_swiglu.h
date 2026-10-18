@@ -1,6 +1,5 @@
 // MLX 0.32.3 Steel loader.h, mma.h and transforms.h as installed (MIT, Apple; notice below), followed by
-// the C14 A13 SwiGLU epilogue. Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14);
-// Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// a SwiGLU epilogue. Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 /*
 MIT License
 

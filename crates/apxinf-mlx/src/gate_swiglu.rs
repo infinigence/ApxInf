@@ -1,5 +1,5 @@
 //! FP16 gate GEMM with a SwiGLU epilogue, on MLX 0.32.3 Steel `BlockLoader`
-//! and `BlockMMA`. Adapted from EngineTailor C14 `a13` (MIT); the Steel
+//! and `BlockMMA`. Portions adapted from EngineTailor (MIT); the Steel
 //! headers are MLX's (MIT, Apple). See NOTICE.
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
