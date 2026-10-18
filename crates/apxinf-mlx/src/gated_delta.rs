@@ -1,6 +1,6 @@
 //! Gated delta-rule recurrence over a whole prompt, four value rows per SIMD
-//! group (EngineTailor g20) or eight (C14). Both adapt the MLX-VLM 0.7.4
-//! kernel (MIT); see NOTICE.
+//! group, or eight in the eight-lane layout. Portions adapted from EngineTailor
+//! (MIT); both layouts adapt the MLX-VLM 0.7.4 kernel (MIT); see NOTICE.
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 
