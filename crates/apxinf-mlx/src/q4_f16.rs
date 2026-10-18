@@ -1,5 +1,5 @@
 //! Per-call FP16 decode of affine Q4 weights and the FP16 GEMMs that consume it.
-//! Adapted from EngineTailor g20 and C14 (MIT); see NOTICE. The GEMM fragment
+//! Portions adapted from EngineTailor (MIT); see NOTICE. The GEMM fragment
 //! layout follows MLX Steel `mma.h` (MIT, Apple).
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
@@ -305,7 +305,7 @@ impl PadRowsF16 {
 ///
 /// Each 64 x 64 tile uses MLX's class-g FP16 layout (`bm64 bn64 bk16 wm1
 /// wn2`): two SIMD groups of 64 x 32 (64 threads) with Steel's unpipelined K
-/// loop (EngineTailor C14 `s28`).
+/// loop.
 pub struct SplitF16Gemm {
     low: MetalKernel,
     high: MetalKernel,
@@ -415,7 +415,7 @@ impl SplitF16Gemm {
 
 /// FP16 `[1, P, K] x [K, N]` GEMM with FP32 accumulation and BF16 output
 /// `[1, T, N]`, in one pass: four SIMD groups of 32 x 32 per 64 x 64 tile
-/// with Steel's unpipelined K loop (C14 `s13`). Rows at and after `T` are
+/// with Steel's unpipelined K loop. Rows at and after `T` are
 /// padding and are never stored.
 pub struct F16Gemm {
     kernel: MetalKernel,

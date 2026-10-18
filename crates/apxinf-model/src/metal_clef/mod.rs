@@ -1,5 +1,5 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
-//! the stock MLX-VLM composition or the EngineTailor C14 composition, and the
+//! the stock MLX-VLM composition or the optimized GPU composition, and the
 //! BF16 joint schema head. No Python model execution.
 #[cfg(feature = "coreml")]
 mod ane;
@@ -27,31 +27,27 @@ pub struct ClefRunner {
     network: Network,
 }
 
-/// MLX architectures where C14 passed its qualification and paired latency
-/// gate: the M1 Pro (2026-10-17, median 1.016 x the Python C14 engine over six
-/// blocks; quality on the 164-request at-risk subset). `auto` uses the
+/// MLX architectures where the optimized GPU composition passed its quality
+/// and paired latency gates: the M1 Pro (2026-10-17). `auto` uses the
 /// reference composition everywhere else.
-const C14_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
+const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
+
+/// MLX architectures where the GPU composition with MLP columns on the Neural
+/// Engine passed its gates; `auto` prefers it there. None yet: its fidelity,
+/// quality, memory and paired latency gates on the M1 Pro are pending.
+#[cfg(feature = "coreml")]
+const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
 
 /// Device-independent option admission, checked before the checkpoint is read.
-/// Returns the requested composition; `None` is `auto`.
+/// Returns the requested composition; `None` is `auto`, which picks the
+/// composition qualified on the device.
 fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     let requested = match options.model_variant.as_deref() {
         None | Some("auto") => None,
         Some("reference") => Some(Composition::Reference),
-        Some("c14") => Some(Composition::C14),
-        // Explicit until A04 passes its gates on a measured architecture.
-        #[cfg(feature = "coreml")]
-        Some("a04") => Some(Composition::A04),
-        #[cfg(not(feature = "coreml"))]
-        Some("a04") => {
-            return Err(Error::Contract(
-                "Clef a04 needs the coreml feature (Core ML on the Neural Engine)",
-            ))
-        }
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto, reference, c14 and a04 variants",
+                "Clef MLX supports the auto and reference variants",
             ))
         }
     };
@@ -75,10 +71,15 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     Ok(requested)
 }
 
-/// `auto` runs C14 only on a qualified architecture.
+/// `auto` runs an optimized composition only on an architecture where it
+/// qualified.
 fn select(requested: Option<Composition>, architecture: &str) -> Composition {
-    requested.unwrap_or(if C14_QUALIFIED_ARCHITECTURES.contains(&architecture) {
-        Composition::C14
+    #[cfg(feature = "coreml")]
+    if requested.is_none() && GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        return Composition::GpuAneColumns;
+    }
+    requested.unwrap_or(if GPU_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        Composition::Gpu
     } else {
         Composition::Reference
     })
@@ -121,7 +122,7 @@ pub fn load(
     let composition = select(requested, architecture);
     if requested.is_none() && composition == Composition::Reference {
         eprintln!(
-            "Clef: C14 is not qualified on {architecture:?}; using the reference composition"
+            "Clef: no optimized composition is qualified on {architecture:?}; using the reference composition"
         );
     }
     let backbone = weights::Backbone::load(&config, &stream, path)?;
@@ -209,13 +210,8 @@ mod tests {
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
         assert_eq!(admit(&LoadOptions::default()).unwrap(), None);
-        for (variant, composition) in [
-            ("auto", None),
-            ("reference", Some(Composition::Reference)),
-            ("c14", Some(Composition::C14)),
-            #[cfg(feature = "coreml")]
-            ("a04", Some(Composition::A04)),
-        ] {
+        for (variant, composition) in [("auto", None), ("reference", Some(Composition::Reference))]
+        {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
                 ..LoadOptions::default()
@@ -228,7 +224,7 @@ mod tests {
                 ..LoadOptions::default()
             },
             LoadOptions {
-                model_variant: Some("g20".into()),
+                model_variant: Some("fast".into()),
                 ..LoadOptions::default()
             },
             LoadOptions {
@@ -245,15 +241,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_runs_c14_only_on_qualified_architectures() {
-        assert_eq!(select(None, "applegpu_g13s"), Composition::C14);
+    fn auto_runs_the_gpu_composition_only_on_qualified_architectures() {
+        assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
         for other in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
             assert_eq!(select(None, other), Composition::Reference, "{other}");
         }
         for architecture in ["applegpu_g13s", "applegpu_g16g"] {
-            for explicit in [Composition::Reference, Composition::C14] {
-                assert_eq!(select(Some(explicit), architecture), explicit);
-            }
+            assert_eq!(
+                select(Some(Composition::Reference), architecture),
+                Composition::Reference
+            );
         }
     }
 }

@@ -1,5 +1,5 @@
-// Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
-// a13: Steel FP16 gate GEMM x W^T with the SwiGLU epilogue silu(gate) * up, FP16 out.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
+// Steel FP16 gate GEMM x W^T with the SwiGLU epilogue silu(gate) * up, FP16 out.
     using namespace mlx::steel;
     using loader_a_t = BlockLoader<half, 64, 32, 40, true, 128>;
     using loader_b_t = BlockLoader<half, 32, 32, 40, true, 128>;

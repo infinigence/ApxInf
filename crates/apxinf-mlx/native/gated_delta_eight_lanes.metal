@@ -1,5 +1,5 @@
-// Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
-// s12: eight value rows per SIMD group, each lane holding two rows of Dk / 8 keys; adapts the
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
+// Eight value rows per SIMD group, each lane holding two rows of Dk / 8 keys; adapts the
 // MLX-VLM 0.7.4 gated delta kernel (MIT, Prince Canuma).
             uint n = thread_position_in_grid.z;
             uint b = n / Hv, hv = n % Hv, hk = hv / (Hv / Hk);
