@@ -552,7 +552,8 @@ impl AneMlp {
                 "Clef m4a012 tiles must be [tiles, 4096, 128]",
             ));
         };
-        let bytes = packed.to_bytes()?;
+        // Wait for the tiles only: the GPU share queued after them keeps running.
+        let bytes = packed.to_bytes_ready()?;
         // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
         let (head, aligned, tail) = unsafe { bytes.align_to::<f16>() };
         let copied: Vec<f16>;

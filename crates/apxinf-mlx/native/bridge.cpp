@@ -59,6 +59,8 @@ int apx_mlx_array_info(const void* p,int32_t* dims,size_t capacity,size_t* rank,
  const auto& a=*static_cast<const A*>(p);*rank=a.ndim();*dt=dtype_code(a.dtype());if(capacity<a.ndim())throw std::invalid_argument("shape output too short");for(size_t i=0;i<a.ndim();++i)dims[i]=a.shape(i);CATCH}
 int apx_mlx_array_read(void* s,const void* p,uint8_t* bytes,size_t len){TRY
  auto a=mx::contiguous(*static_cast<const A*>(p),false,*static_cast<S*>(s));if(a.nbytes()!=len)throw std::invalid_argument("download byte length mismatch");mx::eval(a);mx::synchronize(*static_cast<S*>(s));if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
+int apx_mlx_array_read_ready(const void* p,uint8_t* bytes,size_t len){TRY
+ auto a=*static_cast<const A*>(p);mx::eval(a);if(!a.flags().row_contiguous||a.nbytes()!=len)throw std::invalid_argument("ready download needs a row-contiguous array of the requested length");if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
 int apx_mlx_eval(void* s,const void* const* p,size_t n){TRY mx::eval(arrays(p,n));mx::synchronize(*static_cast<S*>(s));CATCH}
 // Enqueues evaluation and returns; a later eval or read of the same arrays waits for it.
 int apx_mlx_async_eval(const void* const* p,size_t n){TRY mx::async_eval(arrays(p,n));CATCH}
