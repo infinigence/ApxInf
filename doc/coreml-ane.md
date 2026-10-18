@@ -10,20 +10,21 @@ the public Core ML framework to request ANE execution. A model can split one
 stage between MLX on the GPU and Core ML. Whether the Core ML share runs on
 the ANE requires the placement evidence defined below.
 
-The first candidate is Clef Flash on the M1 Pro. The EngineTailor GPU+ANE
-frontier A04 keeps the C14 GPU kernels and moves 5632 of each MLP's 12288
-intermediate columns to the ANE, as per-layer int8 programs. Owner evidence
-(M1 Pro, 2026-10-17, same session after a reboot):
+The first candidate is Clef Flash on the M1 Pro. A GPU+ANE composition keeps
+the optimized GPU kernels and moves 5632 of each MLP's 12288 intermediate
+columns to the ANE, as per-layer int8 programs. Owner evidence (M1 Pro,
+2026-10-17, same session after a reboot):
 
 | Implementation | 32-layer complete request, weighted |
 | --- | --- |
-| C14 (GPU only) | 3603 ms |
-| A04 (GPU + ANE) | 2790 ms (1.29x) |
+| GPU only | 3603 ms |
+| GPU + ANE | 2790 ms (1.29x) |
 
-A04 passed the owner's qualification with two recorded accepted decision
-changes. Its MLX peak memory is 8.68 GB, against 7.22 GB for C14.
+The GPU+ANE composition passed the owner's qualification with two recorded
+accepted decision changes. Its MLX peak memory is 8.68 GB, against 7.22 GB for
+the GPU-only composition.
 
-The EngineTailor implementation generates the ANE programs with Python
+The reference implementation generates the ANE programs with Python
 coremltools. ApxInf does not execute Python, so a port needs its own program
 writer.
 
@@ -34,7 +35,7 @@ writer.
   is inert, as the `mlx` feature is.
 - No silent acceptance of an unqualified path. Compilation or loading errors
   fail preparation. Successful loading alone does not qualify ANE execution.
-  An explicitly requested A04 path must fail preparation or request admission
+  An explicitly requested GPU+ANE path must fail preparation or request admission
   when its placement evidence or approved host-handoff exception is missing.
 - No application compilation during a request. Native framework readiness
   also needs warm execution evidence, not merely a sealed wrapper.
@@ -78,7 +79,7 @@ script code generation or new dependency is needed.
 
 Operations: `const`, `constexpr_blockwise_shift_scale`, `conv`, `mul`, `add`,
 `tanh`, `real_div`, `maximum`, `abs`, `reduce_max`, `split` and `identity`.
-These are the operations in A04's programs. The builder rejects any other
+These are the operations in the GPU+ANE composition's programs. The builder rejects any other
 operation. A new operation is added with its own test.
 
 The weight file uses MILBlob storage version 2:
@@ -111,7 +112,7 @@ committed, because they contain checkpoint-derived weights.
   entry in a temporary directory and renames it into place, so concurrent
   loads never read a partial entry.
 - **Load.** The model is loaded with the compute units the family requests
-  (A04 uses `MLComputeUnitsCPUAndNeuralEngine`). After loading, the runtime is
+  (the GPU+ANE composition uses `MLComputeUnitsCPUAndNeuralEngine`). After loading, the runtime is
   sealed: a later application compile request is an error. Loaded and sealed
   does not mean placement-qualified or ready for requests.
 - **Predict.** Inputs and outputs are FP16 host buffers. Output multi-arrays
@@ -134,9 +135,9 @@ The family must define a placement ledger for every admitted fixed profile:
 
 | Stage | Required placement and CPU allowance |
 | --- | --- |
-| C14 share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
-| A04 Core ML share | The declared 5632-column MLP share in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
-| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and A04 per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. This is a proposed exception, not permission for arbitrary CPU operators. |
+| GPU share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
+| Core ML share | The declared 5632-column MLP share in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
+| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. This is a proposed exception, not permission for arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
 The ledger must map source operations to the compiled structure, including
@@ -178,8 +179,8 @@ remain unqualified. Qualification records must state the trace coverage and
 its limits.
 
 Until the evidence and maintainer decision below exist, report the path as
-unqualified with the blocking reason. An explicit A04 request must fail, not
-silently select CPU-only Core ML or C14. C14 remains a separate, explicit
+unqualified with the blocking reason. An explicit GPU+ANE request must fail, not
+silently select CPU-only Core ML or the GPU-only composition, which remains a separate
 selection. Recheck the plan during preparation and invalidate qualification
 when any bound identity, profile or configuration changes, or when contrary
 placement evidence appears. These are proposed acceptance rules, not an
@@ -190,11 +191,11 @@ implemented status API or a claim that loading enforces placement.
 The canonical [accelerator port acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
 excludes external execution plans and requires intermediate GPU residency.
 The [MLX prepared execution contract](mlx-backend.md#prepared-compiled-execution)
-also requires device-resident handoff. A04's native Core ML programs and host
+also requires device-resident handoff. The GPU+ANE composition's native Core ML programs and host
 tile exchange do not satisfy those rules as written.
 
 This document requests a maintainer decision for only the fixed-profile
-`metal_clef` A04 composition described here. The proposed exception would
+`metal_clef` GPU+ANE composition described here. The proposed exception would
 permit the native Core ML stage and the bounded host work in the placement
 ledger. It does not permit arbitrary external engines, CPU model execution
 or unbounded intermediate transfers. GPU-only and CUDA requirements remain
@@ -218,7 +219,7 @@ the gate; a compile/load/seal/predict smoke test is not sufficient.
 | I/O and transfers | Every public input/output and exchanged tile: shape, dtype, strides, byte extent, source/destination, direction, frequency and numerical conversion. Declare maximum copies, bytes, synchronizations, queue depth and live host/device memory per layer and complete request, then compare observations to those limits. Include packing, quantization and padding. Unified memory does not make these handoffs free; distinguish logical transfers from measured physical traffic and mark opaque framework copies as unknown. |
 | Ownership and lifetimes | Name the owner of every host buffer, `MLMultiArray`, MLX array, loaded program and worker task, with preparation/request/layer lifetime and reuse point. Retain immutable inputs through prediction completion. Read GPU-produced input only after producer completion; release or reuse output storage only after its consumer completes. Validate dtype, dimensions, strides and accessible byte bounds before access. Keep MLX objects on their owning thread. Test alias rejection, retained outputs, changed inputs, cancellation, errors and teardown while work is in flight. |
 | Warm readiness | Prepare all admitted shapes and programs, then exercise repeated complete requests and layer switches. Record cold compilation separately, application compile-call counts, observable framework compilation/load events, resident-program churn, allocator peaks and retained memory. Require the declared warm bounds with no observed hot compilation or repeated load churn. A sealed wrapper proves only that it rejects application compile calls; insufficient native visibility blocks the stronger readiness claim. |
-| Complete request | Use the maintained public path from real input through final output, including all layers, boundary CPU work, transfers, overlap waits and state updates. Check the writer equivalence target, declared intermediate/final numerical tolerances, changed inputs, reset, invalidation and failures. Record any accepted decision changes with maintainer approval. Pair A04 and C14 timings on the same source/environment and workload, with raw samples and actual output completion at the timing boundary. Predeclare any performance release threshold. |
+| Complete request | Use the maintained public path from real input through final output, including all layers, boundary CPU work, transfers, overlap waits and state updates. Check the writer equivalence target, declared intermediate/final numerical tolerances, changed inputs, reset, invalidation and failures. Record any accepted decision changes with maintainer approval. Pair GPU+ANE and GPU-only timings on the same source/environment and workload, with raw samples and actual output completion at the timing boundary. Predeclare any performance release threshold. |
 
 The initial host-buffer design must not claim zero-copy transfer or direct
 GPU/ANE storage sharing. For caller-backed `MLMultiArray` storage, the wrapper
@@ -237,7 +238,7 @@ bit-equal to the GPU and can differ between ANE generations.
 - Families may use `MetalDeviceCaps` architecture to select a candidate, but
   it is not ANE placement evidence. Admission also requires the bound placement
   and complete-request qualification above, with paired timing.
-- Host-side quantization (A04: per-row symmetric int8 with FP16 scales,
+- Host-side quantization (here: per-row symmetric int8 with FP16 scales,
   round-half-even) reproduces the reference exactly. Tests check it against
   recorded digests.
 - A fixed program, weights and input on the same device must give
@@ -251,7 +252,7 @@ bit-equal to the GPU and can differ between ANE generations.
    with one device smoke test (compile, load, seal, predict). This establishes
    neither ANE placement nor heterogeneous-port acceptance.
 3. `apxinf-mlx`: asynchronous evaluation.
-4. `metal_clef` `a04` composition. It depends on the C14 port, the approved
+4. `metal_clef` GPU+ANE composition. It depends on the GPU composition, the approved
    exception and all qualification gates above. `applegpu_g13s` is only the
    initial candidate dispatch identity, not sufficient evidence to enable it.
 
@@ -260,10 +261,10 @@ bit-equal to the GPU and can differ between ANE generations.
 - Is the narrowly scoped Core ML and bounded host-handoff exception acceptable,
   with measured placement rather than an unenforceable ANE-only promise?
 - Is the crate name `apxinf-coreml` and the feature name `coreml` acceptable?
-- Where should the cache live by default? A04 compiles 32 programs; the first
+- Where should the cache live by default? The composition compiles 32 programs; the first
   load takes seconds per layer.
 - Should first-load compilation be an explicit preparation step rather than
   part of loading?
 - CI builds the crate on Linux, where it is inert. Who owns the versioned
   macOS placement and complete-request qualification evidence until a macOS
-  runner exists? A manual smoke test alone cannot qualify A04.
+  runner exists? A manual smoke test alone cannot qualify it.
