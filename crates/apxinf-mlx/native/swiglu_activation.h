@@ -1,5 +1,4 @@
-// Adapted from the EngineTailor Qwen3-TTS predictor MLP frontier 944fd18d.
-// Copyright (c) 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // BF16 gate/up rounding, FP32 SiLU with precise exp, BF16 product.
     struct QwenTTSActivateMultiply {
       bfloat16_t operator()(float gate_acc, float up_acc) thread {
