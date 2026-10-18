@@ -145,8 +145,8 @@ generator, so seeded noise matches `mx.random.normal(..., key=mx.random.key(seed
 
 `SwigluMlpGemv` runs a BF16 SwiGLU MLP for one or two rows at width 1024
 and inner width 3072 (the Qwen3-TTS code predictor MLP): row4-packed weights
-for one row, a fused gate/up kernel for two. Its reduction order differs from MLX matmul, so its test compares within a
-tolerance of the composed operators.
+for one row, a fused gate/up kernel for two. Its reduction order differs from
+MLX matmul, so its test compares within a tolerance of the composed operators.
 
 Sampling families use `Array::random_split` and `Array::categorical`. MLX's
 global key sequence (`mx.random.seed`, then key-less random calls) splits the
