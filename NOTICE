@@ -16,9 +16,8 @@ MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
-The Clef g20 per-call FP16 Q4 decode, row padding, split FP16 GEMM and
-four-value gated delta recurrence kernels derive from EngineTailor
-feat/clef-g20-engine 6edc065c6ffd12bc347e5d06d77b5a000eb87e9d.
+The Clef Q4 decode, row padding, FP16 GEMM and gated delta recurrence kernels
+are adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 
 The MetalPerformancePrimitives BF16 GEMM kernel derives from the EngineTailor
 Qwen-Image Q4 GEMM campaign frontier, candidate SHA-256
