@@ -1,5 +1,4 @@
-// Adapted from the EngineTailor Qwen-Image Q4 GEMM frontier 427d48fc.
-// Copyright (c) 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 64;

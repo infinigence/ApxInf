@@ -121,8 +121,7 @@ pub fn load(
 }
 
 /// MLX architectures where MPP image projections were measured faster than
-/// quantized matmul: the M4 (EngineTailor GEMM frontier 427d48fc and paired
-/// whole-image timing). Other architectures keep quantized matmul until
+/// quantized matmul: the M4 (paired whole-image timing). Other architectures keep quantized matmul until
 /// measured there; the selection is structural, so it stays in this family.
 const MPP_MEASURED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
 
