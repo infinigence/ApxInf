@@ -31,6 +31,67 @@ NSArray<NSNumber*>* contiguous_strides(const int64_t* shape, size_t rank) {
     for (size_t i = 0; i < rank; ++i) [out addObject:@(strides[i])];
     return out;
 }
+
+// Wraps the caller's FP16 buffers; the arrays borrow them for the duration of one bridge call only.
+MLDictionaryFeatureProvider* features_of(const char* const* names, const uint16_t* const* inputs,
+                                         const int64_t* const* shapes, const size_t* ranks, size_t count) {
+    NSMutableDictionary<NSString*, MLFeatureValue*>* features = [NSMutableDictionary dictionary];
+    for (size_t i = 0; i < count; ++i) {
+        NSError* error = nil;
+        MLMultiArray* array = [[MLMultiArray alloc]
+            initWithDataPointer:(void*)inputs[i]
+                          shape:shape_of(shapes[i], ranks[i])
+                       dataType:MLMultiArrayDataTypeFloat16
+                        strides:contiguous_strides(shapes[i], ranks[i])
+                    deallocator:nil
+                          error:&error];
+        if (!array) {
+            fail(error, "cannot wrap a Core ML input");
+            return nil;
+        }
+        features[@(names[i])] = [MLFeatureValue featureValueWithMultiArray:array];
+    }
+    NSError* error = nil;
+    MLDictionaryFeatureProvider* provider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:features error:&error];
+    if (!provider) fail(error, "cannot build Core ML inputs");
+    return provider;
+}
+
+// Copies each named FP16 output into a contiguous buffer, honouring the strides Core ML reports.
+int copy_outputs(id<MLFeatureProvider> result, const char* const* output_names, uint16_t* const* outputs,
+                 const int64_t* const* output_shapes, const size_t* output_ranks, size_t output_count) {
+    for (size_t o = 0; o < output_count; ++o) {
+        MLMultiArray* array = [result featureValueForName:@(output_names[o])].multiArrayValue;
+        if (!array || array.dataType != MLMultiArrayDataTypeFloat16 || array.shape.count != output_ranks[o])
+            return fail(std::string("Core ML output is not the expected FP16 array: ") + output_names[o]);
+        const size_t rank = output_ranks[o];
+        size_t count = 1;
+        for (size_t d = 0; d < rank; ++d) {
+            if (array.shape[d].longLongValue != output_shapes[o][d])
+                return fail(std::string("Core ML output shape differs: ") + output_names[o]);
+            count *= (size_t)output_shapes[o][d];
+        }
+        std::vector<int64_t> strides(rank);
+        for (size_t d = 0; d < rank; ++d) strides[d] = array.strides[d].longLongValue;
+        __block int status = 0;
+        [array getBytesWithHandler:^(const void* bytes, NSInteger size) {
+            const uint16_t* src = (const uint16_t*)bytes;
+            std::vector<int64_t> index(rank, 0);
+            for (size_t n = 0; n < count; ++n) {
+                int64_t at = 0;
+                for (size_t d = 0; d < rank; ++d) at += index[d] * strides[d];
+                if (at < 0 || (at + 1) * 2 > size) { status = -1; return; }
+                outputs[o][n] = src[at];
+                for (size_t d = rank; d-- > 0;) {
+                    if (++index[d] < output_shapes[o][d]) break;
+                    index[d] = 0;
+                }
+            }
+        }];
+        if (status) return fail(std::string("Core ML output strides exceed its buffer: ") + output_names[o]);
+    }
+    return 0;
+}
 }  // namespace
 
 extern "C" {
@@ -84,54 +145,37 @@ int apx_coreml_predict(void* handle, const char* const* input_names, const uint1
                        const size_t* output_ranks, size_t output_count) {
     @autoreleasepool {
         MLModel* model = (__bridge MLModel*)handle;
-        NSMutableDictionary<NSString*, MLFeatureValue*>* features = [NSMutableDictionary dictionary];
-        for (size_t i = 0; i < input_count; ++i) {
-            NSError* error = nil;
-            // The array borrows the caller's buffer for the duration of this call only.
-            MLMultiArray* array = [[MLMultiArray alloc]
-                initWithDataPointer:(void*)inputs[i]
-                              shape:shape_of(input_shapes[i], input_ranks[i])
-                           dataType:MLMultiArrayDataTypeFloat16
-                            strides:contiguous_strides(input_shapes[i], input_ranks[i])
-                        deallocator:nil
-                              error:&error];
-            if (!array) return fail(error, "cannot wrap a Core ML input");
-            features[@(input_names[i])] = [MLFeatureValue featureValueWithMultiArray:array];
-        }
+        MLDictionaryFeatureProvider* provider = features_of(input_names, inputs, input_shapes, input_ranks, input_count);
+        if (!provider) return -1;
         NSError* error = nil;
-        MLDictionaryFeatureProvider* provider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:features error:&error];
-        if (!provider) return fail(error, "cannot build Core ML inputs");
         id<MLFeatureProvider> result = [model predictionFromFeatures:provider error:&error];
         if (!result) return fail(error, "Core ML prediction failed");
-        for (size_t o = 0; o < output_count; ++o) {
-            MLMultiArray* array = [result featureValueForName:@(output_names[o])].multiArrayValue;
-            if (!array || array.dataType != MLMultiArrayDataTypeFloat16 || array.shape.count != output_ranks[o])
-                return fail(std::string("Core ML output is not the expected FP16 array: ") + output_names[o]);
-            const size_t rank = output_ranks[o];
-            size_t count = 1;
-            for (size_t d = 0; d < rank; ++d) {
-                if (array.shape[d].longLongValue != output_shapes[o][d])
-                    return fail(std::string("Core ML output shape differs: ") + output_names[o]);
-                count *= (size_t)output_shapes[o][d];
-            }
-            std::vector<int64_t> strides(rank);
-            for (size_t d = 0; d < rank; ++d) strides[d] = array.strides[d].longLongValue;
-            __block int status = 0;
-            [array getBytesWithHandler:^(const void* bytes, NSInteger size) {
-                const uint16_t* src = (const uint16_t*)bytes;
-                std::vector<int64_t> index(rank, 0);
-                for (size_t n = 0; n < count; ++n) {
-                    int64_t at = 0;
-                    for (size_t d = 0; d < rank; ++d) at += index[d] * strides[d];
-                    if (at < 0 || (at + 1) * 2 > size) { status = -1; return; }
-                    outputs[o][n] = src[at];
-                    for (size_t d = rank; d-- > 0;) {
-                        if (++index[d] < output_shapes[o][d]) break;
-                        index[d] = 0;
-                    }
-                }
-            }];
-            if (status) return fail(std::string("Core ML output strides exceed its buffer: ") + output_names[o]);
+        return copy_outputs(result, output_names, outputs, output_shapes, output_ranks, output_count);
+    }
+}
+
+int apx_coreml_predict_batch(void* handle, size_t batch, const char* const* input_names, const uint16_t* const* inputs,
+                             const int64_t* const* input_shapes, const size_t* input_ranks, size_t input_count,
+                             const char* const* output_names, uint16_t* const* outputs,
+                             const int64_t* const* output_shapes, const size_t* output_ranks, size_t output_count) {
+    @autoreleasepool {
+        MLModel* model = (__bridge MLModel*)handle;
+        NSMutableArray<id<MLFeatureProvider>>* items = [NSMutableArray arrayWithCapacity:batch];
+        for (size_t b = 0; b < batch; ++b) {
+            MLDictionaryFeatureProvider* provider =
+                features_of(input_names, inputs + b * input_count, input_shapes, input_ranks, input_count);
+            if (!provider) return -1;
+            [items addObject:provider];
+        }
+        NSError* error = nil;
+        id<MLBatchProvider> results =
+            [model predictionsFromBatch:[[MLArrayBatchProvider alloc] initWithFeatureProviderArray:items] error:&error];
+        if (!results) return fail(error, "Core ML batch prediction failed");
+        if ((size_t)results.count != batch) return fail("Core ML batch prediction returned another item count");
+        for (size_t b = 0; b < batch; ++b) {
+            int status = copy_outputs([results featuresAtIndex:(NSInteger)b], output_names, outputs + b * output_count,
+                                      output_shapes, output_ranks, output_count);
+            if (status) return status;
         }
         return 0;
     }

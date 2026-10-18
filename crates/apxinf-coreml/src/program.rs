@@ -6,7 +6,7 @@ use crate::blob::{BlobDataType, BlobWriter};
 use crate::proto::{self, binding, data_type, tensor_value, value};
 use apxinf_core::{Error, Result};
 use half::f16;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const OPSET: &str = "CoreML8";
@@ -42,6 +42,8 @@ pub struct ProgramBuilder {
     operations: Vec<proto::Operation>,
     blobs: BlobWriter,
     counts: BTreeMap<&'static str, usize>,
+    /// Names taken out of counter order (a fused operation's); counters skip them.
+    reserved: BTreeSet<String>,
 }
 
 fn tensor_type(dtype: i32, shape: &[usize]) -> proto::ValueType {
@@ -138,11 +140,14 @@ impl ProgramBuilder {
     fn op_name(&mut self, kind: &'static str, name: Option<&str>) -> String {
         match name {
             Some(name) => name.to_owned(),
-            None => {
+            None => loop {
                 let count = self.counts.entry(kind).or_default();
                 *count += 1;
-                format!("{kind}_{}", *count - 1)
-            }
+                let name = format!("{kind}_{}", *count - 1);
+                if !self.reserved.contains(&name) {
+                    break name;
+                }
+            },
         }
     }
 
@@ -279,16 +284,30 @@ impl ProgramBuilder {
         Ok(out)
     }
 
-    /// 2-D convolution, stride 1, `valid` padding, dilation 1, one group.
-    pub fn conv(&mut self, x: &Var, weight: &Var) -> Result<Var> {
-        let (&[n, cin, h, w], &[cout, wcin, kh, kw]) = (&x.shape[..], &weight.shape[..]) else {
+    /// A `const` FP16 tensor stored in the weight file, named `{op}_{param}_0`.
+    fn fp16_blob(&mut self, op: &str, param: &str, values: &[f16], shape: &[usize]) -> Result<Var> {
+        if values.len() != shape.iter().product::<usize>() {
+            return Err(contract("FP16 constant values must match their shape"));
+        }
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let value = self.blob_value(data_type::FLOAT16, shape, BlobDataType::Float16, &bytes);
+        Ok(self.constant(op, param, value, data_type::FLOAT16, shape))
+    }
+
+    /// The output shape of a conv of `x` with a `weight_shape` kernel.
+    fn conv_shape(x: &Var, weight_shape: &[usize]) -> Result<Vec<usize>> {
+        let (&[n, cin, h, w], &[cout, wcin, kh, kw]) = (&x.shape[..], weight_shape) else {
             return Err(contract("conv needs rank-4 input and weight"));
         };
         if cin != wcin || kh > h || kw > w {
             return Err(contract("conv weight does not fit the input"));
         }
-        let name = self.op_name("conv", None);
-        let strides = self.ints(&name, "strides", &[1, 1], false);
+        Ok(vec![n, cout, h - kh + 1, w - kw + 1])
+    }
+
+    /// The stride, padding, dilation and group constants of conv `conv`.
+    fn conv_params(&mut self, conv: &str) -> [(&'static str, Var); 5] {
+        let strides = self.ints(conv, "strides", &[1, 1], false);
         let pad_type = immediate(
             data_type::STRING,
             &[],
@@ -296,29 +315,93 @@ impl ProgramBuilder {
                 values: vec!["valid".to_owned()],
             }),
         );
-        let pad_type = self.constant(&name, "pad_type", pad_type, data_type::STRING, &[]);
-        let pad = self.ints(&name, "pad", &[0, 0, 0, 0], false);
-        let dilations = self.ints(&name, "dilations", &[1, 1], false);
-        let groups = self.ints(&name, "groups", &[1], true);
-        let out = Var {
-            name: name.clone(),
-            dtype: data_type::FLOAT16,
-            shape: vec![n, cout, h - kh + 1, w - kw + 1],
-        };
-        let inputs = [
-            ("x", x),
-            ("weight", weight),
-            ("strides", &strides),
-            ("pad_type", &pad_type),
-            ("pad", &pad),
-            ("dilations", &dilations),
-            ("groups", &groups),
+        let pad_type = self.constant(conv, "pad_type", pad_type, data_type::STRING, &[]);
+        let pad = self.ints(conv, "pad", &[0, 0, 0, 0], false);
+        let dilations = self.ints(conv, "dilations", &[1, 1], false);
+        let groups = self.ints(conv, "groups", &[1], true);
+        [
+            ("strides", strides),
+            ("pad_type", pad_type),
+            ("pad", pad),
+            ("dilations", dilations),
+            ("groups", groups),
         ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), by_name(v)))
-        .collect();
-        self.push("conv", &name, inputs, std::slice::from_ref(&out));
-        Ok(out)
+    }
+
+    fn conv_op(
+        &mut self,
+        name: &str,
+        shape: Vec<usize>,
+        tensors: &[(&str, &Var)],
+        params: &[(&'static str, Var)],
+    ) -> Var {
+        let out = Var {
+            name: name.to_owned(),
+            dtype: data_type::FLOAT16,
+            shape,
+        };
+        let inputs = tensors
+            .iter()
+            .map(|&(k, v)| (k, v))
+            .chain(params.iter().map(|(k, v)| (*k, v)))
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("conv", name, inputs, std::slice::from_ref(&out));
+        out
+    }
+
+    /// 2-D convolution, stride 1, `valid` padding, dilation 1, one group.
+    pub fn conv(&mut self, x: &Var, weight: &Var) -> Result<Var> {
+        let shape = Self::conv_shape(x, &weight.shape)?;
+        let name = self.op_name("conv", None);
+        let params = self.conv_params(&name);
+        Ok(self.conv_op(&name, shape, &[("x", x), ("weight", weight)], &params))
+    }
+
+    /// [`conv`](Self::conv) with FP16 weights in the weight file, as
+    /// coremltools stores a NumPy FP16 weight: `{conv}_weight_0` comes first.
+    pub fn conv_fp16(&mut self, x: &Var, weight: &[f16], weight_shape: &[usize]) -> Result<Var> {
+        let shape = Self::conv_shape(x, weight_shape)?;
+        let name = self.op_name("conv", None);
+        let w = self.fp16_blob(&name, "weight", weight, weight_shape)?;
+        let params = self.conv_params(&name);
+        Ok(self.conv_op(&name, shape, &[("x", x), ("weight", &w)], &params))
+    }
+
+    /// `mul(conv_fp16(x, weight), scale)` after coremltools 9.0's
+    /// `fuse_conv_scale` pass: one conv named `name` (the absorbed `mul`'s
+    /// name, reserved so counters skip it) with weight `weight * scale` and a
+    /// zero bias, both FP16. The conv's parameter constants keep the conv
+    /// counter's name.
+    pub fn conv_fp16_scaled(
+        &mut self,
+        x: &Var,
+        weight: &[f16],
+        weight_shape: &[usize],
+        scale: f16,
+        name: &str,
+    ) -> Result<Var> {
+        let shape = Self::conv_shape(x, weight_shape)?;
+        self.reserved.insert(name.to_owned());
+        let conv = self.op_name("conv", None);
+        let params = self.conv_params(&conv);
+        let scaled: Vec<f16> = weight
+            .iter()
+            .map(|w| f16::from_f32(w.to_f32() * scale.to_f32()))
+            .collect();
+        let w = self.fp16_blob(name, "weight", &scaled, weight_shape)?;
+        let b = self.fp16_blob(
+            name,
+            "bias",
+            &vec![f16::ZERO; weight_shape[0]],
+            &weight_shape[..1],
+        )?;
+        Ok(self.conv_op(
+            name,
+            shape,
+            &[("x", x), ("weight", &w), ("bias", &b)],
+            &params,
+        ))
     }
 
     fn binary(
@@ -632,6 +715,71 @@ mod tests {
         let package = b.finish(&[&y]).unwrap();
         let decoded: proto::Model = prost::Message::decode(&package.model_bytes()[..]).unwrap();
         assert_eq!(decoded, package.model);
+    }
+
+    /// The order and names of coremltools 9.0's m4a012 programs: a NumPy FP16
+    /// conv stores its weight first; a fused `conv * 0.5` keeps the conv's
+    /// parameter names, takes the mul's name and adds a zero bias.
+    #[test]
+    fn fp16_convs_follow_coremltools_storage_and_fusion() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 4, 1, 8]);
+        let w = [f16::from_f32(3.0); 8];
+        let fused = b
+            .conv_fp16_scaled(&x, &w, &[2, 4, 1, 1], f16::from_f32(0.5), "mul_0")
+            .unwrap();
+        let plain = b.conv_fp16(&x, &w, &[2, 4, 1, 1]).unwrap();
+        let m = b.mul(&fused, Operand::Var(&plain), None).unwrap();
+        assert_eq!(
+            (fused.name(), plain.name(), m.name()),
+            ("mul_0", "conv_1", "mul_1")
+        );
+        let names: Vec<&str> = b
+            .operations
+            .iter()
+            .map(|op| op.outputs[0].name.as_str())
+            .collect();
+        assert_eq!(
+            &names[..14],
+            [
+                "conv_0_strides_0",
+                "conv_0_pad_type_0",
+                "conv_0_pad_0",
+                "conv_0_dilations_0",
+                "conv_0_groups_0",
+                "mul_0_weight_0",
+                "mul_0_bias_0",
+                "mul_0",
+                "conv_1_weight_0",
+                "conv_1_strides_0",
+                "conv_1_pad_type_0",
+                "conv_1_pad_0",
+                "conv_1_dilations_0",
+                "conv_1_groups_0",
+            ]
+        );
+        assert!(b.operations[7].inputs.contains_key("bias"));
+        let offsets: Vec<u64> = [5, 6, 8]
+            .iter()
+            .map(|&i| match &b.operations[i].attributes["val"].value {
+                Some(value::Value::BlobFileValue(blob)) => blob.offset,
+                _ => panic!("{} is not stored in the weight file", names[i]),
+            })
+            .collect();
+        let package = b.finish(&[&m]).unwrap();
+        // In operation order: the scaled weight (1.5), the zero bias, the plain weight (3.0).
+        let halves = |offset: u64| -> Vec<f32> {
+            let (dtype, bytes) = crate::blob::read(&package.weights, offset).unwrap();
+            assert_eq!(dtype, BlobDataType::Float16 as u32);
+            bytes
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        assert!(offsets[0] < offsets[1] && offsets[1] < offsets[2]);
+        assert_eq!(halves(offsets[0]), [1.5; 8]);
+        assert_eq!(halves(offsets[1]), [0.0; 2]);
+        assert_eq!(halves(offsets[2]), [3.0; 8]);
     }
 
     #[test]
