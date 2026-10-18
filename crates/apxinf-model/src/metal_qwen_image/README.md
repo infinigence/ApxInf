@@ -43,7 +43,7 @@ Select it from the CLI with `generate-image --model-variant reference`.
   `nn.gelu_approx` as shapeless compiled functions.
 - Image-token block projections decode Q4 to BF16 per call and use the
   MetalPerformancePrimitives GEMM when the token count is a multiple of 64 and
-  at least 1024 (EngineTailor GEMM frontier 427d48fc). Loading enables it only
+  at least 1024. Loading enables it only
   on the MLX architecture where it was measured faster, `applegpu_g16g` (M4),
   and only when a probe shows that it compiles and matches MLX quantized matmul
   bit for bit for all three projection shapes at 1024 rows, on seeded device data.
