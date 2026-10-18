@@ -1,5 +1,4 @@
-// Adapted from the EngineTailor Qwen3-TTS predictor MLP frontier 944fd18d.
-// Copyright (c) 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // Two rows: SwiGLU of gate/up [3072, 1024] times x [2, 1024] -> [2, 3072].
     const uint lane = thread_index_in_simdgroup;
     const uint simd_group = simdgroup_index_in_threadgroup;
