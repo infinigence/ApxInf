@@ -33,10 +33,12 @@ pub struct ClefRunner {
 const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 /// MLX architectures where the GPU composition with MLP columns on the Neural
-/// Engine passed its gates; `auto` prefers it there. None yet: its fidelity,
-/// quality, memory and paired latency gates on the M1 Pro are pending.
+/// Engine passed its gates; `auto` prefers it there: the M1 Pro (2026-10-18;
+/// programs equal to the reference build, at-risk decisions bit-identical to
+/// it, quality against stock, memory, and paired latency against the
+/// reference implementation).
 #[cfg(feature = "coreml")]
-const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
+const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 /// Device-independent option admission, checked before the checkpoint is read.
 /// Returns the requested composition; `None` is `auto`, which picks the
@@ -241,7 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_runs_the_gpu_composition_only_on_qualified_architectures() {
+    fn auto_runs_each_composition_only_on_its_qualified_architectures() {
+        #[cfg(feature = "coreml")]
+        assert_eq!(select(None, "applegpu_g13s"), Composition::GpuAneColumns);
+        #[cfg(not(feature = "coreml"))]
         assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
         for other in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
             assert_eq!(select(None, other), Composition::Reference, "{other}");
