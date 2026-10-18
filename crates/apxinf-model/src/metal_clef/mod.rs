@@ -48,9 +48,18 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
                 "Clef a04 needs the coreml feature (Core ML on the Neural Engine)",
             ))
         }
+        // Explicit until m4a012 passes its gates on the M4.
+        #[cfg(feature = "coreml")]
+        Some("m4a012") => Some(Composition::M4a012),
+        #[cfg(not(feature = "coreml"))]
+        Some("m4a012") => {
+            return Err(Error::Contract(
+                "Clef m4a012 needs the coreml feature (Core ML on the Neural Engine)",
+            ))
+        }
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto, reference, c14 and a04 variants",
+                "Clef MLX supports the auto, reference, c14, a04 and m4a012 variants",
             ))
         }
     };
@@ -212,6 +221,10 @@ mod tests {
             ("auto", None),
             ("reference", Some(Composition::Reference)),
             ("c14", Some(Composition::C14)),
+            #[cfg(feature = "coreml")]
+            ("a04", Some(Composition::A04)),
+            #[cfg(feature = "coreml")]
+            ("m4a012", Some(Composition::M4a012)),
         ] {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),

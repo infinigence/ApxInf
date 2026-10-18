@@ -20,6 +20,8 @@ use apxinf_mlx::fusions::{
     GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
     Q4TransposeDecode, SplitF16Gemm,
 };
+#[cfg(feature = "coreml")]
+use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge, MppF16Gemm, SplitMppF16Gemm};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const EPS: f32 = 1e-6;
@@ -48,6 +50,19 @@ pub enum Composition {
     /// the Neural Engine as one INT8 Core ML program per layer.
     #[cfg(feature = "coreml")]
     A04,
+    /// EngineTailor m4a012 (M4): C14's gated-delta kernels and GPU MLP
+    /// kernels, Metal 4 MPP projections, and each MLP split by neuron: 5632
+    /// INT8 and 1248 FP16 neurons as one Neural Engine program per layer
+    /// (128-token tiles, one batch prediction), the other 5408 on the GPU.
+    #[cfg(feature = "coreml")]
+    M4a012,
+}
+
+/// m4a012's projection GEMMs, in place of C14's Steel `split` and `single`.
+#[cfg(feature = "coreml")]
+struct MppProjections {
+    split: SplitMppF16Gemm,
+    single: MppF16Gemm,
 }
 
 /// Kernels only the C14 composition uses (EngineTailor `c14.py` names).
@@ -69,6 +84,9 @@ struct C14Kernels {
     conv: CausalDepthwiseConv,
     /// `s12`: eight value rows per SIMD group.
     recurrence: GatedDeltaRecurrence,
+    /// m4a012: the projections run as MPP GEMMs instead of `split`/`single`.
+    #[cfg(feature = "coreml")]
+    mpp: Option<MppProjections>,
 }
 
 impl C14Kernels {
@@ -83,6 +101,8 @@ impl C14Kernels {
             single: F16Gemm::new(stream)?,
             conv: CausalDepthwiseConv::new(stream)?,
             recurrence: GatedDeltaRecurrence::with_layout(stream, GatedDeltaLayout::EightLanes)?,
+            #[cfg(feature = "coreml")]
+            mpp: None,
         })
     }
 
@@ -92,6 +112,15 @@ impl C14Kernels {
         let tokens = x.shape()[1];
         let half = q.rows() / 2;
         let h = self.pad.call(x)?;
+        #[cfg(feature = "coreml")]
+        if let Some(mpp) = &self.mpp {
+            let decode = |row0| {
+                self.project_decode
+                    .call(&q.weight, &q.scales, &q.biases, row0, half)
+            };
+            let low = mpp.split.low(&h, tokens, &decode(0)?)?;
+            return mpp.split.high(&decode(half)?, &low, &h, tokens);
+        }
         let low = self.split.low(
             &h,
             tokens,
@@ -111,6 +140,10 @@ impl C14Kernels {
         let weight = self
             .project_decode
             .call(&q.weight, &q.scales, &q.biases, 0, q.rows())?;
+        #[cfg(feature = "coreml")]
+        if let Some(mpp) = &self.mpp {
+            return mpp.single.call(&self.pad.call(x)?, x.shape()[1], &weight);
+        }
         self.single.call(&self.pad.call(x)?, x.shape()[1], &weight)
     }
 
@@ -140,6 +173,77 @@ impl C14Kernels {
     }
 }
 
+/// m4a012's per-layer MLP (`create_mlp` with `_c14_create_mlp` on the GPU
+/// share): the GPU neurons' gate rows (decoded per call), their up and down
+/// weights decoded once at load (FP16 `[5408, 4096]` each), and the Neural
+/// Engine program for the other neurons.
+#[cfg(feature = "coreml")]
+struct M4Mlp {
+    gate: Q4,
+    up: Array,
+    down: Array,
+    ane: super::ane::AneMlp,
+}
+
+#[cfg(feature = "coreml")]
+impl M4Mlp {
+    fn new(c: &C14Kernels, cache: &apxinf_coreml::ProgramCache, mlp: &Mlp) -> Result<Self> {
+        let dense = super::ane::DenseMlp::new(mlp)?;
+        let split = dense.split();
+        let ane = super::ane::AneMlp::load_package(cache, &dense.program(&split)?)?;
+        drop(dense);
+        let stream = mlp.gate.weight.stream();
+        let neurons: Vec<i32> = split.gpu.iter().map(|&n| n as i32).collect();
+        let index = Array::from_i32(stream, &[neurons.len()], &neurons)?;
+        let rows = |q: &Q4| -> Result<Q4> {
+            Ok(Q4 {
+                weight: q.weight.take(&index, 0)?,
+                scales: q.scales.take(&index, 0)?,
+                biases: q.biases.take(&index, 0)?,
+            })
+        };
+        let gate = rows(&mlp.gate)?;
+        let up = rows(&mlp.up)?;
+        let up = c.row_decode.call(&up.weight, &up.scales, &up.biases)?;
+        let d = &mlp.down;
+        let down = c
+            .down_decode
+            .call(&d.weight, &d.scales, &d.biases, 0, d.rows())?
+            .take(&index, 0)?;
+        stream.eval(&[
+            gate.weight.clone(),
+            gate.scales.clone(),
+            gate.biases.clone(),
+            up.clone(),
+            down.clone(),
+        ])?;
+        Ok(Self {
+            gate,
+            up,
+            down,
+            ane,
+        })
+    }
+}
+
+/// A layer MLP slot whose weights moved elsewhere (m4a012): empty arrays, so
+/// the checkpoint's full Q4 weights are released.
+#[cfg(feature = "coreml")]
+fn moved_mlp(stream: &Stream) -> Result<Mlp> {
+    let empty = || -> Result<Q4> {
+        Ok(Q4 {
+            weight: Array::zeros(stream, &[0, 0], MlxDType::U32)?,
+            scales: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+            biases: Array::zeros(stream, &[0, 0], MlxDType::BF16)?,
+        })
+    };
+    Ok(Mlp {
+        gate: empty()?,
+        up: empty()?,
+        down: empty()?,
+    })
+}
+
 /// `compute_g`: `exp(-exp(A_log) * softplus(a + dt_bias))`; beta: `sigmoid(b)`.
 fn g_beta(args: &[Array]) -> Result<Vec<Array>> {
     let [a_log, a, b, dt_bias] = args else {
@@ -166,6 +270,11 @@ pub struct Network {
     /// A04's per-layer Neural Engine programs, in layer order.
     #[cfg(feature = "coreml")]
     ane: Vec<super::ane::AneMlp>,
+    /// m4a012's per-layer MLPs and its GPU/Neural Engine boundary kernels.
+    #[cfg(feature = "coreml")]
+    m4: Vec<M4Mlp>,
+    #[cfg(feature = "coreml")]
+    tiles: Option<(AneTileHandoff, AneTileMerge)>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
 }
@@ -243,7 +352,8 @@ impl Network {
             rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: Compiled::with_shapeless(&stream, 2, true, g_beta)?,
         };
-        let c14 = match composition {
+        #[cfg_attr(not(feature = "coreml"), allow(unused_mut))]
+        let mut c14 = match composition {
             Composition::Reference => None,
             _ => Some(C14Kernels::new(&stream)?),
         };
@@ -260,6 +370,26 @@ impl Network {
             ane
         } else {
             Vec::new()
+        };
+        // m4a012: split each MLP and build its program from the full weights,
+        // keep the GPU share's weights, release the rest.
+        #[cfg(feature = "coreml")]
+        let (m4, tiles) = match (composition, c14.as_mut()) {
+            (Composition::M4a012, Some(c)) => {
+                c.mpp = Some(MppProjections {
+                    split: SplitMppF16Gemm::new(&stream)?,
+                    single: MppF16Gemm::new(&stream)?,
+                });
+                let cache = apxinf_coreml::ProgramCache::new(super::ane::cache_dir());
+                let mut m4 = Vec::with_capacity(backbone.layers.len());
+                for layer in &mut backbone.layers {
+                    m4.push(M4Mlp::new(c, &cache, &layer.mlp)?);
+                    layer.mlp = moved_mlp(&stream)?;
+                }
+                let tiles = (AneTileHandoff::new(&stream)?, AneTileMerge::new(&stream)?);
+                (m4, Some(tiles))
+            }
+            _ => (Vec::new(), None),
         };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
@@ -281,6 +411,10 @@ impl Network {
             c14,
             #[cfg(feature = "coreml")]
             ane,
+            #[cfg(feature = "coreml")]
+            m4,
+            #[cfg(feature = "coreml")]
+            tiles,
             inv_freq,
         })
     }
@@ -338,6 +472,27 @@ impl Network {
     /// Neural Engine predicts while the GPU runs.
     #[cfg_attr(not(feature = "coreml"), allow(unused_variables))]
     fn mlp(&self, h: &Array, m: &Mlp, index: usize) -> Result<Array> {
+        // m4a012: one kernel writes the GPU share's padded rows and the
+        // Neural Engine tiles; the GPU share is queued behind it, the host
+        // waits for the tiles only, the Neural Engine predicts every tile in
+        // one batch, and one kernel adds its share to the GPU's.
+        #[cfg(feature = "coreml")]
+        if let (Some(c), Some((handoff, merge)), Some(m4)) =
+            (&self.c14, &self.tiles, self.m4.get(index))
+        {
+            let tokens = h.shape()[1];
+            let (x, packed) = handoff.call(h, super::ane::M4_TILE)?;
+            let up = x.matmul(&m4.up.transpose(&[1, 0])?)?;
+            let gate = c
+                .row_decode
+                .call(&m4.gate.weight, &m4.gate.scales, &m4.gate.biases)?;
+            let activation = c.gate_swiglu.call(&x, &gate, &up)?;
+            let gpu = activation.matmul(&m4.down)?.slice_axis(1, 0, tokens)?;
+            self.stream.async_eval(std::slice::from_ref(&packed))?;
+            self.stream.async_eval(std::slice::from_ref(&gpu))?;
+            let [y, gate_scale, up_scale] = m4.ane.predict_tiles(&self.stream, &packed)?;
+            return merge.call(&gpu, &y, &gate_scale, &up_scale);
+        }
         #[cfg(feature = "coreml")]
         if let (Some(c), Some(ane)) = (&self.c14, self.ane.get(index)) {
             let gpu = c.mlp(h, m)?;
