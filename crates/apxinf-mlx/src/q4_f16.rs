@@ -1,5 +1,5 @@
 //! Per-call FP16 decode of affine Q4 weights and the FP16 GEMM that consumes it.
-//! Adapted from EngineTailor g20 (MIT); see NOTICE. The GEMM fragment layout
+//! Portions adapted from EngineTailor (MIT); see NOTICE. The GEMM fragment layout
 //! follows MLX Steel `mma.h` (MIT, Apple).
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};

@@ -1,4 +1,4 @@
-// Adapted from EngineTailor feat/clef-g20-engine 6edc065c (g20). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // [P, K] x [K, N] FP16 GEMM, FP32 accumulation, BF16 output rows < T.
 
     constexpr int BK = 16, LA = 24, LB = 72;
