@@ -517,6 +517,15 @@ pub fn cache_dir() -> std::path::PathBuf {
         })
 }
 
+/// The little-endian bytes of FP16 values, without a copy (Apple Silicon only).
+fn f16_bytes(values: &[f16]) -> &[u8] {
+    // SAFETY: f16 is a plain 2-byte value without padding, so its storage is valid as bytes; the
+    // `coreml` feature targets little-endian aarch64 macOS only.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
 /// One layer's loaded Neural Engine program.
 pub struct AneMlp {
     model: Model,
@@ -543,11 +552,19 @@ impl AneMlp {
                 "Clef m4a012 tiles must be [tiles, 4096, 128]",
             ));
         };
-        let values: Vec<f16> = packed
-            .to_bytes()?
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        let bytes = packed.to_bytes()?;
+        // SAFETY: every bit pattern is a valid f16; `align_to` returns only the aligned middle.
+        let (head, aligned, tail) = unsafe { bytes.align_to::<f16>() };
+        let copied: Vec<f16>;
+        let values: &[f16] = if head.is_empty() && tail.is_empty() {
+            aligned
+        } else {
+            copied = bytes
+                .chunks_exact(2)
+                .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            &copied
+        };
         let batch: Vec<Vec<&[f16]>> = values
             .chunks_exact(HIDDEN * M4_TILE)
             .map(|tile| vec![tile])
@@ -562,10 +579,10 @@ impl AneMlp {
             ],
         )?;
         let stacked = |k: usize, shape: &[usize]| -> Result<Array> {
-            let bytes: Vec<u8> = results
-                .iter()
-                .flat_map(|r| r[k].iter().flat_map(|x| x.to_le_bytes()))
-                .collect();
+            let mut bytes = Vec::with_capacity(shape.iter().product::<usize>() * 2);
+            for r in &results {
+                bytes.extend_from_slice(f16_bytes(&r[k]));
+            }
             Array::from_bytes(stream, shape, MlxDType::F16, &bytes)
         };
         Ok([
