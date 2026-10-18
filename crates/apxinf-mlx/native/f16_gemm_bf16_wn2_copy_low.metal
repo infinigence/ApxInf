@@ -1,5 +1,5 @@
-// Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
-// s28 high half prologue: copy the low half's output into columns [0, NW).
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
+// High half prologue: copy the low half's output into columns [0, NW).
     {
         const int r = int(thread_index_in_threadgroup) / 8;
         const int c = int(threadgroup_position_in_grid.x) * 64 +
