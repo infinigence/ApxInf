@@ -49,7 +49,7 @@ framework is linked.
 
 - `cargo test -p apxinf-coreml` runs the portable writer tests.
 - The ignored `tests/recorded_package.rs` takes a coremltools 9.0 package of
-  the Clef A04 MLP program from `APXINF_COREML_REFERENCE`. It rebuilds that
+  a Clef int8 MLP program from `APXINF_COREML_REFERENCE`. It rebuilds that
   program from the package's own weights and checks the three properties
   above, cache sealing, and repeated predictions. The package is not
   committed, because its weights derive from the checkpoint.
