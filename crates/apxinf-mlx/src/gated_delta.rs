@@ -61,7 +61,7 @@ pub enum GatedDeltaLayout {
     FourValues,
     /// Eight value rows per group, each lane holding two rows of `Dk / 8`
     /// keys, reduced over eight lanes by `simd_shuffle_xor`, with the next
-    /// step's operands loaded ahead (C14 `s12`). Requires `Dv` a multiple of 32.
+    /// step's operands loaded ahead. Requires `Dv` a multiple of 32.
     EightLanes,
 }
 
