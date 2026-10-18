@@ -1,4 +1,4 @@
-// Adapted from EngineTailor M4 ANE campaign frontier stk011-m4a012-fp16-1248 (m4a005 projections). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // High half prologue (128 threads): copy the low half's output into columns [0, NW).
     {
         const int r = int(thread_index_in_threadgroup) / 8;

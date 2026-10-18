@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(decoded, package.model);
     }
 
-    /// The order and names of coremltools 9.0's m4a012 programs: a NumPy FP16
+    /// The order and names of coremltools 9.0's FP16 conv programs: a NumPy FP16
     /// conv stores its weight first; a fused `conv * 0.5` keeps the conv's
     /// parameter names, takes the mul's name and adds a zero bias.
     #[test]

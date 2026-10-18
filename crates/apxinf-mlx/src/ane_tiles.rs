@@ -1,7 +1,7 @@
-//! The GPU side of a layer split between the GPU and the Neural Engine
-//! (EngineTailor M4 frontier m4a012, A14 boundary kernels): one kernel writes
-//! both shares' inputs, one restores the Neural Engine share and adds it to
-//! the GPU share. Adapted from EngineTailor (MIT); see NOTICE.
+//! The GPU side of a layer split between the GPU and the Neural Engine: one
+//! kernel writes both shares' inputs, one restores the Neural Engine share and
+//! adds it to the GPU share. Portions adapted from EngineTailor (MIT); see
+//! NOTICE.
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 

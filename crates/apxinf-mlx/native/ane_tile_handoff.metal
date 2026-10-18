@@ -1,4 +1,4 @@
-// Adapted from EngineTailor M4 ANE campaign frontier stk011-m4a012-fp16-1248 (A14 boundary kernels). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // One pass over the layer input: the GPU share's FP16 rows padded to ROWS and every Neural Engine tile
 // channels first, zero past the N real tokens.
     const uint lane = thread_position_in_threadgroup.x;

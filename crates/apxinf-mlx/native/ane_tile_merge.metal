@@ -1,4 +1,4 @@
-// Adapted from EngineTailor M4 ANE campaign frontier stk011-m4a012-fp16-1248 (A14 boundary kernels). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // Restores the Neural Engine share (rows times both scales in FP32), adds the GPU share and rounds once to OT.
     const uint lane = thread_position_in_threadgroup.x;
     const uint row = thread_position_in_threadgroup.y;
