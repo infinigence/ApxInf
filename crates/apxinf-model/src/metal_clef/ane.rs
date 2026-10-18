@@ -1,21 +1,20 @@
-//! The Neural Engine share of each Clef MLP in the EngineTailor GPU+ANE
-//! frontier A04 (campaign/clef-flash9b-m1pro fe66a747 `a04.py`, MIT; see
-//! NOTICE). Intermediate columns `[GPU_COLUMNS, 12288)` run as one Core ML
-//! program per layer; the GPU computes the rest with the C14 MLP, and the two
-//! shares are summed on the GPU.
+//! The Neural Engine share of each Clef MLP in the GPU+ANE column
+//! composition. Intermediate columns `[GPU_COLUMNS, 12288)` run as one Core ML
+//! program per layer; the GPU computes the rest with the GPU composition's MLP,
+//! and the two shares are summed on the GPU. Portions adapted from EngineTailor
+//! (MIT); see NOTICE.
 //!
-//! The program follows `_ane_mlp_program`: gate and up as per-row symmetric
-//! INT8 1x1 convolutions, SiLU as `0.5 v (1 + tanh(v / 2))`, gate and up
-//! normalized by their row maxima before the product, down as K-split INT8
-//! convolutions, 512-token tiles. Weights are quantized on the host from the
-//! Q4 checkpoint exactly as the Python helper does.
+//! The program: gate and up as per-row symmetric INT8 1x1 convolutions, SiLU
+//! as `0.5 v (1 + tanh(v / 2))`, gate and up normalized by their row maxima
+//! before the product, down as K-split INT8 convolutions, 512-token tiles.
+//! Weights are quantized on the host from the Q4 checkpoint.
 use super::weights::{Mlp, Q4};
 use apxinf_core::{Error, Result};
 use apxinf_coreml::{ComputeUnits, Model, Operand, Package, ProgramBuilder, ProgramCache, Var};
 use apxinf_mlx::{Array, MlxDType, Stream};
 use half::f16;
 
-/// Hidden width and MLP width of the only geometry A04 was built for.
+/// Hidden width and MLP width of the only geometry this split was built for.
 const HIDDEN: usize = 4096;
 const INTERMEDIATE: usize = 12288;
 /// `12288 - round(12288 * 5632 / 12288 / 256) * 256`: the GPU keeps the first
@@ -76,7 +75,7 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     let n = INTERMEDIATE - GPU_COLUMNS;
     if mlp.gate.rows() != INTERMEDIATE || mlp.down.rows() != HIDDEN {
         return Err(Error::Contract(
-            "Clef A04 needs the 4096 x 12288 MLP geometry",
+            "Clef GPU+ANE needs the 4096 x 12288 MLP geometry",
         ));
     }
     let (qg, sg) = int8_per_row(
@@ -113,7 +112,7 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     );
     if factor_cap < 1.0 {
         return Err(Error::Contract(
-            "Clef A04 down weights need factor scales outside the FP16 range",
+            "Clef GPU+ANE down weights need factor scales outside the FP16 range",
         ));
     }
 
@@ -164,12 +163,13 @@ pub fn program(mlp: &Mlp) -> Result<Package> {
     b.finish(&[&y, &s_scale, &u_scale])
 }
 
-/// m4a012 (M4 campaign `stk011-m4a012-fp16-1248`): per MLP, the `M4_INT8`
-/// neurons whose int8 encoding adds the least error run on the Neural Engine
-/// as per-channel int8, the next `M4_FP16` as FP16, and the rest on the GPU.
-pub const M4_INT8: usize = 5632;
-pub const M4_FP16: usize = 1248;
-pub const M4_TILE: usize = 128;
+/// The neuron split: per MLP, the `NEURON_INT8` neurons whose int8 encoding
+/// adds the least error run on the Neural Engine as per-channel int8, the
+/// next `NEURON_FP16` as FP16, and the rest on the GPU, in `NEURON_TILE`-token
+/// tiles.
+pub const NEURON_INT8: usize = 5632;
+pub const NEURON_FP16: usize = 1248;
+pub const NEURON_TILE: usize = 128;
 
 /// numpy 2.x `einsum("ij,ij->i", r, r, dtype=float64)` on Apple Silicon: one
 /// two-lane accumulator, each 8-element block fused-multiply-added from its
@@ -214,7 +214,7 @@ fn pairwise_sum(a: &[f64]) -> f64 {
     pairwise_sum(&a[..half]) + pairwise_sum(&a[half..])
 }
 
-/// `_row_stats`: per row, the squared norm and the squared error of its
+/// Per row, the squared norm and the squared error of its
 /// per-channel int8 encoding (FP32 arithmetic, float64 sums).
 fn row_stats(w: &[f16], cols: usize) -> (Vec<f64>, Vec<f64>) {
     let (mut norm, mut err) = (Vec::new(), Vec::new());
@@ -240,7 +240,7 @@ fn row_stats(w: &[f16], cols: usize) -> (Vec<f64>, Vec<f64>) {
     (norm, err)
 }
 
-/// `_column_stats` of a `[rows, cols]` down weight: per column the squared
+/// For a `[rows, cols]` down weight: per column the squared
 /// norm (column sums in 16 row blocks, each block summed row by row, the
 /// blocks added in order) and the mean squared rounding error per-row int8
 /// steps add to any column.
@@ -271,13 +271,13 @@ fn column_stats(w: &[f16], cols: usize) -> (Vec<f64>, f64) {
     (norm, pairwise_sum(&squares) / 12.0)
 }
 
-/// FP16 values of a whole Q4 group-64 weight (`_dense`).
+/// FP16 values of a whole Q4 group-64 weight.
 fn dense_all(q: &Q4) -> Result<Vec<f16>> {
     let (rows, cols) = (q.rows(), q.weight.shape()[1] * 8);
     dense(q, (0, rows), (0, cols))
 }
 
-/// m4a012's neuron split of one MLP (`_split_neurons`): (GPU, Neural Engine
+/// The neuron split of one MLP: (GPU, Neural Engine
 /// int8, Neural Engine FP16) intermediate indices, each ascending. Neurons are
 /// ranked by the error their int8 encoding would add,
 /// `|d|^2 (|u|^2 e(g) + |g|^2 e(u)) + |g|^2 |u|^2 e(d)`, with a stable sort.
@@ -299,7 +299,7 @@ impl DenseMlp {
     pub fn new(mlp: &Mlp) -> Result<Self> {
         if mlp.gate.rows() != INTERMEDIATE || mlp.down.rows() != HIDDEN {
             return Err(Error::Contract(
-                "Clef m4a012 needs the 4096 x 12288 MLP geometry",
+                "Clef GPU+ANE needs the 4096 x 12288 MLP geometry",
             ));
         }
         Ok(Self {
@@ -324,9 +324,9 @@ impl DenseMlp {
             v
         };
         NeuronSplit {
-            int8: sorted(&order[..M4_INT8]),
-            fp16: sorted(&order[M4_INT8..M4_INT8 + M4_FP16]),
-            gpu: sorted(&order[M4_INT8 + M4_FP16..]),
+            int8: sorted(&order[..NEURON_INT8]),
+            fp16: sorted(&order[NEURON_INT8..NEURON_INT8 + NEURON_FP16]),
+            gpu: sorted(&order[NEURON_INT8 + NEURON_FP16..]),
         }
     }
 
@@ -346,8 +346,8 @@ impl DenseMlp {
             .collect()
     }
 
-    /// m4a012's Neural Engine program for this MLP (`_ane_mlp_program`), as
-    /// coremltools 9.0 writes it: FP16 gate conv and the following `* 0.5`
+    /// The Neural Engine program for this MLP's int8 and FP16 neurons, as
+    /// coremltools 9.0 writes it: the FP16 gate conv and the following `* 0.5`
     /// fused into one conv with a zero bias.
     pub fn program(&self, split: &NeuronSplit) -> Result<Package> {
         let (n, nf) = (split.int8.len(), split.fp16.len());
@@ -389,13 +389,13 @@ impl DenseMlp {
         );
         if factor_cap < 1.0 {
             return Err(Error::Contract(
-                "Clef m4a012 down weights need factor scales outside the FP16 range",
+                "Clef GPU+ANE down weights need factor scales outside the FP16 range",
             ));
         }
 
         let half = Operand::Scalar(f16::from_f32(0.5));
         let mut b = ProgramBuilder::new();
-        let x = b.input("x", &[1, HIDDEN, 1, M4_TILE]);
+        let x = b.input("x", &[1, HIDDEN, 1, NEURON_TILE]);
         let wg = b.constexpr_blockwise_shift_scale(&qg, &[n, HIDDEN, 1, 1], &sg, &[n, 1, 1, 1])?;
         let g = b.conv(&x, &wg)?;
         let wu = b.constexpr_blockwise_shift_scale(&qu, &[n, HIDDEN, 1, 1], &su, &[n, 1, 1, 1])?;
@@ -472,7 +472,7 @@ impl DenseMlp {
 }
 
 /// The GPU share of `mlp`: gate and up rows and down columns `[0, GPU_COLUMNS)`,
-/// as contiguous Q4 copies (EngineTailor `_MLPView`).
+/// as contiguous Q4 copies.
 pub fn gpu_share(mlp: &Mlp) -> Result<Mlp> {
     let rows = |q: &Q4| -> Result<Q4> {
         Ok(Q4 {
@@ -542,14 +542,14 @@ impl AneMlp {
         })
     }
 
-    /// m4a012: one Core ML batch prediction over the FP16 channel-first tiles
-    /// `[tiles, 4096, M4_TILE]` (evaluated here). Returns the program's `y` as
-    /// `[tiles, 4096, M4_TILE]` and both scales as `[tiles * M4_TILE]`, FP16 on
-    /// `stream`, as `np.stack` of the per-tile results lays them out.
+    /// Neuron split: one Core ML batch prediction over the FP16 channel-first
+    /// tiles `[tiles, 4096, NEURON_TILE]` (evaluated here). Returns the
+    /// program's `y` as `[tiles, 4096, NEURON_TILE]` and both scales as
+    /// `[tiles * NEURON_TILE]`, FP16 on `stream`, tile after tile.
     pub fn predict_tiles(&self, stream: &Stream, packed: &Array) -> Result<[Array; 3]> {
-        let [tiles, HIDDEN, M4_TILE] = *packed.shape() else {
+        let [tiles, HIDDEN, NEURON_TILE] = *packed.shape() else {
             return Err(Error::Contract(
-                "Clef m4a012 tiles must be [tiles, 4096, 128]",
+                "Clef GPU+ANE tiles must be [tiles, 4096, 128]",
             ));
         };
         // Wait for the tiles only: the GPU share queued after them keeps running.
@@ -567,16 +567,16 @@ impl AneMlp {
             &copied
         };
         let batch: Vec<Vec<&[f16]>> = values
-            .chunks_exact(HIDDEN * M4_TILE)
+            .chunks_exact(HIDDEN * NEURON_TILE)
             .map(|tile| vec![tile])
             .collect();
         let results = self.model.predict_batch(
-            &[("x", &[1, HIDDEN, 1, M4_TILE])],
+            &[("x", &[1, HIDDEN, 1, NEURON_TILE])],
             &batch,
             &[
-                ("y", &[1, HIDDEN, 1, M4_TILE]),
-                ("gate_scale", &[1, 1, 1, M4_TILE]),
-                ("up_scale", &[1, 1, 1, M4_TILE]),
+                ("y", &[1, HIDDEN, 1, NEURON_TILE]),
+                ("gate_scale", &[1, 1, 1, NEURON_TILE]),
+                ("up_scale", &[1, 1, 1, NEURON_TILE]),
             ],
         )?;
         let stacked = |k: usize, shape: &[usize]| -> Result<Array> {
@@ -587,17 +587,17 @@ impl AneMlp {
             Array::from_bytes(stream, shape, MlxDType::F16, &bytes)
         };
         Ok([
-            stacked(0, &[tiles, HIDDEN, M4_TILE])?,
-            stacked(1, &[tiles * M4_TILE])?,
-            stacked(2, &[tiles * M4_TILE])?,
+            stacked(0, &[tiles, HIDDEN, NEURON_TILE])?,
+            stacked(1, &[tiles * NEURON_TILE])?,
+            stacked(2, &[tiles * NEURON_TILE])?,
         ])
     }
 
-    /// `_to_channels_first_tiles`: BF16 `[1, T, 4096]` as FP16 channel-first
-    /// tiles `[1, 4096, 1, 512]`, zero-padded to whole tiles. Evaluates `h`.
+    /// BF16 `[1, T, 4096]` as FP16 channel-first tiles `[1, 4096, 1, 512]`,
+    /// zero-padded to whole tiles. Evaluates `h`.
     pub fn tiles(h: &Array) -> Result<Vec<Vec<f16>>> {
         let [1, tokens, channels] = *h.shape() else {
-            return Err(Error::Contract("Clef A04 tiles take [1, T, 4096]"));
+            return Err(Error::Contract("Clef GPU+ANE tiles take [1, T, 4096]"));
         };
         let tiles = tokens.div_ceil(TILE);
         let padded = if tiles * TILE > tokens {
@@ -621,8 +621,8 @@ impl AneMlp {
             .collect())
     }
 
-    /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`
-    /// (`_from_channels_first_gpu`): rows times both scales in FP32.
+    /// Predicts every tile and restores BF16 `[1, T, 4096]` on `stream`: rows
+    /// times both scales in FP32.
     pub fn predict(&self, stream: &Stream, tiles: &[Vec<f16>], tokens: usize) -> Result<Array> {
         let bytes = |v: &[f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let mut parts = Vec::with_capacity(tiles.len());
@@ -674,13 +674,13 @@ mod tests {
         assert_eq!(&q[4..], &[0; 4]);
     }
 
-    /// Every layer's program from the Q4 checkpoint matches a package that
-    /// the EngineTailor engine compiled with coremltools 9.0 (in the
-    /// directory `recorded_env` names): the same weight file bytes and the
-    /// same decoded program (writer metadata and `buildInfo` excluded).
+    /// Every layer's program from the Q4 checkpoint matches a package that a
+    /// coremltools 9.0 reference build compiled (in the directory
+    /// `recorded_env` names): the same weight file bytes and the same decoded
+    /// program (writer metadata and `buildInfo` excluded).
     fn layer_programs_match_recorded(
         recorded_env: &str,
-        frontier: &str,
+        split: &str,
         build: impl Fn(&Mlp) -> Package,
     ) {
         use sha2::{Digest, Sha256};
@@ -727,23 +727,25 @@ mod tests {
         assert_eq!(
             matched,
             backbone.layers.len(),
-            "layers matching a recorded {frontier} package"
+            "layers matching a recorded {split} package"
         );
     }
 
-    /// A-K: the A04 programs (`APXINF_A04_RECORDED`).
+    /// The column split's programs (`APXINF_CLEF_COLUMNS_RECORDED`).
     #[test]
-    #[ignore = "requires the Clef checkpoint, recorded A04 packages and a Metal device"]
-    fn layer_programs_match_the_recorded_a04_packages() {
-        layer_programs_match_recorded("APXINF_A04_RECORDED", "A04", |mlp| program(mlp).unwrap());
+    #[ignore = "requires the Clef checkpoint, recorded packages and a Metal device"]
+    fn column_programs_match_the_recorded_packages() {
+        layer_programs_match_recorded("APXINF_CLEF_COLUMNS_RECORDED", "column", |mlp| {
+            program(mlp).unwrap()
+        });
     }
 
-    /// M-K: the m4a012 programs (`APXINF_M4A012_RECORDED`). A weight file that
-    /// matches no package also means the neuron split differs.
+    /// The neuron split's programs (`APXINF_CLEF_NEURONS_RECORDED`). A weight
+    /// file that matches no package also means the neuron split differs.
     #[test]
-    #[ignore = "requires the Clef checkpoint, recorded m4a012 packages and a Metal device"]
-    fn layer_programs_match_the_recorded_m4a012_packages() {
-        layer_programs_match_recorded("APXINF_M4A012_RECORDED", "m4a012", |mlp| {
+    #[ignore = "requires the Clef checkpoint, recorded packages and a Metal device"]
+    fn neuron_programs_match_the_recorded_packages() {
+        layer_programs_match_recorded("APXINF_CLEF_NEURONS_RECORDED", "neuron", |mlp| {
             let dense = DenseMlp::new(mlp).unwrap();
             dense.program(&dense.split()).unwrap()
         });

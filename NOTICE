@@ -17,8 +17,9 @@ integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
 The Clef Q4 decode, row padding, FP16 GEMMs (including the gate GEMM with a
-SwiGLU epilogue), causal depthwise convolution and gated delta recurrence kernels
-are adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
+SwiGLU epilogue), causal depthwise convolution and gated delta recurrence kernels,
+and the Clef GPU+Neural Engine split and its Core ML programs, are adapted from
+EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 
 The gated delta recurrence and the half-split rotary embedding kernel adapt
 MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
