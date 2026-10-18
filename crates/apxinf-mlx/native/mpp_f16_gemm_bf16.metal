@@ -1,4 +1,4 @@
-// Adapted from EngineTailor M4 ANE campaign frontier stk011-m4a012-fp16-1248 (m4a005 projections). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // [P, K] x [K, N] FP16 GEMM in Metal 4 MPP matmul2d 64 x 64 x 64 tiles, FP32 accumulation, BF16 output rows < T.
     constexpr int BM = 64, BN = 64, BK = 64;
     const int M = int(x_shape[1]);

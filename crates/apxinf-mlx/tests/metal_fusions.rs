@@ -193,7 +193,7 @@ fn one_pass_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
     Ok(())
 }
 
-/// The Neural Engine boundary kernels (m4a012): the handoff writes padded FP16
+/// The Neural Engine boundary kernels: the handoff writes padded FP16
 /// rows and zero-padded channel-first tiles; the merge restores the tiles with
 /// both per-token scales and adds the GPU share (exact values here, so any
 /// FMA contraction gives the same bits).
@@ -276,7 +276,7 @@ fn ane_tile_handoff_and_merge_match_host_references() -> Result<()> {
     Ok(())
 }
 
-/// The Metal 4 MPP projections (m4a012): the split pair equals the one-pass
+/// The Metal 4 MPP projections: the split pair equals the one-pass
 /// GEMM on each half bit for bit, and both match an FP32 reference.
 #[test]
 #[ignore = "requires shared Metal qualification lock and Metal 4 tensors"]

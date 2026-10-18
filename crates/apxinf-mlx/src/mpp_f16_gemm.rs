@@ -1,6 +1,5 @@
 //! FP16 projection GEMMs on Metal 4 tensors and MetalPerformancePrimitives
-//! `matmul2d` (EngineTailor M4 frontier m4a012's projections, from m4a005).
-//! Adapted from EngineTailor (MIT); see NOTICE.
+//! `matmul2d`. Portions adapted from EngineTailor (MIT); see NOTICE.
 use crate::q4_f16::SplitF16Gemm;
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
@@ -110,8 +109,8 @@ impl SplitMppF16Gemm {
 }
 
 /// FP16 `[1, P, K] x [K, N]` GEMM with FP32 accumulation and BF16 output
-/// `[1, T, N]` in one pass of 64 x 64 x 64 `matmul2d` tiles (m4a012's k and v
-/// projections). Rows at and after `T` are padding and are never stored.
+/// `[1, T, N]` in one pass of 64 x 64 x 64 `matmul2d` tiles (attention k and
+/// v). Rows at and after `T` are padding and are never stored.
 pub struct MppF16Gemm {
     kernel: MetalKernel,
 }
