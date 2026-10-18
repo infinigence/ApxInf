@@ -19,9 +19,8 @@ These revisions describe provenance, not qualification of the ApxInf port.
 The Clef Q4 decode, row padding, FP16 GEMM and gated delta recurrence kernels
 are adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 
-The MetalPerformancePrimitives BF16 GEMM kernel derives from the EngineTailor
-Qwen-Image Q4 GEMM campaign frontier, candidate SHA-256
-427d48fc48fddfeac783b448d240acda1a8e94efae85133d056e7ea4471fc886.
+The Qwen-Image MetalPerformancePrimitives BF16 GEMM kernel is adapted from
+EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 
 The metal_qwen3_tts cast boundaries follow the EngineTailor Qwen3-TTS MLX
 parity path, source 282adc1dc5af4c48ffd17ea2f41e75cc5a24b7ee.
