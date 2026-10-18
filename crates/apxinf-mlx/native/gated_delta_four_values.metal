@@ -1,4 +1,4 @@
-// Adapted from EngineTailor feat/clef-g20-engine 6edc065c (g20). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // Four value rows per SIMD group; adapts the MLX-VLM 0.7.4 gated delta kernel (MIT, Prince Canuma).
 
             uint n = thread_position_in_grid.z;
