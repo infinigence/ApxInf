@@ -1,5 +1,5 @@
-// Adapted from EngineTailor campaign/clef-flash9b-m1pro 4030047b (C14). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
-// [P, K] x [K, N] FP16 GEMM, FP32 accumulation, BF16 output rows < T; Steel's unpipelined K loop (s13).
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
+// [P, K] x [K, N] FP16 GEMM, FP32 accumulation, BF16 output rows < T; Steel's unpipelined K loop.
     constexpr int BK = 16, LA = 24, LB = 72;
     const int lane = thread_index_in_simdgroup;
     const int sg = simdgroup_index_in_threadgroup;

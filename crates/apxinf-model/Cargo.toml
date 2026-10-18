@@ -21,7 +21,7 @@ serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
-# Decodes recorded Core ML packages in the Clef A04 device test.
+# Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
 
 [features]

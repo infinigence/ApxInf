@@ -1,6 +1,6 @@
 //! Gated delta-rule recurrence over a whole prompt, four value rows per SIMD
-//! group (EngineTailor g20) or eight (C14). Both adapt the MLX-VLM 0.7.4
-//! kernel (MIT); see NOTICE.
+//! group, or eight in the eight-lane layout. Portions adapted from EngineTailor
+//! (MIT); both layouts adapt the MLX-VLM 0.7.4 kernel (MIT); see NOTICE.
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 
@@ -61,7 +61,7 @@ pub enum GatedDeltaLayout {
     FourValues,
     /// Eight value rows per group, each lane holding two rows of `Dk / 8`
     /// keys, reduced over eight lanes by `simd_shuffle_xor`, with the next
-    /// step's operands loaded ahead (C14 `s12`). Requires `Dv` a multiple of 32.
+    /// step's operands loaded ahead. Requires `Dv` a multiple of 32.
     EightLanes,
 }
 

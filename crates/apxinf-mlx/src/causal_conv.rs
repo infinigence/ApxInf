@@ -1,5 +1,5 @@
 //! Causal depthwise convolution with zero history, one thread per output.
-//! Adapted from EngineTailor C14 `s31` (MIT), which follows MLX 0.32.3
+//! Portions adapted from EngineTailor (MIT), following MLX 0.32.3
 //! `depthwise_conv_1d` (MIT, Apple). See NOTICE.
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
@@ -54,7 +54,7 @@ impl CausalDepthwiseConv {
             ));
         }
         let scalar = |v: usize| Array::from_i32(x.stream(), &[], &[v as i32]);
-        // As in C14: the largest power of two not above L, capped at 32, rows
+        // The largest power of two not above L, capped at 32, rows
         // of time per threadgroup of 1024 threads.
         let time = 1usize << length.ilog2().min(5);
         // SAFETY: the grid is exactly `[C, L]`, so `c < C`; threads with
