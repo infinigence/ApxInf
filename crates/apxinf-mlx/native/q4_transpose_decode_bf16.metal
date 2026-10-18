@@ -1,4 +1,4 @@
-// Adapted from EngineTailor feat/clef-g20-engine 6edc065c (g20). Copyright 2026 Haiyan Qin. MIT; see NOTICE.
+// Portions adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin; see NOTICE.
 // Affine Q4 group-64 rows R0..R0+N decoded with BF16 arithmetic, widened to FP16, written as [K, N].
 
     threadgroup half tile[32][65];
