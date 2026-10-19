@@ -74,8 +74,59 @@ set. Neither factor is promoted. Quantizing/dequantizing FP32 checkpoint
 weights and rowwise activations inside official OpenPI passes all four selected
 state observations; this retains the official floating-point GEMMs and is not
 an integer-GEMM oracle. The original reference restores bitwise after each
-factor. Native integer arithmetic and the remaining boundaries still need
-attribution.
+factor. A separate integer-GEMM factor uses signed INT8 inputs, INT32
+accumulation, FP32 row-then-channel scaling and BF16 output. Independent FP64
+dot products validate its padded irregular shapes before model execution.
+After correcting the scalar-division rounding described below, quantizing
+only language projections or all transformer projections each passes 3/4
+observations. For frame169, relative L2 is 0.1194 and 0.1399 respectively.
+The earlier reciprocal-multiply factor passed 3/4 and 2/4, with relative L2
+0.1840 and 0.2102; its raw results remain diagnostic evidence. Unmodified reference controls restore bitwise. This
+reproduces some failures outside ApxInf, but leaves the reference's other
+operations unchanged and does not establish native arithmetic equivalence.
+
+A native precision factor preserves only the language projections as BF16,
+keeping the other INT8 computations unchanged. It passes all four selected
+observations, versus 1/4 for its bitwise-restored INT8 controls. Retaining only
+QKV or only the remaining language projections each passes 3/4; frame169
+still fails. The broad retention candidate is rejected for performance:
+
+| One-view state observation | Original P50 | Candidate P50 | Original again P50 |
+| --- | --- | --- | --- |
+| record0 / frame070 | 90.059 ms | 122.527 ms | 90.056 ms |
+| record1 / frame169 | 89.701 ms | 121.695 ms | 90.106 ms |
+
+These measurements use `bench_pi05.py`, 30 warmups and 50 samples, fixed
+recipes, graph execution and identical inputs. The candidate regresses by
+35–36% against the mean of the bracketing originals. They are a shared-board
+pilot, not an exclusive performance budget. The candidate is a private mixed
+precision diagnostic, not an accepted INT8 implementation.
+
+A subsequent capture tests the actual native language arithmetic on frame169.
+Both the trace-disabled graph output and traced eager output restore the
+original INT8 chunk bitwise. All 69 language projections, containing
+208,558,080 output elements, match an independent INT8 dot product and FP32
+row-then-channel dequantization to BF16 exactly; sampled integer dots also
+match FP64 arithmetic. Every captured activation byte and scale matches a
+CPU correctly rounded division oracle. An earlier PyTorch factor differs at
+1,127 scale values and 687 quantized bytes because scalar division by 127
+uses reciprocal multiplication. Those earlier factors cannot establish exact
+native quantizer equivalence; the corrected reference experiment requires
+all 69 captured activation quantizers to match bitwise before evaluation.
+Using the same captured inputs, all 17 GeGLU blocks also match the pinned
+official operation bitwise. The combined RoPE/Attention boundary differs;
+including the reference's two masked camera slots produces the same observed
+errors as compact active slots. This separates shape padding from the remaining
+arithmetic difference on this case. These operator checks narrow attribution
+to remaining boundaries and quantization loss; they do not waive full-chunk
+failures.
+
+For FP8, applying the fixed quantize/dequantize transforms to all transformer
+projections inside official OpenPI does not reproduce the severe native
+language-scale failure: the decreased-language profile passes both selected
+observations. This factor still uses official floating-point GEMMs and other
+BF16 boundaries. Actual native intermediate tensors are needed to distinguish
+clipping, GEMM arithmetic and propagated floating-point differences.
 
 ### Earlier text-only and constructed inputs (2026-10-17)
 
