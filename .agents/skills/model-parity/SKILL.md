@@ -16,7 +16,9 @@ Two different questions; do not mix their evidence:
 
 ## Protocol (stop at the first failing step)
 
-Before experiments, declare the acceptance matrix and public callers using
+Before experiments, create a missing task plan with `just acceptance init
+<feature>` (it creates the ignored directory), or reuse the existing plan.
+Fill in the acceptance matrix and public callers using
 [agent acceptance](../../../doc/guides/agent-acceptance.md). Include each changed
 public path and each affected family when shared binding/backend code changes.
 Private harness results diagnose internals; they cannot substitute for the
