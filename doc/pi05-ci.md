@@ -50,8 +50,32 @@ A separate candidate uses sixteen observations from four different DROID
 trajectories, with episode identities checked against evaluation. Its fixed
 selection is the union of initial, maximum gripper position, largest gripper
 closure change and final frames; missing recorded prompts are excluded and
-selection does not use model outputs. Qualification of that candidate remains
-pending.
+selection does not use model outputs. This candidate also passes 0/8, versus
+3/8 before and after with the original profile. Both original controls restore
+bitwise. It is rejected; additional calibration data alone has not repaired FP8.
+
+Single-factor experiments keep the original profile and change only scales
+that decreased after recalibration. Changing the language sites makes
+`droid-record1-frame169` fall from cosine 0.99806 / relative L2 0.06224 to
+0.27909 / 1.09974. Changing only the remaining sites gives 0.99759 / 0.07023,
+which still fails individual timesteps. This localizes the severe degradation
+to language scale changes; it does not establish a particular faulty kernel.
+Read-only hooks in the official reference preserve both selected outputs
+bitwise. After excluding masked camera slots and their prefix tokens, the new
+state profile clips zero observed values for frame169, versus 2,800 projection
+input values outside the original profile's ranges. Counts include shared
+Q/K/V inputs separately. These are official BF16 activations, not propagated
+native FP8 activations; they do not prove the native FP8 path avoids clipping.
+
+On Orin, the isolated language-normalization weight preparation correction
+passes 5/8 one-view state cases versus 4/8 originally, but introduces a new
+failure. Keeping only the flow state in FP32 preserves the original failure
+set. Neither factor is promoted. Quantizing/dequantizing FP32 checkpoint
+weights and rowwise activations inside official OpenPI passes all four selected
+state observations; this retains the official floating-point GEMMs and is not
+an integer-GEMM oracle. The original reference restores bitwise after each
+factor. Native integer arithmetic and the remaining boundaries still need
+attribution.
 
 ### Earlier text-only and constructed inputs (2026-10-17)
 
@@ -408,6 +432,21 @@ Historical numerical outputs remain diagnostic evidence, but those stability
 receipts cannot qualify the revised gate. CPU negative controls cover the actual
 call sequence, state leaked only after another input, and opposite deviations
 around the saved accuracy output.
+
+Both boards also pass an actual two-input, old/new/old GPU protocol check for
+both supported precisions. Accuracy outputs restore bitwise, repeat/revisit
+drift is zero, and graph mode, recipes and loaded CUDA libraries are unchanged.
+The same five stability calls take the following phase wall times in milliseconds:
+
+| Board / precision | Old protocol | Consecutive protocol | Old protocol revisit |
+| --- | --- | --- | --- |
+| Thor BF16 | 5279 | 2273 | 4123 |
+| Thor FP8 | 2149 | 1052 | 1789 |
+| Orin BF16 | 16940 | 7887 | 13519 |
+| Orin INT8 | 37942 | 14533 | 25398 |
+
+This measures harness work, including fewer shape recaptures; it is not warm
+model latency, a performance budget, or full-bank stability qualification.
 
 Daily bank policies require an independent `stability_max_abs` budget and an
 explicit positive stability count, chosen after same-input and rebuilt-extension
