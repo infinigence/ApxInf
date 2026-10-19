@@ -130,6 +130,22 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+## Clef decision preparation
+
+The `metal_clef` decision family prepares its existing shapeless decay/beta
+callable during loading, before returning the runner. Its disposable BF16
+operands match the admitted 32 value heads and token lengths 1, 2 and 4096;
+`Compiled::prepare` evaluates both outputs and verifies Rust trace reuse for
+each warm profile. Preparation errors fail loading. Real requests retain the
+original single lazy invocation with their actual layer weights and values.
+
+This is local callable preparation, not a whole-backbone or schema-head
+compiled graph. Other admitted lengths remain valid; the three warm profiles
+do not certify native shader/JIT behavior for every length. Qualification must
+separately check changed operands, unseen lengths, Metal parity, retained
+outputs and warm resources. The non-generative `DecisionRuntime` does not
+borrow the text runtime's readiness status or advertise a fabricated `Ready`.
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
