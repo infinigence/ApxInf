@@ -177,6 +177,13 @@ preference. A missing plan, unknown usage, unavailable API or unacceptable
 CPU assignment leaves the path unqualified. `MLComputePlan` is available
 from macOS 14.4; the program format may require a newer deployment target.
 
+The fixed-profile Clef loader now checks the generated source against owned
+plan facts. Static classification requires typed source values, valid weight
+blob extents and exact operation/input/output correspondence. Missing values,
+unexplained rewrites or non-ANE runtime preference fail preparation. Source
+independence does not prove opaque compiled numeric equality or materialization
+timing; the artifact and execution evidence below is still required.
+
 A compute plan describes anticipated placement, not an execution certificate.
 Qualification also requires saved execution traces for every admitted profile
 and per-layer program through the complete request, including program switches
@@ -200,8 +207,9 @@ unqualified with the blocking reason. An explicit GPU+ANE request must fail, not
 silently select CPU-only Core ML or the GPU-only composition, which remains a separate
 selection. Recheck the plan during preparation and invalidate qualification
 when any bound identity, profile or configuration changes, or when contrary
-placement evidence appears. These are proposed acceptance rules, not an
-implemented status API or a claim that loading enforces placement.
+placement evidence appears. These rules do not introduce a generic status API.
+Loading rejects unacceptable anticipated plans but does not enforce physical
+placement for every prediction.
 
 ## Scoped host-handoff decision
 
