@@ -322,7 +322,8 @@ impl<'a> Admission<'a> {
             )?;
             check(
                 compiled.operator == source.r#type
-                    || compiled.operator.strip_prefix("ios18.") == Some(source.r#type.as_str()),
+                    || compiled.operator.strip_prefix("ios18.") == Some(source.r#type.as_str())
+                    || (source.r#type == "reduce_max" && compiled.operator == "ios16.reduce_max"),
                 "compiled operator does not match its source",
             )?;
             check(
@@ -406,8 +407,12 @@ mod tests {
         let gate = builder.identity(&activation, Some("gate_scale"));
         let magnitude = builder.abs(&convolution);
         let up = builder.identity(&magnitude, Some("up_scale"));
+        let maximum = builder.reduce_max(&input, &[1], true).unwrap();
+        let scaled = builder
+            .mul(&input, apxinf_coreml::Operand::Var(&gate), None)
+            .unwrap();
         let output = builder
-            .mul(&input, apxinf_coreml::Operand::Var(&gate), Some("y"))
+            .mul(&scaled, apxinf_coreml::Operand::Var(&maximum), Some("y"))
             .unwrap();
         builder.finish(&[&output, &gate, &up]).unwrap()
     }
@@ -428,7 +433,11 @@ mod tests {
             .enumerate()
             .map(|(index, operation)| OperationPlacement {
                 path: vec![index],
-                operator: format!("ios18.{}", operation.r#type),
+                operator: if operation.r#type == "reduce_max" {
+                    "ios16.reduce_max".into()
+                } else {
+                    format!("ios18.{}", operation.r#type)
+                },
                 inputs: operation
                     .inputs
                     .iter()
@@ -518,6 +527,22 @@ mod tests {
                 admission.check(&facts).is_err(),
                 "placement variant {variant}"
             );
+        }
+    }
+
+    #[test]
+    fn reduction_namespace_does_not_admit_other_versions_or_operators() {
+        let package = package();
+        let admission = Admission::new(&package, [1, 8, 1, 16]).unwrap();
+        for invalid in ["ios17.reduce_max", "ios160.reduce_max", "ios16.mul"] {
+            let mut facts = facts(&package);
+            let reduction = facts.functions[0]
+                .operations
+                .iter_mut()
+                .find(|operation| operation.operator == "ios16.reduce_max")
+                .unwrap();
+            reduction.operator = invalid.into();
+            assert!(admission.check(&facts).is_err(), "{invalid}");
         }
     }
 
