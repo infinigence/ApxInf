@@ -227,34 +227,32 @@ impl Dit {
 /// The compiled denoise step of one request; it owns the transformer.
 pub struct Step {
     compiled: Compiled,
-    dit: Rc<Dit>,
 }
 
 impl Step {
-    pub fn new(dit: Dit) -> Result<Self> {
-        let dit = Rc::new(dit);
-        let traced = dit.clone();
-        let compiled = Compiled::new(dit.ops.stream(), 1, move |inputs| {
-            Ok(vec![traced.image_forward(inputs)?])
+    pub fn prepare(dit: Dit, inputs: &[Array]) -> Result<(Self, Array)> {
+        let stream = dit.ops.stream().clone();
+        let compiled = Compiled::new(&stream, 1, move |inputs| {
+            Ok(vec![dit.image_forward(inputs)?])
         })?;
-        Ok(Self { compiled, dit })
-    }
-
-    pub fn dit(&self) -> &Dit {
-        &self.dit
+        let first = compiled.prepare(inputs)?.remove(0);
+        Ok((Self { compiled }, first))
     }
 
     /// Velocity prediction `[1, N, 64]` BF16 for one timestep.
-    pub fn call(
-        &self,
+    pub fn inputs(
         latents: &Array,
         timestep: &Array,
         cos: &Array,
         sin: &Array,
         cache: &TextCache,
-    ) -> Result<Array> {
+    ) -> Vec<Array> {
         let mut inputs = vec![latents.clone(), timestep.clone(), cos.clone(), sin.clone()];
         inputs.extend(cache.kv.iter().flat_map(|(k, v)| [k.clone(), v.clone()]));
-        Ok(self.compiled.call(&inputs)?.remove(0))
+        inputs
+    }
+
+    pub fn call(&self, inputs: &[Array]) -> Result<Array> {
+        Ok(self.compiled.call(inputs)?.remove(0))
     }
 }
