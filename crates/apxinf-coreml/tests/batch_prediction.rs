@@ -6,6 +6,7 @@ use apxinf_coreml::{ComputeUnits, ProgramBuilder, ProgramCache};
 use half::f16;
 
 #[test]
+#[ignore = "requires an exclusive native Core ML device lease"]
 fn batch_items_match_single_predictions() -> Result<()> {
     let mut b = ProgramBuilder::new();
     let x = b.input("x", &[1, 8, 1, 16]);
