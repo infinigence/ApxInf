@@ -10,6 +10,25 @@ int apx_coreml_compile(const char* package, const char* compiled);
 /* compute_units: 0 all, 1 CPU only, 2 CPU and GPU, 3 CPU and Neural Engine. */
 int apx_coreml_load(const char* compiled, int32_t compute_units, void** out);
 void apx_coreml_free(void* model);
+typedef struct { const uint8_t* data; size_t len; } ApxPlanString;
+typedef struct { int32_t kind; ApxPlanString class_name; } ApxPlanDevice;
+typedef struct { int32_t name_present; ApxPlanString name; int32_t literal_present; } ApxPlanBinding;
+typedef struct { ApxPlanString name; const ApxPlanBinding* bindings; size_t count; } ApxPlanInput;
+typedef struct { ApxPlanString name; size_t root_operations; } ApxPlanFunction;
+typedef struct {
+    size_t function_index;
+    const size_t* path; size_t path_len;
+    ApxPlanString operator_name;
+    const ApxPlanInput* inputs; size_t input_count;
+    const ApxPlanString* outputs; size_t output_count;
+    const size_t* child_operations; size_t child_count;
+    int32_t usage_present;
+    const ApxPlanDevice* supported; size_t supported_count;
+    int32_t preferred_present; ApxPlanDevice preferred;
+} ApxPlanRow;
+typedef int32_t (*ApxPlanVisitor)(void*, const ApxPlanFunction*, const ApxPlanRow*);
+int apx_coreml_inspect_plan(const char* compiled, int32_t units, uint64_t timeout_ms,
+                          ApxPlanVisitor visitor, void* context);
 /* FP16 inputs and outputs, row-major and contiguous; output strides reported by Core ML are honoured. */
 int apx_coreml_predict(void* model, const char* const* input_names, const uint16_t* const* inputs,
                        const int64_t* const* input_shapes, const size_t* input_ranks, size_t input_count,
