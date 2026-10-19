@@ -73,11 +73,14 @@ test-py:
 # All CPU-only tests.
 test-cpu: test-rust-cpu test-py
 
-# Library GPU tests for one model family (requires an NVIDIA device + checkpoint).
-# e.g. just test-gpu pi05
-test-gpu family:
-    cargo test --release -p apxinf-model --lib --features cuda {{ quote(family) }}
-    cargo test --release -p apxinf-cuda-new --lib {{ quote(family) }}
+# CUDA library tests filtered by family; opt-in checkpoint tests need -- --ignored.
+[positional-arguments]
+test-gpu family *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    family="$1"; shift
+    cargo test --release -p apxinf-model --lib --features cuda "$family" "$@"
+    cargo test --release -p apxinf-cuda-new --lib "$family" "$@"
 
 # L3 candidate tests for apxinf-cuda-new; arch/target-dir overridable, see doc/guides/testing.md.
 [positional-arguments]
@@ -131,8 +134,3 @@ pre-commit: doc-lint boundaries
 
 # Pre-PR check; CI runs the same set.
 pre-pr: pre-commit test-tooling workflow-lint check test-cpu
-
-# Run one of the repo skills from just (handy in CI):
-#   just skill model-port-workflow
-skill name *args:
-    echo "skills are invoked by the agent runtime, e.g. /{{ name }} {{ args }}"

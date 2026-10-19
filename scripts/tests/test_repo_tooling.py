@@ -59,12 +59,12 @@ class ToolingTests(unittest.TestCase):
 
     def test_gpu_recipe_uses_real_features_and_library_targets(self):
         self.stub("cargo")
-        result = self.run_command(["just", "test-gpu", "pi05"])
+        result = self.run_command(["just", "test-gpu", "pi05", "--", "--ignored", "--test-threads=1"])
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = [call["args"][1:] for call in self.calls()]
         self.assertEqual(calls, [
-            ["test", "--release", "-p", "apxinf-model", "--lib", "--features", "cuda", "pi05"],
-            ["test", "--release", "-p", "apxinf-cuda-new", "--lib", "pi05"],
+            ["test", "--release", "-p", "apxinf-model", "--lib", "--features", "cuda", "pi05", "--", "--ignored", "--test-threads=1"],
+            ["test", "--release", "-p", "apxinf-cuda-new", "--lib", "pi05", "--", "--ignored", "--test-threads=1"],
         ])
 
     def test_l3_preserves_arguments_and_arch_override(self):

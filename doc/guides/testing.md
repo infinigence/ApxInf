@@ -61,7 +61,10 @@ just test-gpu <family> runs matching library tests in apxinf-model (with
 targets are selected explicitly with just test-l3 --test <target>; the
 known-broken qwen38_gdn_batched_ops target remains excluded from the
 library suite. Verify the output includes the intended tests: a filter
-matching zero tests is not evidence of GPU correctness.
+matching zero tests is not evidence of GPU correctness. Ignored checkpoint
+tests are not selected by default: provide their required environment and use
+just test-gpu <family> -- --ignored --test-threads=1. This library filter is
+not a substitute for the public-policy end-to-end acceptance harness.
 
 PRs that touch GPU behavior must attach the
 recipe output plus board, arch, and commit, per the PR template. If you
