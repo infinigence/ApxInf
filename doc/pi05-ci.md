@@ -240,6 +240,17 @@ results, **not approved baselines**.
 | Complete private arithmetic diagnostic / Thor BF16 | 8/8, 8/8, 8/8 | 13/13, 13/13, 13/13 | 63/63 |
 | Complete private arithmetic diagnostic / Orin BF16 | 7/8, 8/8, 8/8 | 10/13, 8/13, 9/13 | 50/63 |
 
+An independent offline audit of these archived maintained BF16 receipts checks
+all 126 input-file digests, paired checkpoint/config/suite identities and loaded
+CUDA-library digests, then recomputes whole-chunk and timestep metrics from raw
+outputs. Under the historical whole-chunk policy, Thor passes **59/63** and
+Orin **52/63**, versus 54/63 and 49/63 under the additional checks above. Five
+Thor failures and three Orin failures arise only from those additional checks.
+The remaining four Thor and eleven Orin failures still fail whole-chunk limits;
+they cannot be dismissed by removing timestep checks. These are archived
+pre-final-head runs, not additional current-head qualification. The original
+receipts, thresholds and failure verdicts are preserved.
+
 The private Thor result uses staged Attention, ordered patch projection and an
 action-down provider control. It is not a maintained execution path. Its 60/63
 bitwise outputs, unchanged limits, graph execution and zero repeated/revisited
