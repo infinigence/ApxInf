@@ -23,7 +23,8 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
 
 namespace {
 
-constexpr float kLog2E = 1.4426950408889634074f;
+// Round the product once, as in the reference FA2 parameter construction.
+constexpr double kLog2E = 1.4426950408889634074;
 
 void fill_params(FLASH_NAMESPACE::Flash_fwd_params& params, bool is_bf16,
                  const void* q, const void* k, const void* v, void* output,

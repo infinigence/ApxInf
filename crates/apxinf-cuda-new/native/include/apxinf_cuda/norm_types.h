@@ -54,7 +54,7 @@ typedef enum {
   APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL = 8,
 } apxinf_norm_semantic_t;
 
-#define APXINF_NORM_SPEC_VERSION 1u
+#define APXINF_NORM_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
@@ -63,6 +63,8 @@ typedef struct {
   /* E4M3 output is the fused-quantization form and consumes output_scale.
      BF16/F16 output leaves the scale at one. */
   uint32_t output_dtype;
+  /* Weight/conditioning dtype. FP32 is supported with BF16 RMS activations. */
+  uint32_t parameter_dtype;
   /* A null bias is a different kernel path, so it belongs to the identity. */
   uint32_t has_bias;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */

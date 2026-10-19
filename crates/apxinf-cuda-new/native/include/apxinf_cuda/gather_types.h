@@ -32,7 +32,7 @@ typedef enum {
   APXINF_GATHER_SEMANTIC_REPLACE_ROWS = 3,
 } apxinf_gather_semantic_t;
 
-#define APXINF_GATHER_SPEC_VERSION 2u
+#define APXINF_GATHER_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;

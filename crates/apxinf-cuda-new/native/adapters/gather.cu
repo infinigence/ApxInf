@@ -25,7 +25,10 @@ bool may_have_bias(uint32_t semantic) {
 void validate_spec(const apxinf_gather_spec_t& spec) {
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
       spec.semantic > APXINF_GATHER_SEMANTIC_REPLACE_ROWS ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      (spec.dtype == APXINF_DTYPE_F32 &&
+       spec.semantic != APXINF_GATHER_SEMANTIC_BIAS_POSITION &&
+       spec.semantic != APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES) ||
       spec.has_bias > 1 || spec.nhwc > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
       spec.vocab_size > INT32_MAX || spec.tokens_per_view > INT32_MAX ||
@@ -187,7 +190,9 @@ extern "C" apxinf_status_t apxinf_gather_launch(
     validate_bindings(*spec, *bindings);
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(
-        spec->dtype == APXINF_DTYPE_BF16
+        spec->dtype == APXINF_DTYPE_F32
+            ? launch<float>(*spec, *bindings)
+            : spec->dtype == APXINF_DTYPE_BF16
             ? launch<__nv_bfloat16>(*spec, *bindings)
             : launch<__half>(*spec, *bindings));
   });

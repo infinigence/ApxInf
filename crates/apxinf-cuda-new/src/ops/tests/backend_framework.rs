@@ -108,8 +108,8 @@ fn merged_gemm_contract_rejects_pre_merge_spec_version() {
     let args = GemmArgs::new(&activation, &weight, &mut output);
     let mut normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
-    assert_eq!(normalized.spec.version, 6);
-    normalized.spec.version = 5;
+    assert_eq!(normalized.spec.version, 7);
+    normalized.spec.version = 6;
     let error = match super::execution::prepare(&ctx, normalized) {
         Ok(_) => panic!("pre-merge GEMM spec must be rejected"),
         Err(error) => error,
@@ -379,7 +379,7 @@ fn f16_values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-fn f32_values(tensor: &Tensor) -> Vec<f32> {
+pub(super) fn f32_values(tensor: &Tensor) -> Vec<f32> {
     assert_eq!(tensor.dtype(), DType::F32);
     let buffer = CudaBuffer::from_tensor(tensor).unwrap();
     let mut bytes = vec![0; buffer.len()];
@@ -1492,5 +1492,34 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     assert_eq!(mutable.weight_prepack_count(), 1);
 
     drop(mutable);
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn tf32_gemm_recipe_does_not_reuse_ieee_arithmetic() {
+    let ctx = CudaContext::new(0).unwrap();
+    let cache_dir = scratch_cache_dir("gemm-tf32-arithmetic");
+    let input = f32_tensor(0, vec![1, 32], &vec![1.0; 32]);
+    let weight = f32_tensor(0, vec![32, 32], &vec![0.25; 32 * 32]);
+    let mut output = zeros_tensor(0, vec![1, 32], DType::F32);
+    let mut normalize = |math| {
+        let mut args = GemmArgs::new(&input, &weight, &mut output);
+        args.math = math;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap()
+    };
+    let ieee = normalize(GemmMath::Ieee);
+    super::execution::seed_recipe(&ctx, &ieee, 1, 1, 1, 0).unwrap();
+    super::execution::prepare(&ctx, ieee).unwrap();
+    assert!(super::execution::prepare(&ctx, normalize(GemmMath::Tf32)).is_err());
+    let tf32 = normalize(GemmMath::Tf32);
+    super::execution::seed_recipe(&ctx, &tf32, 1, 1, 1, 0).unwrap();
+    super::execution::prepare(&ctx, tf32).unwrap();
+    let recipes = std::fs::read_dir(&cache_dir).unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|ext| ext == "recipe"))
+        .count();
+    assert_eq!(recipes, 2);
     std::fs::remove_dir_all(cache_dir).unwrap();
 }

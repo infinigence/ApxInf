@@ -36,9 +36,14 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 ||
+      (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && spec.output_dtype != spec.dtype) ||
+      (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 &&
+       spec.dtype != APXINF_DTYPE_BF16) ||
+      (spec.dtype == APXINF_DTYPE_F32 &&
+       spec.semantic != APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION &&
+       spec.semantic != APXINF_POINTWISE_SEMANTIC_EULER_UPDATE) ||
       spec.activation > APXINF_POINTWISE_ACTIVATION_GELU_EXACT ||
       spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
@@ -55,6 +60,10 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
         spec.output_alignment < 2 || spec.rows * spec.cols > INT32_MAX))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Pointwise quantized GeGLU contract");
+  }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16 &&
+      spec.rows * spec.cols > INT32_MAX) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "staged GeGLU size exceeds kernel range");
   }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -89,6 +98,15 @@ void validate_bindings(const apxinf_pointwise_spec_t& spec,
        (spec.output_scale_is_unit != 0)) ||
       !std::isfinite(bindings.dt)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Pointwise scalar");
+  }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16) {
+    const auto input = reinterpret_cast<uintptr_t>(bindings.input);
+    const auto output = reinterpret_cast<uintptr_t>(bindings.output);
+    const size_t bytes = static_cast<size_t>(spec.rows) * spec.cols * sizeof(__nv_bfloat16);
+    if (2 * bytes > UINTPTR_MAX - input || bytes > UINTPTR_MAX - output ||
+        (input < output + bytes && output < input + 2 * bytes)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged GeGLU storage");
+    }
   }
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU &&
       spec.dtype == APXINF_DTYPE_F16 &&
@@ -150,6 +168,7 @@ cudaError_t launch_f16_e4m3_geglu(
   return cudaGetLastError();
 }
 
+template <bool Staged = false>
 cudaError_t launch_bf16_geglu(const __nv_bfloat16* input,
                                      __nv_bfloat16* output, int rows, int cols,
                                      cudaStream_t stream) {
@@ -163,13 +182,13 @@ cudaError_t launch_bf16_geglu(const __nv_bfloat16* input,
       reinterpret_cast<uintptr_t>(input) % alignof(__nv_bfloat162) == 0 &&
       reinterpret_cast<uintptr_t>(output) % alignof(__nv_bfloat162) == 0;
   if (packed4) {
-    geglu_bf16_packed4_kernel<<<elementwise_blocks_for(count / 4), kThreads, 0,
+    geglu_bf16_packed4_kernel<Staged><<<elementwise_blocks_for(count / 4), kThreads, 0,
                                 stream>>>(input, output, rows, cols);
   } else if (packed2) {
-    geglu_bf16_packed2_kernel<<<elementwise_blocks_for(count / 2), kThreads, 0,
+    geglu_bf16_packed2_kernel<Staged><<<elementwise_blocks_for(count / 2), kThreads, 0,
                                 stream>>>(input, output, rows, cols);
   } else {
-    geglu_bf16_kernel<<<elementwise_blocks_for(count), kThreads, 0, stream>>>(
+    geglu_bf16_kernel<Staged><<<elementwise_blocks_for(count), kThreads, 0, stream>>>(
         input, output, rows, cols);
   }
   return cudaGetLastError();
@@ -251,6 +270,9 @@ cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU) {
     return launch_bf16_geglu(input, output, rows, cols, stream);
   }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU_STAGED_BF16) {
+    return launch_bf16_geglu<true>(input, output, rows, cols, stream);
+  }
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION) {
     return launch_bf16_bias_activation(
         input, bias, output, rows, cols, static_cast<int>(spec.activation),
@@ -284,7 +306,9 @@ extern "C" apxinf_status_t apxinf_pointwise_launch(
       return;
     }
     apxinf::framework::check_cuda(
-        spec->dtype == APXINF_DTYPE_BF16
+        spec->dtype == APXINF_DTYPE_F32
+            ? launch<float>(*spec, *bindings)
+            : spec->dtype == APXINF_DTYPE_BF16
             ? launch_bf16(*spec, *bindings)
             : launch<__half>(*spec, *bindings));
   });

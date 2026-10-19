@@ -918,6 +918,11 @@ impl ModelRunner {
 
 #[pymethods]
 impl ModelRunner {
+    /// Current native execution path, for correctness and benchmark diagnostics.
+    fn execution_mode(&self) -> PyResult<&'static str> {
+        Ok(self.model.vla().map_err(runtime_err)?.execution_mode())
+    }
+
     /// Load a VLA checkpoint through the unified `AutoModel` frontend.
     ///
     /// * `model` — model name, e.g. `"pi05"`.

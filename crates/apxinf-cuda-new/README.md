@@ -8,12 +8,30 @@ Preparation and graph capture have different owners. GEMM and Attention may own 
 - Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
 
 The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
+BF16 `rms_norm`, `bias_residual_rms_norm`, `adaptive_rms_norm` and
+`ada_gate_residual_rms_norm` also
+accept FP32 weights/conditioning without downcasting those parameters. The
+mixed gated form rounds the gate and gated projection to BF16 before residual
+addition, then applies FP32 normalization and affine conditioning. Its Spec
+version 2 records the parameter dtype; the ordinary same-dtype paths retain
+their existing behavior.
+BF16 LayerNorm uses a four-warp vectorized Welford reduction when the width
+is divisible by four, preserving the frozen PyTorch 2.9.1 reduction order.
+The fused residual/LayerNorm path retains the rounded residual boundary.
+BF16 `gemm_bias` keeps accumulation in FP32 through bias addition. cuBLASLt
+uses its native bias epilogue for unit-scale BF16 output; the generic vendor
+path uses an FP32 intermediate. Operand and bias storage remain BF16.
+This differs from explicitly composing a BF16 `gemm` output and a later bias
+operation, which rounds the projection before bias.
 The BF16 MLP helper remains available as
 `ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
 signature and is used by the Qwen integration tests.
-GEMM Spec version 6 combines NVFP4 block-scale bindings with the
-`GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
-across these incompatible layouts.
+GEMM Spec version 7 records the explicit FP32 multiplication mode in addition
+to NVFP4 block scales and fused semantics. Earlier specs are rejected.
+`GemmMath::Tf32` is opt-in for plain FP32 GEMM; default arithmetic is unchanged.
+The cuBLAS candidate prepares its workspace and any vector-weight packing before
+capture. Mutable weights are repacked on each enqueue; immutable weights may be
+packed once during preparation. Both allocations count against the resource limit.
 
 ## Operator Layers: L3 to L0
 
@@ -238,3 +256,24 @@ outputs with unit and non-unit scales. The framework regression covers recipe
 restoration, all three split schedules, resource rejection, and unsupported
 M789/configuration rejection. Changing these adapter sources invalidates old
 recipes through the normal operator build fingerprint.
+
+### BF16 vision Attention arithmetic
+
+The head-dimension-96 BF16 FA2 specialization keeps the Softmax multiply and
+subtract separate and uses precise division. Its build flags are included in
+the Attention fingerprint, so older recipes cannot be reused silently. The
+host converts the log2-scaled Softmax constant only after the double-precision
+product. `bf16_attention_preserves_softmax_rounding` uses fixed generated inputs
+and independent CUDA PyTorch 2.9.1 outputs, including changed-input graph replay
+for batches 1–3. This operator result does not qualify full PI05 accuracy.
+
+### Pageable host uploads and nonblocking streams
+
+Synchronous host upload helpers wait for the default-stream DMA before returning.
+CUDA permits a pageable H2D `cudaMemcpy` to return after host staging, while the
+DMA is still pending; a nonblocking graph stream has no implicit dependency on
+that copy ([CUDA synchronization behavior](https://docs.nvidia.com/cuda/archive/12.2.1/cuda-runtime-api/api-sync-behavior.html)).
+`CudaBuffer::copy_from_host` and `transfers::copy_cpu_to_cuda` share the completed
+upload primitive. This wait concerns the upload stream, not a device-wide wait.
+The attention regression alternates original and zero values through graph replay
+for 1–3 batches; a separate transfer test covers both public upload entry points.

@@ -65,12 +65,27 @@ cudaDataType_t projection_cuda_dtype(const vendor::CommonResources& common) {
   return CUDA_R_16BF;
 }
 
+bool native_dense_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.output_scale_is_unit != 0;
+}
+
+// Native bias is part of the GEMM epilogue, so it needs no projection buffer.
+Spec allocation_spec(const Spec& spec) {
+  Spec result = spec;
+  if (native_dense_bias(spec)) result.semantic = APXINF_GEMM_SEMANTIC_GEMM;
+  return result;
+}
+
 size_t common_requirement(const Spec& spec, bool native_fp8) {
   const bool needs_zero_bias =
       native_fp8 &&
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
       spec.bias_alignment == 0;
-  return vendor::common_resource_requirements(spec, native_fp8) +
+  return vendor::common_resource_requirements(allocation_spec(spec), native_fp8) +
          (needs_zero_bias
               ? static_cast<size_t>(spec.n) * dtype_bytes(APXINF_DTYPE_F16)
               : 0);
@@ -87,7 +102,8 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   const int heuristic_rank =
       split_geglu ? state.configuration / 3 : state.configuration;
   resources->common.projection_dtype =
-      native_fp4 ? APXINF_DTYPE_BF16 : vendor::common_projection_dtype(spec);
+      native_fp4 ? APXINF_DTYPE_BF16
+                 : vendor::common_projection_dtype(allocation_spec(spec));
   const size_t c_buffer_bytes =
       (direct_fp8_gelu || split_geglu)
           ? static_cast<size_t>(spec.m * projection_stride) * sizeof(half)
@@ -106,7 +122,9 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   cudaDataType_t input_type =
       spec.a_dtype == APXINF_DTYPE_I8
           ? CUDA_R_8I
-          : native_fp8 ? CUDA_R_8F_E4M3 : projection_type;
+          : native_fp8 ? CUDA_R_8F_E4M3
+                       : spec.a_dtype == APXINF_DTYPE_BF16 ? CUDA_R_16BF
+                                                            : projection_type;
   const cublasComputeType_t compute_type =
       spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                       : CUBLAS_COMPUTE_32F;
@@ -175,7 +193,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     check_cublas(cublasLtMatmulDescSetAttribute(
         resources->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
         &state.bindings.bias, sizeof(state.bindings.bias)));
-  } else if (native_bias || native_bias_residual) {
+  } else if (native_bias || native_bias_residual || native_dense_bias(spec)) {
     const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
     check_cublas(cublasLtMatmulDescSetAttribute(
         resources->operation, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
@@ -214,6 +232,19 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   if (status != CUBLAS_STATUS_SUCCESS) {
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
+  }
+  if (spec.a_dtype == APXINF_DTYPE_BF16 &&
+      spec.accumulation_dtype == APXINF_DTYPE_F32) {
+    // In-place/output-type split-K rounds partial sums to BF16. Preserve the
+    // declared FP32 accumulation through the reduction, including bias.
+    const uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    status = cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+        &reduction, sizeof(reduction));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatmulPreferenceDestroy(preference);
+      check_cublas(status);
+    }
   }
   cublasLtMatmulHeuristicResult_t candidates[8]{};
   int candidate_count = 0;
@@ -256,7 +287,8 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->split_geglu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
-    vendor::allocate_common_resources(spec, resources->common, native_fp8);
+    vendor::allocate_common_resources(allocation_spec(spec), resources->common,
+                                      native_fp8);
   }
   if (resources->workspace_bytes != 0) {
     check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));

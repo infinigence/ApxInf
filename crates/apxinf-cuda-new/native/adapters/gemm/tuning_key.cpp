@@ -58,6 +58,7 @@ std::string common_key(const Spec& spec,
       << "|driver=" << cuda_compat_version(driver_version)
       << "|cublaslt=" << cublasLtGetVersion() << "|op|"
       << spec.version << '|' << static_cast<uint32_t>(spec.semantic) << '|'
+      << spec.math << '|'
       << spec.m << '|' << spec.n << '|' << spec.k << '|' << spec.a_dtype << '|'
       << spec.b_dtype << '|' << spec.accumulation_dtype << '|'
       << spec.output_dtype << '|' << spec.quantization << '|'

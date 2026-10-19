@@ -8,6 +8,8 @@ use crate::{CudaBuffer, CudaContext};
 pub enum RopeSemantic {
     /// Grouped-query split with rotary embedding on Q and K.
     SplitQkvRope,
+    /// BF16 frequency, sin/cos, bias sum and rotary-product boundaries.
+    SplitQkvRopeStagedBf16,
     /// Vision MHA split with an optional bias and no rotation.
     SplitQkvBias,
 }
@@ -16,12 +18,13 @@ impl RopeSemantic {
     fn code(self) -> u32 {
         match self {
             Self::SplitQkvRope => 0,
+            Self::SplitQkvRopeStagedBf16 => 5,
             Self::SplitQkvBias => 1,
         }
     }
 
     fn applies_rope(self) -> bool {
-        matches!(self, Self::SplitQkvRope)
+        matches!(self, Self::SplitQkvRope | Self::SplitQkvRopeStagedBf16)
     }
 }
 
@@ -152,6 +155,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
     }
 
     let dtype = args.qkv.dtype();
+    if semantic == RopeSemantic::SplitQkvRopeStagedBf16 && dtype != DType::BF16 {
+        return Err(invalid("staged rotary arithmetic requires BF16 tensors"));
+    }
     let mut storage = Vec::new();
 
     let qkv_elements = tokens
@@ -199,6 +205,27 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
     let v_buffer = tensor_storage(ctx, args.v, dtype, kv_elements)?;
     let v = v_buffer.ptr() as *mut std::ffi::c_void;
     storage.push(v_buffer);
+
+    if semantic == RopeSemantic::SplitQkvRopeStagedBf16 {
+        for index in storage.len() - 3..storage.len() {
+            let output = &storage[index];
+            let output_start = output.ptr() as usize;
+            let end = output_start
+                .checked_add(output.len())
+                .ok_or_else(|| invalid("RoPE output address overflow"))?;
+            for other in &storage[..index] {
+                let other_start = other.ptr() as usize;
+                let other_end = other_start
+                    .checked_add(other.len())
+                    .ok_or_else(|| invalid("RoPE binding address overflow"))?;
+                if output_start < other_end && other_start < end {
+                    return Err(invalid(
+                        "staged RoPE outputs must not overlap other bindings",
+                    ));
+                }
+            }
+        }
+    }
 
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
@@ -249,4 +276,21 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
         bindings,
         storage,
     })
+}
+
+#[cfg(test)]
+impl RopeSemantic {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::SplitQkvRope,
+        Self::SplitQkvBias,
+        Self::SplitQkvRopeStagedBf16,
+    ];
+
+    pub(crate) fn doc_id(self) -> &'static str {
+        match self {
+            Self::SplitQkvRope => "rope_split_qkv",
+            Self::SplitQkvBias => "rope_split_qkv_bias",
+            Self::SplitQkvRopeStagedBf16 => "rope_split_qkv_staged_bf16",
+        }
+    }
 }

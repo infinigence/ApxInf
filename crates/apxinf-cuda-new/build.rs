@@ -647,6 +647,12 @@ fn main() {
             // unused combinatorial kernel set. The shared constant makes the
             // exact compile policy part of the Attention build fingerprint.
             command.args(attention_fingerprint::FA2_FIXED_FEATURE_DEFINES);
+            if source
+                .file_name()
+                .is_some_and(|name| name == "fa2_fwd_hdim96_bf16.cu")
+            {
+                command.args(attention_fingerprint::FA2_BF16_HDIM96_FLAGS);
+            }
             command.arg(if is_fa2_e4m3 {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2_direct_e4m3"
             } else {

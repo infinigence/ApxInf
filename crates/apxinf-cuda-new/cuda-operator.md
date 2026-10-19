@@ -30,6 +30,21 @@ GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the fi
 
 Block-scale tensors must be in the layout the candidate reads, which is **not** a plain `[rows, K/block_size]` array. Build them once with `ops::nvfp4_pack_block_scales` into a buffer sized by `ops::nvfp4_scale_buffer_bytes`; the layout depends only on `block_size`, so the result stays valid when the autotuner selects a different configuration.
 
+`GemmArgs.math` defaults to `GemmMath::Ieee`. Plain FP32 `gemm` may explicitly
+select `GemmMath::Tf32`, permitting TF32 input multiplication with FP32
+accumulation and output. This arithmetic choice is part of the Spec and recipe
+key; it is rejected for quantized or fused calls. It does not promise bitwise
+equality across GPU architectures or library versions.
+`tf32_gemm_all_candidates_match_reference` checks independent exact products;
+`tf32_gemm_validates_contract_and_replays_changed_weights` covers resource
+accounting and mutable-weight graph replay.
+
+BF16 GEMM's FP32 accumulation policy also covers split-K partial sums.
+Candidates must not reduce those partial sums in BF16 before the epilogue.
+`bf16_gemm_preserves_f32_split_k_reduction` checks all candidates with an
+independent, exactly representable cancellation case, with and without bias.
+This does not require identical FP32 reduction order across candidates.
+
 Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
 <!-- l3-operator:gemm -->
@@ -139,3 +154,101 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+## Fixed RoPE semantics
+
+These operators launch directly and retain bindings for graph lifetime. They
+use RoPE Spec version 4 and do not tune or persist recipes.
+
+<!-- l3-operator:rope_split_qkv -->
+### `rope` / `SplitQkvRope`
+
+Split `[tokens, (q_heads + 2*kv_heads)*head_dim]` F16/BF16 QKV, optionally add
+bias, then rotate Q/K using FP32 frequencies and products before output casting.
+Q is `[tokens, q_heads, head_dim]`; K/V may append at `kv_output_offset`.
+Heads require an even nonzero dimension, positive finite theta and sufficient
+output storage. Existing float-intermediate semantics are preserved.
+
+<!-- l3-operator:rope_split_qkv_bias -->
+### `rope` / `SplitQkvBias`
+
+Split F16/BF16 MHA QKV with optional bias and no rotary operation. Query and KV
+head counts must agree; both offsets are zero.
+
+<!-- l3-operator:rope_split_qkv_staged_bf16 -->
+### `rope` / `SplitQkvRopeStagedBf16`
+
+Use the split/append geometry above with BF16 tensors and disjoint outputs.
+Compute `1 / theta^(2*i/head_dim)` in FP32, round frequency to BF16, compute
+position times frequency in FP32, then round sin/cos to BF16. Round any bias sum
+and each rotary product to BF16 before the final BF16 sum/difference. This
+explicit rounding semantic shares one kernel launch with the split; it does
+not allocate tables or copy intermediate activations to the host.
+
+Independent Torch fixtures cover head dimensions 8/256, positions through 1017,
+optional bias, appended KV rows, eager output and changed-input graph replay.
+`staged_rope_rejects_invalid_bindings` covers dtype and alias rejection.
+
+<!-- l3-operator:rope_decode -->
+### `decode_rope`
+
+Single-token BF16 Q rotation and K/V cache append. The position is read from a
+stable device u32 during execution/replay; the cache capacity is validated.
+
+<!-- l3-operator:rope_axial -->
+### `split_qkv_axial_rope`
+
+BF16 packed MHA QKV with two-axis height/width positions. The head dimension is
+a multiple of four, at most 256, and the rotary dimension equals the head dimension.
+
+<!-- l3-operator:rope_partial_multimodal -->
+### `multimodal_rope`
+
+In-place BF16 partial temporal/height/width rotary embedding. The supported
+rotary dimension is 64 with pair sections 11/11/10 and explicit device positions.
+
+## Pointwise
+
+<!-- l3-operator:pointwise_geglu -->
+### `PointwiseSemantic::Geglu`
+
+Contiguous `[rows, 2 * cols]` gate/up input to `[rows, cols]` output:
+`gelu_tanh(gate) * up`. F16 and BF16 preserve FP32 activation intermediates;
+F16-to-E4M3 additionally supports an explicit output scale. The direct adapter
+selects scalar or aligned vector kernels and does not persist recipes.
+
+<!-- l3-operator:pointwise_geglu_staged_bf16 -->
+### `PointwiseSemantic::GegluStagedBf16`
+
+BF16 input/output only. Computes `BF16(BF16(gelu_tanh(gate)) * up)`;
+input and output must not overlap. Scalar, packed-2 and packed-4 kernels share
+this rounding contract. Fixed Torch fixtures cover those paths and PI0.5
+widths 8192/16384, eager/captured execution, and changed-input replay.
+
+<!-- l3-operator:pointwise_bias_activation -->
+### `PointwiseSemantic::BiasActivation`
+
+F16/BF16 `[rows, cols]` input with optional `[cols]` bias, followed by the
+explicitly selected None, GELU-tanh, GELU-erf or SiLU activation. A call with
+neither bias nor activation is rejected.
+
+<!-- l3-operator:pointwise_euler_update -->
+### `PointwiseSemantic::EulerUpdate`
+
+F16/BF16 state and velocity `[rows, cols]`, output `state + dt * velocity`.
+The finite step size is a dynamic binding. Pointwise captures retain their
+input/output storage until the graph is destroyed; no preparation or tuning
+runs during capture.
+
+### FP32 frontend extensions
+
+`PointwiseSemantic::BiasActivation` and `EulerUpdate` additionally accept F32
+bindings with matching input/output/bias/secondary dtypes. FP32 Euler preserves
+separate rounded multiply and add. Other pointwise F32 combinations fail.
+
+`GatherSemantic::RgbToPatches` and `BiasPosition` additionally accept F32 output.
+RGB input is uint8 NHWC/NCHW; division, scaling and subtraction round in F32.
+Bias-position requires matching F32 operands and evaluates projection plus bias
+before adding position. Existing F16/BF16 arithmetic is unchanged. These direct
+paths capture without tuning, retain tensor storage, and cover all RGB values,
+1–3 views, both image layouts and changed-input replay in GPU tests.
