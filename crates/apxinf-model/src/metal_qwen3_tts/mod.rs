@@ -247,7 +247,7 @@ impl QwenTts {
                 )?
             };
             let logits = self.model.predictor(&inputs, group, &mut cache)?;
-            codes.push(self.sampler.sample(&logits, &[], &[])?);
+            codes.push(self.sampler.sample(&logits, None, &[])?);
         }
         let all = Array::concat(&codes.iter().collect::<Vec<_>>(), 1)?;
         let mut embeds = vec![embed(&self.model.talker.codec_embedding, &codes[0])?];
@@ -266,25 +266,32 @@ impl SpeechRuntime for QwenTts {
         self.sampler.seed(request.seed)?;
         let (mut embeds, pad) = self.prefill(request)?;
         stream.eval(&[embeds.clone(), pad.clone()])?;
+        self.ops.prepare_rope(embeds.shape()[1])?;
         let eos = self.config.tokens.codec_eos;
+        let eos = Array::from_i32(&stream, &[], &[eos as i32])?.cast(apxinf_mlx::MlxDType::U32)?;
         // Codec ids 2048..3072 except EOS are control tokens; EOS is also
         // suppressed for the first two frames.
         let control: Vec<u32> = (VOCAB as u32 - 1024..VOCAB as u32)
-            .filter(|&i| i != eos)
+            .filter(|&i| i != self.config.tokens.codec_eos)
             .collect();
-        let early: Vec<u32> = control.iter().copied().chain([eos]).collect();
+        let early: Vec<u32> = control
+            .iter()
+            .copied()
+            .chain([self.config.tokens.codec_eos])
+            .collect();
         let limit = self.config.sampling.max_frames;
         let mut cache = new_caches(self.model.talker.layers.len());
-        let (mut history, mut frames) = (Vec::new(), Vec::new());
+        let mut history = sample::History::new(&stream, VOCAB)?;
+        let mut frames = Vec::new();
         let mut complete = false;
         for step in 0..limit {
             let (logits, hidden) = self.model.talker(&embeds, &mut cache)?;
             let suppress = if step < 2 { &early } else { &control };
-            let token = self.sampler.sample(&logits, &history, suppress)?;
+            let token = self.sampler.sample(&logits, Some(&history), suppress)?;
             token.eval()?;
-            let first = token.to_u32_scalar()?;
-            history.push(first);
-            if first == eos {
+            history.push(&token)?;
+            let stop = token.equal(&eos)?.to_bytes()?;
+            if stop[0] != 0 {
                 complete = true;
                 break;
             }

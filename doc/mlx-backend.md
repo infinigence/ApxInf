@@ -184,6 +184,12 @@ keep the composed reference until their numerical and timing gates pass.
 
 - Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
   logits by inverse CDF, where 0.31.2 used Gumbel-max.
+- The [family-scoped EOS decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary)
+  permits only a stopping Boolean on host. First-code ids and repetition
+  membership remain device arrays. Top-k/categorical vocabulary profiles and
+  local GELU/RoPE prepare explicitly; request-length RoPE prepares before the
+  Talker. This is local compilation, not a prepared full speech loop, and does
+  not establish numerical, resource or performance qualification.
 - As in mlx-audio, the waveform decoder's transformer uses a full causal mask;
   the checkpoint's `sliding_window` of 72 frames is not applied.
 - The checkpoint ships no `tokenizer.json`; the family builds the tokenizer
