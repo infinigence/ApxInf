@@ -177,7 +177,9 @@ fn recomputed_buffer(name: &str) -> bool {
 
 impl Transformer {
     pub fn load(stream: &Stream, dir: &Path) -> Result<Self> {
-        let map = apxinf_mlx::load_safetensors(stream, &files(dir)?, |n| !recomputed_buffer(n))?;
+        let files = files(dir)?;
+        headers(&files)?;
+        let map = apxinf_mlx::load_safetensors(stream, &files, |n| !recomputed_buffer(n))?;
         let mut t = Take {
             map,
             what: "Qwen-Image transformer",
@@ -227,7 +229,9 @@ impl Decoder {
     pub const DIMS: [usize; 6] = [1152, 1152, 1152, 576, 288, 144];
 
     pub fn load(stream: &Stream, dir: &Path) -> Result<Self> {
-        let map = apxinf_mlx::load_safetensors(stream, &files(dir)?, |n| {
+        let files = files(dir)?;
+        headers(&files)?;
+        let map = apxinf_mlx::load_safetensors(stream, &files, |n| {
             n.starts_with("decoder.") || n.starts_with("post_quant_conv.")
         })?;
         let mut t = Take {
@@ -329,6 +333,80 @@ fn text_tensor(name: &str) -> Option<(MlxDType, Vec<usize>)> {
 /// SafeTensors dtype, shape and file of one tensor.
 type Header = (String, Vec<usize>, PathBuf);
 
+fn header_entries(raw: &[u8], payload_bytes: u64) -> Result<HashMap<String, (String, Vec<usize>)>> {
+    let header: HashMap<String, serde_json::Value> = serde_json::from_slice(raw)
+        .map_err(|error| Error::Other(format!("Qwen-Image SafeTensors header: {error}")))?;
+    if let Some(value) = header.get("__metadata__") {
+        let metadata = value
+            .as_object()
+            .ok_or_else(|| Error::Other("malformed SafeTensors metadata".into()))?;
+        if let Some(level) = metadata.get("quantization_level") {
+            if level.as_str() != Some("4") {
+                return Err(Error::Other(
+                    "Qwen-Image quantization_level must be the string 4 when present".into(),
+                ));
+            }
+        }
+    }
+    let mut entries = HashMap::new();
+    let mut ranges = Vec::new();
+    for (name, info) in header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = info.get("dtype").and_then(|value| value.as_str());
+        let shape: Option<Vec<usize>> = info
+            .get("shape")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        let (Some(dtype), Some(shape)) = (dtype, shape) else {
+            return Err(Error::Other(format!("malformed header entry `{name}`")));
+        };
+        let size = match dtype {
+            "BOOL" | "U8" | "I8" => 1u64,
+            "U16" | "I16" | "F16" | "BF16" => 2,
+            "U32" | "I32" | "F32" => 4,
+            "U64" | "I64" | "F64" => 8,
+            _ => {
+                return Err(Error::Other(format!(
+                    "unsupported dtype `{dtype}` for `{name}`"
+                )))
+            }
+        };
+        let bytes = shape
+            .iter()
+            .try_fold(size, |total, dimension| {
+                total.checked_mul(*dimension as u64)
+            })
+            .ok_or_else(|| Error::Other(format!("tensor `{name}` byte extent overflows")))?;
+        let offsets = info
+            .get("data_offsets")
+            .and_then(|value| serde_json::from_value::<[u64; 2]>(value.clone()).ok())
+            .ok_or_else(|| Error::Other(format!("tensor `{name}` has malformed data_offsets")))?;
+        let [start, end] = offsets;
+        if end.checked_sub(start) != Some(bytes) || end > payload_bytes {
+            return Err(Error::Other(format!("tensor `{name}` data_offsets [{start}, {end}] do not match {bytes} bytes within payload {payload_bytes}")));
+        }
+        ranges.push((start, end, name.clone()));
+        entries.insert(name, (dtype.to_owned(), shape));
+    }
+    ranges.sort_unstable();
+    let mut consumed = 0;
+    for (start, end, name) in ranges {
+        if start != consumed {
+            return Err(Error::Other(format!(
+                "tensor `{name}` data_offsets leave a hole or overlap"
+            )));
+        }
+        consumed = end;
+    }
+    if consumed != payload_bytes {
+        return Err(Error::Other(
+            "SafeTensors data_offsets do not cover the complete payload".into(),
+        ));
+    }
+    Ok(entries)
+}
+
 /// Tensor name -> header entry, read from file headers only.
 fn headers(files: &[PathBuf]) -> Result<HashMap<String, Header>> {
     let mut out = HashMap::new();
@@ -347,21 +425,17 @@ fn headers(files: &[PathBuf]) -> Result<HashMap<String, Header>> {
         reader
             .read_exact(&mut raw)
             .map_err(|e| fail(e.to_string()))?;
-        let header: HashMap<String, serde_json::Value> =
-            serde_json::from_slice(&raw).map_err(|e| fail(e.to_string()))?;
-        for (name, info) in header {
-            if name == "__metadata__" {
-                continue;
-            }
-            let dtype = info.get("dtype").and_then(|v| v.as_str());
-            let shape: Option<Vec<usize>> = info
-                .get("shape")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-            let (Some(dtype), Some(shape)) = (dtype, shape) else {
-                return Err(fail(format!("malformed header entry `{name}`")));
-            };
+        let payload_bytes = reader
+            .metadata()
+            .map_err(|error| fail(error.to_string()))?
+            .len()
+            .checked_sub(8 + length)
+            .ok_or_else(|| fail("truncated SafeTensors header".into()))?;
+        for (name, (dtype, shape)) in
+            header_entries(&raw, payload_bytes).map_err(|error| fail(error.to_string()))?
+        {
             if out
-                .insert(name.clone(), (dtype.to_owned(), shape, file.clone()))
+                .insert(name.clone(), (dtype, shape, file.clone()))
                 .is_some()
             {
                 return Err(fail(format!("duplicate tensor `{name}`")));
@@ -461,6 +535,88 @@ impl TextEncoderFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the pinned Qwen-Image checkpoint headers"]
+    fn real_checkpoint_headers_validate_without_materializing_payloads() -> Result<()> {
+        let root = PathBuf::from(
+            std::env::var("APXINF_QWEN_IMAGE_CHECKPOINT")
+                .expect("set APXINF_QWEN_IMAGE_CHECKPOINT"),
+        );
+        TextEncoderFiles::open(&root.join("text_encoder"))?;
+        for component in ["transformer", "vae"] {
+            assert!(!headers(&files(&root.join(component))?)?.is_empty());
+        }
+        Ok(())
+    }
+
+    fn parse_header(
+        value: &serde_json::Value,
+        payload_bytes: u64,
+    ) -> Result<HashMap<String, (String, Vec<usize>)>> {
+        header_entries(&serde_json::to_vec(value).unwrap(), payload_bytes)
+    }
+
+    #[test]
+    fn headers_accept_valid_payload_and_optional_export_metadata() {
+        let mut value =
+            serde_json::json!({"x": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}});
+        assert_eq!(
+            parse_header(&value, 4).unwrap()["x"],
+            ("BF16".into(), vec![2])
+        );
+        value["__metadata__"] =
+            serde_json::json!({"quantization_level": "4", "mflux_version": "0.19.2"});
+        assert!(parse_header(&value, 4).is_ok());
+    }
+
+    #[test]
+    fn headers_reject_quantization_metadata_without_changing_tensors() {
+        let mut value =
+            serde_json::json!({"x": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}});
+        for metadata in [
+            serde_json::json!({"quantization_level": "8"}),
+            serde_json::json!({"quantization_level": 4}),
+        ] {
+            value["__metadata__"] = metadata;
+            assert!(parse_header(&value, 4).is_err());
+        }
+    }
+
+    #[test]
+    fn headers_reject_invalid_offsets_extents_and_overflow() {
+        let original =
+            serde_json::json!({"x": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]}});
+        for offsets in [
+            serde_json::json!(null),
+            serde_json::json!([3, 2]),
+            serde_json::json!([0, 5]),
+            serde_json::json!([0, 3]),
+            serde_json::json!([-1, 4]),
+            serde_json::json!([0, u64::MAX]),
+        ] {
+            let mut value = original.clone();
+            value["x"]["data_offsets"] = offsets;
+            assert!(parse_header(&value, 4).is_err());
+        }
+        let mut overflow = original;
+        overflow["x"]["shape"] = serde_json::json!([usize::MAX, usize::MAX]);
+        assert!(parse_header(&overflow, 4).is_err());
+    }
+
+    #[test]
+    fn headers_reject_payload_overlap_holes_and_trailing_bytes() {
+        let mut value = serde_json::json!({
+            "x": {"dtype": "BF16", "shape": [2], "data_offsets": [0, 4]},
+            "y": {"dtype": "BF16", "shape": [2], "data_offsets": [4, 8]}
+        });
+        assert!(parse_header(&value, 8).is_ok());
+        assert!(parse_header(&value, 10).is_err());
+        value["y"]["data_offsets"] = serde_json::json!([2, 6]);
+        assert!(parse_header(&value, 6).is_err());
+        value["y"]["data_offsets"] = serde_json::json!([6, 10]);
+        assert!(parse_header(&value, 10).is_err());
+    }
 
     #[test]
     fn text_tensor_names_are_exact() {
