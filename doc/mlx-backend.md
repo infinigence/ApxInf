@@ -188,8 +188,12 @@ keep the composed reference until their numerical and timing gates pass.
   permits only a stopping Boolean on host. First-code ids and repetition
   membership remain device arrays. Top-k/categorical vocabulary profiles and
   local GELU/RoPE prepare explicitly; request-length RoPE prepares before the
-  Talker. This is local compilation, not a prepared full speech loop, and does
-  not establish numerical, resource or performance qualification.
+  Talker. The selected predictor fusion evaluates each retained layer on
+  materialized one/two-row scratch inputs at load. The decoder prepares the
+  exact GELU profiles derived from its actual chunk lengths and loaded widths
+  before waveform execution. This is local compilation, not a prepared full
+  speech loop, and does not establish numerical, resource, native-JIT or
+  performance qualification. Warm calls remain in complete load/request timing.
 - As in mlx-audio, the waveform decoder's transformer uses a full causal mask;
   the checkpoint's `sliding_window` of 72 frames is not applied.
 - The checkpoint ships no `tokenizer.json`; the family builds the tokenizer

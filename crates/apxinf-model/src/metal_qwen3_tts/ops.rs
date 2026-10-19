@@ -59,6 +59,7 @@ mod tests {
             assert_eq!(actual_query.to_bytes()?, expected[0].to_bytes()?);
             assert_eq!(actual_key.to_bytes()?, expected[1].to_bytes()?);
         }
+        ops.prepare_gelu(&[1, 17, 4096])?;
         let values = Array::from_f32(&stream, &[1, 17, 4096], &vec![0.75; 17 * 4096])?
             .cast(MlxDType::BF16)?;
         values.eval()?;
@@ -136,6 +137,13 @@ impl Ops {
         )?;
         let table = Array::zeros(&self.stream, &[1, length, HEAD_DIM], MlxDType::BF16)?;
         drop(self.rope.prepare(&[query, key, table.clone(), table])?);
+        Ok(())
+    }
+
+    pub fn prepare_gelu(&self, shape: &[usize]) -> Result<()> {
+        let scratch = Array::zeros(&self.stream, shape, MlxDType::BF16)?;
+        scratch.eval()?;
+        drop(self.gelu.prepare(&[scratch])?);
         Ok(())
     }
 

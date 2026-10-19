@@ -95,6 +95,70 @@ fn heads(x: &Array, n: usize) -> Result<Array> {
     x.reshape(&[b, l, n, HEAD_DIM])
 }
 
+fn prepare_predictor_mlp(kernel: &SwigluMlpGemv, mlp: &Mlp) -> Result<SwigluWeights> {
+    let weights = kernel.prepare(&mlp.gate.weight, &mlp.up.weight, &mlp.down.weight)?;
+    for rows in [1, 2] {
+        let scratch = Array::zeros(
+            mlp.gate.weight.stream(),
+            &[1, rows, mlp.gate.weight.shape()[1]],
+            mlp.gate.weight.dtype(),
+        )?;
+        scratch.eval()?;
+        for _ in 0..2 {
+            kernel.call(&scratch, &weights)?.eval()?;
+        }
+    }
+    Ok(weights)
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::super::weights::Linear;
+    use super::*;
+    use apxinf_mlx::Stream;
+
+    #[test]
+    #[ignore = "requires native Apple Metal; does not qualify architecture selection"]
+    fn predictor_warmup_keeps_changed_inputs_on_device() -> Result<()> {
+        let stream = Stream::metal(0)?;
+        let linear = |shape: &[usize]| -> Result<Linear> {
+            Ok(Linear {
+                weight: Array::zeros(&stream, shape, MlxDType::BF16)?.add(&Array::scalar(
+                    &stream,
+                    0.001,
+                    MlxDType::BF16,
+                )?)?,
+                bias: None,
+            })
+        };
+        let mlp = Mlp {
+            gate: linear(&[3072, 1024])?,
+            up: linear(&[3072, 1024])?,
+            down: linear(&[1024, 3072])?,
+        };
+        let kernel = SwigluMlpGemv::new(&stream)?;
+        let before = stream.counters();
+        let weights = prepare_predictor_mlp(&kernel, &mlp)?;
+        let after = stream.counters();
+        assert_eq!(before.downloads_bytes, after.downloads_bytes);
+        assert_eq!(before.trace_callbacks, after.trace_callbacks);
+        let mut previous = Vec::new();
+        for rows in [1, 2] {
+            for value in [0.25, 0.75] {
+                let input = Array::from_f32(&stream, &[1, rows, 1024], &vec![value; rows * 1024])?
+                    .cast(MlxDType::BF16)?;
+                let result = kernel.call(&input, &weights)?;
+                let values = result.to_f32_vec()?;
+                assert_eq!(result.shape(), &[1, rows, 1024]);
+                assert!(values.iter().all(|value| value.is_finite() && *value > 0.0));
+                assert_ne!(values, previous);
+                previous = values;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Model {
     pub fn new(talker: Talker, predictor: Predictor, ops: &Ops, fused_mlp: bool) -> Result<Self> {
         let inv_freq = ops.inv_freq(HEAD_DIM, ROPE_THETA)?;
@@ -104,7 +168,7 @@ impl Model {
             let weights = predictor
                 .layers
                 .iter()
-                .map(|l| kernel.prepare(&l.mlp.gate.weight, &l.mlp.up.weight, &l.mlp.down.weight))
+                .map(|layer| prepare_predictor_mlp(&kernel, &layer.mlp))
                 .collect::<Result<Vec<_>>>()?;
             Some((kernel, weights))
         } else {
