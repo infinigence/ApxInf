@@ -188,7 +188,7 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(result["cases"][0]["actions"][0][0], 1)
         self.assertNotIn("latency_ms", result["cases"][0])
         self.assertEqual(result["stability"]["repeats"], 2)
-        self.assertEqual(result["stability"]["cases"][0]["repeat_max_abs"], 2)
+        self.assertEqual(result["stability"]["cases"][0]["repeat_max_abs"], 3)
 
     def test_revisit_detects_drift_separately_from_same_input_repeats(self):
         second = parity.save_case(self.root, "two", np.zeros((1, 224, 224, 3), np.uint8),
@@ -201,7 +201,7 @@ class ReceiptTest(unittest.TestCase):
             def infer(self, case):
                 if case["token_ids"][0] == 3:
                     self.other_calls += 1
-                value = 2 if self.other_calls >= 3 else 1
+                value = 2 if case["token_ids"][0] != 3 and self.other_calls >= 2 else 1
                 return np.full((2, 32), value, np.float32)
         parity.collect(self.root, manifest, LeakyModel(), "fake", {},
                        force=False, stability_repeats=1)
@@ -209,6 +209,37 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual([r["repeat_max_abs"] for r in result["stability"]["cases"]], [0, 0])
         self.assertEqual(result["stability"]["revisit_max_abs"], 1)
         self.assertEqual(result["cases"][0]["actions"][0][0], 1)
+
+    def test_stability_repeats_are_consecutive_and_also_revisit(self):
+        second = parity.save_case(self.root, "two", np.zeros((1, 224, 224, 3), np.uint8),
+                                  (3, 108), np.zeros((2, 32), np.float32))
+        manifest = parity.load_suite(self.root)
+        manifest["cases"].append(second)
+        parity.write_json(self.root / "manifest.json", manifest, force=True)
+        calls = []
+        class RecordingModel:
+            def infer(self, case):
+                calls.append(int(case["token_ids"][0]))
+                return np.ones((2, 32), np.float32)
+        parity.collect(self.root, manifest, RecordingModel(), "fake", {},
+                       force=False, stability_repeats=1)
+        first = int(parity.load_case(self.root, manifest["cases"][0])["token_ids"][0])
+        self.assertEqual(calls[:2], [first, 3])
+        self.assertEqual(calls[2:], [first, first, 3, 3, first])
+        result = json.loads((self.root / "fake.json").read_text())
+        self.assertEqual(result["stability"]["protocol"], "consecutive-and-revisit-v1")
+
+    def test_stability_measures_drift_between_repeated_outputs(self):
+        class AlternatingModel:
+            calls = 0
+            def infer(self, case):
+                self.calls += 1
+                value = (0, .004, -.004, .004)[self.calls - 1]
+                return np.full((2, 32), value, np.float32)
+        parity.collect(self.root, parity.load_suite(self.root), AlternatingModel(),
+                       "fake", {}, force=False, stability_repeats=1)
+        result = json.loads((self.root / "fake.json").read_text())
+        self.assertAlmostEqual(result["stability"]["cases"][0]["repeat_max_abs"], .008)
 
     def test_diagnostics_separate_factors_and_cover_configured_token_boundary(self):
         suite = self.root / "diagnostic"
@@ -421,7 +452,7 @@ class MatrixTest(unittest.TestCase):
                    "recipe_cache": {phase: {"files": 1, "sha256": "f" * 64} for phase in ("before", "after")},
                    "runtime_libraries": {name: {"path": f"/fixture/{name}.so", "sha256": "e" * 64}
                                          for name in ("libcuda", "libcudart", "libcublas", "libcublasLt")},
-                   "stability": {"repeats": 2, "revisit_max_abs": 0,
+                   "stability": {"protocol": parity.STABILITY_PROTOCOL, "repeats": 2, "revisit_max_abs": 0,
                                  "cases": [{"name": item["name"], "repeat_max_abs": 0} for item in entries]},
                    "cases": [{"name": item["name"], "input_sha256": item["sha256"],
                               "actions": np.ones((2, 32)).tolist(), "execution_mode": "graph"} for item in entries]}
@@ -555,6 +586,16 @@ class MatrixTest(unittest.TestCase):
         args.hardware = "thor"
         with self.assertRaisesRegex(ValueError, "uncalibrated stability"):
             ci.validate(args)
+
+    def test_old_stability_protocol_cannot_qualify(self):
+        cell = self.bank["cells"][0]
+        path = self.root / cell["hardware"] / f"{cell['id']}.json"
+        actual = ci.read_json(path)
+        for protocol in (None, "interleaved-v0"):
+            actual["stability"]["protocol"] = protocol
+            parity.write_json(path, actual, force=True)
+            with self.assertRaisesRegex(ValueError, "stability protocol"):
+                ci.aggregate(self.args())
 
     def test_stability_uses_its_own_budget(self):
         cell = self.bank["cells"][0]

@@ -199,7 +199,7 @@ repairs, against `35bcbf59`, including earlier INT8 repairs:
 
 Small increases, shape-return costs and baseline drift are retained, not waived.
 Final-source BF16/FP8/INT8 accuracy, stability, performance and hosted aggregation
-must all be accepted before rollout. CPU CI currently has 46 passing tests,
+must all be accepted before rollout. CPU CI currently has 51 passing tests,
 including real-process cancellation, repeated cancellation, unresponsive-worker
 and blocked-auditor cleanup. The standalone comparator also rejects missing,
 invalid or mismatched checkpoint/config identities. Replaying 252 saved GPU
@@ -349,15 +349,29 @@ chunk agreement, not a multi-chunk closed-loop rollout or LIBERO success-rate
 evaluation. Official selected-BF16 is mixed precision; do not describe it as
 all operations being BF16.
 
-Stability is a separate phase enabled by `--stability-repeats`: compare repeated
-calls against the saved accuracy output, then explicitly run A -> other suite
-inputs -> A. Its drifts are separate from accuracy outputs and latency. Daily
-bank policies require an independent `stability_max_abs` budget and an explicit
-positive stability count, chosen after
-same-input and rebuilt-extension measurements; the example's one repetition is
-an unapproved placeholder, not an established protocol. Stability never borrows
-the OpenPI or baseline accuracy tolerance; an uncalibrated stability budget
-fails pre-build validation and hosted aggregation.
+Stability is a separate phase enabled by `--stability-repeats`. For each frozen
+input, it first captures a stability anchor and then performs the requested
+number of consecutive repeat calls. Drift includes differences from that anchor
+and from the saved accuracy output. The same pass visits A and all other inputs;
+one final A call measures revisit drift against both A anchors. This preserves
+`N * (repeats + 1) + 1` stability calls without a redundant extra traversal.
+Accuracy outputs remain the original first valid chunks; stability never replaces
+them or supplies latency samples.
+
+Receipts identify this as `consecutive-and-revisit-v1`; the aggregator rejects
+missing or older stability protocols. Previously, `repeats=1` compared calls
+separated by other inputs and did not establish consecutive repeat stability.
+Historical numerical outputs remain diagnostic evidence, but those stability
+receipts cannot qualify the revised gate. CPU negative controls cover the actual
+call sequence, state leaked only after another input, and opposite deviations
+around the saved accuracy output.
+
+Daily bank policies require an independent `stability_max_abs` budget and an
+explicit positive stability count, chosen after same-input and rebuilt-extension
+measurements. The example's one repetition is an unapproved placeholder, not an
+established protocol. Stability never borrows the OpenPI or baseline accuracy
+tolerance; an uncalibrated stability budget fails pre-build validation and hosted
+aggregation.
 
 Performance runs in a separate process through `bench_pi05.py --suite-dir ...
 --model-dir ... --layer l1`, with independent `--warmup` and `--samples`. This

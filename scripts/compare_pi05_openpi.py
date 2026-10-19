@@ -22,6 +22,7 @@ import numpy as np
 
 
 SCHEMA = "apxinf.pi05.openpi-parity.v4"
+STABILITY_PROTOCOL = "consecutive-and-revisit-v1"
 DEFAULT_DIR = Path(__file__).resolve().parents[1] / "devlocal/pi05-ci-gate/default"
 SHORT_TOKENS = (2, 1065, 2145, 705, 1161, 37801, 611, 573, 37932, 108)
 LONG_TOKENS = (
@@ -349,18 +350,25 @@ def stability(model: Any, root: Path, manifest: dict[str, Any], rows: list[dict]
         return None
     shape = (manifest["horizon"], 32)
     results = []
+    anchor = None
     for entry, row in zip(manifest["cases"], rows, strict=True):
         original = np.asarray(row["actions"], dtype=np.float32)
         case = load_case(root, entry)
-        drift = max(float(np.abs(checked_infer(model, case, shape) - original).max())
-                    for _ in range(repeats))
+        first = checked_infer(model, case, shape)
+        if anchor is None:
+            anchor = first
+        drift = float(np.abs(first - original).max())
+        for _ in range(repeats):
+            repeated = checked_infer(model, case, shape)
+            drift = max(drift, float(np.abs(repeated - first).max()),
+                        float(np.abs(repeated - original).max()))
         results.append({"name": entry["name"], "repeat_max_abs": drift})
-    checked_infer(model, load_case(root, manifest["cases"][0]), shape)
-    for entry in manifest["cases"][1:]:
-        checked_infer(model, load_case(root, entry), shape)
+    # The consecutive-input pass already visits A, then every other input.
     revisited = checked_infer(model, load_case(root, manifest["cases"][0]), shape)
-    return {"repeats": repeats, "cases": results,
-            "revisit_max_abs": float(np.abs(revisited - np.asarray(rows[0]["actions"])).max())}
+    revisit = max(float(np.abs(revisited - anchor).max()),
+                  float(np.abs(revisited - np.asarray(rows[0]["actions"])).max()))
+    return {"protocol": STABILITY_PROTOCOL, "repeats": repeats, "cases": results,
+            "revisit_max_abs": revisit}
 
 
 def collect(root: Path, manifest: dict[str, Any], model: Any,

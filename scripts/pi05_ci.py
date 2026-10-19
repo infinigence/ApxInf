@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 
-from compare_pi05_openpi import compare_results, load_suite, sha256, shape_switch_pair, write_json
+from compare_pi05_openpi import STABILITY_PROTOCOL, compare_results, load_suite, sha256, shape_switch_pair, write_json
 from monitor_pi05_ci import validate_receipt
 
 
@@ -294,7 +294,8 @@ def evaluate(cell: dict, suite: Path, reference: dict, baseline: dict,
     limit = cell.get("shape_switch_limit_ms")
     switch_ok = limit is not None and switch["latency_ms"] <= limit
     stability = actual["stability"]
-    if stability is None or stability["repeats"] != cell["stability_repeats"]:
+    if (stability is None or stability.get("protocol") != STABILITY_PROTOCOL
+            or stability["repeats"] != cell["stability_repeats"]):
         raise ValueError("stability protocol missing or differs")
     if [row["name"] for row in stability["cases"]] != [row["name"] for row in actual["cases"]]:
         raise ValueError("stability cases differ")
