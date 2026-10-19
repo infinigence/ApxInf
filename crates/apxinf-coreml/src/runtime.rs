@@ -56,6 +56,7 @@ impl Specs {
     fn new<'a>(specs: impl Iterator<Item = (&'a str, &'a [usize])>) -> Result<Self> {
         let (mut names, mut shapes) = (Vec::new(), Vec::new());
         for (name, shape) in specs {
+            checked_fp16_count(shape)?;
             names.push(
                 CString::new(name).map_err(|_| Error::Contract("Core ML name contains NUL"))?,
             );
@@ -89,6 +90,26 @@ pub(crate) fn check(status: i32) -> Result<()> {
 fn c_path(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::Contract("Core ML path contains a NUL byte"))
+}
+
+fn checked_fp16_count(shape: &[usize]) -> Result<usize> {
+    let count = shape.iter().try_fold(1usize, |count, &dimension| {
+        if dimension == 0 || i64::try_from(dimension).is_err() {
+            return Err(Error::Contract(
+                "Core ML shape needs positive i64 dimensions",
+            ));
+        }
+        count
+            .checked_mul(dimension)
+            .ok_or(Error::Contract("Core ML shape element count overflows"))
+    })?;
+    count
+        .checked_mul(std::mem::size_of::<f16>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or(Error::Contract(
+            "Core ML FP16 shape exceeds addressable storage",
+        ))?;
+    Ok(count)
 }
 
 /// Compiles the `.mlpackage` directory `package` into `compiled`, which must
@@ -318,5 +339,65 @@ impl ProgramCache {
         let model = Model::load(&compiled, units)?;
         admit(&facts)?;
         Ok(model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+
+    #[test]
+    fn invalid_input_extent_returns_error_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        let shape = [usize::MAX, 2];
+        assert!(model.predict(&[("x", &[], &shape)], &[]).is_err());
+    }
+
+    #[test]
+    fn fp16_shape_count_preserves_scalars_and_clef_tiles() -> Result<()> {
+        assert_eq!(checked_fp16_count(&[])?, 1);
+        for tile in [128, 512] {
+            assert_eq!(checked_fp16_count(&[1, 4096, 1, tile])?, 4096 * tile);
+            assert_eq!(checked_fp16_count(&[1, 1, 1, tile])?, tile);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_fp16_shapes_are_rejected_before_allocation() {
+        for shape in [
+            vec![0],
+            vec![usize::MAX],
+            vec![1usize << 32, 1usize << 32],
+            vec![i64::MAX as usize, 2],
+            vec![i64::MAX as usize, 2, 2],
+            vec![isize::MAX as usize / 2 + 1],
+        ] {
+            assert!(checked_fp16_count(&shape).is_err(), "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_output_extent_returns_error_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        assert!(model.predict(&[], &[("y", &[usize::MAX, 2])]).is_err());
+    }
+
+    #[test]
+    fn invalid_batch_extents_return_errors_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        assert!(model
+            .predict_batch(&[("x", &[usize::MAX, 2])], &[vec![&[]]], &[])
+            .is_err());
+        assert!(model
+            .predict_batch(&[], &[vec![]], &[("y", &[usize::MAX, 2])])
+            .is_err());
     }
 }
