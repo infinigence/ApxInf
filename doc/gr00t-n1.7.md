@@ -201,6 +201,29 @@ not copied into the read-only checkpoint and is not committed to this tree.
 | Orin | BF16 | 75.778 ms | 84.864 ms |
 | Orin | W8A8 | 56.711 ms | 64.924 ms |
 
+## Thor FP8 runtime control
+
+The GR00T execution plan explicitly selects `try_*_sm110` operators. Each
+checks device, shape, dtype, and alignment and returns `None` for caller
+fallback when unsupported. Shared default adapters keep their generic paths;
+operator selection does not depend on mutable thread-local state.
+
+`APXINF_GR00T_FP8_NO_L2_PREFETCH` disables weight prefetch in the DiT,
+Qwen text backbone, and vision encoder when present (any value, including `0`).
+It is unset by default, enabling prefetch on SM110. The flag is read when
+prefetch tensors are collected; set it before loading/running the model and
+keep it unchanged through graph capture and replay. A captured graph retains
+its selected launches. There is no process-wide `OnceLock` cache.
+
+The fine-grained A/B switches added by this optimization have been removed.
+Kernel comparisons use
+internal `apxinf_reference_*` entry points with test-only Rust bindings; these
+are not a supported production C ABI. The fixed M41 GEMM reference is separate
+from the production tactic dispatcher and cannot be selected by a tuning DB.
+`APXINF_REVIEW_TACTICS` is used only by the ignored
+`gr00t_fp8_reference_tactics` diagnostic test: unset means no DB, otherwise its
+value is a DB path read once at test entry. It has no effect on inference.
+
 ## LIBERO-10 task accuracy
 
 | Device | Precision | Episodes | Successes | Success rate |

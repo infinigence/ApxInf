@@ -25,6 +25,14 @@ extern "C" int apxinf_static_cutlass_fp8_gemm_bias_then_residual_bf16_m41(
       activation, weight, bias, residual, output, m, n, k, alpha, stream);
 }
 
+extern "C" int apxinf_static_cutlass_fp8_gemm_self_qkv_bf16_m41(
+    const void* activation, const void* weight, const float* alpha,
+    const void* bias, void* output, int m, int n, int k,
+    cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::fp8_gemm_self_qkv_bf16_m41(
+      activation, weight, alpha, bias, output, m, n, k, stream);
+}
+
 extern "C" int apxinf_static_cutlass_fp8_gemm_bias_gelu_quant_e4m3_m41(
     const void* activation, const void* weight, const void* bias, void* output,
     int m, int n, int k, float alpha, float output_scale,
@@ -59,4 +67,12 @@ extern "C" int apxinf_static_cutlass_fp8_dual_gemm_geglu_e4m3(
   return apxinf::cuda::cutlass_ops::fp8_dual_geglu_detail::production_dual_geglu(
       activation, interleaved_weight, output, m, n, k, full_n, alpha,
       output_scale, stream);
+}
+
+// Regression-test reference only; not a supported production C ABI.
+extern "C" int apxinf_reference_cutlass_fp8_gemm_bf16_m41(
+    const void* activation, const void* weight, void* output,
+    int m, int n, int k, float alpha, cudaStream_t stream) {
+  return apxinf::cuda::cutlass_ops::reference::fp8_gemm_bf16_m41(
+      activation, weight, output, m, n, k, alpha, stream);
 }

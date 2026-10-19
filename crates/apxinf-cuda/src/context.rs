@@ -1,6 +1,6 @@
 //! CUDA device and stream context.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cublas::CublasHandle;
 use crate::device_caps::CudaDeviceCaps;
@@ -38,6 +38,36 @@ pub struct CudaContext {
     library_versions: CudaLibraryVersions,
     tuning: RwLock<Arc<TuningSession>>,
     gemm_plans: GemmPlanCache,
+    prefetch_lane: Mutex<Option<PrefetchLanes>>,
+}
+
+/// Round-robin set of prefetch lanes. A lane is joined back to the main
+/// stream only when it is reused (its previous prefetch was forked several
+/// graph nodes earlier) or by an explicit join-all.
+pub(crate) struct PrefetchLanes {
+    pub(crate) lanes: Vec<PrefetchLane>,
+    pub(crate) next: usize,
+}
+
+/// Side stream plus fork/join events used to overlap L2 weight prefetch with
+/// main-stream work. At most one fork is outstanding; it is joined back to
+/// the main stream before the next fork (and before graph capture ends).
+pub(crate) struct PrefetchLane {
+    pub(crate) stream: CudaStream,
+    pub(crate) fork: ffi::cudaEvent_t,
+    pub(crate) join: ffi::cudaEvent_t,
+    pub(crate) pending: bool,
+}
+
+unsafe impl Send for PrefetchLane {}
+
+impl Drop for PrefetchLane {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaEventDestroy(self.fork);
+            let _ = ffi::cudaEventDestroy(self.join);
+        }
+    }
 }
 
 impl CudaContext {
@@ -61,6 +91,7 @@ impl CudaContext {
             library_versions,
             tuning: RwLock::new(Arc::new(TuningSession::inference(TacticStore::default()))),
             gemm_plans: GemmPlanCache::default(),
+            prefetch_lane: Mutex::new(None),
         })
     }
 
@@ -97,6 +128,10 @@ impl CudaContext {
             .map_err(|_| "CUDA tuning session lock is poisoned".to_string())? = Arc::new(session);
         self.gemm_plans.clear().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub(crate) fn prefetch_lane(&self) -> &Mutex<Option<PrefetchLanes>> {
+        &self.prefetch_lane
     }
 
     pub(crate) fn gemm_plans(&self) -> &GemmPlanCache {
