@@ -72,6 +72,21 @@ Out of scope:
 The family composes MLX arrays and Core ML programs. Neither crate depends on
 the other.
 
+The scoped owner decision covers these two existing Clef compositions, not
+arbitrary program splits. Both retain hidden width 4096, intermediate width
+12288 and 32 layers. The target column identifies the intended qualification
+device, not a claim that every gate has passed.
+
+| Composition | Target | GPU intermediate share | Core ML intermediate share | Token tile |
+| --- | --- | --- | --- | --- |
+| Column split, #147 | M1 Pro, `applegpu_g13s` | First 6656 columns | Remaining 5632, per-row INT8 weights | 512 |
+| Neuron split, #148 | M4, `applegpu_g16g` | 5408 selected neurons | 5632 selected INT8 and 1248 selected FP16 neurons | 128, one batch prediction per layer |
+
+Selection, weight preparation, programs and numerical rules remain owned by
+the respective family composition. This table does not broaden the permitted
+host operations or transfer allowance; each profile must supply its own exact
+counts, byte budgets and observations.
+
 ## Program writer
 
 The protobuf messages are a hand-written subset of coremltools 9.0
@@ -138,7 +153,7 @@ The family must define a placement ledger for every admitted fixed profile:
 | Stage | Required placement and CPU allowance |
 | --- | --- |
 | GPU share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
-| Core ML share | The declared 5632-column MLP share in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
+| Core ML share | The declared fixed-profile column or neuron share above in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
 | Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The requesting Metal maintainer accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
