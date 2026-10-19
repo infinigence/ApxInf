@@ -130,7 +130,6 @@ def main() -> None:
         "commit": git_commit(),
         "model_dir": str(args.model_dir),
         "precision": args.precision,
-        "mode": "eager" if args.eager else "graph",
         "raw_image": [args.views, args.height, args.width],
         "image_grid_thw": np.asarray(grids).tolist(),
         "vision_tokens": int(sum(t * h * w for t, h, w in grids) // (merge * merge)),
@@ -138,19 +137,29 @@ def main() -> None:
         "normalized_actions_sha256": hashlib.sha256(actions.tobytes()).hexdigest(),
         "policy_ms": stats(latencies),
     }
+    # Check the effective runtime mode, not just the requested CLI flag.
+    # Profiling exposes graph_ms only when a captured graph was replayed.
+    # Run this outside the latency samples even when --profile was omitted.
+    rgb, token_ids, action_mask = policy.processor(observation)
+    views, height, width = rgb.shape[:3]
+    patch = int(policy.model_runner.patch_size)
+    grid = np.full((views, 3), (1, height // patch, width // patch), np.uint32)
+    samples = []
+    for _ in range(args.iterations if args.profile else 1):
+        _, phases = policy.model_runner.infer_rgb_profiled(
+            rgb, "nhwc", token_ids, noise=noise, action_mask=action_mask,
+            image_grid_thw=grid,
+        )
+        samples.append(phases)
+    actual_mode = "graph" if "graph_ms" in samples[0] else "eager"
+    expected_mode = "eager" if args.eager else "graph"
+    if actual_mode != expected_mode:
+        raise RuntimeError(
+            f"requested {expected_mode} benchmark but runtime used {actual_mode}; "
+            "check APXINF_WALLOSS_NO_GRAPH and graph-capture diagnostics"
+        )
+    report["mode"] = actual_mode
     if args.profile:
-        processed = policy.processor(observation)
-        rgb, token_ids, action_mask = processed
-        views, height, width = rgb.shape[:3]
-        patch = int(policy.model_runner.patch_size)
-        grid = np.full((views, 3), (1, height // patch, width // patch), np.uint32)
-        samples = []
-        for _ in range(args.iterations):
-            _, phases = policy.model_runner.infer_rgb_profiled(
-                rgb, "nhwc", token_ids, noise=noise, action_mask=action_mask,
-                image_grid_thw=grid,
-            )
-            samples.append(phases)
         report["profile_ms"] = {
             key: stats([sample[key] for sample in samples]) for key in sorted(samples[0])
         }

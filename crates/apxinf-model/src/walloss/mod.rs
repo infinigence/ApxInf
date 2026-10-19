@@ -26,6 +26,9 @@ mod schedule;
 #[cfg(any(feature = "cuda", test))]
 mod weights;
 
+#[cfg(any(feature = "cuda", test))]
+mod workspace;
+
 #[cfg(feature = "cuda")]
 pub(crate) use config::WallossImageProcessorConfig;
 #[cfg(any(feature = "cuda", test))]

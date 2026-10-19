@@ -14,7 +14,7 @@ use crate::vla::{
 };
 
 use super::super::backend::RuntimeBackend;
-use super::super::geometry::{multimodal_position_ids, DeviceVisionGeometry};
+use super::super::geometry::multimodal_position_ids;
 use super::super::model::{ModelVariant, WallossSchedule};
 use super::super::WallossConfig;
 use super::prepare::{rgb_bytes, PreparedShape, WallossPreparedInference};
@@ -105,6 +105,25 @@ impl WallossModelRunner {
         if let Some(plan) = cached {
             return Ok(plan);
         }
+        // Reject malformed host inputs while the healthy plan still exists.
+        // Only a valid replacement may release its workspace; keeping both
+        // workspaces alive while building would double the device budget.
+        let geometry = self.model.model().geometry(&key.1.grids)?;
+        if key.0.image_layout.is_some()
+            && (geometry.rgb_views.is_none() || self.model.model().image_processor.is_none())
+        {
+            return Err(Error::Other(
+                "walloss RGB input requires configured preprocessing and uniform still views"
+                    .into(),
+            ));
+        }
+        prepare_host_inputs(
+            &key.0,
+            &key.1,
+            &self.config,
+            geometry.patch_order.len(),
+            request,
+        )?;
         {
             // Release the old plan before building its replacement so two
             // graph workspaces never coexist.
@@ -140,7 +159,9 @@ fn request_shape(config: &WallossConfig, request: &VlaRequest<'_>) -> Result<Pre
         });
     };
     if grids.is_empty() {
-        return Err(Error::Other("walloss image_grid_thw cannot be empty".into()));
+        return Err(Error::Other(
+            "walloss image_grid_thw cannot be empty".into(),
+        ));
     }
     let merge = config.vision.spatial_merge_size;
     let grids = grids
@@ -163,11 +184,17 @@ pub(super) fn prepare_host_inputs(
     spec: &InferenceSpec,
     shape: &PreparedShape,
     config: &WallossConfig,
-    geometry: &DeviceVisionGeometry,
+    patch_rows: usize,
     request: &VlaRequest<'_>,
 ) -> Result<WallossHostInputs> {
     let observation = request.observation;
     observation.validate()?;
+    spec.validate()?;
+    if spec.token_count <= config.action.action_horizon {
+        return Err(Error::Other(
+            "walloss token sequence must contain a language prefix and action suffix".into(),
+        ));
+    }
     if *spec != observation.inference_spec() {
         return Err(Error::Other(format!(
             "prepared walloss spec {spec:?} does not match observation {:?}",
@@ -219,7 +246,7 @@ pub(super) fn prepare_host_inputs(
         VisionObservation::Patches(value) => WallossHostVision::Patches(normalize_host_bf16(
             value,
             vec![
-                geometry.patch_order.len() / std::mem::size_of::<u32>(),
+                patch_rows,
                 3 * config.vision.temporal_patch_size
                     * config.vision.patch_size
                     * config.vision.patch_size,
@@ -364,5 +391,144 @@ impl VlaRuntime for WallossModelRunner {
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         let output = self.infer(request)?;
         self.backend.to_cpu(output.tensor())?.to_f32_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auto::LoadOptions;
+    use crate::vla::{ImageLayout, Observation};
+    use apxinf_core::DType;
+
+    #[test]
+    #[ignore = "requires CUDA and APXINF_WALLOSS_TEST_MODEL checkpoint"]
+    fn long_prefix_preparation_has_sufficient_workspace() {
+        let path = std::env::var("APXINF_WALLOSS_TEST_MODEL").expect("checkpoint is required");
+        let backend = Arc::new(RuntimeBackend::new(0).unwrap());
+        let runner = super::super::super::load::load_model_runner(
+            std::path::Path::new(&path),
+            backend,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let plan = runner
+            .prepare_with_policy(
+                &InferenceSpec {
+                    token_count: 32768 + runner.config.action.action_horizon,
+                    image_layout: Some(ImageLayout::Nhwc),
+                },
+                ExecutionPolicy::Eager,
+            )
+            .unwrap();
+        assert_eq!(
+            plan.status(),
+            PreparationStatus::Ready {
+                mode: ExecutionMode::Eager,
+                fallback_reason: None
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CUDA and APXINF_WALLOSS_TEST_MODEL checkpoint"]
+    fn rejected_requests_preserve_cached_plan_and_actions() {
+        let path = std::env::var("APXINF_WALLOSS_TEST_MODEL").expect("checkpoint is required");
+        let backend = Arc::new(RuntimeBackend::new(0).unwrap());
+        let runner = super::super::super::load::load_model_runner(
+            std::path::Path::new(&path),
+            backend.clone(),
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        let contract = runner.contract();
+        let mut token_ids = vec![runner.config.image_token_id; 81];
+        token_ids.push(1);
+        token_ids.extend(vec![runner.config.image_token_id; 81]);
+        token_ids.extend(vec![1; runner.config.action.action_horizon]);
+        let good = Observation {
+            vision: VisionObservation::RgbU8 {
+                bytes: vec![
+                    127;
+                    contract.num_views * contract.image_size * contract.image_size * 3
+                ],
+                layout: ImageLayout::Nhwc,
+            },
+            token_ids,
+            state: None,
+            action_mask: None,
+        };
+        let latent = Tensor::zeros(contract.action_shape.to_vec(), DType::BF16);
+        let request = VlaRequest::provided(&good, &latent);
+        let plan = runner.plan_for(&request).unwrap();
+        if std::env::var_os("APXINF_WALLOSS_NO_GRAPH").is_some() {
+            assert!(matches!(plan.status(), PreparationStatus::Ready {
+                mode: ExecutionMode::Eager, fallback_reason: Some(reason),
+            } if reason.contains("APXINF_WALLOSS_NO_GRAPH")));
+            assert!(runner
+                .prepare_with_policy(&good.inference_spec(), ExecutionPolicy::RequireGraph)
+                .is_err());
+        } else {
+            assert_eq!(
+                plan.status(),
+                PreparationStatus::Ready {
+                    mode: ExecutionMode::Graph,
+                    fallback_reason: None,
+                }
+            );
+        }
+        let before = backend
+            .to_cpu(plan.run(&request).unwrap().tensor())
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        let mut bad = good.clone();
+        bad.token_ids.truncate(runner.config.action.action_horizon);
+        assert!(runner
+            .plan_for(&VlaRequest::provided(&bad, &latent))
+            .is_err());
+        assert!(Rc::ptr_eq(&runner.prepared.borrow()[0].1, &plan));
+        bad = good.clone();
+        bad.token_ids.push(1); // New key, but invalid RGB buffer.
+        if let VisionObservation::RgbU8 { bytes, .. } = &mut bad.vision {
+            bytes.pop();
+        }
+        assert!(runner
+            .plan_for(&VlaRequest::provided(&bad, &latent))
+            .is_err());
+        assert!(Rc::ptr_eq(&runner.prepared.borrow()[0].1, &plan));
+        bad = good.clone();
+        bad.token_ids.push(1);
+        let wrong_latent = Tensor::zeros((1, 1), DType::BF16);
+        assert!(runner
+            .plan_for(&VlaRequest::provided(&bad, &wrong_latent))
+            .is_err());
+        assert!(Rc::ptr_eq(&runner.prepared.borrow()[0].1, &plan));
+        bad.action_mask = Some(Tensor::zeros((1, 1), DType::BF16));
+        assert!(runner
+            .plan_for(&VlaRequest::provided(&bad, &latent))
+            .is_err());
+        assert!(Rc::ptr_eq(&runner.prepared.borrow()[0].1, &plan));
+        for token_count in [
+            0,
+            runner.config.action.action_horizon,
+            runner.config.text.max_position_embeddings + 1,
+        ] {
+            let invalid = InferenceSpec {
+                token_count,
+                image_layout: Some(ImageLayout::Nhwc),
+            };
+            assert!(runner
+                .prepare_with_policy(&invalid, ExecutionPolicy::Eager)
+                .is_err());
+        }
+        assert!(Rc::ptr_eq(&runner.plan_for(&request).unwrap(), &plan));
+        let after = backend
+            .to_cpu(plan.run(&request).unwrap().tensor())
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        assert!(before.iter().all(|x| x.is_finite()));
+        assert_eq!(before, after);
     }
 }

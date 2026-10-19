@@ -21,7 +21,9 @@ use crate::vla::{
 
 use super::super::backend::{kernels, transfers, CudaEventTimer, DeviceBuffer, RuntimeBackend};
 use super::super::geometry::{upload_u32, DeviceVisionGeometry};
-use super::super::model::{ModelVariant, WallossDeviceInputs, WallossDeviceVision, WallossSchedule};
+use super::super::model::{
+    ModelVariant, WallossDeviceInputs, WallossDeviceVision, WallossSchedule,
+};
 use super::super::WallossConfig;
 use super::runner::{prepare_host_inputs, WallossHostInputs, WallossHostVision};
 
@@ -70,6 +72,23 @@ pub(super) fn select_graph<G>(
     }
 }
 
+/// An environment opt-out may relax a preference, never a requirement.
+fn effective_policy(
+    policy: ExecutionPolicy,
+    disabled: bool,
+) -> Result<(ExecutionPolicy, Option<String>)> {
+    if !disabled || policy == ExecutionPolicy::Eager {
+        return Ok((policy, None));
+    }
+    let reason = "APXINF_WALLOSS_NO_GRAPH disables CUDA graph capture";
+    if policy == ExecutionPolicy::RequireGraph {
+        return Err(Error::Other(format!(
+            "RequireGraph conflicts with {reason}"
+        )));
+    }
+    Ok((ExecutionPolicy::Eager, Some(reason.into())))
+}
+
 impl WallossPreparedInference {
     pub(super) fn build(
         backend: &Arc<RuntimeBackend>,
@@ -81,12 +100,22 @@ impl WallossPreparedInference {
         policy: ExecutionPolicy,
         first_request: Option<&VlaRequest<'_>>,
     ) -> Result<Self> {
+        let (policy, disabled_reason) = effective_policy(
+            policy,
+            std::env::var_os("APXINF_WALLOSS_NO_GRAPH").is_some(),
+        )?;
         spec.validate()?;
         let action_tokens = config.action.action_horizon;
         if spec.token_count <= action_tokens {
             return Err(Error::Other(
                 "walloss token sequence must contain a language prefix and action suffix".into(),
             ));
+        }
+        if spec.token_count > config.text.max_position_embeddings {
+            return Err(Error::Other(format!(
+                "walloss sequence of {} tokens exceeds max_position_embeddings {}",
+                spec.token_count, config.text.max_position_embeddings,
+            )));
         }
         let host_geometry = model.model().geometry(&shape.grids)?;
         if spec.image_layout.is_some() && host_geometry.rgb_views.is_none() {
@@ -102,9 +131,8 @@ impl WallossPreparedInference {
         let vision = match spec.image_layout {
             None => WallossDeviceVision::Patches,
             Some(layout) => {
-                let bytes = rgb_bytes(config, &shape).ok_or_else(|| {
-                    Error::Other("walloss RGB byte count overflows".into())
-                })?;
+                let bytes = rgb_bytes(config, &shape)
+                    .ok_or_else(|| Error::Other("walloss RGB byte count overflows".into()))?;
                 WallossDeviceVision::RgbU8 {
                     raw_images: DeviceBuffer::alloc_zeros(bytes, device).map_err(Error::Cuda)?,
                     layout,
@@ -130,7 +158,9 @@ impl WallossPreparedInference {
             prefix_tokens,
         };
         let normal_generator = backend.create_normal_generator(inputs.initial_state.clone())?;
-        let requirements = model.model().workspace_requirements(patch_rows, prefix_tokens);
+        let requirements = model
+            .model()
+            .workspace_requirements(patch_rows, prefix_tokens)?;
         let workspace = kernels::GraphWorkspace::new(requirements.bytes, device)?;
         let mut plan = Self {
             spec,
@@ -147,12 +177,8 @@ impl WallossPreparedInference {
             fallback_reason: None,
         };
         plan.warm_up(first_request)?;
-        let policy = if std::env::var_os("APXINF_WALLOSS_NO_GRAPH").is_some() {
-            ExecutionPolicy::Eager
-        } else {
-            policy
-        };
         (plan.graph, plan.fallback_reason) = select_graph(policy, || plan.capture())?;
+        plan.fallback_reason = plan.fallback_reason.or(disabled_reason);
         if let Some(reason) = &plan.fallback_reason {
             eprintln!("[apxinf] WallOSS graph capture unavailable, using eager: {reason}");
         }
@@ -163,14 +189,18 @@ impl WallossPreparedInference {
     /// request that created the plan, it runs on real inputs so missing GEMM
     /// keys can be autotuned; explicit preparation runs on placeholders.
     fn warm_up(&self, request: Option<&VlaRequest<'_>>) -> Result<()> {
-        let forward = || self.model.model().infer(&self.schedule, &self.inputs, &self.geometry);
+        let forward = || {
+            self.model
+                .model()
+                .infer(&self.schedule, &self.inputs, &self.geometry)
+        };
         let output = match request {
             Some(request) => {
                 let host = prepare_host_inputs(
                     &self.spec,
                     &self.shape,
                     &self.config,
-                    &self.geometry,
+                    self.inputs.patches.shape().dims()[0],
                     request,
                 )?;
                 self.bind(&host, request)?;
@@ -186,7 +216,9 @@ impl WallossPreparedInference {
     fn capture(&self) -> Result<CapturedGraph> {
         self.backend.begin_capture()?;
         let output = match kernels::with_workspace(&self.workspace, || {
-            self.model.model().infer(&self.schedule, &self.inputs, &self.geometry)
+            self.model
+                .model()
+                .infer(&self.schedule, &self.inputs, &self.geometry)
         }) {
             Ok(output) => output,
             Err(error) => {
@@ -205,7 +237,13 @@ impl WallossPreparedInference {
         &self,
         request: &VlaRequest<'_>,
     ) -> Result<(Action, BTreeMap<String, f64>)> {
-        let host = prepare_host_inputs(&self.spec, &self.shape, &self.config, &self.geometry, request)?;
+        let host = prepare_host_inputs(
+            &self.spec,
+            &self.shape,
+            &self.config,
+            self.inputs.patches.shape().dims()[0],
+            request,
+        )?;
         self.bind(&host, request)?;
         let (eager, mut profile) = kernels::prepare_with_workspace(&self.workspace, || {
             self.model
@@ -213,8 +251,14 @@ impl WallossPreparedInference {
                 .infer_profiled(&self.schedule, &self.inputs, &self.geometry)
         })?;
         let mib = |bytes: usize| bytes as f64 / f64::from(1u32 << 20);
-        profile.insert("workspace_peak_live_mib".to_string(), mib(self.workspace.peak_used()));
-        profile.insert("workspace_capacity_mib".to_string(), mib(self.workspace.capacity()));
+        profile.insert(
+            "workspace_peak_live_mib".to_string(),
+            mib(self.workspace.peak_used()),
+        );
+        profile.insert(
+            "workspace_capacity_mib".to_string(),
+            mib(self.workspace.capacity()),
+        );
         let Some(captured) = &self.graph else {
             return Ok((Action::new(eager), profile));
         };
@@ -249,9 +293,11 @@ impl WallossPreparedInference {
             (InitialLatent::Provided(_), Some(state)) => {
                 transfers::copy_cpu_to_cuda(state, &inputs.initial_state)
             }
-            (InitialLatent::Generate { rng }, _) => {
-                self.normal_generator.borrow_mut().generate(*rng).map(|_| ())
-            }
+            (InitialLatent::Generate { rng }, _) => self
+                .normal_generator
+                .borrow_mut()
+                .generate(*rng)
+                .map(|_| ()),
             (InitialLatent::Provided(_), None) => {
                 unreachable!("host inputs carry every provided latent")
             }
@@ -280,7 +326,7 @@ impl PreparedInference for WallossPreparedInference {
             &self.spec,
             &self.shape,
             &self.config,
-            &self.geometry,
+            self.inputs.patches.shape().dims()[0],
             request,
         )?;
         self.bind(&host, request)?;
@@ -328,6 +374,28 @@ fn copy_u32(buffer: &DeviceBuffer, values: &[u32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_opt_out_preserves_explicit_requirements() {
+        assert!(effective_policy(ExecutionPolicy::RequireGraph, true)
+            .unwrap_err()
+            .to_string()
+            .contains("RequireGraph"));
+        let (policy, reason) = effective_policy(ExecutionPolicy::PreferGraph, true).unwrap();
+        assert_eq!(policy, ExecutionPolicy::Eager);
+        assert!(reason.unwrap().contains("APXINF_WALLOSS_NO_GRAPH"));
+        assert_eq!(
+            effective_policy(ExecutionPolicy::Eager, true).unwrap(),
+            (ExecutionPolicy::Eager, None)
+        );
+        for policy in [
+            ExecutionPolicy::Eager,
+            ExecutionPolicy::PreferGraph,
+            ExecutionPolicy::RequireGraph,
+        ] {
+            assert_eq!(effective_policy(policy, false).unwrap(), (policy, None));
+        }
+    }
 
     #[test]
     fn graph_policy_selection_and_fallback() {

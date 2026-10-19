@@ -136,3 +136,73 @@ window attention issued as one FA2 launch per window with head dim 80 padded
 to 96 (~10 ms), QKV bias plus RoPE (~8 ms), and the residual/RMSNorm epilogues.
 These need new fused kernels, which belong in `apxinf-cuda-new`, and are not
 part of this change.
+
+
+## Preparation contract regression checks (PR #138 follow-up)
+
+The public `VlaRuntime`, `InferenceSpec` and metadata contracts are unchanged.
+The fixes below are confined to WallOSS:
+
+- `RequireGraph` fails before allocation when `APXINF_WALLOSS_NO_GRAPH` is set.
+  `PreferGraph` records that opt-out as its eager fallback reason; `Eager`
+  continues without attempting capture. Explicit preparation also rejects
+  token counts outside the model's supported range before allocating buffers.
+- An implicit cache miss validates host geometry, token/image correspondence,
+  RGB/patch lengths, latent and mask shapes before releasing the old plan.
+  Invalid requests preserve the old plan. A valid replacement still releases
+  it before allocating a new workspace, so two workspaces do not coexist.
+  Device allocation/capture failures after that point can still empty the cache.
+- Workspace capacity derives from checkpoint dimensions: all layers' persistent
+  KV, one layer's MLP/attention scratch, vision and action scratch, then allocator
+  headroom. Checked arithmetic rejects overflow. This replaces coefficients
+  fitted only to short prompts; it does not guarantee that the maximum context
+  fits available device RAM. Capacity is deliberately conservative and increases
+  relative to the short-prompt estimate.
+
+CPU tests check the live KV + SwiGLU lower bound at 243, 32768 and near-maximum
+prefix lengths, changed checkpoint widths/depth, and arithmetic overflow.
+The CUDA test suite includes execution-policy selection and two opt-in checkpoint
+regressions (missing checkpoints fail rather than silently skip when selected):
+
+```bash
+APXINF_WALLOSS_TEST_MODEL=/path/to/wall-oss-0.5 \
+  cargo test --release -p apxinf-model --features cuda --lib \
+  walloss::model_runner::runner::tests -- --ignored --test-threads=1
+```
+
+These checks prepare a 32768-token prefix and verify that rejected short-token,
+truncated-RGB, wrong-latent and wrong-mask requests preserve both the cached plan identity
+and the complete output tensor. Run the checkpoint tests once normally and once
+with `APXINF_WALLOSS_NO_GRAPH=1` to exercise graph and eager operation.
+
+
+The benchmark also checks effective execution mode via the profiled public
+entry point, even without `--profile`. It rejects a graph-labelled run that
+actually fell back to eager. This extra validation runs outside timed samples;
+`tests/test_bench_walloss.py` covers the CLI behavior without requiring a GPU.
+
+Follow-up verification on Jetson AGX Thor (sm_110, CUDA 13.2):
+
+- WallOSS CUDA library suite: 20 passed; both opt-in checkpoint tests passed
+  separately with graphs enabled and disabled (2 + 2). The long-prefix check
+  runs BF16 eager preparation with 32768 prefix tokens.
+- Final CUDA Python extension: 102 passed, no skips, one inherited PI0-FAST
+  fixture failure (`test_from_pretrained_rejects_options_that_cannot_mean_anything_here`
+  omits the required `config.json`). This is not an all-green Python suite.
+- Public `WallossPolicy` through `scripts/bench_walloss.py`: BF16/FP8 ×
+  default/rectangular × graph/eager, 8 runs. Effective grids were `[1,18,18]`
+  and `[1,24,32]` for both views. Each precision/shape pair's complete normalized
+  action arrays matched exactly between graph and eager; all values were finite.
+  The real CLI also rejected an environment-forced eager fallback when a graph
+  benchmark was requested. Use default arguments or
+  `--height 480 --width 640 --resolution 448`, select
+  `--precision`, toggle `--eager`, and save full arrays with `--dump-actions`.
+- Local model CPU tests: 148 passed, one ignored. Workspace and benchmark
+  regression tests fail with the old implementations and pass with the fixes.
+  CUDA-feature workspace type checks and family/module boundary guards pass.
+
+These are correctness checks, not fresh performance measurements or a new
+reference-implementation accuracy run. The GPU checkpoint matrix for SmolVLA,
+PI0-FAST, GR00T and Qwen-Drive remains unverified by this follow-up. The timings
+and reference comparisons earlier in this document belong to the earlier PR
+snapshots described there.

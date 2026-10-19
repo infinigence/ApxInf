@@ -178,20 +178,10 @@ impl WallossModel {
         &self,
         patch_rows: usize,
         prefix_tokens: usize,
-    ) -> WorkspaceRequirements {
-        // Measured BF16 high-water on Thor (dynamic FP8 is lower): 43 MiB for
-        // 2 views at 252x252 (648 rows, 243 prefix tokens), 102 MiB at 336x448,
-        // 205 MiB for 3 views at 448x448 (3072 rows, 852 tokens). The model
-        // below covers each with at least 50% headroom.
-        const FIXED: usize = 16 << 20;
-        const PER_PATCH_ROW: usize = 48 << 10;
-        const PER_PREFIX_TOKEN: usize = 64 << 10;
-        let bytes = FIXED
-            .saturating_add(patch_rows.saturating_mul(PER_PATCH_ROW))
-            .saturating_add(prefix_tokens.saturating_mul(PER_PREFIX_TOKEN));
-        WorkspaceRequirements {
-            bytes: bytes.saturating_add(bytes / 2),
-        }
+    ) -> Result<WorkspaceRequirements> {
+        Ok(WorkspaceRequirements {
+            bytes: super::workspace::workspace_bytes(&self.config, patch_rows, prefix_tokens)?,
+        })
     }
 
     /// Canonical RGB canonicalization: raw `u8` bytes at the stable device

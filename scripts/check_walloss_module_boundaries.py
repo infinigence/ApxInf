@@ -11,7 +11,7 @@ RULES = {
     "model_runner": r"ModelVariant\s*::|WallossDeviceWeights\s*::|\b(blocks|weights)\s*::",
 }
 # Leaf modules shared by model and model_runner must not depend on either.
-LEAVES = ("geometry.rs", "schedule.rs", "config.rs")
+LEAVES = ("geometry.rs", "schedule.rs", "config.rs", "workspace.rs")
 LEAF_FORBIDDEN = r"\b(model_runner|model|weights)\s*::"
 
 def source(path):
