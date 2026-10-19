@@ -133,8 +133,33 @@ The policy restores the reference T5 pre-tokenization configuration in memory;
 it does not require Transformers or Python tokenizers at inference time.
 
 These checks establish numerical and runtime behavior for the declared profile.
-They do not measure LIBERO task success or real-robot performance. Follow the
-[porting workflow](porting-workflow.md) when qualifying another profile or device.
+Follow the [porting workflow](porting-workflow.md) when qualifying another profile
+or device.
+
+### LIBERO-Spatial rollout pilot
+
+A separate closed-loop pilot on the same Thor ran all ten LIBERO-Spatial tasks,
+using bundled initial state 0 for each task and environment seed 0:
+
+| Runtime | Successful episodes | Pilot success rate |
+| --- | ---: | ---: |
+| Official LeRobot BF16 | 10/10 | 100% |
+| Native default AutoPolicy | 10/10 | 100% |
+
+Both paths used the same checkpoint, fixed action-noise seed 42, ten inference
+steps, and the pinned LeRobot observation processor. The simulator rendered both
+cameras directly at 224 × 224, with relative control at 20 Hz, hard resets, ten
+settling steps, and a 300-action limit. Each prediction produced 32 actions; the
+first ten were executed before replanning. MuJoCo 2.3.7 and robosuite 1.4.1 ran
+in a separate simulator process. Initial-state files and starting observation
+hashes matched exactly across both runs. Success was the simulator's
+`check_success()` result. Native completion took 75–125 steps; official BF16 took
+76–144 steps. The native extension was unchanged from numerical qualification.
+
+This is a ten-episode pilot with one fixed initial state per task, not a full
+LIBERO benchmark or evidence of statistical equivalence. Object, Goal and Long
+suites, additional initial states, and real-robot performance remain untested.
+It does not reproduce published FP32/256-pixel multi-suite benchmark conditions.
 
 ## Measured performance and remaining work
 
