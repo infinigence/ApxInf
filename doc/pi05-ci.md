@@ -130,6 +130,31 @@ Thor sampling encountered foreign GPU workloads, followed by Python and
 establish a regression verdict; the task's affected submissions were stopped,
 without terminating foreign jobs or resetting the device.
 
+A subsequent same-board Thor pair completes the missing warm-inference check
+for this calibration repair. It compares the verified pre-fix `d9424a83`
+extension with the clean `ad35a46d` extension, then revisits the pre-fix
+extension. The same two frozen one-view observations, original FP8 profile,
+prepared recipes and CUDA libraries are used throughout. The maintained
+benchmark takes 30 warmups and 50 samples; its timed inference method is
+unchanged. Output/repeat/revisit checks run after measurement and restore
+bitwise in every phase. All 497 activity samples contain only this task's
+compute processes and no external compiler.
+
+| Precision / observation | P50 ms: before / fix / before again | P50 change vs baseline mean | P95 change vs baseline mean |
+| --- | --- | --- | --- |
+| BF16 / record0-frame070 | 62.130 / 62.182 / 62.174 | +0.05% | +0.30% |
+| BF16 / record1-frame169 | 61.223 / 61.357 / 61.372 | +0.10% | -0.02% |
+| FP8 / record0-frame070 | 38.736 / 38.814 / 38.819 | +0.09% | +0.31% |
+| FP8 / record1-frame169 | 38.804 / 38.850 / 38.854 | +0.05% | +0.12% |
+
+No substantial warm regression is observed in this pilot. First-call timing
+has a wider spread: the BF16 triplets are 1040/1101/1191 ms and
+1013/1018/995 ms, so the warm result is not a blanket cold-start verdict.
+Persistent desktop graphics and power conditions remain unqualified; this
+pair does not approve an exclusive performance budget or replace all-view
+performance qualification. The independently checked raw samples retain
+first-call measurements and baseline revisit drift.
+
 On Orin, the isolated language-normalization weight preparation correction
 passes 5/8 one-view state cases versus 4/8 originally, but introduces a new
 failure. Keeping only the flow state in FP32 preserves the original failure
