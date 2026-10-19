@@ -82,8 +82,8 @@ anchors (active-dimension cosine >= 0.997).
 
 The shared RGB binding change leaves PI0.5 (`pi05_libero_base`, BF16)
 byte-identical to the previous runtime through the policy with explicit noise, the
-seeded device-noise path and `infer_rgb_seeded`. SmolVLA, PI0-FAST, GR00T and
-Qwen-Drive were not run on a GPU for this change (CPU tests only).
+seeded device-noise path and `infer_rgb_seeded`. At that measurement snapshot, SmolVLA, PI0-FAST, GR00T and Qwen-Drive
+had only CPU coverage. See the final-source verification below for later GPU runs.
 
 The padding commit changes BF16 rounding only: action cosine >= 0.99998,
 rel-L2 <= 0.006 versus the unpadded build at 2x252 and 3x448.
@@ -201,8 +201,98 @@ Follow-up verification on Jetson AGX Thor (sm_110, CUDA 13.2):
   regression tests fail with the old implementations and pass with the fixes.
   CUDA-feature workspace type checks and family/module boundary guards pass.
 
-These are correctness checks, not fresh performance measurements or a new
-reference-implementation accuracy run. The GPU checkpoint matrix for SmolVLA,
-PI0-FAST, GR00T and Qwen-Drive remains unverified by this follow-up. The timings
-and reference comparisons earlier in this document belong to the earlier PR
-snapshots described there.
+These initial follow-up runs are correctness checks, not fresh performance
+measurements. The timings earlier in this document retain their original
+measurement snapshots. Later final-source reference and regression results
+are recorded below.
+
+
+### Final-source reference comparison (2026-10-19)
+
+The tested runtime is `fec5ee10eb1fb4ac95d5ddb9ee54cb22f1215854`.
+The candidate CUDA extension SHA-256 is
+`8c1c669a8b298d474b123c2e7ae06dc14a82ac831293270c3dc622897e5501c3`.
+The reference was rerun, rather than reusing the earlier output captures:
+Mizar's vanilla PyTorch/SDPA path at `ca013e817fead355bfca2f989b71a0d72a641a24`,
+with wall-x source `84968afbceca3b8aaa3a7f78aad9d0136438c0ec`.
+It uses the existing private pure-Torch `mizar_kernel` stand-in and import
+shims, with compilation and quantization disabled. Their hashes are recorded
+in the evidence manifest; this is not validation of production Mizar kernels.
+Reference execution used Thor/CUDA 13.0, PyTorch `2.14.1+cu130`; candidate
+execution used Thor/CUDA 13.2.
+
+Both machines used the same `wall-oss-0.5` weights, SHA-256
+`37f8f327d3f9c27f056ed078db43c0e39b8caf3df0dc0163cdb8cf92c167968a`.
+Inputs are deterministic RGB arrays, zero 26-dimensional state, prompt
+`pick up the block`, and explicit `[10,26]` noise generated with NumPy seed
+1234. Training-resolution scaling is disabled for these already aligned
+image sizes. Raw images, state, noise, expanded token IDs, grids and broadcast
+action masks match between the two paths. Each reference output was repeated
+exactly. Normalized actions are captured before reference unnormalization;
+all 260 values are compared, including the padded dimensions.
+
+| Views / RGB size | BF16 cosine | BF16 relative L2 | FP8 cosine | FP8 relative L2 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 × 252×252 | 0.999753 | 0.022762 | 0.999904 | 0.013853 |
+| 3 × 224×224 | 0.999977 | 0.007066 | 0.999814 | 0.019926 |
+| 3 × 448×448 | 0.999278 | 0.038220 | 0.999485 | 0.032104 |
+| 2 × 336×448 | 0.999784 | 0.020797 | 0.999788 | 0.020598 |
+
+Both candidate precisions are compared to the BF16 reference. All eight
+comparisons also exceed the earlier first-seven-dimension cosine criterion
+of 0.997 (observed minimum 0.999614). Maximum absolute error over the complete
+arrays is 0.187413 for BF16 and 0.116814 for FP8; the table is numerical
+agreement evidence, not a claim of per-element equality with the reference.
+
+The public `WallossPolicy` was run for all four shapes, both precisions and
+both execution modes: **16 runs**, with effective Graph/Eager mode checked
+through `infer_rgb_profiled`. Complete normalized outputs are exactly equal
+between Graph/Eager for each shape/precision and repeat identically. These
+synthetic-input checks do not replace a task-success evaluation or extend the
+earlier latency claims.
+
+Private reproduction scripts, full arrays, source/extension/checkpoint hashes
+and logs live under `devlocal/walloss-pr138/final-parity/`. They remain ignored;
+no checkpoint, reference adapter or generated capture is part of the PR.
+
+### Cross-family GPU regression on the same final runtime
+
+The comparison baseline is PR138's base commit
+`da8756eaf112b96dfdf870187d6c58d294a640f3`, rebuilt as a separate CUDA Python
+extension. Both arms use identical family policy source (unchanged by this
+PR), dependencies, checkpoint files and inputs on the same machine. All rows
+below use BF16 and two distinct observations, with repeated inference in each
+arm. Comparisons load the complete saved arrays and require exact equality;
+matching hashes alone are not the acceptance check.
+
+| Family / checkpoint | Exercised interface | Cross-build result |
+| --- | --- | --- |
+| PI0.5 / `pi05_libero_base` | `AutoPolicy.infer` with explicit noise, plus `infer_rgb_seeded` | 2/2 exact: `[50,7]` actions, `[50,32]` normalized and seeded outputs |
+| SmolVLA / `lerobot/smolvla_libero` | `AutoPolicy.infer`, three cameras, explicit noise | 2/2 exact: `[50,7]` actions and normalized outputs |
+| GR00T / prepared N1.7 LIBERO checkpoint | `AutoPolicy.infer` with NVIDIA preprocessing and explicit noise | 2/2 exact: `[16,7]` actions and `[40,132]` normalized outputs |
+| Qwen-Drive / `Qwen-Drive-1.0-4B`, `planner-sft` | `AutoPolicy.infer`, two existing recorded driving scenes, direct planning, ten steps | 2/2 exact: complete `[50,3]` trajectories |
+| PI0-FAST / local `pi0fast` checkpoint (LeRobot layout) | `ModelRunner.infer_action_tokens_rgb`, supplied token IDs | 2/2 exact: all 256 generated action tokens per case |
+
+PI0.5 and PI0-FAST also reject a truncated RGB buffer; the next valid request
+reproduces the prior complete output. GR00T captures successfully in both
+arms. SmolVLA exhausts the same 96 MiB graph workspace in both arms and falls
+back to eager; its result is an **eager regression pass**, not a successful
+Graph test or a fix for that existing capacity limitation. PI0.5 reports
+missing normalization statistics for some transforms in this local checkpoint;
+its cross-build identity does not establish embodiment-level reference parity.
+
+PI0.5/Qwen-Drive ran on Thor2 with CUDA 13.2, SmolVLA/PI0-FAST on Thor3 with
+CUDA 13.2, and GR00T on Thor with CUDA 13.0. The same candidate and baseline
+extension binaries were used across these hosts. Native extension identities,
+checkpoint hashes, fixed-scene file hashes and full outputs are retained with
+the private evidence. The 54 checked runtime, binding and Python source files
+match the reviewed checkout byte-for-byte.
+
+**Remaining policy-level blocker:** the PI0-FAST checkpoint is available, but
+its declared `google/paligemma-3b-pt-224/tokenizer.json` is absent from the
+inspected local assets. Hugging Face returns HTTP 403 with the available
+credentials. The original tokenizer is needed to finish `AutoPolicy.infer`
+coverage, including prompt tokenization and FAST action decoding. The native
+RGB/token regression above does not substitute for that missing policy run.
+No claim is made for every precision, every checkpoint or every deployment
+profile of these families.
