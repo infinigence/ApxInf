@@ -547,6 +547,114 @@ mod tests {
     }
 
     #[test]
+    fn mapped_reductions_still_require_known_ane_placement() {
+        let package = package();
+        let admission = Admission::new(&package, [1, 8, 1, 16]).unwrap();
+        for unknown in [false, true] {
+            let mut facts = facts(&package);
+            let reduction = facts.functions[0]
+                .operations
+                .iter_mut()
+                .find(|operation| operation.operator == "ios16.reduce_max")
+                .unwrap();
+            if unknown {
+                reduction.usage = None;
+            } else {
+                reduction.usage.as_mut().unwrap().preferred = Some(device(ComputeDeviceKind::Cpu));
+            }
+            let error = admission.check(&facts).unwrap_err().to_string();
+            assert!(
+                error.contains(if unknown {
+                    "placement is unknown"
+                } else {
+                    "not ANE-preferred"
+                }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_payload_types_lengths_and_blob_offsets_are_checked() {
+        let package = package();
+        let operations = &package.model.ml_program.as_ref().unwrap().functions["main"]
+            .block_specializations["CoreML8"]
+            .operations;
+        let immediate = operations
+            .iter()
+            .find(|operation| operation.r#type == "const")
+            .unwrap()
+            .attributes["val"]
+            .clone();
+        literal(&immediate, &package.weights).unwrap();
+        for wrong_type in [false, true] {
+            let mut value = immediate.clone();
+            if wrong_type {
+                value
+                    .r#type
+                    .as_mut()
+                    .unwrap()
+                    .tensor_type
+                    .as_mut()
+                    .unwrap()
+                    .data_type = data_type::BOOL;
+            } else {
+                let Some(value::Value::ImmediateValue(immediate)) = &mut value.value else {
+                    panic!()
+                };
+                let Some(tensor_value::Value::Ints(values)) =
+                    &mut immediate.tensor.as_mut().unwrap().value
+                else {
+                    panic!()
+                };
+                values.values.pop();
+            }
+            assert!(literal(&value, &package.weights).is_err());
+        }
+        let Some(binding::Binding::Value(original)) =
+            &operations[0].inputs["data"].arguments[0].binding
+        else {
+            panic!()
+        };
+        literal(original, &package.weights).unwrap();
+        for variant in 0..4 {
+            let mut value = original.clone();
+            let mut weights = package.weights.clone();
+            let Some(value::Value::BlobFileValue(reference)) = &value.value else {
+                panic!()
+            };
+            let offset = reference.offset as usize;
+            match variant {
+                0 => weights[offset + 4..offset + 8].copy_from_slice(&1u32.to_le_bytes()),
+                1 => {
+                    value
+                        .r#type
+                        .as_mut()
+                        .unwrap()
+                        .tensor_type
+                        .as_mut()
+                        .unwrap()
+                        .dimensions[0]
+                        .constant
+                        .as_mut()
+                        .unwrap()
+                        .size += 1
+                }
+                2 => weights[offset + 16..offset + 24].copy_from_slice(&u64::MAX.to_le_bytes()),
+                _ => {
+                    let tensor = value.r#type.as_mut().unwrap().tensor_type.as_mut().unwrap();
+                    tensor.dimensions[0].constant.as_mut().unwrap().size = u64::MAX;
+                    tensor.dimensions[1].constant.as_mut().unwrap().size = u64::MAX;
+                }
+            }
+            assert!(
+                literal(&value, &weights).is_err(),
+                "literal variant {variant}"
+            );
+        }
+    }
+
+    #[test]
     fn literal_flags_names_blocks_and_graph_rewrites_are_not_waived() {
         let package = package();
         let admission = Admission::new(&package, [1, 8, 1, 16]).unwrap();
