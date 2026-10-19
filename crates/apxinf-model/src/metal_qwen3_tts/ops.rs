@@ -1,6 +1,7 @@
 //! Arithmetic shared by the Talker, code predictor and waveform decoder, in
 //! the reference's operation order. Functions the reference wraps in
 //! `mx.compile` run through `Compiled` so MLX builds the same fused graphs.
+use super::config::{HEADS, HEAD_DIM, KV_HEADS};
 use apxinf_core::Result;
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 use std::rc::Rc;
@@ -10,6 +11,73 @@ pub struct Ops {
     stream: Stream,
     gelu: Rc<Compiled>,
     rope: Rc<Compiled>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::config::{HEADS, HEAD_DIM, KV_HEADS};
+    use super::*;
+
+    fn check_prepared_profiles(stream: &Stream) -> Result<()> {
+        let ops = Ops::new(&stream)?;
+        for length in [1, 2, 17] {
+            if length == 17 {
+                ops.prepare_rope(length)?;
+            }
+            let query = Array::from_f32(
+                stream,
+                &[1, HEADS, length, HEAD_DIM],
+                &vec![0.25; HEADS * length * HEAD_DIM],
+            )?
+            .cast(MlxDType::BF16)?;
+            let key = Array::from_f32(
+                stream,
+                &[1, KV_HEADS, length, HEAD_DIM],
+                &vec![-0.5; KV_HEADS * length * HEAD_DIM],
+            )?
+            .cast(MlxDType::BF16)?;
+            let angle = Array::from_f32(
+                &stream,
+                &[1, length, HEAD_DIM],
+                &vec![0.75; length * HEAD_DIM],
+            )?
+            .cast(MlxDType::BF16)?;
+            stream.eval(&[query.clone(), key.clone(), angle.clone()])?;
+            let before = stream.counters().trace_callbacks;
+            let (actual_query, actual_key) = ops.rope(&query, &key, &angle, &angle)?;
+            stream.eval(&[actual_query.clone(), actual_key.clone()])?;
+            assert_eq!(
+                stream.counters().trace_callbacks,
+                before,
+                "rotary length {length}"
+            );
+            let cold = Compiled::new(stream, 2, |inputs| {
+                let (query, key) = rotate(&inputs[0], &inputs[1], &inputs[2], &inputs[3])?;
+                Ok(vec![query, key])
+            })?;
+            let expected = cold.call_and_eval(&[query, key, angle.clone(), angle])?;
+            assert_eq!(actual_query.to_bytes()?, expected[0].to_bytes()?);
+            assert_eq!(actual_key.to_bytes()?, expected[1].to_bytes()?);
+        }
+        let values = Array::from_f32(&stream, &[1, 17, 4096], &vec![0.75; 17 * 4096])?
+            .cast(MlxDType::BF16)?;
+        values.eval()?;
+        let before = stream.counters().trace_callbacks;
+        ops.gelu(&values)?.eval()?;
+        assert_eq!(stream.counters().trace_callbacks, before);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_rotary_and_gelu_profiles_are_prepared_at_construction() -> Result<()> {
+        check_prepared_profiles(&Stream::cpu()?)
+    }
+
+    #[test]
+    #[ignore = "requires native Apple Metal"]
+    fn rotary_and_gelu_preparation_matches_cold_metal() -> Result<()> {
+        check_prepared_profiles(&Stream::metal(0)?)
+    }
 }
 
 /// `rotate_half` for the last axis.
@@ -47,11 +115,28 @@ impl Ops {
             let (q, k) = rotate(&a[0], &a[1], &a[2], &a[3])?;
             Ok(vec![q, k])
         })?;
-        Ok(Self {
+        drop(gelu.prepare(&[Array::zeros(stream, &[1, 2, 2], MlxDType::BF16)?])?);
+        let ops = Self {
             stream: stream.clone(),
             gelu: Rc::new(gelu),
             rope: Rc::new(rope),
-        })
+        };
+        for length in [1, 2] {
+            ops.prepare_rope(length)?;
+        }
+        Ok(ops)
+    }
+
+    pub fn prepare_rope(&self, length: usize) -> Result<()> {
+        let query = Array::zeros(&self.stream, &[1, HEADS, length, HEAD_DIM], MlxDType::BF16)?;
+        let key = Array::zeros(
+            &self.stream,
+            &[1, KV_HEADS, length, HEAD_DIM],
+            MlxDType::BF16,
+        )?;
+        let table = Array::zeros(&self.stream, &[1, length, HEAD_DIM], MlxDType::BF16)?;
+        drop(self.rope.prepare(&[query, key, table.clone(), table])?);
+        Ok(())
     }
 
     pub fn stream(&self) -> &Stream {

@@ -8,6 +8,43 @@ const TEMPERATURE: f64 = 0.9;
 const TOP_K: usize = 50;
 const REPETITION_PENALTY: f64 = 1.05;
 
+pub struct History {
+    seen: Array,
+    ids: Array,
+}
+
+impl History {
+    pub fn new(stream: &Stream, width: usize) -> Result<Self> {
+        Ok(Self {
+            seen: Array::zeros(stream, &[1, width], MlxDType::U32)?,
+            ids: Array::arange(stream, 0.0, width as f32, 1.0, MlxDType::U32)?,
+        })
+    }
+
+    pub fn push(&mut self, token: &Array) -> Result<()> {
+        let seen = self
+            .seen
+            .maximum(&token.equal(&self.ids)?.cast(MlxDType::U32)?)?;
+        seen.eval()?;
+        self.seen = seen;
+        Ok(())
+    }
+
+    fn penalize(&self, logits: &Array) -> Result<Array> {
+        if self.seen.shape() != logits.shape() {
+            return Err(Error::Contract(
+                "sampling history vocabulary does not match logits",
+            ));
+        }
+        let penalty = Array::scalar(logits.stream(), REPETITION_PENALTY as f32, MlxDType::F32)?;
+        let zero = Array::scalar(logits.stream(), 0.0, MlxDType::F32)?;
+        let penalized = zero
+            .less_equal(logits)?
+            .where_select(&logits.div(&penalty)?, &logits.mul(&penalty)?)?;
+        self.seen.where_select(&penalized, logits)
+    }
+}
+
 pub struct Sampler {
     stream: Stream,
     /// `apply_top_k`, compiled like the reference.
@@ -29,12 +66,22 @@ impl Sampler {
             let scaled = a[0].mul(&Array::scalar(&s, 1.0, a[0].dtype())?)?;
             Ok(vec![scaled.categorical(-1, &sub)?, next])
         })?;
-        Ok(Self {
+        let sampler = Self {
             stream: stream.clone(),
             top_k,
             categorical,
             key: None,
-        })
+        };
+        for width in [super::config::VOCAB, super::config::PREDICTOR_VOCAB] {
+            let logits = Array::zeros(stream, &[1, width], MlxDType::F32)?;
+            drop(sampler.top_k.prepare(&[logits.clone()])?);
+            drop(
+                sampler
+                    .categorical
+                    .prepare(&[logits, Array::random_key(stream, 0)?])?,
+            );
+        }
+        Ok(sampler)
     }
 
     /// `mx.random.seed(seed)`.
@@ -50,7 +97,12 @@ impl Sampler {
     /// Sample one token `[1, 1]` (uint32) from the last row of `logits`
     /// `[1, L, V]`. `history` enables the repetition penalty over its unique
     /// tokens; `suppress` lists ids set to -inf first.
-    pub fn sample(&mut self, logits: &Array, history: &[u32], suppress: &[u32]) -> Result<Array> {
+    pub fn sample(
+        &mut self,
+        logits: &Array,
+        history: Option<&History>,
+        suppress: &[u32],
+    ) -> Result<Array> {
         let [1, l, width] = *logits.shape() else {
             unreachable!("logits are [1, L, V]")
         };
@@ -71,24 +123,8 @@ impl Sampler {
             let inf = self.scalar(f64::NEG_INFINITY)?;
             x = x.put_along_axis(&indices(suppress)?, &[1, suppress.len()], &inf, -1)?;
         }
-        let mut unique: Vec<u32> = history
-            .iter()
-            .copied()
-            .filter(|&t| (t as usize) < width)
-            .collect();
-        unique.sort_unstable();
-        unique.dedup();
-        if !unique.is_empty() {
-            let token_indices = indices(&unique)?;
-            let index = Array::from_i32(&self.stream, &[unique.len()], &token_indices)?;
-            let selected = x.take(&index, -1)?;
-            let penalty = self.scalar(REPETITION_PENALTY)?;
-            // where(x < 0, x * p, x / p); 0 <= x selects the division for -0 too.
-            let penalized = self
-                .scalar(0.0)?
-                .less_equal(&selected)?
-                .where_select(&selected.div(&penalty)?, &selected.mul(&penalty)?)?;
-            x = x.put_along_axis(&token_indices, &[1, unique.len()], &penalized, -1)?;
+        if let Some(history) = history {
+            x = history.penalize(&x)?;
         }
         x = x.div(&self.scalar(TEMPERATURE)?)?;
         x = self.top_k.call(&[x])?.remove(0);
@@ -102,6 +138,102 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_history(stream: &Stream) -> Result<()> {
+        let values = [-0.0, 0.0, -3.25, 2.75, f32::NEG_INFINITY, f32::MIN_POSITIVE];
+        let logits = Array::from_f32(&stream, &[1, values.len()], &values)?;
+        let mut history = History::new(&stream, values.len())?;
+        let retained = history.seen.clone();
+        for token in [0u32, 1, 2, 3, 4, 2, 6, u32::MAX] {
+            let token = Array::from_bytes(&stream, &[1, 1], MlxDType::U32, &token.to_ne_bytes())?;
+            token.eval()?;
+            let before = stream.counters();
+            history.push(&token)?;
+            let after = stream.counters();
+            assert_eq!(after.uploads_bytes, before.uploads_bytes);
+            assert_eq!(after.downloads_bytes, before.downloads_bytes);
+        }
+        assert_eq!(retained.to_bytes()?, vec![0; values.len() * 4]);
+        let expected: Vec<f32> = values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                if index == 5 {
+                    value
+                } else if value < 0.0 {
+                    value * REPETITION_PENALTY as f32
+                } else {
+                    value / REPETITION_PENALTY as f32
+                }
+            })
+            .collect();
+        let actual = history.penalize(&logits)?.to_f32_vec()?;
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn check_production_sampling(stream: &Stream) -> Result<()> {
+        let mut sampler = Sampler::new(&stream)?;
+        for width in [
+            super::super::config::VOCAB,
+            super::super::config::PREDICTOR_VOCAB,
+        ] {
+            let values: Vec<f32> = (0..width)
+                .map(|index| (index % 67) as f32 * 0.13 - 3.0)
+                .collect();
+            let logits = Array::from_f32(&stream, &[1, 1, width], &values)?;
+            logits.eval()?;
+            for seed in [0, 42] {
+                sampler.seed(seed)?;
+                let before = stream.counters().trace_callbacks;
+                let token = sampler.sample(&logits, None, &[])?;
+                token.eval()?;
+                assert_eq!(
+                    stream.counters().trace_callbacks,
+                    before,
+                    "vocabulary {width}"
+                );
+                let scaled = logits
+                    .reshape(&[1, width])?
+                    .div(&sampler.scalar(TEMPERATURE)?)?;
+                let masked = scaled.top_k_mask(TOP_K, -1)?;
+                let (next, subkey) = Array::random_split(&Array::random_key(&stream, seed)?)?;
+                assert_eq!(
+                    token.to_bytes()?,
+                    masked.categorical(-1, &subkey)?.to_bytes()?
+                );
+                assert_eq!(sampler.key.as_ref().unwrap().to_bytes()?, next.to_bytes()?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn device_history_preserves_unique_membership_and_penalty_bits() -> Result<()> {
+        check_history(&Stream::cpu()?)
+    }
+
+    #[test]
+    fn production_sampling_profiles_are_prepared_without_consuming_request_keys() -> Result<()> {
+        check_production_sampling(&Stream::cpu()?)
+    }
+
+    #[test]
+    #[ignore = "requires native Apple Metal"]
+    fn history_and_sampling_match_reference_metal() -> Result<()> {
+        let stream = Stream::metal(0)?;
+        check_history(&stream)?;
+        check_production_sampling(&stream)
+    }
 
     #[test]
     fn checked_sampling_matches_seeded_reference_after_rejection() -> Result<()> {
@@ -130,14 +262,18 @@ mod tests {
         for seed in [0, 42, 43] {
             sampler.seed(seed)?;
             for invalid in [64, u32::MAX] {
-                assert!(sampler.sample(&logits, &[], &[invalid]).is_err());
+                assert!(sampler.sample(&logits, None, &[invalid]).is_err());
             }
             let (_, subkey) = Array::random_split(&Array::random_key(&stream, seed)?)?;
             let reference = expected.categorical(-1, &subkey)?;
-            let actual = sampler.sample(&logits, &[12, 62, 62], &[63])?;
+            let mut history = History::new(&stream, logits.shape()[2])?;
+            for token in [12i32, 62, 62] {
+                history.push(&Array::from_i32(&stream, &[1, 1], &[token])?.cast(MlxDType::U32)?)?;
+            }
+            let actual = sampler.sample(&logits, Some(&history), &[63])?;
             assert_eq!(actual.to_bytes()?, reference.to_bytes()?);
             sampler.seed(seed)?;
-            let repeated = sampler.sample(&logits, &[12, 62], &[63])?;
+            let repeated = sampler.sample(&logits, Some(&history), &[63])?;
             assert_eq!(repeated.to_bytes()?, actual.to_bytes()?);
         }
         Ok(())

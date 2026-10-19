@@ -27,11 +27,38 @@ and geometry fail at load.
 - `sample.rs` reproduces `_sample_token`: control-token suppression, the
   repetition penalty, temperature, compiled top-k and categorical sampling.
   The family owns the MLX key: the seed resets it, and each sample splits it.
+  First-code repetition membership is a request-local device array. Codec ids
+  are not downloaded to construct history or penalty indices. Both vocabulary
+  profiles are explicitly prepared with independent scratch keys at load,
+  without consuming a request's random sequence.
 - `codec.rs` decodes 300-frame chunks with 25 frames of left context. As in
   mlx-audio, its transformer applies a full causal mask, not the
   checkpoint's 72-frame sliding window.
 - `ops.rs` holds the parity arithmetic: FP32 SiLU before the BF16 cast, and
-  the reference's compiled GELU and RoPE.
+  the reference's compiled GELU and RoPE. Local GELU and one/two-row rotary
+  profiles prepare at load; each actual Talker prefill length prepares before
+  model execution. These are local functions, not compiled layers or speech
+  loops. Ordinary runtime invocations execute once.
+
+## Scoped EOS control boundary
+
+On 2026-10-19 the requesting Metal maintainer accepted only a host EOS stopping
+Boolean for this batch-one, non-streaming family. The pinned MLX 0.32.3 native
+interface has no device conditional loop for exact early stopping. The family
+compares the first codec id with EOS on device and downloads one Boolean byte
+per Talker step. The host may stop the fixed predictor schedule on that flag;
+it may not receive codec ids, logits, repetition history or other intermediate
+tensors. Codes, repetition penalties, residual-code prediction and waveform
+decoding remain on device until final public audio transfer.
+
+EOS is checked before the length cap. A stopping or capped first code executes
+no residual predictor and consumes no residual sampling keys. This exception
+does not authorize maximum-length speculative work, a changed RNG sequence,
+CPU tensor computation or a generic speech/LLM control exception. Static masks,
+positions and KV offsets may be prepared from known geometry and loop counters,
+not reconstructed from downloaded intermediate data. All numerical, warm
+preparation, resource, lifecycle and performance gates remain required before
+Ready. The owner's scope decision is not upstream PR approval or qualification.
 
 Variants: the default `auto` runs the five code predictor MLPs on
 `apxinf_mlx::fusions::SwigluMlpGemv` only on the measured MLX architecture
