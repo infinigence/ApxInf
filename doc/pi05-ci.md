@@ -67,6 +67,40 @@ input values outside the original profile's ranges. Counts include shared
 Q/K/V inputs separately. These are official BF16 activations, not propagated
 native FP8 activations; they do not prove the native FP8 path avoids clipping.
 
+The subsequent native FP8 capture identifies a calibration-coordinate bug.
+FP8 folds each language RMSNorm's trained scale into QKV and gate/up weights,
+then quantizes the RMS output **before** that scale. The BF16 reference path
+keeps the scale explicit, but the collector was recording the post-scale
+projection input. For frame169, native layer 1's raw RMS maximum is about
+44.39 while the reference's scaled maximum is 13.31. Lowering the bound to
+14.64 clips this native input. The original profile has no raw-RMS range
+violations on this capture; the reduced language profile has 6,163. Traced
+eager and ordinary graph outputs both restore the frozen outputs bitwise.
+
+The collector now separately computes identity-weight RMS at the language
+projection sites and excludes their post-scale linear inputs from collection.
+It uses dedicated CUDA scratch storage, preserving prepared inference arena
+addresses. The real GPU regression fails before the fix (range 2 instead of
+approximately 16), then passes after it with identical model outputs. The
+prepared eager-calibration regression also passes. This repairs observation
+coordinates without changing FP8 inference, its weight folding, or the limits.
+A correct calibration coordinate is necessary but does not establish that a
+new profile meets the full-chunk accuracy gate. Failed profiles remain unapproved.
+
+Recollecting the same 48 episode-disjoint projections with the corrected
+observer improves the one-view evaluation from 0/8 to 6/8. The original profile
+still gives 3/8 before and after, with bitwise controls. Frame137 fails only
+zero-based timestep 48 (cosine 0.996208); frame169 still fails whole-chunk limits
+(cosine 0.978581, relative L2 0.217067, maximum absolute error 0.400615), although
+its previous erroneous-profile cosine was 0.259216. With identical frozen GEMM
+recipes, a separate before/after calibration replay verifies that every other
+site is bitwise unchanged and both collectors repeat exactly. The new profile
+is not approved. The repair's paired performance qualification remains open:
+Thor sampling encountered foreign GPU workloads, followed by Python and
+`nvidia-smi` waiting in `os_acquire_rwlock_read`. Those measurements cannot
+establish a regression verdict; the task's affected submissions were stopped,
+without terminating foreign jobs or resetting the device.
+
 On Orin, the isolated language-normalization weight preparation correction
 passes 5/8 one-view state cases versus 4/8 originally, but introduces a new
 failure. Keeping only the flow state in FP32 preserves the original failure
@@ -101,6 +135,14 @@ recipes, graph execution and identical inputs. The candidate regresses by
 35–36% against the mean of the bracketing originals. They are a shared-board
 pilot, not an exclusive performance budget. The candidate is a private mixed
 precision diagnostic, not an accepted INT8 implementation.
+
+A subsequent eight-observation bisection retains only language layers 0–8 or
+9–17. Each passes 7/8, versus 4/8 for bitwise-restored original controls. The
+first half still fails frame169; the second half fails frame137. Splitting the
+layer groups further on four fixed observations gives 3/4 for layers 0–4,
+3/4 for 5–8, 0/4 for 9–12 and 3/4 for 13–17. The first two groups fail frame169;
+the last group fails frame137. These are sensitivity experiments, not fixes or
+accepted mixed precision policies. No smaller group yet passes this pilot.
 
 A subsequent capture tests the actual native language arithmetic on frame169.
 Both the trace-disabled graph output and traced eager output restore the

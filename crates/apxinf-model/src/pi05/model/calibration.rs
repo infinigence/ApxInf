@@ -5,13 +5,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
-use crate::pi05::{backend::{self, Context}, Bf16Weights, Pi05CalibrationPlan, Pi05Config};
+use crate::pi05::{
+    backend::{self, ops, Context, DeviceBuffer},
+    Bf16Weights, Pi05CalibrationPlan, Pi05Config,
+};
 
 pub struct Pi05CalibrationObserver {
     backend: Arc<Context>,
     sites: HashMap<usize, String>,
+    folded_rms_sites: BTreeSet<usize>,
+    rms_identity: Tensor,
+    rms_scratch: DeviceBuffer,
     plan: Pi05CalibrationPlan,
     records: RefCell<BTreeMap<String, f32>>,
 }
@@ -54,21 +60,33 @@ pub(in crate::pi05::model) fn observe_bf16_activation(
     })
 }
 
+/// FP8 folds language RMS scales into projection weights. Collect its input
+/// before that scale without changing the BF16 reference traversal.
+pub(in crate::pi05::model) fn observe_bf16_folded_rms(
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<()> {
+    BF16_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.observe_folded_rms(input, weight, eps)?;
+        }
+        Ok(())
+    })
+}
+
 impl Pi05CalibrationObserver {
-    pub fn new(
-        backend: Arc<Context>,
-        config: &Pi05Config,
-        weights: &Bf16Weights,
-    ) -> Result<Self> {
+    pub fn new(backend: Arc<Context>, config: &Pi05Config, weights: &Bf16Weights) -> Result<Self> {
         let mut sites = HashMap::new();
+        let mut folded_rms_sites = BTreeSet::new();
         let plan = Pi05CalibrationPlan::for_config(config);
-        let mut insert = |tensor: &Tensor, name: String| -> Result<()> {
+        let mut insert = |tensor: &Tensor, name: String| -> Result<usize> {
             let handle = tensor
                 .storage()
                 .as_gpu()
                 .ok_or_else(|| Error::Other(format!("calibration weight {name} is not on CUDA")))?;
             sites.insert(handle.ptr, name);
-            Ok(())
+            Ok(handle.ptr)
         };
 
         insert(&weights.patch_embedding.weight, "vision.patch_input".into())?;
@@ -92,13 +110,13 @@ impl Pi05CalibrationObserver {
             "vision.post_norm".into(),
         )?;
         for (layer, names) in weights.language_layers.iter().zip(plan.language_layers()) {
-            insert(&layer.qkv.weight, names.attention_norm.clone())?;
+            folded_rms_sites.insert(insert(&layer.qkv.weight, names.attention_norm.clone())?);
             if let Some(attention_output) = &names.attention_output {
                 insert(&layer.output.weight, attention_output.clone())?;
-                insert(
+                folded_rms_sites.insert(insert(
                     &layer.gate_up.weight,
                     names.mlp_norm.clone().expect("language tail site"),
-                )?;
+                )?);
                 insert(
                     &layer.down.weight,
                     names.mlp_activation.clone().expect("language tail site"),
@@ -136,9 +154,30 @@ impl Pi05CalibrationObserver {
         }
         insert(&weights.action_out.weight, "action.final_norm".into())?;
 
+        let tokens = config
+            .num_views
+            .checked_mul(config.patches_per_view())
+            .and_then(|patches| patches.checked_add(config.max_token_len));
+        let bytes = tokens
+            .and_then(|tokens| tokens.checked_mul(config.language.width))
+            .and_then(|elements| elements.checked_mul(DType::BF16.size_in_bytes()))
+            .ok_or_else(|| Error::Other("calibration RMS scratch size overflow".into()))?;
+        let rms_identity = backend::to_device(
+            &backend,
+            &Tensor::from_f32(
+                vec![config.language.width],
+                &vec![1.0; config.language.width],
+            )?,
+        )?;
+        // Keep diagnostic output outside the inference arena: additional arena
+        // allocations would invalidate the prepared GEMM binding addresses.
+        let rms_scratch = DeviceBuffer::alloc(bytes, backend.device_id()).map_err(Error::Cuda)?;
         Ok(Self {
             backend,
             sites,
+            folded_rms_sites,
+            rms_identity,
+            rms_scratch,
             plan,
             records: RefCell::new(BTreeMap::new()),
         })
@@ -169,13 +208,47 @@ impl Pi05CalibrationObserver {
         let Some(name) = self.sites.get(&pointer) else {
             return Ok(());
         };
+        if self.folded_rms_sites.contains(&pointer) {
+            return Ok(());
+        }
+        self.record(activation, name)
+    }
+
+    fn observe_folded_rms(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<()> {
+        let pointer = weight
+            .storage()
+            .as_gpu()
+            .ok_or_else(|| Error::Other("observed BF16 weight is not on CUDA".into()))?
+            .ptr;
+        if !self.folded_rms_sites.contains(&pointer) {
+            return Err(Error::Other(
+                "unregistered folded RMS calibration site".into(),
+            ));
+        }
+        let bytes = input
+            .numel()
+            .checked_mul(input.dtype().size_in_bytes())
+            .ok_or_else(|| Error::Other("calibration RMS input size overflow".into()))?;
+        let mut output = self
+            .rms_scratch
+            .view(0, bytes)
+            .and_then(|buffer| buffer.as_tensor(input.shape().clone(), input.dtype()))
+            .map_err(Error::Cuda)?;
+        ops::rms_norm(
+            &self.backend,
+            ops::RmsNormArgs::new(input, &self.rms_identity, &mut output, eps),
+        )?;
+        self.record(&output, &self.sites[&pointer])
+    }
+
+    fn record(&self, activation: &Tensor, name: &str) -> Result<()> {
         // The host vector is scoped to this reduction and dropped immediately;
         // the collector retains only one scalar per logical site.
         let values = backend::to_cpu(activation)?.to_f32_vec()?;
         let amax = finite_amax(values, name)?;
         let mut records = self.records.borrow_mut();
         records
-            .entry(name.clone())
+            .entry(name.to_owned())
             .and_modify(|current| *current = current.max(amax))
             .or_insert(amax);
         Ok(())
@@ -198,6 +271,96 @@ fn finite_amax(values: impl IntoIterator<Item = f32>, name: &str) -> Result<f32>
 #[cfg(test)]
 mod tests {
     use super::finite_amax;
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn calibration_observes_language_norm_before_folded_scale() {
+        use super::*;
+        use crate::pi05::model::blocks::bf16::language_layer_bf16;
+        use crate::pi05::{GemmaVariantConfig, Pi05Weights};
+        use apxinf_core::DType;
+
+        let language = GemmaVariantConfig {
+            width: 256,
+            depth: 2,
+            mlp_dim: 256,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 256,
+        };
+        let config = Pi05Config {
+            language,
+            action_expert: language,
+            vocab_size: 16,
+            num_views: 1,
+            vision_depth: 1,
+            vision_width: 64,
+            vision_heads: 1,
+            vision_head_dim: 64,
+            vision_mlp_dim: 64,
+            action_horizon: 2,
+            num_flow_steps: 1,
+            ..Pi05Config::default()
+        };
+        let backend = Arc::new(Context::new_with_autotune(0, false).unwrap());
+        let mut host = Pi05Weights::synthetic(&config, 7).unwrap();
+        let layer = &mut host.language_layers[0];
+        layer.input_norm.offset = Tensor::from_f32(vec![256], &vec![-0.875; 256]).unwrap();
+        layer.post_attention_norm.offset = Tensor::from_f32(vec![256], &vec![1.0; 256]).unwrap();
+        // Zero attention projection keeps the second norm's input identical.
+        layer.attention.output.weight = Tensor::zeros(vec![256, 256], DType::F32);
+        let weights = Bf16Weights::from_host(&host, &backend).unwrap();
+        let mut values = vec![half::bf16::ZERO; 32 * 256];
+        for row in values.chunks_exact_mut(256) {
+            row[0] = half::bf16::from_f32(16.0);
+        }
+        let input = backend::to_device(
+            &backend,
+            &Tensor::from_bf16(vec![32, 256], &values).unwrap(),
+        )
+        .unwrap();
+        let run = || {
+            language_layer_bf16(
+                &backend,
+                language,
+                &weights.language_layers[0],
+                &input,
+                true,
+                0,
+                config.rms_norm_eps,
+                config.rope_theta,
+            )
+            .unwrap()
+        };
+        let expected_output = backend::to_cpu(&run().hidden)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        let observer =
+            Rc::new(Pi05CalibrationObserver::new(backend.clone(), &config, &weights).unwrap());
+        let guard = install_bf16_observer(observer.clone()).unwrap();
+        let observed_output = backend::to_cpu(&run().hidden)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            observed_output, expected_output,
+            "calibration changed model output"
+        );
+        let records = observer.records.borrow();
+        let expected = (16.0 / (1.0 + f64::from(config.rms_norm_eps)).sqrt()) as f32;
+        for site in [
+            "language.layers.0.attention_norm",
+            "language.layers.0.mlp_norm",
+        ] {
+            assert!(
+                (records[site] - expected).abs() < 1.0e-5,
+                "FP8 folded norm range at {site}: {} != {expected}",
+                records[site],
+            );
+        }
+    }
 
     #[test]
     fn activation_amax_rejects_non_finite_values() {

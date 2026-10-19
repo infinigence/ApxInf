@@ -594,6 +594,7 @@ fn language_layer_bf16_with_policies(
     rms_eps: f32,
     rope_theta: f32,
 ) -> Result<Bf16LanguageLayerOutput> {
+    crate::pi05::model::calibration::observe_bf16_folded_rms(input, &weights.qkv.weight, rms_eps)?;
     let normalized = rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
     let qkv = gemm_dense(ctx, policies, &normalized, &weights.qkv.weight)?;
     let qkv = split_qkv_rope_bf16(
@@ -623,6 +624,11 @@ fn language_layer_bf16_with_policies(
         weights.output.bias.as_ref(),
         input,
         &weights.post_attention_norm_scale,
+        rms_eps,
+    )?;
+    crate::pi05::model::calibration::observe_bf16_folded_rms(
+        &fused.hidden,
+        &weights.gate_up.weight,
         rms_eps,
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
