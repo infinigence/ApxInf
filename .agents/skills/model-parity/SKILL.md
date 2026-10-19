@@ -16,6 +16,12 @@ Two different questions; do not mix their evidence:
 
 ## Protocol (stop at the first failing step)
 
+Before experiments, declare the acceptance matrix and public callers using
+[agent acceptance](../../../doc/guides/agent-acceptance.md). Include each changed
+public path and each affected family when shared binding/backend code changes.
+Private harness results diagnose internals; they cannot substitute for the
+public policy/binding call. A skip or absent device is UNVERIFIED, not a pass.
+
 1. **Name the reference of record.** Repository or checkout, revision,
    checkpoint identity, precision, attention backend. A public upstream that
    only defines preprocessing is not automatically the forward-pass
@@ -25,7 +31,8 @@ Two different questions; do not mix their evidence:
    matched (stored inputs: token IDs, pixel values or patches, grids, masks,
    position IDs, state, initial noise) to both stacks and reproduce the
    recorded number. Do not test new shapes, precisions or code until the
-   anchor reproduces; a harness that cannot reproduce it is the bug.
+   anchor reproduces; a harness that cannot reproduce it is not yet qualified
+   to diagnose new shapes. Record the anchor as blocked when it cannot run.
 3. **Measure the noise floor.** Run the reference against itself in FP32 vs
    the target precision on the same fixture. A gap well above this floor is
    semantic, not rounding. "BF16 accumulation" is a hypothesis until this
@@ -71,6 +78,24 @@ write COMPLETE or CONFIRMED next to a result whose inputs, shape or output
 domain were not checked by steps 4 to 6. When a contract rejects your input,
 first check whether your branch changed that contract. Withdraw a superseded
 claim explicitly instead of leaving it in the record.
+
+## Final evidence
+
+Freeze implementation and harnesses before final measurements. Record their
+hashes and the loaded extension path/hash; rerun after edits. Compare full action
+tensors, not log tails. Test unchanged inputs twice, changed images and prompts,
+and shape A -> B -> A (including equal-sized buffers with different grids).
+Test explicit preparation separately from implicit inference: required graph
+mode, fallback reason, updated inputs on replay, and preservation of a healthy
+plan after a rejected request are distinct contracts.
+
+For timing/tuning, read back actual execution mode and fallback reason before
+using a sample. Diagnostic event synchronization belongs outside graph capture.
+Require a nonzero count of newly tuned keys for a tuning experiment; unchanged
+keys mean the experiment did not exercise tuning. Reconcile stage timings with
+the measured scope and board bandwidth before explaining a speedup. Validate an
+optimization on its actual caller path (bias, shape, precision), then rerun
+shared callers; compiling a new kernel does not prove it is used.
 
 ## Timebox
 

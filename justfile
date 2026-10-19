@@ -117,6 +117,11 @@ boundaries:
 test-tooling:
     python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+# Record/check an opt-in acceptance plan; run, block, check (see --help).
+[positional-arguments]
+acceptance *args:
+    python3 scripts/agent_acceptance.py "$@"
+
 # Validate GitHub Actions syntax and embedded shell commands (requires actionlint).
 workflow-lint:
     actionlint

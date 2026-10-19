@@ -41,6 +41,10 @@ everything found is a Nit, lead the summary with "No blocking issues."
 ## Always check
 
 - New public API surface has at least one caller test.
+- Shared binding/backend changes list affected public callers and their measured
+  or unverified status; private harnesses are not public-path acceptance.
+- Model evidence identifies effective grids, actual graph/eager mode, full output
+  comparison and loaded build. Final source/harness edits invalidate old evidence.
 - `just --list` covers any new command the PR introduces.
 - Docs touched by the PR still pass `just doc-lint`.
 

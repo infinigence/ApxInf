@@ -4,6 +4,12 @@ Generated from the source tree (`grep -rE "APXINF_"`). Names are
 classified by where they are consumed; a variable absent from this
 list is not a supported knob — grep the source for it instead.
 
+## Agent infrastructure
+
+| Name | Where read |
+|---|---|
+| `APXINF_AGENT_ACCEPTANCE_PLAN` | scripts/hooks/guard_agent_stop.py; opt-in absolute path to a task acceptance JSON under devlocal; see [agent acceptance](../guides/agent-acceptance.md) |
+
 ## Build-time (read in build.rs / build_support)
 
 | Name | Where read |
