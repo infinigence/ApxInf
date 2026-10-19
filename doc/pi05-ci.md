@@ -10,14 +10,57 @@ missing asset, uncalibrated budget, failed preflight or numerical failure cannot
 implemented. Final-source GPU qualification and performance budgets remain
 incomplete. The PR stays a draft until the required matrix below passes.
 
-### Verified results (2026-10-17)
+### Measured state inputs (2026-10-19)
+
+The eight DROID observations now also have their synchronized seven joint
+positions and gripper position, normalized with the official
+[pi05_droid quantile statistics](https://storage.googleapis.com/openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json)
+and tokenized by the pinned OpenPI Pi05 state-token path before state padding.
+Images, noise, base checkpoint and original numerical limits are unchanged.
+The prompts contain 44–54 valid tokens. This evaluates the base model's
+implementation, not the fine-tuned DROID policy's task success. Third-camera
+remapping remains shape coverage.
+
+| Hardware / precision | 1 view | 2 views | 3 views | Total |
+| --- | --- | --- | --- | --- |
+| Thor BF16 | 8/8 | 8/8 | 8/8 | 24/24 |
+| Thor FP8, original profile | 3/8 | 5/8 | 4/8 | 12/24 |
+| Orin BF16 | 8/8 | 8/8 | 8/8 | 24/24 |
+| Orin INT8 | 4/8 | 5/8 | 5/8 | 14/24 |
+
+These are diagnostic reruns with existing curated native builds, not clean
+final-PR-source acceptance. Every count includes all action timesteps. Graph
+execution, fixed recipes and matching CUDA-library identities are verified.
+Repeated/revisited outputs under the earlier protocol are bitwise stable; that
+protocol does not qualify the revised consecutive-call gate below. The original
+text-only and constructed failures remain recorded and unresolved.
+
+The largest new FP8 discrepancy is `droid-record0-frame165`: two-view cosine
+0.9766 / relative L2 0.2337, and three-view cosine 0.9541 / relative L2 0.3148.
+The corresponding BF16 cases pass. Other quantized cases fail only an individual
+timestep despite passing whole-chunk limits.
+
+A controlled calibration experiment uses four fixed real frames with identical
+images/noise, varying only text-only versus measured-state tokenization. Both
+new profiles pass 0/8 one-view evaluation cases, versus 3/8 for the original
+profile. Original outputs restore bitwise before and after the factors, and the
+new profiles are rejected. These calibration frames are disjoint by frame but
+share evaluation episodes; they are diagnostics, not qualified calibration data.
+A separate candidate uses sixteen observations from four different DROID
+trajectories, with episode identities checked against evaluation. Its fixed
+selection is the union of initial, maximum gripper position, largest gripper
+closure change and final frames; missing recorded prompts are excluded and
+selection does not use model outputs. Qualification of that candidate remains
+pending.
+
+### Earlier text-only and constructed inputs (2026-10-17)
 
 Each numerical run covers eight real observations and thirteen constructed
 diagnostics per view: 63 cases per board/precision. The existing limits apply
 to the whole chunk and every action timestep. Counts below are diagnostic
 results, **not approved baselines**.
 
-| Build / hardware / precision | Real, 1 / 2 / 3 views | Constructed, 1 / 2 / 3 views | Total |
+| Build / hardware / precision | Real images, text-only, 1 / 2 / 3 views | Constructed, 1 / 2 / 3 views | Total |
 | --- | --- | --- | --- |
 | Maintained TF32 and split-K repair / Thor BF16 | 7/8, 8/8, 8/8 | 11/13, 8/13, 12/13 | 54/63 |
 | Maintained TF32 build / FP8, original calibration | 0/8, 5/8, 5/8 | 1/13, 0/13, 0/13 | 11/63 |
