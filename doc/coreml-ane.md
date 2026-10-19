@@ -65,7 +65,7 @@ Out of scope:
 | Owner | Responsibility |
 | --- | --- |
 | `apxinf-coreml` program writer | Typed operation builder for the supported list, ML Program protobuf, MILBlob weight file, package layout |
-| `apxinf-coreml` runtime | Compile, content-addressed cache, load with requested compute units, seal after load, FP16 `MLMultiArray` host input and output with explicit strides, worker-thread prediction, `NSError` conversion |
+| `apxinf-coreml` runtime | Compile, content-addressed cache, load with requested compute units, seal after load, synchronous prediction over FP16 host buffers with explicit strides, `NSError` conversion |
 | `apxinf-mlx` | Asynchronous evaluation, so the GPU share runs while the ANE predicts; host transfer of the exchanged tiles |
 | Model family | What runs on the ANE, host-side quantization and its numerics, tiling, the GPU/ANE overlap schedule, residency budget, architecture policy |
 
@@ -134,8 +134,12 @@ committed, because they contain checkpoint-derived weights.
   does not mean placement-qualified or ready for requests.
 - **Predict.** Inputs and outputs are FP16 host buffers. Output multi-arrays
   are read with their reported strides, because the ANE may pad them.
-  Prediction runs on a worker thread that the runtime owns. MLX arrays never
-  cross threads, so MLX's thread affinity is preserved.
+  Prediction is synchronous on the calling thread. ApxInf creates no prediction
+  worker; Core ML owns its internal scheduling. Input multi-arrays borrow the
+  caller's FP16 buffers only until prediction and output copying complete.
+  Outputs are copied into caller-owned storage before the bridge returns.
+  MLX arrays stay on their owning thread. GPU work enqueued before prediction
+  may overlap it without moving MLX objects to an application worker.
 - **Memory.** The ANE keeps only a limited amount of program weights resident;
   about 2.4 GB was observed on the M1 Pro. Exceeding it reloads programs on
   every switch. The family owns the per-layer budget.
