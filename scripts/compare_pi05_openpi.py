@@ -201,18 +201,37 @@ def load_suite(root: Path) -> dict[str, Any]:
         raise ValueError("suite must contain distinct cases")
     if not 1 <= len(manifest["image_keys"]) <= 3 or manifest["horizon"] < 1 or manifest["num_flow_steps"] < 1:
         raise ValueError("invalid view count, horizon or flow steps")
-    for case in manifest["cases"]:
-        path = (root / case["path"]).resolve()
-        if not path.is_relative_to(root.resolve()):
-            raise ValueError("case path escapes suite")
-        if sha256(root / case["path"]) != case["sha256"]:
-            raise ValueError(f"case input changed: {case['name']}")
+    for entry in manifest["cases"]:
+        case = load_case(root, entry)
+        if case["images"].shape[0] != len(manifest["image_keys"]):
+            raise ValueError(f"case camera count differs from manifest: {entry['name']}")
+        if case["noise"].shape != (manifest["horizon"], 32):
+            raise ValueError(f"case action horizon differs from manifest: {entry['name']}")
     return manifest
 
 
-def load_case(root: Path, case: dict[str, str]) -> dict[str, np.ndarray]:
-    with np.load(root / case["path"], allow_pickle=False) as archive:
-        return {name: np.array(archive[name], copy=True) for name in archive.files}
+def load_case(root: Path, entry: dict[str, str]) -> dict[str, np.ndarray]:
+    path = (root / entry["path"]).resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError("case path escapes suite")
+    if sha256(path) != entry["sha256"]:
+        raise ValueError(f"case input changed: {entry['name']}")
+    with np.load(path, allow_pickle=False) as archive:
+        case = {name: np.array(archive[name], copy=True) for name in archive.files}
+    if not {"images", "token_ids", "noise"} <= case.keys():
+        raise ValueError("case requires images, token_ids and noise")
+    images, tokens, noise = case["images"], case["token_ids"], case["noise"]
+    if (images.dtype != np.uint8 or images.ndim != 4 or
+            not 1 <= images.shape[0] <= 3 or images.shape[1:] != (224, 224, 3)):
+        raise ValueError("frozen images must be uint8 (views, 224, 224, 3)")
+    if (tokens.ndim != 1 or not tokens.size or
+            not np.issubdtype(tokens.dtype, np.integer) or
+            tokens.min() < 0 or tokens.max() >= 257152):
+        raise ValueError("frozen token_ids must be a nonempty integer vector within vocabulary")
+    if (noise.dtype != np.float32 or noise.ndim != 2 or noise.shape[0] < 1 or
+            noise.shape[1] != 32 or not np.isfinite(noise).all()):
+        raise ValueError("frozen noise must be finite float32 (horizon, 32)")
+    return case
 
 
 def shape_switch_pair(root: Path, manifest: dict[str, Any]) -> tuple[dict, dict]:

@@ -111,6 +111,38 @@ class ReceiptTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parity.load_suite(self.root)
 
+    def test_frozen_input_contract_is_checked_even_with_matching_digest(self):
+        manifest = parity.load_suite(self.root)
+        entry = manifest["cases"][0]
+        original = parity.load_case(self.root, entry)
+        invalid = [
+            ("noise", original["noise"].astype(np.float64)),
+            ("noise", np.full((2, 32), np.nan, np.float32)),
+            ("noise", np.zeros((3, 32), np.float32)),
+            ("token_ids", np.array([-1, 108], np.int64)),
+            ("token_ids", np.array([257152], np.uint32)),
+            ("token_ids", np.array([2.5, 108], np.float32)),
+            ("token_ids", np.array([], np.uint32)),
+            ("images", original["images"].astype(np.float32)),
+            ("images", np.zeros((2, 224, 224, 3), np.uint8)),
+            ("images", np.zeros((1, 3, 224, 224), np.uint8)),
+        ]
+        for key, value in invalid:
+            with self.subTest(key=key, shape=value.shape, dtype=value.dtype):
+                np.savez(self.root / entry["path"], **dict(original, **{key: value}))
+                entry["sha256"] = parity.sha256(self.root / entry["path"])
+                parity.write_json(self.root / "manifest.json", manifest, force=True)
+                with self.assertRaises(ValueError):
+                    parity.load_suite(self.root)
+
+    def test_case_changed_after_suite_validation_is_rejected(self):
+        entry = parity.load_suite(self.root)["cases"][0]
+        case = parity.load_case(self.root, entry)
+        case["noise"][0, 0] = 1
+        np.savez(self.root / entry["path"], **case)
+        with self.assertRaises(ValueError):
+            parity.load_case(self.root, entry)
+
     def test_replay_keeps_all_three_source_observations(self):
         paths = []
         for index in range(3):

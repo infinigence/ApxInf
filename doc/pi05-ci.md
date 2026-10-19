@@ -235,7 +235,11 @@ Preferred preparation is `--case-npz`: one frozen model observation per file,
 with `images` (V,224,224,3 uint8), `token_ids` (T integer), and `noise` (H,32
 float32). Preserve the actual preprocessed camera order and tokenized
 prompt/state from the same observation. Gaussian noise must be saved, not
-regenerated separately by two frameworks. The same observation can produce
+regenerated separately by two frameworks. Loading a frozen suite validates
+uint8 NHWC image shape and view count, nonempty in-vocabulary integer tokens,
+and finite FP32 noise with the declared action horizon. Each case digest is
+checked again when loading it for inference, so a changed archive cannot reuse
+a prior suite-validation result. These checks run outside latency sampling. The same observation can produce
 1/2/3 view shape fixtures by retaining the first V cameras. This is a computation
 test, not evidence that a deployed policy with removed cameras succeeds.
 
@@ -294,6 +298,15 @@ small reference action magnitudes, and minimized historical failures. Retain
 which case covers each difference, and remove cases with identical canonical
 model input. Determine the resulting count from measured runtime and coverage;
 synthetic diagnostic counts do not prescribe the formal bank count.
+
+The eight existing DROID image fixtures use the pinned tokenizer with
+`state=None`: they contain the recorded task text but no state tokens. The
+pinned official tokenizer identifies that branch as the Pi0 prompt format;
+Pi05 state input uses `Task: ..., State: ...; Action: ...`. Therefore those
+fixtures are text-only computation diagnostics, not coverage of the normal
+Pi05 state-token path. Additional controlled zero-state fixtures must also be
+labelled as constructed states, not measured normalized DROID observations.
+Neither category replaces or waives previously failing numerical cases.
 
 The official adapter uses OpenPI PyTorch PI0.5 with compilation disabled,
 selected BF16 parameters, zero direct state, explicit prompt tokens/masks and
