@@ -31,7 +31,7 @@ mod ffi {
     }
 }
 
-fn check(status: i32) -> Result<()> {
+pub(crate) fn check(status: i32) -> Result<()> {
     if status == 0 {
         return Ok(());
     }
@@ -214,5 +214,23 @@ impl ProgramCache {
 
     pub fn load(&self, package: &Package, units: ComputeUnits) -> Result<Model> {
         Model::load(&self.compiled(package)?, units)
+    }
+
+    pub fn load_with_placement(
+        &self,
+        package: &Package,
+        units: ComputeUnits,
+        timeout: std::time::Duration,
+        admit: impl FnOnce(&crate::placement::ExpectedPlacement) -> Result<()>,
+    ) -> Result<Model> {
+        let timeout_ms = crate::placement::timeout_millis(timeout)?;
+        let compiled = self
+            .compiled(package)?
+            .canonicalize()
+            .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
+        let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
+        let model = Model::load(&compiled, units)?;
+        admit(&facts)?;
+        Ok(model)
     }
 }
