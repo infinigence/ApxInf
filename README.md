@@ -130,12 +130,12 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 
 ### GR00T N1.7
 
-One or two views, batch 1. Best recorded P50.
+One or two views, batch 1. Measured P50.
 
 | Hardware | Precision | 1-view P50 | 2-view P50 |
 |---|---|---:|---:|
 | Jetson AGX Thor | BF16 | 51.834 ms | 54.216 ms |
-| Jetson AGX Thor | FP8 | 32.557 ms | 35.436 ms |
+| Jetson AGX Thor | FP8 | 26.567 ms | 29.960 ms |
 | Jetson AGX Orin | BF16 | 75.778 ms | 84.864 ms |
 | Jetson AGX Orin | W8A8 | 56.711 ms | 64.924 ms |
 
