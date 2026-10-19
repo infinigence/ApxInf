@@ -40,6 +40,15 @@ and geometry fail at load.
   model execution. These are local functions, not compiled layers or speech
   loops. Ordinary runtime invocations execute once.
 
+At load, the selected predictor fusion evaluates each retained layer twice for
+both one- and two-row device scratch inputs, after weight packing. Before
+waveform execution, the decoder derives distinct GELU profiles from the actual
+300-frame chunks, left context, upsampling ratios and loaded projection widths,
+then prepares each with materialized BF16 device scratch. It does not run a
+whole decoder or consume request RNG during preparation. These warm calls are
+included in complete load/request latency. They do not by themselves prove
+absence of native JIT across the rest of the model.
+
 ## Scoped EOS control boundary
 
 On 2026-10-19 the requesting Metal maintainer accepted only a host EOS stopping

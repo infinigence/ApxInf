@@ -9,9 +9,30 @@ use super::ops::Ops;
 use super::weights::{Codec, CodecLayer, Conv, ConvNext, Snake};
 use apxinf_core::Result;
 use apxinf_mlx::{Array, MlxDType};
+use std::collections::BTreeSet;
+use std::ops::Range;
 
 const CHUNK: usize = 300;
 const LEFT_CONTEXT: usize = 25;
+
+fn chunks(frames: usize) -> impl Iterator<Item = (Range<usize>, usize)> {
+    (0..frames).step_by(CHUNK).map(move |start| {
+        let context = start.min(LEFT_CONTEXT);
+        (start - context..(start + CHUNK).min(frames), context)
+    })
+}
+
+fn gelu_profiles(frames: usize, widths: &[usize]) -> BTreeSet<[usize; 3]> {
+    let mut profiles = BTreeSet::new();
+    for (range, _) in chunks(frames) {
+        let mut length = range.len();
+        for (&factor, &width) in UPSAMPLING_RATIOS.iter().zip(widths) {
+            length *= factor;
+            profiles.insert([1, length, width]);
+        }
+    }
+    profiles
+}
 
 pub struct Decoder {
     w: Codec,
@@ -204,22 +225,74 @@ impl Decoder {
     /// `chunked_decode` of codes `[1, 16, F]`: `F * 1920` samples, as host `f32`.
     pub fn decode(&self, codes: &Array) -> Result<Vec<f32>> {
         let frames = codes.shape()[2];
+        let widths: Vec<_> = self
+            .w
+            .upsample
+            .iter()
+            .map(|(_, next)| next.pwconv1.weight.shape()[0])
+            .collect();
+        for shape in gelu_profiles(frames, &widths) {
+            self.ops.prepare_gelu(&shape)?;
+        }
         let mut chunks = Vec::new();
-        let mut start = 0;
-        while start < frames {
-            let end = (start + CHUNK).min(frames);
-            let context = if start > LEFT_CONTEXT {
-                LEFT_CONTEXT
-            } else {
-                start
-            };
-            let wav = self.call(&codes.slice(&[0, 0, start - context], &[1, CODE_GROUPS, end])?)?;
+        for (range, context) in self::chunks(frames) {
+            let wav =
+                self.call(&codes.slice(&[0, 0, range.start], &[1, CODE_GROUPS, range.end])?)?;
             let samples = wav.shape()[2];
             chunks.push(wav.slice(&[0, 0, context * SAMPLES_PER_FRAME], &[1, 1, samples])?);
-            start = end;
         }
         let audio = Array::concat(&chunks.iter().collect::<Vec<_>>(), 2)?
             .reshape(&[frames * SAMPLES_PER_FRAME])?;
         audio.cast(MlxDType::F32)?.to_f32_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_ranges_keep_exact_context_and_cover_each_new_frame() {
+        assert_eq!(chunks(300).collect::<Vec<_>>(), vec![(0..300, 0)]);
+        assert_eq!(
+            chunks(301).collect::<Vec<_>>(),
+            vec![(0..300, 0), (275..301, 25)]
+        );
+        assert_eq!(
+            chunks(601).collect::<Vec<_>>(),
+            vec![(0..300, 0), (275..600, 25), (575..601, 25)]
+        );
+        for frames in 0..=901 {
+            let mut covered = 0;
+            for (range, context) in chunks(frames) {
+                assert_eq!(range.start + context, covered);
+                assert!(range.len() > context && context <= LEFT_CONTEXT);
+                covered += range.len() - context;
+            }
+            assert_eq!(covered, frames);
+        }
+    }
+
+    #[test]
+    fn gelu_profiles_use_actual_chunk_lengths_and_each_loaded_width() {
+        assert!(gelu_profiles(0, &[4096, 2048]).is_empty());
+        assert_eq!(
+            gelu_profiles(301, &[4096, 2048]),
+            BTreeSet::from([
+                [1, 52, 4096],
+                [1, 104, 2048],
+                [1, 600, 4096],
+                [1, 1200, 2048],
+            ])
+        );
+        assert_eq!(
+            gelu_profiles(900, &[4096, 4096]),
+            BTreeSet::from([
+                [1, 600, 4096],
+                [1, 650, 4096],
+                [1, 1200, 4096],
+                [1, 1300, 4096],
+            ])
+        );
     }
 }
