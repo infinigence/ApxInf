@@ -35,6 +35,13 @@ Select it from the CLI with `generate-image --model-variant reference`.
   decoder layer at a time per request. It loads the stored
   `rotary_emb.inv_freq` as mflux does, and skips the deterministic DiT buffers
   that mflux recomputes.
+  All shards are checked for overflow-safe byte extents and complete,
+  nonoverlapping SafeTensors data offsets before payload loading. The optional
+  mflux export tag `quantization_level` must be the string `4` when present;
+  it describes the global export, including its BF16 text and F32 VAE shards,
+  rather than overriding individual tensor dtypes. Missing tags remain valid
+  when the physical checkpoint contracts match. Text validation reads headers
+  and file sizes only, preserving layer-at-a-time payload loading.
 - `text.rs` applies the fixed system template, drops the system-prefix states
   and follows Qwen3-VL's FP32 norm, BF16 RoPE and FP32 attention rounding.
 - `dit.rs` computes the text-prefix K/V once per request with the t = 0
