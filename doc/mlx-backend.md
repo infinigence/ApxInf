@@ -157,6 +157,13 @@ codec dependency is added.
   projections, without changing the scheduler or other execution paths. The DiT
   is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
   read again by the next request, as `--low-ram` does.
+- The pure image-forward callable prepares the request's exact first-step
+  inputs twice and supplies its second output to the first solver update.
+  Later steps execute once each; all 40 original BF16 updates are unchanged.
+  This is request-local velocity compilation, not a compiled scheduler or
+  rollout. Local activations are prepared separately. VAE overlap accumulation,
+  normalization and final channel rounding use safe device arrays; the final
+  download contains completed integer channels for RGB8 serialization.
 - The checkpoint weights are under the Qwen Research License, which permits
   non-commercial use only. APXinf ships no weights.
 

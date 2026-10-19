@@ -289,8 +289,8 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let step = dit::Step::new(dit::Dit::new(transformer, ops, self.gemm.clone())?)?;
-        let cache = step.dit().text_cache(
+        let dit = dit::Dit::new(transformer, ops, self.gemm.clone())?;
+        let cache = dit.text_cache(
             &prompt,
             &table(&cos[..split], text_len)?,
             &table(&sin[..split], text_len)?,
@@ -300,9 +300,18 @@ impl ImageRuntime for QwenImage {
             table(&cos[split..], lh * lw)?,
             table(&sin[split..], lh * lw)?,
         );
+        latents.eval()?;
+        let sigma = |i: usize| sigmas.slice(&[i], &[i + 1]);
+        let (step, first) = dit::Step::prepare(
+            dit,
+            &dit::Step::inputs(&latents, &sigma(0)?, &cos, &sin, &cache),
+        )?;
+        let mut first = Some(first);
         for t in 0..request.steps {
-            let sigma = |i: usize| sigmas.slice(&[i], &[i + 1]);
-            let velocity = step.call(&latents, &sigma(t)?, &cos, &sin, &cache)?;
+            let velocity = match first.take() {
+                Some(velocity) => velocity,
+                None => step.call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?,
+            };
             let dt = sigma(t + 1)?
                 .sub(&sigma(t)?)?
                 .reshape(&[])?

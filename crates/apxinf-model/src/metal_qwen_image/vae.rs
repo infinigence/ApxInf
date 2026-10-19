@@ -1,5 +1,5 @@
 //! VAE decoding as mflux runs it under `--low-ram`: `Qwen21VAE.decode` on
-//! NCHW tensors (each convolution in NHWC), tiled with host-side blending
+//! NCHW tensors (each convolution in NHWC), tiled with device-side blending
 //! (`VAETiler.decode_image_tiled`, `TilingConfig()` defaults), then RGB8.
 use super::ops::Ops;
 use super::tables::cos_ramp;
@@ -161,10 +161,102 @@ impl Vae<'_> {
     }
 }
 
-/// One decoded tile as host `[h, w, 3]` FP32.
-fn decode_tile(vae: &Vae, latents: &Array) -> Result<Vec<f32>> {
+/// One decoded tile as device `[h, w, 3]` FP32.
+fn decode_tile(vae: &Vae, latents: &Array) -> Result<Array> {
     let decoded = vae.decode(latents)?.cast(MlxDType::F32)?;
-    decoded.transpose(&[0, 2, 3, 1])?.contiguous()?.to_f32_vec()
+    let shape = decoded.shape();
+    let tile = decoded
+        .transpose(&[0, 2, 3, 1])?
+        .reshape(&[shape[2], shape[3], 3])?
+        .contiguous()?;
+    tile.eval()?;
+    Ok(tile)
+}
+
+fn edge_weights(n: usize, head: bool, tail: bool, ramp: &[f32]) -> Vec<f32> {
+    let overlap = (OVERLAP * SCALE).min(n - 1);
+    let mut weights = vec![1f32; n];
+    if head {
+        weights[..overlap].copy_from_slice(&ramp[..overlap]);
+    }
+    if tail {
+        for (index, value) in ramp[..overlap].iter().enumerate() {
+            weights[n - overlap + index] = 1.0 - value;
+        }
+    }
+    weights
+}
+
+struct Blend {
+    sum: Array,
+    count: Array,
+}
+
+impl Blend {
+    fn new(ops: &Ops, width: usize, height: usize) -> Result<Self> {
+        Ok(Self {
+            sum: Array::zeros(ops.stream(), &[height, width, 3], MlxDType::F32)?,
+            count: Array::zeros(ops.stream(), &[height, width, 1], MlxDType::F32)?,
+        })
+    }
+
+    fn add(&mut self, tile: &Array, y: usize, x: usize, weight: &Array) -> Result<()> {
+        let (height, width) = (tile.shape()[0], tile.shape()[1]);
+        let start = Array::from_i32(tile.stream(), &[2], &[y as i32, x as i32])?;
+        let weighted = tile.mul(weight)?;
+        weighted.eval()?;
+        let sum = self.sum.slice(&[y, x, 0], &[y + height, x + width, 3])?;
+        let count = self.count.slice(&[y, x, 0], &[y + height, x + width, 1])?;
+        let sum = self
+            .sum
+            .slice_update(&sum.add(&weighted)?, &start, &[0, 1])?;
+        let count = self
+            .count
+            .slice_update(&count.add(weight)?, &start, &[0, 1])?;
+        tile.stream().eval(&[sum.clone(), count.clone()])?;
+        self.sum = sum;
+        self.count = count;
+        Ok(())
+    }
+
+    fn finish(self, ops: &Ops) -> Result<Array> {
+        let pixels = self.sum.div(&self.count.maximum(&ops.f32(1e-6)?)?)?;
+        pixels.eval()?;
+        Ok(pixels)
+    }
+}
+
+fn rgb8(pixels: &Array, ops: &Ops) -> Result<Vec<u8>> {
+    let two = ops.f32(2.0)?;
+    let half = ops.f32(0.5)?;
+    let divided = pixels.div(&two)?;
+    divided.eval()?;
+    let shifted = divided.add(&half)?;
+    shifted.eval()?;
+    let clipped = shifted.clip(&ops.f32(0.0)?, &ops.f32(1.0)?)?;
+    let scaled = clipped.mul(&ops.f32(255.0)?)?.nan_to_num(0.0, 255.0, 0.0)?;
+    scaled.eval()?;
+    let lower = scaled.cast(MlxDType::I32)?;
+    let integer = |value| Array::from_i32(ops.stream(), &[], &[value]);
+    let odd = lower.sub(
+        &lower
+            .cast(MlxDType::F32)?
+            .div(&two)?
+            .cast(MlxDType::I32)?
+            .mul(&integer(2)?)?,
+    )?;
+    let fraction = scaled.sub(&lower.cast(MlxDType::F32)?)?;
+    let rounded = fraction.equal(&half)?.where_select(
+        &lower.add(&odd)?,
+        &half
+            .less_equal(&fraction)?
+            .where_select(&lower.add(&integer(1)?)?, &lower)?,
+    )?;
+    let bytes = rounded.cast(MlxDType::U32)?.to_bytes()?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|channel| u32::from_ne_bytes(channel.try_into().unwrap()) as u8)
+        .collect())
 }
 
 /// Final latents `[1, N, 64]` BF16 for an image of `width` x `height` pixels: RGB8.
@@ -185,8 +277,7 @@ pub fn decode(
         decode_tile(&vae, &latents)?
     } else {
         let ramp = cos_ramp(OVERLAP * SCALE);
-        let mut out = vec![0f32; height * width * 3];
-        let mut count = vec![0f32; height * width];
+        let mut blend = Blend::new(ops, width, height)?;
         let stride = TILE - OVERLAP;
         for y in (0..lh).step_by(stride) {
             let y_end = (y + TILE).min(lh);
@@ -199,41 +290,128 @@ pub fn decode(
                 let tile = latents.slice(&[0, 0, y, x], &[1, LATENT, y_end, x_end])?;
                 let tile = decode_tile(&vae, &tile)?;
                 let (th, tw) = ((y_end - y) * SCALE, (x_end - x) * SCALE);
-                let weights = |n: usize, head: bool, tail: bool| {
-                    let overlap = (OVERLAP * SCALE).min(n - 1);
-                    let mut w = vec![1f32; n];
-                    if head {
-                        w[..overlap].copy_from_slice(&ramp[..overlap]);
-                    }
-                    if tail {
-                        for (i, r) in ramp[..overlap].iter().enumerate() {
-                            w[n - overlap + i] = 1.0 - r;
-                        }
-                    }
-                    w
-                };
-                let wh = weights(th, y > 0, y_end < lh);
-                let ww = weights(tw, x > 0, x_end < lw);
-                for i in 0..th {
-                    for j in 0..tw {
-                        let weight = wh[i] * ww[j];
-                        let at = (y * SCALE + i) * width + x * SCALE + j;
-                        for ch in 0..3 {
-                            out[at * 3 + ch] += tile[(i * tw + j) * 3 + ch] * weight;
-                        }
-                        count[at] += weight;
-                    }
-                }
+                let wh = edge_weights(th, y > 0, y_end < lh, &ramp);
+                let ww = edge_weights(tw, x > 0, x_end < lw, &ramp);
+                let wh = Array::from_f32(ops.stream(), &[th, 1, 1], &wh)?;
+                let ww = Array::from_f32(ops.stream(), &[1, tw, 1], &ww)?;
+                let weight = wh.mul(&ww)?;
+                weight.eval()?;
+                blend.add(&tile, y * SCALE, x * SCALE, &weight)?;
             }
         }
-        for (i, value) in out.iter_mut().enumerate() {
-            *value /= count[i / 3].max(1e-6);
-        }
-        out
+        blend.finish(ops)?
     };
     // ImageUtil.to_pil: clip(x / 2 + 0.5, 0, 1), then (x * 255).round() as u8.
-    Ok(pixels
-        .iter()
-        .map(|&x| ((x / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round_ties_even() as u8)
-        .collect())
+    rgb8(&pixels, ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apxinf_mlx::Stream;
+
+    fn reference_rgb(pixels: &[f32]) -> Vec<u8> {
+        pixels
+            .iter()
+            .map(|&value| ((value / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round_ties_even() as u8)
+            .collect()
+    }
+
+    fn device_pixels_match_host(stream: &Stream) -> Result<()> {
+        let ops = Ops::new(stream)?;
+        let mut values = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            -2.0,
+            2.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ];
+        for channel in 0..255 {
+            let value = ((channel as f32 + 0.5) / 255.0) * 2.0 - 1.0;
+            values.extend([value, value.next_up(), value.next_down()]);
+        }
+        values.extend((0..8192).map(|index| (index as f32 - 4096.0) / 1024.0));
+        let input = Array::from_f32(stream, &[values.len()], &values)?;
+        assert_eq!(rgb8(&input, &ops)?, reference_rgb(&values));
+        for (lh, lw) in [(33, 33), (36, 64), (40, 80), (7, 65)] {
+            let (height, width) = (lh * SCALE, lw * SCALE);
+            let mut blend = Blend::new(&ops, width, height)?;
+            let mut expected = vec![0f32; height * width * 3];
+            let mut counts = vec![0f32; height * width];
+            let ramp = cos_ramp(OVERLAP * SCALE);
+            let mut ordinal = 0;
+            for y in (0..lh).step_by(TILE - OVERLAP) {
+                let y_end = (y + TILE).min(lh);
+                for x in (0..lw).step_by(TILE - OVERLAP) {
+                    let x_end = (x + TILE).min(lw);
+                    if (y > 0 && y_end - y <= OVERLAP) || (x > 0 && x_end - x <= OVERLAP) {
+                        continue;
+                    }
+                    let (th, tw) = ((y_end - y) * SCALE, (x_end - x) * SCALE);
+                    let wh = edge_weights(th, y > 0, y_end < lh, &ramp);
+                    let ww = edge_weights(tw, x > 0, x_end < lw, &ramp);
+                    let values: Vec<f32> = (0..th * tw * 3)
+                        .map(|index| (((index * 13 + ordinal * 7) % 257) as f32 - 128.0) / 83.0)
+                        .collect();
+                    let tile = Array::from_f32(stream, &[th, tw, 3], &values)?;
+                    let weight = Array::from_f32(stream, &[th, 1, 1], &wh)?
+                        .mul(&Array::from_f32(stream, &[1, tw, 1], &ww)?)?;
+                    stream.eval(&[tile.clone(), weight.clone()])?;
+                    let before = stream.counters();
+                    blend.add(&tile, y * SCALE, x * SCALE, &weight)?;
+                    let after = stream.counters();
+                    assert_eq!(after.downloads_bytes, before.downloads_bytes);
+                    assert_eq!(after.uploads_bytes - before.uploads_bytes, 8);
+                    for row in 0..th {
+                        for column in 0..tw {
+                            let weight = wh[row] * ww[column];
+                            let at = (y * SCALE + row) * width + x * SCALE + column;
+                            for channel in 0..3 {
+                                expected[at * 3 + channel] +=
+                                    values[(row * tw + column) * 3 + channel] * weight;
+                            }
+                            counts[at] += weight;
+                        }
+                    }
+                    ordinal += 1;
+                }
+            }
+            for (index, value) in expected.iter_mut().enumerate() {
+                *value /= counts[index / 3].max(1e-6);
+            }
+            let before = stream.counters();
+            let output = blend.finish(&ops)?;
+            let after = stream.counters();
+            assert_eq!(after.downloads_bytes, before.downloads_bytes);
+            let actual = output.to_f32_vec()?;
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "latent extent {lh}x{lw}"
+            );
+            assert_eq!(rgb8(&output, &ops)?, reference_rgb(&expected));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn device_blending_and_rgb_match_host_cpu() -> Result<()> {
+        device_pixels_match_host(&Stream::cpu()?)
+    }
+
+    #[test]
+    #[ignore = "requires native Apple Metal"]
+    fn device_blending_and_rgb_match_host_metal() -> Result<()> {
+        device_pixels_match_host(&Stream::metal(0)?)
+    }
 }
