@@ -19,6 +19,25 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def init_plan(feature):
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", feature):
+        raise ValueError("feature must be a kebab-case name, not a path")
+    root = Path(subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"], text=True
+    ).strip()).resolve()
+    path = root / "devlocal" / feature / "acceptance.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Deliberately incomplete: initialization alone cannot produce a pass.
+    with path.open("x") as output:
+        json.dump({"version": 1, "cases": [{
+            "id": "public-policy", "criterion": "", "entry_point": "",
+            "command": [], "inputs": [],
+        }]}, output, indent=2)
+        output.write("\n")
+    print(f"Created {path}. Fill in the task's criteria, entry points and commands before running.")
+    return 0
+
+
 def source_digest(root):
     names = subprocess.check_output(
         ["git", "ls-files", "-cz", "--others", "--exclude-standard"], cwd=root
@@ -40,9 +59,11 @@ def source_digest(root):
 
 def load_plan(path):
     path = path.resolve()
+    if not path.is_file():
+        raise ValueError("acceptance plan does not exist; use just acceptance init <feature> first")
     root = Path(subprocess.check_output(
         ["git", "rev-parse", "--show-toplevel"], cwd=path.parent, text=True
-    ).strip())
+    ).strip()).resolve()
     if not path.is_relative_to(root / "devlocal"):
         raise ValueError("plan must live under this worktree's devlocal/<feature>/")
     plan = json.loads(path.read_text())
@@ -151,6 +172,8 @@ def inspect(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
+    initializer = sub.add_parser("init", help="create an incomplete task plan in a fresh checkout")
+    initializer.add_argument("feature")
     for action in ("run", "block", "check"):
         command = sub.add_parser(action)
         command.add_argument("plan", type=Path)
@@ -160,6 +183,8 @@ def main():
             command.add_argument("--reason", required=True)
     args = parser.parse_args()
     try:
+        if args.action == "init":
+            return init_plan(args.feature)
         if args.action != "check":
             return record(args.plan.resolve(), args.case, getattr(args, "reason", None))
         failures, blocked = inspect(args.plan.resolve())

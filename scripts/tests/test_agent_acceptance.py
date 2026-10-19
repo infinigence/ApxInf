@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -66,6 +67,29 @@ class AcceptanceTests(unittest.TestCase):
         self.git("commit", "--allow-empty", "-qm", "metadata only")
         self.assertEqual(self.cli("check").returncode, 0)
         self.assertEqual(self.hook().stdout, "")
+
+    def test_fresh_checkout_bootstrap_and_complete_run(self):
+        shutil.rmtree(self.root / "devlocal")
+        command = [sys.executable, str(SCRIPT), "init", "task"]
+        result = subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.plan.is_file())
+        self.assertNotEqual(self.cli("check").returncode, 0)
+        original = self.plan.read_bytes()
+        result = subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.plan.read_bytes(), original)
+        self.harness.write_text("print('assertions passed')\n")
+        self.save()
+        self.assertEqual(self.cli("run", "public-policy").returncode, 0)
+        self.assertEqual(self.cli("check").returncode, 0)
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+
+    def test_missing_plan_has_bootstrap_instruction(self):
+        shutil.rmtree(self.root / "devlocal")
+        result = self.cli("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("just acceptance init", result.stderr)
 
     def test_failure_is_not_a_receipt_of_success(self):
         self.harness.write_text("raise SystemExit(7)\n")

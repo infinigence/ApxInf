@@ -7,7 +7,11 @@ audit aid, not a numerical oracle, permission grant or security sandbox.
 
 ## Declare the task before measuring
 
-Store a JSON plan under `devlocal/<feature>/acceptance.json`. Every case has an
+Start with `just acceptance init <feature>`. It creates
+`devlocal/<feature>/acceptance.json` even on a fresh clone with no `devlocal/`.
+The generated plan is deliberately incomplete and cannot pass until its task
+criteria and commands are filled in; existing plans are never overwritten.
+Every case has an
 id, criterion, named entry point and an argv command. Commands run from the
 worktree root. `inputs` pins ignored harnesses/fixtures that Git cannot track.
 
