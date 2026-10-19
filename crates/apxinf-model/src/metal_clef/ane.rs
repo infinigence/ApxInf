@@ -236,9 +236,31 @@ pub struct AneMlp {
 
 impl AneMlp {
     pub fn load(cache: &ProgramCache, mlp: &Mlp) -> Result<Self> {
+        let package = program(mlp)?;
+        let admission = super::ane_admission::Admission::new(&package, [1, HIDDEN, 1, TILE])?;
         Ok(Self {
-            model: cache.load(&program(mlp)?, ComputeUnits::CpuAndNeuralEngine)?,
+            model: cache.load_with_placement(
+                &package,
+                ComputeUnits::CpuAndNeuralEngine,
+                std::time::Duration::from_secs(60),
+                |facts| admission.check(facts),
+            )?,
         })
+    }
+
+    pub fn warm(&self) -> Result<()> {
+        let shape = [1, HIDDEN, 1, TILE];
+        let scale_shape = [1, 1, 1, TILE];
+        let input = vec![f16::ZERO; HIDDEN * TILE];
+        drop(self.model.predict(
+            &[("x", &input, &shape)],
+            &[
+                ("y", &shape),
+                ("gate_scale", &scale_shape),
+                ("up_scale", &scale_shape),
+            ],
+        )?);
+        Ok(())
     }
 
     /// BF16 `[1, T, 4096]` as FP16 channel-first tiles `[1, 4096, 1, 512]`,
