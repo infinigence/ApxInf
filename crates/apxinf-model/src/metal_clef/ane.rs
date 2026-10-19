@@ -529,6 +529,7 @@ fn f16_bytes(values: &[f16]) -> &[u8] {
 /// One layer's loaded Neural Engine program.
 pub struct AneMlp {
     model: Model,
+    tile: usize,
 }
 
 impl AneMlp {
@@ -537,9 +538,55 @@ impl AneMlp {
     }
 
     pub fn load_package(cache: &ProgramCache, package: &Package) -> Result<Self> {
+        let input = package
+            .model
+            .description
+            .as_ref()
+            .and_then(|description| description.input.first())
+            .and_then(|input| input.r#type.as_ref())
+            .and_then(|kind| kind.multi_array_type.as_ref())
+            .ok_or(Error::Contract("Clef Core ML input profile is absent"))?;
+        let tile = if input.shape == [1, HIDDEN as i64, 1, TILE as i64] {
+            TILE
+        } else if input.shape == [1, HIDDEN as i64, 1, NEURON_TILE as i64] {
+            NEURON_TILE
+        } else {
+            return Err(Error::Contract(
+                "Clef Core ML input needs its fixed column or neuron profile",
+            ));
+        };
+        let admission = super::ane_admission::Admission::new(package, [1, HIDDEN, 1, tile])?;
         Ok(Self {
-            model: cache.load(package, ComputeUnits::CpuAndNeuralEngine)?,
+            model: cache.load_with_placement(
+                package,
+                ComputeUnits::CpuAndNeuralEngine,
+                std::time::Duration::from_secs(60),
+                |facts| admission.check(facts),
+            )?,
+            tile,
         })
+    }
+
+    pub fn warm(&self) -> Result<()> {
+        let shape = [1, HIDDEN, 1, self.tile];
+        let scale_shape = [1, 1, 1, self.tile];
+        let outputs: [(&str, &[usize]); 3] = [
+            ("y", &shape),
+            ("gate_scale", &scale_shape),
+            ("up_scale", &scale_shape),
+        ];
+        let input = vec![f16::ZERO; HIDDEN * self.tile];
+        if self.tile == NEURON_TILE {
+            let batch =
+                vec![vec![input.as_slice()]; super::config::MAX_INPUT_TOKENS.div_ceil(self.tile)];
+            drop(
+                self.model
+                    .predict_batch(&[("x", &shape)], &batch, &outputs)?,
+            );
+        } else {
+            drop(self.model.predict(&[("x", &input, &shape)], &outputs)?);
+        }
+        Ok(())
     }
 
     /// Neuron split: one Core ML batch prediction over the FP16 channel-first
@@ -659,6 +706,32 @@ impl AneMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_clef_package_is_rejected_before_compilation() -> Result<()> {
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input("x", &[1, 8, 1, 16]);
+        let output = builder.identity(&input, Some("y"));
+        let package = builder.finish(&[&output])?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../devlocal/clef-coreml-admission-tests")
+            .join(format!("{}-{nonce}", std::process::id()));
+        let cache = ProgramCache::new(&root);
+        let result = AneMlp::load_package(&cache, &package);
+        let rejected = result.is_err();
+        drop(result);
+        let compiled = root.exists();
+        if compiled {
+            std::fs::remove_dir_all(root)?;
+        }
+        assert!(rejected, "non-Clef input/output geometry was admitted");
+        assert!(!compiled, "invalid profile reached Core ML compilation");
+        Ok(())
+    }
 
     #[test]
     fn int8_rows_match_the_python_rounding() {

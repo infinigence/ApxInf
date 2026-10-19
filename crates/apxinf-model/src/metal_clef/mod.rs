@@ -3,6 +3,8 @@
 //! BF16 joint schema head. No Python model execution.
 #[cfg(feature = "coreml")]
 mod ane;
+#[cfg(feature = "coreml")]
+mod ane_admission;
 mod config;
 mod encode;
 mod model;
