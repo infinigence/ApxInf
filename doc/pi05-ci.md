@@ -7,8 +7,37 @@ missing asset, uncalibrated budget, failed preflight or numerical failure cannot
 ## Acceptance status
 
 **Not accepted / not online.** CPU contracts and the shared-board harness are
-implemented. Final-source GPU qualification and performance budgets remain
-incomplete. The PR stays a draft until the required matrix below passes.
+implemented. All 12 hardware/precision/view cells have been measured on the
+clean implementation commit `ad35a46d`; numerical qualification and performance
+budgets remain incomplete. The PR stays a draft until the required gates pass.
+
+### Clean implementation-head verification (2026-10-19)
+
+The complete Thor BF16/FP8 and Orin BF16/INT8 campaigns use clean `ad35a46d`
+checkouts, eight frozen observations per view, fresh recipe preparation, the
+revised consecutive/revisit protocol, and independent `bench_pi05.py` runs
+with 30 warmups and 50 samples per observation. Input, checkpoint, config,
+loaded CUDA libraries, extension and recipe identities pass independent checks.
+All 96 outputs match the preceding curated-build outputs bitwise, with zero
+consecutive/revisit drift. Independent local recomputation also verifies all
+whole-chunk metrics and P50/P95 values from the raw latency samples.
+
+| Hardware / precision | Historical whole-chunk passes, 1/2/3 views | Additional timestep/max-abs diagnostic passes | Measured P50 ranges in ms, 1/2/3 views |
+| --- | --- | --- | --- |
+| Thor BF16 | 8/8, 8/8, 8/8 | 8/8, 8/8, 8/8 | 61.26–62.28 / 69.48–70.69 / 85.53–86.01 |
+| Thor FP8 | 7/8, 7/8, 6/8 | 3/8, 5/8, 4/8 | 38.73–38.91 / 44.91–45.22 / 52.91–53.88 |
+| Orin BF16 | 8/8, 8/8, 8/8 | 8/8, 8/8, 8/8 | 136.48–137.92 / 170.50–171.93 / 216.21–217.82 |
+| Orin INT8 | 7/8, 7/8, 6/8 | 4/8, 5/8, 5/8 | 89.09–89.98 / 128.88–129.59 / 167.73–168.82 |
+
+Both quantized variants still fail the historical whole-chunk rules for
+record0/frame165 in all three views and record1/frame169 in three views.
+The additional requirements are distinguished in the budget audit below;
+no failure or limit has been removed. Earlier constructed-input failures
+also remain unresolved. Desktop GPU clients and unqualified power conditions
+mean these latency samples do not establish an exclusive performance budget
+or a paired before/after regression verdict. Completed measurement is not
+release acceptance. The Thor campaign used the alternate shared board and
+released its host GPU lock after all six cells completed.
 
 ### Measured state inputs (2026-10-19)
 
@@ -489,11 +518,29 @@ approved baseline automatically with main: this would permit gradual drift.
 Per-channel physical accuracy still requires policy-level evaluation; padded
 32-dimensional latent output cannot certify robot units.
 
-The existing `pi05_bench.rs` reference floors (.999/.05 BF16, .997/.10 FP8,
-.995/.10 INT8 with .125 max abs) are historical comparison policies, not newly
-calibrated deployment guarantees. [Edge-LLM's PI05 comparator](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/experimental_models/pi05/scripts/compare_pi05_actions.py)
-uses .99999 cosine and .005 max abs for its configuration. Do not apply those
-numbers blindly to ApxInf's different dtype and implementation.
+The existing `pi05_bench.rs` checks whole-chunk cosine/relative L2 at
+.999/.05 for BF16, .997/.10 for FP8, and .995/.10 for INT8. Only INT8 has
+its historical reference max-abs limit of .125; BF16 and FP8 have no such
+limit in that benchmark. Applying these floors to every timestep and adding
+.125 max-abs to BF16/FP8 are additional diagnostic requirements introduced by
+this work, not unchanged historical gates. Those additions have not been
+independently calibrated and must not be described as approved merge budgets.
+No saved failure or measured output is changed by this clarification.
+
+For example, re-scoring the clean `ad35a46d` Orin state-bank outputs against
+the original whole-chunk policy gives INT8 7/8, 7/8 and 6/8 across views,
+versus 4/8, 5/8 and 5/8 under the additional timestep checks. Four whole-chunk
+failures remain; the six additional failures are attributable to the stronger
+protocol, not evidence of six new implementation regressions.
+
+[Edge-LLM's PI05 design at revision 0f527057](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/0f52705723abfa8c6702654bfdcc082a728ed353/docs/source/developer_guide/models/pi05.md)
+describes FP16 engines compared with the OpenPI FP32 policy on each
+configuration's own embodiment observations. Its comparator uses .99999
+whole-chunk cosine per batch entry and .005 maximum absolute error, with no
+per-timestep cosine gate. Its PI05 path does not implement FP8/INT8
+quantization. These are not evidence for applying the same budgets to ApxInf
+quantized models, all artificial inputs, or every rebuilt engine; the design
+also records build-dependent numerical variation.
 
 The example definition deliberately has exact-equality numerical placeholders
 and null performance budgets. Replace them only after measuring same-build and
