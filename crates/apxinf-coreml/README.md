@@ -72,6 +72,10 @@ framework is linked.
 ## Tests
 
 - `cargo test -p apxinf-coreml` runs the portable writer tests.
+- The ignored `tests/batch_prediction.rs` checks batch/single prediction
+  parity and invalid-input rejection. With an exclusive device reservation,
+  run `cargo test -p apxinf-coreml --features native --test batch_prediction -- --ignored --test-threads=1`.
+  Ordinary native test runs do not schedule this ANE test.
 - With `native`, library tests also cover owned facts, nested/empty traversal,
   distinct unknown states, malformed views, completeness and timeout checks.
   The ignored `tests/placement.rs` exercises real CPU-only plan/configuration,
