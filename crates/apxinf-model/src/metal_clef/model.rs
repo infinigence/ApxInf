@@ -6,7 +6,7 @@
 //! compiled functions. The gated-delta recurrence is a Metal kernel with the
 //! MLX-VLM kernel's arithmetic. One request is one lazy graph evaluated once;
 //! no state survives between requests.
-use super::config::Config;
+use super::config::{Config, MAX_INPUT_TOKENS};
 use super::encode::{Encoded, EncodedQuestion};
 use super::weights::{
     Attention, Backbone, DecoderLayer, EvidenceLayer, GatedDelta, Head, Linear, Mha, Mixer, Mlp,
@@ -18,6 +18,7 @@ use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
+const G_BETA_WARM_LENGTHS: [usize; 3] = [1, 2, MAX_INPUT_TOKENS];
 
 struct Kernels {
     recurrence: GatedDeltaRecurrence,
@@ -42,6 +43,20 @@ fn g_beta(args: &[Array]) -> Result<Vec<Array>> {
         .mul(&softplus)?
         .exp()?;
     Ok(vec![decay, b.sigmoid()?])
+}
+
+fn prepared_g_beta(stream: &Stream, value_heads: usize) -> Result<Compiled> {
+    let callable = Compiled::with_shapeless(stream, 2, true, g_beta)?;
+    for tokens in G_BETA_WARM_LENGTHS {
+        let inputs = [
+            Array::zeros(stream, &[value_heads], MlxDType::BF16)?,
+            Array::zeros(stream, &[1, tokens, value_heads], MlxDType::BF16)?,
+            Array::zeros(stream, &[1, tokens, value_heads], MlxDType::BF16)?,
+            Array::zeros(stream, &[value_heads], MlxDType::BF16)?,
+        ];
+        drop(callable.prepare(&inputs)?);
+    }
+    Ok(callable)
 }
 
 pub struct Network {
@@ -119,7 +134,7 @@ impl Network {
         let kernels = Kernels {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
             rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
-            g_beta: Compiled::with_shapeless(&stream, 2, true, g_beta)?,
+            g_beta: prepared_g_beta(&stream, config.text.linear_num_value_heads)?,
         };
         // compute_inv_freq: 1 / (base ** (arange(0, dim, 2) / dim)) in FP32.
         let dim = config.rotary_dim();
@@ -469,5 +484,120 @@ impl Network {
             logits.push(prior.add(&gate.mul(&joint_scale.mul(&cosine)?.add(&residual)?)?)?);
         }
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g_beta_inputs(stream: &Stream, tokens: usize, variant: usize) -> Result<Vec<Array>> {
+        let value_heads = 32;
+        let make = |shape: &[usize], count: usize, offset: f32| {
+            let values = (0..count)
+                .map(|index| (index % 17) as f32 / 16.0 + variant as f32 / 8.0 + offset)
+                .collect::<Vec<_>>();
+            Array::from_f32(stream, shape, &values)?.cast(MlxDType::BF16)
+        };
+        Ok(vec![
+            make(&[value_heads], value_heads, -2.0)?,
+            make(&[1, tokens, value_heads], tokens * value_heads, -1.0)?,
+            make(&[1, tokens, value_heads], tokens * value_heads, -0.5)?,
+            make(&[value_heads], value_heads, -0.25)?,
+        ])
+    }
+
+    fn check_g_beta_preparation(stream: Stream) -> Result<()> {
+        let prepared = prepared_g_beta(&stream, 32)?;
+        let original = Compiled::with_shapeless(&stream, 2, true, g_beta)?;
+        let nonsingleton_first = Compiled::with_shapeless(&stream, 2, true, g_beta)?;
+        let first_inputs = g_beta_inputs(&stream, 17, 2)?;
+        let first_outputs = nonsingleton_first.call_and_eval(&first_inputs)?;
+        let first_bytes = first_outputs
+            .iter()
+            .map(Array::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        let mut retained = Vec::new();
+        for (tokens, variant) in [
+            (1, 0),
+            (2, 1),
+            (17, 2),
+            (3, 3),
+            (2, 4),
+            (1, 0),
+            (512, 3),
+            (4096, 4),
+        ] {
+            let inputs = g_beta_inputs(&stream, tokens, variant)?;
+            let before = stream.counters();
+            let actual = prepared.call_and_eval(&inputs)?;
+            let after = stream.counters();
+            assert_eq!(after.trace_callbacks, before.trace_callbacks);
+            assert_eq!(after.uploads_bytes, before.uploads_bytes);
+            assert_eq!(after.downloads_bytes, before.downloads_bytes);
+            assert_eq!(actual[0].shape(), &[1, tokens, 32]);
+            assert_eq!(actual[0].dtype(), MlxDType::F32);
+            assert_eq!(actual[1].dtype(), MlxDType::BF16);
+            let expected = original.call_and_eval(&inputs)?;
+            let expected_bytes = expected
+                .iter()
+                .map(Array::to_bytes)
+                .collect::<Result<Vec<_>>>()?;
+            for (index, (output, expected)) in actual.iter().zip(expected_bytes).enumerate() {
+                let bytes = output.to_bytes()?;
+                assert_eq!(bytes, expected);
+                if tokens == 17 {
+                    assert_eq!(bytes, first_bytes[index]);
+                }
+            }
+            retained.push(actual);
+        }
+        let before_drop = retained
+            .iter()
+            .flatten()
+            .map(Array::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        drop(prepared);
+        drop(original);
+        drop(nonsingleton_first);
+        let after_drop = retained
+            .iter()
+            .flatten()
+            .map(Array::to_bytes)
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(after_drop, before_drop);
+        Ok(())
+    }
+
+    #[test]
+    fn g_beta_preparation_preserves_values_and_replays_without_host_io() -> Result<()> {
+        check_g_beta_preparation(Stream::cpu()?)
+    }
+
+    #[test]
+    fn g_beta_preparation_rejects_foreign_inputs_without_poisoning_replay() -> Result<()> {
+        let stream = Stream::cpu()?;
+        let foreign = Stream::cpu()?;
+        let prepared = prepared_g_beta(&stream, 32)?;
+        let foreign_prepared = prepared_g_beta(&foreign, 32)?;
+        assert!(prepared.call(&g_beta_inputs(&foreign, 2, 1)?).is_err());
+        assert!(foreign_prepared
+            .call(&g_beta_inputs(&stream, 2, 1)?)
+            .is_err());
+        let inputs = g_beta_inputs(&stream, 2, 1)?;
+        let before = stream.counters().trace_callbacks;
+        let result = prepared.call_and_eval(&inputs)?;
+        assert_eq!(stream.counters().trace_callbacks, before);
+        assert!(result[0]
+            .to_f32_vec()?
+            .iter()
+            .all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an Apple Metal GPU and the shared device lease"]
+    fn g_beta_preparation_preserves_metal_values_and_replays_without_host_io() -> Result<()> {
+        check_g_beta_preparation(Stream::metal(0)?)
     }
 }
