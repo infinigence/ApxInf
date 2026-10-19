@@ -28,8 +28,9 @@ class UniqueLoader(yaml.BaseLoader):
 
 class ToolingTests(unittest.TestCase):
     def setUp(self):
-        (REPO / "devlocal").mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(prefix="tooling-test-", dir=REPO / "devlocal")
+        evidence = REPO / "devlocal" / "agent-tooling"
+        evidence.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="run-", dir=evidence)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.bin = self.root / "bin"
@@ -66,6 +67,12 @@ class ToolingTests(unittest.TestCase):
             ["test", "--release", "-p", "apxinf-model", "--lib", "--features", "cuda", "pi05", "--", "--ignored", "--test-threads=1"],
             ["test", "--release", "-p", "apxinf-cuda-new", "--lib", "pi05", "--", "--ignored", "--test-threads=1"],
         ])
+
+        self.log.unlink()
+        self.env["TOOL_EXIT"] = "3"
+        failed = self.run_command(["just", "test-gpu", "pi05"])
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(len(self.calls()), 1, "stop after the first failed crate")
 
     def test_l3_preserves_arguments_and_arch_override(self):
         self.stub("cargo")
