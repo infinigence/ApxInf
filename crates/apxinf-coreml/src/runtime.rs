@@ -45,6 +45,26 @@ fn c_path(path: &Path) -> Result<CString> {
         .map_err(|_| Error::Contract("Core ML path contains a NUL byte"))
 }
 
+fn checked_fp16_count(shape: &[usize]) -> Result<usize> {
+    let count = shape.iter().try_fold(1usize, |count, &dimension| {
+        if dimension == 0 || i64::try_from(dimension).is_err() {
+            return Err(Error::Contract(
+                "Core ML shape needs positive i64 dimensions",
+            ));
+        }
+        count
+            .checked_mul(dimension)
+            .ok_or(Error::Contract("Core ML shape element count overflows"))
+    })?;
+    count
+        .checked_mul(std::mem::size_of::<f16>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or(Error::Contract(
+            "Core ML FP16 shape exceeds addressable storage",
+        ))?;
+    Ok(count)
+}
+
 /// Compiles the `.mlpackage` directory `package` into `compiled`, which must
 /// not exist. [`ProgramCache`] is the normal entry; this compiles a package
 /// written elsewhere, such as a reference.
@@ -103,9 +123,18 @@ impl Model {
                 .map(|d| d.iter().map(|&x| x as i64).collect())
                 .collect()
         };
+        let input_counts: Vec<usize> = inputs
+            .iter()
+            .map(|input| checked_fp16_count(input.2))
+            .collect::<Result<_>>()?;
+        let output_counts: Vec<usize> = outputs
+            .iter()
+            .map(|output| checked_fp16_count(output.1))
+            .collect::<Result<_>>()?;
         if inputs
             .iter()
-            .any(|(_, data, shape)| data.len() != shape.iter().product::<usize>())
+            .zip(&input_counts)
+            .any(|((_, data, _), &count)| data.len() != count)
         {
             return Err(Error::Contract(
                 "Core ML input length differs from its shape",
@@ -115,9 +144,9 @@ impl Model {
         let in_shapes = shapes(&inputs.iter().map(|i| i.2).collect::<Vec<_>>());
         let out_names = names(&outputs.iter().map(|o| o.0).collect::<Vec<_>>())?;
         let out_shapes = shapes(&outputs.iter().map(|o| o.1).collect::<Vec<_>>());
-        let mut results: Vec<Vec<f16>> = outputs
+        let mut results: Vec<Vec<f16>> = output_counts
             .iter()
-            .map(|o| vec![f16::ZERO; o.1.iter().product()])
+            .map(|&count| vec![f16::ZERO; count])
             .collect();
         let ptrs = |v: &[CString]| v.iter().map(|s| s.as_ptr()).collect::<Vec<*const c_char>>();
         let (in_name_ptrs, out_name_ptrs) = (ptrs(&in_names), ptrs(&out_names));
@@ -232,5 +261,52 @@ impl ProgramCache {
         let model = Model::load(&compiled, units)?;
         admit(&facts)?;
         Ok(model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+
+    #[test]
+    fn invalid_input_extent_returns_error_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        let shape = [usize::MAX, 2];
+        assert!(model.predict(&[("x", &[], &shape)], &[]).is_err());
+    }
+
+    #[test]
+    fn fp16_shape_count_preserves_scalars_and_clef_tiles() -> Result<()> {
+        assert_eq!(checked_fp16_count(&[])?, 1);
+        for tile in [128, 512] {
+            assert_eq!(checked_fp16_count(&[1, 4096, 1, tile])?, 4096 * tile);
+            assert_eq!(checked_fp16_count(&[1, 1, 1, tile])?, tile);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_fp16_shapes_are_rejected_before_allocation() {
+        for shape in [
+            vec![0],
+            vec![usize::MAX],
+            vec![1usize << 32, 1usize << 32],
+            vec![i64::MAX as usize, 2],
+            vec![i64::MAX as usize, 2, 2],
+            vec![isize::MAX as usize / 2 + 1],
+        ] {
+            assert!(checked_fp16_count(&shape).is_err(), "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_output_extent_returns_error_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        assert!(model.predict(&[], &[("y", &[usize::MAX, 2])]).is_err());
     }
 }
