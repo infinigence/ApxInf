@@ -132,6 +132,20 @@ chat options containing `tools` enable this behavior automatically. MiniCPM's
 
 ## Clef decision preparation
 
+With `coreml`, Clef checks its selected fixed input/output profile before
+compilation and matches the inspected expected plan to the generated source
+graph. Typed literals and bounded weight blobs establish static dependencies;
+all other operations require known ANE support and preference. Unknown graph
+rewrites or unacceptable placement fail loading rather than selecting CPU.
+This checks anticipated placement, not actual or exclusive ANE execution.
+
+Before returning a GPU+ANE runner, construction warms the actual retained
+programs in two complete layer-ordered passes through their native prediction
+entry points. Neuron batches use the declared maximum tile depth where that
+composition is implemented. Warmup failures abort construction. This does not
+replace complete-request, artifact-identity, transfer, lifetime or native trace
+qualification in [the Core ML contract](coreml-ane.md).
+
 The `metal_clef` decision family prepares its existing shapeless decay/beta
 callable during loading, before returning the runner. Its disposable BF16
 operands match the admitted 32 value heads and token lengths 1, 2 and 4096;

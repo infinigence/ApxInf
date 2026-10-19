@@ -287,6 +287,12 @@ impl Network {
         )?;
         let inv_freq = Array::scalar(&stream, 1.0, MlxDType::F32)?.div(&base.pow(&exponents)?)?;
         stream.eval(&[inv_freq.clone()])?;
+        #[cfg(feature = "coreml")]
+        for _ in 0..2 {
+            for model in &ane {
+                model.warm()?;
+            }
+        }
         Ok(Self {
             config,
             stream,
