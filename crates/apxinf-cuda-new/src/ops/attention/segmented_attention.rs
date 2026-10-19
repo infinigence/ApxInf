@@ -113,6 +113,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
     }
 
     let dtype = args.query.dtype();
+    if dtype == DType::F32 {
+        return Err(invalid("F32 is supported only for dense Attention"));
+    }
     let q = tensor_storage(ctx, args.query, dtype, shape)?;
     let k = tensor_storage(ctx, args.key, dtype, shape)?;
     let v = tensor_storage(ctx, args.value, dtype, shape)?;
@@ -138,6 +141,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
     }
     let default_scale = 1.0 / (shape[2] as f32).sqrt();
     let bindings = abi::Bindings {
+        bias: std::ptr::null(),
         query: q.ptr(),
         key: k.ptr(),
         value: v.ptr(),
@@ -150,6 +154,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
     };
     Ok(Normalized {
         spec: abi::Spec {
+            bias_alignment: 0,
+            bias_broadcast_batch: 0,
+            input_precision: 0,
+            reserved: 0,
             version: abi::SPEC_VERSION,
             semantic: Semantic::Segmented.abi_value(),
             dtype: dtype_code(dtype)?,

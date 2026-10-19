@@ -25,6 +25,10 @@ TuningKeys tuning_keys(const Spec& spec,
   int driver_version = 0;
   check_cuda(cudaRuntimeGetVersion(&runtime_version));
   check_cuda(cudaDriverGetVersion(&driver_version));
+  int cublas_major = 0, cublas_minor = 0, cublas_patch = 0;
+  apxinf::framework::check_cublas(cublasGetProperty(MAJOR_VERSION, &cublas_major));
+  apxinf::framework::check_cublas(cublasGetProperty(MINOR_VERSION, &cublas_minor));
+  apxinf::framework::check_cublas(cublasGetProperty(PATCH_LEVEL, &cublas_patch));
   cudaDeviceProp properties{};
   check_cuda(cudaGetDeviceProperties(&properties, device));
 
@@ -32,12 +36,13 @@ TuningKeys tuning_keys(const Spec& spec,
   // identity and the suffix captures the normalized operation and policy.
   // There is no compatible fallback key; a miss runs the full autotuner.
   std::ostringstream key;
-  key << "attention-recipe-v5|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
+  key << "attention-recipe-v7|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
       << "|cuda=" << cuda_compat_version(runtime_version)
       << "|driver=" << cuda_compat_version(driver_version)
+      << "|cublas=" << cublas_major << '.' << cublas_minor << '.' << cublas_patch
       << "|op|" << spec.version << '|' << spec.semantic << '|'
       << spec.dtype << '|' << spec.output_dtype << '|' << spec.mask << '|'
       << spec.batch << '|' << spec.query_tokens << '|' << spec.key_tokens << '|'
@@ -52,6 +57,8 @@ TuningKeys tuning_keys(const Spec& spec,
   }
   key << spec.segments << '|' << spec.max_segment_tokens << '|'
       << spec.scale_is_default << '|'
+      << spec.bias_broadcast_batch << '|' << spec.input_precision << '|'
+      << alignment_class(spec.bias_alignment, 4) << '|'
       << alignment_class(spec.q_alignment, 16) << '|'
       << alignment_class(spec.k_alignment, 16) << '|'
       << alignment_class(spec.v_alignment, 16) << '|'

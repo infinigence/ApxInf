@@ -8,6 +8,7 @@ use crate::{CudaBuffer, CudaContext};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Semantic {
     Rms,
+    RmsRounded,
     Layer,
     AdaptiveRms,
     BiasResidual,
@@ -25,6 +26,7 @@ impl Semantic {
     fn code(self) -> u32 {
         match self {
             Self::Rms => 0,
+            Self::RmsRounded => 9,
             Self::Layer => 1,
             Self::AdaptiveRms => 2,
             Self::BiasResidual => 3,
@@ -37,7 +39,10 @@ impl Semantic {
     }
 
     fn writes_hidden(self) -> bool {
-        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
+        !matches!(
+            self,
+            Self::Rms | Self::RmsRounded | Self::Layer | Self::AdaptiveRms
+        )
     }
 
     fn writes_normalized(self) -> bool {
@@ -54,7 +59,11 @@ impl Semantic {
     fn reads_weight(self) -> bool {
         matches!(
             self,
-            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
+            Self::Rms
+                | Self::RmsRounded
+                | Self::Layer
+                | Self::BiasResidualRms
+                | Self::BiasResidualLayer
         )
     }
 
@@ -110,11 +119,14 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn dtype_code(dtype: DType) -> Result<u32> {
+fn dtype_code(dtype: DType, semantic: Semantic) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Norm currently supports F16 and BF16")),
+        DType::F32 if semantic == Semantic::Layer => Ok(0),
+        _ => Err(invalid(
+            "Norm supports F16/BF16; only LayerNorm also supports F32",
+        )),
     }
 }
 
@@ -123,7 +135,10 @@ fn output_dtype_code(dtype: DType) -> Result<u32> {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
-        _ => Err(invalid("Norm output supports F16, BF16 and E4M3")),
+        DType::F32 => Ok(0),
+        _ => Err(invalid(
+            "Norm output supports F16, BF16, E4M3 and LayerNorm F32",
+        )),
     }
 }
 
@@ -174,6 +189,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Norm column count exceeds the CUDA kernel range"))?;
     let dtype = args.input.dtype();
+    let dtype_value = dtype_code(dtype, semantic)?;
     if semantic == Semantic::BiasThenResidual && dtype != DType::BF16 {
         return Err(invalid(
             "BiasThenResidual is a BF16-only semantic because its intermediate rounding is part of the contract",
@@ -312,6 +328,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .normalized
         .as_ref()
         .map_or(dtype, |tensor| tensor.dtype());
+    if semantic == Semantic::RmsRounded && output_dtype != dtype {
+        return Err(invalid("Rounded RMS normalization must preserve dtype"));
+    }
     if output_dtype == DType::F8E4M3 {
         if dtype != DType::F16 || !semantic.writes_normalized() {
             return Err(invalid(
@@ -331,7 +350,58 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         &mut storage,
     )?;
 
-    let dtype_value = dtype_code(dtype)?;
+    if semantic == Semantic::RmsRounded {
+        let bytes = count
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let weight_bytes = cols
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let input_start = input_pointer as usize;
+        let output_start = normalized as usize;
+        let weight_start = weight as usize;
+        let input_end = input_start
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Norm address overflow"))?;
+        let output_end = output_start
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Norm address overflow"))?;
+        let weight_end = weight_start
+            .checked_add(weight_bytes)
+            .ok_or_else(|| invalid("Norm address overflow"))?;
+        if (input_start != output_start && input_start < output_end && output_start < input_end)
+            || (weight_start < output_end && output_start < weight_end)
+        {
+            return Err(invalid(
+                "Rounded RMS input/output partially overlap or weight/output overlap",
+            ));
+        }
+    }
+    if semantic == Semantic::Layer && dtype == DType::F32 {
+        let output_start = normalized as usize;
+        let output_end = output_start
+            .checked_add(
+                count
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+            )
+            .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+        for (pointer, elements) in [(input_pointer, count), (weight, cols), (norm_bias, cols)] {
+            let start = pointer as usize;
+            let end = start
+                .checked_add(
+                    elements
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+                )
+                .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+            if start < output_end && output_start < end {
+                return Err(invalid(
+                    "F32 LayerNorm output overlaps an input, weight or bias",
+                ));
+            }
+        }
+    }
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
         semantic: semantic.code(),

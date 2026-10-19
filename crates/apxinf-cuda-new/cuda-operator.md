@@ -53,8 +53,8 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Inputs | `A=[M,K]`, `B=[K,N]`, `bias=[N]`; supports all four GEMM quantization contracts |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = (alpha * projection(A,B) + bias) / output_scale`, with bias broadcast across M |
-| Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
-| Reference test | `gemm_bias_all_candidates_match_torch` |
+| Constraints | For `None`, bias dtype matches A/B; F16/BF16 operands retain the F32 accumulator through bias addition and convert only the final result. Quantized bias dtype follows the projection contract; W8A8 output must be BF16 |
+| Reference tests | `gemm_bias_all_candidates_match_torch`, `gemm_bias_preserves_accumulator_through_bias_all_candidates` (F16/BF16 cancellation fixtures, all eligible candidates, eager and graph) |
 
 <!-- l3-operator:gemm_bias_residual -->
 ### `gemm_bias_residual`
@@ -103,11 +103,25 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Item | Contract |
 | --- | --- |
 | Rust API | `ops::attention(ctx, AttentionArgs)` |
-| Inputs | `Q=[B,Tq,Hq,D]`, `K/V=[B,Tk,Hkv,D]`; Q/K/V share F16 or BF16 dtype; mask is `None` or `Causal` |
+| Inputs | `Q=[B,Tq,Hq,D]`, `K/V=[B,Tk,Hkv,D]`; Q/K/V share F16, BF16, or F32 dtype; mask is `None` or `Causal` |
 | Output | `Y=[B,Tq,Hq,D]`; ordinary output uses the input dtype, and F16 input may also be written as E4M3 |
 | Mathematical semantic | dense scaled dot-product attention |
 | Constraints | Causal requires `Tk>=Tq`, with queries aligned to the final positions of the key sequence; ordinary output requires `output_scale=1`; E4M3 stores `round_to_e4m3(attention/output_scale)` |
-| Reference test | `attention_all_candidates_match_reference` |
+| Reference tests | `attention_all_candidates_match_reference`, `attention_f32_real_shapes_all_candidates_match_reference`, `attention_f32_reduction_all_candidates_match_reference`, `attention_bf16_vae_all_candidates_match_reference` |
+
+<!-- l3-operator:additive_attention -->
+### `additive_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::additive_attention(ctx, AttentionBiasArgs { attention, bias, precision })` |
+| Inputs | Dense Q/K/V as above, F16/BF16/F32; F32 `bias=[1 or B,Hq,Tq,Tk]`, broadcast across batch when its leading dimension is one |
+| Output | Same shape and dtype as Q; no E4M3 output |
+| Mathematical semantic | `softmax(mask(scale * QK^T + bias)) @ V`; negative infinity masks a key, and an entirely masked row produces zero |
+| Arithmetic | `AttentionPrecision::F32` accumulates scores, bias, probabilities and PV in F32. `Input` rounds scaled QK to input dtype, adds bias and rounds again, then rounds F32 softmax probabilities to input dtype before FP32-accumulated PV. The final output is rounded to input dtype in both modes. |
+| Constraints | Same masks and positive scale as dense attention; bias must not alias output. NaN and positive-infinity bias are outside the contract. |
+| Graph/tuning identity | Bias address belongs to the execution key; its values can change between replays. Broadcast and arithmetic precision belong to the exact recipe key. |
+| Reference tests | `additive_attention_all_candidates_match_torch`, `additive_attention_all_candidates_match_reference`, `additive_attention_bf16_mha_batched_candidates_match_reference`; `additive_attention_validates_bias_and_replays_changed_bias` |
 
 <!-- l3-operator:kv_cache_attention -->
 ### `kv_cache_attention`
@@ -139,3 +153,104 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+
+## HWC image building blocks
+
+<!-- l3-operator:image_rgb_indices -->
+`image_rgb_indices` accepts exactly `views*height*width*channels` unsigned bytes
+in an owned device buffer and a non-aliasing, four-byte-aligned flat I32 output.
+`ImageMemoryLayout::{Nhwc,Nchw}` declares the packed input layout. It concatenates
+the views along width and widens each byte without normalization, yielding
+logical `[height, views*width, channels]` HWC values in `[0,255]`. Both layout
+conversion and dtype conversion execute on CUDA. Prepared graph profiles must
+retain the selected layout and geometry; changing source contents needs only
+an upload into the retained source allocation. This fixed semantic allocates
+no device memory and retains both bindings through graph lifetime.
+
+<!-- l3-operator:image_im2col -->
+<!-- l3-operator:image_space_to_depth -->
+<!-- l3-operator:image_grouped_average -->
+<!-- l3-operator:channel_l2_normalize -->
+<!-- l3-operator:channel_standardize -->
+
+`image_im2col` maps contiguous `[H*W,C]` BF16/F32 images to
+`[OH*OW,K*K*C]` convolution columns ordered `[kh,kw,channel]`, with zero
+padding and explicit output extent (including asymmetric right/bottom padding).
+`image_space_to_depth` uses width-first output channels `[channel,dx,dy]`.
+`image_grouped_average` rearranges a single frame with explicit left temporal
+zero padding into `[C,T,dy,dx,H/f,W/f]`, groups the leading dimension, and averages
+in F32 before rounding to the input dtype. It has no temporal cache.
+
+`channel_l2_normalize` computes a per-row F32 L2 norm, clamps its denominator to
+the positive epsilon, then rounds division, scalar multiplication and gamma
+multiplication individually to the input dtype. It is distinct from RMSNorm's
+additive epsilon. `channel_standardize` selects the leading output channels,
+converts to F32 and computes `(x-mean)/std` with F32 per-channel parameters.
+
+These fixed, single-implementation primitives perform no tuning, allocation or
+synchronization in enqueue. Callers supply non-aliasing device outputs; a CUDA
+Graph retains every binding. No recipe selection is involved.
+
+## Rounded arithmetic and adjacent-pair rotations
+
+These fixed primitives enqueue directly on the context stream, allocate no
+resources during enqueue, and are captured by the owning `PreparedPhase`.
+They have one native baseline, no autotuning or persisted recipe. Inputs and
+outputs are contiguous; arithmetic is deterministic for a fixed GPU build.
+Capture retains every input, output, weight, and coefficient binding needed
+by replay.
+
+<!-- l3-operator:pointwise-multiply -->
+<!-- l3-operator:pointwise-add -->
+<!-- l3-operator:pointwise-broadcast-multiply -->
+<!-- l3-operator:pointwise-broadcast-add -->
+<!-- l3-operator:pointwise-row-multiply -->
+<!-- l3-operator:pointwise-euler-rounded -->
+<!-- l3-operator:pointwise-gelu-rounded -->
+`pointwise(ctx, PointwiseArgs)` extends the existing pointwise family with
+`Multiply`/`Add` (secondary `[rows, cols]`), `BroadcastMultiply`/`BroadcastAdd`
+(secondary `[cols]`), and `RowMultiply` (secondary `[rows]`). Inputs and output
+share F32, F16, or BF16 dtype. `EulerUpdateRounded` first rounds the scalar step
+to the input dtype, rounds velocity times step, then adds state and rounds
+again. Existing `EulerUpdate` retains its single final rounding contract.
+`PointwiseActivation::GeluRounded` evaluates tanh GELU with dtype rounding after
+each arithmetic operation, including both multiplies in `x³`, scalar products, additions and tanh;
+this differs from `Gelu`, which evaluates the expression in FP32.
+
+### Ordinary LayerNorm dtype extension
+
+`layer_norm(ctx, LayerNormArgs)` computes row-wise
+`((x - mean(x)) / sqrt(mean((x - mean(x))²) + eps)) * weight + bias`
+for contiguous `[rows, cols]` input/output and per-column weight/bias.
+Alongside the existing F16/BF16 contract, ordinary LayerNorm accepts F32
+input, weight, bias and output together, with FP32 statistics/affine arithmetic.
+F32 moments are computed relative to the row's first value, retaining that
+centered coordinate system through normalization to avoid loss from a large
+common offset. The contract requires
+finite positive epsilon and unit output scale. F32 output may not overlap any
+read-only binding. Mixed F32/BF16 bindings and F32 quantized output are rejected.
+Other Norm semantics retain their existing dtype domains. This fixed kernel
+has no tuning recipe or workspace and retains operand owners during capture.
+`layer_norm_f32_real_shapes_match_independent_f64_eager_and_graph` covers
+1024/3072 columns, learned affine parameters, true F32 inputs, changed-input
+replay and dropped owners against an independent F64 Welford reference.
+
+<!-- l3-operator:rms-norm-rounded -->
+`rms_norm_rounded(ctx, RmsNormArgs)` uses FP32 square/reduction/inverse RMS,
+rounds the normalized activation to the input dtype, then multiplies the
+per-column weight and rounds again. F16/BF16 input and output share dtype;
+quantized output is rejected. The existing `rms_norm` remains a single final
+rounding operation.
+
+<!-- l3-operator:pairwise-rope -->
+`PairwiseRopeTable::new(ctx, tokens, head_dim, coefficients)` uploads immutable
+FP64 `(cos, sin)` pairs shaped `[tokens, head_dim / 2]` before capture.
+`pairwise_rope(ctx, PairwiseRopeArgs)` rotates adjacent real/imaginary channels
+of BF16 `[tokens, heads * head_dim]` input, using FP64 multiply/add without
+contraction, then converts to F32 or BF16 output. The even head dimension must
+be at most 2048. Dense and axial position schemes are expressed by the table;
+no model family or axis convention enters this operator. Partial overlapping
+input/output storage is rejected; exact alias is allowed for BF16 only. The
+captured graph retains the immutable table and activation storage through
+replay, even after the caller drops its handles.

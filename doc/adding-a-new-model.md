@@ -240,6 +240,11 @@ Complete these steps in the new family's own code and the existing registries:
    `builtin::register_builtin_models`, with the correct feature gate and names.
    `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
    metadata; test both explicit selection and the supported detection path.
+   Families using cuda-new directly (currently PI0.5, D3 and Fast-WAM) also
+   have a dedicated `AutoModel` loader dispatch before legacy `Backend`
+   construction. Keep that dispatch family-local and route its registry
+   factory to the same loader; do not construct an unused legacy backend for
+   the public CUDA path. This preserves the existing factory contract.
    For Metal, the current `mlx` feature registers `metal_qwen3` and
    `metal_minicpm5`; `AutoModel` resolves the Metal prefix. MiniCPM5 must be
    explicitly named because its official checkpoint identifies as `llama`.
@@ -267,7 +272,8 @@ Complete these steps in the new family's own code and the existing registries:
 
 ```text
 AutoPolicy → <Family>Policy → apxinf.ModelRunner (= apxinf_py.ModelRunner)
-  → Rust AutoModel → registry loader → LoadedModel::Vla(<Family>ModelRunner)
+  → Rust AutoModel → family loader (registry or dedicated cuda-new dispatch)
+  → LoadedModel::Vla(<Family>ModelRunner)
   → <Family>Model / Blocks → safe backend operations
 ```
 

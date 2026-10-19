@@ -251,3 +251,17 @@ def test_websocket_model_variant_cli_reaches_evaluator(monkeypatch, tmp_path, va
         websocket_client_policy=SimpleNamespace(WebsocketClientPolicy=Client)))
     backend = eval_libero.WebsocketBackend("localhost", 8000, precision, None)
     backend.close()
+
+
+def test_autopolicy_example_respects_fixed_image_profile():
+    example = _load_example("autopolicy_infer")
+
+    class FixedProfile:
+        metadata = dict(image_keys=["front", "wrist"], image_size=224,
+                        state_key="observation.state", state_dim=8, prompt_key="task")
+
+    observation = example.synthetic_observation_for(FixedProfile())
+    assert observation["front"].shape == (224, 224, 3)
+    assert observation["wrist"].shape == (224, 224, 3)
+    assert observation["observation.state"].shape == (8,)
+    assert "task" in observation

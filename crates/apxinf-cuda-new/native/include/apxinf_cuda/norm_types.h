@@ -27,6 +27,9 @@
  *                          norm_style                        -> hidden, normalized
  *   BIAS_THEN_RESIDUAL     input, bias, residual             -> hidden
  *
+ * LAYER additionally accepts F32 input, weight, norm_bias and normalized
+ * together. Other semantics retain F16/BF16 contracts.
+ *
  * BIAS_THEN_RESIDUAL is BF16-only.  Unlike BIAS_RESIDUAL, it rounds
  * input+bias to BF16 before adding residual, preserving the legacy two-step
  * numerical contract in a single launch.
@@ -52,6 +55,7 @@ typedef enum {
   APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL = 6,
   APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL_RMS = 7,
   APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL = 8,
+  APXINF_NORM_SEMANTIC_RMS_ROUNDED = 9,
 } apxinf_norm_semantic_t;
 
 #define APXINF_NORM_SPEC_VERSION 1u
@@ -61,7 +65,7 @@ typedef struct {
   uint32_t semantic;
   uint32_t dtype;
   /* E4M3 output is the fused-quantization form and consumes output_scale.
-     BF16/F16 output leaves the scale at one. */
+     BF16/F16/F32 output leaves the scale at one. */
   uint32_t output_dtype;
   /* A null bias is a different kernel path, so it belongs to the identity. */
   uint32_t has_bias;

@@ -106,7 +106,11 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   cudaDataType_t input_type =
       spec.a_dtype == APXINF_DTYPE_I8
           ? CUDA_R_8I
-          : native_fp8 ? CUDA_R_8F_E4M3 : projection_type;
+          : native_fp8 ? CUDA_R_8F_E4M3
+          : spec.quantization != APXINF_GEMM_QUANT_NONE ? projection_type
+          : spec.a_dtype == APXINF_DTYPE_F16 ? CUDA_R_16F
+          : spec.a_dtype == APXINF_DTYPE_BF16 ? CUDA_R_16BF
+                                            : CUDA_R_32F;
   const cublasComputeType_t compute_type =
       spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                       : CUBLAS_COMPUTE_32F;

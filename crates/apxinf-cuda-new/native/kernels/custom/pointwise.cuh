@@ -10,6 +10,9 @@ template <class T>
 __device__ float to_float(T value);
 
 template <>
+__device__ inline float to_float(float value) { return value; }
+
+template <>
 __device__ inline float to_float(__half value) {
   return __half2float(value);
 }
@@ -21,6 +24,9 @@ __device__ inline float to_float(__nv_bfloat16 value) {
 
 template <class T>
 __device__ T from_float(float value);
+
+template <>
+__device__ inline float from_float(float value) { return value; }
 
 template <>
 __device__ inline __half from_float(float value) {
@@ -75,6 +81,19 @@ __global__ void geglu(const T* gate_up, T* output, int rows, int inner) {
   }
 }
 
+template <class T>
+__device__ float gelu_rounded(float x) {
+  const float half_x = to_float(from_float<T>(__fmul_rn(0.5f, x)));
+  const float square = to_float(from_float<T>(__fmul_rn(x, x)));
+  const float cube = to_float(from_float<T>(__fmul_rn(square, x)));
+  const float cubic_term = to_float(from_float<T>(__fmul_rn(0.044715f, cube)));
+  const float sum = to_float(from_float<T>(__fadd_rn(x, cubic_term)));
+  const float scaled = to_float(from_float<T>(__fmul_rn(0.7978845608028654f, sum)));
+  const float nonlinear = to_float(from_float<T>(tanhf(scaled)));
+  const float shifted = to_float(from_float<T>(__fadd_rn(1.0f, nonlinear)));
+  return __fmul_rn(half_x, shifted);
+}
+
 // Optional per-column bias followed by an optional activation.  A null bias
 // with kActivationNone is a plain copy and is rejected by the contract.
 template <class T>
@@ -85,7 +104,12 @@ __global__ void bias_activation(const T* input, const T* bias, T* output,
   for (; index < count; index += stride) {
     float value = to_float(input[index]);
     if (bias != nullptr) value += to_float(bias[index % cols]);
-    output[index] = from_float<T>(apply_activation(value, activation));
+    if (activation == 4) {
+      if (bias != nullptr) value = to_float(from_float<T>(value));
+      output[index] = from_float<T>(gelu_rounded<T>(value));
+    } else {
+      output[index] = from_float<T>(apply_activation(value, activation));
+    }
   }
 }
 
@@ -98,6 +122,25 @@ __global__ void euler_update(const T* state, const T* velocity, T* output,
   for (; index < count; index += stride) {
     output[index] = from_float<T>(to_float(state[index]) +
                                   dt * to_float(velocity[index]));
+  }
+}
+
+// IDs 3..8 are the public binary semantics. Every materialized intermediate
+// is explicitly rounded; __fadd_rn/__fmul_rn prevent contraction across them.
+template <class T>
+__global__ void binary_rounded(const T* input, const T* secondary, T* output,
+                               int64_t count, int cols, int semantic, float dt) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const float x = to_float(input[i]);
+    const float y = to_float(secondary[(semantic == 4 || semantic == 5) ? i % cols : semantic == 8 ? i / cols : i]);
+    if (semantic == 6) {
+      const float step = to_float(from_float<T>(dt));
+      const float delta = to_float(from_float<T>(__fmul_rn(step, y)));
+      output[i] = from_float<T>(__fadd_rn(x, delta));
+    } else {
+      output[i] = from_float<T>((semantic == 5 || semantic == 7) ? __fadd_rn(x, y) : __fmul_rn(x, y));
+    }
   }
 }
 

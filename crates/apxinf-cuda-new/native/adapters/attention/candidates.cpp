@@ -21,7 +21,33 @@ bool supports_custom(const Spec& spec) {
 
 bool supports_dense_custom(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
-         supports_custom(spec);
+         (supports_custom(spec) || (spec.dtype == APXINF_DTYPE_F32 &&
+                                   spec.output_dtype == spec.dtype));
+}
+
+bool supports_additive_custom(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE &&
+         (supports_custom(spec) || (spec.dtype == APXINF_DTYPE_F32 &&
+                                   spec.output_dtype == spec.dtype));
+}
+
+bool supports_parallel_custom(const Spec& spec) {
+  return ((spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+           (spec.dtype == APXINF_DTYPE_F32 ||
+            (spec.dtype == APXINF_DTYPE_BF16 && spec.head_dim > 256)) &&
+           spec.output_dtype == spec.dtype) ||
+          supports_additive_custom(spec)) &&
+         static_cast<uint64_t>(spec.batch) * spec.query_tokens * spec.query_heads <= INT32_MAX;
+}
+
+bool supports_input_cublas(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE &&
+         spec.dtype == APXINF_DTYPE_BF16 && spec.output_dtype == spec.dtype &&
+         spec.input_precision == 1 && spec.query_heads == spec.kv_heads &&
+         spec.key_tokens <= 1024 && spec.query_tokens > 0 &&
+         static_cast<uint64_t>(spec.query_heads) * spec.head_dim <= INT32_MAX &&
+         static_cast<uint64_t>(spec.batch) * spec.query_heads <=
+             INT32_MAX / spec.query_tokens;
 }
 
 bool supports_kv_cache_custom(const Spec& spec) {
@@ -135,6 +161,15 @@ AlignmentRequirements cutlass_alignment(const Spec&) {
 
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
+      {kProviderCustom, 6, 1, "custom-warp-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_cooperative_custom, destroy_custom},
+      {kProviderCustom, 5, 1, "custom-parallel-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_parallel_custom, destroy_custom},
+
 #if defined(APXINF_ATTENTION_CUTLASS)
       {kProviderCutlass, 1, 1, "cutlass-fmha-sm100",
        apxinf::gemm::kDeviceFeatureCutlassSm100, true, true, false,
@@ -161,6 +196,25 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
       {kProviderCustom, 1, 1, "custom-attention-fallback", 0, true, true,
        true, supports_dense_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_custom, destroy_custom},
+  };
+  static const ImplementationRegistry additive_entries = {
+      {4, 1, 1, "cublas-input-attention", 0, true, true,
+       true, supports_input_cublas, natural_alignment,
+       cublas_resource_requirements, one_configuration, prepare_cublas,
+       launch_cublas, destroy_cublas},
+      {kProviderCustom, 6, 1, "custom-warp-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_cooperative_custom, destroy_custom},
+      {kProviderCustom, 5, 1, "custom-parallel-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_parallel_custom, destroy_custom},
+
+      {kProviderCustom, 4, 1, "custom-additive-attention", 0, true, true,
+       true, supports_additive_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,
        launch_custom, destroy_custom},
   };
@@ -198,6 +252,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   switch (semantic) {
     case APXINF_ATTENTION_SEMANTIC_DENSE:
       return dense_entries;
+    case APXINF_ATTENTION_SEMANTIC_ADDITIVE:
+      return additive_entries;
     case APXINF_ATTENTION_SEMANTIC_KV_CACHE:
       return kv_cache_entries;
     case APXINF_ATTENTION_SEMANTIC_SEGMENTED:

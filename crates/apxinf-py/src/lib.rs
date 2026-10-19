@@ -56,6 +56,13 @@ pub struct HfTokenizer {
 #[pymethods]
 impl HfTokenizer {
     #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: NativeHf::from_json(json).map_err(runtime_err)?,
+        })
+    }
+
+    #[staticmethod]
     fn from_file(path: PathBuf) -> PyResult<Self> {
         Ok(Self {
             inner: NativeHf::from_file(path).map_err(runtime_err)?,

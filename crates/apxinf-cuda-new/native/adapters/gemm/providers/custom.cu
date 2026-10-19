@@ -58,6 +58,13 @@ bool fp8_f32_projection_forced() {
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
+  // Ordinary GEMM+bias preserves the accumulator through bias addition.
+  // Operand and bias storage remain F16/BF16; only the intermediate is wider.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+      spec.quantization == APXINF_GEMM_QUANT_NONE &&
+      (spec.a_dtype == APXINF_DTYPE_F16 || spec.a_dtype == APXINF_DTYPE_BF16)) {
+    return APXINF_DTYPE_F32;
+  }
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_dtype == APXINF_DTYPE_E4M3) {
@@ -101,7 +108,8 @@ void CommonResources::release() noexcept {
 
 void allocate_common_resources(const Spec& spec,
                                CommonResources& resources,
-                               bool native_fp8) {
+                               bool native_fp8,
+                               std::optional<uint32_t> projection_dtype) {
   const bool unpack =
       ((spec.a_dtype == APXINF_DTYPE_E4M3 ||
         spec.b_dtype == APXINF_DTYPE_E4M3) &&
@@ -109,7 +117,7 @@ void allocate_common_resources(const Spec& spec,
       (has_row_channel_scales(spec) && !native_fp8 &&
        spec.a_dtype != APXINF_DTYPE_I8);
 
-  resources.projection_dtype = common_projection_dtype(spec);
+  resources.projection_dtype = projection_dtype.value_or(common_projection_dtype(spec));
 
   if (unpack) {
     const size_t a_bytes =
@@ -140,14 +148,17 @@ void allocate_common_resources(const Spec& spec,
   }
 }
 
-size_t common_resource_requirements(const Spec& spec, bool native_fp8) {
+size_t common_resource_requirements(
+    const Spec& spec, bool native_fp8,
+    std::optional<uint32_t> requested_projection_dtype) {
   const bool unpack =
       ((spec.a_dtype == APXINF_DTYPE_E4M3 ||
         spec.b_dtype == APXINF_DTYPE_E4M3) &&
        !native_fp8) ||
       (has_row_channel_scales(spec) && !native_fp8 &&
        spec.a_dtype != APXINF_DTYPE_I8);
-  const uint32_t projection_dtype = common_projection_dtype(spec);
+  const uint32_t projection_dtype =
+      requested_projection_dtype.value_or(common_projection_dtype(spec));
   size_t bytes = 0;
   if (unpack) {
     bytes += static_cast<size_t>(spec.m * spec.k) *
@@ -216,7 +227,8 @@ cudaError_t launch_postprocess(const Spec& spec,
               spec.output_dtype == APXINF_DTYPE_E4M3
           ? APXINF_DTYPE_F16
           : has_row_channel_scales(spec) ? spec.output_dtype
-                                         : resources.projection_dtype;
+          : spec.quantization == APXINF_GEMM_QUANT_NONE ? spec.a_dtype
+                                                       : resources.projection_dtype;
   apxinf::cuda_new::custom::finish<<<blocks, 256, 0,
                                  static_cast<cudaStream_t>(bindings.stream)>>>(
       projection, resources.projection_dtype, bindings.output,
