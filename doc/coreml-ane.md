@@ -1,7 +1,9 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
-Status: design proposal. No Core ML code is merged. This document asks
-maintainers to agree on ownership, scope and evidence before implementation.
+Status: design under review; no Core ML code is merged. On 2026-10-19 the
+requesting Metal maintainer accepted the fixed-profile Clef host-handoff scope
+below, conditional on completing every qualification gate. This decision does
+not approve unrelated interfaces, qualify an implementation or merge a PR.
 
 ## Motivation
 
@@ -63,12 +65,27 @@ Out of scope:
 | Owner | Responsibility |
 | --- | --- |
 | `apxinf-coreml` program writer | Typed operation builder for the supported list, ML Program protobuf, MILBlob weight file, package layout |
-| `apxinf-coreml` runtime | Compile, content-addressed cache, load with requested compute units, seal after load, FP16 `MLMultiArray` host input and output with explicit strides, worker-thread prediction, `NSError` conversion |
+| `apxinf-coreml` runtime | Compile, content-addressed cache, load with requested compute units, seal after load, synchronous prediction over FP16 host buffers with explicit strides, `NSError` conversion |
 | `apxinf-mlx` | Asynchronous evaluation, so the GPU share runs while the ANE predicts; host transfer of the exchanged tiles |
 | Model family | What runs on the ANE, host-side quantization and its numerics, tiling, the GPU/ANE overlap schedule, residency budget, architecture policy |
 
 The family composes MLX arrays and Core ML programs. Neither crate depends on
 the other.
+
+The scoped owner decision covers these two existing Clef compositions, not
+arbitrary program splits. Both retain hidden width 4096, intermediate width
+12288 and 32 layers. The target column identifies the intended qualification
+device, not a claim that every gate has passed.
+
+| Composition | Target | GPU intermediate share | Core ML intermediate share | Token tile |
+| --- | --- | --- | --- | --- |
+| Column split, #147 | M1 Pro, `applegpu_g13s` | First 6656 columns | Remaining 5632, per-row INT8 weights | 512 |
+| Neuron split, #148 | M4, `applegpu_g16g` | 5408 selected neurons | 5632 selected INT8 and 1248 selected FP16 neurons | 128, one batch prediction per layer |
+
+Selection, weight preparation, programs and numerical rules remain owned by
+the respective family composition. This table does not broaden the permitted
+host operations or transfer allowance; each profile must supply its own exact
+counts, byte budgets and observations.
 
 ## Program writer
 
@@ -117,8 +134,12 @@ committed, because they contain checkpoint-derived weights.
   does not mean placement-qualified or ready for requests.
 - **Predict.** Inputs and outputs are FP16 host buffers. Output multi-arrays
   are read with their reported strides, because the ANE may pad them.
-  Prediction runs on a worker thread that the runtime owns. MLX arrays never
-  cross threads, so MLX's thread affinity is preserved.
+  Prediction is synchronous on the calling thread. ApxInf creates no prediction
+  worker; Core ML owns its internal scheduling. Input multi-arrays borrow the
+  caller's FP16 buffers only until prediction and output copying complete.
+  Outputs are copied into caller-owned storage before the bridge returns.
+  MLX arrays stay on their owning thread. GPU work enqueued before prediction
+  may overlap it without moving MLX objects to an application worker.
 - **Memory.** The ANE keeps only a limited amount of program weights resident;
   about 2.4 GB was observed on the M1 Pro. Exceeding it reloads programs on
   every switch. The family owns the per-layer budget.
@@ -136,8 +157,8 @@ The family must define a placement ledger for every admitted fixed profile:
 | Stage | Required placement and CPU allowance |
 | --- | --- |
 | GPU share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
-| Core ML share | The declared 5632-column MLP share in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
-| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. This is a proposed exception, not permission for arbitrary CPU operators. |
+| Core ML share | The declared fixed-profile column or neuron share above in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
+| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The requesting Metal maintainer accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
 The ledger must map source operations to the compiled structure, including
@@ -186,7 +207,7 @@ when any bound identity, profile or configuration changes, or when contrary
 placement evidence appears. These are proposed acceptance rules, not an
 implemented status API or a claim that loading enforces placement.
 
-## Proposed host-handoff exception
+## Scoped host-handoff decision
 
 The canonical [accelerator port acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
 excludes external execution plans and requires intermediate GPU residency.
@@ -194,21 +215,25 @@ The [MLX prepared execution contract](mlx-backend.md#prepared-compiled-execution
 also requires device-resident handoff. The GPU+ANE composition's native Core ML programs and host
 tile exchange do not satisfy those rules as written.
 
-This document requests a maintainer decision for only the fixed-profile
-`metal_clef` GPU+ANE composition described here. The proposed exception would
-permit the native Core ML stage and the bounded host work in the placement
+The requesting Metal maintainer accepted only the fixed-profile
+`metal_clef` GPU+ANE compositions described here on 2026-10-19, in the
+EngineTailor-to-APXinf review session. The accepted boundary permits the
+native Core ML stage and the bounded host work in the placement
 ledger. It does not permit arbitrary external engines, CPU model execution
 or unbounded intermediate transfers. GPU-only and CUDA requirements remain
 unchanged, including device residency and CUDA Graph capture. MLX stages
 outside the listed boundaries retain their existing preparation requirements.
 
-Approval is pending. Before calling this a completed heterogeneous port,
-maintainers must record the accepted scope and evidence and link that decision
-from the canonical acceptance contract. Until then the existing contract
-remains authoritative and the exception is an acceptance blocker. This design
-change neither implements nor approves the exception.
+The maintainer's instruction was to accept the documented handoff boundary
+and continue completing the evidence, not to remove Draft early. The
+[canonical acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
+links this limited decision. Qualification remains conditional on the exact
+profile, placement, warm preparation, complete-request numerical/performance,
+resource, lifetime and transfer evidence below. Missing evidence still blocks
+port completion. This record is not upstream PR approval, implementation,
+measured acceptance or permission for additional host computation.
 
-The approval record must include the following evidence, with immutable
+The qualification record must include the following evidence, with immutable
 artifact digests and replay instructions. Missing budgets or evidence fail
 the gate; a compile/load/seal/predict smoke test is not sufficient.
 
@@ -258,8 +283,9 @@ bit-equal to the GPU and can differ between ANE generations.
 
 ## Questions for maintainers
 
-- Is the narrowly scoped Core ML and bounded host-handoff exception acceptable,
-  with measured placement rather than an unenforceable ANE-only promise?
+- The requesting Metal maintainer accepted the narrowly scoped host-handoff
+  boundary above. Upstream review must still assess the evidence and design;
+  no unenforceable ANE-only promise is made.
 - Is the crate name `apxinf-coreml` and the feature name `coreml` acceptable?
 - Where should the cache live by default? The composition compiles 32 programs; the first
   load takes seconds per layer.
