@@ -35,12 +35,24 @@ Select it from the CLI with `generate-image --model-variant reference`.
   decoder layer at a time per request. It loads the stored
   `rotary_emb.inv_freq` as mflux does, and skips the deterministic DiT buffers
   that mflux recomputes.
+  All shards are checked for overflow-safe byte extents and complete,
+  nonoverlapping SafeTensors data offsets before payload loading. The optional
+  mflux export tag `quantization_level` must be the string `4` when present;
+  it describes the global export, including its BF16 text and F32 VAE shards,
+  rather than overriding individual tensor dtypes. Missing tags remain valid
+  when the physical checkpoint contracts match. Text validation reads headers
+  and file sizes only, preserving layer-at-a-time payload loading.
 - `text.rs` applies the fixed system template, drops the system-prefix states
   and follows Qwen3-VL's FP32 norm, BF16 RoPE and FP32 attention rounding.
 - `dit.rs` computes the text-prefix K/V once per request with the t = 0
-  modulation row, then runs one compiled image-token forward per step against
-  that cache, as mflux does. `ops.rs` keeps MLX `nn.silu` and
-  `nn.gelu_approx` as shapeless compiled functions.
+  modulation row. The pure image-token forward is explicitly prepared twice
+  on the actual first-step inputs. Its second evaluated velocity supplies the
+  first solver update; steps 1 through 39 call it once each. There are exactly
+  40 original BF16 solver updates and one initial noise realization. Preparation
+  belongs to the request because the low-RAM path releases the transformer.
+  Neither the scheduler nor the rollout is compiled. `ops.rs` keeps MLX
+  `nn.silu` and `nn.gelu_approx` as shapeless compiled functions, preparing their
+  BF16 rank-2/3 and FP32 rank-4 singleton/nonsingleton classes before first use.
 - Image-token block projections decode Q4 to BF16 per call and use the
   MetalPerformancePrimitives GEMM when the token count is a multiple of 64 and
   at least 1024. Loading enables it only
@@ -54,7 +66,11 @@ Select it from the CLI with `generate-image --model-variant reference`.
   on other architectures, when the probe fails, below 1024 or for unaligned image
   token counts, and for the text prefix, projections use quantized matmul.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
-  overlap, and blends tiles on the host.
+  overlap. FP32 tiles, weighted products and ordered overlap sums/counts remain
+  on device. Each product is materialized before addition, and each replacement
+  sum/count pair is evaluated before decoding another tile. Normalization,
+  clipping and ties-to-even channel rounding also stay on device. Only final
+  U32 channel values are downloaded and serialized to owned RGB8 bytes on host.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and
   the blending ramp; tests check recorded NumPy digests.
 
@@ -62,7 +78,10 @@ Lifecycle: the DiT is loaded with the model, released before each VAE decode
 and read again by the next request; the VAE decoder stays loaded. The MLX
 buffer cache is cleared after text encoding and after the DiT is released, as
 mflux `--low-ram` does; its 1 GB cache limit is not applied. This matches
-the memory profile of the `--low-ram` reference on 16 GB devices.
+the reference's weight-release boundaries. Device accumulation and integer
+pixel finalization add bounded request-local arrays; their measured peak and
+complete-request cost require source-bound qualification, not a claim of
+identical memory usage.
 
 Verification status: CPU tests cover the tables, admission, RoPE positions,
 text-encoder tensor names and checkpoint detection. Image output against the
