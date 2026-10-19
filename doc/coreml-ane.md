@@ -4,6 +4,9 @@ Status: design under review; no Core ML code is merged. On 2026-10-19 the
 requesting Metal maintainer accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
+The same maintainer subsequently accepted the finite placement-evidence policy
+below for these Clef compositions. Quality, performance, resource, lifetime and
+warm-readiness requirements are unchanged.
 
 ## Motivation
 
@@ -161,11 +164,14 @@ The family must define a placement ledger for every admitted fixed profile:
 | Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The requesting Metal maintainer accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
-The ledger must map source operations to the compiled structure, including
-fused or eliminated operations. Any CPU work inside Core ML must be listed
-by operation and purpose and limited to non-arithmetic data movement or
-metadata. Unknown mappings or unlisted CPU operations block qualification.
-The writer's supported-operation list is not a CPU-placement allowlist.
+The ledger must map source operations to the compute-plan structure, including
+fused or eliminated operations. Unknown source-to-plan mappings block
+qualification. The CPU audit records observed symbols or call stacks and their
+purpose against the permitted work above. Evidence of runtime layer arithmetic
+on the CPU outside that allowance fails qualification. Sampling cannot account
+for every short or unsampled operation; record that limitation rather than
+claiming their absence. The writer's supported-operation list is not a
+CPU-placement allowlist.
 
 ### Placement qualification
 
@@ -189,22 +195,31 @@ independence does not prove opaque compiled numeric equality or materialization
 timing; the artifact and execution evidence below is still required.
 
 A compute plan describes anticipated placement, not an execution certificate.
-Qualification also requires saved execution traces for every admitted profile
-and per-layer program through the complete request, including program switches
-and GPU overlap. Apple's [Core ML and Neural Engine Instruments workflow](https://developer.apple.com/videos/play/wwdc2022/10027/)
-can correlate Core ML compute requests with hardware activity. Evidence must
-identify the traced program and stage, establish ANE activity for its required
-computation and account for CPU work against the ledger. Aggregate ANE
-utilization, prediction success or a preferred-device report alone is not
-enough. If the available diagnostics cannot resolve the required attribution,
-qualification remains blocked rather than inferring placement.
+On 2026-10-19 the requesting Metal maintainer accepted the following combined,
+finite evidence for the fixed Clef compositions, instead of requiring a
+per-source-operation execution span:
 
-The supported claim is measured ANE execution for an identified profile and
-environment, not a guarantee about every future prediction. Public APIs do
-not provide a strict per-invocation ANE-only enforcement mechanism here. If
-that stronger guarantee is required, this design cannot satisfy it and must
-remain unqualified. Qualification records must state the trace coverage and
-its limits.
+| Evidence | Required coverage |
+| --- | --- |
+| Operation-level compute plans | Source-to-plan mapping and the ANE support/preference checks above for every runtime arithmetic operation in all 32 layer programs. |
+| Actual program execution | Saved, identity-bound ANE hardware traces for every admitted qualification profile and all 32 per-layer programs through the complete request, including program switches and GPU overlap. Record how program ownership is established and any missing direct process fields. |
+| CPU sampling audit | Inspect sampled target-process stacks, classify observed work against the ledger and retain unexplained samples and sampling gaps. Do not infer zero CPU arithmetic from absent samples or empty operation tables. |
+
+Apple's [Core ML and Neural Engine Instruments workflow](https://developer.apple.com/videos/play/wwdc2022/10027/)
+can correlate Core ML compute requests with hardware activity. Aggregate ANE
+utilization, prediction success, a preferred-device report or CPU sampling
+alone is not enough. Missing required plans, program identities or actual ANE
+program coverage still block qualification. An empty per-operation execution
+table is an explicit evidence limitation, not by itself a failure of this
+accepted finite policy.
+
+The supported claim is measured ANE program execution with ANE-preferred plans
+and a sampled CPU audit for an identified profile and environment. It is not
+proof that every source operation ran exclusively on ANE or that any particular
+invocation contains no CPU arithmetic. Public APIs do not provide strict
+per-invocation ANE-only enforcement here. If a consumer requires that stronger
+guarantee, this path does not satisfy it. Qualification records must state the
+trace coverage, unknowns and these limits.
 
 Until the evidence and maintainer decision below exist, report the path as
 unqualified with the blocking reason. An explicit GPU+ANE request must fail, not
