@@ -42,6 +42,9 @@ const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 #[cfg(feature = "coreml")]
 const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
+/// MLX allocator cache limit set when Clef loads (bytes).
+const CACHE_LIMIT: usize = 1 << 30;
+
 /// Device-independent option admission, checked before the checkpoint is read.
 /// Returns the requested composition; `None` is `auto`, which picks the
 /// composition qualified on the device.
@@ -129,6 +132,9 @@ pub fn load(
             "Clef: no optimized composition is qualified on {architecture:?}; using the reference composition"
         );
     }
+    // Process-wide, as the reference engine sets it: an unbounded allocator cache grew to 4 GiB and slowed
+    // requests under memory pressure on a 16 GB M1 Pro.
+    apxinf_mlx::set_cache_limit(CACHE_LIMIT)?;
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(Box::new(ClefRunner {
