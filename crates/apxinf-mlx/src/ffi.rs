@@ -94,6 +94,7 @@ extern "C" {
         input_count: usize,
         outputs: *const *const c_char,
         output_count: usize,
+        row_contiguous: i32,
         out: *mut Handle,
     ) -> i32;
     pub fn apx_mlx_metal_free(kernel: Handle);
