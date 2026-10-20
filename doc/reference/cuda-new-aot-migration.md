@@ -2,7 +2,7 @@
 
 This note records where the seven translated CUDA operators belong in
 `apxinf-cuda-new`. It follows the operator classification and L3-to-L0 layering
-in `cuda-new-design.md`: public APIs describe mathematical semantics, while
+in [cuda-new design](../design/cuda-new-design.md): public APIs describe mathematical semantics, while
 model names and fixed production shapes stay inside candidate support checks.
 
 | Translated operator | cuda-new family | Shape | Status in this change |

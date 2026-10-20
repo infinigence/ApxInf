@@ -93,7 +93,7 @@ cargo build --release --features mlx
   --chat-options '{"enable_thinking":false}' --prompt 'Explain gravity briefly.'
 ```
 
-See the [MLX architecture and supported profiles](doc/mlx-backend.md) and
+See the [MLX architecture and supported profiles](doc/design/mlx-backend.md) and
 [native SDK setup](crates/apxinf-mlx/README.md) for build requirements,
 MiniCPM/DSpark commands and supported options.
 
@@ -192,7 +192,7 @@ actions = client.infer(observation)["actions"]
 ### d3-mini
 
 Text decision model, BF16, batch 1. Public Jev Decision Index 0.3, 140,178
-requests. See [reproduction details](doc/d3-mini-decision-index.md).
+requests. See [reproduction details](doc/guides/d3-mini-decision-index.md).
 
 | Hardware | Precision | Public score | Coverage | P50 | P95 |
 |---|---|---:|---:|---:|---:|

@@ -35,6 +35,15 @@ build-py:
 build-cli:
     cargo build --release --features cuda --bin apxinf
 
+# Build the pinned CUDA Decision Index runner.
+build-d3-index:
+    cargo build --locked --release -p apxinf-model --features cuda --example d3_decision_index
+
+# Run the native Apple Silicon CLI (requires the MLX SDK).
+[positional-arguments]
+run-metal *args:
+    cargo run --features mlx -- "$@"
+
 # Type-check lib and bin targets including cfg(feature="cuda") code.
 # `--all-targets` is excluded while an upstream test target is broken.
 check:

@@ -1,8 +1,9 @@
 # Environment variable reference
 
-Generated from the source tree (`grep -rE "APXINF_"`). Names are
-classified by where they are consumed; a variable absent from this
-list is not a supported knob — grep the source for it instead.
+Names are indexed from the source tree and classified by where they are
+consumed. The scan also finds compile-time and ABI symbols; entries explicitly
+marked as constants are not environment-variable controls. A name absent from
+this list is not a supported knob — inspect the source before using it.
 
 ## Agent infrastructure
 
@@ -290,3 +291,56 @@ list is not a supported knob — grep the source for it instead.
 
 Add the name here and in the same PR record where it is read. `just doc-lint`
 fails on an `APXINF_*` name that appears in source but not in this file.
+
+## New model diagnostics and test inputs
+
+Environment variables used by D3 and Metal diagnostics or opt-in tests.
+
+| Name | Where consumed |
+|---|---|
+| `APXINF_D3_CHECKPOINT` | `crates/apxinf-model/src/d3/config.rs` |
+| `APXINF_D3_EAGER` | `crates/apxinf-model/src/d3/runner.rs` |
+| `APXINF_D3_PREPARED_EAGER` | `crates/apxinf-model/src/d3/runner.rs` |
+| `APXINF_D3_TRACE` | `crates/apxinf-model/src/d3/model.rs`, `crates/apxinf-model/src/d3/runner.rs` |
+| `APXINF_DSPARK_CASE_LIMIT` | `crates/apxinf-model/src/metal_minicpm5/dspark.rs` |
+| `APXINF_DSPARK_CHECKPOINT` | `crates/apxinf-model/src/metal_minicpm5/dspark.rs`, `crates/apxinf-model/src/metal_minicpm5/README.md` |
+| `APXINF_DSPARK_REPLAY_INPUT` | `crates/apxinf-model/src/metal_minicpm5/dspark.rs`, `crates/apxinf-model/src/metal_minicpm5/tests.rs` |
+| `APXINF_MINICPM_CHECKPOINT` | `crates/apxinf-model/src/metal_minicpm5/dspark.rs`, `crates/apxinf-model/src/metal_minicpm5/tests.rs` |
+| `APXINF_MLX_DISABLED_COMPILE_TEST_CHILD` | `crates/apxinf-mlx/tests/native_cpu.rs` |
+
+## Native translation compile-time symbols
+
+C/C++ preprocessor definitions selected in source or build.rs; setting an
+environment variable with the same name does not configure these kernels.
+
+| Name | Where consumed |
+|---|---|
+| `APXINF_D256_BUILD_ACTION` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_causal_sm110.cu`, `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_sm110.cuh` |
+| `APXINF_D256_BUILD_LANGUAGE` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_causal_sm110.cu`, `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_sm110.cuh` |
+| `APXINF_D256_NS` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_causal_sm110.cu`, `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_sm110.cuh` |
+| `APXINF_DUAL_GEGLU_SWIGLU_STAGE_COUNT` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/gemm/gemm_bf16_geglu_interleaved_sm100.cu` |
+| `APXINF_DUAL_GEGLU_SWIGLU_TILE_M` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/gemm/gemm_bf16_geglu_interleaved_sm100.cu` |
+| `APXINF_DUAL_GEGLU_WIDE_TILE_M` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/gemm/gemm_bf16_geglu_interleaved_sm100.cu` |
+| `APXINF_EX2_EMU_RES` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_FMHA_KV_STAGES` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_MASK_R2P` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_NO_LSE` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_NO_ORDER_S` | `crates/apxinf-cuda-new/native/kernels/cutlass/fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp`, `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_strided_groups_sm110.cu` |
+| `APXINF_NVFP4_GEMM_SWIGLU` | `crates/apxinf-cuda-new/build.rs`, `crates/apxinf-cuda-new/native/adapters/gemm/execution.cpp` |
+| `APXINF_PACK_GQA_QPK` | `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_sm110.cuh`, `crates/apxinf-cuda-new/native/kernels/cutlass/ops/attention/fmha_d256_split_batch_sm110.cu` |
+| `APXINF_PERSISTENT` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_P_CHUNKS16` | `crates/apxinf-cuda-new/build.rs` |
+| `APXINF_SKIP_PAD_QSTAGE` | `crates/apxinf-cuda-new/build.rs` |
+
+## Native translation ABI constants
+
+C ABI enum values, not environment variables.
+
+| Name | Where consumed |
+|---|---|
+| `APXINF_GATHER_SEMANTIC_REPLACE_ROWS` | `crates/apxinf-cuda-new/native/adapters/gather.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/gather_types.h` |
+| `APXINF_POINTWISE_ACTIVATION_GELU_EXACT` | `crates/apxinf-cuda-new/native/adapters/pointwise.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/pointwise_types.h` |
+| `APXINF_QUANTIZATION_SEMANTIC_CAST_BF16_F32` | `crates/apxinf-cuda-new/native/adapters/quantization.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/quantization_types.h` |
+| `APXINF_QUANTIZATION_SEMANTIC_CAST_F32_BF16` | `crates/apxinf-cuda-new/native/adapters/quantization.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/quantization_types.h` |
+| `APXINF_ROPE_SEMANTIC_PARTIAL_MROPE` | `crates/apxinf-cuda-new/native/adapters/rope.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/rope_types.h` |
+| `APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL` | `crates/apxinf-cuda-new/native/adapters/rope.cu`, `crates/apxinf-cuda-new/native/include/apxinf_cuda/rope_types.h` |

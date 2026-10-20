@@ -70,7 +70,8 @@ prepares local norm/RoPE and decoder blocks, while `mixed-w8` uses local
 functions, scoped W8 weights and the Q/K Metal fusion. MiniCPM5
 `bf16-compiled` prepares the complete decode step with packed residual/norm;
 its explicit `dspark` variant adds the compiled draft chain and target
-verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
+verification schedule. Use the exact
+[scope/profile table](../../../doc/design/mlx-backend.md#implemented-text-selections).
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
 ## Workflow

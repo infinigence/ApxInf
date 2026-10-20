@@ -42,7 +42,7 @@ The native backend provides Qwen3 BF16 local functions
 plus decoder blocks, Qwen3 W8 local functions plus a Q/K Metal fusion,
 MiniCPM5 BF16 whole decode steps plus packed residual/norm, and MiniCPM5 DSpark
 compiled draft chains plus target verification. Their exact profiles and
-selection rules are in the [MLX table](mlx-backend.md#implemented-text-selections).
+selection rules are in the [MLX table](../design/mlx-backend.md#implemented-text-selections).
 The public variants are construction choices, not a new universal runtime class.
 
 These are new-port acceptance requirements, not a statement that every existing

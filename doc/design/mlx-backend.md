@@ -1,5 +1,7 @@
 # MLX backend and Apple Silicon model migration
 
+Status: Accepted — implemented native backend; supported profiles are listed below.
+
 The optional `mlx` backend supports native Apple Silicon macOS inference.
 See the [selection table](#implemented-text-selections) for supported model
 geometry, precision and compilation scopes. Other Metal platforms require
@@ -111,12 +113,12 @@ official `model_type` is `llama`, so select `--model-name metal_minicpm5` explic
 DSpark requires the named `draft` asset and is never selected by default.
 
 ```sh
-cargo run --features mlx -- generate --model /path/to/Qwen3-0.6B \
+just run-metal generate --model /path/to/Qwen3-0.6B \
   --device metal --dtype bf16 --model-variant bf16-compiled --greedy \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
   --prompt 'Explain gravity briefly.'
 
-cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
+just run-metal generate --model /path/to/MiniCPM5-2B \
   --model-name metal_minicpm5 --device metal --dtype bf16 --model-variant dspark \
   --asset draft=/path/to/official-DSpark --greedy \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
@@ -305,7 +307,7 @@ copy, device-residency or synchronization obligations.
 
 ## Migration sequence and acceptance
 
-Follow the [porting workflow](porting-workflow.md) for source/checkpoint
+Follow the [porting workflow](../guides/porting-workflow.md) for source/checkpoint
 identity, independent numerical and complete-answer checks, public integration
 and performance validation. Keep references and captures in `devlocal/`.
 

@@ -129,10 +129,7 @@ replace either when comparing with the published score.
 
 ```bash
 cd "$APXINF_DIR"
-cargo build --locked --release \
-  -p apxinf-model \
-  --features cuda \
-  --example d3_decision_index
+just build-d3-index
 ```
 
 ## 7. Run the full benchmark

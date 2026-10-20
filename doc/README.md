@@ -97,5 +97,7 @@ ignored devlocal/<feat-name>/ according to [AGENTS.md](../AGENTS.md).
 - [Qwen-Drive](models/qwen-drive.md)
 - [Qwen3.8 NVFP4](models/qwen38.md)
 - [Python API and policies](../python/apxinf/README.md)
+- [d3-mini Decision Index](guides/d3-mini-decision-index.md) — public text reproduction.
+- [AOT-to-native CUDA migration](reference/cuda-new-aot-migration.md) — translated operator ownership and current exposure.
 - [Native binding](../crates/apxinf-py/README.md)
 - [One-step warm-start evaluation](reports/2026-07-04-run-warmstart-with-onestep.md)

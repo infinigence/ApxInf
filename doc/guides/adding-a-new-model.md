@@ -64,8 +64,8 @@ A small model commonly starts with:
 Add files such as `vision.rs`, `vision_weights.rs`, or `decode_graph.rs` only
 when the architecture requires them.
 
-The native [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
-[MiniCPM5](../crates/apxinf-model/src/metal_minicpm5/README.md) MLX families use their
+The native [Qwen3](../../crates/apxinf-model/src/metal_qwen3/README.md) and
+[MiniCPM5](../../crates/apxinf-model/src/metal_minicpm5/README.md) MLX families use their
 own `config`, `weights` and `model` modules, plus family-specific math/state
 files. They demonstrate family ownership and explicit state, not a license to import another family's
 model or to generalize its accepted hardware/geometry.
@@ -197,7 +197,7 @@ prepare compiled local/block/step functions with explicit changing array
 inputs/outputs, then evaluate all required logits/state before committing a
 position change. Infallible `prewarm_decode` retains a preparation error for
 the next fallible call; it cannot pretend preparation succeeded. See
-[MLX execution](mlx-backend.md#prepared-compiled-execution) for bounded lazy
+[MLX execution](../design/mlx-backend.md#prepared-compiled-execution) for bounded lazy
 allocations, thread ownership and the exact current compilation scopes.
 CUDA Graph capture requirements below retain their original meaning.
 
