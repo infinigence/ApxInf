@@ -25,6 +25,10 @@ mod half_split_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod interleaved_qk_norm_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod layer_norm_modulate;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod mpp_epilogues;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod mpp_gemm;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod q4_f16;
