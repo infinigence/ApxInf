@@ -27,6 +27,7 @@ There is no Python `AutoModel` binding or Python PI0.5 network class.
 | Directory | Current organization |
 | --- | --- |
 | `pi05/` | `load.rs` and `config.rs` construct `Pi05ModelRunner`; `model/` holds `Pi05Model<B>`, Blocks and `ModelVariant`; `model_runner/` owns preparation/cache/resources; `weights/` owns host mapping and device representations |
+| `fastwam/` | `config.rs`/`load.rs`, native `model.rs` with `text.rs`, `vae.rs`, `dit.rs`, runner-owned graph preparation in `model_runner.rs`, and checkpoint mapping in `weights/`; [profile and limits](fastwam.md) |
 | `walloss/` | Existing BF16 runtime/executor, `fp8.rs`, schedule/geometry and weight files |
 | `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
 | `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |

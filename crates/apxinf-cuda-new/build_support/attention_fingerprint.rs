@@ -26,7 +26,9 @@ const INPUT_FILES: &[&str] = &[
     "include/apxinf_cuda/status.h",
     "include/apxinf_cuda/tuning_types.h",
     "include/apxinf_cuda/types.h",
+    "adapters/cublas_resources.h",
     "kernels/custom/attention.cuh",
+    "kernels/custom/attention_softmax.cuh",
 ];
 
 fn hash_bytes(hash: &mut u128, bytes: &[u8]) {

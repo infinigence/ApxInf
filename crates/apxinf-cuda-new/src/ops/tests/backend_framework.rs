@@ -1494,3 +1494,30 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     drop(mutable);
     std::fs::remove_dir_all(cache_dir).unwrap();
 }
+
+#[test]
+fn cublas_stream_resource_cache_is_weak_and_isolates_streams() {
+    unsafe extern "C" {
+        fn apxinf_gemm_test_cublas_stream_resources(
+            device: c_int,
+            first: *mut std::ffi::c_void,
+            second: *mut std::ffi::c_void,
+            error: *mut c_char,
+            capacity: usize,
+        ) -> c_int;
+    }
+    let first = CudaContext::new_with_autotune(0, false).unwrap();
+    let second = CudaContext::new_with_autotune(0, false).unwrap();
+    run_framework_contract(
+        "cuBLAS stream resource ownership",
+        |error, capacity| unsafe {
+            apxinf_gemm_test_cublas_stream_resources(
+                0,
+                first.stream().handle(),
+                second.stream().handle(),
+                error,
+                capacity,
+            )
+        },
+    );
+}

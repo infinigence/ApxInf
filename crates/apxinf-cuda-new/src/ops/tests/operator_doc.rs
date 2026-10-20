@@ -40,6 +40,10 @@ fn every_l3_operator_appears_once_in_cuda_operator_doc() {
                 .copied()
                 .map(attention_contracts::Semantic::doc_id),
         )
+        .chain(crate::ops::pointwise::ROUNDED_DOC_IDS.iter().copied())
+        .chain(crate::ops::norm::ROUNDED_DOC_IDS.iter().copied())
+        .chain(crate::ops::rope::PAIRWISE_DOC_IDS.iter().copied())
+        .chain(crate::ops::image::DOC_IDS.iter().copied())
         .collect();
     let expected: BTreeSet<_> = expected_ids.iter().copied().collect();
 

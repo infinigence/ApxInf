@@ -95,6 +95,19 @@ cudaError_t launch_custom(Execution& execution) {
   const int key_stride = spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE
                              ? static_cast<int>(spec.key_capacity)
                              : static_cast<int>(spec.key_tokens);
+  if (spec.dtype == APXINF_DTYPE_F32) {
+    return kernels::launch_attention<float>(
+        bindings.query, bindings.key, bindings.value, bindings.output,
+        state->probabilities, static_cast<int>(spec.batch),
+        static_cast<int>(spec.query_tokens), static_cast<int>(spec.key_tokens),
+        key_stride,
+        static_cast<int>(spec.query_heads), static_cast<int>(spec.kv_heads),
+        static_cast<int>(spec.head_dim),
+        spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
+        static_cast<int>(spec.query_start), bindings.decode_meta,
+        bindings.scale, stream, static_cast<const float*>(bindings.bias),
+        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
+  }
   if (spec.dtype == APXINF_DTYPE_F16) {
     return kernels::launch_attention<__half>(
         bindings.query, bindings.key, bindings.value, bindings.output,
@@ -105,7 +118,8 @@ cudaError_t launch_custom(Execution& execution) {
         static_cast<int>(spec.head_dim),
         spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
         static_cast<int>(spec.query_start), bindings.decode_meta,
-        bindings.scale, stream);
+        bindings.scale, stream, static_cast<const float*>(bindings.bias),
+        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
   }
   return kernels::launch_attention<__nv_bfloat16>(
       bindings.query, bindings.key, bindings.value, bindings.output,
@@ -116,7 +130,35 @@ cudaError_t launch_custom(Execution& execution) {
       static_cast<int>(spec.head_dim),
       spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
       static_cast<int>(spec.query_start), bindings.decode_meta,
-      bindings.scale, stream);
+      bindings.scale, stream, static_cast<const float*>(bindings.bias),
+        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
+}
+
+template <bool Cooperative>
+cudaError_t launch_parallel_impl(Execution& execution) {
+  auto* state = static_cast<CustomState*>(execution.provider_state);
+  const auto& spec = execution.spec;
+  const auto& b = execution.bindings;
+#define APXINF_LAUNCH_PARALLEL(T) kernels::launch_parallel_attention<T, Cooperative>( \
+      b.query, b.key, b.value, b.output, state->probabilities, \
+      static_cast<int>(spec.batch), static_cast<int>(spec.query_tokens), \
+      static_cast<int>(spec.key_tokens), static_cast<int>(spec.query_heads), \
+      static_cast<int>(spec.kv_heads), static_cast<int>(spec.head_dim), b.scale, \
+      spec.mask == APXINF_ATTENTION_MASK_CAUSAL, static_cast<int>(spec.query_start), \
+      static_cast<const float*>(b.bias), spec.bias_broadcast_batch != 0, \
+      spec.input_precision != 0, static_cast<cudaStream_t>(b.stream))
+  if (spec.dtype == APXINF_DTYPE_F32) return APXINF_LAUNCH_PARALLEL(float);
+  if (spec.dtype == APXINF_DTYPE_F16) return APXINF_LAUNCH_PARALLEL(__half);
+  return APXINF_LAUNCH_PARALLEL(__nv_bfloat16);
+#undef APXINF_LAUNCH_PARALLEL
+}
+
+cudaError_t launch_parallel_custom(Execution& execution) {
+  return launch_parallel_impl<false>(execution);
+}
+
+cudaError_t launch_cooperative_custom(Execution& execution) {
+  return launch_parallel_impl<true>(execution);
 }
 
 void destroy_custom(Execution& execution) noexcept {

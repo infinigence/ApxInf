@@ -306,6 +306,7 @@ fn main() {
         "pointwise.cu",
         "rope.cu",
         "gather.cu",
+        "image.cu",
         "quantization.cu",
     ]
     .map(|source| adapters.join(source))
@@ -432,6 +433,8 @@ fn main() {
     }
     let patched_fa2_root =
         (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    // Append new provider objects without renumbering the existing native cache.
+    let input_attention_source = adapters.join("attention/providers/cublas.cu");
     assert!(
         generic_sources
             .iter()
@@ -441,6 +444,7 @@ fn main() {
             .chain(&cutlass_sm89_sources)
             .chain(&fa2_sources)
             .chain(&fa2_e4m3_sources)
+            .chain(std::iter::once(&input_attention_source))
             .all(|path| path.is_file()),
         "native build source is missing"
     );
@@ -537,6 +541,14 @@ fn main() {
                 .into_iter()
                 .map(|source| (source, false, false, false, false, false, true)),
         )
+        .chain(std::iter::once((
+            input_attention_source,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )))
         .enumerate()
     {
         let (

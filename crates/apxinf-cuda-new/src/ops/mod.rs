@@ -4,6 +4,7 @@ mod attention;
 mod attn_ops;
 mod cache;
 mod gather;
+mod image;
 mod gdn;
 mod gemm;
 pub mod mlp;
@@ -28,7 +29,7 @@ pub(crate) use gemm::gemm_execution as execution;
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use attention::{
     attention, decode_attention, decode_attention_workspace_bytes, kv_cache_attention,
-    packed_qkv_attention, segmented_attention, AttentionArgs, AttentionMask, AttentionPolicy,
+    additive_attention, packed_qkv_attention, segmented_attention, AttentionArgs, AttentionBiasArgs, AttentionPrecision, AttentionMask, AttentionPolicy,
     KvCacheAttentionArgs, KvCacheDecodeMeta, PackedQkvAttentionArgs, SegmentedAttentionArgs,
 };
 pub use attn_ops::{
@@ -36,6 +37,7 @@ pub use attn_ops::{
 };
 pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
+pub use image::{image_im2col, image_space_to_depth, image_grouped_average, channel_l2_normalize, channel_standardize, image_rgb_indices, ImageMemoryLayout};
 pub use gdn::{
     gdn_causal_conv_forward, gdn_causal_conv_step, gdn_decay_and_beta,
     gdn_decay_and_beta_seq, gdn_gated_norm, gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16,
@@ -54,6 +56,7 @@ pub use gemm::{
 pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
 pub use model::{argmax, embedding_gather};
 pub use norm::{
+    rms_norm_rounded,
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual,
     bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, layer_norm, rms_norm,
     AdaGateResidualArgs, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs, BiasResidualArgs,
@@ -63,6 +66,7 @@ pub use norm::{
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
 pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
 pub use rope::{
+    pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable,
     decode_rope, multimodal_rope, rope, split_qkv_axial_rope, AxialRopeArgs, DecodeRopeArgs,
     MultimodalRopeArgs, RopeArgs, RopeSemantic,
 };

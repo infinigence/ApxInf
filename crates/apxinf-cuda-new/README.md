@@ -11,6 +11,10 @@ The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
 The BF16 MLP helper remains available as
 `ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
 signature and is used by the Qwen integration tests.
+Attention Spec version 5 adds additive bias bindings and explicit intermediate
+precision. Dense attention also accepts F32 inputs and output; KV-cache and
+segmented contracts retain F16/BF16. Prior attention specs are rejected.
+
 GEMM Spec version 6 combines NVFP4 block-scale bindings with the
 `GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
 across these incompatible layouts.
@@ -121,7 +125,7 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | Component | Attention | GEMM |
 | --- | --- | --- |
 | Problem | Complete normalized `Spec` | Complete normalized `Spec` |
-| Device and execution location | device, Q/K/V/offsets/output addresses, stream | device, A/B/bias/scales/output addresses, stream |
+| Device and execution location | device, Q/K/V/bias/offsets/output addresses, stream | device, A/B/bias/scales/output addresses, stream |
 | Actual dynamic values | Bit patterns of `scale` and `output_scale` | Bit patterns of `alpha` and `output_scale`; B version/immutable flag |
 | Policy affecting prepared state | workspace limit, graph-safe, deterministic | workspace limit, graph-safe, deterministic |
 | Excluded from key | `online_tune`, `allow_fallback`, `cache_dir` | `online_tune`, `allow_fallback`, `cache_dir` |
@@ -131,8 +135,8 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | Component | Contents |
 | --- | --- |
 | Cache/build namespace | recipe schema version, operator build fingerprint, compiled CUDA toolkit |
-| Runtime environment | GPU compute capability, SM count; compatible CUDA runtime/driver version; GEMM also includes the cuBLASLt version |
-| Attention equivalence class | semantic, input/output dtype, mask, batch, Q/K tokens, key capacity, Q/KV heads, head dim, query start, segments/max segment, default-scale predicate |
+| Runtime environment | GPU compute capability, SM count; compatible CUDA runtime/driver version; GEMM also includes the cuBLASLt version, and Attention includes the cuBLAS version |
+| Attention equivalence class | semantic, input/output dtype, mask, batch, Q/K tokens, key capacity, Q/KV heads, head dim, query start, segments/max segment, default-scale predicate, additive-bias broadcast and intermediate precision |
 | GEMM equivalence class | semantic, M/N/K, A/B/accumulation/output dtype, quantization, B immutable, unit-alpha/unit-output-scale predicates |
 | Candidate eligibility | Alignment class for each binding, workspace limit, graph-safe, deterministic |
 | Excluded from key | Raw pointers, stream, input contents, actual scale, B version, device UUID, cache dir, tune/fallback switches, Attention offsets contents |
@@ -177,6 +181,15 @@ benchmark default to cache-only/fallback, not tuning. Tuning occurs at first eag
 execution or prepare, never inside graph capture or steady-state replay. A warm
 cache does not retune just because `--autotune` is present.
 
+BF16 additive attention with `Input` arithmetic, equal Q/KV head counts and
+at most 1024 keys has a cuBLAS candidate. It computes BF16 QK scores, rounds the
+bias addition, computes softmax in FP32 and rounds probabilities to BF16 before
+the final cuBLAS PV. It is the first eligible fallback for this domain, including
+when online tuning is disabled. Other arithmetic and GQA use the custom
+candidates. Provider scratch contains the score/probability matrix plus the
+shared 4 MiB cuBLAS workspace. Attention recipe namespace v7 includes the
+runtime cuBLAS version and the softmax source fingerprint.
+
 ## Session / CUDA Graph State Machine
 
 | Stage | Entry Point | Allowed | Forbidden/Failure Conditions | Result |
@@ -187,6 +200,15 @@ cache does not retune just because `--autotune` is present.
 | Replay | `CapturedGraph::replay()` | Launch the instantiated graph | changing the captured structure | GPU work |
 
 The graph retains the executions and storage used during capture. The recipe key does not contain raw pointers; fixed addresses and the stream belong to the Rust execution cache key.
+
+The cuBLAS providers reuse an immutable handle and 4 MiB scratch allocation for
+executions on the same device and concrete stream. Executions hold strong
+ownership; the provider-private lookup table holds weak references only. A
+mutex serializes complete cuBLAS host calls, and stream order serializes scratch
+use on the device. Different streams keep separate resources. Projection and
+dequantization buffers remain per-execution; workspace policy accounting still
+charges the full 4 MiB to each execution conservatively. Resource lookup and
+creation occur only during prepare, never during capture or replay.
 
 ## Directory Responsibilities
 

@@ -52,3 +52,18 @@ unsafe extern "C" {
         bindings: *const Bindings,
     ) -> i32;
 }
+
+unsafe extern "C" {
+    pub(crate) fn apxinf_pairwise_rope_launch(
+        runtime: Runtime,
+        version: u32,
+        input: *const c_void,
+        coefficients: *const c_void,
+        output: *mut c_void,
+        tokens: i64,
+        heads: i64,
+        head_dim: i64,
+        output_dtype: u32,
+        stream: CudaStream,
+    ) -> i32;
+}

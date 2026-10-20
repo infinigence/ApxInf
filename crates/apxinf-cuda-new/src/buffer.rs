@@ -102,17 +102,11 @@ impl CudaBuffer {
         Ok(buf)
     }
 
-    /// Copy data from host to this device buffer.
+    /// Copy data from host to this device buffer and wait for the upload to finish.
+    /// Callers must finish earlier device readers before overwriting the buffer.
     pub fn copy_from_host(&self, src: &[u8]) -> Result<(), String> {
         assert!(src.len() <= self.len, "source exceeds buffer size");
-        unsafe {
-            ffi::check_cuda(ffi::cudaMemcpy(
-                self.ptr,
-                src.as_ptr() as *const c_void,
-                src.len(),
-                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            ))
-        }
+        crate::transfers::copy_host_to_device(self.device, src, self.ptr as usize)
     }
 
     /// Copy data from this device buffer to host.

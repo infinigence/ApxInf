@@ -5,6 +5,7 @@ pub(crate) mod gemm;
 pub(crate) mod model;
 pub(crate) mod mlp;
 pub(crate) mod gather;
+pub(crate) mod image;
 pub(crate) mod norm;
 pub(crate) mod pointwise;
 pub(crate) mod quantization;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../internal.h"
+#include <optional>
 
 namespace apxinf::gemm::vendor {
 
@@ -24,9 +25,12 @@ struct CommonResources {
 
 void allocate_common_resources(const Spec& spec,
                                CommonResources& resources,
-                               bool native_fp8);
+                               bool native_fp8,
+                               std::optional<uint32_t> projection_dtype = std::nullopt);
 uint32_t common_projection_dtype(const Spec& spec);
-size_t common_resource_requirements(const Spec& spec, bool native_fp8);
+size_t common_resource_requirements(
+    const Spec& spec, bool native_fp8,
+    std::optional<uint32_t> projection_dtype = std::nullopt);
 cudaError_t launch_postprocess(const Spec& spec,
                                CommonResources& resources,
                                const apxinf_gemm_bindings_t& bindings,

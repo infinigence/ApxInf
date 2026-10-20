@@ -224,3 +224,21 @@ __global__ void partial_multimodal_rope(
 }
 
 }  // namespace apxinf::rope::kernels
+
+namespace apxinf::rope::kernels {
+template <class Out>
+__global__ void pairwise_rotate(const __nv_bfloat16* input, const double2* table,
+                                 Out* output, int64_t count, int heads, int dim) {
+  for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       pair < count; pair += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t token = pair / (heads * static_cast<int64_t>(dim / 2));
+    const double2 cs = table[token * (dim / 2) + pair % (dim / 2)];
+    const double x = static_cast<double>(__bfloat162float(input[2 * pair]));
+    const double y = static_cast<double>(__bfloat162float(input[2 * pair + 1]));
+    const float real = static_cast<float>(__dsub_rn(__dmul_rn(x, cs.x), __dmul_rn(y, cs.y)));
+    const float imag = static_cast<float>(__dadd_rn(__dmul_rn(x, cs.y), __dmul_rn(y, cs.x)));
+    output[2 * pair] = static_cast<Out>(real);
+    output[2 * pair + 1] = static_cast<Out>(imag);
+  }
+}
+} // namespace apxinf::rope::kernels

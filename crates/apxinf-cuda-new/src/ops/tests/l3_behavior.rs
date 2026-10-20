@@ -961,3 +961,79 @@ fn attention_semantics_use_distinct_native_registries() {
         .summary()
         .starts_with("custom-segmented-attention "));
 }
+
+#[test]
+fn rounded_primitives_and_pairwise_rope_capture_contract() {
+    use apxinf_core::DType;
+    let ctx = CudaContext::new(0).unwrap();
+    let input = tensor(0, vec![2, 4], &[1.0, -2.0, 3.0, 4.0, -1.0, 0.5, 8.0, -4.0]);
+    let columns = tensor(0, vec![4], &[0.5, 2.0, -1.0, 0.0]);
+    let mut output = zeros_tensor(0, vec![2, 4], DType::BF16);
+    let apply = |output: &mut apxinf_core::Tensor| {
+        let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &input, output);
+        args.secondary = Some(&columns);
+        pointwise(&ctx, args)
+    };
+    apply(&mut output).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![0.5,-4.0,-3.0,0.0,-0.5,1.0,-8.0,0.0]);
+    let graph = crate::capture(&ctx, || apply(&mut output)).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![0.5,-4.0,-3.0,0.0,-0.5,1.0,-8.0,0.0]);
+    let bad = tensor(0, vec![3], &[1.0;3]);
+    let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &input, &mut output);
+    args.secondary = Some(&bad);
+    assert!(pointwise(&ctx, args).is_err());
+    let table = PairwiseRopeTable::new(&ctx, 2, 4, &[(0.0,1.0);4]).unwrap();
+    let mut rotated = zeros_tensor(0, vec![2,4], DType::F32);
+    let graph = crate::capture(&ctx, || pairwise_rope(&ctx, PairwiseRopeArgs {
+        input: &input, table: &table, output: &mut rotated, heads: 1,
+    })).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    let buffer = crate::CudaBuffer::from_tensor(&rotated).unwrap();
+    let mut bytes = vec![0; 8 * 4];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    let actual: Vec<f32> = bytes.chunks_exact(4).map(|v| f32::from_ne_bytes(v.try_into().unwrap())).collect();
+    assert_eq!(actual, vec![2.0,1.0,-4.0,3.0,-0.5,-1.0,4.0,8.0]);
+    assert!(PairwiseRopeTable::new(&ctx, 2, 3, &[(0.0,1.0);3]).is_err());
+    assert!(PairwiseRopeTable::new(&ctx, 2, 4, &[(f64::NAN,1.0);4]).is_err());
+}
+
+#[test]
+fn additive_attention_validates_bias_and_replays_changed_bias() {
+    use super::framework::f32_tensor;
+    let ctx = CudaContext::new(0).unwrap();
+    let query = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+    let key = tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
+    let value = tensor(0, vec![1, 2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let bias = f32_tensor(0, vec![1, 1, 1, 2], &[0.0, f32::NEG_INFINITY]);
+    let bad_bias = f32_tensor(0, vec![1, 1, 2, 1], &[0.0; 2]);
+    let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+    let args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bad_bias);
+    assert!(additive_attention(&ctx, args).unwrap_err().to_string().contains("bias must be"));
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    prepare_with_session(&session, || {
+        let mut args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+        args.attention.policy.online_tune = false;
+        additive_attention(&ctx, args)
+    }).unwrap();
+    assert_eq!(values(&out), [1.0, 2.0]);
+    let graph = crate::capture(&ctx, || with_session(&session, || {
+        let mut args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+        args.attention.policy.online_tune = false;
+        additive_attention(&ctx, args)
+    })).unwrap();
+    let changed: Vec<_> = [f32::NEG_INFINITY, 0.0].iter().flat_map(|x| x.to_ne_bytes()).collect();
+    crate::CudaBuffer::from_tensor(&bias).unwrap().copy_from_host(&changed).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&out), [3.0, 4.0]);
+    // Addresses must be retained by the prepared session, and replacing a bias
+    // allocation must miss even when the structural recipe is equivalent.
+    let replacement = f32_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+    let err = with_session(&session, || additive_attention(&ctx,
+        AttentionBiasArgs::new(AttentionArgs::new(&query,&key,&value,&mut out),&replacement))).unwrap_err();
+    assert!(err.to_string().contains("cache miss"), "{err}");
+}

@@ -65,6 +65,7 @@ from .policies import (
     AutoPolicy,
     ComposablePolicy,
     Gr00tPolicy,
+    FastWamPolicy,
     Pi05Policy,
     Pi0FastPolicy,
     Policy,
@@ -90,6 +91,7 @@ __all__ = [
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
+    "FastWamPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework

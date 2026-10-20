@@ -4,11 +4,17 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace apxinf::norm::kernels {
 
 template <class T>
 __device__ float to_float(T value);
+
+template <>
+__device__ inline float to_float(float value) {
+  return value;
+}
 
 template <>
 __device__ inline float to_float(__half value) {
@@ -22,6 +28,11 @@ __device__ inline float to_float(__nv_bfloat16 value) {
 
 template <class T>
 __device__ T from_float(float value);
+
+template <>
+__device__ inline float from_float(float value) {
+  return value;
+}
 
 template <>
 __device__ inline __half from_float(float value) {
@@ -65,7 +76,7 @@ __device__ __forceinline__ float block_sum_parallel_unsafe(float value,
 // `uint32_t`, with the row and column arguments swapped between them; the port
 // deliberately keeps a single signature so that mistake cannot recur.
 
-template <class T>
+template <class T, bool RoundNormalized = false>
 __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
                          int cols, float eps) {
   __shared__ float scratch[32];
@@ -74,14 +85,16 @@ __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
   float square_sum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const float value = to_float(input[static_cast<int64_t>(row) * cols + col]);
-    square_sum += value * value;
+    if constexpr (RoundNormalized) square_sum = __fadd_rn(square_sum, __fmul_rn(value, value));
+    else square_sum += value * value;
   }
   const float inverse_rms =
       rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const int64_t index = static_cast<int64_t>(row) * cols + col;
-    output[index] =
-        from_float<T>(to_float(input[index]) * inverse_rms * to_float(weight[col]));
+    float normalized = __fmul_rn(to_float(input[index]), inverse_rms);
+    if constexpr (RoundNormalized) normalized = to_float(from_float<T>(normalized));
+    output[index] = from_float<T>(__fmul_rn(normalized, to_float(weight[col])));
   }
 }
 
@@ -91,14 +104,27 @@ __global__ void layer_norm(const T* input, const T* weight, const T* bias,
   __shared__ float scratch[32];
   const int row = blockIdx.x;
   if (row >= rows) return;
+  // F32 state can have a large common offset and very small variance. Sum
+  // offsets from one exactly represented input, rather than the large values
+  // themselves. Keep the mean in this centered coordinate system through the
+  // output calculation, avoiding a second loss when adding the origin back.
+  // Half/BF16 instantiations retain their existing arithmetic unchanged.
+  float origin = 0.0f;
+  if constexpr (std::is_same_v<T, float>) {
+    origin = input[static_cast<int64_t>(row) * cols];
+  }
   float sum = 0.0f;
-  for (int col = threadIdx.x; col < cols; col += blockDim.x)
-    sum += to_float(input[static_cast<int64_t>(row) * cols + col]);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float value = to_float(input[static_cast<int64_t>(row) * cols + col]);
+    if constexpr (std::is_same_v<T, float>) value -= origin;
+    sum += value;
+  }
   const float mean = block_sum_parallel_unsafe(sum, scratch) / cols;
   float variance_sum = 0.0f;
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-    const float centered =
-        to_float(input[static_cast<int64_t>(row) * cols + col]) - mean;
+    float value = to_float(input[static_cast<int64_t>(row) * cols + col]);
+    if constexpr (std::is_same_v<T, float>) value -= origin;
+    const float centered = value - mean;
     variance_sum += centered * centered;
   }
   // Finish reading the mean before the variance reduction overwrites scratch.
@@ -107,8 +133,10 @@ __global__ void layer_norm(const T* input, const T* weight, const T* bias,
       block_sum_parallel_unsafe(variance_sum, scratch) / cols + eps);
   for (int col = threadIdx.x; col < cols; col += blockDim.x) {
     const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float value = to_float(input[index]);
+    if constexpr (std::is_same_v<T, float>) value -= origin;
     output[index] = from_float<T>(
-        (to_float(input[index]) - mean) * inverse_std * to_float(weight[col]) +
+        (value - mean) * inverse_std * to_float(weight[col]) +
         to_float(bias[col]));
   }
 }
