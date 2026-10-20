@@ -593,3 +593,11 @@ fn image_operators_follow_mlx_semantics() -> Result<()> {
     assert_eq!(image.to_f32_vec()?, [0., 0.625, 1.]);
     Ok(())
 }
+
+#[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}
