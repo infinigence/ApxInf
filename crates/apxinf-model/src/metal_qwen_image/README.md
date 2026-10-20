@@ -75,10 +75,10 @@ Select it from the CLI with `generate-image --model-variant reference`.
   the blending ramp; tests check recorded NumPy digests.
 
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
-and read again by the next request; the VAE decoder stays loaded. The MLX
-buffer cache is cleared after text encoding and after the DiT is released, as
-mflux `--low-ram` does; its 1 GB cache limit is not applied. This matches
-the reference's weight-release boundaries. Device accumulation and integer
+and read again by the next request; the VAE decoder stays loaded. As mflux
+`--low-ram` does, loading caps the process-wide MLX allocator cache at 1 GB,
+and the cache is cleared after text encoding and after the DiT is released.
+This matches the reference's weight-release boundaries. Device accumulation and integer
 pixel finalization add bounded request-local arrays; their measured peak and
 complete-request cost require source-bound qualification, not a claim of
 identical memory usage.
