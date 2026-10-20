@@ -24,9 +24,10 @@ checks the dimensions and checked token product before any request device work.
 sides 8192, 16384 or 32768 are rejected. Empty prompts, other step counts,
 negative prompts, true CFG, editing, ControlNet and LoRA are rejected or not exposed.
 
-`model_variant=auto`, also the default when omitted, retains the existing MPP
-selection and optimization target. `model_variant=reference` skips the MPP
-probe and uses MLX quantized matmul for all Q4 projections. It changes neither
+`model_variant=auto`, also the default when omitted, selects per MLX
+architecture: on `applegpu_g16g` (M4) the fused image blocks below, elsewhere
+the MPP selection described below. `model_variant=reference` skips both and
+uses MLX quantized matmul for all Q4 projections. It changes neither
 checkpoint interpretation nor the schedule, text encoder, compilation or VAE.
 Select it from the CLI with `generate-image --model-variant reference`.
 
@@ -65,6 +66,21 @@ Select it from the CLI with `generate-image --model-variant reference`.
   optimization still needs device and workload qualification. In `reference`,
   on other architectures, when the probe fails, below 1024 or for unaligned image
   token counts, and for the text prefix, projections use quantized matmul.
+- Fused image blocks (`auto` on `applegpu_g16g`, image-token counts that are
+  multiples of 64 in 1024..=4096; other counts use the path above). Each image
+  block runs seven kernels from `apxinf-mlx`: `LayerNormModulate`; Q and K
+  through `MppGemmHeadRmsRope` (BF16-rounded GEMM, head RMSNorm and RoPE in the
+  epilogue, K with the cached text keys copied in front); V through
+  `MppGemmHeadsWithPrefix`; SDPA; the output projection through
+  `MppGemmDecodeQ4Rows`, which also decodes the MLP gate/up weight;
+  `GatedResidualLayerNormModulate`; `MppGemmSwigluPairs`; and the MLP down
+  projection through `MppGemmGatedResidual`. The broadcast modulation rows are
+  read through their strides. Each block's gate and up Q4 weights are
+  interleaved in 32-row pairs when the DiT is loaded for a request, beside the
+  originals that the text prefix reads (about 1.8 GB for 32 blocks). These
+  kernels round differently from mflux: images are not bit-identical to
+  `reference`, so qualification compares them with the reference
+  implementation they reproduce and reports PSNR against mflux.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
   overlap. FP32 tiles, weighted products and ordered overlap sums/counts remain
   on device. Each product is materialized before addition, and each replacement
