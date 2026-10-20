@@ -21,6 +21,7 @@ this list is not a supported knob — inspect the source before using it.
 | `APXINF_CUDA_ARCH_CUTLASS` | crates/apxinf-cuda-new/build.rs, crates/apxinf-cuda-new/build_support/cuda_arch.rs, crates |
 | `APXINF_CUDA_DEVICE` | crates/apxinf-cuda-new/build_support/cuda_arch.rs, crates/apxinf-cuda/build_support/cuda_a |
 | `APXINF_FA2_HEAD64_MAXREG` | crates/apxinf-cuda/build.rs |
+| `APXINF_HIP_ARCH` | crates/apxinf-hip/build.rs; selects the ROCm gfx target, auto-detected from the first GPU when unset; embedded into the runtime for architecture checks |
 | `APXINF_KERNEL_BUILD_ID` | crates/apxinf-cuda-new/build.rs, crates/apxinf-cuda/build.rs, crates/apxinf-cuda/src/tunin |
 | `APXINF_NVCC_PARALLELISM` | crates/apxinf-cuda/build_support/nvcc_build.rs |
 | `APXINF_STATUS_UNSUPPORTED` | crates/apxinf-cuda-new/native/framework/autotune.h, crates/apxinf-cuda-new/native/include/ |
@@ -55,6 +56,7 @@ this list is not a supported knob — inspect the source before using it.
 | `CUDA_VISIBLE_DEVICES` | crates/apxinf-cuda-new/build.rs, crates/apxinf-cuda/build.rs |
 | `HF_HOME` | python/apxinf/tests/test_pi0fast_policy.py, python/apxinf/apxinf/policies/impls/pi0fast.py |
 | `NVIDIA_VISIBLE_DEVICES` | crates/apxinf-cuda/build.rs |
+| `ROCM_PATH` | crates/apxinf-hip/build.rs; ROCm toolkit root (defaults to /opt/rocm) |
 
 ## Debug / tuning (scattered per-family overrides)
 

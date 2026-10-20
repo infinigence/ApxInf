@@ -17,7 +17,7 @@ code, the code wins and this file must be fixed in the same PR.
 | apxinf-cuda | Legacy CUDA backend: context, buffers, cuBLAS, custom kernels | new kernels go to apxinf-cuda-new, not here |
 | apxinf-cuda-new | Current CUDA backend: L3 semantics, candidates, graphs | kernel rules in its AGENTS.md |
 | apxinf-mlx | Native MLX arrays, compiled functions and Metal operations | optional mlx feature; Apple Silicon |
-| apxinf-hip | HIP backend skeleton | new; minimal surface |
+| apxinf-hip | HIP runtime, memory, KV cache and Backend operations | ROCm required for device execution; builds unavailable-runtime stubs without it |
 | apxinf-model | All model architecture: llm_trait, VlaRuntime, families | see families below |
 | apxinf-py | PyO3 binding (ModelRunner) | built via just build-py |
 

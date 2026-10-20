@@ -52,8 +52,7 @@ board, checkpoint, tactics and effective execution mode.
 Freeze source and harnesses before final measurements. Later optimizations need
 fresh evidence. Performance harnesses assert actual graph/eager mode, record
 fallback, reconcile timing scopes, and prove tuning created keys. Full tensor
-comparison is required; matching stdout tails is not identity evidence. See
-the [model-parity skill](../../.agents/skills/model-parity/SKILL.md).
+comparison is required; matching stdout tails is not identity evidence.
 
 ## Blocked is a result, not a pass
 
