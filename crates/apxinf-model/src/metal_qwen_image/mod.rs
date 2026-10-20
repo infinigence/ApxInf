@@ -319,13 +319,14 @@ impl ImageRuntime for QwenImage {
             Some(t) => t,
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
-        let dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
+        let mut dit = dit::Dit::new(transformer, ops, self.gemm.clone(), self.fused.clone())?;
         let cache = dit.text_cache(
             &prompt,
             &table(&cos[..split], text_len)?,
             &table(&sin[..split], text_len)?,
         )?;
         drop(prompt);
+        dit.interleave_for_image(lh * lw)?;
         let (cos, sin) = (
             table(&cos[split..], lh * lw)?,
             table(&sin[split..], lh * lw)?,

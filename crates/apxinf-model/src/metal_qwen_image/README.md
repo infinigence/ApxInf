@@ -75,9 +75,10 @@ Select it from the CLI with `generate-image --model-variant reference`.
   `MppGemmDecodeQ4Rows`, which also decodes the MLP gate/up weight;
   `GatedResidualLayerNormModulate`; `MppGemmSwigluPairs`; and the MLP down
   projection through `MppGemmGatedResidual`. The broadcast modulation rows are
-  read through their strides. Each block's gate and up Q4 weights are
-  interleaved in 32-row pairs when the DiT is loaded for a request, beside the
-  originals that the text prefix reads (about 1.8 GB for 32 blocks). These
+  read through their strides. After the text prefix, the only other reader of
+  the image MLP's gate and up Q4 weights, each block's pair is interleaved in
+  32-row pairs and replaces the originals, one block at a time, so the DiT keeps
+  one copy. Requests outside the fused token range keep them separate. These
   kernels round differently from mflux: images are not bit-identical to
   `reference`, so qualification compares them with the reference
   implementation they reproduce and reports PSNR against mflux.

@@ -37,9 +37,15 @@ pub struct Block {
     pub to_k: Q4,
     pub to_v: Q4,
     pub to_out: Q4,
-    pub gate: Q4,
-    pub proj: Q4,
+    pub gate_up: GateUp,
     pub out: Q4,
+}
+
+/// The image MLP's gate and up projections: separate as stored, or
+/// interleaved in 32-row pairs for the fused SwiGLU after the text prefix.
+pub enum GateUp {
+    Separate { gate: Q4, up: Q4 },
+    Interleaved(Q4),
 }
 
 pub struct Transformer {
@@ -202,8 +208,10 @@ impl Transformer {
                 to_k: t.q4(&format!("{p}.attn.to_k"), DIM, DIM)?,
                 to_v: t.q4(&format!("{p}.attn.to_v"), DIM, DIM)?,
                 to_out: t.q4(&format!("{p}.attn.to_out.0"), DIM, DIM)?,
-                gate: t.q4(&format!("{p}.img_mlp.gate_layer"), MLP, DIM)?,
-                proj: t.q4(&format!("{p}.img_mlp.proj"), MLP, DIM)?,
+                gate_up: GateUp::Separate {
+                    gate: t.q4(&format!("{p}.img_mlp.gate_layer"), MLP, DIM)?,
+                    up: t.q4(&format!("{p}.img_mlp.proj"), MLP, DIM)?,
+                },
                 out: t.q4(&format!("{p}.img_mlp.out"), DIM, MLP)?,
             });
         }
