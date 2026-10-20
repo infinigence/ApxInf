@@ -35,7 +35,7 @@ pub struct ClefRunner {
 const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
 /// MLX architectures where the GPU composition with MLP columns on the Neural
-/// Engine passed its gates; `auto` prefers it there: the M1 Pro (2026-10-18;
+/// Engine passed its gates; `auto` prefers it there: the M1 Pro (2026-10-20;
 /// programs equal to the reference build, at-risk decisions bit-identical to
 /// it, quality against stock, memory, and paired latency against the
 /// reference implementation).
