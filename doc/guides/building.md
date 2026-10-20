@@ -30,20 +30,21 @@ automatically; L1 bare-handle callers must pass `tactics=` explicitly to
 `ModelRunner.load(...)` or they silently fall back to untuned default GEMM
 keys (see `python/apxinf/AGENTS.md`).
 
-**If `import apxinf_py` fails with `undefined symbol` right after a build
-that reported success, the wheel on disk is stale, not your code.** The CUDA
-kernel cache keys on source mtime plus a hashed `.cmdline` stamp
-(`crates/apxinf-cuda/build_support/nvcc_build.rs:64`,
-`crates/apxinf-cuda/build.rs:240`); restoring `.cu` files with preserved
-timestamps (`cp -p`, `tar -x`, `scp -p`) can leave objects that look fresh to
-Cargo but predate your edit. Confirm with
-`ls -l target/wheel/wheels/apxinf_py-*.whl`, then force a clean kernel
-rebuild:
+**An `undefined symbol` import failure needs a build-and-load diagnosis.**
+Identify the extension Python actually loads, the build's Python ABI, and the
+missing symbol's caller and definition. Check whether the selected architecture
+and template instantiations compile and link that definition. A completed build
+alone does not establish that the extension can import; rebuilding cannot fix
+a definition excluded by the source configuration.
 
-```bash
-cargo clean -p apxinf-cuda -p apxinf-cuda-new
-just build-py
-```
+Stale artifacts are another possibility. The CUDA object cache uses dependency
+mtimes and command stamps; restoring source with preserved timestamps can permit
+reuse of an object built from different content. File timestamps or hashes alone
+do not prove source-to-object provenance. When that provenance is uncertain,
+preserve the suspect artifacts and run `build-py` in a separate checkout with
+its own `target/wheel` directory. Record the source and build settings, verify
+which new extension is loaded, and test import before inference. Import success
+and model numerical acceptance are separate checks.
 
 ## Platform presets
 

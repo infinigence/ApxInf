@@ -17,12 +17,10 @@ would pass CI and to surface anything a reviewer would flag.
 3. If the change touches GPU behavior and you have a device, run the
    matching `just test-gpu <family>` or `just bench <model>` recipe and
    record the output path under `devlocal/<feat>/pre-pr/`.
-   For model behavior changes, use `model-parity` and the task's
-   [acceptance plan](../../../doc/guides/agent-acceptance.md). Check it with
-   `just acceptance check <plan>` after the final source edit. List failed and
-   blocked cases explicitly; a private harness or zero selected tests does not
-   establish public API compatibility. Inspect shared caller coverage before
-   claiming that other families are unaffected.
+   For model behavior changes, check the task's
+   [acceptance plan](../../../doc/guides/agent-acceptance.md) with
+   `just acceptance check <plan>` after the final source edit. Record affected
+   public callers and failed or blocked cases in the PR evidence.
 4. Assemble the PR-template evidence block:
 
    ```
