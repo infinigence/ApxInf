@@ -1018,6 +1018,7 @@ pub struct MetalKernel {
     output_count: usize,
 }
 impl MetalKernel {
+    /// Inputs are made row-contiguous before each launch.
     pub fn new(
         stream: &Stream,
         name: &str,
@@ -1025,6 +1026,31 @@ impl MetalKernel {
         outputs: &[&str],
         source: &str,
         header: &str,
+    ) -> Result<Self> {
+        Self::build(stream, name, inputs, outputs, source, header, true)
+    }
+
+    /// Inputs keep their layout, so broadcast or sliced views are not copied;
+    /// the source must index every input through its `<name>_strides`.
+    pub fn new_strided(
+        stream: &Stream,
+        name: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        source: &str,
+        header: &str,
+    ) -> Result<Self> {
+        Self::build(stream, name, inputs, outputs, source, header, false)
+    }
+
+    fn build(
+        stream: &Stream,
+        name: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        source: &str,
+        header: &str,
+        row_contiguous: bool,
     ) -> Result<Self> {
         if stream.metal_index().is_none() {
             return Err(error("custom Metal kernels require a Metal stream"));
@@ -1047,6 +1073,7 @@ impl MetalKernel {
                 ip.len(),
                 op.as_ptr(),
                 op.len(),
+                row_contiguous as i32,
                 &mut raw,
             )
         })?;

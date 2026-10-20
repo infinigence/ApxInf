@@ -143,8 +143,8 @@ int apx_mlx_safetensors_load(const char* path,void** out,size_t* count){TRY
  std::sort(entries->begin(),entries->end(),[](const auto& a,const auto& b){return a.first<b.first;});*count=entries->size();*out=entries.release();CATCH}
 int apx_mlx_safetensors_entry(const void* p,size_t i,const char** name,void** out){TRY const auto& entry=static_cast<const Loaded*>(p)->at(i);*out=new A(entry.second);*name=entry.first.c_str();CATCH}
 void apx_mlx_safetensors_free(void* p){delete static_cast<Loaded*>(p);}
-int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
- std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
+int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,int row_contiguous,void** out){TRY
+ std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,row_contiguous!=0,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
 int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,const char* const* tnames,const int32_t* tkinds,const int32_t* tvalues,size_t nt,void** outputs){TRY
  std::vector<mx::Shape> shapes;std::vector<mx::Dtype> types;size_t offset=0;for(size_t j=0;j<no;++j){shapes.push_back(shape(dims+offset,ranks[j]));offset+=ranks[j];types.push_back(dtype(dtypes[j]));}
