@@ -66,8 +66,8 @@ dependent operation waits for it.
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams
 share counters; separate logical streams do not. Byte counters report bridge
-host IO, not driver transfers. `memory_stats`, `reset_peak_memory` and
-`clear_cache` observe or change the process-wide MLX allocator. Synchronize before
+host IO, not driver transfers. `memory_stats`, `reset_peak_memory`, `set_cache_limit`
+and `clear_cache` observe or change the process-wide MLX allocator. Synchronize before
 comparing release observations and run memory qualification in an isolated
 process. The ignored `metal_memory` integration executable checks repeated
 compiled-instance release and pool reuse when run under the shared Metal lock.

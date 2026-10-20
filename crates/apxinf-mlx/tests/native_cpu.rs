@@ -522,3 +522,11 @@ fn async_evaluation_completes_before_reads_and_checks_streams() -> Result<()> {
     assert!(s.async_eval(&[foreign]).is_err());
     Ok(())
 }
+
+#[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}
