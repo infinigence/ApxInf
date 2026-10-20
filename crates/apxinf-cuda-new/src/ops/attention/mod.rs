@@ -6,7 +6,10 @@ mod segmented_attention;
 
 pub use attention::{attention, packed_qkv_attention};
 pub use contracts::{AttentionArgs, AttentionMask, AttentionPolicy, PackedQkvAttentionArgs};
-pub use kv_cache_attention::{kv_cache_attention, KvCacheAttentionArgs, KvCacheDecodeMeta};
+pub use kv_cache_attention::{
+    decode_attention, decode_attention_workspace_bytes, kv_cache_attention, KvCacheAttentionArgs,
+    KvCacheDecodeMeta,
+};
 pub use segmented_attention::{segmented_attention, SegmentedAttentionArgs};
 
 #[cfg(test)]

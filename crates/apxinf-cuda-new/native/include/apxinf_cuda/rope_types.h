@@ -5,7 +5,7 @@
 /* Shares the dtype enum and status codes with the gemm family. */
 #include "gemm_types.h"
 
-/* Packed-QKV split family.
+/* RoPE / packed-QKV split family.
  *
  *   SPLIT_QKV_ROPE  qkv [tokens, q_heads*head_dim + 2*kv_heads*head_dim]
  *                   -> q [tokens, q_heads, head_dim]
@@ -29,9 +29,13 @@ typedef enum {
      into the token-major cache, and V is appended to its cache. The current
      position is read from bindings.position at enqueue/replay time. */
   APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE = 2,
+  /* Packed BF16 QKV split with two-axis H/W rotary positions. */
+  APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL = 3,
+  /* In-place partial interleaved temporal/height/width rotary embedding. */
+  APXINF_ROPE_SEMANTIC_PARTIAL_MROPE = 4,
 } apxinf_rope_semantic_t;
 
-#define APXINF_ROPE_SPEC_VERSION 2u
+#define APXINF_ROPE_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;
@@ -42,6 +46,11 @@ typedef struct {
   uint32_t q_heads;
   uint32_t kv_heads;
   uint32_t head_dim;
+  /* Multimodal geometry, expressed in scalar dimensions/pairs. */
+  uint32_t rotary_dim;
+  uint32_t section_t;
+  uint32_t section_h;
+  uint32_t section_w;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */
   uint32_t qkv_alignment;
   uint32_t bias_alignment;
@@ -55,6 +64,7 @@ typedef struct {
 typedef struct {
   const void* qkv;
   const void* bias;
+  /* Q output, or the in-place activation for PARTIAL_MROPE. */
   void* q;
   void* k;
   void* v;

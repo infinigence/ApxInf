@@ -128,4 +128,99 @@ __global__ void split_qkv_bias(const T* qkv, const T* bias, T* q, T* k, T* v,
   }
 }
 
+// Packed BF16 QKV split with height/width axial rotary positions.
+__global__ void split_qkv_axial_rope(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* bias,
+    const uint32_t* positions, __nv_bfloat16* query, __nv_bfloat16* key,
+    __nv_bfloat16* value, int tokens, int heads, int head_dim, float theta) {
+  const int token = blockIdx.x;
+  const int half = head_dim / 2;
+  const int projection_width = heads * head_dim;
+  const int fused_width = 3 * projection_width;
+  const int pairs_per_projection = heads * half;
+
+  extern __shared__ float rope[];
+  const int quarter = half / 2;
+  float* sine = rope;
+  float* cosine = rope + 2 * quarter;
+  for (int slot = threadIdx.x; slot < 2 * quarter; slot += blockDim.x) {
+    const int axis = slot / quarter;
+    const int pair = slot - axis * quarter;
+    const float position = static_cast<float>(positions[token * 2 + axis]);
+    const float frequency =
+        powf(theta, -2.0f * static_cast<float>(pair) / half);
+    sincosf(position * frequency, &sine[slot], &cosine[slot]);
+  }
+  __syncthreads();
+
+  for (int work = threadIdx.x; work < 2 * pairs_per_projection;
+       work += blockDim.x) {
+    const bool is_key = work >= pairs_per_projection;
+    const int local = is_key ? work - pairs_per_projection : work;
+    const int head = local / half;
+    const int pair = local - head * half;
+    const int projection_offset = is_key ? projection_width : 0;
+    const int source = token * fused_width + projection_offset + head * head_dim;
+    const int bias_base = projection_offset + head * head_dim;
+    float first = __bfloat162float(qkv[source + pair]);
+    float second = __bfloat162float(qkv[source + half + pair]);
+    if (bias != nullptr) {
+      first += __bfloat162float(bias[bias_base + pair]);
+      second += __bfloat162float(bias[bias_base + half + pair]);
+    }
+    first = __bfloat162float(__float2bfloat16(first));
+    second = __bfloat162float(__float2bfloat16(second));
+    const int axis = pair < quarter ? 0 : 1;
+    const int slot = axis * quarter + (pair < quarter ? pair : pair - quarter);
+    __nv_bfloat16* destination =
+        (is_key ? key : query) + (token * heads + head) * head_dim;
+    destination[pair] =
+        __float2bfloat16(first * cosine[slot] - second * sine[slot]);
+    destination[half + pair] =
+        __float2bfloat16(first * sine[slot] + second * cosine[slot]);
+  }
+
+  for (int column = threadIdx.x; column < projection_width;
+       column += blockDim.x) {
+    const int source = token * fused_width + 2 * projection_width + column;
+    float result = __bfloat162float(qkv[source]);
+    if (bias != nullptr) {
+      result += __bfloat162float(bias[2 * projection_width + column]);
+    }
+    value[token * projection_width + column] = __float2bfloat16(result);
+  }
+}
+
+__device__ __forceinline__ int multimodal_axis(int pair, int section_h,
+                                                int section_w) {
+  const int remainder = pair % 3;
+  if (remainder == 1 && pair < section_h * 3) return 1;
+  if (remainder == 2 && pair < section_w * 3) return 2;
+  return 0;
+}
+
+__global__ void partial_multimodal_rope(
+    __nv_bfloat16* data, const uint32_t* positions, int tokens, int heads,
+    int head_dim, int rotary_dim, int section_h, int section_w, float theta) {
+  const int token = blockIdx.x;
+  const int head = blockIdx.y;
+  if (token >= tokens || head >= heads) return;
+  const int half = rotary_dim / 2;
+  const int64_t base = (static_cast<int64_t>(token) * heads + head) * head_dim;
+  for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    const int axis = multimodal_axis(pair, section_h, section_w);
+    const float position = static_cast<float>(positions[token * 3 + axis]);
+    const float frequency =
+        __powf(theta, -2.0f * static_cast<float>(pair) / rotary_dim);
+    float sine;
+    float cosine;
+    __sincosf(position * frequency, &sine, &cosine);
+    const float low = __bfloat162float(data[base + pair]);
+    const float high = __bfloat162float(data[base + half + pair]);
+    data[base + pair] = __float2bfloat16(low * cosine - high * sine);
+    data[base + half + pair] =
+        __float2bfloat16(high * cosine + low * sine);
+  }
+}
+
 }  // namespace apxinf::rope::kernels

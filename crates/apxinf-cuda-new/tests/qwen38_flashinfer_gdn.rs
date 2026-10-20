@@ -184,7 +184,7 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
 
         // --- FlashInfer, reached the way the model reaches it.
         //
-        // The conversion runs on the device through gdn_prepare_flashinfer,
+        // The conversion runs on the device through gdn_prepare_prefill,
         // not on the host. An earlier version of this test normalized and
         // narrowed here instead, which exercised the vendored kernel while
         // leaving our own preparation pass entirely uncovered -- and that is
@@ -221,7 +221,7 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
         let v_h = zeros(&ctx, vec![seq, V_HEADS, HEAD_DIM], DType::F16);
         let g_fi = zeros(&ctx, vec![seq, V_HEADS], DType::F32);
         let g_log = upload(&ctx, &f32_bytes(&g), vec![seq, V_HEADS], DType::F32);
-        ops::gdn_prepare_flashinfer(
+        ops::gdn_prepare_prefill(
             &ctx, &fused, &q_h, &k_h, &v_h, &g_log, &g_fi, seq, row_width,
             Q_HEADS, V_HEADS, HEAD_DIM, 1e-6,
         )
@@ -235,11 +235,11 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
             vec![2],
             DType::I32,
         );
-        let workspace_bytes = ops::flashinfer_gdn_workspace_bytes(V_HEADS, 1);
+        let workspace_bytes = ops::gdn_prefill_workspace_bytes(V_HEADS, 1);
         assert!(workspace_bytes > 0, "workspace query returned 0");
         let workspace = zeros(&ctx, vec![workspace_bytes / 4], DType::F32);
 
-        ops::flashinfer_gdn_prefill(
+        ops::gdn_prefill(
             &ctx, &q_h, &k_h, &v_h, &out_fi, &g_fi, &beta_fi, &cu, &state_fi,
             &workspace, seq, Q_HEADS, V_HEADS, 1, scale,
         )

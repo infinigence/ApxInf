@@ -74,7 +74,6 @@ pub fn nvfp4_pack_block_scales(
         ))
     }
 }
-
 /// Which layout a quantizer should write its block scales in.
 ///
 /// The block-scaled GEMM reads a tcgen05 atom layout; the GEMV indexes a
@@ -267,6 +266,98 @@ pub fn nvfp4_quantize_swiglu(
             block_size,
             input_scale,
             layout.flag(),
+            ctx.stream().handle(),
+        ))
+    }
+}
+
+/// Shape-specialized NVFP4 dense projection with fused SwiGLU and NVFP4
+/// requantization. This entry point is available only when the matching CuTe
+/// DSL AOT object was supplied at build time.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_dense_swiglu_aot(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    activation_scales: &Tensor,
+    weight: &Tensor,
+    weight_scales: &Tensor,
+    output: &Tensor,
+    output_scales: &Tensor,
+    alpha: &Tensor,
+    input_global_scale: &Tensor,
+    down_inverse_global_scale: &Tensor,
+    tile_groups: &Tensor,
+    tile_limits: &Tensor,
+    token_map: &Tensor,
+    tile_count: &Tensor,
+) -> Result<()> {
+    let activation_dims = activation.shape().dims().to_vec();
+    if activation_dims.len() != 2 {
+        return Err(invalid("fused NVFP4 SwiGLU activation must be rank 2"));
+    }
+    let rows = activation_dims[0];
+    let k = activation_dims[1] * 2;
+    let weight_dims = weight.shape().dims().to_vec();
+    if weight_dims.len() != 2 || weight_dims[1] * 2 != k || weight_dims[0] % 2 != 0 {
+        return Err(invalid("fused NVFP4 SwiGLU weight must be [2*n, k/2]"));
+    }
+    let n = weight_dims[0] / 2;
+    let output_dims = output.shape().dims().to_vec();
+    if output_dims != [rows, n / 2] {
+        return Err(invalid("fused NVFP4 SwiGLU output must be [rows, n/2]"));
+    }
+
+    let activation_buffer = tensor_storage(ctx, activation, DType::E2M1Pair, &activation_dims)?;
+    let weight_buffer = tensor_storage(ctx, weight, DType::E2M1Pair, &weight_dims)?;
+    let output_buffer = tensor_storage(ctx, output, DType::E2M1Pair, &output_dims)?;
+    let activation_scale_dims = activation_scales.shape().dims().to_vec();
+    let activation_scale_buffer = tensor_storage(
+        ctx,
+        activation_scales,
+        DType::F8E4M3,
+        &activation_scale_dims,
+    )?;
+    let weight_scale_dims = weight_scales.shape().dims().to_vec();
+    let weight_scale_buffer =
+        tensor_storage(ctx, weight_scales, DType::F8E4M3, &weight_scale_dims)?;
+    let output_scale_dims = output_scales.shape().dims().to_vec();
+    let output_scale_buffer =
+        tensor_storage(ctx, output_scales, DType::F8E4M3, &output_scale_dims)?;
+    if activation_scale_buffer.len() < rows * k / 16
+        || weight_scale_buffer.len() < nvfp4_scale_buffer_bytes(2 * n, k, 16)?
+        || output_scale_buffer.len() < nvfp4_scale_buffer_bytes(rows, n, 16)?
+    {
+        return Err(invalid("fused NVFP4 SwiGLU scale buffer is too small"));
+    }
+
+    let scalar = |tensor: &Tensor| tensor_storage(ctx, tensor, DType::F32, &[1]);
+    let alpha_buffer = scalar(alpha)?;
+    let input_scale_buffer = scalar(input_global_scale)?;
+    let down_scale_buffer = scalar(down_inverse_global_scale)?;
+    let tiles = rows.div_ceil(128);
+    let group_buffer = tensor_storage(ctx, tile_groups, DType::I32, &[tiles])?;
+    let limit_buffer = tensor_storage(ctx, tile_limits, DType::I32, &[tiles])?;
+    let map_buffer = tensor_storage(ctx, token_map, DType::I32, &[rows])?;
+    let count_buffer = tensor_storage(ctx, tile_count, DType::I32, &[1])?;
+
+    unsafe {
+        status::check(abi::apxinf_gemm_nvfp4_dense_swiglu_aot(
+            activation_buffer.ptr(),
+            weight_buffer.ptr(),
+            activation_scale_buffer.ptr(),
+            weight_scale_buffer.ptr(),
+            output_buffer.ptr(),
+            output_scale_buffer.ptr(),
+            alpha_buffer.ptr(),
+            input_scale_buffer.ptr(),
+            down_scale_buffer.ptr(),
+            group_buffer.ptr(),
+            limit_buffer.ptr(),
+            map_buffer.ptr(),
+            count_buffer.ptr(),
+            rows as i64,
+            n as i64,
+            k as i64,
             ctx.stream().handle(),
         ))
     }

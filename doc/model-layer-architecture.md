@@ -32,11 +32,16 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda
+apxinf-core / apxinf-cuda / apxinf-mlx
   tensors, devices, model-neutral operators, kernel APIs
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
+The [MLX backend contract](mlx-backend.md) applies these owners to Apple Silicon.
+Its native arrays, opaque storage and family-selected compiled execution are
+implemented. The selection table defines each family's supported geometry,
+precision and compilation scopes; a compiled callable alone does not establish
+hardware or workload acceptance.
 
 Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
 private `src/ffi/` declarations. The C/C++ boundary in
@@ -49,6 +54,17 @@ model-layer interfaces.
 
 `LlmTrait` is the shared autoregressive LLM/VLM process. A VLM extends prefill
 semantics but continues through the common categorical generation pipeline.
+`forward(token_ids, start_pos)` returns full `[seq_len, vocab_size]` logits.
+Generation-oriented `prefill(LlmInput)` may consume every prompt position and
+return its final `[1, vocab_size]` row. The common sampler selects the last row
+through `NextTokenLogits::last`; specialized schedules such as DSpark override
+the request-level generation hook without weakening `forward`.
+
+`LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
+state, selected implementation/variant, prepared compilation scopes and shape
+profiles, capacity and retained error. Only successful preparation reports
+`Ready`; legacy `RuntimeManaged` proves no readiness. This text contract is
+independent of VLA `PreparationStatus` and owns no executable resources.
 
 `VlaRuntime` is the observation-to-action process. It owns continuous action
 generation, stochastic inputs, schedules, and prepared inference contracts that
@@ -80,6 +96,7 @@ not a port requirement.
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
 | `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
+| `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
 `ModelVariantChoice` is a configuration choice; `ModelVariant` is a loaded private
@@ -123,6 +140,8 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -131,14 +150,24 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader currently accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names. Supporting it for a new family requires updating that admission check
+The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
+names, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
+parses its variants locally; the common loader does not infer quantization from
+a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
 and implementing family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
 extend a shared option only for a demonstrated contract, not by copying
 `Pi05Config` or adding unrelated fields to it.
+
+Metal model composition is performance-first and independent of the provisional
+cross-backend design. With the `mlx` feature, Metal selection resolves `metal_qwen3` or `metal_minicpm5`.
+Qwen3 checkpoint detection uses `model_type=qwen3`; MiniCPM5 requires explicit
+family selection because its official metadata says `llama`. Unsupported
+families fail instead of silently moving work to CPU. See the
+[implemented MLX selection table](mlx-backend.md#implemented-text-selections)
+for profiles, compilation scopes and CLI options.
 
 See [Adding a New Model](adding-a-new-model.md#registration-and-public-integration)
 for the exact integration sequence and

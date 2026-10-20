@@ -101,6 +101,25 @@ unsafe extern "C" {
         row_major_scales: i32,
         stream: CudaStream,
     ) -> i32;
+    pub(crate) fn apxinf_gemm_nvfp4_dense_swiglu_aot(
+        activation: *const c_void,
+        weight: *const c_void,
+        activation_scales: *const c_void,
+        weight_scales: *const c_void,
+        output: *mut c_void,
+        output_scales: *mut c_void,
+        alpha: *const c_void,
+        input_global_scale: *const c_void,
+        down_inverse_global_scale: *const c_void,
+        tile_groups: *const c_void,
+        tile_limits: *const c_void,
+        token_map: *const c_void,
+        tile_count: *const c_void,
+        rows: i64,
+        n: i64,
+        k: i64,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_gemm_nvfp4_quantize_activation(
         source_bf16: *const c_void,
         destination_packed: *mut c_void,

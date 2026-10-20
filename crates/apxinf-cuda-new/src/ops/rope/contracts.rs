@@ -73,7 +73,7 @@ fn alignment_of(pointer: usize) -> u32 {
 /// Validates device and dtype and returns the buffer. Unlike the other
 /// families the element count is only a lower bound, because K and V may be
 /// slices of a larger cache.
-fn tensor_storage(
+pub(crate) fn tensor_storage(
     ctx: &CudaContext,
     tensor: &Tensor,
     dtype: DType,
@@ -211,6 +211,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
             .map_err(|_| invalid("RoPE KV head count exceeds the ABI range"))?,
         head_dim: u32::try_from(args.head_dim)
             .map_err(|_| invalid("RoPE head dimension exceeds the ABI range"))?,
+        rotary_dim: 0,
+        section_t: 0,
+        section_h: 0,
+        section_w: 0,
         qkv_alignment,
         bias_alignment,
         q_alignment,

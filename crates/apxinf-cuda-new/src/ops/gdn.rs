@@ -105,6 +105,61 @@ pub fn gdn_gated_norm(
     }
 }
 
+/// Qwen3.8's fixed-width gated RMSNorm and the following FP8 quantization.
+/// The BF16 output is retained so the fused path preserves the model boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_gated_norm_quantize(
+    ctx: &CudaContext,
+    input: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    output: &Tensor,
+    quantized: &Tensor,
+    epsilon: f32,
+    input_scale: f32,
+) -> Result<()> {
+    let dims = input.shape().dims().to_vec();
+    if dims.len() != 3 || dims[2] != 128 || dims[0] == 0 || dims[1] == 0 {
+        return Err(invalid(
+            "GDN norm quantization expects nonempty [tokens, heads, 128]",
+        ));
+    }
+    let rows = dims[0]
+        .checked_mul(dims[1])
+        .filter(|value| *value <= i32::MAX as usize)
+        .ok_or_else(|| invalid("GDN norm quantization row extent overflows i32"))?;
+    if !epsilon.is_finite()
+        || epsilon <= 0.0
+        || !input_scale.is_finite()
+        || input_scale <= 0.0
+        || !(1.0 / input_scale).is_finite()
+        || !matches!(input.dtype(), DType::F16 | DType::BF16)
+    {
+        return Err(invalid(
+            "GDN norm quantization requires positive finite epsilon and scale",
+        ));
+    }
+    let input_buffer = tensor_storage(ctx, input, input.dtype(), &dims)?;
+    let gate_buffer = tensor_storage(ctx, gate, DType::BF16, &dims)?;
+    let weight_buffer = tensor_storage(ctx, weight, DType::BF16, &[128])?;
+    let output_buffer = tensor_storage(ctx, output, DType::BF16, &dims)?;
+    let quantized_buffer = tensor_storage(ctx, quantized, DType::F8E4M3, &dims)?;
+    unsafe {
+        status::check(abi::apxinf_gdn_gated_norm_quantize(
+            input_buffer.ptr(),
+            gate_buffer.ptr(),
+            weight_buffer.ptr(),
+            output_buffer.ptr(),
+            quantized_buffer.ptr(),
+            rows as i64,
+            i32::from(input.dtype() == DType::F16),
+            epsilon,
+            input_scale,
+            ctx.stream().handle(),
+        ))
+    }
+}
+
 /// Advance the causal convolution by one token, then apply SiLU.
 ///
 /// `window` is `[channels, kernel_width]` f32 holding the last
@@ -268,7 +323,7 @@ pub fn gdn_gated_norm_seq(
 }
 
 /// Sequence-axis `gdn_gated_norm` reading FP16 input, as the FlashInfer scan
-/// emits it. The FP16 load replicates `convert_f16_to_bf16`'s rounding, so
+/// emits it. The FP16 load replicates `gdn_widen_f16_to_bf16`'s rounding, so
 /// this equals running that conversion first -- without the extra pass over
 /// `tokens * heads * head_dim` elements each way.
 #[allow(clippy::too_many_arguments)]
@@ -532,7 +587,7 @@ pub fn gdn_chunk_scan_interleaved(
 /// place -- the same layout `gdn_recurrent_step` uses, so decode continues
 /// without conversion.
 #[allow(clippy::too_many_arguments)]
-pub fn flashinfer_gdn_prefill(
+pub fn gdn_prefill(
     ctx: &CudaContext,
     q: &Tensor,
     k: &Tensor,
@@ -572,7 +627,7 @@ pub fn flashinfer_gdn_prefill(
         tensor_storage(ctx, workspace, workspace.dtype(), &workspace_dims)?;
 
     unsafe {
-        status::check(abi::apxinf_flashinfer_gdn_prefill(
+        status::check(abi::apxinf_gdn_prefill(
             q_buffer.ptr(),
             k_buffer.ptr(),
             v_buffer.ptr(),
@@ -592,22 +647,22 @@ pub fn flashinfer_gdn_prefill(
     }
 }
 
-/// Scratch bytes `flashinfer_gdn_prefill` needs for its TMA rewrites.
-pub fn flashinfer_gdn_workspace_bytes(v_heads: usize, num_seqs: usize) -> usize {
+/// Scratch bytes `gdn_prefill` needs for its TMA rewrites.
+pub fn gdn_prefill_workspace_bytes(v_heads: usize, num_seqs: usize) -> usize {
     unsafe {
-        abi::apxinf_flashinfer_gdn_workspace_bytes(v_heads as i64, num_seqs as i64)
+        abi::apxinf_gdn_prefill_workspace_bytes(v_heads as i64, num_seqs as i64)
             .max(0) as usize
     }
 }
 
 /// One-pass conversion of a GDN projection into FlashInfer's input form.
 ///
-/// `flashinfer_gdn_prefill` wants q/k/v split into contiguous FP16 tensors
+/// `gdn_prefill` wants q/k/v split into contiguous FP16 tensors
 /// with q and k L2-normalized and q unscaled, plus a linear-space decay. Doing
 /// those as separate ops would reread the projection four times; at 2048
 /// tokens it is 40 MB, so the conversion would rival the kernel it feeds.
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_prepare_flashinfer(
+pub fn gdn_prepare_prefill(
     ctx: &CudaContext,
     fused: &Tensor,
     q_out: &Tensor,
@@ -632,7 +687,7 @@ pub fn gdn_prepare_flashinfer(
     let g_buffer = tensor_storage(ctx, g, DType::F32, &[tokens, v_heads])?;
     let alpha_buffer = tensor_storage(ctx, alpha, DType::F32, &[tokens, v_heads])?;
     unsafe {
-        status::check(abi::apxinf_gdn_prepare_flashinfer(
+        status::check(abi::apxinf_gdn_prepare_prefill(
             fused_buffer.ptr(),
             q_buffer.ptr(),
             k_buffer.ptr(),
@@ -651,7 +706,7 @@ pub fn gdn_prepare_flashinfer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_conv_prepare_flashinfer(
+pub fn gdn_conv_prepare(
     ctx: &CudaContext,
     input: &Tensor,
     weight: &Tensor,
@@ -683,7 +738,7 @@ pub fn gdn_conv_prepare_flashinfer(
     let decay_buffer = tensor_storage(ctx, decay, DType::F32, &[tokens, v_heads])?;
     let alpha_buffer = tensor_storage(ctx, alpha, DType::F32, &[tokens, v_heads])?;
     unsafe {
-        status::check(abi::apxinf_gdn_conv_prepare_flashinfer(
+        status::check(abi::apxinf_gdn_conv_prepare(
             input_buffer.ptr(), weight_buffer.ptr(), window_buffer.ptr(),
             q_buffer.ptr(), k_buffer.ptr(), v_buffer.ptr(), decay_buffer.ptr(),
             alpha_buffer.ptr(), tokens as i64, k_heads as i64, v_heads as i64,
@@ -697,7 +752,7 @@ pub fn gdn_conv_prepare_flashinfer(
 /// The FlashInfer scan emits FP16 because the head-generic variant our 48
 /// value heads force has no BF16 build; everything downstream of it here is
 /// BF16.
-pub fn convert_f16_to_bf16(
+pub fn gdn_widen_f16_to_bf16(
     ctx: &CudaContext,
     input: &Tensor,
     output: &Tensor,

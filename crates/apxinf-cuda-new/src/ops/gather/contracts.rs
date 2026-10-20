@@ -13,6 +13,8 @@ pub enum GatherSemantic {
     BiasPosition,
     /// RGB u8 images to flattened patches in `[-1, 1]`.
     RgbToPatches,
+    /// Replace selected matrix rows according to a u32 row map.
+    ReplaceRows,
 }
 
 impl GatherSemantic {
@@ -21,6 +23,7 @@ impl GatherSemantic {
             Self::EmbeddingLookup => 0,
             Self::BiasPosition => 1,
             Self::RgbToPatches => 2,
+            Self::ReplaceRows => 3,
         }
     }
 
@@ -52,6 +55,10 @@ pub struct GatherArgs<'a> {
     pub ids_address: Option<CudaDeviceAddress>,
     /// Packed u8 images for [`GatherSemantic::RgbToPatches`].
     pub images: Option<&'a CudaBuffer>,
+    /// Replacement matrix for [`GatherSemantic::ReplaceRows`].
+    pub replacement: Option<&'a Tensor>,
+    /// Per-output-row replacement index; `u32::MAX` keeps the input row.
+    pub row_map: Option<&'a CudaBuffer>,
     pub bias: Option<&'a Tensor>,
     /// Learned position embedding for [`GatherSemantic::BiasPosition`].
     pub position: Option<&'a Tensor>,
@@ -69,6 +76,8 @@ impl<'a> GatherArgs<'a> {
             ids: None,
             ids_address: None,
             images: None,
+            replacement: None,
+            row_map: None,
             bias: None,
             position: None,
             out,
@@ -89,6 +98,8 @@ impl<'a> GatherArgs<'a> {
             ids: None,
             ids_address: None,
             images: Some(images),
+            replacement: None,
+            row_map: None,
             bias: None,
             position: None,
             out,
@@ -183,7 +194,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     }
     match semantic {
         GatherSemantic::EmbeddingLookup => {
-            if args.images.is_some() || args.position.is_some() || args.patches.is_some() {
+            if args.images.is_some()
+                || args.replacement.is_some()
+                || args.row_map.is_some()
+                || args.position.is_some()
+                || args.patches.is_some()
+            {
                 return Err(invalid("embedding lookup received unrelated bindings"));
             }
         }
@@ -191,6 +207,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
             if args.ids.is_some()
                 || args.ids_address.is_some()
                 || args.images.is_some()
+                || args.replacement.is_some()
+                || args.row_map.is_some()
                 || args.patches.is_some()
             {
                 return Err(invalid("bias-position received unrelated bindings"));
@@ -201,9 +219,22 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
                 || args.ids.is_some()
                 || args.ids_address.is_some()
                 || args.bias.is_some()
+                || args.replacement.is_some()
+                || args.row_map.is_some()
                 || args.position.is_some()
             {
                 return Err(invalid("RGB-to-patches received unrelated bindings"));
+            }
+        }
+        GatherSemantic::ReplaceRows => {
+            if args.ids.is_some()
+                || args.ids_address.is_some()
+                || args.images.is_some()
+                || args.bias.is_some()
+                || args.position.is_some()
+                || args.patches.is_some()
+            {
+                return Err(invalid("row replacement received unrelated bindings"));
             }
         }
     }
@@ -275,6 +306,13 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
             }
             images.clone()
         }
+        GatherSemantic::ReplaceRows => typed_buffer(
+            ctx,
+            args.input
+                .ok_or_else(|| invalid("row replacement requires an input"))?,
+            dtype,
+            count,
+        )?,
     };
     let input = input_buffer.ptr() as *const std::ffi::c_void;
     let input_alignment = alignment_of(input_buffer.ptr() as usize);
@@ -353,6 +391,47 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
         None => std::ptr::null(),
     };
 
+    let (replacement, replacement_rows) = match args.replacement {
+        Some(tensor) if matches!(semantic, GatherSemantic::ReplaceRows) => {
+            let dims = tensor.shape().dims();
+            if dims.len() != 2 || dims[0] == 0 || dims[1] != cols {
+                return Err(invalid("replacement must be non-empty [rows, cols]"));
+            }
+            let elements = dims[0]
+                .checked_mul(cols)
+                .ok_or_else(|| invalid("Gather replacement size overflow"))?;
+            let buffer = typed_buffer(ctx, tensor, dtype, elements)?;
+            let pointer = buffer.ptr() as *const std::ffi::c_void;
+            storage.push(buffer);
+            (pointer, dims[0])
+        }
+        Some(_) => return Err(invalid("Gather semantic does not take replacement rows")),
+        None if matches!(semantic, GatherSemantic::ReplaceRows) => {
+            return Err(invalid("row replacement requires replacement rows"))
+        }
+        None => (std::ptr::null(), 0),
+    };
+
+    let row_map = match args.row_map {
+        Some(buffer) if matches!(semantic, GatherSemantic::ReplaceRows) => {
+            let required = rows
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| invalid("Gather row-map size overflow"))?;
+            if buffer.device() != ctx.device_id() || buffer.len() < required {
+                return Err(invalid("Gather row-map buffer device/size mismatch"));
+            }
+            let buffer = buffer.clone();
+            let pointer = buffer.ptr() as *const u32;
+            storage.push(buffer);
+            pointer
+        }
+        Some(_) => return Err(invalid("Gather semantic does not take a row map")),
+        None if matches!(semantic, GatherSemantic::ReplaceRows) => {
+            return Err(invalid("row replacement requires a row map"))
+        }
+        None => std::ptr::null(),
+    };
+
     let output_buffer = typed_buffer(ctx, args.out, dtype, count)?;
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
@@ -376,6 +455,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
         } else {
             0
         },
+        replacement_rows: u32::try_from(replacement_rows)
+            .map_err(|_| invalid("Gather replacement row count exceeds the ABI range"))?,
         tokens_per_view: u32::try_from(tokens_per_view)
             .map_err(|_| invalid("Gather tokens-per-view exceeds the ABI range"))?,
         views: u32::try_from(geometry.views)
@@ -395,6 +476,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     let bindings = abi::Bindings {
         input,
         ids,
+        replacement,
+        row_map,
         bias,
         position,
         output,

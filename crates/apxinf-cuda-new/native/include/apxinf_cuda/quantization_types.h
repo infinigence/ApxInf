@@ -12,6 +12,8 @@
  *                  [rows, output_cols] plus F32 scales [rows].  Columns in
  *                  [input_cols, output_cols) are exactly zero.
  * CAST_F16_BF16    F16 input -> BF16 output, same shape.
+ * CAST_BF16_F32    BF16 input -> F32 output, same shape.
+ * CAST_F32_BF16    F32 input -> BF16 output, same shape.
  * SLICE_BF16       leading columns of a contiguous BF16 matrix.
  * ROWWISE_I8       BF16 input -> I8 output plus F32 scales [rows].
  */
@@ -21,6 +23,8 @@ typedef enum {
   APXINF_QUANTIZATION_SEMANTIC_CAST_F16_BF16 = 2,
   APXINF_QUANTIZATION_SEMANTIC_SLICE_BF16 = 3,
   APXINF_QUANTIZATION_SEMANTIC_ROWWISE_I8 = 4,
+  APXINF_QUANTIZATION_SEMANTIC_CAST_BF16_F32 = 5,
+  APXINF_QUANTIZATION_SEMANTIC_CAST_F32_BF16 = 6,
 } apxinf_quantization_semantic_t;
 
 #define APXINF_QUANTIZATION_SPEC_VERSION 1u

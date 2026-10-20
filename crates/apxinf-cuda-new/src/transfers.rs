@@ -48,6 +48,36 @@ pub fn copy_cpu_to_cuda(source: &Tensor, destination: &Tensor) -> Result<()> {
     copy_host_to_device(device_id, source, destination.ptr()).map_err(Error::Cuda)
 }
 
+/// Copy a shape-identical CUDA tensor into stable-address CUDA storage on the
+/// context stream. Source and destination must be on the same device.
+pub fn copy_cuda_to_cuda(
+    ctx: &crate::CudaContext,
+    source: &Tensor,
+    destination: &Tensor,
+) -> Result<()> {
+    if source.device() != destination.device()
+        || source.device() != Device::Cuda(ctx.device_id())
+        || source.shape() != destination.shape()
+        || source.dtype() != destination.dtype()
+    {
+        return Err(Error::Other(
+            "fixed CUDA copy requires matching device, shape and dtype".into(),
+        ));
+    }
+    let source = CudaBuffer::from_tensor(source).map_err(Error::Cuda)?;
+    let destination = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    unsafe {
+        ffi::check_cuda(ffi::cudaMemcpyAsync(
+            destination.ptr(),
+            source.ptr(),
+            source.len(),
+            ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)
+    }
+}
+
 /// Transfer a CUDA tensor back to CPU.
 pub fn to_cpu(tensor: &Tensor) -> Result<Tensor> {
     let handle = match tensor.storage() {

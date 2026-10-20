@@ -23,6 +23,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -148,8 +149,9 @@ __global__ void gated_norm_kernel(const __nv_bfloat16* __restrict__ input,
 
   const float scale = rsqrtf(total / static_cast<float>(head_dim) + epsilon);
   for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
-    const float normalized = __bfloat162float(input[base + index]) * scale *
-                             __bfloat162float(weight[index]);
+    const float norm_rounded = __bfloat162float(
+        __float2bfloat16(__bfloat162float(input[base + index]) * scale));
+    const float normalized = norm_rounded * __bfloat162float(weight[index]);
     const float z = __bfloat162float(gate[base + index]);
     output[base + index] = __float2bfloat16(normalized * z / (1.0f + __expf(-z)));
   }
@@ -422,11 +424,52 @@ __global__ void gated_norm_seq_kernel(const Input* __restrict__ input,
 
   const float scale = rsqrtf(total / static_cast<float>(head_dim) + epsilon);
   for (int index = lane; index < head_dim; index += 32) {
-    const float normalized = norm_input(input, base + index) * scale *
-                             __bfloat162float(weight[index]);
+    const float norm_rounded =
+        __bfloat162float(__float2bfloat16(norm_input(input, base + index) * scale));
+    const float normalized = norm_rounded * __bfloat162float(weight[index]);
     const float z = __bfloat162float(gate[base + index]);
     output[base + index] =
         __float2bfloat16(normalized * z / (1.0f + __expf(-z)));
+  }
+}
+
+// Fused fixed-head-dimension path used by Qwen3.8. It preserves the BF16
+// output boundary, then quantizes that rounded value for the following GEMV.
+template <typename Input>
+__global__ void gated_norm_quantize_kernel(
+    const Input* __restrict__ input,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output, uint8_t* __restrict__ quantized,
+    int rows, float epsilon, float inverse_scale) {
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * 4 + threadIdx.x / 32;
+  if (row >= rows) return;
+  const long long base = static_cast<long long>(row) * 128;
+  float values[4];
+  float total = 0.0f;
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const int column = lane + slot * 32;
+    values[slot] = norm_input(input, base + column);
+    total += values[slot] * values[slot];
+  }
+  for (int offset = 16; offset > 0; offset >>= 1)
+    total += __shfl_down_sync(0xffffffff, total, offset);
+  total = __shfl_sync(0xffffffff, total, 0);
+  const float scale = rsqrtf(total / 128.0f + epsilon);
+#pragma unroll
+  for (int slot = 0; slot < 4; ++slot) {
+    const int column = lane + slot * 32;
+    const float norm_rounded =
+        __bfloat162float(__float2bfloat16(values[slot] * scale));
+    const float normalized = norm_rounded * __bfloat162float(weight[column]);
+    const float z = __bfloat162float(gate[base + column]);
+    const __nv_bfloat16 rounded =
+        __float2bfloat16(normalized * z / (1.0f + __expf(-z)));
+    output[base + column] = rounded;
+    quantized[base + column] = __nv_cvt_float_to_fp8(
+        __bfloat162float(rounded) * inverse_scale, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
@@ -464,7 +507,7 @@ __global__ void widen_f16_to_bf16_kernel(const __half* __restrict__ input,
 // 1024 threads is the CUDA maximum, so 32 warps bounds the partials.
 constexpr int kMaxWarpsPerBlock = 32;
 
-__global__ void gdn_prepare_flashinfer_kernel(
+__global__ void gdn_prepare_prefill_kernel(
     const __nv_bfloat16* __restrict__ fused, __half* __restrict__ q_out,
     __half* __restrict__ k_out, __half* __restrict__ v_out,
     const float* __restrict__ g_in, float* __restrict__ alpha, int tokens,
@@ -532,7 +575,7 @@ __global__ void gdn_prepare_flashinfer_kernel(
   }
 }
 
-__global__ void gdn_prepare_flashinfer_preserved_warp_kernel(
+__global__ void gdn_prepare_prefill_preserved_warp_kernel(
     const __nv_bfloat16* __restrict__ fused, __half* __restrict__ q_out,
     __half* __restrict__ k_out, __half* __restrict__ v_out,
     const float* __restrict__ g_in, float* __restrict__ alpha, int tokens,
@@ -639,7 +682,7 @@ __global__ void conv_final_window_kernel(const __nv_bfloat16* input, float* wind
   window[index] = token < 0 ? 0.0f : __bfloat162float(input[(long long)token * channels + index / 4]);
 }
 
-__global__ void gdn_prepare_flashinfer_parallel_kernel(
+__global__ void gdn_prepare_prefill_parallel_kernel(
     const __nv_bfloat16* __restrict__ fused, __half* __restrict__ q_out,
     __half* __restrict__ k_out, __half* __restrict__ v_out,
     const float* __restrict__ g_in, float* __restrict__ alpha, int tokens,
@@ -680,7 +723,7 @@ __global__ void gdn_prepare_flashinfer_parallel_kernel(
   }
 }
 
-__global__ void gdn_prepare_flashinfer_warp_kernel(
+__global__ void gdn_prepare_prefill_warp_kernel(
     const __nv_bfloat16* __restrict__ fused, __half* __restrict__ q_out,
     __half* __restrict__ k_out, __half* __restrict__ v_out,
     const float* __restrict__ g_in, float* __restrict__ alpha, int tokens,
@@ -739,7 +782,7 @@ int gdn_widen_f16_to_bf16(const void* input, void* output, long long count,
   return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 
-int gdn_conv_prepare_flashinfer(const void* input, const void* weight,
+int gdn_conv_prepare(const void* input, const void* weight,
                                void* window, void* q_out, void* k_out,
                                void* v_out, const void* decay, void* alpha,
                                int tokens, int k_heads, int v_heads,
@@ -763,7 +806,7 @@ int gdn_conv_prepare_flashinfer(const void* input, const void* weight,
   return static_cast<int>(cudaGetLastError());
 }
 
-int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
+int gdn_prepare_prefill(const void* fused, void* q_out, void* k_out,
                            void* v_out, const void* g, void* alpha, int tokens,
                            int row_width, int k_heads, int v_heads, int dim,
                            float epsilon, cudaStream_t stream) {
@@ -774,7 +817,7 @@ int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
   if (2 * k_heads * dim + v_heads * dim > row_width) return -2;
   const char* parallel = std::getenv("APXINF_GDN_PREPARE_PARALLEL");
   if (parallel != nullptr && std::strcmp(parallel, "5") == 0 && dim == 128) {
-    gdn_prepare_flashinfer_preserved_warp_kernel<<<tokens, 256, 0, stream>>>(
+    gdn_prepare_prefill_preserved_warp_kernel<<<tokens, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(fused), static_cast<__half*>(q_out),
         static_cast<__half*>(k_out), static_cast<__half*>(v_out),
         static_cast<const float*>(g), static_cast<float*>(alpha), tokens,
@@ -783,7 +826,7 @@ int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
   }
   if (parallel != nullptr && std::strcmp(parallel, "2") == 0 &&
       dim == 128 && k_heads <= 16 && v_heads <= 48) {
-    gdn_prepare_flashinfer_warp_kernel<<<tokens, 256, 0, stream>>>(
+    gdn_prepare_prefill_warp_kernel<<<tokens, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(fused), static_cast<__half*>(q_out),
         static_cast<__half*>(k_out), static_cast<__half*>(v_out),
         static_cast<const float*>(g), static_cast<float*>(alpha), tokens,
@@ -792,7 +835,7 @@ int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
   }
   if (parallel != nullptr && std::strcmp(parallel, "1") == 0 && dim == 128 &&
       k_heads <= 16 && v_heads <= 48) {
-    gdn_prepare_flashinfer_parallel_kernel<<<tokens, 1024, 0, stream>>>(
+    gdn_prepare_prefill_parallel_kernel<<<tokens, 1024, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(fused), static_cast<__half*>(q_out),
         static_cast<__half*>(k_out), static_cast<__half*>(v_out),
         static_cast<const float*>(g), static_cast<float*>(alpha), tokens,
@@ -800,7 +843,7 @@ int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
     return cudaGetLastError() == cudaSuccess ? 0 : -3;
   }
   const int threads = dim >= 128 ? 128 : dim;
-  gdn_prepare_flashinfer_kernel<<<tokens, threads, 0, stream>>>(
+  gdn_prepare_prefill_kernel<<<tokens, threads, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(fused), static_cast<__half*>(q_out),
       static_cast<__half*>(k_out), static_cast<__half*>(v_out),
       static_cast<const float*>(g), static_cast<float*>(alpha), tokens,
@@ -882,6 +925,30 @@ int gdn_gated_norm_seq(const void* input, const void* gate, const void* weight,
       static_cast<const __nv_bfloat16*>(gate),
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<__nv_bfloat16*>(output), tokens, heads, head_dim, epsilon);
+  return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+int gdn_gated_norm_quantize(const void* input, const void* gate,
+                            const void* weight, void* output, void* quantized,
+                            int rows, bool fp16_input, float epsilon, float input_scale,
+                            cudaStream_t stream) {
+  if (rows <= 0 || !(epsilon > 0.0f) || !(input_scale > 0.0f)) return -1;
+  const int blocks = (rows + 3) / 4;
+  if (fp16_input) {
+    gated_norm_quantize_kernel<<<blocks, 128, 0, stream>>>(
+        static_cast<const __half*>(input),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(output),
+        static_cast<uint8_t*>(quantized), rows, epsilon, 1.0f / input_scale);
+  } else {
+    gated_norm_quantize_kernel<<<blocks, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_bfloat16*>(output),
+        static_cast<uint8_t*>(quantized), rows, epsilon, 1.0f / input_scale);
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 

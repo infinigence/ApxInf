@@ -149,6 +149,32 @@ mod tests {
     }
 
     #[test]
+    fn captured_async_zero_replays() {
+        let ctx = CudaContext::new(0).unwrap();
+        let buffer = crate::CudaBuffer::alloc(32, ctx.device_id()).unwrap();
+        let fill = |value| unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                buffer.ptr(),
+                value,
+                buffer.len(),
+                ctx.stream().handle(),
+            ))
+            .map_err(Error::Cuda)
+        };
+        fill(0x5a).unwrap();
+        let graph = capture(&ctx, || {
+            buffer.zero_async(ctx.stream()).map_err(Error::Cuda)
+        })
+        .unwrap();
+        fill(0x2a).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        let mut actual = [0xff; 32];
+        buffer.copy_to_host(&mut actual).unwrap();
+        assert_eq!(actual, [0; 32]);
+    }
+
+    #[test]
     fn failed_capture_preserves_operation_error_and_recovers() {
         let ctx = CudaContext::new(0).unwrap();
         let result = capture(&ctx, || ctx.synchronize().map_err(Error::Cuda));

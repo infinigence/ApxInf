@@ -92,6 +92,25 @@ impl CudaContext {
         self.stream.synchronize()
     }
 
+    /// Free and total device memory, in bytes.
+    ///
+    /// The counterpart to [`crate::GraphWorkspace::capacity`] for diagnostics
+    /// that have to account for the whole process: graph instantiation and the
+    /// native GEMM/Attention libraries allocate outside our arenas, so arena
+    /// capacities alone cannot show whether a change moved the footprint.
+    ///
+    /// On unified-memory parts (Tegra/Thor) these are system-memory figures,
+    /// not discrete VRAM. A caller should report the delta across the
+    /// allocation it is measuring, not the absolute numbers.
+    pub fn memory_info(&self) -> Result<(usize, usize), String> {
+        self.stream.with_current_device(|| {
+            let mut free = 0usize;
+            let mut total = 0usize;
+            unsafe { ffi::check_cuda(ffi::cudaMemGetInfo(&mut free, &mut total))? };
+            Ok((free, total))
+        })
+    }
+
     /// Allocate caller-owned output storage for an L3 semantic operation.
     ///
     /// Inside an [`crate::ExecutionSession`] this sub-allocates from the

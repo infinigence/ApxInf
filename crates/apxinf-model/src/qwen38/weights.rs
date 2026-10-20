@@ -25,6 +25,10 @@ fn scalar(tensors: &HashMap<String, Tensor>, name: &str) -> f32 {
     tensors[name].to_f32_vec().unwrap()[0]
 }
 
+fn device_f32(ctx: &CudaContext, value: f32) -> Tensor {
+    upload(ctx, &value.to_le_bytes(), vec![1], DType::F32)
+}
+
 /// An NVFP4 weight with its relaid-out scales and the alpha folding both
 /// per-tensor scales.
 pub(crate) struct Nvfp4Weight {
@@ -32,6 +36,15 @@ pub(crate) struct Nvfp4Weight {
     pub(crate) scales: Tensor,
     pub(crate) input_scale: f32,
     pub(crate) alpha: f32,
+    pub(crate) fused_fc1: Option<FusedFc1Weight>,
+}
+
+pub(crate) struct FusedFc1Weight {
+    pub(crate) packed: Tensor,
+    pub(crate) scales: Tensor,
+    pub(crate) alpha: Tensor,
+    pub(crate) input_global_scale: Tensor,
+    pub(crate) down_inverse_global_scale: Tensor,
 }
 
 fn relayout(ctx: &CudaContext, source: &Tensor, rows: usize, k: usize) -> Tensor {
@@ -67,6 +80,7 @@ fn load_nvfp4(
         scales: relayout(ctx, &checkpoint_scales, n, k),
         input_scale,
         alpha: input_scale * weight_scale_2,
+        fused_fc1: None,
     }
 }
 
@@ -111,11 +125,75 @@ fn load_fused_gate_up(
         DType::F8E4M3,
     );
 
+    // Shape- and capability-driven, not env-gated: the interleaved copy exists
+    // only for the AOT-exported FC1 kernel, which is linked into the build or
+    // not. Building it unconditionally would waste host time and device memory
+    // on builds where the op is a stub. The shape check lives at the call site
+    // (`nvfp4_mlp_rows`); here the checkpoint always supplies the tensors.
+    let fused_fc1 = apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT.then(|| {
+        let gate_weight = cpu_bytes(&tensors[&format!("{prefix}.gate_proj.weight")]);
+        let up_weight = cpu_bytes(&tensors[&format!("{prefix}.up_proj.weight")]);
+        let bytes_per_row = HIDDEN / 2;
+        let mut interleaved_weight = vec![0u8; 2 * INTERMEDIATE * bytes_per_row];
+        for target_row in 0..2 * INTERMEDIATE {
+            let group_row = target_row % 128;
+            let source_row = target_row / 128 * 64 + group_row % 64;
+            let source = if group_row < 64 {
+                up_weight
+            } else {
+                gate_weight
+            };
+            let from = source_row * bytes_per_row;
+            let to = target_row * bytes_per_row;
+            interleaved_weight[to..to + bytes_per_row]
+                .copy_from_slice(&source[from..from + bytes_per_row]);
+        }
+
+        let gate_scales = cpu_bytes(&tensors[&format!("{prefix}.gate_proj.weight_scale")]);
+        let up_scales = cpu_bytes(&tensors[&format!("{prefix}.up_proj.weight_scale")]);
+        let scales_per_row = HIDDEN / BLOCK as usize;
+        let mut interleaved_scales = vec![0u8; 2 * INTERMEDIATE * scales_per_row];
+        for target_row in 0..2 * INTERMEDIATE {
+            let group_row = target_row % 128;
+            let source_row = target_row / 128 * 64 + group_row % 64;
+            let source = if group_row < 64 {
+                up_scales
+            } else {
+                gate_scales
+            };
+            let from = source_row * scales_per_row;
+            let to = target_row * scales_per_row;
+            interleaved_scales[to..to + scales_per_row]
+                .copy_from_slice(&source[from..from + scales_per_row]);
+        }
+        let packed = upload(
+            ctx,
+            &interleaved_weight,
+            vec![2 * INTERMEDIATE, HIDDEN / 2],
+            DType::E2M1Pair,
+        );
+        let checkpoint_scales = upload(
+            ctx,
+            &interleaved_scales,
+            vec![2 * INTERMEDIATE, scales_per_row],
+            DType::F8E4M3,
+        );
+        let down_input_scale = scalar(tensors, &format!("{prefix}.down_proj.input_scale"));
+        FusedFc1Weight {
+            packed,
+            scales: relayout(ctx, &checkpoint_scales, 2 * INTERMEDIATE, HIDDEN),
+            alpha: device_f32(ctx, input_scale * weight_scale_2),
+            input_global_scale: device_f32(ctx, 1.0),
+            down_inverse_global_scale: device_f32(ctx, 1.0 / down_input_scale),
+        }
+    });
+
     Nvfp4Weight {
         packed,
         scales: relayout(ctx, &checkpoint_scales, 2 * INTERMEDIATE, HIDDEN),
         input_scale,
         alpha: input_scale * weight_scale_2,
+        fused_fc1,
     }
 }
 
@@ -216,6 +294,36 @@ fn load_bf16_transposed(
     upload(ctx, &transposed, vec![cols, rows], DType::BF16)
 }
 
+/// Merge two `[rows, cols]` BF16 projections while transposing them into the
+/// GEMM `[K, 2N]` layout. Decode can then produce both outputs with one launch.
+fn load_bf16_transposed_pair(
+    ctx: &CudaContext,
+    tensors: &HashMap<String, Tensor>,
+    first_name: &str,
+    second_name: &str,
+    rows: usize,
+    cols: usize,
+) -> Tensor {
+    let element = DType::BF16.size_in_bytes();
+    let first = cpu_bytes(&tensors[first_name]);
+    let second = cpu_bytes(&tensors[second_name]);
+    assert_eq!(first.len(), rows * cols * element, "invalid {first_name} shape");
+    assert_eq!(second.len(), rows * cols * element, "invalid {second_name} shape");
+    let mut transposed = vec![0u8; first.len() + second.len()];
+    for column in 0..cols {
+        for row in 0..rows {
+            let source = (row * cols + column) * element;
+            let first_destination = (column * 2 * rows + row) * element;
+            let second_destination = (column * 2 * rows + rows + row) * element;
+            transposed[first_destination..first_destination + element]
+                .copy_from_slice(&first[source..source + element]);
+            transposed[second_destination..second_destination + element]
+                .copy_from_slice(&second[source..source + element]);
+        }
+    }
+    upload(ctx, &transposed, vec![cols, 2 * rows], DType::BF16)
+}
+
 pub(crate) struct AttentionLayer {
     pub(crate) input_norm: Tensor,
     pub(crate) post_norm: Tensor,
@@ -237,6 +345,7 @@ pub(crate) struct GdnLayer {
     pub(crate) out: Fp8Weight,
     pub(crate) in_proj_a: Tensor,
     pub(crate) in_proj_b: Tensor,
+    pub(crate) in_proj_ab: Tensor,
     pub(crate) a_log: Tensor,
     pub(crate) dt_bias: Tensor,
     pub(crate) conv_weight: Tensor,
@@ -308,6 +417,14 @@ pub(crate) fn load_model(
                 // which requires b = [K, N].
                 in_proj_a: load_bf16_transposed(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), GDN_V_HEADS, HIDDEN),
                 in_proj_b: load_bf16_transposed(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), GDN_V_HEADS, HIDDEN),
+                in_proj_ab: load_bf16_transposed_pair(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                    &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    GDN_V_HEADS,
+                    HIDDEN,
+                ),
                 a_log: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.A_log"), vec![GDN_V_HEADS]),
                 dt_bias: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![GDN_V_HEADS]),
                 conv_weight: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![QKV_WIDTH, CONV_WIDTH]),

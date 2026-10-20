@@ -24,11 +24,12 @@ bool may_have_bias(uint32_t semantic) {
 
 void validate_spec(const apxinf_gather_spec_t& spec) {
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_REPLACE_ROWS ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.has_bias > 1 || spec.nhwc > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
       spec.vocab_size > INT32_MAX || spec.tokens_per_view > INT32_MAX ||
+      spec.replacement_rows > INT32_MAX ||
       spec.views > INT32_MAX || spec.image_size > INT32_MAX ||
       spec.patch_size > INT32_MAX || !valid_alignment(spec.input_alignment) ||
       !valid_alignment(spec.bias_alignment) ||
@@ -66,6 +67,18 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
                     "RGB-to-patches shape disagrees with the geometry");
     }
   }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_REPLACE_ROWS &&
+      (spec.replacement_rows == 0 || spec.vocab_size != 0 ||
+       spec.tokens_per_view != 0 || spec.views != 0 ||
+       spec.image_size != 0 || spec.patch_size != 0 || spec.nhwc != 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid row replacement Gather Spec");
+  }
+  if (spec.semantic != APXINF_GATHER_SEMANTIC_REPLACE_ROWS &&
+      spec.replacement_rows != 0) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "Gather semantic does not take replacement rows");
+  }
 }
 
 void validate_bindings(const apxinf_gather_spec_t& spec,
@@ -82,6 +95,22 @@ void validate_bindings(const apxinf_gather_spec_t& spec,
       bindings.position == nullptr) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "bias-position requires a position embedding");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_REPLACE_ROWS &&
+      (bindings.replacement == nullptr || bindings.row_map == nullptr)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "row replacement requires replacement and row map");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_REPLACE_ROWS &&
+      (bindings.ids != nullptr || bindings.bias != nullptr ||
+       bindings.position != nullptr)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "row replacement received unrelated bindings");
+  }
+  if (spec.semantic != APXINF_GATHER_SEMANTIC_REPLACE_ROWS &&
+      (bindings.replacement != nullptr || bindings.row_map != nullptr)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "Gather semantic does not take row replacement bindings");
   }
   if ((spec.has_bias != 0) != (bindings.bias != nullptr)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -134,6 +163,11 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
       }
       break;
     }
+    case APXINF_GATHER_SEMANTIC_REPLACE_ROWS:
+      kernels::replace_rows<T><<<grid, kThreads, 0, stream>>>(
+          input, static_cast<const T*>(bindings.replacement), bindings.row_map,
+          output, count, cols, spec.replacement_rows);
+      break;
     default:
       return cudaErrorInvalidValue;
   }

@@ -38,12 +38,12 @@ use numpy::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config,
-    SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation,
+    Pi05Config, SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -122,7 +122,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -131,9 +131,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     };
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
+        "hip" => Ok(Device::Hip(index)),
+        "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
         ))),
     }
 }
@@ -181,7 +183,7 @@ fn load_config(checkpoint: &Path) -> PyResult<Pi05Config> {
 /// Python binding for a loaded VLA runner. Holds the runtime and its contract,
 /// adapts NumPy inputs/outputs, and supplies default sampling keys.
 ///
-/// The pi05 runtime uses `Rc`/`RefCell` internally and is therefore not `Send`;
+/// The pi05 and MLX runtimes may own thread-bound `Rc`/`RefCell` resources;
 /// the handle is `unsendable` and must be used from the thread that created it.
 #[pyclass(unsendable)]
 pub struct ModelRunner {
@@ -235,6 +237,136 @@ impl PackedRgbU8 {
         self.bytes
             .take()
             .ok_or_else(|| PyValueError::new_err("packed RGB holder was already consumed"))
+    }
+}
+
+/// Decision model runner (d3-mini, etc.). Loads via `AutoModel` and exposes a
+/// single `decide(token_ids, candidate_count)` method that returns scored codes.
+#[pyclass(unsendable)]
+pub struct DecisionRunner {
+    model: LoadedModel,
+    device: Device,
+    model_path: PathBuf,
+}
+
+#[pymethods]
+impl DecisionRunner {
+    /// Load a decision model checkpoint.
+    ///
+    /// * `model_path` — directory containing decision_config.json and tokenizer.json.
+    /// * `device` — `cuda:N` (default `cuda:0`). d3 is CUDA-only.
+    /// * `autotune` — tune missing GEMM recipes from the first request.
+    /// * `tuning_dir` — directory to persist tuning recipes.
+    #[staticmethod]
+    #[pyo3(signature = (model_path, device="cuda:0", autotune=false, tuning_dir=None))]
+    fn load(
+        model_path: PathBuf,
+        device: &str,
+        autotune: bool,
+        tuning_dir: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let options = LoadOptions {
+            autotune,
+            tuning_path: tuning_dir,
+            ..LoadOptions::default()
+        };
+        let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        // Verify this is actually a decision model.
+        model.decision_code_names().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.DecisionRunner.load: {:?} is not a decision model",
+                model_path
+            ))
+        })?;
+        Ok(Self {
+            model,
+            device,
+            model_path,
+        })
+    }
+
+    /// Run a text decision and return scored codes.
+    ///
+    /// * `token_ids` — 1-D uint32 numpy array of tokenized prompt.
+    /// * `candidate_count` — number of leading codes to score.
+    ///
+    /// Returns a dict with:
+    /// * `selected_index` — index of the highest-probability code.
+    /// * `scores` — list of `{"code": str, "token_id": int, "probability": float}`.
+    fn decide(
+        &mut self,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        candidate_count: usize,
+    ) -> PyResult<PyObject> {
+        let ids = token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "apxinf_py.DecisionRunner.decide: token_ids must be a 1-D uint32 contiguous array",
+            )
+        })?;
+        let output = self
+            .model
+            .decide(DecisionInput::text(ids, candidate_count))
+            .map_err(runtime_err)?;
+        Python::with_gil(|py| {
+            let score_dicts: Vec<PyObject> = output
+                .scores
+                .iter()
+                .map(|score| {
+                    let d = PyDict::new_bound(py);
+                    d.set_item("code", &score.code).unwrap();
+                    d.set_item("token_id", score.token_id).unwrap();
+                    d.set_item("probability", score.probability).unwrap();
+                    d.into()
+                })
+                .collect();
+            let scores = PyList::new_bound(py, &score_dicts);
+            let result = PyDict::new_bound(py);
+            result.set_item("selected_index", output.selected_index)?;
+            result.set_item("scores", scores)?;
+            Ok(result.into())
+        })
+    }
+
+    /// Available code names in the package code table.
+    #[getter]
+    fn codes(&self) -> PyResult<Vec<String>> {
+        self.model
+            .decision_code_names()
+            .map(|names| names.to_vec())
+            .map_err(runtime_err)
+    }
+
+    /// Total number of codes in the package.
+    #[getter]
+    fn num_codes(&self) -> PyResult<usize> {
+        self.model
+            .decision_code_names()
+            .map(|names| names.len())
+            .map_err(runtime_err)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        self.device.to_string()
+    }
+
+    #[getter]
+    fn model_path(&self) -> String {
+        self.model_path.display().to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        let num = self
+            .model
+            .decision_code_names()
+            .map(|names| names.len())
+            .unwrap_or(0);
+        format!(
+            "DecisionRunner(device={}, codes={num}, path={:?})",
+            self.device(),
+            self.model_path
+        )
     }
 }
 
@@ -790,7 +922,8 @@ impl ModelRunner {
     ///
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `path` — checkpoint directory or index file.
-    /// * `device` — `cuda:N` (default) or `cpu`.
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
     /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
     /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
     /// * `calibration` — optional FP8 calibration json.
@@ -903,7 +1036,8 @@ impl ModelRunner {
     /// parameters, letting one call sweep 2/3-view, image size, horizon, etc.
     ///
     /// * `model` — model name, e.g. `"pi05"`.
-    /// * `device` — `cuda:N` (default) or `cpu`.
+    /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
+    ///   The selected family and compiled features must support that backend.
     /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
@@ -1754,10 +1888,7 @@ impl ModelRunner {
     /// Device string, e.g. `"cuda:0"`.
     #[getter]
     fn device(&self) -> String {
-        match self.device {
-            Device::Cuda(index) => format!("cuda:{index}"),
-            Device::Cpu => "cpu".to_string(),
-        }
+        self.device.to_string()
     }
 
     /// Actual loaded implementation; `auto` is resolved during loading.
@@ -1827,6 +1958,7 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
         apxinf_model::qwen_drive::FIXED_SCENE_TOKENS,
     )?;
     module.add_class::<ModelRunner>()?;
+    module.add_class::<DecisionRunner>()?;
     module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
@@ -1841,8 +1973,15 @@ mod tests {
     #[test]
     fn parses_device_forms() {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
+        assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
+        assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
+        assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
+        assert_eq!(parse_device("metal:1").unwrap(), Device::Metal(1));
+        assert_eq!(parse_device("mlx:0").unwrap(), Device::Metal(0));
+        assert!(parse_device("metal:").is_err());
+        assert!(parse_device("mlx:-1").is_err());
         assert!(parse_device("tpu").is_err());
         assert!(parse_device("cuda:x").is_err());
     }

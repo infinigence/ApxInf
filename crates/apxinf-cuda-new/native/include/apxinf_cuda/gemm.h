@@ -57,6 +57,18 @@ apxinf_status_t apxinf_gemm_nvfp4_quantize_swiglu(
     float input_scale, int32_t row_major_scales,
     apxinf_cuda_stream_t stream);
 
+/* Optional shape-specialized NVFP4 FC1 + SwiGLU + requantization AOT path.
+   The weight is already interleaved in 64-row [up, gate] groups; activation
+   scales are row-major and output scales use the GEMM atom layout. */
+apxinf_status_t apxinf_gemm_nvfp4_dense_swiglu_aot(
+    const void* activation, const void* weight,
+    const void* activation_scales, const void* weight_scales,
+    void* output, void* output_scales, const void* alpha,
+    const void* input_global_scale, const void* down_inverse_global_scale,
+    const void* tile_groups, const void* tile_limits,
+    const void* token_map, const void* tile_count,
+    int64_t rows, int64_t n, int64_t k, apxinf_cuda_stream_t stream);
+
 uint64_t apxinf_gemm_execution_weight_prepack_count(
     apxinf_gemm_execution_t execution);
 apxinf_status_t apxinf_gemm_test_validate_candidates(
