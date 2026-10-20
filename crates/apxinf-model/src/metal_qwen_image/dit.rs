@@ -2,7 +2,7 @@
 //! once per prompt and caches each block's post-RoPE K/V; every denoise step
 //! then runs one compiled image-token forward against that cache.
 use super::ops::Ops;
-use super::weights::{Block, Transformer, DIM, HEADS, HEAD_DIM, Q4};
+use super::weights::{Block, GateUp, Transformer, DIM, HEADS, HEAD_DIM, Q4};
 use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::{
     GatedResidualLayerNormModulate, InterleavedQkNormRope, LayerNormModulate, MppBf16GemmNt,
@@ -82,8 +82,8 @@ pub struct Dit {
     ops: Ops,
     /// The image-token GEMM, when it reproduces MLX quantized matmul here.
     gemm: Option<Rc<MppBf16GemmNt>>,
-    /// The fused image blocks and each block's interleaved gate/up weight.
-    fused: Option<(Rc<Fused>, Vec<Q4>)>,
+    /// The fused image blocks, when selected for this architecture.
+    fused: Option<Rc<Fused>>,
 }
 
 /// Per-block post-RoPE text K/V, `[1, 32, T, 128]` BF16 each.
@@ -100,24 +100,6 @@ impl Dit {
     ) -> Result<Self> {
         let stream = ops.stream();
         let freqs = super::tables::timestep_frequencies(128);
-        // The interleaved weights are materialized before the first step,
-        // beside the originals that the text prefix reads.
-        let fused = match fused {
-            Some(kernels) => {
-                let packed = w
-                    .blocks
-                    .iter()
-                    .map(|b| interleave_gate_up(&b.gate, &b.proj))
-                    .collect::<Result<Vec<_>>>()?;
-                let arrays: Vec<Array> = packed
-                    .iter()
-                    .flat_map(|q| [q.weight.clone(), q.scales.clone(), q.biases.clone()])
-                    .collect();
-                stream.eval(&arrays)?;
-                Some((kernels, packed))
-            }
-            None => None,
-        };
         Ok(Self {
             w,
             qk: InterleavedQkNormRope::new(stream)?,
@@ -126,6 +108,33 @@ impl Dit {
             gemm,
             fused,
         })
+    }
+
+    /// Whether `tokens` image tokens run the fused blocks.
+    pub fn fuses(&self, tokens: usize) -> bool {
+        self.fused.is_some() && tokens.is_multiple_of(64) && FUSED_TOKENS.contains(&tokens)
+    }
+
+    /// Interleave every block's gate/up weights for the fused blocks and drop
+    /// the originals, one block at a time, after the text prefix (their only
+    /// other reader) has run. Requests that do not fuse keep them separate.
+    pub fn interleave_for_image(&mut self, tokens: usize) -> Result<()> {
+        if !self.fuses(tokens) {
+            return Ok(());
+        }
+        let stream = self.ops.stream().clone();
+        for b in &mut self.w.blocks {
+            if let GateUp::Separate { gate, up } = &b.gate_up {
+                let packed = interleave_gate_up(gate, up)?;
+                stream.eval(&[
+                    packed.weight.clone(),
+                    packed.scales.clone(),
+                    packed.biases.clone(),
+                ])?;
+                b.gate_up = GateUp::Interleaved(packed);
+            }
+        }
+        Ok(())
     }
 
     /// `nn.QuantizedLinear`. At least `MPP_MIN_TOKENS` image tokens in a
@@ -217,8 +226,13 @@ impl Dit {
     }
 
     fn mlp(&self, b: &Block, x: &Array, image: bool) -> Result<Array> {
-        let gate = self.ops.silu(&self.project(&b.gate, x, image)?)?;
-        let gated = gate.mul(&self.project(&b.proj, x, image)?)?;
+        let GateUp::Separate { gate, up } = &b.gate_up else {
+            return Err(Error::Contract(
+                "interleaved gate/up weights run only in the fused image blocks",
+            ));
+        };
+        let gated = self.ops.silu(&self.project(gate, x, image)?)?;
+        let gated = gated.mul(&self.project(up, x, image)?)?;
         self.project(&b.out, &gated, image)
     }
 
@@ -282,7 +296,6 @@ impl Dit {
     #[allow(clippy::too_many_arguments)]
     fn block(
         &self,
-        index: usize,
         b: &Block,
         h: &Array,
         text_kv: Option<(&Array, &Array)>,
@@ -292,9 +305,11 @@ impl Dit {
         sin: &Array,
     ) -> Result<(Array, Option<(Array, Array)>)> {
         let tokens = h.shape()[1];
-        if let (Some((f, packed)), Some(text)) = (&self.fused, text_kv) {
-            if tokens.is_multiple_of(64) && FUSED_TOKENS.contains(&tokens) {
-                let h = self.fused_block(f, &packed[index], b, h, text, mod1, mod2, cos, sin)?;
+        if let (Some(f), Some(text), GateUp::Interleaved(gate_up)) =
+            (&self.fused, text_kv, &b.gate_up)
+        {
+            if self.fuses(tokens) {
+                let h = self.fused_block(f, gate_up, b, h, text, mod1, mod2, cos, sin)?;
                 return Ok((h, None));
             }
         }
@@ -341,8 +356,8 @@ impl Dit {
         let (mod1, mod2) = (Self::row(&mod1, 1, tokens)?, Self::row(&mod2, 1, tokens)?);
         let mut h = self.txt_in(prompt)?;
         let mut kv = Vec::with_capacity(self.w.blocks.len());
-        for (i, b) in self.w.blocks.iter().enumerate() {
-            let (next, cached) = self.block(i, b, &h, None, &mod1, &mod2, cos, sin)?;
+        for b in &self.w.blocks {
+            let (next, cached) = self.block(b, &h, None, &mod1, &mod2, cos, sin)?;
             h = next;
             kv.push(cached.expect("the text prefix returns its K/V"));
         }
@@ -363,9 +378,9 @@ impl Dit {
         let (mod1, mod2) = self.modulation(&temb)?;
         let (mod1, mod2) = (Self::row(&mod1, 0, tokens)?, Self::row(&mod2, 0, tokens)?);
         let mut h = self.w.img_in.apply(latents)?;
-        for (i, (b, kv)) in self.w.blocks.iter().zip(inputs[4..].chunks(2)).enumerate() {
+        for (b, kv) in self.w.blocks.iter().zip(inputs[4..].chunks(2)) {
             let text = Some((&kv[0], &kv[1]));
-            h = self.block(i, b, &h, text, &mod1, &mod2, cos, sin)?.0;
+            h = self.block(b, &h, text, &mod1, &mod2, cos, sin)?.0;
         }
         let scale = self.w.norm_out.apply(&self.ops.silu(&temb)?)?;
         let scale = Self::row(&scale, 0, tokens)?;
