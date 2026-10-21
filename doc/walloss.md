@@ -11,7 +11,7 @@ policy: `python/apxinf/apxinf/policies/impls/walloss.py`.
 | Item | Supported |
 | --- | --- |
 | Device | CUDA; measured on Jetson AGX Thor (sm_110) |
-| Precision | BF16 (default), dynamic FP8 (`precision="fp8"`, per-token activation scales) |
+| Precision | BF16 (default), dynamic FP8 (`model_variant="fp8_dynamic"`, per-token activation scales) |
 | Views | any count; all views of one request resize to one shared size |
 | Image size | any size the processor produces (patch grids divisible by the merge size); square and rectangular |
 | Execution | one CUDA graph per prepared shape; eager with `ExecutionPolicy::Eager` or `APXINF_WALLOSS_NO_GRAPH` |
@@ -36,6 +36,25 @@ without `config.yml` smart-resizes the raw image. Check the grids in
 
 A custom `processor=` returns patches for the default profile only (two
 views, 18x18 grids); other shapes need the built-in RGB route.
+
+## Public loading and benchmark inputs
+
+`WallossPolicy.from_pretrained` and `AutoPolicy.from_pretrained` accept
+`model_variant="bf16"` or `"fp8_dynamic"` (`"fp8"` is an alias); omission/`"auto"`
+selects the native default. Existing `precision=` calls remain supported, but
+conflicting `precision` and `model_variant` values fail before loading weights.
+
+`policy.prepare_rgb_inputs(observation, noise=...)` returns keyword arguments
+for `policy.model_runner.infer_rgb(**inputs)`. It performs the same preprocessing
+as policy inference and owns the image grids and action mask. It does not execute
+the model. This optional capability is implemented by PI0.5 and WallOSS; custom
+WallOSS patch processors do not expose the RGB path.
+
+The shared benchmark accepts either checkpoint with
+`python scripts/bench_pi05.py --model-dir <checkpoint> --model-variant bf16 --layer l1,l2`.
+The specialized `bench_walloss.py` also accepts `--model-variant`; `--precision`
+remains a CLI alias. CPU CI checks command parsing, real policy dispatch and
+native-call arguments with GPU/assets stubbed; it does not measure performance.
 
 ## Preparation and shape changes
 

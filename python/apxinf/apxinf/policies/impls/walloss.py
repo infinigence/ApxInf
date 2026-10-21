@@ -534,7 +534,8 @@ class WallossPolicy:
         model_runner=None,
         checkpoint=None,
         device="cuda:0",
-        precision="auto",
+        model_variant=None,
+        precision=None,
         tactics=None,
         autotune=False,
         norm_key="x2_normal",
@@ -550,6 +551,14 @@ class WallossPolicy:
         metadata=None,
         **kwargs,
     ):
+        variants = {"auto": "auto", "bf16": "bf16", "fp8": "fp8", "fp8_dynamic": "fp8"}
+        selected = model_variant if model_variant is not None else precision
+        selected = "auto" if selected is None else selected
+        if selected not in variants:
+            raise ValueError("WallOSS model_variant must be auto, bf16 or fp8_dynamic (fp8 alias)")
+        if precision is not None and (precision not in variants or variants[precision] != variants[selected]):
+            raise ValueError("model_variant and precision select conflicting WallOSS variants")
+        precision = variants[selected]
         if kwargs:
             raise TypeError(f"unsupported WallossPolicy options: {sorted(kwargs)}")
         if discrete_state is False:
@@ -639,29 +648,37 @@ class WallossPolicy:
             metadata=processor_metadata,
         )
 
+    def prepare_rgb_inputs(self, observation: Mapping[str, Any], *, noise=None) -> dict:
+        """Prepare keyword arguments for ModelRunner.infer_rgb without inference.
+
+        Resize, tokens, masks and patch geometry stay owned by this policy.
+        """
+        if not self._native_rgb:
+            raise ValueError("prepare_rgb_inputs requires the built-in RGB processor")
+        vision, token_ids, action_mask = self.processor(observation)
+        views, height, width = vision.shape[:3]
+        patch = int(self.model_runner.patch_size)
+        return dict(
+            rgb_u8=vision, layout="nhwc", token_ids=token_ids,
+            noise=None if noise is None else np.ascontiguousarray(noise, dtype=np.float32),
+            action_mask=action_mask,
+            image_grid_thw=np.full((views, 3), (1, height // patch, width // patch), np.uint32),
+        )
+
     def infer(self, observation: Mapping[str, Any], *, noise=None) -> dict:
         started = time.perf_counter()
-        vision, token_ids, action_mask = self.processor(observation)
-        model_started = time.perf_counter()
-        inference_kwargs = {
-            **(
-                {"noise": np.ascontiguousarray(noise, dtype=np.float32)}
-                if noise is not None
-                else {}
-            ),
-            "action_mask": action_mask,
-        }
         if self._native_rgb:
-            # All views share one resized size; declare its patch grid.
-            views, height, width = vision.shape[:3]
-            patch = int(self.model_runner.patch_size)
-            grids = np.full((views, 3), (1, height // patch, width // patch), np.uint32)
-            normalized = self.model_runner.infer_rgb(
-                vision, "nhwc", token_ids, image_grid_thw=grids, **inference_kwargs
-            )
+            inputs = self.prepare_rgb_inputs(observation, noise=noise)
+            token_ids = inputs["token_ids"]
+            model_started = time.perf_counter()
+            normalized = self.model_runner.infer_rgb(**inputs)
         else:
+            vision, token_ids, action_mask = self.processor(observation)
+            model_started = time.perf_counter()
             normalized = self.model_runner._infer_patches(
-                vision, token_ids, **inference_kwargs
+                vision, token_ids,
+                noise=None if noise is None else np.ascontiguousarray(noise, dtype=np.float32),
+                action_mask=action_mask,
             )
         normalized = np.asarray(normalized, dtype=np.float32)
         model_ms = (time.perf_counter() - model_started) * 1000

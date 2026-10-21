@@ -656,15 +656,26 @@ python scripts/bench_pi05.py --model-dir <path-to-model> --model-variant bf16 --
   select the synthetic workload.
 - `--calibration` is FP8-only and synthetic-only; a checkpoint reads
   `calibration.json` from its own directory.
-- `--action-horizon` also applies to a checkpoint — the horizon is a sequence
+- `--action-horizon` also applies to a PI0.5 checkpoint — the horizon is a sequence
   length, not a weight dimension — which is what makes a real checkpoint
   comparable to a synthetic run.
 - `--warmup` / `--samples` set the sampling protocol (default 10 and 30);
   `--out` writes the report as JSON.
 
-Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
-`config.json`, so the same command benchmarks the next model without a flag
-change.
+The command above supports PI0.5 and WallOSS through `AutoPolicy` checkpoint
+selection. `l1` measures `ModelRunner.infer_rgb`; `l2` measures `policy.infer`,
+including preprocessing and postprocessing. These are benchmark labels, not
+separate inference APIs. Both policies expose `prepare_rgb_inputs` so the
+benchmark uses their normal preprocessing, including WallOSS grids and masks.
+The legacy `l0` patch diagnostic remains PI0.5-only.
+
+Use `--model-variant bf16` for either model, or `--model-variant fp8_dynamic`
+for WallOSS dynamic FP8. WallOSS retains `precision=` as a compatible Python
+alias; conflicting selections fail. Its specialized shape/stage benchmark is
+`scripts/bench_walloss.py --model-dir <path> --model-variant bf16`.
+Other families' maintained benchmark commands are linked in their model docs;
+registration alone does not guarantee compatibility with this script's
+synthetic observation or measurement layers.
 
 For one-step evaluation, please refer to `doc/run_warmstart_with_onestep.md`
 
