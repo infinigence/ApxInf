@@ -98,10 +98,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (index, record) in records.iter().enumerate() {
         let started = Instant::now();
-        let output = model.decide(DecisionInput::text(
-            &record.token_ids,
-            record.candidate_count,
-        ))?;
+        let output = model
+            .decide(DecisionInput::text(
+                &record.token_ids,
+                record.candidate_count,
+            ))?
+            .into_single()?;
         let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let probabilities = output
             .scores
