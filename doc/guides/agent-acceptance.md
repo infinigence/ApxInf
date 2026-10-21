@@ -39,6 +39,10 @@ must fail on missing required hardware/checkpoints, zero selected tests,
 unexpected fallback or skipped mandatory cases. Exit zero alone does not prove
 those properties; review the assertions.
 
+For model comparisons, use the [model comparison checks](model-parity.md)
+inside the harness for full tensors, consumed inputs, grids and build bindings.
+Their scoped results supplement the public-path acceptance cases.
+
 Use `just acceptance run <plan> <case>` to execute the declared command and
 capture its full output. Receipts and uniquely named logs live beside the plan.
 `just acceptance check <plan>` returns zero only when all cases have successful,

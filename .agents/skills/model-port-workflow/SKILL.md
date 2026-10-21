@@ -149,6 +149,8 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    captured inference, host-transfer audit, public serving/policy integration,
    and requested performance using the task's
    [acceptance plan](../../../doc/guides/agent-acceptance.md).
+   Use [model-parity](../model-parity/SKILL.md) for recorded model-output
+   comparisons and effective-shape checks.
    Prove that tensor computation between public
    input upload and public output transfer stays on GPU, and verify eager versus
    captured parity, repeated replay, changed-input propagation, stable

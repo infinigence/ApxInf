@@ -134,6 +134,11 @@ test-tooling:
 acceptance *args:
     python3 scripts/agent_acceptance.py "$@"
 
+# Model evidence: fresh build, tensor parity, effective shapes and persisted tuning keys.
+[positional-arguments]
+parity *args:
+    python3 scripts/model_parity.py "$@"
+
 # Validate GitHub Actions syntax and embedded shell commands (requires actionlint).
 workflow-lint:
     actionlint

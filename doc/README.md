@@ -68,6 +68,7 @@ cover Jetson Thor.
 ## Agent workflows
 
 - [Agent acceptance](guides/agent-acceptance.md): public-path commands, source-bound evidence, bounded Stop hooks and headless operation.
+- [Model comparison](guides/model-parity.md) and [model-parity](../.agents/skills/model-parity/SKILL.md): executable tensor, shape, tuning and build-binding checks with scoped diagnosis.
 - [apxinf-pre-pr](../.agents/skills/apxinf-pre-pr/SKILL.md): submission checks, review rules and the PR evidence block.
 - [model-port-workflow](../.agents/skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
 - [analyze-model-impl](../.agents/skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.

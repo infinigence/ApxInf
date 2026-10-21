@@ -64,6 +64,8 @@ Historical Session/Network names in `doc/archive/` are not integration APIs.
 For model changes and long agent runs, declare public-path acceptance using
 [agent acceptance](doc/guides/agent-acceptance.md). Use `just acceptance` to
 record results; missing hardware remains unverified, even when CPU checks pass.
+For model-output comparisons or shape/tuning regressions, use the
+`model-parity` skill and its executable evidence checks.
 
 Review against [REVIEW.md](REVIEW.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, PR evidence
 requirements, and AI-assistance policy.
