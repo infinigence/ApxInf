@@ -26,7 +26,10 @@ tables, and pure compiled decode function. `bf16-public` is the ordered referenc
 composition. `bf16-compiled` selects local norm/RoPE compilation and whole-step
 decode with the fixed packed residual/norm kernel. Every new KV array and output
 is evaluated before the request state is published; failed preparation cannot
-be reported ready. Changing prepared capacity requires a reset.
+be reported ready. Changing prepared capacity requires a reset. The whole-step
+decode function is warmed once per KV capacity (and again after a failure); a
+request with a new prompt length at the same capacity re-warms only the
+prompt-shaped norm/RoPE/SwiGLU subgraphs.
 
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes the complete prompt while applying the untied head

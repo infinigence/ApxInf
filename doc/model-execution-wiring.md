@@ -194,7 +194,7 @@ and replayed outputs before relying on replay latency.
 
 On MLX, use the family's fallible `prepare` and explicit compiled state rather
 than CUDA `GraphWorkspace`. Qwen3 warms admitted prompt/chunk lengths and its
-decoder block; MiniCPM5 warms its whole-step function; DSpark additionally warms
+decoder block; MiniCPM5 warms its whole-step function once per KV capacity; DSpark additionally warms
 the draft-input and target-verification row counts. The caller must evaluate
 every new state array before publishing it. Verify actual unchanged-shape input
 rebinding, reset, invalidation and retained outputs. A zero trace-callback count
