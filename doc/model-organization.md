@@ -27,7 +27,7 @@ There is no Python `AutoModel` binding or Python PI0.5 network class.
 | Directory | Current organization |
 | --- | --- |
 | `pi05/` | `load.rs` and `config.rs` construct `Pi05ModelRunner`; `model/` holds `Pi05Model<B>`, Blocks and `ModelVariant`; `model_runner/` owns preparation/cache/resources; `weights/` owns host mapping and device representations |
-| `walloss/` | Existing BF16 runtime/executor, `fp8.rs`, schedule/geometry and weight files |
+| `walloss/` | `load.rs`/`config.rs` construct `WallossModelRunner`; `model/` holds `WallossModel`, `ModelVariant` (BF16, dynamic FP8) and `blocks/`; `model_runner/` owns preparation, the plan cache and capture; `weights/` owns host mapping and device representations; `geometry.rs`/`schedule.rs` are shared leaves |
 | `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
 | `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |
 | `qwen_drive/` | Planning VLA: `load.rs`, `model/mod.rs`, one `model/blocks/bf16.rs`, `model_runner/` execution state/local GDN graphs, and `weights/`; [scope and current limits](qwen-drive-benchmark.md) |
@@ -43,7 +43,7 @@ Each family is self-contained. Inspect/copy a close implementation when useful,
 then rename concepts and validate independently. Shared infrastructure stays
 above family directories; no family imports another family's private model,
 weights, runner, graph or backbone. Existing `*_runtime.rs`/`*_executor.rs`
-filenames in WallOSS/GR00T are current code, not a reason to recreate PI0.5's
+filenames in GR00T are current code, not a reason to recreate PI0.5's
 removed files or claim all families have migrated.
 
 ## How to navigate a change

@@ -16,11 +16,11 @@ decode, CUDA-graph decode, batched FlashInfer GDN prefill — is the default cod
 path, selected by checkpoint shape and by what the build linked, not by the
 caller's environment.
 
-The two selection inputs that do exist are both build- or shape-derived:
+The two selection inputs that do exist are build- or shape-derived:
 
 | Input | Effect |
 |---|---|
-| `APXINF_CUDA_AOT_MANIFEST` (build time) | if it supplies the `qwen38-dense-swiglu-nvfp4` object and `sm_110` is a target, the fused FC1 kernel is compiled in and used for 2048-token prefill; otherwise the generic quantize → GEMM → quantize sequence runs. Surfaced at runtime as `apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT`. |
+| `sm_110` build target | compiles the native NVFP4 GEMM + SwiGLU kernel, surfaced as `apxinf_cuda_new::NVFP4_GEMM_SWIGLU`; other targets use the generic quantize → GEMM → quantize sequence. |
 | prompt length = 2048 tokens | the fused kernel is specialized to M=2048; other prefill lengths take the generic path. |
 
 `APXINF_QWEN38_GEMM_TUNE_CACHE` / `APXINF_QWEN38_TUNE_CACHE` still override the
@@ -101,14 +101,10 @@ Jetson AGX Thor, locked clocks (1575 MHz GPC):
 
 - Quantizer contract suites: `qwen38_fp8_quant_contract`,
   `qwen38_nvfp4_quant_contract` (`apxinf-cuda-new`).
-- Fused-vs-generic FC1 equivalence: `qwen38_fused_fc1_equivalence`
-  (`apxinf-cuda-new`). At the production 2048-token prefill shape it drives
-  `ops::nvfp4_dense_swiglu_aot` and the generic
-  `nvfp4_quantize_rms_norm` → NVFP4 `gemm` → `nvfp4_quantize_swiglu` sequence
-  over real layer-0 weights and asserts the packed FP4 output and the E4M3
-  scales are byte-identical. It gates on
-  `apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT`, so it exercises the fused branch
-  whenever the AOT bundle is linked and skips honestly otherwise.
+- The 2048-token end-to-end benchmark exercises `ops::nvfp4_gemm_swiglu` in
+  every layer, checks deterministic generated tokens, and compares the token
+  hash with the accepted reference run. Other prompt lengths exercise the
+  generic fallback.
 
 ## Limitations
 

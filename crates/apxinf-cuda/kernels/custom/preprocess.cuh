@@ -235,12 +235,12 @@ __global__ void pixel_shuffle_4_f16_kernel(
 template <bool kNhwc>
 __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(
     const uint8_t* images, __nv_bfloat16* patches, int views,
-    int image_size, int patch_size, int temporal_patch_size, int merge_size,
-    double rescale_factor, float mean0, float mean1, float mean2,
+    int image_height, int image_width, int patch_size, int temporal_patch_size,
+    int merge_size, double rescale_factor, float mean0, float mean1, float mean2,
     float std0, float std1, float std2) {
-  const int grid_size = image_size / patch_size;
-  const int groups_per_side = grid_size / merge_size;
-  const int rows_per_view = grid_size * grid_size;
+  const int grid_w = image_width / patch_size;
+  const int groups_w = grid_w / merge_size;
+  const int rows_per_view = (image_height / patch_size) * grid_w;
   const int patch_area = patch_size * patch_size;
   const int patch_width = 3 * temporal_patch_size * patch_area;
   const int64_t count =
@@ -259,8 +259,8 @@ __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(
     row /= merge_size;
     const int merge_y = row % merge_size;
     row /= merge_size;
-    const int group_x = row % groups_per_side;
-    const int group_y = row / groups_per_side;
+    const int group_x = row % groups_w;
+    const int group_y = row / groups_w;
 
     const int dx = patch_element % patch_size;
     patch_element /= patch_size;
@@ -273,8 +273,8 @@ __global__ void rgb_u8_to_normalized_temporal_merged_patches_bf16_kernel(
     const int y = (group_y * merge_size + merge_y) * patch_size + dy;
     const int x = (group_x * merge_size + merge_x) * patch_size + dx;
     const int64_t input_index = kNhwc
-        ? ((static_cast<int64_t>(view) * image_size + y) * image_size + x) * 3 + channel
-        : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) * image_size + x;
+        ? ((static_cast<int64_t>(view) * image_height + y) * image_width + x) * 3 + channel
+        : ((static_cast<int64_t>(view) * 3 + channel) * image_height + y) * image_width + x;
 
     const float mean = channel == 0 ? mean0 : (channel == 1 ? mean1 : mean2);
     const float std = channel == 0 ? std0 : (channel == 1 ? std1 : std2);

@@ -21,6 +21,17 @@ pub struct VisionGeometry {
     pub reverse_indices: Vec<u32>,
     pub max_window_tokens: usize,
     pub max_full_tokens: usize,
+    /// Packed RGB layout when every view is one still frame of the same patch
+    /// grid; `None` means the grids can only be served as patches.
+    pub rgb_views: Option<RgbViews>,
+}
+
+/// Uniform still-frame RGB layout: `views` images of `grid_h x grid_w` patches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbViews {
+    pub views: usize,
+    pub grid_h: usize,
+    pub grid_w: usize,
 }
 
 impl VisionGeometry {
@@ -103,6 +114,15 @@ impl VisionGeometry {
         }
         let max_window_tokens = offset_max_delta(&window_offsets);
         let max_full_tokens = offset_max_delta(&full_offsets);
+        let [_, grid_h, grid_w] = grids[0];
+        let rgb_views = grids
+            .iter()
+            .all(|&[t, h, w]| t == 1 && h == grid_h && w == grid_w)
+            .then_some(RgbViews {
+                views: grids.len(),
+                grid_h,
+                grid_w,
+            });
         Ok(Self {
             patch_order,
             position_ids,
@@ -111,23 +131,25 @@ impl VisionGeometry {
             reverse_indices,
             max_window_tokens,
             max_full_tokens,
+            rgb_views,
         })
     }
 
     #[cfg(feature = "cuda")]
     pub fn upload(&self, context: &Context) -> Result<DeviceVisionGeometry> {
         Ok(DeviceVisionGeometry {
-            patch_order: upload_u32(context, &self.patch_order)?,
-            position_ids: upload_u32(context, &self.position_ids)?,
-            window_offsets: upload_u32(context, &self.window_offsets)?,
-            full_offsets: upload_u32(context, &self.full_offsets)?,
-            reverse_indices: upload_u32(context, &self.reverse_indices)?,
+            patch_order: upload_u32(context.device_id(), &self.patch_order)?,
+            position_ids: upload_u32(context.device_id(), &self.position_ids)?,
+            window_offsets: upload_u32(context.device_id(), &self.window_offsets)?,
+            full_offsets: upload_u32(context.device_id(), &self.full_offsets)?,
+            reverse_indices: upload_u32(context.device_id(), &self.reverse_indices)?,
             window_segments: self.window_offsets.len() - 1,
             full_segments: self.full_offsets.len() - 1,
             max_window_tokens: self.max_window_tokens,
             max_full_tokens: self.max_full_tokens,
             host_window_offsets: self.window_offsets.clone(),
             host_full_offsets: self.full_offsets.clone(),
+            rgb_views: self.rgb_views,
         })
     }
 }
@@ -145,16 +167,17 @@ pub struct DeviceVisionGeometry {
     pub max_full_tokens: usize,
     pub host_window_offsets: Vec<u32>,
     pub host_full_offsets: Vec<u32>,
+    pub rgb_views: Option<RgbViews>,
 }
 
+/// Upload `u32` values into a new device buffer of exactly their byte size.
 #[cfg(feature = "cuda")]
-fn upload_u32(context: &Context, values: &[u32]) -> Result<DeviceBuffer> {
+pub(super) fn upload_u32(device_id: usize, values: &[u32]) -> Result<DeviceBuffer> {
     let bytes = values
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect::<Vec<_>>();
-    let buffer = DeviceBuffer::alloc_zeros(bytes.len(), context.device_id())
-        .map_err(Error::Cuda)?;
+    let buffer = DeviceBuffer::alloc_zeros(bytes.len(), device_id).map_err(Error::Cuda)?;
     buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
     Ok(buffer)
 }
@@ -257,6 +280,22 @@ mod tests {
         assert_eq!(*geometry.window_offsets.last().unwrap(), 160);
         assert_eq!(geometry.reverse_indices.len(), 40);
         assert_eq!(geometry.max_full_tokens, 96);
+        assert_eq!(geometry.rgb_views, None);
+    }
+
+    #[test]
+    fn uniform_still_frames_have_an_rgb_layout() {
+        let geometry = VisionGeometry::new(&config(), &[[1, 16, 24]; 3]).unwrap();
+        assert_eq!(
+            geometry.rgb_views,
+            Some(RgbViews {
+                views: 3,
+                grid_h: 16,
+                grid_w: 24
+            })
+        );
+        let video = VisionGeometry::new(&config(), &[[2, 16, 16]]).unwrap();
+        assert_eq!(video.rgb_views, None);
     }
 
 

@@ -50,6 +50,12 @@
       || (__CUDA_ARCH__ == 1030 && defined(__CUDA_ARCH_FEAT_SM103_ALL))     \
       || (__CUDA_ARCH__ == 1200 && defined(__CUDA_ARCH_FEAT_SM120_ALL))     \
       || (__CUDA_ARCH__ == 1210 && defined(__CUDA_ARCH_FEAT_SM121_ALL))     \
+      /* APXINF local patch: upstream omits SM110 (Thor), which silently turns \
+         every warpgroup_reg_alloc/dealloc into a no-op there. Requires the \
+         consuming TU to be compiled with                                      \
+         `--generate-code arch=compute_110a,code=sm_110a`; under `-arch=sm_110a` \
+         ptxas retargets at sm_110 and rejects `setmaxnreg` outright. */        \
+      || (__CUDA_ARCH__ == 1100 && defined(__CUDA_ARCH_FEAT_SM110_ALL))     \
     )
     #define CUDA_CTA_RECONFIG_ACTIVATED 1
   #endif

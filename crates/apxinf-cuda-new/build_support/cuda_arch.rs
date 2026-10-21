@@ -322,7 +322,9 @@ fn validate_nvcc_arch(nvcc: &Path, out_dir: &Path, arch: &str) -> Result<(), Str
         .arg(&source)
         .arg("-o")
         .arg(&object)
-        .arg(format!("-arch={arch}"))
+        // Validate the same flag spelling the real compiles use, so a target
+        // that only works under `-arch=` never reaches the kernel build.
+        .args(gencode_args([arch.to_owned()]))
         .output()
         .map_err(|error| format!("run {} to validate {arch}: {error}", nvcc.display()))?;
     ensure_success(&format!("validate CUDA architecture {arch}"), &output)

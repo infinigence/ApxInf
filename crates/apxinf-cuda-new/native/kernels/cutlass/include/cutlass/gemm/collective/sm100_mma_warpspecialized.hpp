@@ -33,6 +33,11 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+// apxinf: the TMA dummy-shape hook. Primary template is upstream's own
+// expression, so this is inert for every stride type nothing specialises;
+// pack-GQA (`fmha_d256_action_sm100.cu`) specialises it for its hierarchical
+// M-mode stride, which cannot be typed from an all-dynamic dummy shape.
+#include "cutlass/gemm/collective/apxinf_tma_dummy_shape.hpp"
 #include "cutlass/detail/collective.hpp"
 #include "cutlass/detail/cluster.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -304,7 +309,7 @@ struct CollectiveMma<
 
     using TMA_A = decltype(make_tma_atom_A_sm100<TmaInternalElementA>(
         GmemTiledCopyA{},
-        make_tensor(recast_ptr<TmaInternalElementA>(nullptr), repeat_like(StrideA{}, int32_t(0)), StrideA{}),
+        make_tensor(recast_ptr<TmaInternalElementA>(nullptr), detail::ApxinfTmaDummyShape<StrideA>::get(), StrideA{}),
         SmemLayoutA{}(_,_,_,cute::Int<0>{}),
         TileShape{},
         TiledMma{},
@@ -313,7 +318,7 @@ struct CollectiveMma<
 
     using TMA_B = decltype(make_tma_atom_B_sm100<TmaInternalElementB>(
         GmemTiledCopyB{},
-        make_tensor(recast_ptr<TmaInternalElementB>(nullptr), repeat_like(StrideB{}, int32_t(0)), StrideB{}),
+        make_tensor(recast_ptr<TmaInternalElementB>(nullptr), detail::ApxinfTmaDummyShape<StrideB>::get(), StrideB{}),
         SmemLayoutB{}(_,_,_,cute::Int<0>{}),
         TileShape{},
         TiledMma{},

@@ -252,7 +252,7 @@ tuning all degenerate to picking 1 out of 1.
 | **gemm/nvfp4_scales.rs** (↔ `abi/gemm.rs` ↔ `kernels/cutlass/ops/gemm/gemm_nvfp4_sm100.cu`) | | |
 | `nvfp4_quantize_activation` / `_rms_norm` / `_swiglu` | `apxinf_gemm_nvfp4_quantize_*` | NVFP4 activation quantization |
 | `nvfp4_pack_block_scales` | `apxinf_gemm_nvfp4_pack_block_scales` | block-scale layout |
-| `nvfp4_dense_swiglu_aot` | `apxinf_gemm_nvfp4_dense_swiglu_aot` | AOT fused FC1, specialized for M=2048 |
+| `nvfp4_gemm_swiglu` | `apxinf_gemm_nvfp4_swiglu` | native NVFP4 GEMM + SwiGLU + requantization, specialized for M=2048 |
 
 ### Host helpers (called by the model, no GPU work)
 

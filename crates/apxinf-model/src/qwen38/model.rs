@@ -10,7 +10,7 @@ use std::time::Instant;
 use apxinf_core::{DType, Shape, Tensor};
 use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 
-use super::backend::{graph_tensor_bytes, prefix, upload, view, zeros};
+use super::backend::{graph_tensor_bytes, prefix, view, zeros};
 use super::config::*;
 use super::weights::{Fp8Weight, GdnLayer, Layer, Model, Nvfp4Weight};
 
@@ -709,30 +709,10 @@ pub(crate) struct PrefillScratch {
     gdn_alpha: Option<Tensor>,
     cu_seqlens: Option<Tensor>,
     flashinfer_workspace: Option<Tensor>,
-    fused_fc1: Option<FusedFc1Metadata>,
 }
 
-struct FusedFc1Metadata {
-    tile_groups: Tensor,
-    tile_limits: Tensor,
-    token_map: Tensor,
-    tile_count: Tensor,
-}
-
-/// Row count the AOT fused FC1 kernel is specialized to.
-///
-/// Fixed at export time (`crates/apxinf-cuda/aot/qwen38.json` pins
-/// `original_m`), so both the metadata built in `PrefillScratch::new` and the
-/// dispatch test in `nvfp4_mlp_rows` have to agree on it.
+/// Row count whose native fused FC1 result has been accepted end to end.
 const FUSED_FC1_ROWS: usize = 2048;
-
-fn device_i32(ctx: &CudaContext, values: &[i32]) -> Tensor {
-    let bytes = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect::<Vec<_>>();
-    upload(ctx, &bytes, vec![values.len()], DType::I32)
-}
 
 impl PrefillScratch {
     pub(crate) fn capacity(&self) -> usize {
@@ -748,29 +728,6 @@ impl PrefillScratch {
         // reference scan remains available in the kernel harness for
         // precision comparison.
         let flashinfer = true;
-        // The AOT FC1 kernel is specialized to M=FUSED_FC1_ROWS and only exists
-        // when the export bundle was linked. Both are build/shape properties,
-        // so the selection is unconditional here and env-free.
-        //
-        // Keyed on `>=`, not `==`: `capacity` rounds the first request up to
-        // CHUNK, so a 2049-token prompt reserves 2112 and an `==` test would
-        // leave the metadata absent for the whole life of that scratch --
-        // including every later request that *is* FUSED_FC1_ROWS long. The
-        // contents are built at FUSED_FC1_ROWS rather than `t` because
-        // `nvfp4_dense_swiglu_aot` sizes `token_map` as `[rows]` and the tile
-        // arrays as `[rows / 128]`, and `nvfp4_mlp_rows` only takes this path
-        // when `rows == FUSED_FC1_ROWS`.
-        let fused_fc1 = (t >= FUSED_FC1_ROWS && apxinf_cuda_new::QWEN38_DENSE_SWIGLU_AOT).then(
-            || {
-                let tiles = FUSED_FC1_ROWS / 128;
-                FusedFc1Metadata {
-                    tile_groups: device_i32(ctx, &vec![0; tiles]),
-                    tile_limits: device_i32(ctx, &vec![FUSED_FC1_ROWS as i32; tiles]),
-                    token_map: device_i32(ctx, &(0..FUSED_FC1_ROWS as i32).collect::<Vec<_>>()),
-                    tile_count: device_i32(ctx, &[tiles as i32]),
-                }
-            },
-        );
         PrefillScratch {
             capacity,
             hidden: zeros(ctx, vec![t, HIDDEN], DType::BF16),
@@ -815,7 +772,6 @@ impl PrefillScratch {
                 assert!(bytes > 0, "FlashInfer workspace query returned 0");
                 zeros(ctx, vec![bytes.div_ceil(4)], DType::F32)
             }),
-            fused_fc1,
         }
     }
 }
@@ -848,7 +804,7 @@ fn nvfp4_mlp_rows(
 ) {
     let fused_fc1 = rows == FUSED_FC1_ROWS
         && gate_up.fused_fc1.is_some()
-        && scratch.fused_fc1.is_some();
+        && apxinf_cuda_new::NVFP4_GEMM_SWIGLU;
     let hidden_rows = prefix(&scratch.hidden, vec![rows, HIDDEN], DType::BF16);
     verify_finite_bf16(ctx, "prefill MLP input", &hidden_rows);
     let activation = prefix(&scratch.nvfp4_activation, vec![rows, HIDDEN / 2], DType::E2M1Pair);
@@ -861,11 +817,7 @@ fn nvfp4_mlp_rows(
         EPSILON,
         gate_up.input_scale,
         BLOCK,
-        if fused_fc1 {
-            ops::ScaleLayout::RowMajor
-        } else {
-            ops::ScaleLayout::GemmAtom
-        },
+        ops::ScaleLayout::GemmAtom,
     )
     .unwrap();
 
@@ -879,8 +831,7 @@ fn nvfp4_mlp_rows(
         prefix(&scratch.mlp_activation, vec![rows, INTERMEDIATE / 2], DType::E2M1Pair);
     if fused_fc1 {
         let weight = gate_up.fused_fc1.as_ref().unwrap();
-        let metadata = scratch.fused_fc1.as_ref().unwrap();
-        ops::nvfp4_dense_swiglu_aot(
+        ops::nvfp4_gemm_swiglu(
             ctx,
             &activation,
             &scratch.nvfp4_scales,
@@ -891,10 +842,6 @@ fn nvfp4_mlp_rows(
             &weight.alpha,
             &weight.input_global_scale,
             &weight.down_inverse_global_scale,
-            &metadata.tile_groups,
-            &metadata.tile_limits,
-            &metadata.token_map,
-            &metadata.tile_count,
         )
         .unwrap();
     } else {

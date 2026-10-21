@@ -200,7 +200,17 @@ class _WallossImageProcessor:
         if self.min_pixels > self.max_pixels:
             raise ValueError("WallOSS min_pixels exceeds max_pixels")
 
-    def _resize_one(self, image: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int]]:
+    def _resize_one(
+        self, image: np.ndarray, resolution: int = -1
+    ) -> tuple[np.ndarray, tuple[int, int, int]]:
+        if resolution != -1:
+            # Training resolution: the longer side becomes `resolution`.
+            height, width = image.shape[:2]
+            if width > height:
+                size = (resolution, int(resolution * height / width))
+            else:
+                size = (int(resolution * width / height), resolution)
+            image = np.asarray(Image.fromarray(image).resize(size, resample=_BICUBIC))
         factor = self.patch_size * self.merge_size
         new_h, new_w = _smart_resize(
             image.shape[0], image.shape[1], factor, self.min_pixels, self.max_pixels
@@ -250,8 +260,15 @@ class _WallossImageProcessor:
         )
         return flattened
 
-    def resize(self, images: Sequence[np.ndarray]):
-        processed = [self._resize_one(image) for image in images]
+    def resize(
+        self, images: Sequence[np.ndarray], resolutions: Sequence[int] | None = None
+    ):
+        """Resize like wall-x: per-view training resolution (-1: none), then smart_resize."""
+        resolutions = [-1] * len(images) if resolutions is None else resolutions
+        processed = [
+            self._resize_one(image, int(resolution))
+            for image, resolution in zip(images, resolutions)
+        ]
         shapes = {image.shape for image, _ in processed}
         if len(shapes) != 1:
             raise ValueError(
@@ -266,8 +283,10 @@ class _WallossImageProcessor:
             ),
         }
 
-    def __call__(self, images: Sequence[np.ndarray]):
-        resized = self.resize(images)
+    def __call__(
+        self, images: Sequence[np.ndarray], resolutions: Sequence[int] | None = None
+    ):
+        resized = self.resize(images, resolutions)
         return {
             "pixel_values": np.ascontiguousarray(
                 np.concatenate(
@@ -279,26 +298,45 @@ class _WallossImageProcessor:
         }
 
 
+def _training_config(model_dir: Path) -> tuple[Path, Any] | None:
+    """The checkpoint's training config (config.yml), if it ships one."""
+    for name in ("config.yml", "config.yaml"):
+        path = model_dir / name
+        if path.is_file():
+            try:
+                import yaml
+            except ImportError as error:  # pragma: no cover - declared project dependency
+                raise ImportError(
+                    "WallossPolicy requires PyYAML to read config.yml"
+                ) from error
+            return path, yaml.safe_load(path.read_text()) or {}
+    return None
+
+
+def _training_resolution(model_dir: Path) -> dict[str, int]:
+    """Per-camera training resolution, read like wall-x (`data` first)."""
+    training = _training_config(model_dir)
+    if training is None or not isinstance(training[1], Mapping):
+        return {}
+    document = training[1]
+    data = document.get("data")
+    if not isinstance(data, Mapping):
+        data = {}
+    resolution = data.get("resolution", document.get("resolution"))
+    if not isinstance(resolution, Mapping):
+        return {}
+    return {str(camera): int(value) for camera, value in resolution.items()}
+
+
 def _checkpoint_state_bins(model_dir: Path) -> int:
     """Resolve state-token bins from checkpoint metadata, with legacy fallback."""
     documents = []
     config_json = model_dir / "config.json"
     if config_json.is_file():
         documents.append((config_json, json.loads(config_json.read_text())))
-    config_yaml = None
-    for name in ("config.yml", "config.yaml"):
-        candidate = model_dir / name
-        if candidate.is_file():
-            config_yaml = candidate
-            break
-    if config_yaml is not None:
-        try:
-            import yaml
-        except ImportError as error:  # pragma: no cover - declared project dependency
-            raise ImportError(
-                "WallossPolicy requires PyYAML to read config.yml"
-            ) from error
-        documents.append((config_yaml, yaml.safe_load(config_yaml.read_text()) or {}))
+    training = _training_config(model_dir)
+    if training is not None:
+        documents.append(training)
 
     for path, document in documents:
         if not isinstance(document, Mapping):
@@ -340,6 +378,8 @@ class _WallossProcessor:
         self.native_rgb = bool(native_rgb)
         self.tokenizer = _WallossTokenizer(model_dir)
         self.image_processor = _WallossImageProcessor(model_dir)
+        resolution = _training_resolution(model_dir)
+        self.resolutions = tuple(resolution.get(name, -1) for name in self.camera_names)
         self.action_token_id = self.tokenizer.token_to_id(_ACTION)
         self.image_pad_token_id = self.tokenizer.token_to_id(_IMAGE_PAD)
         self.propri_min, self.propri_delta = _load_normalizer(
@@ -403,19 +443,12 @@ class _WallossProcessor:
             images.append(image)
 
         processed = (
-            self.image_processor.resize(images)
-            if getattr(self, "native_rgb", False)
-            else self.image_processor(images)
+            self.image_processor.resize(images, self.resolutions)
+            if self.native_rgb
+            else self.image_processor(images, self.resolutions)
         )
         grids = np.asarray(processed["image_grid_thw"])
-        if grids.shape != (2, 3) or not np.array_equal(
-            grids, np.array([[1, 18, 18]] * 2)
-        ):
-            raise ValueError(
-                f"WallOSS runtime currently requires two 18x18 image grids; got {grids.tolist()} "
-                "(256x256 input images smart-resize to the required 252x252)"
-            )
-        if getattr(self, "native_rgb", False):
+        if self.native_rgb:
             vision = np.ascontiguousarray(processed["rgb_u8"], dtype=np.uint8)
         else:
             vision = np.ascontiguousarray(processed["pixel_values"], dtype=np.float32)
@@ -503,6 +536,7 @@ class WallossPolicy:
         device="cuda:0",
         precision="auto",
         tactics=None,
+        autotune=False,
         norm_key="x2_normal",
         action_dim=None,
         image_keys=_DEFAULT_IMAGE_KEYS,
@@ -547,6 +581,7 @@ class WallossPolicy:
                 device=device,
                 precision=precision,
                 **({"tactics": str(tactics)} if tactics else {}),
+                autotune=bool(autotune),
                 sampling_seed=int(seed),
             )
         width = int(action_dim) if action_dim is not None else int(model_runner.action_dim)
@@ -563,9 +598,10 @@ class WallossPolicy:
             )
         native_rgb = False
         if processor is None:
-            if len(image_keys) != 2 or len(camera_names) != 2:
+            if not image_keys or len(image_keys) != len(camera_names):
                 raise ValueError(
-                    "WallOSS runtime currently requires exactly two camera views"
+                    "WallOSS needs one camera name per image key, got "
+                    f"{len(image_keys)} keys and {len(camera_names)} names"
                 )
             native_rgb = bool(getattr(model_runner, "accepts_rgb_u8", False))
             processor = _WallossProcessor(
@@ -616,8 +652,12 @@ class WallossPolicy:
             "action_mask": action_mask,
         }
         if self._native_rgb:
+            # All views share one resized size; declare its patch grid.
+            views, height, width = vision.shape[:3]
+            patch = int(self.model_runner.patch_size)
+            grids = np.full((views, 3), (1, height // patch, width // patch), np.uint32)
             normalized = self.model_runner.infer_rgb(
-                vision, "nhwc", token_ids, **inference_kwargs
+                vision, "nhwc", token_ids, image_grid_thw=grids, **inference_kwargs
             )
         else:
             normalized = self.model_runner._infer_patches(

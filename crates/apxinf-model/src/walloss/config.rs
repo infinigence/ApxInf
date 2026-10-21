@@ -391,6 +391,33 @@ mod tests {
     }"#;
 
     #[test]
+    fn workspace_covers_long_prefix_live_tensor_floor() {
+        let config = WallossConfig::from_json_str(CONFIG).unwrap();
+        for prefix in [243, 32768, 128000 - config.action.action_horizon] {
+            // Last language MLP: all KV + gate/up + activated coexist.
+            let kv = 4 * config.text.num_layers * config.text.num_kv_heads
+                * config.text.head_dim * (prefix + config.action.action_horizon);
+            let mlp = 6 * config.text.intermediate_size * prefix;
+            let capacity = crate::walloss::workspace::workspace_bytes(&config, 648, prefix).unwrap();
+            assert!(capacity > kv + mlp, "prefix={prefix}: {capacity} <= {}", kv + mlp);
+        }
+    }
+
+    #[test]
+    fn workspace_tracks_checkpoint_dimensions_and_rejects_overflow() {
+        let mut config = WallossConfig::from_json_str(CONFIG).unwrap();
+        let budget = |c: &WallossConfig| crate::walloss::workspace::workspace_bytes(c, 648, 32768).unwrap();
+        let original = budget(&config);
+        config.text.num_layers *= 2;
+        assert!(budget(&config) > original);
+        let deeper = budget(&config);
+        config.text.intermediate_size *= 2;
+        assert!(budget(&config) > deeper);
+        assert!(crate::walloss::workspace::workspace_bytes(&config, usize::MAX, 243).is_err());
+        assert!(crate::walloss::workspace::workspace_bytes(&config, 648, usize::MAX).is_err());
+    }
+
+    #[test]
     fn parses_published_architecture() {
         let config = WallossConfig::from_json_str(CONFIG).unwrap();
         assert_eq!(config.text.head_dim, 128);
