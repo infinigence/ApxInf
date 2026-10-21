@@ -196,7 +196,7 @@ All backbone and action-head inference weights and NVIDIA's checkpoint
 processor metadata remain in the GR00T checkpoint. `backbone=` is an optional
 local override for existing deployments. Loading does not search environment
 paths or checkpoint export paths, or download missing resources. See the
-[GR00T loading contract](../../doc/gr00t-n1.7.md#loading) for the required assets
+[GR00T loading contract](../../doc/models/gr00t.md#loading) for the required assets
 and an FP8 calibration bound to the selected model/processor metadata. Profiles
 without the versioned GR00T processor identity require recalibration for both
 prepared resources and explicit `backbone=` snapshots.
@@ -254,7 +254,7 @@ rounding near a bin edge can change the prompt tokens.
 
 Tokenizer execution is native, while prompt/state orchestration and action
 postprocessing remain Python. The shared lifecycle and ownership rules are in
-[Model Lifecycle and Contracts](../../doc/model-lifecycle.md).
+[Model Lifecycle and Contracts](../../doc/reference/model-lifecycle.md).
 
 | Contract | PI0.5 | WallOSS |
 | --- | --- | --- |
@@ -280,6 +280,9 @@ responsibilities. These differences must survive a future native prompt builder.
 pip install -e '.[test]'
 pytest tests/        # offline; tokenizer + real-model tests skip without a checkpoint
 ```
+
+The repo-level equivalent, which also runs the root `tests/` suite:
+`just test-py`.
 
 The `test` extra holds reference implementations, never runtime dependencies: the
 native tokenizer differential tests need the Python `sentencepiece` reference and

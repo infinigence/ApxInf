@@ -1,0 +1,428 @@
+# Adding a New Model to ApxInf
+
+Use this guide after the reference model runs and its semantics are understood.
+Follow [the porting workflow](../guides/porting-workflow.md) for evidence and acceptance,
+[Model Lifecycle and Contracts](../reference/model-lifecycle.md) for stages and data contracts,
+[the model-layer architecture](../reference/model-layer-architecture.md) for ownership and
+dependencies, [Model Execution Wiring](../reference/model-execution-wiring.md) for composing
+the maintained device path, and [the kernel guide](../guides/adding-new-kernels.md) for
+genuine backend gaps. For a VLA, the *body* side of deployment — which
+observation keys a client sends, how state is routed, how a named robot fixes
+them together — is not needed to land a model here. A policy registered in
+`apxinf.policies` is servable on its own, with the caller naming its own wire
+keys.
+
+## Start with a separate model directory
+
+Every model implementation starts in its own directory:
+
+```text
+crates/apxinf-model/src/<model>/
+```
+
+Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
+most code looks similar. Register the new directory from `lib.rs` and
+`builtin.rs`; keep model detection in the existing registry/`AutoModel` path.
+
+The first correct implementation should be self-contained. Copying substantial
+code from the closest model is preferable to inventing a shared abstraction
+before the second implementation exposes the real common boundary. Preserve
+provenance when copying and rename model-specific concepts immediately.
+
+Model-family directories are private architecture modules. Follow the
+[dependency matrix](../reference/model-layer-architecture.md#per-model-isolation): inspect
+and copy from a close implementation when useful, but keep the new product code
+independent of other families. Run
+`scripts/check_model_family_boundaries.sh` before review.
+
+## Choose the runtime contract
+
+### LLM and VLM
+
+Autoregressive text models and vision-language models implement `LlmTrait`.
+VLMs use `LlmInput` and override `prefill` for processor output, image-token
+placement, multimodal positions, or other model-specific input semantics. They
+reuse the shared token generation and sampling pipeline.
+
+Keep `forward(token_ids, start_pos)` full: its result is
+`[seq_len, vocab_size]`. A generation-oriented `prefill(LlmInput)` may consume
+the complete prompt into state and return only `[1, vocab_size]`; the shared
+sampler takes the last row. Qwen3's native prefill evaluates cache-only chunks
+before its final token, and MiniCPM5 applies its head only to the final prompt
+row. Specialized speculative generation belongs to the request-level hook.
+
+A small model commonly starts with:
+
+```text
+<model>/
+  mod.rs
+  config.rs
+  weights.rs
+  general.rs
+```
+
+Add files such as `vision.rs`, `vision_weights.rs`, or `decode_graph.rs` only
+when the architecture requires them.
+
+The native [Qwen3](../../crates/apxinf-model/src/metal_qwen3/README.md) and
+[MiniCPM5](../../crates/apxinf-model/src/metal_minicpm5/README.md) MLX families use their
+own `config`, `weights` and `model` modules, plus family-specific math/state
+files. They demonstrate family ownership and explicit state, not a license to import another family's
+model or to generalize its accepted hardware/geometry.
+
+### VLA
+
+VLA models implement `VlaRuntime`; they do not use the categorical token
+generation loop. Their public contract is an observation-to-action inference
+path with model-specific state, image, language, noise, schedule, and action
+semantics.
+
+PI0.5 is the maintained VLA structural reference. Use the
+[module responsibility table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities)
+to assign ownership; this is its current layout, not a required number of files:
+
+```text
+pi05/
+  mod.rs                 registration and deliberate exports
+  config.rs / load.rs     config validation, variant selection, construction
+  backend.rs             safe CUDA imports and type aliases
+  math.rs                CPU helpers/reference semantics
+  model/
+    mod.rs               Pi05Model<B>: shared forward computation and flow schedule
+    model.rs           ModelVariant: loaded precision-specific dispatch
+    blocks/              layer/backbone implementation and resource requirements
+    calibration.rs       model-specific diagnostic traversal
+  model_runner/
+    runner.rs            Pi05ModelRunner: VlaRuntime, input/RNG binding, plan cache
+    prepare.rs           workspace allocation, warmup, capture and resource lifetime
+  weights/               host mapping, packing, device weights, calibration scales
+```
+
+Create the new model's own directory and equivalent responsibilities. Do not
+place its state encoder, action decoder, denoising schedule, embodiment logic,
+or workspace inside `pi05/`.
+
+SmolVLA is the current compact BF16-default example of that split (with an
+optional FP16 GEMM variant for Xavier tensor cores):
+`crates/apxinf-model/src/smolvla/` owns the SigLIP/VLM/expert forward path and
+flow schedule; `python/apxinf/apxinf/policies/impls/smolvla.py` owns the native
+HF tokenizer, state/action normalization, two-camera resize-with-padding, and
+action unnormalization. Its maintained latency and LIBERO entry points are
+`scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
+
+Inspect or copy PI0.5's model/Blocks and runner
+structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
+those roles. Preserve static precision specialization and keep one owner of
+forward order. A family with one implementation needs neither `ModelVariant`
+nor a generic Blocks abstraction merely to resemble PI0.5.
+
+Choose the model input seam explicitly. The policy or application adapter owns
+raw observation-container decoding, robot field and camera mapping, resize when
+it is outside the declared model input representation, and experimental or
+user-defined transforms. Policy semantics also stay outside the low-level
+model: prompt and token construction, state/action normalization, action-mask
+construction, and final action postprocessing.
+
+The Rust runtime may accept either already canonical patch tensors or a
+declared intermediate representation such as resized RGB `u8`. When
+`VlaContract` advertises resized RGB support, checkpoint-fixed model tensor
+canonicalization after that seam may belong to the Rust/CUDA runtime. Examples
+include pixel normalization, temporal duplication, patchification, merge
+ordering, layout conversion, and dtype conversion. These operations may be
+prepared and CUDA-graph captured with the model computation. RGB support does not
+make the low-level model responsible for arbitrary image containers, robot
+observation dictionaries, prompt construction, or action unnormalization.
+
+## Implement by responsibility
+
+### Configuration
+
+Parse the reference checkpoint configuration without forcing it into a
+Llama-shaped shared config. Validate dimensions and architecture invariants at
+load time. Defaults are acceptable only when the reference format defines the
+same defaults.
+
+### Weights
+
+Map checkpoint keys explicitly. Record every transpose, reshape, concatenation,
+packing operation, tied weight, and precision conversion. Hugging Face linear
+weights commonly require `[out, in]` to `[in, out]` transposition, while
+higher-rank convolutional weights require semantics-aware flattening.
+
+Keep source weights, device weights, and precision-specific packed weights as
+separate concepts when their lifecycles differ. Perform stable transformations
+once during load, not in every inference.
+
+### Model mathematics
+
+Express the architecture as model-level composition of safe backend operators.
+The model owns layer ordering, residual structure, attention layout, schedules,
+and fusion selection. The backend owns device management and individual kernel
+APIs; it never imports model types.
+
+Use `backend.rs` as the model directory's CUDA seam when the implementation
+needs concrete CUDA facilities. Portable operations use `dyn Backend`; a
+specialized fast path may recover a concrete backend for capabilities that do
+not belong on the portable trait. Trait is the floor; concrete types are the
+ceiling.
+
+For Metal, use a `metal_<family>` module and registration for native composition;
+the provisional cross-backend design is not a prerequisite. Preserve measured
+performance and reference semantics when choosing the boundary.
+
+For MLX, the concrete safe seam is `MlxBackend` with `Array`, `Stream` and
+`Compiled` from `apxinf-mlx`. Family code composes safe operations and explicit
+casts; only the backend handles native FFI and unsafe custom Metal calls.
+`MlxBackend::from_array` materializes public contiguous tensor boundaries;
+canonical `[in,out]` weights may retain backend-private strided views. A
+quantized representation is a separately prepared private artifact with an
+explicit selection rule, not a new meaning for canonical tensor dimensions.
+
+Do not begin coverage discovery from `dyn Backend` alone. First inspect the
+closest maintained model/Blocks implementation at the requested precision and the safe interfaces
+under `apxinf_cuda::kernels`, especially fused normalization/residual,
+QKV/RoPE/cache, attention, activation, and GEMM paths. Complete the execution
+ledger from [Model Execution Wiring](../reference/model-execution-wiring.md) before treating
+an operation as missing.
+
+### Execution and preparation
+
+Separate model computation from execution state. A model runner owns or retains
+the model/weights, caches, workspaces, CUDA graphs and prepared profiles. A
+prepared object must bind every shape or condition that changes allocation,
+dispatch, or captured execution.
+
+MLX text families own their KV, position and fallible `prepare` methods. They
+prepare compiled local/block/step functions with explicit changing array
+inputs/outputs, then evaluate all required logits/state before committing a
+position change. Infallible `prewarm_decode` retains a preparation error for
+the next fallible call; it cannot pretend preparation succeeded. See
+[MLX execution](../design/mlx-backend.md#prepared-compiled-execution) for bounded lazy
+allocations, thread ownership and the exact current compilation scopes.
+CUDA Graph capture requirements below retain their original meaning.
+
+Expose text readiness through `LlmTrait::preparation_status` with actual
+`TextPreparationStatus` scopes and admitted shapes. Report no successful
+compiled scopes for unprepared/invalidated states; do not infer readiness from
+the variant name or a non-null compiled handle. Keep that data interface
+separate from VLA `PreparedInference` and its execution policy.
+
+Preparation queries model/Blocks requirements, allocates stable resources,
+and warms up the real model computation until native plans/tactics are stable
+before capture. Configuration validation
+alone is not preparation. Keep a CPU implementation inside a layer only as a
+named correctness scaffold with an exit criterion. For an accelerator target,
+replace it through an existing safe device path or `adding-new-kernels.md`
+before completion; a repeated host escape is unfinished implementation rather
+than ordinary best-effort optimization debt.
+
+For VLA models, include state shape, image/grid structure, masks, action horizon,
+action width, embodiment/category selection, and stochastic input shape where
+they affect execution.
+
+Keep request values distinct from plan compatibility. Current `InferenceSpec`
+contains token count and image layout only; validate additional family invariants
+in the runner or its profile key. Implement `PreparedInference::spec` and `run`;
+declare the actual `status`. Implement `prepare_with_policy`, `prepare_for` and
+`clear_prepared` when adopting the explicit preparation contract. Their defaults
+are unsupported, not successful readiness. Verify mode/fallback reporting,
+incompatible inputs, tuning-store replacement/generation, retained-plan lifetime,
+and output overwrite behavior through native calls. The
+[PI0.5 contract](../archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
+is the executable reference; new-family support needs its own evidence.
+
+### Registration and public integration
+
+Complete these steps in the new family's own code and the existing registries:
+
+1. Export the family module from `crates/apxinf-model/src/lib.rs`. Implement a
+   `registry::ModelFactory` loader and wire its registration through
+   `builtin::register_builtin_models`, with the correct feature gate and names.
+   `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
+   metadata; test both explicit selection and the supported detection path.
+   For Metal, the current `mlx` feature registers `metal_qwen3` and
+   `metal_minicpm5`; `AutoModel` resolves the Metal prefix. MiniCPM5 must be
+   explicitly named because its official checkpoint identifies as `llama`.
+2. For LLM/VLM, return `LoadedModel::text(Box<dyn LlmTrait>)` and exercise shared
+   generation. For VLA, implement `VlaRuntime` on the family runner and return
+   `LoadedModel::Vla(Box::new(runner))`. Required methods include `contract`,
+   `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
+   deliberately instead of inheriting unsupported defaults unknowingly.
+3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Use `VlaRequest` for observation, provided latent or RNG key, and applicable
+   metadata. Keep family config parsing in the loader. Check the
+   [current option limits](../reference/model-layer-architecture.md#current-coverage-and-port-decisions)
+   before adopting `model_variant` or binding config overrides.
+4. Reuse the generic native `ModelRunner` binding. Add a
+   `python/apxinf/apxinf/policies/impls/<family>.py` policy implementing the
+   policy contract, register it with `register_policy`, and import it from
+   `policies/__init__.py`. `AutoPolicy` must discover it by supported metadata
+   or explicit `model_type`. Implement family input/output pipelines and
+   `model_runner` injection; a new Python network or native binding class is
+   unnecessary unless the existing public tensor contract cannot express it.
+5. Test the complete chain below with real inputs. Rebuild the extension
+   together with Python when the binding changes. Ensure checkpoint validation
+   and server/policy selection support the new family; a private benchmark
+   executable alone is not public integration.
+
+```text
+AutoPolicy → <Family>Policy → apxinf.ModelRunner (= apxinf_py.ModelRunner)
+  → Rust AutoModel → registry loader → LoadedModel::Vla(<Family>ModelRunner)
+  → <Family>Model / Blocks → safe backend operations
+```
+
+AutoPolicy and AutoModel are construction entry points, not per-request layers.
+Policy `infer` preprocesses, calls the existing binding and decodes the result.
+Keep robot adaptation, prompt, state/action normalization and output context at
+that boundary. Checkpoint-fixed conversion after the declared RGB/tensor input
+seam remains in the native model computation. See the
+[current ownership table](../reference/model-layer-architecture.md#current-module-names-and-responsibilities).
+
+## Add static-FP8 calibration
+
+Use `apxinf.calibration.CalibrationRunner` for representative-data activation
+calibration. The runner is model-neutral: it iterates public Observations,
+aggregates statistics, validates coverage, creates scales, and emits the
+manifest. Do not add a model branch to the runner or copy those operations into
+a model command.
+
+The family policy/calibration integration publishes its **actual FP8 execution plan** as stable
+`QuantizedOperator` values. The default plan captures the input of every
+quantized `linear` or `gemm` operator. It deliberately does not scan for every
+module whose class or name happens to contain `Linear`; BF16 operators and
+operators absent from the FP8 execution path do not require a scale.
+
+A conventional model needs only a family name:
+
+```python
+spec = QuantizationSpec(model_family="new_model")
+plan = spec.plan_for(policy.fp8_execution_plan())
+```
+
+Keep the model quantization specification thin. Use its overrides only for
+real execution exceptions:
+
+- `excluded_outputs` keeps declared outputs/layers in BF16;
+- `shared_scales` maps multiple FP8 consumers to one capture-site scale;
+- `custom_captures` declares a fused/custom operator's stable site and
+  statistic;
+- `default_statistic` changes the conventional sites from `absmax` when the
+  quantization algorithm requires it.
+
+Every quantized operator whose kind is not a conventional `linear` or `gemm`
+must have a `custom_captures` entry. Planning fails when the override is absent;
+an exceptional FP8 consumer must never disappear from coverage silently. Shared
+sites must also declare one consistent statistic across all consumers.
+
+Supported statistics are `absmax` and an explicit `percentile:P` with
+`0 < P <= 100`. The model-side collector must calculate the statistic declared
+for each site; the common runner retains and aggregates scalar records rather
+than full activations. Add another statistic only with its aggregation and
+runtime-consumption contract.
+
+Capture-site names are artifact compatibility identifiers. Derive them from
+logical model structure (for example `blocks.3.qkv.input`), never object IDs,
+GPU addresses, hook order, or transient module paths. Renaming a stable site is
+a calibration-schema migration.
+
+`Fp8ExecutionPlan` and `QuantizationSpec` are Python calibration contracts;
+they are not methods supplied by Rust `VlaRuntime`. The current Rust hooks are
+`calibration_plan` and `calibration_amax`, both unsupported by default. Adapt
+native observations into the Python plan in the family policy, as needed.
+
+The policy implements the public `collect_calibration(observation,
+context)` seam. It owns normal preprocessing and model-specific deterministic
+inputs. A dataset adapter may translate an external record with
+`adapt_records`, but it must return only the same public Observation accepted by
+inference; it must not resize images, tokenize, normalize, generate noise, or
+construct hidden tensors.
+
+Before writing a manifest, validation requires every planned capture site to be
+observed, rejects unknown observations, and rejects any generated scale without
+an FP8 consumer. A custom site missing from execution therefore fails closed.
+Dynamic-activation FP8 plans are classified as calibration-free: the runner
+does not iterate the dataset and returns no static profile.
+
+Override the defaults only when the quantized model implementation proves they are wrong:
+fused operators need explicit capture boundaries, excluded BF16 layers consume
+no FP8 scale, tied kernels may share one scale, and algorithms beyond static
+per-tensor FP8 may require different statistics. Tests should exercise the
+public Observation-to-manifest seam and consumer map, not collector
+registration, hooks, or pointers.
+
+PI0.5's pre-existing schema serializes only its native runtime-validated site
+list. `CalibrationPlan.runtime_validated_sites` is the compatibility adapter for
+that legacy contract; do not use it for a newly integrated model. New schemas
+must serialize and test the consumer map generated from `Fp8ExecutionPlan`.
+
+## YAGNI and refactoring
+
+Apply YAGNI when any of these is true:
+
+- only one maintained model needs the behavior;
+- the apparent commonality is based on names rather than identical semantics;
+- a second model is still experimental or its shapes and lifecycle are unknown;
+- the proposed abstraction would add optional fields, family branches, or a
+  configuration language for hypothetical users;
+- copying keeps failures local and makes reference comparison easier.
+
+In those cases, keep the implementation in the model directory. Duplication is
+an explicit temporary design choice, not an invitation to hide it in the
+backend.
+
+Consider refactoring only when:
+
+- at least two maintained models contain the same stable semantics;
+- both implementations have independent correctness evidence;
+- the shared dependency direction is model → model-neutral helper/backend;
+- the extracted API has fewer concepts than either caller and needs no
+  model-family switch;
+- changes to one copy repeatedly require the identical change in the other.
+
+Extract the smallest proven seam. Good candidates are pure tensor
+transformations, checkpoint utilities with identical formats, or genuinely
+model-neutral operators. Schedules, layer topology, workspace layouts, and
+precision dispatch normally remain model-specific until repeated evidence says
+otherwise.
+
+## Kernel decisions
+
+Match repeated model sequences to existing fused safe interfaces first, then
+compose device primitives and layouts. A missing dtype, layout, shape, mask, or
+semantic variant may require backend work, but the new API must be
+model-neutral. Follow [Adding New Kernels](../guides/adding-new-kernels.md) and return to
+the original model references for operator replay.
+
+## Verification
+
+Verify progressively:
+
+1. configuration and checkpoint identity;
+2. every weight transformation;
+3. representative operator and layer checkpoints;
+4. full deterministic output against the reference;
+5. registered Rust loading path;
+6. Python policy or serving path when in scope;
+7. requested device and precision combinations;
+8. latency and memory, reported separately from correctness.
+
+Temporary capture and replay programs belong in the
+[private port workspace](../guides/porting-workflow.md#private-port-workspace). Commit only
+maintained product tests or examples whose purpose remains after the port is
+complete.
+
+## Completion criteria
+
+Apply the [accelerator acceptance contract](../reference/model-execution-wiring.md#accelerator-port-acceptance)
+when completing a new GPU port. The model has its own directory, uses the correct runtime contract, respects the
+model/backend boundary, loads through the maintained registry, passes declared
+numerical tolerances through the public path, has no accelerator hot-path host
+escapes, verifies the required
+prepared/static/captured execution, reports functional and optimization status
+separately, reports unsupported cases clearly, and introduces no speculative
+shared abstraction. Explicit performance release gates remain mandatory;
+otherwise optimization is best effort.
+A concrete operator/capture blocker is unfinished port work, not completion.
+Update the family's capability documentation and the shared registry/interface
+documentation in the same change; historical performance or another family's
+prepared-plan tests do not establish support for the new family.

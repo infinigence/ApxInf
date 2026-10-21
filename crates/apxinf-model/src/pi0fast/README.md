@@ -75,7 +75,7 @@ activation scales from a calibration profile. An autoregressive argmax decoder h
 no error budget to spend on a guessed scale, so FP8 **requires** a profile
 (`<model-dir>/calibration.json`, or an explicit `calibration=`) and refuses to
 load without one; `APXINF_PI0FAST_FP8_ACTIVATION_SCALE` overrides that for
-bring-up and prints a warning. See `doc/pi0fast-fp8-calibration.md`.
+bring-up and prints a warning. See `../../../../doc/guides/fp8-calibration.md`.
 
 ## Accuracy: LIBERO-10
 
@@ -277,7 +277,7 @@ MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
   --results-jsonl out/libero_10_fp8.jsonl --summary-json out/libero_10_fp8.summary.json
 
 # latency, and the fixed / per-step split
-python scripts/bench_pi0_fast.py --model-dir <checkpoint> \
+just bench pi0_fast --model-dir <checkpoint> \
   --state-key observation/state --mode all \
   --frames devlocal/pi0-fast/results/raw/libero_frames.npz \
   --out devlocal/pi0-fast/results/bench_pi0_fast.json

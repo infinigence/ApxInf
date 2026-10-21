@@ -5,7 +5,7 @@
 Preparation and graph capture have different owners. GEMM and Attention may own persistent native executions because they select providers and configurations. Fixed operators enqueue directly on the active stream. A model or execution phase owns the CUDA Graph; use `PreparedPhase` when a phase contains both direct fixed operators and persistent GEMM/Attention executions.
 
 - Current public interfaces and mathematical semantics: [L3 operator catalog](cuda-operator.md)
-- Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
+- Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/guides/adding-new-kernels.md)
 
 The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
 The BF16 MLP helper remains available as
@@ -211,7 +211,7 @@ The graph retains the executions and storage used during capture. The recipe key
 | Add a semantic | Rust Args/normalize/export; ABI enum/Spec; independent registry; fallback; catalog/tests | new fields, provider/kernel, ABI version; exact key/autotune when tuning is required | reuse another semantic's selection domain |
 | Change candidate behavior/performance | implementation version or a build fingerprint covering the change; regression tests | recipe schema/key version | continue reusing old recipes that are no longer equivalent |
 
-Every candidate must be tested on the inputs it claims to support, not only when it becomes the final autotune winner. See [Adding New Kernels](../../doc/adding-new-kernels.md) for complete testing and acceptance steps.
+Every candidate must be tested on the inputs it claims to support, not only when it becomes the final autotune winner. See [Adding New Kernels](../../doc/guides/adding-new-kernels.md) for complete testing and acceptance steps.
 
 ### FP8 GeGLU migration coverage
 

@@ -27,20 +27,21 @@ The VLA runtimes are CUDA-only, so real inference needs the `cuda` feature and a
 CUDA machine (e.g. Thor). Without CUDA the module still imports and reports its
 shape contract, but model loading errors.
 
+Build and install the binding plus the frontend from the repository root:
+
 ```sh
-# In this crate directory. --features cuda is additive to pyproject's
-# extension-module feature.
-CARGO_TARGET_DIR=../../target/wheel maturin build --release --features cuda --auditwheel skip
-pip install --force-reinstall ../../target/wheel/wheels/apxinf_py-*.whl
+just build-py            # or: APXINF_PLATFORM=thor just build-py
 ```
 
-On Thor set the usual environment (see repo memory): `APXINF_CUDA_ARCH=sm_110`,
-`CUDA_PATH`, proxy, and checkpoint path.
+On Thor the platform preset (`configs/platforms/thor.env`) already sets
+`APXINF_CUDA_ARCH=sm_110` and the nvcc parallelism cap; set `CUDA_PATH` only if
+CUDA is not at `/usr/local/cuda`.
 
-Compile-check only (no CUDA, no link):
+Compile-check the whole workspace including cfg(feature="cuda") code (no GPU
+required; the CUDA build scripts skip kernel compilation without a toolkit):
 
 ```sh
-cargo check -p apxinf-py
+just check
 ```
 
 Device parsing also accepts `metal:N` and its `mlx:N` alias; the canonical
