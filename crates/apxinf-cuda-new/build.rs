@@ -306,6 +306,9 @@ fn main() {
         "pointwise.cu",
         "rope.cu",
         "gather.cu",
+        "volume.cu",
+        "recurrence.cu",
+        "reduction.cu",
         "quantization.cu",
     ]
     .map(|source| adapters.join(source))

@@ -14,6 +14,7 @@ pub use context::CudaContext;
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use graph::{capture, CapturedGraph};
 pub use ops::{
+    channel_l2_norm, ChannelL2NormArgs,
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, attention, bias_residual,
     bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, concat_rows, decode_rope,
     gather, kv_cache_attention, layer_norm, multimodal_rope, packed_qkv_attention, pointwise,
@@ -30,6 +31,7 @@ pub use phase::PreparedPhase;
 pub use stream::CudaStream;
 
 pub mod ops;
+pub use ops::{PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry};
 
 /// Whether the SM110 native NVFP4 GEMM+SwiGLU implementation is available.
 ///
@@ -44,3 +46,7 @@ pub const NVFP4_GEMM_SWIGLU: bool = cfg!(apxinf_nvfp4_gemm_swiglu);
 /// Like [`NVFP4_GEMM_SWIGLU`], this is a zero-cost compile-time constant
 /// carrying a build-time cfg across the crate boundary.
 pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);
+
+pub use ops::{F64RecurrenceState,PreparedRecurrence,RecurrenceCoefficients};
+
+pub use ops::PreparedIndexedMean;

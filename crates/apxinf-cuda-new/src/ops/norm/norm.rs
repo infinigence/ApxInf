@@ -4,6 +4,24 @@ use super::contracts::{normalize, RawArgs, Semantic};
 use super::launch;
 use crate::CudaContext;
 
+/// BF16 channel L2 normalization with an explicit rounding recipe:
+/// BF16 L2 norm, clamped denominator, BF16 division, BF16 multiplication by
+/// sqrt(cols), then BF16 multiplication by the learned channel weight.
+/// This uses max(norm, eps), not sqrt(mean(x*x) + eps).
+pub struct ChannelL2NormArgs<'a> {
+    pub input: &'a Tensor,
+    pub weight: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub eps: f32,
+}
+
+pub fn channel_l2_norm(ctx: &CudaContext, args: ChannelL2NormArgs<'_>) -> Result<()> {
+    execute(ctx, RawArgs { semantic: Semantic::ChannelL2, input: args.input,
+        bias: None, residual: None, weight: Some(args.weight), norm_bias: None,
+        norm_style: None, gate_style: None, hidden: None, normalized: Some(args.out),
+        eps: args.eps, output_scale: 1.0 })
+}
+
 /// Inputs for ordinary RMS normalization.
 pub struct RmsNormArgs<'a> {
     pub input: &'a Tensor,

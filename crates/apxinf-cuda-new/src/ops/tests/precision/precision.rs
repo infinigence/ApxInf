@@ -6,7 +6,7 @@
 //! depend on or prescribe a candidate's internal implementation.
 
 use super::framework::{
-    bf16_bits_tensor, bytes_tensor, f16_tensor, f32_tensor, scales, tensor, zeros_tensor,
+    bf16_bits_tensor, bytes_tensor, f16_tensor, f32_tensor, scales, tensor, values, zeros_tensor,
 };
 use super::l3_behavior::{attention_reference, kv_cache_attention_reference};
 use super::*;
@@ -686,4 +686,76 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
             .unwrap();
         }
     }
+}
+
+#[path = "torch_video_fixtures.rs"]
+mod video_fixture;
+
+#[test]
+fn channel_l2_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let input=bf16_bits_tensor(0,vec![2,96],video_fixture::L2_INPUT);
+    let weight=bf16_bits_tensor(0,vec![96],video_fixture::L2_WEIGHT);
+    let mut output=zeros_tensor(0,vec![2,96],DType::BF16);
+    crate::channel_l2_norm(&ctx,crate::ChannelL2NormArgs{input:&input,weight:&weight,out:&mut output,eps:1e-12}).unwrap();
+    ctx.synchronize().unwrap();
+    let expected:Vec<_>=video_fixture::L2_OUTPUT.iter().map(|&v|half::bf16::from_bits(v).to_f32()).collect();
+    assert_eq!(values(&output),expected);
+}
+#[test]
+fn multiply_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let a=bf16_bits_tensor(0,vec![1,4],video_fixture::MULTIPLY_A);
+    let b=bf16_bits_tensor(0,vec![1,4],video_fixture::MULTIPLY_B);
+    let mut out=zeros_tensor(0,vec![1,4],DType::BF16);
+    let mut args=crate::PointwiseArgs::new(crate::PointwiseSemantic::Multiply,&a,&mut out);args.secondary=Some(&b);
+    crate::pointwise(&ctx,args).unwrap();ctx.synchronize().unwrap();
+    assert_eq!(values(&out),video_fixture::MULTIPLY_OUTPUT.iter().map(|&v|half::bf16::from_bits(v).to_f32()).collect::<Vec<_>>());
+}
+#[test]
+fn staged_rgb_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let bytes:Vec<_>=(0..768).map(|i|(i%256)as u8).collect();
+    let images=crate::CudaBuffer::alloc(768,0).unwrap();images.copy_from_host(&bytes).unwrap();
+    let mut out=zeros_tensor(0,vec![256,3],DType::BF16);
+    let mut args=crate::GatherArgs::rgb_to_patches(&images,&mut out,crate::GatherPatchGeometry{views:1,image_size:16,patch_size:1,nhwc:true});
+    args.semantic=crate::GatherSemantic::RgbToPatchesStaged;crate::gather(&ctx,args).unwrap();ctx.synchronize().unwrap();
+    let expected:Vec<_>=(0..768).map(|i|half::bf16::from_bits(video_fixture::RGB_STAGED[i%256]).to_f32()).collect();
+    assert_eq!(values(&out),expected);
+}
+#[test]
+fn f64_recurrence_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let initial=f32_tensor(0,vec![1,4],video_fixture::RECURRENCE_INITIAL);
+    let value=f32_tensor(0,vec![1,4],video_fixture::RECURRENCE_VALUE);
+    let out=f32_tensor(0,vec![1,4],&[0.;4]);
+    let state=crate::F64RecurrenceState::new(&ctx,4).unwrap();
+    state.prepare_reset(&ctx,&initial,&out).unwrap().enqueue().unwrap();
+    let update=state.prepare_update(&ctx,&value,&out,crate::RecurrenceCoefficients{a:1.,b:1.,c:0.25,d:1.}).unwrap();
+    for _ in 0..9 {update.enqueue().unwrap();}ctx.synchronize().unwrap();
+    assert_eq!(video_f32_values(&out),video_fixture::RECURRENCE_OUTPUT);
+}
+#[test]
+fn indexed_mean_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let input=f32_tensor(0,vec![1,33],&(0..33).map(|i|i as f32-15.).collect::<Vec<_>>());
+    let out=f32_tensor(0,vec![1,3],&[0.;3]);
+    crate::PreparedIndexedMean::new(&ctx,&input,&out,&[32,0,10,31,2,15,30,4,20,29,6,25]).unwrap().enqueue().unwrap();ctx.synchronize().unwrap();
+    assert_eq!(video_f32_values(&out),video_fixture::INDEXED_MEAN);
+}
+#[test]
+fn unfold3d_all_candidates_match_torch() {
+    let ctx=CudaContext::new(0).unwrap();
+    let input=bf16_bits_tensor(0,vec![2,2,3,2],video_fixture::UNFOLD_INPUT);
+    let history=bf16_bits_tensor(0,vec![1,2,3,2],video_fixture::UNFOLD_HISTORY);
+    let mut out=zeros_tensor(0,vec![6,24],DType::BF16);
+    crate::PreparedUnfold3d::new(&ctx,crate::Unfold3dArgs{input:&input,history:Some(&history),row_start:0,out:&mut out,
+        geometry:crate::Unfold3dGeometry{kernel:[3,2,2],stride:[1;3],padding_before:[0,1,0],padding_after:[0,0,1]}}).unwrap().enqueue().unwrap();ctx.synchronize().unwrap();
+    assert_eq!(values(&out),video_fixture::UNFOLD_OUTPUT.iter().map(|&v|half::bf16::from_bits(v).to_f32()).collect::<Vec<_>>());
+}
+
+fn video_f32_values(tensor: &Tensor) -> Vec<f32> {
+    let mut bytes=vec![0;tensor.size_in_bytes()];
+    crate::CudaBuffer::from_tensor(tensor).unwrap().copy_to_host(&mut bytes).unwrap();
+    bytes.chunks_exact(4).map(|b|f32::from_ne_bytes(b.try_into().unwrap())).collect()
 }

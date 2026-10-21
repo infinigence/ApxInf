@@ -52,6 +52,8 @@ typedef enum {
   APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL = 6,
   APXINF_NORM_SEMANTIC_ADA_GATE_RESIDUAL_RMS = 7,
   APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL = 8,
+  /* BF16 L2 clamp/divide/sqrt(cols)/weight, rounding after each operation. */
+  APXINF_NORM_SEMANTIC_CHANNEL_L2 = 9,
 } apxinf_norm_semantic_t;
 
 #define APXINF_NORM_SPEC_VERSION 1u

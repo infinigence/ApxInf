@@ -249,6 +249,9 @@ Complete these steps in the new family's own code and the existing registries:
    `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
    deliberately instead of inheriting unsupported defaults unknowingly.
 3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Override `VlaRuntime::initial_latent_shape()` when supplied noise has a
+   different geometry from the action output; see the
+   [runtime contract](model-layer-architecture.md#runtime-contracts).
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
    [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)

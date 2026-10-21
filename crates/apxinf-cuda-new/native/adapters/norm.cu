@@ -5,6 +5,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <cuda_fp8.h>
 
 namespace {
@@ -23,6 +24,7 @@ bool valid_alignment(uint32_t alignment) {
 bool writes_hidden(uint32_t semantic) {
   return semantic != APXINF_NORM_SEMANTIC_RMS &&
          semantic != APXINF_NORM_SEMANTIC_LAYER &&
+         semantic != APXINF_NORM_SEMANTIC_CHANNEL_L2 &&
          semantic != APXINF_NORM_SEMANTIC_ADAPTIVE_RMS;
 }
 
@@ -36,6 +38,7 @@ bool reads_residual(uint32_t semantic) { return writes_hidden(semantic); }
 
 bool reads_weight(uint32_t semantic) {
   return semantic == APXINF_NORM_SEMANTIC_RMS ||
+         semantic == APXINF_NORM_SEMANTIC_CHANNEL_L2 ||
          semantic == APXINF_NORM_SEMANTIC_LAYER ||
          semantic == APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_RMS ||
          semantic == APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_LAYER;
@@ -69,7 +72,7 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.output_dtype == APXINF_DTYPE_E4M3 &&
       writes_normalized(spec.semantic);
   if (spec.version != APXINF_NORM_SPEC_VERSION ||
-      spec.semantic > APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL ||
+      spec.semantic > APXINF_NORM_SEMANTIC_CHANNEL_L2 ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (spec.output_dtype != spec.dtype && !quantized_output) ||
       spec.rows <= 0 || spec.cols <= 0 ||
@@ -84,7 +87,8 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       !valid_alignment(spec.normalized_alignment)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Norm Spec");
   }
-  if (spec.semantic == APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL &&
+  if ((spec.semantic == APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL ||
+       spec.semantic == APXINF_NORM_SEMANTIC_CHANNEL_L2) &&
       spec.dtype != APXINF_DTYPE_BF16) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "BiasThenResidual requires BF16 input and output");
@@ -98,6 +102,8 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
 void validate_bindings(const apxinf_norm_spec_t& spec,
                        const apxinf_norm_bindings_t& bindings) {
   const uint32_t semantic = spec.semantic;
+  if (semantic == APXINF_NORM_SEMANTIC_CHANNEL_L2 && bindings.eps < std::numeric_limits<float>::min())
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "ChannelL2 epsilon must be normal FP32");
   const bool missing =
       bindings.input == nullptr ||
       (writes_hidden(semantic) && bindings.hidden == nullptr) ||
@@ -221,6 +227,10 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
   switch (spec.semantic) {
+    case APXINF_NORM_SEMANTIC_CHANNEL_L2:
+      kernels::channel_l2_norm<T><<<rows, kThreads, 0, stream>>>(
+          input, weight, normalized, rows, cols, bindings.eps);
+      break;
     case APXINF_NORM_SEMANTIC_RMS:
       kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
           input, weight, normalized, rows, cols, bindings.eps);

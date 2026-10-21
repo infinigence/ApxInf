@@ -12,3 +12,8 @@ pub(crate) mod rope;
 pub(crate) mod runtime;
 pub(crate) mod status;
 pub(crate) mod types;
+pub(crate) mod volume;
+
+pub(crate) mod recurrence;
+
+pub(crate) mod reduction;

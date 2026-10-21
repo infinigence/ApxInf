@@ -13,6 +13,8 @@ pub enum GatherSemantic {
     BiasPosition,
     /// RGB u8 images to flattened patches in `[-1, 1]`.
     RgbToPatches,
+    /// RGB cast to output dtype, rounded division by 127.5, then rounded subtraction of 1.
+    RgbToPatchesStaged,
     /// Replace selected matrix rows according to a u32 row map.
     ReplaceRows,
 }
@@ -23,6 +25,7 @@ impl GatherSemantic {
             Self::EmbeddingLookup => 0,
             Self::BiasPosition => 1,
             Self::RgbToPatches => 2,
+            Self::RgbToPatchesStaged => 4,
             Self::ReplaceRows => 3,
         }
     }
@@ -214,7 +217,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
                 return Err(invalid("bias-position received unrelated bindings"));
             }
         }
-        GatherSemantic::RgbToPatches => {
+        GatherSemantic::RgbToPatches | GatherSemantic::RgbToPatchesStaged => {
             if args.input.is_some()
                 || args.ids.is_some()
                 || args.ids_address.is_some()
@@ -267,7 +270,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
             dtype,
             count,
         )?,
-        GatherSemantic::RgbToPatches => {
+        GatherSemantic::RgbToPatches | GatherSemantic::RgbToPatchesStaged => {
             let geometry = args
                 .patches
                 .ok_or_else(|| invalid("RGB-to-patches requires a geometry"))?;

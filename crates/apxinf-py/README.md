@@ -61,11 +61,17 @@ model = apxinf_py.ModelRunner.load("pi05", "/path/to/checkpoint", device="cuda:0
 rgb = np.zeros((model.num_views, model.image_size, model.image_size, 3), np.uint8)
 tokens = np.zeros(16, np.uint32)
 noise = np.random.default_rng(0).standard_normal(
-    (model.action_horizon, model.action_dim), dtype=np.float32
+    model.initial_latent_shape, dtype=np.float32
 )
 
 action = model.infer_rgb(rgb, "nhwc", tokens, noise)  # -> [horizon, dim] float32
 ```
+
+Supplied noise must be finite, C-contiguous `float32` with the runtime's
+`initial_latent_shape`. This defaults to `[action_horizon, action_dim]`; a joint
+diffusion family can declare a higher-rank latent while keeping the action output
+unchanged. Processor bridges retain their existing optional leading batch
+dimension for action-matrix noise.
 
 ## Tests
 

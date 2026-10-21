@@ -12,6 +12,7 @@ mod norm;
 mod pointwise;
 mod quantization;
 mod rope;
+mod volume;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -26,6 +27,7 @@ pub(crate) use gemm::contracts;
 pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
+pub use volume::{PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry};
 pub use attention::{
     attention, decode_attention, decode_attention_workspace_bytes, kv_cache_attention,
     packed_qkv_attention, segmented_attention, AttentionArgs, AttentionMask, AttentionPolicy,
@@ -54,6 +56,7 @@ pub use gemm::{
 pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
 pub use model::{argmax, embedding_gather};
 pub use norm::{
+    channel_l2_norm, ChannelL2NormArgs,
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual,
     bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, layer_norm, rms_norm,
     AdaGateResidualArgs, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs, BiasResidualArgs,
@@ -85,3 +88,9 @@ pub fn with_session<T>(
 }
 #[cfg(test)]
 mod tests;
+
+mod recurrence;
+pub use recurrence::{F64RecurrenceState,PreparedRecurrence,RecurrenceCoefficients};
+
+mod reduction;
+pub use reduction::PreparedIndexedMean;

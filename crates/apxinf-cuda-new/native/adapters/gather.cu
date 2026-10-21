@@ -24,7 +24,7 @@ bool may_have_bias(uint32_t semantic) {
 
 void validate_spec(const apxinf_gather_spec_t& spec) {
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_REPLACE_ROWS ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.has_bias > 1 || spec.nhwc > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
@@ -51,7 +51,7 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "bias-position rows must be a whole number of views");
   }
-  if (spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES) {
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES || spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED) {
     if (spec.views == 0 || spec.image_size == 0 || spec.patch_size == 0 ||
         spec.image_size % spec.patch_size != 0) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -148,18 +148,21 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
           input, bias, position, output, count, cols,
           static_cast<int>(spec.tokens_per_view));
       break;
+    case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED:
     case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES: {
       const auto* images = static_cast<const uint8_t*>(bindings.input);
       if (spec.nhwc != 0) {
         kernels::rgb_u8_to_patches<T, true><<<grid, kThreads, 0, stream>>>(
             images, output, static_cast<int>(spec.views),
             static_cast<int>(spec.image_size),
-            static_cast<int>(spec.patch_size));
+            static_cast<int>(spec.patch_size),
+            spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED);
       } else {
         kernels::rgb_u8_to_patches<T, false><<<grid, kThreads, 0, stream>>>(
             images, output, static_cast<int>(spec.views),
             static_cast<int>(spec.image_size),
-            static_cast<int>(spec.patch_size));
+            static_cast<int>(spec.patch_size),
+            spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED);
       }
       break;
     }
