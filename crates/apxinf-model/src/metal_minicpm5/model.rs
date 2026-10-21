@@ -30,6 +30,7 @@ pub struct MiniCpm5 {
     local: Option<LocalMath>,
     swiglu: Compiled,
     step: Option<Compiled>,
+    step_ready: bool,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -77,6 +78,7 @@ impl MiniCpm5 {
             local,
             swiglu,
             step: None,
+            step_ready: false,
             states: Vec::new(),
             capacity: 0,
             offset: 0,
@@ -88,6 +90,9 @@ impl MiniCpm5 {
 
     /// Prepare one bounded native KV capacity and warm the actual decode path.
     /// All changing tokens, positions and K/V are explicit compiled arguments.
+    /// The decode step depends only on the capacity, so it is warmed once per
+    /// capacity (and again after a failure); a new prompt length re-warms only
+    /// the prompt-shaped subgraphs.
     pub fn prepare(&mut self, prompt: usize, output: usize) -> Result<()> {
         match self.prepare_inner(prompt, output) {
             Ok(()) => Ok(()),
@@ -95,6 +100,7 @@ impl MiniCpm5 {
                 // No partially built or unsuccessfully warmed plan is ready.
                 // The next request must reset and complete preparation again.
                 self.prepared_prompt = None;
+                self.step_ready = false;
                 self.failure = Some(error.to_string());
                 Err(error)
             }
@@ -141,6 +147,7 @@ impl MiniCpm5 {
             self.states = states;
             self.capacity = capacity;
             self.step = step;
+            self.step_ready = false;
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
@@ -163,7 +170,8 @@ impl MiniCpm5 {
             let activation = Array::zeros(self.backend.stream(), &[1, rows, 6144], MlxDType::BF16)?;
             self.swiglu.prepare(&[activation.clone(), activation])?;
         }
-        if let Some(step) = &self.step {
+        let warm_step = !self.step_ready || self.failure.is_some();
+        if let Some(step) = self.step.as_ref().filter(|_| warm_step) {
             // Shape-specialized DSpark verification warms all admitted row counts.
             let max_rows = if self.variant == Variant::DSpark {
                 8
@@ -176,6 +184,7 @@ impl MiniCpm5 {
                 step.prepare(&args)?;
             }
         }
+        self.step_ready = true;
         self.failure = None;
         self.prepared_prompt = Some(prompt);
         Ok(())
