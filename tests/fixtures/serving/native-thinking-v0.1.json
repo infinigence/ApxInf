@@ -1,0 +1,139 @@
+{
+  "format": "apxinf-native-thinking-conformance-v1",
+  "templates": {
+    "ready": {
+      "protocol": "apxinf-worker/2.3", "kind": "ready",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "model_revision": "399347d60119b3dbc6d36d425a5dafb633b45ea26770a6184b33293e1125a1a3",
+      "capability_revision": "4d68ba24c2d06ff835a0133ca8f0ea72c0e03a4b4857c93482484faeb3b7d989",
+      "model_manifest": {
+        "adapter_revision": "apxinf-native-minicpm5-thinking-v1", "artifacts": [],
+        "runtime": {
+          "kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.31.2",
+          "executable_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "metal_library_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "execution": {
+          "provider": "metal_minicpm5", "precision": "bf16", "variant": "bf16-compiled",
+          "parser": "minicpm5_xml", "enable_thinking": true,
+          "output_policy": "minicpm5-initial-thinking-v1",
+          "max_context": 16384, "max_output_tokens": 128, "memory_limit_bytes": 2097152,
+          "sampling": {
+            "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1", "top_p": "0.95",
+            "seed_policy": "request-id-sha256-v1"
+          }
+        }
+      },
+      "capabilities": {
+        "text": true, "image": false, "greedy": true, "sampling": true,
+        "token_events": true, "cancel_granularity": "token_or_prefill_chunk",
+        "max_active_sequences": 1, "max_context": 16384, "max_output_tokens": 128,
+        "exact_append": false, "state_schema": "none"
+      },
+      "runtime": {
+        "kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.31.2",
+        "executable_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "metal_library_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "limits": {"max_frame_bytes": 1048576, "max_depth": 16, "max_commands": 10000},
+      "model_path": "/models/thinking-fixture", "eos_token_ids": [15], "vocab_size": 16,
+      "memory": {"active_bytes": 0, "peak_bytes": 0, "cache_bytes": 0}
+    },
+    "prepare": {
+      "protocol": "apxinf-worker/2.3", "kind": "prepare_input",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "command_id": "bb000000-0000-4000-8000-000000000002",
+      "model_revision": "399347d60119b3dbc6d36d425a5dafb633b45ea26770a6184b33293e1125a1a3",
+      "messages": [{"role": "user", "content": "Return the measured result."}],
+      "tools": [], "template_options": {"enable_thinking": true}
+    },
+    "submit": {
+      "protocol": "apxinf-worker/2.3", "kind": "submit",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "command_id": "bb000000-0000-4000-8000-000000000003",
+      "request_id": "bb000000-0000-4000-8000-000000000004", "attempt": 1,
+      "model_revision": "399347d60119b3dbc6d36d425a5dafb633b45ea26770a6184b33293e1125a1a3",
+      "capability_revision": "4d68ba24c2d06ff835a0133ca8f0ea72c0e03a4b4857c93482484faeb3b7d989",
+      "token_ids": [4], "max_tokens": 8, "remaining_timeout_ms": 500,
+      "eos_token_ids": [15], "capacity_lease_ids": [], "sampling": {"mode": "greedy"}
+    },
+    "tokens": {
+      "protocol": "apxinf-worker/2.3", "kind": "tokens",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "request_id": "bb000000-0000-4000-8000-000000000004", "attempt": 1,
+      "event_seq": 1, "output_index": 0, "token_ids": [5, 6],
+      "text_delta": "考え</think>result"
+    },
+    "terminal": {
+      "protocol": "apxinf-worker/2.3", "kind": "terminal",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "request_id": "bb000000-0000-4000-8000-000000000004", "attempt": 1,
+      "event_seq": 2, "status": "completed", "cause": "eos",
+      "usage": {"input_tokens": 1, "output_tokens": 2},
+      "state_result": {"validity": "none", "consumed_position": 3, "history_count": 3},
+      "text_delta": "</think>最終", "metrics": {"elapsed_ns": 300, "ttft_ns": 150, "peak_memory_bytes": 128}
+    },
+    "stop": {
+      "protocol": "apxinf-worker/2.3", "kind": "stop_generation",
+      "worker_epoch": "bb000000-0000-4000-8000-000000000001",
+      "command_id": "bb000000-0000-4000-8000-000000000005",
+      "request_id": "bb000000-0000-4000-8000-000000000004", "attempt": 1,
+      "cause": "stop_sequence", "output_token_count": 2, "text_byte_cutoff": 17
+    }
+  },
+  "frame_cases": [
+    {"name": "thinking_ready", "template": "ready", "valid": true},
+    {"name": "thinking_prepare", "template": "prepare", "valid": true, "envelope_valid": true},
+    {"name": "false_prepare_is_content_error", "template": "prepare", "set": {"/template_options/enable_thinking": false}, "valid": false, "envelope_valid": true},
+    {"name": "numeric_prepare_is_content_error", "template": "prepare", "set": {"/template_options/enable_thinking": 1}, "valid": false, "envelope_valid": true},
+    {"name": "missing_prepare_setting", "template": "prepare", "set": {"/template_options": {}}, "valid": false, "envelope_valid": true},
+    {"name": "unknown_prepare_setting", "template": "prepare", "set": {"/template_options/extra": true}, "valid": false, "envelope_valid": true},
+    {"name": "old_sampled_prepare_false_unchanged", "template": "prepare", "set": {"/protocol": "apxinf-worker/2.2", "/template_options/enable_thinking": false}, "valid": true, "envelope_valid": true},
+    {"name": "old_native_prepare_false_unchanged", "template": "prepare", "set": {"/protocol": "apxinf-worker/2.1", "/template_options/enable_thinking": false}, "valid": true, "envelope_valid": true},
+    {"name": "old_python_prepare_false_unchanged", "template": "prepare", "set": {"/protocol": "apxinf-worker/2.0", "/template_options/enable_thinking": false}, "valid": true, "envelope_valid": true},
+    {"name": "greedy_submit", "template": "submit", "valid": true, "envelope_valid": true},
+    {"name": "random_submit", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 0.75, "top_p": 0.9, "seed": 37}}, "valid": true, "envelope_valid": true},
+    {"name": "missing_sampling_is_envelope_error", "template": "submit", "remove": ["sampling"], "valid": false, "envelope_valid": false},
+    {"name": "null_sampling_is_content_error", "template": "submit", "set": {"/sampling": null}, "valid": false, "envelope_valid": true},
+    {"name": "greedy_conflict", "template": "submit", "set": {"/sampling/seed": 37}, "valid": false, "envelope_valid": true},
+    {"name": "random_boolean_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": true}}, "valid": false},
+    {"name": "random_unsafe_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": 9007199254740992}}, "valid": false},
+    {"name": "random_temperature_bound", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 2.1, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "random_top_p_underflow", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1e-46, "seed": 0}}, "valid": false},
+    {"name": "raw_thinking_token_text", "template": "tokens", "valid": true},
+    {"name": "raw_terminal_text", "template": "terminal", "valid": true},
+    {"name": "raw_partial_delimiter", "template": "tokens", "set": {"/text_delta": "想</thi"}, "valid": true},
+    {"name": "raw_stop_cutoff", "template": "stop", "valid": true, "envelope_valid": true},
+    {"name": "raw_tool_stop_cutoff", "template": "stop", "set": {"/cause": "tool_calls", "/text_byte_cutoff": 0}, "valid": true, "envelope_valid": true},
+    {"name": "stop_boolean_count", "template": "stop", "set": {"/output_token_count": true}, "valid": false, "envelope_valid": true},
+    {"name": "stop_negative_cutoff", "template": "stop", "set": {"/text_byte_cutoff": -1}, "valid": false, "envelope_valid": true},
+    {"name": "model_digest_checked", "template": "ready", "set": {"/model_revision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}, "valid": false},
+    {"name": "capability_digest_checked", "template": "ready", "set": {"/capability_revision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}, "valid": false},
+    {"name": "sampled_adapter_rejected", "template": "ready", "set": {"/model_manifest/adapter_revision": "apxinf-native-minicpm5-sampled-v1"}, "refresh_identity": true, "valid": false},
+    {"name": "thinking_identity_false_rejected", "template": "ready", "set": {"/model_manifest/execution/enable_thinking": false}, "refresh_identity": true, "valid": false},
+    {"name": "thinking_identity_integer_rejected", "template": "ready", "set": {"/model_manifest/execution/enable_thinking": 1}, "refresh_identity": true, "valid": false},
+    {"name": "unknown_output_policy", "template": "ready", "set": {"/model_manifest/execution/output_policy": "all-thinking"}, "refresh_identity": true, "valid": false},
+    {"name": "missing_output_policy", "template": "ready", "set": {"/model_manifest/execution": {"provider": "metal_minicpm5", "precision": "bf16", "variant": "bf16-compiled", "parser": "minicpm5_xml", "enable_thinking": true, "max_context": 16384, "max_output_tokens": 128, "memory_limit_bytes": 2097152, "sampling": {"algorithm": "apxinf-cpu-categorical-v1", "temperature": "1", "top_p": "0.95", "seed_policy": "request-id-sha256-v1"}}}, "refresh_identity": true, "valid": false},
+    {"name": "unknown_execution_field", "template": "ready", "set": {"/model_manifest/execution/reasoning_budget": 64}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_algorithm_required", "template": "ready", "set": {"/model_manifest/execution/sampling/algorithm": "unknown"}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_seed_policy_required", "template": "ready", "set": {"/model_manifest/execution/sampling/seed_policy": "global"}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_description_exact", "template": "ready", "set": {"/model_manifest/execution/sampling/extra": "field"}, "refresh_identity": true, "valid": false},
+    {"name": "provider_required", "template": "ready", "set": {"/model_manifest/execution/provider": "mlx-lm"}, "refresh_identity": true, "valid": false},
+    {"name": "precision_required", "template": "ready", "set": {"/model_manifest/execution/precision": "fp32"}, "refresh_identity": true, "valid": false},
+    {"name": "variant_required", "template": "ready", "set": {"/model_manifest/execution/variant": "other"}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_capability_required", "template": "ready", "set": {"/capabilities/sampling": false}, "refresh_identity": true, "valid": false},
+    {"name": "chunk_cancel_required", "template": "ready", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token"}, "refresh_identity": true, "valid": false},
+    {"name": "native_context_limit", "template": "ready", "set": {"/capabilities/max_context": 16385}, "refresh_identity": true, "valid": false},
+    {"name": "serial_capacity_required", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": false},
+    {"name": "runtime_identity_mismatch", "template": "ready", "set": {"/runtime/metal_library_sha256": "5555555555555555555555555555555555555555555555555555555555555555"}, "valid": false},
+    {"name": "old_sampled_rejects_thinking_identity", "template": "ready", "set": {"/protocol": "apxinf-worker/2.2"}, "valid": false},
+    {"name": "old_native_rejects_thinking_ready", "template": "ready", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false},
+    {"name": "old_python_rejects_thinking_ready", "template": "ready", "set": {"/protocol": "apxinf-worker/2.0"}, "valid": false}
+  ],
+  "invalid_number_literals": ["NaN", "Infinity", "-Infinity", "1e309"],
+  "identity_digests": [
+    {"template": "ready", "pointer": "/model_manifest", "domain": "apxinf-model-identity-v1", "digest": "399347d60119b3dbc6d36d425a5dafb633b45ea26770a6184b33293e1125a1a3"},
+    {"template": "ready", "pointer": "/capabilities", "domain": "apxinf-capability-v1", "digest": "4d68ba24c2d06ff835a0133ca8f0ea72c0e03a4b4857c93482484faeb3b7d989"},
+    {"template": "ready", "pointer": "/model_manifest/execution", "domain": "apxinf-thinking-identity-test-v1", "digest": "532eba590379cf1a9d0a09ca372fc269c02d90b5726133b2b9d5e0f818dfd79d"}
+  ]
+}
