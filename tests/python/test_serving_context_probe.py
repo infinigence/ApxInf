@@ -35,6 +35,8 @@ class FixtureTransport:
             ready = copy.deepcopy(self.ready)
             if self.mode == "identity_change" and self.ready_reads > 1:
                 ready["worker"]["model_revision"] = "c" * 64
+            if self.mode == "profile_change" and self.ready_reads > 1:
+                ready["profile"] = "apxinf-native-bounded-thinking-v0.1"
             return 200, ready
         if path == "/v1/messages/count_tokens":
             self.counted_body = body
@@ -61,9 +63,12 @@ class FixtureTransport:
                 count += 1
             reason = "max_tokens" if self.mode == "truncated" else "end_turn"
             model = "fallback-fixture" if self.mode == "fallback_model" else "local-fixture"
+            answer = json.dumps(facts)
+            if self.mode == "fenced_json":
+                answer = "```json\n" + answer + "\n```"
             return 200, {"model": model, "stop_reason": reason,
                          "usage": {"input_tokens": count},
-                         "content": [{"type": "text", "text": json.dumps(facts)}]}
+                         "content": [{"type": "text", "text": answer}]}
         raise AssertionError(path)
 
 
@@ -72,6 +77,30 @@ def no_metrics(_):
 
 
 class ContextProbeTests(unittest.TestCase):
+    def test_correct_facts_in_a_code_fence_remain_a_format_failure(self):
+        case = probe.run_case("http://127.0.0.1:8000", 500, 96,
+                              FixtureTransport(mode="fenced_json"), no_metrics)
+        self.assertEqual(case["status"], "failed")
+        self.assertEqual(case["reason"],
+                         "The response is not a plain JSON object with the required string facts.")
+        text = case["raw_response"]["content"][0]["text"]
+        for value in case["nonce_facts"].values():
+            self.assertIn(value, text)
+
+    def test_declared_text_profiles_use_the_same_context_checks(self):
+        for profile in ("apxinf-serial-v0.1", "apxinf-native-sampled-v0.1",
+                        "apxinf-native-thinking-v0.1", "apxinf-native-bounded-thinking-v0.1"):
+            with self.subTest(profile=profile):
+                transport = FixtureTransport()
+                transport.ready["profile"] = profile
+                case = probe.run_case("http://127.0.0.1:8000", 500, 96, transport, no_metrics)
+                self.assertEqual(case["status"], "passed", case["reason"])
+        transport = FixtureTransport()
+        transport.ready["profile"] = "unknown-profile"
+        case = probe.run_case("http://127.0.0.1:8000", 500, 96, transport, no_metrics)
+        self.assertEqual(case["status"], "failed")
+        self.assertNotIn("/v1/messages", transport.paths)
+
     def test_calibration_uses_counted_template_and_same_generation_body(self):
         transport = FixtureTransport()
         case = probe.run_case("http://127.0.0.1:8000", 500, 96, transport, no_metrics)
@@ -106,7 +135,7 @@ class ContextProbeTests(unittest.TestCase):
                 self.assertIsNotNone(case["reason"])
 
     def test_errors_and_identity_change_fail(self):
-        for mode in ("count_error", "http_error", "identity_change"):
+        for mode in ("count_error", "http_error", "identity_change", "profile_change"):
             with self.subTest(mode=mode):
                 case = probe.run_case("http://127.0.0.1:8000", 500, 96,
                                       FixtureTransport(mode=mode), no_metrics)
