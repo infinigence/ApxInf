@@ -349,7 +349,9 @@ def task_outcome(name, spec, directory, capture):
         observed_input_usage = {key: usage[key] for key in (
             "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
                                 if isinstance(usage, dict) and type(usage.get(key)) is int}
-        return {"passed": bool(finished and final.get("subtype") == "success" and assertion),
+        automated_passed = bool(finished and final.get("subtype") == "success" and assertion)
+        return {"passed": None if automated_passed else False,
+                "automated_passed": automated_passed,
                 "assertion_passed": bool(assertion), "tool_calls": tools, "tool_results": results,
                 "result": final, "tool_cycle_passed": tool_cycle_passed,
                 "svg_check": {"valid": valid_svg, "reason": reason},
@@ -439,7 +441,9 @@ def run(args):
                 print(json.dumps({"task": name, "repeat": repeat, "passed": outcome["passed"],
                                   "elapsed_s": capture["elapsed_s"], "exit_code": capture["exit_code"],
                                   "tools": [item["name"] for item in outcome["tool_calls"]]}), flush=True)
-    return 0 if all(task["passed"] for task in report["tasks"]) else 1
+    if any(task["passed"] is False for task in report["tasks"]):
+        return 1
+    return 2 if any(task["passed"] is None for task in report["tasks"]) else 0
 
 
 def parser():
