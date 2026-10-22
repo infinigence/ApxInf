@@ -223,4 +223,29 @@ __global__ void partial_multimodal_rope(
   }
 }
 
+template <class T> __device__ T from_double(double value);
+template <> __device__ inline __half from_double(double value) {
+  return __float2half(__double2float_rn(value));
+}
+template <> __device__ inline __nv_bfloat16 from_double(double value) {
+  return __float2bfloat16(__double2float_rn(value));
+}
+
+template <class T>
+__global__ void complex_table(const T* input, const double* coefficients,
+                             T* output, int heads, int dim) {
+  const int token = blockIdx.x;
+  const int head = blockIdx.y;
+  for (int pair = threadIdx.x; pair < dim / 2; pair += blockDim.x) {
+    const int64_t offset = (static_cast<int64_t>(token) * heads + head) * dim + 2 * pair;
+    const int64_t coeff = static_cast<int64_t>(token) * dim + 2 * pair;
+    const double real = static_cast<double>(to_float(input[offset]));
+    const double imag = static_cast<double>(to_float(input[offset + 1]));
+    const double c = coefficients[coeff], s = coefficients[coeff + 1];
+    // Match unfused complex multiplication, including the FP64 boundaries.
+    output[offset] = from_double<T>(__dsub_rn(__dmul_rn(real, c), __dmul_rn(imag, s)));
+    output[offset + 1] = from_double<T>(__dadd_rn(__dmul_rn(real, s), __dmul_rn(imag, c)));
+  }
+}
+
 }  // namespace apxinf::rope::kernels

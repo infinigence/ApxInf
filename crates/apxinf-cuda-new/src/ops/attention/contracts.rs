@@ -12,6 +12,7 @@ pub(crate) enum Semantic {
     KvCache = abi::SEMANTIC_KV_CACHE,
     Segmented = abi::SEMANTIC_SEGMENTED,
     PackedQkv = abi::SEMANTIC_PACKED_QKV,
+    RoundedAdditive = abi::SEMANTIC_ROUNDED_ADDITIVE,
 }
 
 impl Semantic {
@@ -20,7 +21,12 @@ impl Semantic {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: &'static [Self] = &[Self::Dense, Self::KvCache, Self::Segmented];
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Dense,
+        Self::KvCache,
+        Self::Segmented,
+        Self::RoundedAdditive,
+    ];
 
     #[cfg(test)]
     pub(crate) const fn doc_id(self) -> &'static str {
@@ -28,6 +34,7 @@ impl Semantic {
             Self::Dense => "attention",
             Self::KvCache => "kv_cache_attention",
             Self::Segmented => "segmented_attention",
+            Self::RoundedAdditive => "rounded_additive_attention",
             // Packed QKV is a storage layout for the dense mathematical
             // semantic, not a separate public operator family.
             Self::PackedQkv => "attention",
@@ -281,6 +288,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
     let default_scale = 1.0 / (head_dim as f32).sqrt();
     let bindings = abi::Bindings {
         query: q.ptr(),
+        bias: std::ptr::null(),
         key: k.ptr(),
         value: v.ptr(),
         offsets: std::ptr::null(),
@@ -294,6 +302,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
             semantic: Semantic::Dense.abi_value(),
+            bias_alignment: 0,
             dtype: dtype_code(dtype)?,
             output_dtype: output_dtype_code(output_dtype)?,
             mask: args.mask as u32,
@@ -388,6 +397,7 @@ pub(crate) fn normalize_packed_qkv(
     let default_scale = 1.0 / (head_dim as f32).sqrt();
     let bindings = abi::Bindings {
         query: qkv.ptr(),
+        bias: std::ptr::null(),
         key: key.ptr(),
         value: value.ptr(),
         offsets: std::ptr::null(),
@@ -401,6 +411,7 @@ pub(crate) fn normalize_packed_qkv(
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
             semantic: Semantic::PackedQkv.abi_value(),
+            bias_alignment: 0,
             dtype: dtype_code(dtype)?,
             output_dtype: dtype_code(dtype)?,
             mask: AttentionMask::None as u32,

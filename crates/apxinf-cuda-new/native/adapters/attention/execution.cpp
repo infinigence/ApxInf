@@ -4,6 +4,8 @@
 #include <cuda_fp8.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(APXINF_ATTENTION_FA2)
@@ -32,8 +34,8 @@ void validate_spec(const Spec& spec) {
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
-  if (spec.version != 4 ||
-      spec.semantic > APXINF_ATTENTION_SEMANTIC_PACKED_QKV ||
+  if (spec.version != 5 ||
+      spec.semantic > APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!native_output && !static_e4m3_output) ||
       spec.mask > APXINF_ATTENTION_MASK_CAUSAL || spec.batch <= 0 ||
@@ -49,7 +51,8 @@ void validate_spec(const Spec& spec) {
       spec.scale_is_default > 1 || spec.dynamic_decode > 1) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Attention Spec");
   }
-  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+  if ((spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE ||
+       spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE) &&
       (spec.key_capacity != spec.key_tokens ||
        spec.query_start !=
            (spec.mask == APXINF_ATTENTION_MASK_CAUSAL
@@ -60,6 +63,15 @@ void validate_spec(const Spec& spec) {
        spec.dynamic_decode != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
+  }
+  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE) {
+    if (spec.mask != APXINF_ATTENTION_MASK_NONE || spec.query_heads != spec.kv_heads ||
+        spec.output_dtype != spec.dtype || !valid_alignment(spec.bias_alignment) ||
+        spec.bias_alignment < apxinf::attention::dtype_bytes(spec.dtype)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid rounded additive Attention fields");
+    }
+  } else if (spec.bias_alignment != 0) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "Attention semantic does not take bias");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_PACKED_QKV &&
       (spec.key_tokens != spec.query_tokens ||
@@ -146,9 +158,14 @@ void validate_bindings(const Spec& spec,
       ((spec.semantic == APXINF_ATTENTION_SEMANTIC_SEGMENTED) !=
        (bindings.offsets != nullptr)) ||
       ((spec.dynamic_decode != 0) !=
-       (bindings.decode_meta != nullptr))) {
+       (bindings.decode_meta != nullptr)) ||
+      ((spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE) !=
+       (bindings.bias != nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Attention bindings");
+  }
+  if (bindings.bias != nullptr && reinterpret_cast<uintptr_t>(bindings.bias) % spec.bias_alignment != 0) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "Attention bias alignment mismatch");
   }
   if (bindings.offsets != nullptr &&
       reinterpret_cast<uintptr_t>(bindings.offsets) % spec.offsets_alignment != 0) {
@@ -446,6 +463,22 @@ extern "C" apxinf_status_t apxinf_attention_prepare(
         " config=" + std::to_string(recipe.configuration) +
         " workspace=" + std::to_string(execution->resource_bytes) +
         " source=" + source;
+    // Preparation-only diagnostics expose actual tuning/recipe selection to
+    // whole-model qualification without touching enqueue or tensor contents.
+    static const bool report = std::getenv("APXINF_ATTENTION_REPORT") != nullptr;
+    if (report) {
+      std::fprintf(stderr,
+                   "[apxinf-attention] sem=%u batch=%lld q=%lld k=%lld "
+                   "qh=%lld kvh=%lld d=%lld dtype=%u | %s\n",
+                   normalized.semantic,
+                   static_cast<long long>(normalized.batch),
+                   static_cast<long long>(normalized.query_tokens),
+                   static_cast<long long>(normalized.key_tokens),
+                   static_cast<long long>(normalized.query_heads),
+                   static_cast<long long>(normalized.kv_heads),
+                   static_cast<long long>(normalized.head_dim),
+                   normalized.dtype, execution->summary.c_str());
+    }
     auto wrapper = std::make_unique<apxinf_attention_execution>();
     wrapper->state = std::move(execution);
     *output = wrapper.release();

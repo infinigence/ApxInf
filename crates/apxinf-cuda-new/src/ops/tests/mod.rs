@@ -14,5 +14,18 @@ mod l3_behavior;
 #[path = "precision/nvfp4_precision.rs"]
 mod nvfp4_precision;
 mod operator_doc;
+mod pointwise_behavior;
 #[path = "precision/precision.rs"]
 mod precision;
+
+mod transfer_ordering;
+
+mod bicubic_behavior;
+mod complex_rotary_behavior;
+mod layout_behavior;
+
+mod layer_norm_behavior;
+
+mod convolution_behavior;
+
+mod efficient_attention_behavior;

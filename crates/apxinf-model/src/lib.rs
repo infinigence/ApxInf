@@ -5,6 +5,7 @@ pub mod auto;
 pub mod builtin;
 pub mod d3;
 pub mod debug;
+pub mod dreamzero;
 mod generation_config;
 pub mod gr00t;
 pub mod llama;

@@ -30,8 +30,8 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 6 ||
-      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
+  if (spec.version != 9 ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
@@ -40,7 +40,10 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
-      spec.b_is_immutable > 1) {
+      spec.b_is_immutable > 1 || spec.b_transposed > 1 ||
+      (spec.b_transposed &&
+       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
+        spec.quantization != APXINF_GEMM_QUANT_NONE))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
   }
   for (uint32_t alignment : {
@@ -70,6 +73,12 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
        (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM &&
         spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS))) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid INT8 GEMM contract");
+  }
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND &&
+      (spec.quantization != APXINF_GEMM_QUANT_NONE ||
+       (spec.a_dtype != APXINF_DTYPE_F16 && spec.a_dtype != APXINF_DTYPE_BF16) ||
+       spec.b_dtype != spec.a_dtype || spec.output_dtype != spec.a_dtype)) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid single-round GEMM+bias contract");
   }
   if (spec.a_dtype != APXINF_DTYPE_I8 &&
       spec.accumulation_dtype != APXINF_DTYPE_F32) {
@@ -133,7 +142,9 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
 }
 
 void validate_policy(const apxinf_gemm_policy_t& policy) {
-  if (policy.online_tune > 1 || policy.allow_fallback > 1 ||
+  if (policy.version != 1 ||
+      policy.algorithm > APXINF_GEMM_ALGORITHM_COLD_BASELINE ||
+      policy.online_tune > 1 || policy.allow_fallback > 1 ||
       policy.graph_safe > 1 || policy.deterministic > 1) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Policy");
   }
@@ -143,6 +154,7 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
                        const apxinf_gemm_bindings_t& bindings,
                        bool require_output) {
   const bool needs_bias =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
   const bool allows_bias =
@@ -215,6 +227,20 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
                               "GEMM output binding");
 }
 
+Recipe recipe_for(const Execution& execution) {
+  return {execution.implementation->provider_id,
+          execution.implementation->implementation_id,
+          execution.implementation->implementation_version,
+          execution.configuration};
+}
+
+bool same_recipe(const Recipe& left, const Recipe& right) {
+  return left.provider_id == right.provider_id &&
+         left.implementation_id == right.implementation_id &&
+         left.implementation_version == right.implementation_version &&
+         left.configuration == right.configuration;
+}
+
 const apxinf::gemm::Implementation* find_implementation(const Recipe& recipe,
                                                         const apxinf::gemm::Spec& spec,
                                                         int device) {
@@ -237,11 +263,11 @@ const apxinf::gemm::Implementation* find_implementation(const Recipe& recipe,
   return nullptr;
 }
 
-std::unique_ptr<Execution> fallback(
+std::unique_ptr<Execution> fallback_from_registry(
+    const apxinf::gemm::ImplementationRegistry& implementations,
     const apxinf::gemm::Spec& spec, const apxinf_gemm_policy_t& policy,
     const apxinf_gemm_bindings_t& bindings, int device) {
-  for (const auto& implementation :
-       apxinf::gemm::registry(spec.semantic)) {
+  for (const auto& implementation : implementations) {
     if (!implementation.fallback ||
         !apxinf::gemm::supports_device(implementation, device) ||
         !implementation.supports(spec) ||
@@ -255,13 +281,26 @@ std::unique_ptr<Execution> fallback(
       try {
         return apxinf::gemm::prepare(
             implementation, configuration, spec, policy, bindings, device);
-      } catch (const Failure&) {
+      } catch (const Failure& failure) {
+        // An unsupported configuration can be skipped. An allocation/driver
+        // failure must not silently change a fixed numerical algorithm domain.
+        if (policy.algorithm == APXINF_GEMM_ALGORITHM_COLD_BASELINE &&
+            failure.status != APXINF_STATUS_UNSUPPORTED) {
+          throw;
+        }
         cudaGetLastError();
       }
     }
   }
   throw Failure(APXINF_STATUS_UNSUPPORTED,
                 "no GEMM fallback satisfies the Spec and Policy");
+}
+
+std::unique_ptr<Execution> fallback(
+    const apxinf::gemm::Spec& spec, const apxinf_gemm_policy_t& policy,
+    const apxinf_gemm_bindings_t& bindings, int device) {
+  return fallback_from_registry(apxinf::gemm::registry(spec.semantic), spec,
+                                policy, bindings, device);
 }
 
 }  // namespace
@@ -324,8 +363,27 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     }
     }
 
+    // Resolve the legal singleton with exactly the cold-fallback traversal.
+    // This only prepares resources: no caller output is enqueued or measured.
+    // Reuse that prepared execution on a recipe hit, instead of preparing it
+    // twice. A stored alternative is a miss even if it is otherwise supported.
+    const bool fixed_algorithm =
+        policy->algorithm == APXINF_GEMM_ALGORITHM_COLD_BASELINE;
+    std::unique_ptr<Execution> baseline;
+    Recipe baseline_recipe{};
+    if (fixed_algorithm) {
+      baseline = fallback(normalized_spec, *policy, *bindings, runtime->device);
+      baseline_recipe = recipe_for(*baseline);
+    }
     std::unique_ptr<Execution> execution;
-    if (recipe_found) {
+    if (recipe_found && fixed_algorithm) {
+      if (same_recipe(recipe, baseline_recipe)) {
+        execution = std::move(baseline);
+        runtime->gemm_recipes[key] = recipe;
+      } else {
+        runtime->gemm_recipes.erase(key);
+      }
+    } else if (recipe_found) {
       if (const auto* implementation =
               find_implementation(recipe, normalized_spec, runtime->device)) {
         try {
@@ -345,9 +403,13 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     bool persist_recipe = false;
     if (execution == nullptr) {
       if (runtime->allow_online_tune && policy->online_tune) {
+        // The ordinary tuner still measures, warms up and capture-checks the
+        // eligible algorithm. Release the probe's resources before it allocates
+        // its isolated output and candidate execution.
+        baseline.reset();
         const Recipe tuned_recipe = apxinf::gemm::tune(
             normalized_spec, *policy, *bindings, runtime->device,
-            source);
+            source, fixed_algorithm ? &baseline_recipe : nullptr);
         const auto* implementation =
             find_implementation(tuned_recipe, normalized_spec, runtime->device);
         if (implementation == nullptr) {
@@ -363,7 +425,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
         } catch (const Failure&) {
           execution.reset();
           cudaGetLastError();
-          if (!policy->allow_fallback) {
+          if (fixed_algorithm || !policy->allow_fallback) {
             throw;
           }
           execution = fallback(normalized_spec, *policy, *bindings,
@@ -371,8 +433,10 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
           source = "fallback-after-tune";
         }
       } else if (policy->allow_fallback) {
-        execution = fallback(normalized_spec, *policy, *bindings,
-                             runtime->device);
+        execution = fixed_algorithm
+                        ? std::move(baseline)
+                        : fallback(normalized_spec, *policy, *bindings,
+                                   runtime->device);
         source = "fallback";
       } else {
         throw Failure(APXINF_STATUS_CACHE_MISS,
@@ -400,7 +464,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
         std::string(execution->implementation->name) +
         " config=" + std::to_string(execution->configuration) +
         " workspace=" + std::to_string(execution->resource_bytes) +
-        " source=" + source;
+        " source=" + source + execution->provider_detail;
     // The per-attempt autotune report is otherwise only reachable from unit
     // tests inside the library crate, which is exactly where an integration
     // run cannot see it. APXINF_GEMM_REPORT=1 puts it on stderr.
@@ -695,4 +759,55 @@ extern "C" apxinf_status_t apxinf_gemm_test_seed_recipe(
     apxinf::gemm::write_recipe(policy->cache_dir, keys.key,
                                serialized.str());
   });
+}
+
+// Private regression hook: use actual fallback traversal and provider prepare
+// admission with controlled failure statuses, without allocating GPU storage.
+extern "C" int apxinf_gemm_test_baseline_failure_contract(int device) {
+  using namespace apxinf::gemm;
+  const ImplementationRegistry implementations{{
+      999, 1, 1, "baseline-failure-test", 0, true, true, true,
+      [](const Spec&) { return true; },
+      [](const Spec&) { return AlignmentRequirements{}; },
+      [](const Spec&) -> size_t { return 0; },
+      [](const Spec&, std::vector<int>& values) { values = {0, 1}; },
+      [](Execution& execution) {
+        if (execution.spec.k == 2 || execution.configuration == 0) {
+          throw Failure(execution.spec.k == 3 ? APXINF_STATUS_PROVIDER_ERROR
+                                               : APXINF_STATUS_UNSUPPORTED,
+                        "controlled provider failure");
+        }
+      },
+      [](Execution&) { return cudaSuccess; },
+      [](Execution&) noexcept {}}};
+  Spec spec{};
+  spec.a_alignment = spec.b_alignment = spec.output_alignment = 1;
+  apxinf_gemm_policy_t policy{};
+  policy.version = 1;
+  policy.algorithm = APXINF_GEMM_ALGORITHM_COLD_BASELINE;
+  apxinf_gemm_bindings_t bindings{};
+  try {
+    spec.k = 1;  // First configuration unsupported; second must be selected.
+    auto baseline = fallback_from_registry(implementations, spec, policy,
+                                           bindings, device);
+    if (baseline->configuration != 1) return 0;
+    for (int mode : {2, 3}) {
+      spec.k = mode;
+      try {
+        fallback_from_registry(implementations, spec, policy, bindings, device);
+        return 0;
+      } catch (const Failure& failure) {
+        const auto expected = mode == 2 ? APXINF_STATUS_UNSUPPORTED
+                                        : APXINF_STATUS_PROVIDER_ERROR;
+        if (failure.status != expected) return 0;
+      }
+    }
+    // Unrestricted callers retain their previous skip-and-continue behavior.
+    policy.algorithm = APXINF_GEMM_ALGORITHM_ANY;
+    auto unrestricted = fallback_from_registry(implementations, spec, policy,
+                                               bindings, device);
+    return unrestricted->configuration == 1;
+  } catch (...) {
+    return 0;
+  }
 }

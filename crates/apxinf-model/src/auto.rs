@@ -338,6 +338,15 @@ impl AutoModel {
             .map_err(|error| Error::Other(format!("read {}: {error}", config_path.display())))?;
         let config: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|error| Error::Other(format!("parse {}: {error}", config_path.display())))?;
+        if config
+            .pointer("/action_head_cfg/_target_")
+            .and_then(serde_json::Value::as_str)
+            == Some(
+                "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead",
+            )
+        {
+            return Ok("dreamzero".into());
+        }
         let model_type = config
             .get("model_type")
             .and_then(serde_json::Value::as_str)
@@ -390,6 +399,14 @@ impl AutoModel {
 
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("d3-mini requires CUDA support".into()));
+        }
+
+        if matches!(model_name, "dreamzero" | "dreamzero_droid") {
+            #[cfg(feature = "cuda")]
+            return crate::dreamzero::load::load_with_cuda_new(path, device, options);
+
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("DreamZero requires CUDA support".into()));
         }
 
         register_builtin_models();
@@ -509,6 +526,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "d3-cuda"
             | "smolvla"
             | "smolvla_libero"
+            | "dreamzero"
+            | "dreamzero_droid"
     ) || (matches!(device, Device::Metal(_))
         && matches!(
             model_name,
@@ -683,6 +702,31 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn dreamzero_joint_head_resolves_before_generic_vla_type() {
+        let directory = temporary_directory("dreamzero-detection");
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("dreamzero/config_fixture.json")).unwrap();
+        config["model_type"] = serde_json::json!("vla");
+        std::fs::write(directory.join("config.json"), config.to_string()).unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "dreamzero"
+        );
+        config["action_head_cfg"]["_target_"] = serde_json::json!("another.Head");
+        std::fs::write(directory.join("config.json"), config.to_string()).unwrap();
+        assert_eq!(AutoModel::detect_model_name(&directory).unwrap(), "vla");
+        for name in ["dreamzero", "dreamzero_droid"] {
+            assert!(supports_model_variant(name, Device::Cuda(0)));
+            #[cfg(feature = "cuda")]
+            {
+                register_builtin_models();
+                assert!(registry::get(name).is_some());
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

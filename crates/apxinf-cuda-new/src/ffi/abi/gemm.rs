@@ -1,6 +1,17 @@
 use std::ffi::{c_char, c_void};
 
-pub(crate) use super::types::Policy;
+/// GEMM policy ABI v1, admitted only with GEMM Spec v9 or later.
+#[repr(C)]
+pub(crate) struct Policy {
+    pub version: u32,
+    pub algorithm: u32,
+    pub workspace_limit: u64,
+    pub online_tune: u32,
+    pub allow_fallback: u32,
+    pub graph_safe: u32,
+    pub deterministic: u32,
+    pub cache_dir: *const c_char,
+}
 use super::types::{CudaStream, Runtime};
 
 #[repr(C)]
@@ -13,6 +24,7 @@ pub(crate) struct Spec {
     pub accumulation_dtype: u32,
     pub output_dtype: u32,
     pub quantization: u32,
+    pub b_transposed: u32,
     pub b_is_immutable: u32,
     pub a_alignment: u32,
     pub b_alignment: u32,

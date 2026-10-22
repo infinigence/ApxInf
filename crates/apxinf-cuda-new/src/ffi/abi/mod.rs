@@ -1,5 +1,6 @@
 pub(crate) mod attention;
 pub(crate) mod attn;
+pub(crate) mod convolution;
 pub(crate) mod gdn;
 pub(crate) mod gemm;
 pub(crate) mod model;

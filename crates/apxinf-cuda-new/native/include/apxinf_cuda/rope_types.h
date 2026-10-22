@@ -33,9 +33,12 @@ typedef enum {
   APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL = 3,
   /* In-place partial interleaved temporal/height/width rotary embedding. */
   APXINF_ROPE_SEMANTIC_PARTIAL_MROPE = 4,
+  /* Adjacent-pair FP64 complex rotation: qkv input, q output, bias points to
+     double coefficients [tokens, head_dim/2, 2]. No K/V/position bindings. */
+  APXINF_ROPE_SEMANTIC_COMPLEX_TABLE = 5,
 } apxinf_rope_semantic_t;
 
-#define APXINF_ROPE_SPEC_VERSION 3u
+#define APXINF_ROPE_SPEC_VERSION 4u
 
 typedef struct {
   uint32_t version;

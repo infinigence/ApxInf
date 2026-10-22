@@ -86,7 +86,12 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    confirmed or explicitly authorized tuple. Completion: every requested tuple
    and acceptance threshold is explicit.
 2. Run the reference privately and capture deterministic inputs, outputs, and
-   diagnostic tensors. Completion: the reference loads and repeated captures
+   diagnostic tensors. Preserve the public entry point's autocast and dtype
+   scopes when capturing isolated components; an unwrapped component call can
+   silently change interpolation, normalization, and activation arithmetic.
+   Record the reference attention implementation and numerical build settings,
+   including fused multiply-add/reduction behavior, when isolating BF16 drift.
+   Completion: the reference loads and repeated captures
    are attributable to the same source, environment, weights, and stochastic
    inputs.
 3. Inventory semantics and weight transformations. Completion: every required
@@ -132,6 +137,14 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    `RuntimeManaged` status and unsupported policy methods are not readiness.
    For cuda-new, verify GEMM and Attention cold-cache tuning, fresh-process recipe
    reuse with autotune disabled, and the public `--autotune`/load-option wiring.
+   For joint video/action models, freeze both noise tensors and their separate
+   time schedules; `initial_latent_shape()` may differ from `action_shape`.
+   Verify each modality influences the output through actual network computation.
+   For cross-request history, test session/episode/task changes, observation
+   commit, window rollover, and failed-call rollback. Keep semantic
+   `reset_history`, executable `clear_prepared`, and RNG reset distinct. A
+   distilled/Flash checkpoint needs independent weight and schedule acceptance;
+   reducing the standard checkpoint's step count is not equivalent support.
    Run default-path tests from a task artifact directory to isolate generated
    `configs/tuning/.../*.recipe` files; never depend on legacy JSON presence.
    Completion: registry loading, native contract, Python policy/public inference

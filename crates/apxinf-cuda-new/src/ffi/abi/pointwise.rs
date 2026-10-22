@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 
-use super::types::Runtime;
 pub(crate) use super::types::CudaStream;
+use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 1;
+pub(crate) const SPEC_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -19,10 +19,12 @@ class GemmTuningProblem {
   using Execution = apxinf::gemm::Execution;
 
   GemmTuningProblem(const Spec& spec, const apxinf_gemm_policy_t& policy,
-                    const apxinf_gemm_bindings_t& bindings, int device)
+                    const apxinf_gemm_bindings_t& bindings, int device,
+                    const Recipe* eligible)
       : spec_(spec),
         policy_(policy),
         device_(device),
+        eligible_(eligible),
         output_(static_cast<size_t>(
                     spec.m *
                     (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
@@ -39,6 +41,13 @@ class GemmTuningProblem {
 
   bool supports(const Implementation& implementation,
                 std::string& reason) const {
+    if (eligible_ != nullptr &&
+        (implementation.provider_id != eligible_->provider_id ||
+         implementation.implementation_id != eligible_->implementation_id ||
+         implementation.implementation_version != eligible_->implementation_version)) {
+      reason = "baseline-domain";
+      return false;
+    }
     if (!supports_device(implementation, device_)) {
       reason = "device";
       return false;
@@ -65,6 +74,11 @@ class GemmTuningProblem {
   void configurations(const Implementation& implementation,
                       std::vector<int>& values) const {
     implementation.enumerate_configs(spec_, values);
+    if (eligible_ != nullptr) {
+      values.erase(std::remove_if(values.begin(), values.end(), [this](int value) {
+                     return value != eligible_->configuration;
+                   }), values.end());
+    }
   }
 
   std::unique_ptr<Execution> prepare(const Implementation& implementation,
@@ -87,6 +101,7 @@ class GemmTuningProblem {
   const Spec& spec_;
   const apxinf_gemm_policy_t& policy_;
   int device_;
+  const Recipe* eligible_;
   Allocation output_;
   apxinf_gemm_bindings_t bindings_;
 };
@@ -95,8 +110,8 @@ class GemmTuningProblem {
 
 Recipe tune(const Spec& spec, const apxinf_gemm_policy_t& policy,
             const apxinf_gemm_bindings_t& bindings, int device,
-            std::string& report) {
-  GemmTuningProblem problem(spec, policy, bindings, device);
+            std::string& report, const Recipe* eligible) {
+  GemmTuningProblem problem(spec, policy, bindings, device, eligible);
   return apxinf::framework::autotune(problem, report);
 }
 

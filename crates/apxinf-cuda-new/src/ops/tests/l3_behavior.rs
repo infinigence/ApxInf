@@ -5,10 +5,148 @@
 //! resource lifetime, binding rule, or capture behavior not already covered by
 //! the shared framework tests.
 
-use super::framework::{f16_tensor, tensor, values, zeros_tensor};
+use super::framework::{f16_tensor, f16_values, tensor, values, zeros_tensor};
 use super::*;
 use crate::CudaContext;
 use half::bf16;
+
+#[test]
+fn rounded_additive_attention_bindings_workspace_and_graph_lifetime() {
+    use apxinf_core::DType;
+    let ctx = CudaContext::new(0).unwrap();
+    let q = tensor(0, vec![1, 3, 2, 16], &vec![0.; 96]);
+    let k = tensor(0, vec![1, 5, 2, 16], &vec![0.; 160]);
+    let v_values: Vec<_> = (0..160).map(|i| (i / 32) as f32).collect();
+    let v = tensor(0, vec![1, 5, 2, 16], &v_values);
+    let bias = tensor(0, vec![1, 2, 3, 5], &vec![0.; 30]);
+    let mut out = tensor(0, vec![1, 3, 2, 16], &vec![0.; 96]);
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let invoke = |output: &mut apxinf_core::Tensor, workspace| {
+        let mut attention = AttentionArgs::new(&q, &k, &v, output);
+        attention.scale = 1.;
+        attention.policy.online_tune = false;
+        attention.policy.workspace_limit = workspace;
+        attention.policy.cache_dir = Some(String::new());
+        rounded_additive_attention(
+            &ctx,
+            RoundedAttentionBiasArgs {
+                attention,
+                bias: &bias,
+            },
+        )
+    };
+    assert!(invoke(&mut out, 1).is_err());
+    prepare_with_session(&session, || invoke(&mut out, 16 << 20)).unwrap();
+    let initial = values(&out);
+    for x in &initial {
+        assert!((*x - 2.).abs() < 0.01);
+    }
+    let graph = crate::capture(&ctx, || {
+        with_session(&session, || invoke(&mut out, 16 << 20))
+    })
+    .unwrap();
+    let bias_buffer = crate::CudaBuffer::from_tensor(&bias).unwrap();
+    let changed: Vec<_> = (0..30)
+        .flat_map(|i| {
+            bf16::from_f32(if i % 5 == 4 { 0. } else { -100. })
+                .to_bits()
+                .to_ne_bytes()
+        })
+        .collect();
+    ctx.synchronize().unwrap();
+    bias_buffer.copy_from_host(&changed).unwrap();
+    with_session(&session, || invoke(&mut out, 16 << 20)).unwrap();
+    ctx.synchronize().unwrap();
+    let changed_eager = values(&out);
+    assert!(changed_eager.iter().all(|&x| x == 4.));
+    let bad = zeros_tensor(0, vec![1, 2, 3, 5], DType::F32);
+    assert!(rounded_additive_attention(
+        &ctx,
+        RoundedAttentionBiasArgs {
+            attention: AttentionArgs::new(&q, &k, &v, &mut out),
+            bias: &bad
+        }
+    )
+    .is_err());
+    drop(bad);
+    drop(bias_buffer);
+    drop(session);
+    drop(q);
+    drop(k);
+    drop(v);
+    drop(bias);
+    for _ in 0..3 {
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&out), changed_eager);
+    }
+}
+
+#[test]
+fn rounded_attention_block_softmax_tail_and_changed_bias() {
+    // More than 2048 keys selects the block fallback, with a non-full final
+    // iteration. A single unmasked key gives an independent exact output.
+    let ctx = CudaContext::new(0).unwrap();
+    let keys = 2051;
+    for half_precision in [false, true] {
+        let upload = |shape, data: &[f32]| {
+            if half_precision {
+                f16_tensor(0, shape, data)
+            } else {
+                tensor(0, shape, data)
+            }
+        };
+        let read = if half_precision { f16_values } else { values };
+        let q = upload(vec![1, 1, 1, 16], &[0.; 16]);
+        let k = upload(vec![1, keys, 1, 16], &vec![0.; keys * 16]);
+        let mut source = vec![0.; keys * 16];
+        source[..16].fill(-2.);
+        source[(keys - 1) * 16..].fill(3.5);
+        let v = upload(vec![1, keys, 1, 16], &source);
+        let mut mask = vec![-100.; keys];
+        mask[0] = 0.;
+        let bias = upload(vec![1, 1, 1, keys], &mask);
+        let mut out = upload(vec![1, 1, 1, 16], &[0.; 16]);
+        let session = ExecutionSession::with_capacity(16 << 20, 0).unwrap();
+        let invoke = |out: &mut apxinf_core::Tensor| {
+            let mut attention = AttentionArgs::new(&q, &k, &v, out);
+            attention.policy.online_tune = false;
+            attention.policy.cache_dir = Some(String::new());
+            attention.policy.workspace_limit = 16 << 20;
+            rounded_additive_attention(
+                &ctx,
+                RoundedAttentionBiasArgs {
+                    attention,
+                    bias: &bias,
+                },
+            )
+        };
+        prepare_with_session(&session, || invoke(&mut out)).unwrap();
+        assert_eq!(read(&out), vec![-2.; 16]);
+        let graph = crate::capture(&ctx, || with_session(&session, || invoke(&mut out))).unwrap();
+        mask[0] = -100.;
+        mask[keys - 1] = 0.;
+        let bytes: Vec<_> = mask
+            .iter()
+            .flat_map(|&x| {
+                let bits = if half_precision {
+                    half::f16::from_f32(x).to_bits()
+                } else {
+                    bf16::from_f32(x).to_bits()
+                };
+                bits.to_ne_bytes()
+            })
+            .collect();
+        ctx.synchronize().unwrap();
+        crate::CudaBuffer::from_tensor(&bias)
+            .unwrap()
+            .copy_from_host(&bytes)
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(read(&out), vec![3.5; 16]);
+    }
+}
 
 #[test]
 fn pointwise_exact_gelu_runs_on_all_bf16_vector_paths() {
@@ -44,8 +182,8 @@ fn quantization_rejects_packed_fp4_input() {
         (QuantizationSemantic::RowwiseI8, DType::I8),
     ] {
         let mut output = zeros_tensor(0, vec![1, 16], dtype);
-        let error = quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output))
-            .unwrap_err();
+        let error =
+            quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output)).unwrap_err();
         assert!(
             error.to_string().contains("requires F16 or BF16")
                 || error.to_string().contains("dtype disagrees"),
@@ -388,23 +526,24 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
                         packed_values.push(match plane {
                             0 => 0.25,
                             1 => 0.5,
-                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32
-                                / 32.0,
+                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32 / 32.0,
                         });
                     }
                 }
             }
             for head in 0..heads {
                 for dimension in 0..head_dim {
-                    expected.push(
-                        ((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0,
-                    );
+                    expected.push(((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0);
                 }
             }
         }
     }
     let qkv = f16_tensor(0, vec![batch, tokens, 3, heads, head_dim], &packed_values);
-    let mut out = f16_tensor(0, vec![batch, tokens, heads, head_dim], &vec![0.0; elements]);
+    let mut out = f16_tensor(
+        0,
+        vec![batch, tokens, heads, head_dim],
+        &vec![0.0; elements],
+    );
     let normalized = super::attention_contracts::normalize_packed_qkv(
         &ctx,
         PackedQkvAttentionArgs::new(&qkv, &mut out),
@@ -421,9 +560,15 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         packed_qkv_attention(&ctx, args)
     })
     .unwrap();
-    let eager = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+    let eager = crate::transfers::to_cpu(&out)
+        .unwrap()
+        .to_f32_vec()
+        .unwrap();
     for (actual, reference) in eager.iter().zip(&expected) {
-        assert!((actual - reference).abs() < 0.002, "{actual} != {reference}");
+        assert!(
+            (actual - reference).abs() < 0.002,
+            "{actual} != {reference}"
+        );
     }
     let graph = crate::capture(&ctx, || {
         with_session(&session, || {
@@ -442,7 +587,10 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         output.copy_from_host(&sentinel).unwrap();
         graph.replay().unwrap();
         ctx.synchronize().unwrap();
-        let replayed = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+        let replayed = crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(replayed, eager);
     }
 }
@@ -960,4 +1108,111 @@ fn attention_semantics_use_distinct_native_registries() {
     assert!(segmented
         .summary()
         .starts_with("custom-segmented-attention "));
+}
+
+#[test]
+fn dense_attention_cold_cache_bounded_workspace_fallback() {
+    // The custom implementation needs a quadratic score matrix. A compiled
+    // FlashAttention provider must remain usable without a tuning recipe.
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    let shape = vec![1, 1024, 2, 128];
+    let q = tensor(0, shape.clone(), &vec![0.; 262144]);
+    let k = tensor(0, shape.clone(), &vec![0.; 262144]);
+    let v = tensor(
+        0,
+        shape.clone(),
+        &(0..262144)
+            .map(|i| ((i / 256) % 8) as f32)
+            .collect::<Vec<_>>(),
+    );
+    let mut out = tensor(0, shape, &vec![0.; 262144]);
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let invoke = |out: &mut apxinf_core::Tensor| {
+        let mut args = AttentionArgs::new(&q, &k, &v, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        args.policy.workspace_limit = 2 << 20;
+        args.policy.deterministic = true;
+        attention(&ctx, args)
+    };
+    // Builds without FA2 correctly reject this workspace-limited profile.
+    if let Err(error) = prepare_with_session(&session, || invoke(&mut out)) {
+        assert!(
+            error.to_string().contains("no Attention fallback"),
+            "{error}"
+        );
+        eprintln!("bounded attention unavailable on this compiled target: {error}");
+        return;
+    }
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&x| x == 3.5));
+    let graph = crate::capture(&ctx, || with_session(&session, || invoke(&mut out))).unwrap();
+    let changed = vec![bf16::from_f32(2.); 262144];
+    crate::transfers::copy_cpu_to_cuda(
+        &apxinf_core::Tensor::from_bf16(vec![1, 1024, 2, 128], &changed).unwrap(),
+        &v,
+    )
+    .unwrap();
+    drop(session);
+    drop(q);
+    drop(k);
+    drop(v);
+    for _ in 0..3 {
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(values(&out).iter().all(|&x| x == 2.));
+    }
+    eprintln!("bounded cold-cache attention and retained graph replay passed");
+}
+
+#[test]
+fn attention_large_equal_logits_remain_finite() {
+    use apxinf_core::{DType, Tensor};
+    let read = |x: &Tensor| crate::transfers::to_cpu(x).unwrap().to_f32_vec().unwrap();
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    for (dtype, magnitude) in [
+        (DType::F16, 60000.),
+        (DType::BF16, 1e12),
+        (DType::BF16, 1e15),
+    ] {
+        let upload = |shape, data: &[f32]| {
+            if dtype == DType::F16 {
+                f16_tensor(0, shape, data)
+            } else {
+                tensor(0, shape, data)
+            }
+        };
+        let q = upload(vec![1, 3, 1, 128], &vec![magnitude; 3 * 128]);
+        let k = upload(vec![1, 7, 1, 128], &vec![magnitude; 7 * 128]);
+        let v = upload(vec![1, 7, 1, 128], &vec![1.; 7 * 128]);
+        let mut out = zeros_tensor(0, vec![1, 3, 1, 128], dtype);
+        let session = ExecutionSession::with_capacity(256, 0).unwrap();
+        let invoke = |out: &mut Tensor| {
+            let mut args = AttentionArgs::new(&q, &k, &v, out);
+            args.policy.cache_dir = Some(String::new());
+            // Linear-memory attention fits its 12-byte LSE; a materialized
+            // probability matrix needs 84 bytes. No implementation is named.
+            args.policy.workspace_limit = 32;
+            attention(&ctx, args)
+        };
+        session.prepare(|| invoke(&mut out)).unwrap();
+        ctx.synchronize().unwrap();
+        // Identical finite logits and all-one values imply exactly one.
+        // Fusing score*scale - rounded_max*scale can instead overflow exp2.
+        assert!(
+            read(&out).iter().all(|&x| x == 1.),
+            "{dtype:?}/{magnitude}: {:?}",
+            &read(&out)[..4]
+        );
+        let graph = session
+            .run(|| crate::capture(&ctx, || invoke(&mut out)))
+            .unwrap();
+        drop(q);
+        drop(k);
+        drop(v);
+        drop(session);
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(read(&out).iter().all(|&x| x == 1.));
+    }
 }

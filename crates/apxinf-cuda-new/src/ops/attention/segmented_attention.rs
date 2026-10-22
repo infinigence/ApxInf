@@ -139,6 +139,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
     let default_scale = 1.0 / (shape[2] as f32).sqrt();
     let bindings = abi::Bindings {
         query: q.ptr(),
+        bias: std::ptr::null(),
         key: k.ptr(),
         value: v.ptr(),
         offsets: offsets.ptr(),
@@ -152,6 +153,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: SegmentedAttentionArgs<'_>) -> 
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
             semantic: Semantic::Segmented.abi_value(),
+            bias_alignment: 0,
             dtype: dtype_code(dtype)?,
             output_dtype: dtype_code(dtype)?,
             mask: AttentionMask::None as u32,

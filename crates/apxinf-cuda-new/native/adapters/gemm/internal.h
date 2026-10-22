@@ -96,6 +96,7 @@ inline bool supports_alignment(const Implementation& implementation,
                                const Spec& spec) {
   const auto required = implementation.alignment_requirements(spec);
   const bool has_bias =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU ||
       (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
@@ -148,6 +149,8 @@ struct Execution {
   // algorithms and construct descriptors first, but must not allocate device
   // memory beyond this limit.
   size_t resource_limit = 0;
+  // Provider diagnostics only; never parsed for dispatch or recipe identity.
+  std::string provider_detail;
   std::string summary;
 
   ~Execution();
@@ -160,6 +163,9 @@ size_t cublas_resource_requirements(const Spec& spec);
 void destroy_cublas(Execution& execution) noexcept;
 cudaError_t launch_cublas(Execution& execution);
 void prepare_cublaslt(Execution& execution);
+void prepare_cublaslt_f32_reduction(Execution& state);
+void prepare_cublaslt_direct_bias(Execution& execution);
+size_t cublaslt_direct_bias_resource_requirements(const Spec& spec);
 void prepare_cublaslt_native_fp8(Execution& execution);
 void prepare_cublaslt_native_fp4(Execution& execution);
 void prepare_cublaslt_native_fp8_gelu(Execution& execution);
@@ -203,7 +209,7 @@ std::unique_ptr<Execution> prepare(const Implementation& implementation,
 Recipe tune(
     const Spec& spec, const apxinf_gemm_policy_t& policy,
     const apxinf_gemm_bindings_t& bindings, int device,
-    std::string& report);
+    std::string& report, const Recipe* eligible = nullptr);
 AccuracyMetrics compare_reference(const std::vector<float>& expected,
                                   const std::vector<float>& actual);
 std::string format_accuracy(const AccuracyMetrics& metrics);

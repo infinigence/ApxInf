@@ -23,6 +23,20 @@ impl WeightVersion {
     }
 }
 
+/// Legal algorithm domain within the existing GEMM preparation/tuning path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum GemmAlgorithmPolicy {
+    #[default]
+    Any = 0,
+    /// Use the first successfully prepared cold-fallback algorithm for this
+    /// exact contract. Online tuning still measures and captures that singleton
+    /// domain, but cannot change its reduction order to improve latency.
+    /// This is scoped to one compatible build, library, device and policy;
+    /// it does not promise identical arithmetic across hardware/toolkit versions.
+    ColdBaseline = 1,
+}
+
 #[derive(Clone, Debug)]
 pub struct GemmPolicy {
     /// Accumulation precision is part of the GEMM key, not a candidate detail.
@@ -32,6 +46,7 @@ pub struct GemmPolicy {
     pub allow_fallback: bool,
     pub graph_safe: bool,
     pub deterministic: bool,
+    pub algorithm: GemmAlgorithmPolicy,
     /// None uses the context's hardware/toolkit directory; Some("") disables disk caching.
     pub cache_dir: Option<String>,
 }
@@ -45,6 +60,7 @@ impl Default for GemmPolicy {
             allow_fallback: true,
             graph_safe: true,
             deterministic: false,
+            algorithm: GemmAlgorithmPolicy::Any,
             cache_dir: None,
         }
     }
@@ -70,6 +86,9 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
+    /// Store B as contiguous [N,K] for single-round GEMM+bias. Other
+    /// semantics and quantized operands currently require their default layout.
+    pub b_transposed: bool,
 }
 
 /// Quantization contract for the operands supplied to one GEMM call.
@@ -127,6 +146,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            b_transposed: false,
         }
     }
 
@@ -149,6 +169,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            b_transposed: false,
         }
     }
 
@@ -175,6 +196,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy,
             weight_version: None,
+            b_transposed: false,
         }
     }
 
@@ -211,6 +233,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            b_transposed: false,
         }
     }
 }
@@ -222,6 +245,7 @@ pub(crate) enum Semantic {
     GemmGeglu = 2,
     GemmBias = 3,
     GemmBiasResidual = 4,
+    GemmBiasSingleRound = 5,
 }
 
 #[cfg(test)]
@@ -234,6 +258,7 @@ impl Semantic {
         Self::GemmBiasGelu,
         Self::GemmGeglu,
         Self::GemmBiasResidual,
+        Self::GemmBiasSingleRound,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -246,6 +271,7 @@ impl Semantic {
             Self::GemmBiasGelu => "gemm_bias_gelu",
             Self::GemmGeglu => "gemm_geglu",
             Self::GemmBiasResidual => "gemm_bias_residual",
+            Self::GemmBiasSingleRound => "gemm_bias_single_round",
         }
     }
 }
@@ -366,13 +392,7 @@ pub(crate) fn normalize_bias_residual<'a>(
     bias: Option<&'a Tensor>,
     residual: &'a Tensor,
 ) -> Result<Normalized> {
-    normalize_fused(
-        ctx,
-        args,
-        Semantic::GemmBiasResidual,
-        bias,
-        Some(residual),
-    )
+    normalize_fused(ctx, args, Semantic::GemmBiasResidual, bias, Some(residual))
 }
 
 fn normalize_fused<'a>(
@@ -387,15 +407,18 @@ fn normalize_fused<'a>(
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(invalid("GEMM requires rank-2 tensors"));
     }
+    if args.b_transposed
+        && (semantic != Semantic::GemmBiasSingleRound
+            || !matches!(args.quantization, GemmQuantization::None))
+    {
+        return Err(invalid(
+            "transposed B is supported only by unquantized single-round GEMM+bias",
+        ));
+    }
     let nvfp4 = matches!(args.quantization, GemmQuantization::Nvfp4 { .. });
-    // Public storage is deliberately canonical and candidate-independent.
-    // Candidates may transpose or pack internally while preparing an execution.
-    //
-    // NVFP4 is the one contract whose canonical storage is not `A=[M,K]`,
-    // `B=[K,N]`: both operands are packed two-values-per-byte along K, and the
-    // weight is stored `[N, K/2]`. That is how the checkpoint already stores it
-    // and what the block-scaled kernel consumes, so demanding the usual [K,N]
-    // orientation would force a transpose that buys nothing.
+    // Layout is explicit and candidate-independent. Single-round bias admits
+    // original linear weights [N,K]; other floating-point contracts use [K,N].
+    // NVFP4 packs two values per byte along K, with weight storage [N,K/2].
     let (m, k) = if nvfp4 {
         (a_shape[0], a_shape[1] * 2)
     } else {
@@ -403,6 +426,8 @@ fn normalize_fused<'a>(
     };
     let (weight_k, n) = if nvfp4 {
         (b_shape[1] * 2, b_shape[0])
+    } else if args.b_transposed {
+        (b_shape[1], b_shape[0])
     } else {
         (b_shape[0], b_shape[1])
     };
@@ -424,7 +449,7 @@ fn normalize_fused<'a>(
     }
     let needs_bias = matches!(
         semantic,
-        Semantic::GemmBias | Semantic::GemmBiasGelu
+        Semantic::GemmBias | Semantic::GemmBiasGelu | Semantic::GemmBiasSingleRound
     );
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
@@ -482,9 +507,7 @@ fn normalize_fused<'a>(
             if args.a.dtype() != DType::E2M1Pair || args.b.dtype() != DType::E2M1Pair {
                 return Err(invalid("NVFP4 GEMM requires two packed E2M1 tensors"));
             }
-            if a_block_scales.dtype() != DType::F8E4M3
-                || b_block_scales.dtype() != DType::F8E4M3
-            {
+            if a_block_scales.dtype() != DType::F8E4M3 || b_block_scales.dtype() != DType::F8E4M3 {
                 // The kernel reads these as unsigned E4M3. For the non-negative
                 // values a scale tensor holds, that encoding is bit-identical
                 // to signed E4M3, so the checkpoint bytes pass through as-is.
@@ -499,6 +522,15 @@ fn normalize_fused<'a>(
             (4, None, None)
         }
     };
+    if semantic == Semantic::GemmBiasSingleRound
+        && (quantization != 0
+            || !matches!(args.a.dtype(), DType::F16 | DType::BF16)
+            || args.out.dtype() != args.a.dtype())
+    {
+        return Err(invalid(
+            "single-round GEMM+bias requires matching F16/BF16 inputs and output",
+        ));
+    }
     let has_row_channel_scales = matches!(quantization, 2 | 3);
     if semantic == Semantic::GemmGeglu && has_row_channel_scales {
         return Err(invalid("scaled GEMM+GeGLU is unsupported"));
@@ -573,7 +605,11 @@ fn normalize_fused<'a>(
                 output_bytes,
                 &buffer,
                 bytes,
-                if slot == 0 { "A block scale" } else { "B block scale" },
+                if slot == 0 {
+                    "A block scale"
+                } else {
+                    "B block scale"
+                },
             )?;
             if slot == 0 {
                 bindings.a_block_scales = buffer.ptr();
@@ -637,13 +673,14 @@ fn normalize_fused<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 6,
+            version: 9,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
             accumulation_dtype: dtype(args.policy.accumulation_dtype)?,
             output_dtype: dtype(args.out.dtype())?,
             quantization,
+            b_transposed: u32::from(args.b_transposed),
             b_is_immutable: bindings.b_is_immutable,
             a_alignment: alignment_class(bindings.a),
             b_alignment: alignment_class(bindings.b),
