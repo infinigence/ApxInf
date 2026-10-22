@@ -9,13 +9,22 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import subprocess
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 from http_benchmark import local_url, metal_measurement_lock, metrics_snapshot, request_json
+
+
+PELICAN_TITLE = "Pelican at the Harbor"
+SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+SVG_ELEMENTS = {"svg", "title", "desc", "g", "path", "circle", "ellipse", "rect",
+                "line", "polyline", "polygon", "text", "tspan"}
+SVG_GRAPHICS = {"path", "circle", "ellipse", "rect", "line", "polyline", "polygon", "text"}
 
 
 def client_environment(base_url, model, config_dir, max_tokens=512, max_context=None):
@@ -73,6 +82,16 @@ def prepare_task(name, directory):
         return {"prompt": "Write a detailed list of 200 different short sentences about bounded queues. "
                           "Number every sentence. Continue until you reach item 200.",
                 "tools": [], "allowed": []}
+    if name == "pelican":
+        (directory / "drawing-brief.txt").write_text(
+            "Draw an original pelican beside a harbor buoy. Use plain SVG shapes and colors.\n"
+            "Show a long beak, a throat pouch, a body, feet, water, and one buoy.\n"
+            'Use an SVG root with xmlns="http://www.w3.org/2000/svg" and viewBox="0 0 640 480".\n'
+            f"Add a direct <title> child with the exact text {PELICAN_TITLE}.\n"
+            "Keep the SVG self-contained. Do not use scripts, links, images, styles, or external assets.\n")
+        return {"prompt": "Use Read to inspect drawing-brief.txt. After Read finishes, use Write or Edit "
+                          "to create pelican.svg from that brief. Reply when the file is saved.",
+                "tools": ["Read", "Write", "Edit"], "allowed": ["Read", "Write", "Edit"]}
     raise ValueError(f"Unknown task: {name}")
 
 
@@ -127,6 +146,89 @@ def inspect_events(events):
                                     "is_error": block.get("is_error", False),
                                     "content": block.get("content"), "elapsed_s": record["elapsed_s"]})
     return tools, results, final
+
+
+def successful_pelican_tool_cycle(events, directory):
+    pending = {}
+    read_complete = False
+    for record in events:
+        event = record["event"]
+        kind = event.get("type")
+        if kind not in ("assistant", "user"):
+            continue
+        content = event.get("message", {}).get("content", [])
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if kind == "assistant" and block.get("type") == "tool_use":
+                tool_id = block.get("id")
+                name = block.get("name")
+                tool_input = block.get("input")
+                if isinstance(tool_id, str) and tool_id and tool_id not in pending:
+                    target = "drawing-brief.txt" if name == "Read" else "pelican.svg"
+                    file_path = tool_input.get("file_path") if isinstance(tool_input, dict) else None
+                    if not isinstance(file_path, str):
+                        continue
+                    path = Path(file_path)
+                    if not path.is_absolute():
+                        path = directory / path
+                    if path.resolve() != (directory / target).resolve():
+                        continue
+                    if name == "Read" or (read_complete and name in ("Write", "Edit")):
+                        pending[tool_id] = name
+            elif kind == "user" and block.get("type") == "tool_result":
+                name = pending.pop(block.get("tool_use_id"), None)
+                if name is None or block.get("is_error", False) is not False:
+                    continue
+                if name == "Read":
+                    read_complete = True
+                elif name in ("Write", "Edit"):
+                    return True
+    return False
+
+
+def check_pelican_svg(path):
+    if path.is_symlink() or not path.is_file():
+        return False, "The SVG file is absent or is not a regular file."
+    try:
+        if not 0 < path.stat().st_size <= 1_000_000:
+            return False, "The SVG file is empty or exceeds the size limit."
+        source = path.read_bytes()
+        decoded = source.decode("utf-8-sig")
+        if ("<!DOCTYPE" in decoded.upper() or "<!ENTITY" in decoded.upper() or
+                re.search(r"<\?(?!xml\s)", decoded, flags=re.IGNORECASE)):
+            return False, "The SVG contains a document type, entity, or processing instruction."
+        root = ET.fromstring(source)
+    except (OSError, UnicodeError, ET.ParseError):
+        return False, "The SVG is not well-formed XML."
+    if root.tag != f"{{{SVG_NAMESPACE}}}svg":
+        return False, "The root is not an SVG element."
+    if root.get("viewBox", "").split() != ["0", "0", "640", "480"]:
+        return False, "The SVG viewBox differs from the brief."
+    titles = [item for item in root if item.tag == f"{{{SVG_NAMESPACE}}}title"]
+    if len(titles) != 1 or "".join(titles[0].itertext()).strip() != PELICAN_TITLE:
+        return False, "The SVG title differs from the brief."
+    graphics = False
+    for element in root.iter():
+        if not isinstance(element.tag, str) or not element.tag.startswith(f"{{{SVG_NAMESPACE}}}"):
+            return False, "The SVG contains a foreign element."
+        name = element.tag.rsplit("}", 1)[1]
+        if name not in SVG_ELEMENTS:
+            return False, "The SVG contains an unsupported element."
+        graphics |= name in SVG_GRAPHICS
+        for attribute, value in element.attrib.items():
+            if "}" in attribute:
+                return False, "The SVG contains a namespaced attribute."
+            if attribute.lower().startswith("on") or attribute == "style":
+                return False, "The SVG contains active content or a style attribute."
+            lowered = value.lower()
+            if attribute.lower() in ("href", "src") or any(
+                    token in lowered for token in ("url(", "javascript:", "data:", "http:",
+                                                  "https:", "file:", "@import", "expression(")):
+                return False, "The SVG contains a reference or active content."
+    if not graphics:
+        return False, "The SVG has no graphical element."
+    return True, None
 
 
 def has_content_delta(event):
@@ -237,6 +339,20 @@ def task_outcome(name, spec, directory, capture):
         assertion = ("Read" in names and any(
             item["tool_use_id"] in successful_bash and not item["is_error"] and
             "APXINF_CHECK_PASS" in json.dumps(item["content"]) for item in results))
+    elif name == "pelican":
+        valid_svg, reason = check_pelican_svg(directory / "pelican.svg")
+        tool_cycle_passed = successful_pelican_tool_cycle(capture["events"], directory)
+        assertion = tool_cycle_passed and valid_svg
+        usage = final.get("usage", {}) if final else {}
+        observed_input_usage = {key: usage[key] for key in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                                if isinstance(usage, dict) and type(usage.get(key)) is int}
+        return {"passed": bool(finished and final.get("subtype") == "success" and assertion),
+                "assertion_passed": bool(assertion), "tool_calls": tools, "tool_results": results,
+                "result": final, "tool_cycle_passed": tool_cycle_passed,
+                "svg_check": {"valid": valid_svg, "reason": reason},
+                "svg_path": str(directory / "pelican.svg"), "visual_review": "pending",
+                "observed_input_usage": observed_input_usage or None}
     else:
         assertion = capture["cancel_sent"] and capture["first_content_s"] is not None
         finished = assertion
@@ -329,7 +445,7 @@ def parser():
     result.add_argument("--base-url", default="http://127.0.0.1:8080")
     result.add_argument("--model")
     result.add_argument("--claude", type=Path, default=Path("/opt/homebrew/bin/claude"))
-    result.add_argument("--tasks", nargs="+", choices=("read", "edit", "check", "cancel"),
+    result.add_argument("--tasks", nargs="+", choices=("read", "edit", "check", "cancel", "pelican"),
                         default=["read", "edit", "check"])
     result.add_argument("--repeats", type=int, default=1)
     result.add_argument("--timeout", type=float, default=180)
