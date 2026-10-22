@@ -26,7 +26,12 @@ The parser decodes the five predefined XML entities in ordinary text. It also de
 
 The parser rejects unknown entities, invalid character references, and raw `<` characters in ordinary text. It preserves string whitespace exactly.
 
-For a property with type `string`, the decoded value is a string. For every other declared type, the decoded value must be one JSON document.
+For a property with type `string`, the decoded value is a string.
+For a Boolean property, the parser also accepts the exact literals `True` and `False` after surrounding whitespace removal.
+The checkpoint template uses these literals in tool history.
+The parser converts them to JSON Boolean values.
+Every other non-string value must be one JSON document.
+This exception does not permit Python expressions, dictionaries, or other literal spellings.
 
 The parser checks basic argument types, required properties, enums, and additional properties. It checks declared nested properties and array items with the same rules. It does not enforce general JSON Schema constraints, such as `minLength`, `pattern`, or union type arrays.
 
