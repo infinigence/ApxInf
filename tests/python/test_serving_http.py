@@ -302,23 +302,25 @@ class LifecycleGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "supported worker protocol"):
                 lifecycle.verify_worker_target(self.arguments(), ready)
 
-    def test_sampled_native_target_requires_explicit_sampled_provider(self):
-        ready = self.readiness()
-        ready["worker"]["protocol"] = "apxinf-worker/2.2"
-        identities = self.identities()
-        identities[0]["command"] += (" --provider native-minicpm5-sampled"
-                                    " --native-worker /original/apxinf-native-worker"
-                                    " --metal-library /original/libmlx.dylib")
-        identities[1]["command"] = ("/original/apxinf-native-worker --protocol apxinf-worker/2.2"
-                                    " --worker-epoch original-epoch --model /original/model"
-                                    " --metal-library /original/libmlx.dylib")
-        with patch.object(lifecycle, "process_identity", side_effect=identities), \
-                patch.object(lifecycle.subprocess, "run", return_value=SimpleNamespace(stdout="p400\n")):
-            self.assertEqual(lifecycle.verify_worker_target(self.arguments(), ready)["worker"]["pid"], 401)
-        identities[0]["command"] = identities[0]["command"].replace("native-minicpm5-sampled", "native-minicpm5")
-        with patch.object(lifecycle, "process_identity", side_effect=identities):
-            with self.assertRaisesRegex(RuntimeError, "does not match the service launch"):
-                lifecycle.verify_worker_target(self.arguments(), ready)
+    def test_native_sampling_and_thinking_require_the_selected_provider(self):
+        for protocol, provider in (("apxinf-worker/2.2", "native-minicpm5-sampled"),
+                                   ("apxinf-worker/2.3", "native-minicpm5-thinking")):
+            ready = self.readiness()
+            ready["worker"]["protocol"] = protocol
+            identities = self.identities()
+            identities[0]["command"] += (f" --provider {provider}"
+                                        " --native-worker /original/apxinf-native-worker"
+                                        " --metal-library /original/libmlx.dylib")
+            identities[1]["command"] = (f"/original/apxinf-native-worker --protocol {protocol}"
+                                        " --worker-epoch original-epoch --model /original/model"
+                                        " --metal-library /original/libmlx.dylib")
+            with patch.object(lifecycle, "process_identity", side_effect=identities), \
+                    patch.object(lifecycle.subprocess, "run", return_value=SimpleNamespace(stdout="p400\n")):
+                self.assertEqual(lifecycle.verify_worker_target(self.arguments(), ready)["worker"]["pid"], 401)
+            identities[0]["command"] = identities[0]["command"].replace(provider, "native-minicpm5")
+            with patch.object(lifecycle, "process_identity", side_effect=identities):
+                with self.assertRaisesRegex(RuntimeError, "does not match the service launch"):
+                    lifecycle.verify_worker_target(self.arguments(), ready)
 
     def test_worker_fault_requires_explicit_flag_before_process_inspection(self):
         with patch.object(lifecycle, "process_identity") as inspection:

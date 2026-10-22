@@ -71,6 +71,24 @@ fn native_manifest_checks_selected_runtime_and_execution_profile() {
     verify_manifest(&manifest, &config).unwrap();
     manifest["execution"]["sampling"]["top_p"] = "1".into();
     assert!(verify_manifest(&manifest, &config).is_err());
+    config.runtime = WorkerRuntime::NativeMiniCpm5Thinking {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest = crate::native_identity::manifest(
+        &config.model,
+        crate::native_identity::runtime(&executable, &library).unwrap(),
+        crate::native_identity::thinking_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["execution"]["enable_thinking"] = false.into();
+    assert!(verify_manifest(&manifest, &config).is_err());
     config.prefill_step_size = 256;
     config.max_context = 16384;
     assert!(config.validate_memory().is_ok());
