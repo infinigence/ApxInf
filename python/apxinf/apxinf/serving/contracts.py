@@ -12,6 +12,7 @@ PROTOCOL = "apxinf-worker/2.0"
 NATIVE_PROTOCOL = "apxinf-worker/2.1"
 NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
 NATIVE_THINKING_PROTOCOL = "apxinf-worker/2.3"
+NATIVE_BOUNDED_THINKING_PROTOCOL = "apxinf-worker/2.4"
 MAX_FRAME_BYTES = 1_048_576
 MAX_DEPTH = 16
 MAX_COMMANDS = 10_000
@@ -175,7 +176,7 @@ def _sampling(value: Any) -> None:
 
 def _submit_fields(frame: dict) -> set[str]:
     fields = {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}
-    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL):
+    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL):
         fields.add("sampling")
     return fields
 
@@ -203,7 +204,7 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL), "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
@@ -229,8 +230,9 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL), "unsupported protocol")
-    thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
+    bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+    thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL or bounded
     sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL or thinking
     native = frame["protocol"] == NATIVE_PROTOCOL or sampled
     _uuid(frame["worker_epoch"])
@@ -245,6 +247,15 @@ def validate_frame(frame: dict) -> None:
         _int(frame.get("event_seq"))
     if kind == "ready":
         _keys(frame, BASE | {"model_revision", "capability_revision", "model_manifest", "capabilities", "limits", "model_path", "eos_token_ids", "vocab_size", "runtime", "memory"})
+        manifest = frame["model_manifest"]
+        _require(type(manifest) is dict, "model manifest must be an object")
+        if not bounded:
+            execution = manifest.get("execution")
+            _require(manifest.get("adapter_revision") != "apxinf-native-minicpm5-bounded-thinking-v1"
+                     and not (type(execution) is dict and (
+                         execution.get("output_policy") == "minicpm5-initial-thinking-fixed512-v1"
+                         or "initial_reasoning" in execution)),
+                     "bounded thinking identity requires protocol 2.4")
         _capabilities(frame["capabilities"], native, sampled)
         _keys(frame["limits"], {"max_frame_bytes", "max_depth", "max_commands"})
         _require(frame["limits"] == {"max_frame_bytes": MAX_FRAME_BYTES, "max_depth": MAX_DEPTH, "max_commands": MAX_COMMANDS}, "incompatible transport limits")
@@ -262,11 +273,22 @@ def validate_frame(frame: dict) -> None:
                 execution = manifest.get("execution")
                 _require(type(execution) is dict, "expected execution identity")
                 if thinking:
-                    _keys(execution, {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
-                                      "max_output_tokens", "memory_limit_bytes", "sampling", "output_policy"})
-                    _require(execution["output_policy"] == "minicpm5-initial-thinking-v1",
+                    required = {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
+                                "max_output_tokens", "memory_limit_bytes", "sampling", "output_policy"}
+                    if bounded:
+                        required.add("initial_reasoning")
+                    _keys(execution, required)
+                    output_policy = "minicpm5-initial-thinking-fixed512-v1" if bounded else "minicpm5-initial-thinking-v1"
+                    _require(execution["output_policy"] == output_policy,
                              "unsupported native thinking output policy")
-                adapter = "apxinf-native-minicpm5-thinking-v1" if thinking else "apxinf-native-minicpm5-sampled-v1"
+                if bounded:
+                    reasoning = execution["initial_reasoning"]
+                    _keys(reasoning, {"budget_tokens", "close_token_id", "selection"})
+                    _int(reasoning["budget_tokens"], 512, 512)
+                    _int(reasoning["close_token_id"], 9, 9)
+                    _enum(reasoning["selection"], {"cpu-constrained-close-v1"})
+                adapter = ("apxinf-native-minicpm5-bounded-thinking-v1" if bounded else
+                           "apxinf-native-minicpm5-thinking-v1" if thinking else "apxinf-native-minicpm5-sampled-v1")
                 _require(manifest.get("adapter_revision") == adapter
                          and execution.get("provider") == "metal_minicpm5"
                          and execution.get("precision") == "bf16"
@@ -286,6 +308,9 @@ def validate_frame(frame: dict) -> None:
         _int(frame["vocab_size"], 1, 2_147_483_648)
         _tokens(frame["eos_token_ids"], 256)
         _require(all(token < frame["vocab_size"] for token in frame["eos_token_ids"]), "EOS outside vocabulary")
+        if bounded:
+            _require(9 < frame["vocab_size"] and 9 not in frame["eos_token_ids"],
+                     "initial reasoning close token must be inside vocabulary and outside EOS")
         _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
         _require(frame["model_revision"] == canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"]), "model revision mismatch")
         _require(frame["capability_revision"] == canonical_identity_digest("apxinf-capability-v1", frame["capabilities"]), "capability revision mismatch")
@@ -296,7 +321,7 @@ def validate_frame(frame: dict) -> None:
         _keys(frame["template_options"], {"enable_thinking"})
         _require(type(frame["template_options"]["enable_thinking"]) is bool, "enable_thinking must be Boolean")
         _require(not thinking or frame["template_options"]["enable_thinking"] is True,
-                 "protocol 2.3 requires thinking preparation")
+                 "protocol 2.4 requires thinking preparation" if bounded else "protocol 2.3 requires thinking preparation")
     elif kind == "prepared_input":
         _keys(frame, COMMAND | {"model_revision", "token_ids", "effective_input_tokens", "prompt_digest"})
         _digest(frame["model_revision"])
