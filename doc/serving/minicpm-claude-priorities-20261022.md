@@ -55,6 +55,10 @@ The [calculation diagnostic](minicpm-reference-validation-20261023.md) compares 
 Five selected positions have matching greedy IDs, but their probability distributions differ.
 The diagnostic does not establish general numerical equivalence or drawing capability.
 It identifies an abrupt forced reasoning boundary that requires a separate controlled task comparison.
+The [closure comparison with one seed](minicpm-closure-validation-20261023.md) completes that separate observation on the original direct brief.
+Natural closure exhausts 4096 output tokens.
+Bounded closure yields an extracted SVG that still fails visual review.
+Removing the boundary alone has no demonstrated task-quality benefit in this pair.
 The current MiniCPM5-2B profile remains text-only and rejects image input.
 A vision model requires a separate declared provider and interface qualification.
 KV reuse remains lower priority than these task gates.
