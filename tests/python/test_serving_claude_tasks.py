@@ -1,0 +1,164 @@
+"""Check the original pelican task without starting Claude Code or a model."""
+
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
+import claude_code_tasks as client
+
+
+VALID_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">'
+    '<title>Pelican at the Harbor</title>'
+    '<ellipse cx="240" cy="220" rx="100" ry="60" fill="white"/>'
+    '<path d="M 280 220 L 420 240 L 300 260 Z" fill="orange"/>'
+    '</svg>'
+)
+
+
+def event(kind, blocks=None, **fields):
+    value = {"type": kind, **fields}
+    if blocks is not None:
+        value["message"] = {"content": blocks}
+    return {"elapsed_s": 0.1, "event": value}
+
+
+def tool_call(tool_id, name, path=None):
+    path = path or ("drawing-brief.txt" if name == "Read" else "pelican.svg")
+    return event("assistant", [{"type": "tool_use", "id": tool_id, "name": name,
+                                "input": {"file_path": path}}])
+
+
+def tool_result(tool_id, failed=False):
+    return event("user", [{"type": "tool_result", "tool_use_id": tool_id,
+                           "is_error": failed, "content": "Tool completed."}])
+
+
+def capture(events=None, subtype="success"):
+    return {"events": (events or []) + [event("result", result="Done.", subtype=subtype,
+                                               is_error=False, usage={"input_tokens": 123})],
+            "exit_code": 0}
+
+
+def successful_events():
+    return [tool_call("read-1", "Read"), tool_result("read-1"),
+            tool_call("write-1", "Write"), tool_result("write-1")]
+
+
+class PelicanTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name) / "task"
+        self.spec = client.prepare_task("pelican", self.directory)
+
+    def outcome(self, events=None, subtype="success"):
+        return client.task_outcome("pelican", self.spec, self.directory, capture(events, subtype))
+
+    def save_svg(self, text=VALID_SVG):
+        (self.directory / "pelican.svg").write_text(text)
+
+    def test_task_creates_an_original_brief_and_narrow_tool_set(self):
+        brief = (self.directory / "drawing-brief.txt").read_text()
+        self.assertIn("pelican", brief)
+        self.assertIn('viewBox="0 0 640 480"', brief)
+        self.assertEqual(self.spec["tools"], ["Read", "Write", "Edit"])
+        self.assertEqual(self.spec["allowed"], ["Read", "Write", "Edit"])
+
+    def test_valid_svg_and_matched_read_write_cycle_pass_structurally(self):
+        self.save_svg()
+        result = self.outcome(successful_events())
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["visual_review"], "pending")
+        self.assertEqual(result["observed_input_usage"], {"input_tokens": 123})
+
+    def test_edit_result_also_completes_the_save_cycle(self):
+        self.save_svg()
+        events = [tool_call("read-1", "Read"), tool_result("read-1"),
+                  tool_call("edit-1", "Edit"), tool_result("edit-1")]
+        self.assertTrue(self.outcome(events)["passed"])
+
+    def test_standard_xml_declaration_does_not_reject_svg(self):
+        self.save_svg('<?xml version="1.0" encoding="UTF-8"?>' + VALID_SVG)
+        self.assertTrue(self.outcome(successful_events())["passed"])
+
+    def test_a_write_before_the_brief_read_does_not_count(self):
+        self.save_svg()
+        events = [tool_call("write-1", "Write"), tool_result("write-1"),
+                  tool_call("read-1", "Read"), tool_result("read-1")]
+        self.assertFalse(self.outcome(events)["passed"])
+
+    def test_wrong_tool_result_id_does_not_complete_write(self):
+        self.save_svg()
+        for events in (
+            successful_events()[:-1] + [tool_result("another-id")],
+            [tool_call("read-1", "Read"), tool_result("another-id"),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_wrong_tool_paths_do_not_complete_the_cycle(self):
+        self.save_svg()
+        for events in (
+            [tool_call("read-1", "Read", "another-brief.txt"), tool_result("read-1"),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+            [tool_call("read-1", "Read"), tool_result("read-1"),
+             tool_call("write-1", "Write", "another.svg"), tool_result("write-1")],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_failed_tool_result_does_not_complete_read_or_write(self):
+        self.save_svg()
+        for events in (
+            [tool_call("read-1", "Read"), tool_result("read-1", True),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+            successful_events()[:-1] + [tool_result("write-1", True)],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_empty_and_malformed_artifacts_fail(self):
+        self.assertFalse(self.outcome(successful_events())["passed"])
+        for source in ("", "<svg", "not xml"):
+            with self.subTest(source=source):
+                self.save_svg(source)
+                result = self.outcome(successful_events())
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["svg_check"]["valid"])
+
+    def test_false_success_without_a_tool_cycle_or_valid_artifact_fails(self):
+        self.save_svg()
+        self.assertFalse(self.outcome([])["passed"])
+        self.assertFalse(self.outcome(successful_events(), "error")["passed"])
+        self.save_svg("<svg/>")
+        self.assertFalse(self.outcome(successful_events())["passed"])
+
+    def test_active_content_and_external_references_fail(self):
+        cases = (
+            VALID_SVG.replace("</svg>", '<script>alert(1)</script></svg>'),
+            VALID_SVG.replace("</svg>", '<image href="https://example.com/x.png"/></svg>'),
+            VALID_SVG.replace('fill="white"', 'fill="url(https://example.com/fill.svg)"'),
+            '<!DOCTYPE svg [<!ENTITY x "unsafe">]>' + VALID_SVG,
+            '<?xml-stylesheet href="https://example.com/x.css"?>' + VALID_SVG,
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.save_svg(source)
+                self.assertFalse(self.outcome(successful_events())["passed"])
+
+    def test_title_and_viewbox_are_required(self):
+        for source in (VALID_SVG.replace("Pelican at the Harbor", "Other title"),
+                       VALID_SVG.replace("0 0 640 480", "0 0 600 480")):
+            with self.subTest(source=source):
+                self.save_svg(source)
+                self.assertFalse(self.outcome(successful_events())["passed"])
+
+
+if __name__ == "__main__":
+    unittest.main()
