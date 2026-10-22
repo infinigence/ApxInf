@@ -64,6 +64,9 @@ Repetition 1.05 and an 8192-token allowance still produce no initial reasoning c
 A qualified reference generation path remains necessary before attributing this behavior to the model or native execution.
 The current MiniCPM5-2B profile remains text-only and rejects image input.
 A vision model requires a separate declared provider and interface qualification.
+The [real client image probe](minicpm-vision-transport-validation-20261023.md) shows that Read returns PNG bytes in a Messages tool result.
+The current gateway rejects that result before worker preparation.
+Visual feedback therefore requires explicit serving media support as well as a vision model.
 KV reuse remains lower priority than these task gates.
 
 ## Baseline gaps and acceptance order
