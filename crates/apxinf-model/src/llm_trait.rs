@@ -148,6 +148,13 @@ pub struct GeneratedToken {
     pub logprob: Option<f32>,
 }
 
+/// A completed execution boundary where a caller may stop generation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GenerationBoundary {
+    PrefillProgress { consumed_tokens: usize },
+    Token(GeneratedToken),
+}
+
 /// Generated tokens together with host-side timing metrics.
 pub struct GenerationOutput {
     pub tokens: Vec<GeneratedToken>,
@@ -205,6 +212,21 @@ pub trait LlmTrait {
 
     /// Reset state for a new generation.
     fn reset(&mut self);
+
+    /// Release request-owned state after checked device settlement.
+    fn release_request_state(&mut self) -> Result<()> {
+        Err(Error::Contract("request state release is unsupported"))
+    }
+
+    /// Run the shared loop with control at completed execution boundaries.
+    fn generate_streaming_controlled_dyn(
+        &mut self,
+        request: GenerationRequest<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<GenerationOutput> {
+        let options = request.options.resolve()?;
+        generate_streaming_with_resolved_options(self, request.input, &options, boundary)
+    }
 
     /// Optional hook called once before prefill, with the prompt length and
     /// the number of tokens that will be generated. Models with a CUDA
@@ -272,25 +294,30 @@ pub trait LlmTrait {
 pub fn generate_streaming_with_options<M, F>(
     model: &mut M,
     request: GenerationRequest<'_>,
-    on_token: F,
+    mut on_token: F,
 ) -> Result<GenerationOutput>
 where
     M: LlmTrait + ?Sized,
     F: FnMut(GeneratedToken),
 {
     let options = request.options.resolve()?;
-    generate_streaming_with_resolved_options(model, request.input, &options, on_token)
+    generate_streaming_with_resolved_options(model, request.input, &options, |boundary| {
+        if let GenerationBoundary::Token(token) = boundary {
+            on_token(token);
+        }
+        Ok(true)
+    })
 }
 
 fn generate_streaming_with_resolved_options<M, F>(
     model: &mut M,
     input: LlmInput<'_>,
     options: &ResolvedGenerationOptions,
-    mut on_token: F,
+    mut boundary: F,
 ) -> Result<GenerationOutput>
 where
     M: LlmTrait + ?Sized,
-    F: FnMut(GeneratedToken),
+    F: FnMut(GenerationBoundary) -> Result<bool>,
 {
     let prompt_tokens = input.token_ids;
     if prompt_tokens.is_empty() {
@@ -330,6 +357,15 @@ where
 
     let mut generated = Vec::with_capacity(options.max_new_tokens);
     let logits = model.prefill(input)?;
+    if !boundary(GenerationBoundary::PrefillProgress {
+        consumed_tokens: prompt_tokens.len(),
+    })? {
+        profile.finalize(prompt_tokens.len(), 0);
+        return Ok(GenerationOutput {
+            tokens: generated,
+            profile,
+        });
+    }
     let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
     profile.record_first_token();
     let mut current = GeneratedToken {
@@ -337,10 +373,10 @@ where
         logprob: first.logprob,
     };
     generated.push(current);
-    profile.run_unprofiled(|| on_token(current));
+    let mut keep_going = profile.run_unprofiled(|| boundary(GenerationBoundary::Token(current)))?;
 
     for index in 1..options.max_new_tokens {
-        if options.eos_token_ids.contains(&current.token_id) {
+        if !keep_going || options.eos_token_ids.contains(&current.token_id) {
             break;
         }
         let position = prompt_tokens
@@ -355,7 +391,7 @@ where
             logprob: sample.logprob,
         };
         generated.push(current);
-        profile.run_unprofiled(|| on_token(current));
+        keep_going = profile.run_unprofiled(|| boundary(GenerationBoundary::Token(current)))?;
     }
 
     profile.finalize(prompt_tokens.len(), generated.len());
