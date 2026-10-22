@@ -34,6 +34,13 @@ def fixture(case: dict, corpus: dict = CORPUS) -> dict:
 class ServingContractTests(unittest.TestCase):
     def test_shared_native_sampling_profile(self):
         corpus = json.loads((ROOT / "tests/fixtures/serving/native-sampling-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+
+    def test_shared_native_thinking_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-thinking-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+
+    def check_sampled_profile(self, corpus):
         for case in corpus["frame_cases"]:
             with self.subTest(case["name"]):
                 frame = fixture(case, corpus)

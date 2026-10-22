@@ -10,6 +10,7 @@ use std::fmt;
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
 pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
+pub const NATIVE_THINKING_PROTOCOL: &str = "apxinf-worker/2.3";
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
@@ -300,7 +301,8 @@ fn sampling(value: &Value) -> Result<()> {
 }
 
 fn submit_fields(frame: &Value) -> Result<()> {
-    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL;
+    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
+        || frame["protocol"] == NATIVE_THINKING_PROTOCOL;
     fields(
         frame,
         REQUEST,
@@ -399,7 +401,8 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
     require(
         frame["protocol"] == PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
-            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL,
+            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
+            || frame["protocol"] == NATIVE_THINKING_PROTOCOL,
         "unsupported protocol",
     )?;
     uuid(&frame["worker_epoch"])?;
@@ -440,10 +443,12 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
     require(
         frame["protocol"] == PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
-            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL,
+            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
+            || frame["protocol"] == NATIVE_THINKING_PROTOCOL,
         "unsupported protocol",
     )?;
-    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL;
+    let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL;
+    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL || thinking;
     let native = frame["protocol"] == NATIVE_PROTOCOL || sampled;
     uuid(&frame["worker_epoch"])?;
     let kind = string(&frame["kind"])?;
@@ -515,12 +520,40 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 if sampled {
                     let manifest = &frame["model_manifest"];
                     let execution = &manifest["execution"];
+                    if thinking {
+                        fields(
+                            execution,
+                            &[],
+                            &[
+                                "provider",
+                                "precision",
+                                "variant",
+                                "parser",
+                                "enable_thinking",
+                                "max_context",
+                                "max_output_tokens",
+                                "memory_limit_bytes",
+                                "sampling",
+                                "output_policy",
+                            ],
+                            &[],
+                        )?;
+                        require(
+                            execution["output_policy"] == "minicpm5-initial-thinking-v1",
+                            "unsupported native thinking output policy",
+                        )?;
+                    }
                     require(
-                        manifest["adapter_revision"] == "apxinf-native-minicpm5-sampled-v1"
+                        manifest["adapter_revision"]
+                            == if thinking {
+                                "apxinf-native-minicpm5-thinking-v1"
+                            } else {
+                                "apxinf-native-minicpm5-sampled-v1"
+                            }
                             && execution["provider"] == "metal_minicpm5"
                             && execution["precision"] == "bf16"
                             && execution["variant"] == "bf16-compiled"
-                            && execution["enable_thinking"] == false
+                            && execution["enable_thinking"] == thinking
                             && execution["sampling"]
                                 == serde_json::json!({
                                     "algorithm": "apxinf-cpu-categorical-v1",
@@ -582,6 +615,10 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             require(
                 frame["template_options"]["enable_thinking"].is_boolean(),
                 "enable_thinking must be Boolean",
+            )?;
+            require(
+                !thinking || frame["template_options"]["enable_thinking"] == true,
+                "protocol 2.3 requires thinking preparation",
             )?;
         }
         "prepared_input" => {
@@ -1145,8 +1182,21 @@ mod tests {
             "../../../tests/fixtures/serving/native-sampling-v0.1.json"
         ))
         .unwrap();
+        check_sampled_profile(&corpus);
+    }
+
+    #[test]
+    fn shared_native_thinking_profile() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
+        ))
+        .unwrap();
+        check_sampled_profile(&corpus);
+    }
+
+    fn check_sampled_profile(corpus: &Value) {
         for case in corpus["frame_cases"].as_array().unwrap() {
-            let mut frame = fixture(&corpus, case);
+            let mut frame = fixture(corpus, case);
             if case["refresh_identity"] == true {
                 frame["model_revision"] =
                     canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"])
@@ -1165,11 +1215,10 @@ mod tests {
                 case["name"]
             );
             if case["valid"] == true {
-                assert!(
-                    decode_frame(&encode_frame(&frame).unwrap()).is_ok(),
-                    "{}",
-                    case["name"]
-                );
+                let decoded = decode_frame(&encode_frame(&frame).unwrap()).unwrap();
+                for key in ["text_delta", "text_byte_cutoff", "output_token_count"] {
+                    assert_eq!(decoded.get(key), frame.get(key), "{}", case["name"]);
+                }
             }
             if let Some(valid) = case["envelope_valid"].as_bool() {
                 assert_eq!(
