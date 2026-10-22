@@ -1,6 +1,9 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import os
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -45,6 +48,37 @@ def capture(events=None, subtype="success"):
 def successful_events():
     return [tool_call("read-1", "Read"), tool_result("read-1"),
             tool_call("write-1", "Write"), tool_result("write-1")]
+
+
+class ClientCaptureTests(unittest.TestCase):
+    def test_output_is_visible_before_the_client_exits(self):
+        producer = '''import pathlib, sys, time
+print('{"type":"system","subtype":"capture_probe"}', flush=True)
+print('capture stderr probe', file=sys.stderr, flush=True)
+pathlib.Path('producer-ready').touch()
+while not pathlib.Path('release-producer').exists():
+    time.sleep(0.01)
+'''
+        with tempfile.TemporaryDirectory() as temporary, ThreadPoolExecutor(max_workers=1) as executor:
+            directory = Path(temporary)
+            future = executor.submit(client.capture_client, [sys.executable, "-c", producer],
+                                     directory, dict(os.environ), 15, False)
+            try:
+                deadline = time.monotonic() + 5
+                stdout = directory / "client.stdout.jsonl"
+                stderr = directory / "client.stderr.txt"
+                while time.monotonic() < deadline:
+                    if ((directory / "producer-ready").exists() and stdout.read_bytes() and stderr.read_bytes()):
+                        break
+                    time.sleep(.01)
+                self.assertFalse(future.done())
+                self.assertIn(b'"capture_probe"', stdout.read_bytes())
+                self.assertEqual(stderr.read_text(), "capture stderr probe\n")
+            finally:
+                (directory / "release-producer").touch()
+                result = future.result(timeout=5)
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(result["events"][0]["event"]["subtype"], "capture_probe")
 
 
 class PelicanTaskTests(unittest.TestCase):
