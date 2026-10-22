@@ -148,10 +148,14 @@ pub struct GeneratedToken {
     pub logprob: Option<f32>,
 }
 
-/// A completed execution boundary where a caller may stop generation.
+/// A control boundary where a caller may stop generation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GenerationBoundary {
-    PrefillProgress { consumed_tokens: usize },
+    /// No prompt work has started. This does not report consumed positions.
+    PrefillStart,
+    PrefillProgress {
+        consumed_tokens: usize,
+    },
     Token(GeneratedToken),
 }
 
@@ -210,6 +214,26 @@ pub trait LlmTrait {
         self.forward(input.token_ids, 0)
     }
 
+    /// Process a prompt with control before work and after evaluated progress.
+    /// A false callback result stops prefill without logits for the sampler.
+    /// The caller must still release partial request state after a stop or error.
+    fn prefill_controlled(
+        &mut self,
+        input: LlmInput<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<Option<Tensor>> {
+        if !boundary(GenerationBoundary::PrefillStart)? {
+            return Ok(None);
+        }
+        let logits = self.prefill(input)?;
+        if !boundary(GenerationBoundary::PrefillProgress {
+            consumed_tokens: input.token_ids.len(),
+        })? {
+            return Ok(None);
+        }
+        Ok(Some(logits))
+    }
+
     /// Reset state for a new generation.
     fn reset(&mut self);
 
@@ -218,7 +242,7 @@ pub trait LlmTrait {
         Err(Error::Contract("request state release is unsupported"))
     }
 
-    /// Run the shared loop with control at completed execution boundaries.
+    /// Run the shared loop with control before prefill and at completed execution boundaries.
     fn generate_streaming_controlled_dyn(
         &mut self,
         request: GenerationRequest<'_>,
@@ -356,16 +380,13 @@ where
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
 
     let mut generated = Vec::with_capacity(options.max_new_tokens);
-    let logits = model.prefill(input)?;
-    if !boundary(GenerationBoundary::PrefillProgress {
-        consumed_tokens: prompt_tokens.len(),
-    })? {
+    let Some(logits) = model.prefill_controlled(input, &mut boundary)? else {
         profile.finalize(prompt_tokens.len(), 0);
         return Ok(GenerationOutput {
             tokens: generated,
             profile,
         });
-    }
+    };
     let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
     profile.record_first_token();
     let mut current = GeneratedToken {

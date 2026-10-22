@@ -7,7 +7,7 @@ mod model;
 mod tests;
 mod weights;
 
-pub use config::{Config, Variant, CONTEXT_CAPACITY};
+pub use config::{Config, Variant, CONTEXT_CAPACITY, DSPARK_CONTEXT_CAPACITY, PREFILL_CHUNK_TOKENS};
 pub use dspark::DSpark;
 pub use model::MiniCpm5;
 

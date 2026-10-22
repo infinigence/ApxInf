@@ -29,18 +29,21 @@ is evaluated before the request state is published; failed preparation cannot
 be reported ready. Changing prepared capacity requires a reset.
 
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
-Generation `prefill` consumes the complete prompt while applying the untied head
-only to its final normalized hidden row. This distinction retains the accepted
-prefill optimization without weakening the full forward contract. Ordinary
-generation uses ApxInf's shared sampler/EOS loop.
+Ordinary `prefill` consumes the complete prompt in evaluated chunks of at most 256 tokens.
+Each chunk applies the untied head only to its final normalized hidden row.
+Generation returns the final chunk's logits to ApxInf's shared sampler and EOS loop.
+The full `forward` contract remains unchanged.
 
-The shared controlled loop exposes completed prefill and token boundaries.
+The shared controlled loop checks control before prefill and after each evaluated chunk and output token.
+Its initial control boundary does not report consumed positions.
 The native serving owner can stop at these boundaries.
 `release_request_state` checks device synchronization before it releases request KV and compiled traces.
 It preserves fixed weights and position tables.
 The existing `reset` operation retains prepared state and cannot establish resource release.
 
 The supported workload is one text sequence with at most 4096 consumed positions.
+DSpark retains its complete prompt taps and 4096-position limit.
+The [context profile](../../../../doc/serving/minicpm-context-v0.1.md) defines preparation shapes, cancellation, and longer context gates.
 Only greedy sampling without penalties/log-probability is currently implemented
 by the native backend. Unsupported sampling requests fail explicitly. DSpark is
 an explicit selection with a separately pinned drafter; it is never the default.
