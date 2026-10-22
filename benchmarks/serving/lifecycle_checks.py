@@ -210,9 +210,22 @@ def verify_worker_target(args, ready):
         raise RuntimeError("The explicit service PID does not run apxinf-serve.")
     if worker["parent_pid"] != service["pid"]:
         raise RuntimeError("The explicit worker is not a child of the explicit service.")
-    if not any(Path(part).name == "text_worker.py" for part in worker_command):
-        raise RuntimeError("The explicit worker does not run text_worker.py.")
-    if argument_value(worker_command, "--protocol") != "apxinf-worker/2.0":
+    protocol = ready.get("worker", {}).get("protocol")
+    if protocol == "apxinf-worker/2.0":
+        if not any(Path(part).name == "text_worker.py" for part in worker_command):
+            raise RuntimeError("The explicit worker does not run text_worker.py.")
+    elif protocol == "apxinf-worker/2.1":
+        expected_executable = argument_value(service_command, "--native-worker")
+        expected_library = argument_value(service_command, "--metal-library")
+        if (argument_value(service_command, "--provider") != "native-minicpm5"
+                or not expected_executable or not expected_library
+                or not worker_command or worker_command[0] != expected_executable
+                or Path(worker_command[0]).name != "apxinf-native-worker"
+                or argument_value(worker_command, "--metal-library") != expected_library):
+            raise RuntimeError("The explicit native worker does not match the service launch.")
+    else:
+        raise RuntimeError("Readiness has no supported worker protocol.")
+    if argument_value(worker_command, "--protocol") != protocol:
         raise RuntimeError("The explicit worker protocol does not match.")
     epoch = ready.get("worker", {}).get("worker_epoch")
     model_path = ready.get("worker", {}).get("model_path")
