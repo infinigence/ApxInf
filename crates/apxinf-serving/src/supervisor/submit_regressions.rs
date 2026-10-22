@@ -147,6 +147,7 @@ sys.stdin.buffer.readline()
 
 fn request() -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"submit write probe"})],
         tools: vec![],
         max_tokens: 1,

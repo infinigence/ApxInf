@@ -101,6 +101,7 @@ fn cpu_service_with_completion(
 
 pub(super) fn request(count_only: bool) -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"original lifecycle request"})],
         tools: vec![],
         max_tokens: 0,
@@ -649,6 +650,7 @@ sys.stdin.readline()
         };
         let ticket = service
             .enqueue(Request {
+                selection: crate::sampling::Selection::Greedy,
                 messages: vec![json!({"role":"user","content":content})],
                 tools: vec![],
                 max_tokens: 0,
