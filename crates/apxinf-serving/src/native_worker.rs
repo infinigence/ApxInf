@@ -1,7 +1,11 @@
 //! One native model owner with bounded command and control queues.
-use apxinf_core::{DType, Device, Error};
+use apxinf_core::{
+    CpuBackend, DType, Device, Error, NextTokenLogits, SamplingBackend, Tensor, TokenSample,
+    TokenSampler, TokenSamplingInit, TokenSamplingSpec,
+};
 use apxinf_model::{
-    AutoModel, GenerationBoundary, GenerationOptions, GenerationRequest, LlmInput, LoadOptions,
+    generate_streaming_controlled_with_sampler, AutoModel, GenerationBoundary, GenerationOptions,
+    GenerationRequest, LlmInput, LoadOptions, SamplingMode,
 };
 use apxinf_serving::{contracts, native_identity};
 use apxinf_tokenizer::Tokenizer;
@@ -141,6 +145,7 @@ impl Outbox {
 
 struct State {
     output: Outbox,
+    protocol: String,
     epoch: String,
     controls: Receiver<Value>,
     fault: Arc<AtomicBool>,
@@ -155,7 +160,7 @@ struct State {
 
 impl State {
     fn frame(&self, kind: &str) -> Value {
-        json!({"protocol":contracts::NATIVE_PROTOCOL,"kind":kind,"worker_epoch":self.epoch})
+        json!({"protocol":self.protocol,"kind":kind,"worker_epoch":self.epoch})
     }
     fn send(&self, value: Value) -> Result<()> {
         let bytes = contracts::encode_frame(&value)?;
@@ -356,13 +361,14 @@ struct Incoming {
 }
 
 fn read_commands(
+    mut source: impl BufRead,
+    protocol: String,
     epoch: String,
     fault: Arc<AtomicBool>,
     commands: mpsc::SyncSender<Incoming>,
     controls: mpsc::SyncSender<Value>,
 ) {
     let result = (|| -> Result<()> {
-        let mut source = std::io::stdin().lock();
         loop {
             let mut bytes = Vec::new();
             loop {
@@ -383,8 +389,7 @@ fn read_commands(
             }
             let command = contracts::parse_document(&bytes)?;
             contracts::validate_command_envelope(&command)?;
-            if command["protocol"] != contracts::NATIVE_PROTOCOL || command["worker_epoch"] != epoch
-            {
+            if command["protocol"] != protocol || command["worker_epoch"] != epoch {
                 return Err("Input identity mismatch".into());
             }
             let valid = contracts::validate_frame(&command).is_ok();
@@ -409,8 +414,10 @@ fn read_commands(
 }
 
 fn run(args: Args) -> Result<()> {
-    if args.protocol != contracts::NATIVE_PROTOCOL
-        || !(1..=16384).contains(&args.max_context)
+    if !matches!(
+        args.protocol.as_str(),
+        contracts::NATIVE_PROTOCOL | contracts::NATIVE_SAMPLED_PROTOCOL
+    ) || !(1..=16384).contains(&args.max_context)
         || args.prefill_step_size != 256
         || args.output_batch_tokens != 1
         || args.max_output_tokens > 65536
@@ -422,10 +429,16 @@ fn run(args: Args) -> Result<()> {
         return Err("Loaded MLX library differs from the selected runtime.".into());
     }
     let runtime = native_identity::runtime(&std::env::current_exe()?, &loaded_library)?;
+    let sampled = args.protocol == contracts::NATIVE_SAMPLED_PROTOCOL;
+    let execution = if sampled {
+        native_identity::sampled_execution
+    } else {
+        native_identity::execution
+    };
     let manifest = native_identity::manifest(
         &args.model,
         runtime.clone(),
-        native_identity::execution(
+        execution(
             args.max_context,
             args.max_output_tokens,
             args.memory_limit_bytes,
@@ -433,7 +446,7 @@ fn run(args: Args) -> Result<()> {
     )?;
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
-    let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":false,"token_events":true,
+    let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":sampled,"token_events":true,
         "cancel_granularity":"token_or_prefill_chunk","max_active_sequences":1,"max_context":args.max_context,
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
@@ -469,6 +482,7 @@ fn run(args: Args) -> Result<()> {
     let fault = Arc::new(AtomicBool::new(false));
     let mut state = State {
         output: Outbox::start(std::io::stdout(), fault.clone()),
+        protocol: args.protocol.clone(),
         epoch: args.worker_epoch.clone(),
         controls,
         fault: fault.clone(),
@@ -486,7 +500,17 @@ fn run(args: Args) -> Result<()> {
         "model_path":args.model,"eos_token_ids":eos,"vocab_size":tokenizer.vocab_size(),"runtime":runtime,"memory":memory()?}).as_object().unwrap().clone());
     state.send(ready)?;
     let epoch = args.worker_epoch.clone();
-    std::thread::spawn(move || read_commands(epoch, fault, command_tx, control_tx));
+    let protocol = args.protocol.clone();
+    std::thread::spawn(move || {
+        read_commands(
+            std::io::stdin().lock(),
+            protocol,
+            epoch,
+            fault,
+            command_tx,
+            control_tx,
+        )
+    });
     let mut drained = false;
     let mut pending = None;
     loop {
@@ -637,6 +661,64 @@ fn prepare(
     Ok(tokens)
 }
 
+struct NativeSampler {
+    backend: apxinf_mlx::MlxBackend,
+    cpu: Box<dyn TokenSampler>,
+}
+
+impl NativeSampler {
+    fn new(backend: apxinf_mlx::MlxBackend, spec: TokenSamplingSpec) -> apxinf_core::Result<Self> {
+        Ok(Self {
+            backend,
+            cpu: CpuBackend.create_token_sampler(spec)?,
+        })
+    }
+}
+
+impl TokenSampler for NativeSampler {
+    fn spec(&self) -> TokenSamplingSpec {
+        self.cpu.spec()
+    }
+
+    fn begin(&mut self, init: TokenSamplingInit<'_>) -> apxinf_core::Result<()> {
+        self.cpu.begin(init)
+    }
+
+    fn sample(&mut self, logits: NextTokenLogits<'_>) -> apxinf_core::Result<TokenSample> {
+        let array = self.backend.array(logits.tensor())?;
+        let row = selected_logits_row(&array, logits.row_index(), logits.vocab_size())?;
+        self.cpu
+            .sample(NextTokenLogits::last(&row, logits.vocab_size())?)
+    }
+}
+
+fn selected_logits_row(
+    logits: &apxinf_mlx::Array,
+    row: usize,
+    vocab_size: usize,
+) -> apxinf_core::Result<Tensor> {
+    let selected = logits
+        .reshape(&[
+            logits.shape().iter().product::<usize>() / vocab_size,
+            vocab_size,
+        ])?
+        .slice_axis(0, row, row + 1)?
+        .cast(apxinf_mlx::MlxDType::F32)?;
+    Tensor::from_f32(vec![vocab_size], &selected.to_f32_vec()?)
+}
+
+fn generation_options(command: &Value, maximum: usize, eos: &[u32]) -> GenerationOptions {
+    let mut options = GenerationOptions::greedy(maximum, None);
+    options.eos_token_ids = Some(eos.to_vec());
+    if command["sampling"]["mode"] == "random" {
+        options.sampling_mode = Some(SamplingMode::Random);
+        options.temperature = Some(command["sampling"]["temperature"].as_f64().unwrap() as f32);
+        options.top_p = Some(command["sampling"]["top_p"].as_f64().unwrap() as f32);
+        options.seed = Some(command["sampling"]["seed"].as_u64().unwrap());
+    }
+    options
+}
+
 #[allow(clippy::too_many_arguments)]
 fn submit(
     state: &mut State,
@@ -693,42 +775,89 @@ fn submit(
             mutated = true;
             let mut output_ids = Vec::new();
             let mut emitted = String::new();
-            let mut options = GenerationOptions::greedy(maximum, None);
-            options.eos_token_ids = Some(eos.to_vec());
-            let generated = model.text_mut()?.generate_streaming_controlled_dyn(GenerationRequest {input:LlmInput::text(&tokens), options:&options}, &mut |boundary| {
+            let options = generation_options(&state.active.as_ref().unwrap().command, maximum, eos);
+            let mut boundary = |boundary| {
                 let result = (|| -> Result<bool> {
                     match boundary {
                         GenerationBoundary::PrefillStart => {}
-                        GenerationBoundary::PrefillProgress {consumed_tokens} => {
+                        GenerationBoundary::PrefillProgress { consumed_tokens } => {
                             state.active.as_mut().unwrap().consumed = consumed_tokens;
-                            state.event("prefill_progress",json!({"consumed_tokens":consumed_tokens}))?;
+                            state.event(
+                                "prefill_progress",
+                                json!({"consumed_tokens":consumed_tokens}),
+                            )?;
                         }
                         GenerationBoundary::Token(token) => {
                             let terminal = eos.contains(&token.token_id);
-                            if !terminal { output_ids.push(token.token_id); }
-                            let decoded = tokenizer.decode_with_options(&output_ids,false)?;
-                            let text = if decoded.ends_with('\u{fffd}') { String::new() } else {
-                                let suffix = decoded.strip_prefix(&emitted).ok_or("Tokenizer changed emitted text")?.to_owned();
+                            if !terminal {
+                                output_ids.push(token.token_id);
+                            }
+                            let decoded = tokenizer.decode_with_options(&output_ids, false)?;
+                            let text = if decoded.ends_with('\u{fffd}') {
+                                String::new()
+                            } else {
+                                let suffix = decoded
+                                    .strip_prefix(&emitted)
+                                    .ok_or("Tokenizer changed emitted text")?
+                                    .to_owned();
                                 emitted = decoded;
                                 suffix
                             };
                             let a = state.active.as_mut().unwrap();
-                            if a.output_count == 0 { a.first_token_ns = a.started.elapsed().as_nanos() as u64; }
+                            if a.output_count == 0 {
+                                a.first_token_ns = a.started.elapsed().as_nanos() as u64;
+                            }
                             let index = a.output_count;
                             state.event("tokens",json!({"output_index":index,"token_ids":[token.token_id],"text_delta":text}))?;
                             let a = state.active.as_mut().unwrap();
                             a.output_count += 1;
                             a.text_bytes += text.len();
-                            a.consumed = tokens.len()+a.output_count-1;
-                            if terminal { a.stop = Some(("completed".into(),"eos".into())); }
+                            a.consumed = tokens.len() + a.output_count - 1;
+                            if terminal {
+                                a.stop = Some(("completed".into(), "eos".into()));
+                            }
                         }
                     }
                     let m = apxinf_mlx::memory_stats()?;
-                    if (m.active_bytes+m.cache_bytes) as u64 > args.memory_limit_bytes { return Err("Native memory limit exceeded".into()); }
+                    if (m.active_bytes + m.cache_bytes) as u64 > args.memory_limit_bytes {
+                        return Err("Native memory limit exceeded".into());
+                    }
                     state.check_controls()
                 })();
-                result.map_err(|e|Error::Other(e.to_string()))
-            });
+                result.map_err(|e| Error::Other(e.to_string()))
+            };
+            let generated = (|| {
+                let text_model = model.text_mut()?;
+                let request = GenerationRequest {
+                    input: LlmInput::text(&tokens),
+                    options: &options,
+                };
+                if options.sampling_mode == Some(SamplingMode::Random) {
+                    let backend = text_model
+                        .backend()
+                        .as_any()
+                        .downcast_ref::<apxinf_mlx::MlxBackend>()
+                        .ok_or_else(|| {
+                            Error::Other("Native sampling requires an MLX backend".into())
+                        })?
+                        .clone();
+                    let mut sampler = NativeSampler::new(
+                        backend,
+                        TokenSamplingSpec {
+                            vocab_size: tokenizer.vocab_size(),
+                            max_sequence_len: args.max_context,
+                        },
+                    )?;
+                    generate_streaming_controlled_with_sampler(
+                        text_model,
+                        request,
+                        &mut sampler,
+                        &mut boundary,
+                    )
+                } else {
+                    text_model.generate_streaming_controlled_dyn(request, &mut boundary)
+                }
+            })();
             if let Err(error_value) = generated {
                 eprintln!("Native generation failed: {error_value}");
                 failure = Some(error("internal_error", "Native model execution failed."));
@@ -802,6 +931,7 @@ mod tests {
         (
             State {
                 output: Outbox::start(capture.clone(), fault.clone()),
+                protocol: contracts::NATIVE_PROTOCOL.into(),
                 epoch: "00000000-0000-4000-8000-000000000001".into(),
                 controls,
                 fault,
@@ -834,6 +964,167 @@ mod tests {
             .split_inclusive(|b| *b == b'\n')
             .map(|b| contracts::decode_frame(b).unwrap())
             .collect()
+    }
+    fn input(protocol: &str, command: Value) -> (bool, Vec<Incoming>, Vec<Value>) {
+        let epoch = command["worker_epoch"].as_str().unwrap().to_owned();
+        let shutdown = json!({"protocol":protocol,"worker_epoch":epoch,"kind":"shutdown",
+            "command_id":"00000000-0000-4000-8000-000000000099"});
+        let mut bytes = serde_json::to_vec(&command).unwrap();
+        bytes.push(b'\n');
+        bytes.extend(contracts::encode_frame(&shutdown).unwrap());
+        let fault = Arc::new(AtomicBool::new(false));
+        let (command_tx, commands) = mpsc::sync_channel(8);
+        let (control_tx, controls) = mpsc::sync_channel(32);
+        read_commands(
+            std::io::Cursor::new(bytes),
+            protocol.into(),
+            epoch,
+            fault.clone(),
+            command_tx,
+            control_tx,
+        );
+        (
+            fault.load(Ordering::Acquire),
+            commands.try_iter().collect(),
+            controls.try_iter().collect(),
+        )
+    }
+
+    #[test]
+    fn input_fences_protocol_and_preserves_content_rejection() {
+        for protocol in [
+            contracts::NATIVE_PROTOCOL,
+            contracts::NATIVE_SAMPLED_PROTOCOL,
+        ] {
+            let mut command = fixture("submit");
+            command["protocol"] = protocol.into();
+            if protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+                command["sampling"] = json!({"mode":"greedy"});
+            }
+            let (fault, commands, controls) = input(protocol, command.clone());
+            assert!(!fault);
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0].valid);
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0]["kind"], "shutdown");
+
+            let other = if protocol == contracts::NATIVE_PROTOCOL {
+                contracts::NATIVE_SAMPLED_PROTOCOL
+            } else {
+                contracts::NATIVE_PROTOCOL
+            };
+            let (fault, commands, controls) = input(other, command.clone());
+            assert!(fault);
+            assert!(commands.is_empty());
+            assert!(controls.is_empty());
+
+            if protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+                command["sampling"] =
+                    json!({"mode":"random", "temperature":true, "top_p":0.95, "seed":1});
+            } else {
+                let mut unsupported = command.clone();
+                unsupported["sampling"] = json!({"mode":"greedy"});
+                assert!(input(protocol, unsupported).0);
+                command["max_tokens"] = true.into();
+            }
+            let (fault, commands, _) = input(protocol, command);
+            assert!(!fault);
+            assert!(!commands[0].valid);
+        }
+    }
+
+    #[test]
+    fn selected_protocol_is_used_for_worker_events() {
+        let (mut state, _controls, _capture) = state();
+        assert_eq!(
+            state.frame("drained")["protocol"],
+            contracts::NATIVE_PROTOCOL
+        );
+        state.protocol = contracts::NATIVE_SAMPLED_PROTOCOL.into();
+        let frame = state.frame("drained");
+        assert_eq!(frame["protocol"], contracts::NATIVE_SAMPLED_PROTOCOL);
+        contracts::validate_frame(&frame).unwrap();
+        state.output.finish().unwrap();
+    }
+
+    #[test]
+    fn validated_policy_sets_options_and_overrides_checkpoint_defaults() {
+        let mut command = fixture("submit");
+        let greedy = generation_options(&command, 7, &[1, 130073]);
+        assert_eq!(
+            greedy,
+            GenerationOptions::greedy(7, None).overlay(&GenerationOptions {
+                eos_token_ids: Some(vec![1, 130073]),
+                ..Default::default()
+            })
+        );
+        command["protocol"] = contracts::NATIVE_SAMPLED_PROTOCOL.into();
+        command["sampling"] = json!({"mode":"greedy"});
+        contracts::validate_frame(&command).unwrap();
+        assert_eq!(generation_options(&command, 7, &[1, 130073]), greedy);
+        command["sampling"] = json!({"mode":"random", "temperature":0.7, "top_p":0.8,
+            "seed":9007199254740991u64});
+        contracts::validate_frame(&command).unwrap();
+        let random = generation_options(&command, 7, &[1, 130073]);
+        assert_eq!(random.sampling_mode, Some(SamplingMode::Random));
+        assert_eq!(random.temperature, Some(0.7));
+        assert_eq!(random.top_p, Some(0.8));
+        assert_eq!(random.seed, Some(9007199254740991));
+        assert_eq!(random.top_k, Some(0));
+        assert_eq!(random.repetition_penalty, Some(1.0));
+        assert_eq!(random.frequency_penalty, Some(0.0));
+        assert_eq!(random.presence_penalty, Some(0.0));
+        assert_eq!(random.return_logprob, Some(false));
+        assert_eq!(random.max_new_tokens, Some(7));
+        assert_eq!(random.eos_token_ids, Some(vec![1, 130073]));
+    }
+
+    #[test]
+    fn row_transfer_and_cpu_selection_use_only_the_selected_row() {
+        use apxinf_core::{RngKey, TokenSamplingParams, TokenSelection};
+        let stream = apxinf_mlx::Stream::cpu().unwrap();
+        let logits = apxinf_mlx::Array::from_f32(
+            &stream,
+            &[1, 2, 3],
+            &[1000.0, 0.0, 0.0, f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY],
+        )
+        .unwrap();
+        let row = selected_logits_row(&logits, 1, 3).unwrap();
+        assert_eq!(row.device(), Device::Cpu);
+        assert_eq!(row.shape().dims(), &[3]);
+        assert_eq!(
+            row.as_f32().unwrap(),
+            &[f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]
+        );
+        let mut cpu = CpuBackend
+            .create_token_sampler(TokenSamplingSpec {
+                vocab_size: 3,
+                max_sequence_len: 3,
+            })
+            .unwrap();
+        let params = TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: 0.7,
+                top_k: None,
+                top_p: 0.95,
+            },
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            cpu.begin(TokenSamplingInit {
+                prompt_token_ids: &[0, 2],
+                params: &params,
+                rng: RngKey::new(17, 0, 0),
+            })
+            .unwrap();
+            assert_eq!(
+                cpu.sample(NextTokenLogits::last(&row, 3).unwrap())
+                    .unwrap()
+                    .token_id,
+                1
+            );
+            assert!(cpu.sample(NextTokenLogits::last(&row, 3).unwrap()).is_err());
+        }
     }
     #[test]
     fn invalid_submit_rejects_then_settles_without_execution() {
