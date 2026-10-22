@@ -15,6 +15,7 @@
 | [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
 | [有界初始思考](native-bounded-thinking-v0.1.md) | 显式 worker 2.4 配置、512-token 预算和完整用量计数 | 接口规范，控制机制已验证 |
 | [有界思考验证](native-bounded-thinking-validation-20261023.md) | 原生预算边界、15K 输入、真实客户端和图像检查 | 控制机制通过，视觉验收未通过 |
+| [默认上下文策略验证](minicpm-default-context-validation-20261023.md) | 4K 输出下的真实工具流程与直接绘图对照 | 短工具流程通过，任务质量未通过 |
 | [依赖边界](dependencies.md) | 依赖版本、公开 API 和替换边界 | 独立实现审计 |
 | [Metal 实验](metal-experiments.md) | M4 上的实验矩阵与创新候选 | 测量方案 |
 | [Metal 参数实测](metal-results-20261009.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
