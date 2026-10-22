@@ -1,4 +1,5 @@
 //! Public API profiles for local text and tool requests.
+mod vision;
 use crate::{
     output::{anthropic_blocks, Part},
     supervisor::{ApiError, Begin, Event as ModelEvent, Request, Service},
@@ -75,12 +76,21 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     let sampled = service.sampling_enabled();
-    let tools = if service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL || sampled {
+    let tools = if !service.image_enabled()
+        && (service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL || sampled)
+    {
         "minicpm5_xml"
     } else {
         "qwen_xml_or_json"
     };
     let mut body = json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}});
+    if service.image_enabled() {
+        body["public_capabilities"]["images"] = json!(true);
+        body["public_capabilities"]["image_input_restriction"] =
+            json!("anthropic_base64_png_user_and_tool_result");
+        body["public_capabilities"]["media_limits"] =
+            service.ready["capabilities"]["media_limits"].clone();
+    }
     if service.model_thinking() {
         body["public_capabilities"]["model_thinking"] = json!("initial_hidden");
     }
@@ -91,7 +101,9 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
 }
 
 fn public_profile(service: &Service) -> &'static str {
-    if service.bounded_thinking() {
+    if service.image_enabled() {
+        "apxinf-minicpm-vision-v0.1"
+    } else if service.bounded_thinking() {
         "apxinf-native-bounded-thinking-v0.1"
     } else if service.model_thinking() {
         "apxinf-native-thinking-v0.1"
@@ -312,7 +324,11 @@ fn normalize(
             "Select the model listed by /v1/models.",
         ));
     }
-    let selection = crate::sampling::Selection::from_request(value, service.sampling_enabled())?;
+    let selection = if service.image_enabled() {
+        crate::sampling::Selection::from_vision_request(value)?
+    } else {
+        crate::sampling::Selection::from_request(value, service.sampling_enabled())?
+    };
     if let Some(thinking) = value.get("thinking") {
         if thinking != &json!({"type":"disabled"}) {
             return Err(ApiError::new(
@@ -496,6 +512,9 @@ fn normalize(
                 "Message",
             )?;
             let mut message = message.clone();
+            if service.image_enabled() && message["content"].is_array() {
+                return Err(ApiError::new(400, "unsupported_feature", "OpenAI image inputs are unsupported."));
+            }
             if message["content"].is_null() && message.get("tool_calls").is_some() {
                 message["content"] = json!("");
             }
@@ -526,12 +545,19 @@ fn normalize(
             continue;
         }
         let mut text_parts = String::new();
+        let mut ordered_parts = Vec::new();
         let mut calls = Vec::new();
         for block in array(&message["content"], "Message content")? {
             match block["type"].as_str() {
                 Some("text") => {
                     unknown(block, &["type", "text", "cache_control"], "Text block")?;
                     text_parts.push_str(&text(&block["text"], "Text block text")?);
+                    if service.image_enabled() && role == "user" {
+                        ordered_parts.push(json!({"type":"text","text":block["text"]}));
+                    }
+                }
+                Some("image") if service.image_enabled() && role == "user" => {
+                    ordered_parts.push(vision::image_part(block)?);
                 }
                 Some("tool_use") if role == "assistant" => {
                     unknown(
@@ -556,13 +582,17 @@ fn normalize(
                         ],
                         "Tool result",
                     )?;
-                    if !text_parts.is_empty() {
+                    if !text_parts.is_empty() || !ordered_parts.is_empty() {
                         return Err(ApiError::invalid(
                             "Tool results must precede text within the user message.",
                         ));
                     }
                     if block.get("is_error").is_some_and(|v| !v.is_boolean()) {
                         return Err(ApiError::invalid("Tool result is_error must be a Boolean."));
+                    }
+                    if service.image_enabled() {
+                        messages.push(json!({"role":"tool","tool_call_id":text(&block["tool_use_id"],"Tool result ID")?,"content":vision::tool_content(block)?}));
+                        continue;
                     }
                     let mut content = if block.get("content").is_none() {
                         String::new()
@@ -583,8 +613,11 @@ fn normalize(
                 }
             }
         }
-        if !text_parts.is_empty() || !calls.is_empty() {
+        if !text_parts.is_empty() || !calls.is_empty() || !ordered_parts.is_empty() {
             let mut normalized = json!({"role":role,"content":text_parts});
+            if !ordered_parts.is_empty() {
+                normalized["content"] = json!(ordered_parts);
+            }
             if !calls.is_empty() {
                 normalized["tool_calls"] = json!(calls);
             }
@@ -595,6 +628,9 @@ fn normalize(
         return Err(ApiError::invalid(
             "Use between 1 and 256 normalized messages.",
         ));
+    }
+    if service.image_enabled() {
+        vision::check_media_limits(&messages)?;
     }
     Ok((
         Request {

@@ -22,6 +22,8 @@ mod shutdown_regressions;
 mod submit_regressions;
 #[cfg(test)]
 mod thinking_regressions;
+#[cfg(test)]
+mod vision_regressions;
 use crate::{
     contracts,
     diagnostics::{self, WorkerDiagnostics},
@@ -84,6 +86,7 @@ impl ApiError {
 pub enum WorkerRuntime {
     #[default]
     Python,
+    PythonMiniCpmVision,
     NativeMiniCpm5 {
         executable: PathBuf,
         metal_library: PathBuf,
@@ -106,6 +109,7 @@ impl WorkerRuntime {
     pub fn protocol(&self) -> &'static str {
         match self {
             Self::Python => PROTOCOL,
+            Self::PythonMiniCpmVision => contracts::VISION_PROTOCOL,
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
             Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
             Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
@@ -136,6 +140,14 @@ pub struct Config {
 
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
+        if matches!(self.runtime, WorkerRuntime::PythonMiniCpmVision)
+            && (!(1..=16384).contains(&self.max_context)
+                || self.max_output > 8192
+                || self.prefill_step_size != 256
+                || self.output_batch_tokens != 1)
+        {
+            return Err("MiniCPM vision requires at most 16384 positions, 8192 output tokens, 256-token prefill chunks, and one token per output frame.".into());
+        }
         if matches!(
             self.runtime,
             WorkerRuntime::NativeMiniCpm5 { .. }
@@ -271,11 +283,21 @@ impl Service {
     }
 
     pub(crate) fn sampling_enabled(&self) -> bool {
-        self.ready["protocol"] == contracts::NATIVE_SAMPLED_PROTOCOL || self.model_thinking()
+        self.ready["protocol"] == contracts::NATIVE_SAMPLED_PROTOCOL
+            || self.model_thinking()
+            || self.image_enabled()
+    }
+
+    pub(crate) fn image_enabled(&self) -> bool {
+        self.ready["protocol"] == contracts::VISION_PROTOCOL
     }
 
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
-        request.selection.validate(self.sampling_enabled())?;
+        if self.image_enabled() {
+            request.selection.validate_vision()?;
+        } else {
+            request.selection.validate(self.sampling_enabled())?;
+        }
         if !self.available.load(Ordering::Acquire) {
             if self.rotating.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -560,7 +582,7 @@ async fn launch_worker_until(
     pressure.require_load().map_err(LaunchError::Pressure)?;
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut command = match &config.runtime {
-        WorkerRuntime::Python => {
+        WorkerRuntime::Python | WorkerRuntime::PythonMiniCpmVision => {
             let mut command = Command::new(&config.python);
             command.arg("-u").arg(&config.worker);
             command
@@ -1213,6 +1235,14 @@ async fn prepare_request(
                 Some("prepared_input")
                     if event["model_revision"] == service.ready["model_revision"] =>
                 {
+                    if service.image_enabled() {
+                        crate::vision_identity::verify_prepared(
+                            &event,
+                            &service.ready,
+                            &job.request.messages,
+                        )
+                        .map_err(|message| ApiError::new(500, "protocol_fault", message))?;
+                    }
                     Ok(true)
                 }
                 Some("command_result") if event["status"] == "error" => Ok(true),
@@ -1416,7 +1446,7 @@ async fn settle_stopped_submission(
     })
 }
 
-fn file_digest(path: &std::path::Path) -> Result<(u64, String), String> {
+pub(crate) fn file_digest(path: &std::path::Path) -> Result<(u64, String), String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() {
@@ -1535,6 +1565,9 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         }
         return Ok(());
     }
+    if matches!(config.runtime, WorkerRuntime::PythonMiniCpmVision) {
+        return crate::vision_identity::verify_manifest(manifest, config);
+    }
     let root = config
         .worker
         .ancestors()
@@ -1638,7 +1671,14 @@ async fn execute(
     submit["eos_token_ids"] = service.ready["eos_token_ids"].clone();
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
     if service.sampling_enabled() {
-        submit["sampling"] = job.request.selection.submission(&job.id);
+        submit["sampling"] = if service.image_enabled() {
+            job.request.selection.vision_submission(&job.id)
+        } else {
+            job.request.selection.submission(&job.id)
+        };
+    }
+    if service.image_enabled() {
+        submit["replay"] = prepared["replay"].clone();
     }
     let mut tracker = contracts::AttemptTracker::new(&submit)
         .map_err(|e| ApiError::new(500, "protocol_fault", e.to_string()))
@@ -2046,6 +2086,10 @@ fn gateway_test_service_config(
     protocol: &str,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
+    let mut capabilities = json!({"max_context":4096,"max_output_tokens":1024});
+    if protocol == contracts::VISION_PROTOCOL {
+        capabilities["media_limits"] = json!({"max_images":4,"max_image_bytes":131072,"max_total_bytes":262144,"max_dimension":1024,"max_host_array_bytes":67108864});
+    }
     let service = Arc::new(Service {
         queue: PendingQueue::new(8),
         host_pressure: pressure,
@@ -2055,7 +2099,7 @@ fn gateway_test_service_config(
             "protocol": protocol,
             "worker_epoch": "00000000-0000-4000-8000-000000000001",
             "model_revision": "1111111111111111111111111111111111111111111111111111111111111111",
-            "capabilities": {"max_context": 4096, "max_output_tokens": 1024}
+            "capabilities": capabilities
         }),
         model_id: "test-model".into(),
         available: AtomicBool::new(true),
