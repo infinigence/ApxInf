@@ -38,6 +38,76 @@ The supervisor must check those local files before it publishes readiness.
 The interpreter launch path must preserve its virtual environment, including a final executable symlink.
 The interpreter content digest identifies the resolved executable separately.
 
+### Runtime source identity
+
+These requirements apply to startup verification. Standalone wire checks do not establish startup verification.
+The candidate runtime targets macOS Metal. Its manifest `platform` is `macos-metal`.
+`adapter_sha256` identifies `vision_worker.py`. `python_sha256` identifies the resolved interpreter.
+`sources` maps seven local filenames to their content digests.
+They are `vision_worker.py`, `vision_runtime.py`, `vision_identity.py`, `vision_preparation.py`, `text_worker.py`, `contracts.py`, and `owned_media.py`.
+The runtime checks all eight checkpoint artifact identities before loading model weights.
+`vision_identity.py` contains their pinned lengths and digests.
+The dependency record defines the exact package versions and their roles.
+
+`runtime_files` contains exact fields `modules` and `libraries`.
+Each file record has exactly `path` and `sha256`.
+Module keys are `mlx_core`, `mlx_vlm`, `transformers`, `numpy`, `pillow`, `torch`, `torchvision`, `tokenizers`, `generation`, and `processor`.
+They also include `module_state`, `minicpm_model`, `minicpm_language`, `minicpm_language_base`, `qwen_language`, and `rotary_state`.
+The library array contains one resolved MLX library.
+Its SHA-256 is `d8c9393d584e781393c3effccfccd8ba85ad0c70264edaf9f897dca9875375c6`.
+All recorded module and library files belong to the selected virtual environment.
+The runtime checks this identity before and after model loading.
+
+The processor document has exact fields `class`, `runtime`, `artifacts`, `options`, and `template_options`.
+`class` contains the processor class specified below. `runtime` contains the four pinned runtime versions.
+`artifacts` retains every checkpoint artifact except model weights.
+`options` contains `return_tensors: np`, `downsample_mode: 16x`, `max_slice_nums: 1`, `padding: true`, and `add_special_tokens: false`.
+`template_options` contains `enable_thinking: false`, `tokenize: false`, and `add_generation_prompt: true`.
+The loaded model contains 1554476272 BF16 parameters.
+
+### Model request-state ownership
+
+One runtime owner restores model-held transient state after synchronization.
+The owner uses the public `Module.state` and attribute interfaces.
+The field names below remain qualified dependency internals. They are not a general dependency reset contract.
+Startup checks exact model classes and the six state-source digests in `vision_identity.py`.
+It also checks initial baselines and captures resident state topology and array handles.
+
+| Location | Field | Baseline | Permitted active value |
+| --- | --- | --- | --- |
+| Selected language module | `_position_ids` | Readable `None`. Absent public state key. | Int32 array `[3,1,N]`, with `1 <= N <= max_context`. |
+| Selected language module | `_rope_deltas` | Readable `None`. Absent public state key. | Int32 array `[1,1]`. |
+| Each of 18 qualified convolution modules | `_qwen3_5_decode_conv_weight` | Absent attribute and public state key. | Tuple of resident weight identity and FP32 array `[4,6144]`. |
+| Each of 6 qualified rotary modules | `_compiled_apply` | Empty dictionary with its original identity. | Key `3` maps to a callable `mlx.core._gc_func`. |
+
+Each convolution module has resident `conv1d.weight` shape `[6144,4,1]`.
+The cached identity equals that resident array's Python identity.
+The owner checks every installed field and the remaining state inventory before restoration.
+Early cancellation and partial installation can leave individual fields at baseline.
+Restoration recovers the exact readable or absent baseline for each field.
+The rotary modules have class `mlx_vlm.models.qwen3_5.language.Qwen3_5RotaryEmbedding` and dimension 64.
+Their compilation dictionaries retain their original identities and become empty during restoration.
+This removal does not clear the dependency's global kernel or compilation caches.
+The qualified factory captures kernel configuration. Its callable accepts request arrays as arguments.
+Unknown state, replaced resident handles, unsupported values, or uncertain synchronization permanently fence the runtime.
+
+The model manifest adds `request_state` with exact fields:
+
+| Field | Value |
+| --- | --- |
+| `revision` | `minicpmv47-transient-state-v1` |
+| `max_context` | The execution context bound. |
+| `position_fields` | Ordered array `[_position_ids, _rope_deltas]`. |
+| `convolution_cache_field` | `_qwen3_5_decode_conv_weight` |
+| `convolution_module_count` | 18 |
+| `rotary_cache_field` | `_compiled_apply` |
+| `rotary_module_count` | 6 |
+
+State restoration retains resident array handles. It does not copy or evaluate their contents.
+Handle checks do not establish the absence of in-place content changes.
+The pinned source path and execution qualification must establish that stronger invariant.
+No release event follows uncertain cleanup. Process exit remains the recovery boundary.
+
 `execution` has these exact fields:
 
 | Field | Value or bound |
@@ -54,6 +124,8 @@ The interpreter content digest identifies the resolved executable separately.
 Their values are `mlx-vlm-fixed-controls-v1`, 100, `0`, `1.03`, 8192, `0`, `0`, and `request-id-sha256-v1`.
 The numeric values in backticks are strings, except `top_k` and `repetition_context_size`.
 Random requests carry temperature, top-p, and seed through the existing sampling object.
+Random temperature ranges from 0.01 through 2, inclusive.
+The dependency increases smaller positive temperatures. This profile rejects them instead.
 Greedy requests carry only `mode: greedy`. Greedy selection retains the fixed repetition controls.
 Public defaults are temperature 1 and top-p 0.95. Public seed derivation retains the existing request-ID rule.
 The worker must apply the supplied selection mode explicitly.
@@ -156,6 +228,7 @@ The worker checks the processor's actual one-patch result and NumPy representati
 One adapter applies the chat template once.
 Replay passes its already rendered string to the processor without applying another template.
 Both paths call the selected public processor with NumPy output, 16x downsampling, and one image slice.
+Source images use Pillow RGB conversion before this call.
 The actual processor class must be `mlx_vlm.models.minicpmv4_7.processing_minicpmv4_7.MiniCPMV4_7Processor`.
 The worker must not use a helper that drops these options or creates device arrays during preparation.
 
@@ -196,6 +269,8 @@ Replay occurs only after context, pressure, and resource admission.
 Existing attempt and command identity rules prevent duplicate generation.
 
 Output counts include every yielded ID, including EOS.
+Text decoding preserves generated tool delimiters and excludes the configured EOS IDs.
+Final decoding must extend the already emitted text without changing its prefix.
 The dependency can select tokens before their yield. Yielded counts do not measure internal selections.
 `state_result` retains `validity: none` and `history_count`, but `consumed_position` must be null.
 The profile does not claim exact consumed positions or reusable model state.
@@ -212,6 +287,7 @@ Repeated images contribute their byte counts separately. A text-only request con
 These counts exclude queue copies, wire buffers, decoder temporaries, and allocator reserve.
 Readiness memory retains the existing device allocator fields.
 Resource release follows generator close, device synchronization, and removal of request references.
+The runtime synchronizes the public generation stream, including failures before the first yield.
 The worker must not return a capacity lease after uncertain device settlement.
 
 The P2c reference, shape, context, repeated-request, memory, and cancellation gates remain required.
