@@ -114,7 +114,20 @@ The records reside in the three `repetition-direct*` directories and `repetition
 For this request and seed, the optional penalty and larger allowance do not resolve missing final output.
 These results reject another budget increase as a demonstrated fix.
 They do not establish general model inability or identify a native calculation defect.
-The next comparison must test a qualified reference generation path before another production policy change.
+A completed reference generation remains necessary before attributing this behavior to native execution.
+
+A subsequent reference attempt uses the pinned BF16 checkpoint with Transformers 5.6.2 and Torch 2.12.1 on CPU.
+Its template reproduces the same 158 input IDs.
+It requests 8192 output tokens and explicitly uses top-k 50, unlike the native policy without top-k.
+Its arithmetic and random generator also differ from native execution.
+
+The parent stops this attempt at its 1800-second deadline through SIGTERM and reaps the child with return code -15.
+The outer wrapper exits one, and its owned processes are absent.
+The retained stream continues planning without a delivered final SVG.
+No completed selected-ID record exists for this interrupted reference.
+This timeout does not establish exhaustion of the requested 8192-token allowance.
+It does not identify a faulty backend or prove general model inability.
+The private `native-reference/qualified-generation-top50/` directory retains the partial stream and authoritative process record.
 
 ## Lifecycle, review, and records
 
