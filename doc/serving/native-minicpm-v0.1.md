@@ -43,8 +43,8 @@ The worker must not emit EOS text.
 
 ## Controlled execution and settlement
 
-`GenerationBoundary` identifies prefill start, completed prefill progress, or an emitted token.
-Prefill start checks controls without emitting a progress frame.
+`GenerationBoundary` identifies a control boundary, completed prefill progress, or an emitted token.
+`PrefillStart` checks controls without emitting a progress frame.
 A callback returns false to stop generation at that boundary.
 The existing generation wrapper always continues through this callback.
 The worker checks controls before generation and at each boundary.
