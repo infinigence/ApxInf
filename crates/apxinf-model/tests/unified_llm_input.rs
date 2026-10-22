@@ -87,16 +87,47 @@ fn controlled_generation_stops_after_prefill_without_sampling_a_token() {
             },
             &mut |boundary| {
                 boundaries.push(boundary);
-                Ok(false)
+                Ok(matches!(
+                    boundary,
+                    apxinf_model::GenerationBoundary::PrefillStart
+                ))
             },
         )
         .unwrap();
     assert!(output.tokens.is_empty());
     assert_eq!(
         boundaries,
-        vec![apxinf_model::GenerationBoundary::PrefillProgress { consumed_tokens: 2 }]
+        vec![
+            apxinf_model::GenerationBoundary::PrefillStart,
+            apxinf_model::GenerationBoundary::PrefillProgress { consumed_tokens: 2 },
+        ]
     );
     assert_eq!(model.forward_calls, vec![(vec![0, 1], 0)]);
+}
+
+#[test]
+fn controlled_generation_stops_before_prompt_execution() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut boundaries = Vec::new();
+    let output = model
+        .generate_streaming_controlled_dyn(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        boundaries,
+        vec![apxinf_model::GenerationBoundary::PrefillStart]
+    );
+    assert!(output.tokens.is_empty());
+    assert!(model.forward_calls.is_empty());
 }
 
 #[test]
