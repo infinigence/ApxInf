@@ -316,7 +316,9 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                         if pending and kind == "stdout":
                             diagnostics.append("The client ended with an incomplete JSON line.")
                         continue
-                    (saved_stdout if kind == "stdout" else saved_stderr).write(chunk)
+                    destination = saved_stdout if kind == "stdout" else saved_stderr
+                    destination.write(chunk)
+                    destination.flush()
                     if kind == "stderr":
                         continue
                     pending.extend(chunk)
