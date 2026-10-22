@@ -26,6 +26,13 @@ pub fn embedding_gather(
     let table_buffer = tensor_storage(ctx, table, DType::BF16, &table_dims)?;
     let id_buffer = tensor_storage(ctx, ids, DType::I32, &[tokens])?;
     let output_buffer = tensor_storage(ctx, output, DType::BF16, &output_dims)?;
+    crate::workspace::validate_capture_target(ctx.device_id(), ctx.stream().handle() as usize)?;
+    let owners = std::rc::Rc::new(vec![
+        table_buffer.clone(),
+        id_buffer.clone(),
+        output_buffer.clone(),
+    ]);
+    crate::workspace::retain_resource(&owners);
     unsafe {
         status::check(abi::apxinf_model_embedding_gather(
             table_buffer.ptr(),

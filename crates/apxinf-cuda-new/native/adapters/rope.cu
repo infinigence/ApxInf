@@ -71,7 +71,7 @@ bool applies_rope(uint32_t semantic) {
 
 void validate_spec(const apxinf_rope_spec_t& spec) {
   if (spec.version != APXINF_ROPE_SPEC_VERSION ||
-      spec.semantic > APXINF_ROPE_SEMANTIC_PARTIAL_MROPE ||
+      spec.semantic > APXINF_ROPE_SEMANTIC_COMPLEX_TABLE ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.has_bias > 1 || spec.tokens <= 0 || spec.tokens > INT32_MAX ||
       spec.q_heads == 0 || spec.kv_heads == 0 || spec.head_dim == 0 ||
@@ -87,6 +87,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
   }
   if (spec.semantic != APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
       spec.semantic != APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
+      spec.semantic != APXINF_ROPE_SEMANTIC_COMPLEX_TABLE &&
       static_cast<uint64_t>(spec.q_heads) + 2ull * spec.kv_heads > 65535) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE grid");
   }
@@ -135,6 +136,16 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
 
 void validate_bindings(const apxinf_rope_spec_t& spec,
                        const apxinf_rope_bindings_t& bindings) {
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE) {
+    if (spec.has_bias != 1 || spec.q_heads != spec.kv_heads || spec.q_heads > 65535 ||
+        spec.cache_capacity != 0 || spec.bias_alignment < 8 ||
+        !bindings.qkv || !bindings.q || !bindings.bias ||
+        bindings.k || bindings.v || bindings.position || bindings.key_input ||
+        bindings.value_input || bindings.position_offset || bindings.kv_output_offset) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid complex rotary binding");
+    }
+    return;
+  }
   const bool partial_mrope =
       spec.semantic == APXINF_ROPE_SEMANTIC_PARTIAL_MROPE;
   if ((!partial_mrope &&
@@ -204,6 +215,10 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
   switch (spec.semantic) {
+    case APXINF_ROPE_SEMANTIC_COMPLEX_TABLE:
+      kernels::complex_table<T><<<dim3(tokens, q_heads), 128, 0, stream>>>(
+          qkv, static_cast<const double*>(bindings.bias), q, q_heads, head_dim);
+      break;
     case APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE: {
       const dim3 grid(static_cast<unsigned>(tokens),
                       static_cast<unsigned>(q_heads + 2 * kv_heads));

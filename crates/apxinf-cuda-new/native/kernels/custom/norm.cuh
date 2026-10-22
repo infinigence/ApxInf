@@ -33,6 +33,9 @@ __device__ inline __nv_bfloat16 from_float(float value) {
   return __float2bfloat16(value);
 }
 
+template <> __device__ inline float to_float(float value) { return value; }
+template <> __device__ inline float from_float(float value) { return value; }
+
 __device__ __forceinline__ float warp_sum(float value) {
   for (int offset = 16; offset > 0; offset >>= 1)
     value += __shfl_down_sync(0xffffffff, value, offset);
@@ -82,6 +85,155 @@ __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
     const int64_t index = static_cast<int64_t>(row) * cols + col;
     output[index] =
         from_float<T>(to_float(input[index]) * inverse_rms * to_float(weight[col]));
+  }
+}
+
+// Two channel rows per warp. Sixteen F32 partials keep loads coalesced;
+// four strided groups are combined in a fixed order before the norm is rounded.
+// The explicit group order is part of the F32/BF16 numerical recipe.
+template <class T>
+__global__ void rounded_l2_rows(const T* input, T* output,
+                                int rows, int cols, float eps) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 16) +
+                      threadIdx.x / 16;
+  if (row >= rows) return;
+  const int lane = threadIdx.x % 16;
+  const unsigned mask = __activemask();
+  float sum = 0.0f;
+  for (int64_t col = lane; col < cols; col += 16) {
+    const float x = to_float(input[static_cast<int64_t>(row) * cols + col]);
+    sum = __fadd_rn(sum, __fmul_rn(x, x));
+  }
+  const int group = lane % 4;
+  float grouped = __shfl_sync(mask, sum, group, 16);
+  grouped = __fadd_rn(grouped, __shfl_sync(mask, sum, group + 4, 16));
+  grouped = __fadd_rn(grouped, __shfl_sync(mask, sum, group + 8, 16));
+  grouped = __fadd_rn(grouped, __shfl_sync(mask, sum, group + 12, 16));
+  const float even = __fadd_rn(__shfl_sync(mask, grouped, 0, 16),
+                             __shfl_sync(mask, grouped, 2, 16));
+  const float odd = __fadd_rn(__shfl_sync(mask, grouped, 1, 16),
+                            __shfl_sync(mask, grouped, 3, 16));
+  const float factor = fmaxf(to_float(from_float<T>(sqrtf(__fadd_rn(even, odd)))),
+                             to_float(from_float<T>(eps)));
+  for (int64_t col = lane; col < cols; col += 16) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    output[index] = from_float<T>(to_float(input[index]) / factor);
+  }
+}
+
+template <class T>
+__global__ void rounded_norm(const T* input, const T* weight, T* output,
+                            int rows, int cols, float eps, bool l2) {
+  __shared__ float scratch[32];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  float sum = 0.0f;
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float x = to_float(input[static_cast<int64_t>(row) * cols + col]);
+    sum = __fadd_rn(sum, __fmul_rn(x, x));
+  }
+  const float square_sum = block_sum_parallel_unsafe(sum, scratch);
+  const float factor = l2
+      ? fmaxf(to_float(from_float<T>(sqrtf(square_sum))), to_float(from_float<T>(eps)))
+      : rsqrtf(square_sum / cols + eps);
+  for (int64_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    const float x = to_float(input[index]);
+    if (l2) output[index] = from_float<T>(x / factor);
+    else {
+      const float normalized = to_float(from_float<T>(__fmul_rn(x, factor)));
+      output[index] = from_float<T>(__fmul_rn(normalized, to_float(weight[col])));
+    }
+  }
+}
+
+// F32 square/mean followed by dtype-rounded normalization and scaling.
+// Four independent lane accumulators preserve the vectorized mean reduction
+// order used by tensor-expression RMSNorm on medium-width rows.
+template <class T>
+__global__ void rounded_rms_warp(const T* input,const T* weight,T* output,
+                                int rows,int cols,float eps) {
+  const int64_t row=static_cast<int64_t>(blockIdx.x)*4+threadIdx.y;
+  if (row>=rows) return;
+  const int lane=threadIdx.x;
+  const int64_t base=static_cast<int64_t>(row)*cols;
+  float sums[4]={0.f,0.f,0.f,0.f};
+  for (int start=lane*4;start<cols;start+=128) {
+    #pragma unroll
+    for (int j=0;j<4;++j) {
+      const float x=to_float(input[base+start+j]);
+      sums[j]=__fadd_rn(sums[j],__fmul_rn(x,x));
+    }
+  }
+  float sum=__fadd_rn(__fadd_rn(__fadd_rn(sums[0],sums[1]),sums[2]),sums[3]);
+  for (int d=16;d;d/=2) sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,d));
+  sum=__shfl_sync(0xffffffff,sum,0);
+  const float factor=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/cols),eps));
+  for (int c=lane;c<cols;c+=32) {
+    const float normalized=to_float(from_float<T>(__fmul_rn(to_float(input[base+c]),factor)));
+    output[base+c]=from_float<T>(__fmul_rn(normalized,to_float(weight[c])));
+  }
+}
+
+// Vector-four Welford accumulation avoids a separate rounded mean/variance
+// traversal. The fixed reduction tree follows the CUDA LayerNorm arithmetic
+// in PyTorch v2.11.0 (aten/src/ATen/native/cuda/layer_norm_kernel.cu).
+struct Moments {
+  float mean = 0.f;
+  float variance = 0.f;
+  float count = 0.f;
+};
+__device__ __forceinline__ Moments append_moment(Moments m, float value) {
+  const float difference = value - m.mean;
+  const float count = m.count + 1.f;
+  const float mean = m.mean + difference * (1.f / count);
+  return {mean, m.variance + difference * (value - mean), count};
+}
+__device__ __forceinline__ Moments merge_moments(Moments left, Moments right) {
+  const float count = right.count + left.count;
+  if (count == 0.f) return {};
+  const float inverse = 1.f / count;
+  const float right_fraction = right.count * inverse;
+  const float left_fraction = left.count * inverse;
+  const float difference = left.mean - right.mean;
+  return {right_fraction * right.mean + left_fraction * left.mean,
+          right.variance + left.variance +
+              difference * difference * right.count * left_fraction,
+          count};
+}
+template <class T>
+__global__ void layer_norm_welford(const T* input, const T* weight,
+                                  const T* bias, T* output,
+                                  int rows, int cols, float eps) {
+  __shared__ Moments partial[4];
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int thread = lane + warp * 32;
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  Moments m;
+  for (int start = thread * 4; start < cols; start += 512) {
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+      m = append_moment(m, to_float(input[base + start + j]));
+  }
+  for (int offset = 16; offset; offset /= 2) {
+    Moments peer{__shfl_down_sync(0xffffffff, m.mean, offset),
+                 __shfl_down_sync(0xffffffff, m.variance, offset),
+                 __shfl_down_sync(0xffffffff, m.count, offset)};
+    m = merge_moments(m, peer);
+  }
+  if (lane == 0) partial[warp] = m;
+  __syncthreads();
+  for (int offset = 2; offset; offset /= 2) {
+    if (lane == 0 && warp < offset)
+      partial[warp] = merge_moments(partial[warp], partial[warp + offset]);
+    __syncthreads();
+  }
+  const float mean = partial[0].mean;
+  const float inverse_std = rsqrtf(partial[0].variance / float(cols) + eps);
+  for (int col = thread; col < cols; col += 128) {
+    const float normalized = inverse_std * (to_float(input[base + col]) - mean);
+    output[base + col] = from_float<T>(to_float(weight[col]) * normalized + to_float(bias[col]));
   }
 }
 

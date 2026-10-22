@@ -21,6 +21,18 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_GEGLU = 0,
   APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION = 1,
   APXINF_POINTWISE_SEMANTIC_EULER_UPDATE = 2,
+  APXINF_POINTWISE_SEMANTIC_ADD = 3,
+  APXINF_POINTWISE_SEMANTIC_SUBTRACT = 4,
+  APXINF_POINTWISE_SEMANTIC_MULTIPLY = 5,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD = 6,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY = 7,
+  APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY = 8,
+  APXINF_POINTWISE_SEMANTIC_SCALE = 9,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_ADD = 10,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE = 11,
+  APXINF_POINTWISE_SEMANTIC_EXP = 12,
+  APXINF_POINTWISE_SEMANTIC_SIN = 13,
+  APXINF_POINTWISE_SEMANTIC_COS = 14,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -29,9 +41,12 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_GELU = 1,
   APXINF_POINTWISE_ACTIVATION_SILU = 2,
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
+  APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED = 4,
+  APXINF_POINTWISE_ACTIVATION_RELU = 5,
+  APXINF_POINTWISE_ACTIVATION_SWISH_ROUNDED = 6,
 } apxinf_pointwise_activation_t;
 
-#define APXINF_POINTWISE_SPEC_VERSION 1u
+#define APXINF_POINTWISE_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
@@ -56,12 +71,12 @@ typedef struct {
 
 typedef struct {
   const void* input;
-  /* EULER_UPDATE reads the velocity here; unused elsewhere. */
+  /* Binary operand: full shape, [1,cols] for BROADCAST_*, [rows,1] for ROW_*. */
   const void* secondary;
   const void* bias;
   void* output;
   apxinf_cuda_stream_t stream;
-  /* EULER_UPDATE step size; unused elsewhere. */
+  /* EULER_UPDATE step size or SCALE/SCALAR_ADD scalar. */
   float dt;
   float output_scale;
 } apxinf_pointwise_bindings_t;

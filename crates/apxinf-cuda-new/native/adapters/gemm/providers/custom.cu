@@ -58,6 +58,9 @@ bool fp8_f32_projection_forced() {
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND) {
+    return APXINF_DTYPE_F32;
+  }
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_dtype == APXINF_DTYPE_E4M3) {
@@ -211,6 +214,7 @@ cudaError_t launch_postprocess(const Spec& spec,
   const int blocks = static_cast<int>(
       std::min<int64_t>((count + 255) / 256, 4096));
   const uint32_t bias_dtype =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ? spec.a_dtype :
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU &&
               spec.a_dtype == APXINF_DTYPE_E4M3 &&
               spec.output_dtype == APXINF_DTYPE_E4M3

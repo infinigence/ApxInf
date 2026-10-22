@@ -42,6 +42,8 @@ pub fn register_builtin_models() {
     crate::gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::dreamzero::register_builtin();
 }
 fn load_llama(
     path: &Path,
@@ -115,7 +117,6 @@ fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// Qwen3.8-27B-NVFP4 on CUDA: safetensors shards in the checkpoint directory,
 /// validated default execution (FlashInfer-GDN prefill, CUDA-graph decode,

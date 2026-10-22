@@ -471,6 +471,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
         output_alignment,
         rows: i64::from(rows_abi),
         cols: i64::from(cols_abi),
+        ..Default::default()
     };
 
     let bindings = abi::Bindings {

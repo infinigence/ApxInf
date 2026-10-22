@@ -64,13 +64,39 @@ pub fn copy_cuda_to_cuda(
             "fixed CUDA copy requires matching device, shape and dtype".into(),
         ));
     }
+    let bytes = source
+        .shape()
+        .dims()
+        .iter()
+        .try_fold(source.dtype().size_in_bytes(), |n, &d| n.checked_mul(d))
+        .ok_or_else(|| Error::Other("CUDA copy byte size overflow".into()))?;
     let source = CudaBuffer::from_tensor(source).map_err(Error::Cuda)?;
     let destination = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    if source.len() < bytes || destination.len() < bytes {
+        return Err(Error::Other("CUDA copy storage is too small".into()));
+    }
+    let a = source.ptr() as usize;
+    let b = destination.ptr() as usize;
+    let ae = a
+        .checked_add(bytes)
+        .ok_or_else(|| Error::Other("CUDA copy address overflow".into()))?;
+    let be = b
+        .checked_add(bytes)
+        .ok_or_else(|| Error::Other("CUDA copy address overflow".into()))?;
+    if a == b {
+        return Ok(());
+    }
+    if a < be && b < ae {
+        return Err(Error::Other("CUDA copy storage overlaps".into()));
+    }
+    crate::workspace::validate_capture_target(ctx.device_id(), ctx.stream().handle() as usize)?;
+    let owners = std::rc::Rc::new(vec![source.clone(), destination.clone()]);
+    crate::workspace::retain_resource(&owners);
     unsafe {
         ffi::check_cuda(ffi::cudaMemcpyAsync(
             destination.ptr(),
             source.ptr(),
-            source.len(),
+            bytes,
             ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
             ctx.stream().handle(),
         ))
@@ -106,7 +132,11 @@ pub(crate) fn copy_host_to_device(
             source.as_ptr().cast(),
             source.len(),
             ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-        ))
+        ))?;
+        // Pageable H2D cudaMemcpy may return after staging, before DMA ends.
+        // Context streams are non-blocking and do not wait for the default
+        // stream. Complete this public, synchronous upload before returning.
+        ffi::check_cuda(ffi::cudaStreamSynchronize(std::ptr::null_mut()))
     }
 }
 

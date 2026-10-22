@@ -50,7 +50,7 @@ std::string common_key(const Spec& spec,
                        int driver_version,
                        const cudaDeviceProp& properties) {
   std::ostringstream key;
-  key << "gemm-recipe-v8|ns|" << APXINF_GEMM_BUILD_ID << '|'
+  key << "gemm-recipe-v13|ns|" << APXINF_GEMM_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
@@ -61,7 +61,7 @@ std::string common_key(const Spec& spec,
       << spec.m << '|' << spec.n << '|' << spec.k << '|' << spec.a_dtype << '|'
       << spec.b_dtype << '|' << spec.accumulation_dtype << '|'
       << spec.output_dtype << '|' << spec.quantization << '|'
-      << spec.b_is_immutable << '|'
+      << spec.b_transposed << '|' << spec.b_is_immutable << '|'
       << alignment_class(spec.a_alignment, 32) << '|'
       << alignment_class(spec.b_alignment, 32) << '|'
       << alignment_class(spec.bias_alignment, 32) << '|'
@@ -78,7 +78,7 @@ std::string common_key(const Spec& spec,
   key << '|' << (spec.alpha_is_unit != 0 ? 1 : 0) << '|'
       << (spec.output_scale_is_unit != 0 ? 1 : 0) << '|'
       << policy.workspace_limit << '|' << policy.graph_safe << '|'
-      << policy.deterministic;
+      << policy.deterministic << '|' << policy.algorithm;
   return key.str();
 }
 

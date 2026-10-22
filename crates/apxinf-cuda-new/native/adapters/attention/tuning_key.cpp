@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <cublas_v2.h>
 
 #ifndef APXINF_ATTENTION_BUILD_ID
 #define APXINF_ATTENTION_BUILD_ID "attention-development"
@@ -32,7 +33,7 @@ TuningKeys tuning_keys(const Spec& spec,
   // identity and the suffix captures the normalized operation and policy.
   // There is no compatible fallback key; a miss runs the full autotuner.
   std::ostringstream key;
-  key << "attention-recipe-v5|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
+  key << "attention-recipe-v6|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
@@ -44,6 +45,15 @@ TuningKeys tuning_keys(const Spec& spec,
       << spec.key_capacity << '|' << spec.query_heads << '|' << spec.kv_heads
       << '|' << spec.head_dim << '|';
   key << spec.dynamic_decode << '|';
+  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE) {
+    int major=0, minor=0, patch=0;
+    if (cublasGetProperty(MAJOR_VERSION,&major) != CUBLAS_STATUS_SUCCESS ||
+        cublasGetProperty(MINOR_VERSION,&minor) != CUBLAS_STATUS_SUCCESS ||
+        cublasGetProperty(PATCH_LEVEL,&patch) != CUBLAS_STATUS_SUCCESS) {
+      throw Failure(APXINF_STATUS_PROVIDER_ERROR, "cannot query cuBLAS version");
+    }
+    key << "cublas=" << major << '.' << minor << '.' << patch << '|';
+  }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
       spec.dynamic_decode != 0) {
     key << "decode-meta|";
@@ -57,6 +67,7 @@ TuningKeys tuning_keys(const Spec& spec,
       << alignment_class(spec.v_alignment, 16) << '|'
       << alignment_class(spec.output_alignment, 16) << '|'
       << alignment_class(spec.offsets_alignment, 4) << '|'
+      << alignment_class(spec.bias_alignment, 16) << '|'
       << policy.workspace_limit << '|' << policy.graph_safe << '|'
       << policy.deterministic;
   return {key.str()};

@@ -30,9 +30,12 @@ typedef enum {
   APXINF_GATHER_SEMANTIC_BIAS_POSITION = 1,
   APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES = 2,
   APXINF_GATHER_SEMANTIC_REPLACE_ROWS = 3,
+  APXINF_GATHER_SEMANTIC_PERMUTE = 4,
+  APXINF_GATHER_SEMANTIC_UNFOLD3D = 5,
+  APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC = 6,
 } apxinf_gather_semantic_t;
 
-#define APXINF_GATHER_SPEC_VERSION 2u
+#define APXINF_GATHER_SPEC_VERSION 5u
 
 typedef struct {
   uint32_t version;
@@ -58,6 +61,17 @@ typedef struct {
   uint32_t output_alignment;
   int64_t rows;
   int64_t cols;
+  uint32_t rank;
+  int64_t layout_shape[8];
+  int64_t layout_strides[8];
+  int64_t row_start;
+  int64_t output_spatial[3];
+  int64_t kernel[3];
+  int64_t stride[3];
+  int64_t dilation[3];
+  int64_t padding[3];
+  /* UNFOLD3D: zero means tap/channel order; otherwise blocked channels. */
+  int64_t channel_block;
 } apxinf_gather_spec_t;
 
 typedef struct {

@@ -19,6 +19,9 @@ __device__ inline float to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
+template <>
+__device__ inline float to_float(float value) { return value; }
+
 template <class T>
 __device__ T from_float(float value);
 
@@ -30,6 +33,31 @@ __device__ inline __half from_float(float value) {
 template <>
 __device__ inline __nv_bfloat16 from_float(float value) {
   return __float2bfloat16(value);
+}
+
+template <>
+__device__ inline float from_float(float value) { return value; }
+
+template <class T>
+__device__ __forceinline__ float rounded(float value) {
+  return to_float(from_float<T>(value));
+}
+
+// Tensor-expression tanh GELU. Each assignment is a materialization boundary,
+// including 0.5*x, rather than a single fused float expression.
+template <class T>
+__device__ __forceinline__ float gelu_rounded(float x) {
+  // PyTorch scalar pow(x, 3) specializes to scalar_t x*x*x: the
+  // square is rounded before the second multiplication for F16/BF16.
+  const float square = rounded<T>(__fmul_rn(x, x));
+  const float cube = rounded<T>(__fmul_rn(square, x));
+  const float scaled_cube = rounded<T>(__fmul_rn(0.044715f, cube));
+  const float sum = rounded<T>(__fadd_rn(x, scaled_cube));
+  const float inner = rounded<T>(__fmul_rn(0.7978845608028654f, sum));
+  const float activation = rounded<T>(tanhf(inner));
+  const float factor = rounded<T>(__fadd_rn(1.0f, activation));
+  const float half_x = rounded<T>(__fmul_rn(0.5f, x));
+  return __fmul_rn(half_x, factor);
 }
 
 __device__ __forceinline__ float gelu_tanh(float value) {
@@ -48,6 +76,9 @@ enum Activation : int {
   kActivationGelu = 1,
   kActivationSilu = 2,
   kActivationGeluExact = 3,
+  kActivationGeluRounded = 4,
+  kActivationRelu = 5,
+  kActivationSwishRounded = 6,
 };
 
 __device__ __forceinline__ float apply_activation(float value, int activation) {
@@ -56,6 +87,7 @@ __device__ __forceinline__ float apply_activation(float value, int activation) {
   if (activation == kActivationGeluExact) {
     return 0.5f * value * (1.0f + erff(value * 0.7071067811865475f));
   }
+  if (activation == kActivationRelu) return value < 0.0f ? 0.0f : value;
   return value;
 }
 
@@ -85,7 +117,41 @@ __global__ void bias_activation(const T* input, const T* bias, T* output,
   for (; index < count; index += stride) {
     float value = to_float(input[index]);
     if (bias != nullptr) value += to_float(bias[index % cols]);
-    output[index] = from_float<T>(apply_activation(value, activation));
+    if (activation == kActivationSwishRounded) {
+      value = rounded<T>(value);
+      const float sigmoid = rounded<T>(1.0f / (1.0f + expf(-value)));
+      output[index] = from_float<T>(__fmul_rn(value, sigmoid));
+    } else {
+      output[index] = from_float<T>(activation == kActivationGeluRounded
+          ? gelu_rounded<T>(rounded<T>(value)) : apply_activation(value, activation));
+    }
+  }
+}
+
+// Semantic encodings follow pointwise_types.h. Each operation rounds only at
+// its output; composing operations preserves the caller's rounding boundaries.
+template <class T>
+__global__ void binary_scalar(const T* input, const T* secondary, T* output,
+                              int64_t count, int cols, int semantic, float scalar) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const float x = to_float(input[index]);
+    float value;
+    if (semantic == 9) value = __fmul_rn(x, scalar);
+    else if (semantic == 10) value = __fadd_rn(x, scalar);
+    else if (semantic == 11) value = __fdiv_rn(x, scalar);
+    else if (semantic == 12) value = expf(x);
+    else if (semantic == 13) value = sinf(x);
+    else if (semantic == 14) value = cosf(x);
+    else {
+      const int64_t j = (semantic == 6 || semantic == 7) ? index % cols
+                         : semantic == 8 ? index / cols : index;
+      const float y = to_float(secondary[j]);
+      value = (semantic == 3 || semantic == 6) ? __fadd_rn(x, y)
+               : semantic == 4 ? __fsub_rn(x, y) : __fmul_rn(x, y);
+    }
+    output[index] = from_float<T>(value);
   }
 }
 

@@ -19,9 +19,45 @@ pub(crate) enum Semantic {
     /// residual and rounds again. This is deliberately distinct from
     /// [`Self::BiasResidual`], which rounds only the final sum.
     BiasThenResidual,
+    /// Round the normalized value before multiplying by the learned weight.
+    RmsRounded,
+    /// Row L2 norm rounded to the input dtype, clamped by eps, then divide.
+    L2Rounded,
 }
 
 impl Semantic {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Rms,
+        Self::Layer,
+        Self::AdaptiveRms,
+        Self::BiasResidual,
+        Self::BiasResidualRms,
+        Self::BiasResidualLayer,
+        Self::AdaGateResidual,
+        Self::AdaGateResidualRms,
+        Self::BiasThenResidual,
+        Self::RmsRounded,
+        Self::L2Rounded,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const fn doc_id(self) -> &'static str {
+        match self {
+            Self::Rms => "rms_norm",
+            Self::Layer => "layer_norm",
+            Self::AdaptiveRms => "adaptive_rms_norm",
+            Self::BiasResidual => "bias_residual",
+            Self::BiasResidualRms => "bias_residual_rms_norm",
+            Self::BiasResidualLayer => "bias_residual_layer_norm",
+            Self::AdaGateResidual => "ada_gate_residual",
+            Self::AdaGateResidualRms => "ada_gate_residual_rms_norm",
+            Self::BiasThenResidual => "bias_then_residual",
+            Self::RmsRounded => "rms_norm_rounded",
+            Self::L2Rounded => "l2_norm_rounded",
+        }
+    }
+
     fn code(self) -> u32 {
         match self {
             Self::Rms => 0,
@@ -33,11 +69,16 @@ impl Semantic {
             Self::AdaGateResidual => 6,
             Self::AdaGateResidualRms => 7,
             Self::BiasThenResidual => 8,
+            Self::RmsRounded => 9,
+            Self::L2Rounded => 10,
         }
     }
 
     fn writes_hidden(self) -> bool {
-        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
+        !matches!(
+            self,
+            Self::Rms | Self::Layer | Self::AdaptiveRms | Self::RmsRounded | Self::L2Rounded
+        )
     }
 
     fn writes_normalized(self) -> bool {
@@ -54,7 +95,11 @@ impl Semantic {
     fn reads_weight(self) -> bool {
         matches!(
             self,
-            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
+            Self::Rms
+                | Self::Layer
+                | Self::BiasResidualRms
+                | Self::BiasResidualLayer
+                | Self::RmsRounded
         )
     }
 
@@ -114,7 +159,8 @@ fn dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Norm currently supports F16 and BF16")),
+        DType::F32 => Ok(0),
+        _ => Err(invalid("Norm supports F16/BF16, and F32 row L2")),
     }
 }
 
@@ -122,8 +168,11 @@ fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
+        DType::F32 => Ok(0),
         DType::F8E4M3 => Ok(3),
-        _ => Err(invalid("Norm output supports F16, BF16 and E4M3")),
+        _ => Err(invalid(
+            "Norm output supports F16/BF16/E4M3, and F32 row L2",
+        )),
     }
 }
 
@@ -161,11 +210,41 @@ fn tensor_storage(
 
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
     let semantic = args.semantic;
+    if args.input.dtype() == DType::F32 && semantic != Semantic::L2Rounded {
+        return Err(invalid("F32 normalization is supported only for row L2"));
+    }
+    if matches!(semantic, Semantic::RmsRounded | Semantic::L2Rounded)
+        && args
+            .normalized
+            .as_ref()
+            .is_some_and(|out| out.dtype() != args.input.dtype())
+    {
+        return Err(invalid(
+            "Rounded normalization requires matching input/output dtype",
+        ));
+    }
     let dims = args.input.shape().dims();
     if dims.len() != 2 {
         return Err(invalid("Norm input must be rank 2 [rows, cols]"));
     }
     let (rows, cols) = (dims[0], dims[1]);
+    if matches!(semantic, Semantic::RmsRounded | Semantic::L2Rounded) {
+        if args
+            .normalized
+            .as_ref()
+            .is_some_and(|out| out.shape() != args.input.shape())
+        {
+            return Err(invalid(
+                "Rounded normalization input/output shapes must match",
+            ));
+        }
+        if args
+            .weight
+            .is_some_and(|weight| weight.shape().dims() != [cols])
+        {
+            return Err(invalid("Rounded RMS weight must have shape [cols]"));
+        }
+    }
     if rows == 0 || cols == 0 {
         return Err(invalid("Norm input must be non-empty"));
     }
@@ -330,6 +409,24 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "normalized",
         &mut storage,
     )?;
+    if matches!(semantic, Semantic::RmsRounded | Semantic::L2Rounded) {
+        let output = storage.last().expect("normalized output is required");
+        let start = output.ptr() as usize;
+        let end = start
+            .checked_add(output.len())
+            .ok_or_else(|| invalid("Norm storage range overflow"))?;
+        for input in &storage[..storage.len() - 1] {
+            let input_start = input.ptr() as usize;
+            let input_end = input_start
+                .checked_add(input.len())
+                .ok_or_else(|| invalid("Norm storage range overflow"))?;
+            if input_start < end && start < input_end {
+                return Err(invalid(
+                    "Rounded normalization input/output storage must not overlap",
+                ));
+            }
+        }
+    }
 
     let dtype_value = dtype_code(dtype)?;
     let spec = abi::Spec {

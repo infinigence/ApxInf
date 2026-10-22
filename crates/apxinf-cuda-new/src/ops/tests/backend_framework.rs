@@ -25,6 +25,7 @@ unsafe extern "C" {
         capacity: usize,
     ) -> usize;
     fn apxinf_gemm_test_resource_prefilter(device: c_int) -> c_int;
+    fn apxinf_gemm_test_baseline_failure_contract(device: c_int) -> c_int;
     fn apxinf_framework_test_registry_contract(error: *mut c_char, capacity: usize) -> c_int;
     fn apxinf_framework_test_recipe_db_contract(
         directory: *const c_char,
@@ -100,7 +101,7 @@ fn graph_safe_autotune_captures_the_winner() {
 }
 
 #[test]
-fn merged_gemm_contract_rejects_pre_merge_spec_version() {
+fn gemm_contract_rejects_previous_spec_version() {
     let ctx = CudaContext::new(0).unwrap();
     let activation = zeros_tensor(0, vec![1, 16], DType::BF16);
     let weight = zeros_tensor(0, vec![16, 16], DType::BF16);
@@ -108,10 +109,10 @@ fn merged_gemm_contract_rejects_pre_merge_spec_version() {
     let args = GemmArgs::new(&activation, &weight, &mut output);
     let mut normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
-    assert_eq!(normalized.spec.version, 6);
-    normalized.spec.version = 5;
+    assert_eq!(normalized.spec.version, 9);
+    normalized.spec.version = 8;
     let error = match super::execution::prepare(&ctx, normalized) {
-        Ok(_) => panic!("pre-merge GEMM spec must be rejected"),
+        Ok(_) => panic!("previous GEMM spec must be rejected"),
         Err(error) => error,
     };
     assert!(error.to_string().contains("invalid GEMM Spec"), "{error}");
@@ -368,7 +369,7 @@ pub(super) fn values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
-fn f16_values(tensor: &Tensor) -> Vec<f32> {
+pub(super) fn f16_values(tensor: &Tensor) -> Vec<f32> {
     assert_eq!(tensor.dtype(), DType::F16);
     let buffer = CudaBuffer::from_tensor(tensor).unwrap();
     let mut bytes = vec![0; buffer.len()];
@@ -471,8 +472,12 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // A spread of finite E4M3 codes. Constant operands would hide an indexing
     // fault, because every element of the result would be identical.
     const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
-    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
-    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a_codes: Vec<u8> = (0..m * k)
+        .map(|i| CODES[(i * 7 + 1) % CODES.len()])
+        .collect();
+    let b_codes: Vec<u8> = (0..k * n)
+        .map(|i| CODES[(i * 5 + 3) % CODES.len()])
+        .collect();
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
@@ -484,8 +489,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
         for column in 0..n {
             let mut accumulator = 0.0f32;
             for index in 0..k {
-                accumulator += e4m3_value(a_codes[row * k + index])
-                    * e4m3_value(b_codes[index * n + column]);
+                accumulator +=
+                    e4m3_value(a_codes[row * k + index]) * e4m3_value(b_codes[index * n + column]);
             }
             expected[row * n + column] = accumulator * alpha;
         }
@@ -493,7 +498,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // Guard the magnitude as well as the direction: a candidate that is the
     // right shape and the wrong scale scores near-perfect cosine.
     let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
-    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+    assert!(
+        peak > 0.1 && peak < 1.0e4,
+        "degenerate reference peak {peak}"
+    );
 
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.quantization = GemmQuantization::Fp8UnitScale;
@@ -526,7 +534,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
     // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
     // bound is deliberately far above that and far below any real fault.
-    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+    assert!(
+        relative_l2 < 0.01,
+        "winner drifted by relative L2 {relative_l2}"
+    );
 }
 
 #[test]
@@ -1493,4 +1504,568 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
 
     drop(mutable);
     std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn single_round_bias_cold_fallback_fits_without_full_f32_projection() {
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    for dtype in [DType::F16, DType::BF16] {
+        for b_transposed in [false, true] {
+            let upload = |shape, values: &[f32]| {
+                if dtype == DType::F16 {
+                    f16_tensor(0, shape, values)
+                } else {
+                    tensor(0, shape, values)
+                }
+            };
+            let a = upload(vec![128, 16], &vec![0.25; 128 * 16]);
+            let b = upload(
+                if b_transposed {
+                    vec![4096, 16]
+                } else {
+                    vec![16, 4096]
+                },
+                &vec![0.5; 16 * 4096],
+            );
+            let bias = upload(vec![4096], &vec![0.125; 4096]);
+            let mut out = zeros_tensor(0, vec![128, 4096], dtype);
+            let mut args = GemmArgs::new(&a, &b, &mut out);
+            args.b_transposed = b_transposed;
+            args.policy.cache_dir = Some(String::new());
+            args.policy.deterministic = true;
+            // A full FP32 projection alone requires 2 MiB.
+            args.policy.workspace_limit = 1 << 20;
+            let normalized = super::contracts::normalize(
+                &ctx,
+                args,
+                super::contracts::Semantic::GemmBiasSingleRound,
+                Some(&bias),
+            )
+            .unwrap();
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            assert!(execution
+                .summary()
+                .starts_with("cublasLt-single-round-bias "));
+            execution.enqueue().unwrap();
+            ctx.synchronize().unwrap();
+            assert!(crate::transfers::to_cpu(&out)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap()
+                .iter()
+                .all(|&x| x == 2.125));
+            let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+            drop(a);
+            drop(b);
+            drop(bias);
+            drop(execution);
+            for _ in 0..3 {
+                graph.replay().unwrap();
+                ctx.synchronize().unwrap();
+                assert!(crate::transfers::to_cpu(&out)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap()
+                    .iter()
+                    .all(|&x| x == 2.125));
+            }
+        }
+    }
+}
+
+#[test]
+fn single_round_transposed_weight_contract_rejects_other_semantics_and_wrong_shape() {
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    let a = zeros_tensor(0, vec![3, 16], DType::BF16);
+    let b = zeros_tensor(0, vec![32, 16], DType::BF16);
+    let bias = zeros_tensor(0, vec![32], DType::BF16);
+    let mut out = zeros_tensor(0, vec![3, 32], DType::BF16);
+    for semantic in [
+        super::contracts::Semantic::Gemm,
+        super::contracts::Semantic::GemmBias,
+    ] {
+        let mut args = GemmArgs::new(&a, &b, &mut out);
+        args.b_transposed = true;
+        assert!(super::contracts::normalize(&ctx, args, semantic, Some(&bias)).is_err());
+    }
+    // The default KN contract must not silently reinterpret a nonsquare NK tensor.
+    assert!(super::contracts::normalize(
+        &ctx,
+        GemmArgs::new(&a, &b, &mut out),
+        super::contracts::Semantic::GemmBiasSingleRound,
+        Some(&bias)
+    )
+    .is_err());
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.b_transposed = true;
+    let normalized = super::contracts::normalize(
+        &ctx,
+        args,
+        super::contracts::Semantic::GemmBiasSingleRound,
+        Some(&bias),
+    )
+    .unwrap();
+    assert_eq!(normalized.spec.b_transposed, 1);
+    assert_eq!(
+        (normalized.spec.m, normalized.spec.k, normalized.spec.n),
+        (3, 16, 32)
+    );
+}
+
+/// Independent dyadic oracle: every F32 partial is exact, while rounding
+/// partials through the output dtype loses information. The long reduction
+/// and narrow output exercise cuBLASLt's split-K COMPUTE_TYPE epilogue.
+#[test]
+fn single_round_bias_f32_split_reduction_capture_and_owner_lifetime() {
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    let (m, n, k) = (1760, 64, 5120);
+    for dtype in [DType::F16, DType::BF16] {
+        let upload = |shape, values: &[f32]| {
+            if dtype == DType::F16 {
+                f16_tensor(0, shape, values)
+            } else {
+                tensor(0, shape, values)
+            }
+        };
+        let av = |r: usize, j: usize| ((r * 7 + j) % 17) as f64 - 8.;
+        let bv = |c: usize, j: usize| ((c * 3 + j * 5) % 17) as f64 - 8.;
+        let source: Vec<_> = (0..m * k)
+            .map(|i| (av(i / k, i % k) / 16.) as f32)
+            .collect();
+        let weights: Vec<_> = (0..n * k)
+            .map(|i| (bv(i / k, i % k) / 32.) as f32)
+            .collect();
+        let biases: Vec<_> = (0..n).map(|c| (c as i32 % 7 - 3) as f32 / 128.).collect();
+        let a = upload(vec![m, k], &source);
+        let retained_a = a.clone();
+        let b = upload(vec![n, k], &weights);
+        let bias = upload(vec![n], &biases);
+        let mut out = zeros_tensor(0, vec![m, n], dtype);
+        let mut args = GemmArgs::new(&a, &b, &mut out);
+        args.b_transposed = true;
+        args.policy.cache_dir = Some(String::new());
+        args.policy.deterministic = true;
+        args.policy.workspace_limit = 1 << 20;
+        let normalized = super::contracts::normalize(
+            &ctx,
+            args,
+            super::contracts::Semantic::GemmBiasSingleRound,
+            Some(&bias),
+        )
+        .unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        let summary = execution.summary();
+        eprintln!("F32_SPLIT_REDUCTION {dtype:?}: {summary}");
+        let split = summary
+            .split_whitespace()
+            .find_map(|v| v.strip_prefix("split-k="))
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(0);
+        if split > 1 {
+            assert!(summary.contains("reduction=2"), "{summary}");
+        }
+        // Heuristics vary by hardware/toolkit. Generic correctness must also
+        // cover legal unsplit/fallback executions; target validation explicitly
+        // requires this branch and records the actual algorithm in its log.
+        if std::env::var_os("APXINF_TEST_REQUIRE_SPLIT_K").is_some() {
+            assert!(split > 1, "split-K path was not exercised: {summary}");
+        }
+        let check = |scale: f64| {
+            let actual = crate::transfers::to_cpu(&out)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap();
+            for r in 0..m {
+                for c in 0..n {
+                    let period: f64 = (0..17).map(|j| av(r, j) * bv(c, j)).sum();
+                    let tail: f64 = (0..k % 17).map(|j| av(r, j) * bv(c, j)).sum();
+                    let expected = ((period * (k / 17) as f64 + tail) * scale / 512.
+                        + biases[c] as f64) as f32;
+                    let rounded = if dtype == DType::F16 {
+                        f16::from_f32(expected).to_f32()
+                    } else {
+                        bf16::from_f32(expected).to_f32()
+                    };
+                    assert_eq!(
+                        actual[r * n + c],
+                        rounded,
+                        "{dtype:?} scale={scale} row={r} col={c}"
+                    );
+                }
+            }
+        };
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        check(1.);
+        let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+        drop(a);
+        drop(b);
+        drop(bias);
+        drop(execution);
+        for scale in [0.5, 1., 0.5] {
+            let changed: Vec<_> = source.iter().map(|&v| v * scale as f32).collect();
+            let host = if dtype == DType::F16 {
+                Tensor::from_f16(
+                    vec![m, k],
+                    &changed
+                        .iter()
+                        .copied()
+                        .map(f16::from_f32)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            } else {
+                Tensor::from_bf16(
+                    vec![m, k],
+                    &changed
+                        .iter()
+                        .copied()
+                        .map(bf16::from_f32)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            };
+            crate::transfers::copy_cpu_to_cuda(&host, &retained_a).unwrap();
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            check(scale);
+        }
+    }
+}
+
+#[test]
+fn zero_workspace_f32_projection_fallback_capture_and_lifetime() {
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    let (m, n, k) = (37, 32, 4096);
+    for dtype in [DType::F16, DType::BF16] {
+        let upload = |shape, values: &[f32]| {
+            if dtype == DType::F16 {
+                f16_tensor(0, shape, values)
+            } else {
+                tensor(0, shape, values)
+            }
+        };
+        let av: Vec<_> = (0..m * k).map(|i| ((i % 31) as f32 - 15.) / 16.).collect();
+        let bv: Vec<_> = (0..k * n).map(|i| ((i % 17) as f32 - 8.) / 32.).collect();
+        let a = upload(vec![m, k], &av);
+        let retained = a.clone();
+        let b = upload(vec![k, n], &bv);
+        let mut out = zeros_tensor(0, vec![m, n], dtype);
+        let mut args = GemmArgs::new(&a, &b, &mut out);
+        args.policy.cache_dir = Some(String::new());
+        args.policy.deterministic = true;
+        args.policy.workspace_limit = 0;
+        let normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(
+            execution.summary().contains("cublasLt-f32-reduction"),
+            "{}",
+            execution.summary()
+        );
+        assert!(
+            execution.summary().contains("workspace=0"),
+            "{}",
+            execution.summary()
+        );
+        // Independent f64 sums also validate every admitted configuration at a
+        // nonzero workspace budget, including non-unit alpha/output scaling.
+        let round = |v: f32| {
+            if dtype == DType::F16 {
+                f16::from_f32(v).to_f32()
+            } else {
+                bf16::from_f32(v).to_f32()
+            }
+        };
+        let expected: Vec<_> = (0..m * n)
+            .map(|i| {
+                let (r, c) = (i / n, i % n);
+                let sum = (0..k)
+                    .map(|j| av[r * k + j] as f64 * bv[j * n + c] as f64)
+                    .sum::<f64>();
+                round(round((sum * 0.5) as f32) / 0.25)
+            })
+            .collect();
+        let mut scaled = GemmArgs::new(&a, &b, &mut out);
+        scaled.alpha = 0.5;
+        scaled.output_scale = 0.25;
+        scaled.policy.cache_dir = Some(String::new());
+        scaled.policy.workspace_limit = 16 << 20;
+        let normalized =
+            super::contracts::normalize(&ctx, scaled, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+        let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+        drop(a);
+        drop(b);
+        drop(execution);
+        for sign in [1., -1.] {
+            let changed = upload(vec![m, k], &av.iter().map(|v| v * sign).collect::<Vec<_>>());
+            crate::transfers::copy_cuda_to_cuda(&ctx, &changed, &retained).unwrap();
+            drop(changed);
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            let actual = crate::transfers::to_cpu(&out)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap();
+            for r in 0..m {
+                for c in 0..n {
+                    let exact = (0..k)
+                        .map(|j| av[r * k + j] as f64 * bv[j * n + c] as f64)
+                        .sum::<f64>()
+                        * sign as f64;
+                    let expected = if dtype == DType::F16 {
+                        f16::from_f64(exact).to_f32()
+                    } else {
+                        bf16::from_f64(exact).to_f32()
+                    };
+                    assert_eq!(actual[r * n + c], expected, "{dtype:?} ({r},{c})");
+                }
+            }
+        }
+    }
+}
+
+/// The numerical domain must be identical across cold fallback, measured
+/// preparation and a fresh process restoring the recipe. Exercise all three
+/// projection contracts used by BF16 joint diffusion networks.
+#[test]
+fn cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic() {
+    const CHILD: &str = "APXINF_COLD_BASELINE_RESTORE_CHILD";
+    let directory = FrameworkTestDirectory::new();
+    let child_cache = std::env::var(CHILD).ok();
+    let cache = child_cache
+        .clone()
+        .unwrap_or_else(|| directory.0.to_string_lossy().into_owned());
+    let ctx = CudaContext::new(0).unwrap();
+    for profile in 0..3 {
+        let (m, k, n) = match profile {
+            1 => (1760, 5120, 64), // Transposed, long-K split reduction.
+            2 => (37, 4096, 32),   // Zero-workspace projection.
+            _ => (7, 64, 32),
+        };
+        let av = |r: usize, j: usize| ((r * 7 + j) % 17) as f64 - 8.;
+        let bv = |c: usize, j: usize| ((c * 3 + j * 5) % 17) as f64 - 8.;
+        let a_values: Vec<_> = (0..m * k)
+            .map(|i| (av(i / k, i % k) / 16.) as f32)
+            .collect();
+        let b_values: Vec<_> = (0..k * n)
+            .map(|i| {
+                let (c, j) = if profile == 1 {
+                    (i / k, i % k)
+                } else {
+                    (i % n, i / n)
+                };
+                (bv(c, j) / 32.) as f32
+            })
+            .collect();
+        let a = tensor(0, vec![m, k], &a_values);
+        let b = tensor(
+            0,
+            if profile == 1 { vec![n, k] } else { vec![k, n] },
+            &b_values,
+        );
+        let bias = tensor(0, vec![n], &vec![0.125; n]);
+        let dtype = DType::BF16;
+        let mut out = zeros_tensor(0, vec![m, n], dtype);
+        let prepare = |out: &mut Tensor, algorithm, tune, fallback, cache: String| {
+            let mut args = GemmArgs::new(&a, &b, out);
+            args.b_transposed = profile == 1;
+            args.policy.algorithm = algorithm;
+            args.policy.online_tune = tune;
+            args.policy.allow_fallback = fallback;
+            args.policy.deterministic = true;
+            args.policy.workspace_limit = if profile == 2 { 0 } else { 1 << 20 };
+            args.policy.cache_dir = Some(cache);
+            let semantic = if profile == 1 {
+                super::contracts::Semantic::GemmBiasSingleRound
+            } else {
+                super::contracts::Semantic::Gemm
+            };
+            super::execution::prepare(
+                &ctx,
+                super::contracts::normalize(
+                    &ctx,
+                    args,
+                    semantic,
+                    if profile == 1 { Some(&bias) } else { None },
+                )
+                .unwrap(),
+            )
+        };
+        let ordinary = prepare(
+            &mut out,
+            GemmAlgorithmPolicy::Any,
+            false,
+            true,
+            String::new(),
+        )
+        .unwrap();
+        assert!(ordinary.summary().contains("source=fallback"));
+        if profile == 1 && std::env::var_os("APXINF_TEST_REQUIRE_SPLIT_K").is_some() {
+            let split = ordinary
+                .summary()
+                .split_whitespace()
+                .find_map(|v| v.strip_prefix("split-k="))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            assert!(split > 1, "{}", ordinary.summary());
+            assert!(ordinary.summary().contains("reduction=2"));
+        }
+
+        let identity = ordinary
+            .summary()
+            .split(" source=")
+            .next()
+            .unwrap()
+            .to_owned();
+        ordinary.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        let expected = crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        // An independent dyadic oracle catches mutually consistent wrong outputs.
+        for row in 0..m {
+            for col in 0..n {
+                let period: f64 = (0..17).map(|j| av(row, j) * bv(col, j)).sum();
+                let tail: f64 = (0..k % 17).map(|j| av(row, j) * bv(col, j)).sum();
+                let exact = ((period * (k / 17) as f64 + tail) / 512.
+                    + if profile == 1 { 0.125 } else { 0.0 }) as f32;
+                let rounded = if dtype == DType::BF16 {
+                    bf16::from_f32(exact).to_f32()
+                } else {
+                    exact
+                };
+                assert_eq!(expected[row * n + col], rounded);
+            }
+        }
+        let stable = prepare(
+            &mut out,
+            GemmAlgorithmPolicy::ColdBaseline,
+            child_cache.is_none(),
+            false,
+            cache.clone(),
+        )
+        .unwrap();
+        assert_eq!(stable.summary().split(" source=").next().unwrap(), identity);
+        if child_cache.is_some() {
+            assert!(
+                stable.summary().contains("source=recipe"),
+                "{}",
+                stable.summary()
+            );
+            assert!(!stable.summary().contains("timed("));
+        } else {
+            assert!(
+                stable
+                    .summary()
+                    .contains("source=tuned checked=1 rejected=0"),
+                "{}",
+                stable.summary()
+            );
+            assert_eq!(stable.summary().matches("=timed(").count(), 1);
+            assert!(stable.summary().contains("winner-graph=capture-pass"));
+        }
+        stable.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            crate::transfers::to_cpu(&out)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap(),
+            expected
+        );
+        let graph = crate::capture(&ctx, || stable.enqueue()).unwrap();
+        // Change an existing input allocation; graph must read its new content.
+        CudaBuffer::from_tensor(&a)
+            .unwrap()
+            .copy_from_host(&vec![0u8; m * k * 2])
+            .unwrap();
+        drop(stable);
+        drop(ordinary);
+        drop(a);
+        drop(b);
+        drop(bias);
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap()
+            .iter()
+            .all(|&v| v == if profile == 1 { 0.125 } else { 0.0 }));
+    }
+    if child_cache.is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","ops::tests::framework::cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic","--nocapture","--test-threads=1"]).env(CHILD,&cache).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn cold_baseline_gemm_partitions_keys_and_rejects_alternate_recipes() {
+    assert_eq!(GemmPolicy::default().algorithm, GemmAlgorithmPolicy::Any);
+    let directory = FrameworkTestDirectory::new();
+    let cache = directory.0.to_string_lossy().into_owned();
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![4, 64], &vec![0.5; 256]);
+    let b = tensor(0, vec![64, 32], &vec![0.25; 2048]);
+    let mut out = zeros_tensor(0, vec![4, 32], DType::BF16);
+    let normalize = |out: &mut Tensor, algorithm, tune, fallback| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.algorithm = algorithm;
+        args.policy.online_tune = tune;
+        args.policy.allow_fallback = fallback;
+        args.policy.cache_dir = Some(cache.clone());
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap()
+    };
+    let any = super::execution::prepare(
+        &ctx,
+        normalize(&mut out, GemmAlgorithmPolicy::Any, true, false),
+    )
+    .unwrap();
+    assert!(any.summary().contains("source=tuned"));
+    let miss = super::execution::prepare(
+        &ctx,
+        normalize(&mut out, GemmAlgorithmPolicy::ColdBaseline, false, false),
+    );
+    assert!(miss.err().unwrap().to_string().contains("recipe miss"));
+    // A valid but non-baseline provider under the restricted key cannot bypass
+    // eligibility, even when the persisted payload itself is well formed.
+    let normalized = normalize(&mut out, GemmAlgorithmPolicy::ColdBaseline, false, false);
+    super::execution::seed_recipe(&ctx, &normalized, 2, 6, 1, 0).unwrap();
+    let miss = super::execution::prepare(&ctx, normalized);
+    assert!(miss.err().unwrap().to_string().contains("recipe miss"));
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    super::execution::reset_execution_create_count();
+    prepare_with_session(&session, || {
+        for algorithm in [
+            GemmAlgorithmPolicy::Any,
+            GemmAlgorithmPolicy::ColdBaseline,
+            GemmAlgorithmPolicy::Any,
+            GemmAlgorithmPolicy::ColdBaseline,
+        ] {
+            super::execution::prepare(&ctx, normalize(&mut out, algorithm, false, true))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        super::execution::execution_create_count(),
+        2,
+        "algorithm policy must partition the session execution cache"
+    );
+}
+
+#[test]
+fn cold_baseline_skips_unsupported_but_propagates_operational_failure() {
+    assert_eq!(unsafe { apxinf_gemm_test_baseline_failure_contract(0) }, 1);
 }

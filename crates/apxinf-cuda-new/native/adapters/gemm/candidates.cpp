@@ -29,6 +29,23 @@ bool supports_vendor(const Spec& spec) {
            spec.accumulation_dtype == APXINF_DTYPE_F32));
 }
 
+bool supports_f32_projection(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
+         spec.b_dtype == spec.a_dtype && spec.output_dtype == spec.a_dtype &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE;
+}
+
+bool supports_direct_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND &&
+         (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
+         spec.b_dtype == spec.a_dtype && spec.output_dtype == spec.a_dtype &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.output_scale_is_unit != 0;
+}
+
 bool supports_native_fp8(const Spec& spec) {
   return supports_vendor(spec) && spec.a_dtype == APXINF_DTYPE_E4M3 &&
          spec.k % 16 == 0 && spec.n % 16 == 0;
@@ -96,6 +113,12 @@ AlignmentRequirements cublaslt_alignment(const Spec&) {
   requirements.b = 16;
   requirements.output = 16;
   requirements.residual = 16;
+  return requirements;
+}
+
+AlignmentRequirements direct_bias_alignment(const Spec& spec) {
+  auto requirements = cublaslt_alignment(spec);
+  requirements.bias = 16;
   return requirements;
 }
 
@@ -320,8 +343,8 @@ bool supports_device(const Implementation& implementation,
 }
 
 const ImplementationRegistry& registry(uint32_t semantic) {
-  // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
-  // faster or more specialized providers remain autotuning candidates only.
+  // cuBLAS is the general fallback. Single-round bias additionally tries the
+  // direct Lt epilogue first to avoid retaining an M*N FP32 projection.
   static const ImplementationRegistry gemm_bias_gelu_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
@@ -353,6 +376,19 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
   };
+  static const ImplementationRegistry single_round_bias_entries = {
+      {kProviderCublasLt, 9, 1, "cublasLt-single-round-bias", 0, true, true, true,
+       supports_direct_bias, direct_bias_alignment,
+       cublaslt_direct_bias_resource_requirements, cublaslt_configurations,
+       prepare_cublaslt_direct_bias, launch_cublaslt, destroy_cublaslt},
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+       supports_vendor, vendor_alignment, cublas_resource_requirements,
+       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
+       cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
+       destroy_cublaslt},
+  };
   static const ImplementationRegistry gemm_bias_residual_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
@@ -371,6 +407,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_vendor, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+      {kProviderCublasLt, 6, 1, "cublasLt-f32-reduction", 0, true, true, true,
+       supports_f32_projection, cublaslt_alignment, cublaslt_resource_requirements,
+       cublaslt_configurations, prepare_cublaslt_f32_reduction, launch_cublaslt,
+       destroy_cublaslt},
       {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
        supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
@@ -455,6 +495,9 @@ const ImplementationRegistry& registry(uint32_t semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM_GEGLU:
       selected = &gemm_geglu_entries;
       break;
+    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND:
+      selected = &single_round_bias_entries;
+      break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS:
       selected = &gemm_bias_entries;
       break;
@@ -470,9 +513,12 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       [](const Implementation& implementation) {
         return implementation.fallback;
       });
-  if (fallback_count != 1) {
+  const int expected_fallbacks =
+      (semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
+       semantic == APXINF_GEMM_SEMANTIC_GEMM) ? 2 : 1;
+  if (fallback_count != expected_fallbacks) {
     throw Failure(APXINF_STATUS_INTERNAL_ERROR,
-                  "GEMM semantic must register exactly one fallback");
+                  "GEMM semantic fallback registry is inconsistent");
   }
   return *selected;
 }

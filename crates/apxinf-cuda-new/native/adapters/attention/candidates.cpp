@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <climits>
 
 namespace apxinf::attention {
 namespace {
@@ -24,6 +25,14 @@ bool supports_dense_custom(const Spec& spec) {
          supports_custom(spec);
 }
 
+bool supports_rounded(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE &&
+         supports_custom(spec) && spec.mask == APXINF_ATTENTION_MASK_NONE &&
+         spec.query_heads == spec.kv_heads &&
+         spec.query_heads <= INT32_MAX / spec.head_dim &&
+         spec.batch <= INT32_MAX / spec.query_heads / spec.query_tokens;
+}
+
 bool supports_kv_cache_custom(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
          supports_custom(spec);
@@ -41,6 +50,16 @@ void one_configuration(const Spec&, std::vector<int>& configurations) {
 }
 
 #if defined(APXINF_ATTENTION_FA2)
+bool supports_efficient(const Spec& s) {
+  return s.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+      s.mask == APXINF_ATTENTION_MASK_NONE && supports_custom(s) &&
+      s.head_dim == 384 && s.query_heads == s.kv_heads &&
+      s.query_heads <= INT32_MAX / s.head_dim && s.query_heads <= 65535 &&
+      s.batch <= 65535 && s.query_tokens <= INT32_MAX - 32 &&
+      s.batch <= INT32_MAX / s.query_tokens &&
+      s.query_tokens <= INT32_MAX / (s.query_heads * s.head_dim) &&
+      s.key_tokens <= INT32_MAX / (s.query_heads * s.head_dim);
+}
 bool supports_fa2(const Spec& spec) {
   const bool layout_supported =
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE ||
@@ -133,6 +152,30 @@ AlignmentRequirements cutlass_alignment(const Spec&) {
 
 }  // namespace
 
+extern "C" int apxinf_attention_test_efficient_support_domain() {
+#if defined(APXINF_ATTENTION_FA2)
+  Spec s{};
+  s.semantic=APXINF_ATTENTION_SEMANTIC_DENSE;
+  s.dtype=s.output_dtype=APXINF_DTYPE_BF16;
+  s.mask=APXINF_ATTENTION_MASK_NONE;
+  s.batch=1; s.head_dim=384; s.query_heads=s.kv_heads=2;
+  s.query_tokens=35; s.key_tokens=137;
+  if (!supports_efficient(s)) return 0;
+  const int64_t limit=INT32_MAX/(s.query_heads*s.head_dim);
+  s.key_tokens=limit;
+  if (!supports_efficient(s)) return 0;
+  s.key_tokens=limit+1;
+  if (supports_efficient(s)) return 0;
+  s.key_tokens=137; s.query_tokens=limit;
+  if (!supports_efficient(s)) return 0;
+  s.query_tokens=limit+1;
+  if (supports_efficient(s)) return 0;
+  s.query_tokens=35; s.query_heads=3;
+  if (supports_efficient(s)) return 0;
+#endif
+  return 1;
+}
+
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
 #if defined(APXINF_ATTENTION_CUTLASS)
@@ -154,15 +197,26 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_fa2_splitkv, fa2_alignment,
        fa2_splitkv_resource_requirements, splitkv_configurations,
        prepare_fa2_splitkv, launch_fa2_splitkv, destroy_fa2_splitkv},
-      {kProviderFa2, 1, 1, "flash-attention-2",
-       apxinf::gemm::kDeviceFeatureFa2, true, true, false, supports_fa2,
-       fa2_alignment, fa2_resource_requirements, one_configuration,
-       prepare_fa2, launch_fa2, destroy_fa2},
+#endif
+#if defined(APXINF_ATTENTION_FA2)
+      {5, 1, 1, "cutlass-memory-efficient-attention", apxinf::gemm::kDeviceFeatureFa2,
+       true, true, true, supports_efficient, fa2_alignment,
+       efficient_resource_requirements, one_configuration,
+       prepare_efficient, launch_efficient, destroy_efficient},
 #endif
       {kProviderCustom, 1, 1, "custom-attention-fallback", 0, true, true,
        true, supports_dense_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,
        launch_custom, destroy_custom},
+#if defined(APXINF_ATTENTION_FA2)
+      // Keep the existing custom cold-cache baseline when it fits. Large
+      // sequences can exceed its quadratic workspace budget; FA2 is then a
+      // deterministic, graph-safe fallback without requiring online tuning.
+      {kProviderFa2, 1, 1, "flash-attention-2",
+       apxinf::gemm::kDeviceFeatureFa2, true, true, true, supports_fa2,
+       fa2_alignment, fa2_resource_requirements, one_configuration,
+       prepare_fa2, launch_fa2, destroy_fa2},
+#endif
   };
   static const ImplementationRegistry kv_cache_entries = {
 #if defined(APXINF_ATTENTION_FA2)
@@ -196,6 +250,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
   };
   switch (semantic) {
+    case APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE: {
+      static const ImplementationRegistry rounded_entries = {
+          {4, 1, 1, "cublas-rounded-additive-attention", 0, true, true, true,
+           supports_rounded, natural_alignment, rounded_resource_requirements,
+           one_configuration, prepare_rounded, launch_rounded, destroy_rounded},
+      };
+      return rounded_entries;
+    }
     case APXINF_ATTENTION_SEMANTIC_DENSE:
       return dense_entries;
     case APXINF_ATTENTION_SEMANTIC_KV_CACHE:

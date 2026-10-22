@@ -4,6 +4,8 @@
 
 #include <climits>
 #include <cstdint>
+#include <algorithm>
+#include <array>
 
 namespace {
 
@@ -24,10 +26,12 @@ bool may_have_bias(uint32_t semantic) {
 
 void validate_spec(const apxinf_gather_spec_t& spec) {
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_REPLACE_ROWS ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC ||
+      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
+       !(spec.dtype == APXINF_DTYPE_F32 && spec.semantic >= APXINF_GATHER_SEMANTIC_PERMUTE)) ||
       spec.has_bias > 1 || spec.nhwc > 1 || spec.rows <= 0 || spec.cols <= 0 ||
-      spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
+      (spec.semantic < APXINF_GATHER_SEMANTIC_PERMUTE && (spec.rows > INT32_MAX || spec.cols > INT32_MAX)) ||
+      spec.rows > INT64_MAX / spec.cols ||
       spec.vocab_size > INT32_MAX || spec.tokens_per_view > INT32_MAX ||
       spec.replacement_rows > INT32_MAX ||
       spec.views > INT32_MAX || spec.image_size > INT32_MAX ||
@@ -35,6 +39,57 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
       !valid_alignment(spec.bias_alignment) ||
       !valid_alignment(spec.output_alignment)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Gather Spec");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_PERMUTE) {
+    if (spec.rank == 0 || spec.rank > 8 || spec.cols != 1)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid permutation rank");
+    int64_t count=1;
+    for (unsigned i=0;i<spec.rank;++i) {
+      if(spec.layout_shape[i]<=0 || spec.layout_strides[i]<=0 || count>INT64_MAX/spec.layout_shape[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid permutation geometry");
+      count*=spec.layout_shape[i];
+    }
+    if(count!=spec.rows) throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"permutation size mismatch");
+    std::array<unsigned,8> axes{};
+    for(unsigned i=0;i<spec.rank;++i) axes[i]=i;
+    std::sort(axes.begin(),axes.begin()+spec.rank,[&](unsigned a,unsigned b){return spec.layout_strides[a]<spec.layout_strides[b];});
+    int64_t expected_stride=1;
+    for(unsigned i=0;i<spec.rank;++i) {
+      const auto axis=axes[i];
+      if(spec.layout_shape[axis]==1) continue;
+      if(spec.layout_strides[axis]!=expected_stride)
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"noncontiguous permutation strides");
+      expected_stride*=spec.layout_shape[axis];
+    }
+  }
+  if(spec.semantic==APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC) {
+    int64_t count=1;
+    if(spec.rank!=4 || spec.output_spatial[0]<=0 || spec.output_spatial[1]<=0 ||
+       spec.output_spatial[0]>INT32_MAX || spec.output_spatial[1]>INT32_MAX)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid bicubic output dimensions");
+    for(int i=0;i<4;++i) {
+      if(spec.layout_shape[i]<=0 || spec.layout_shape[i]>INT32_MAX || count>INT64_MAX/spec.layout_shape[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid bicubic input dimensions");
+      count*=spec.layout_shape[i];
+    }
+    if(spec.layout_shape[0]>INT64_MAX/spec.output_spatial[0] ||
+       spec.layout_shape[0]*spec.output_spatial[0]>INT64_MAX/spec.output_spatial[1] ||
+       spec.rows!=spec.layout_shape[0]*spec.output_spatial[0]*spec.output_spatial[1] || spec.cols!=spec.layout_shape[3])
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"bicubic output size mismatch");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_UNFOLD3D) {
+    int64_t rows=spec.layout_shape[0],cols=spec.layout_shape[4];
+    if(rows<=0 || cols<=0 || spec.row_start<0)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid unfold geometry");
+    for(int i=0;i<3;++i) {
+      if(spec.layout_shape[i+1]<=0 || spec.output_spatial[i]<=0 || spec.kernel[i]<=0 || spec.stride[i]<=0 || spec.dilation[i]<=0 || spec.padding[i]<0 || rows>INT64_MAX/spec.output_spatial[i] || cols>INT64_MAX/spec.kernel[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid unfold geometry");
+      rows*=spec.output_spatial[i];cols*=spec.kernel[i];
+    }
+    const int64_t taps=cols/spec.layout_shape[4];
+    if(spec.cols<cols || spec.cols%taps!=0 || spec.channel_block<0 ||
+       (spec.channel_block>0 && (spec.cols/taps)%spec.channel_block!=0) || spec.rows>rows || spec.row_start>rows-spec.rows)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"unfold output range mismatch");
   }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -168,6 +223,15 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
           input, static_cast<const T*>(bindings.replacement), bindings.row_map,
           output, count, cols, spec.replacement_rows);
       break;
+    case APXINF_GATHER_SEMANTIC_PERMUTE:
+      kernels::permute<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+      break;
+    case APXINF_GATHER_SEMANTIC_UNFOLD3D:
+      kernels::unfold3d<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+      break;
+    case APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC:
+      kernels::resize_bicubic<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+      break;
     default:
       return cudaErrorInvalidValue;
   }
@@ -189,6 +253,8 @@ extern "C" apxinf_status_t apxinf_gather_launch(
     apxinf::framework::check_cuda(
         spec->dtype == APXINF_DTYPE_BF16
             ? launch<__nv_bfloat16>(*spec, *bindings)
-            : launch<__half>(*spec, *bindings));
+            : spec->dtype == APXINF_DTYPE_F32
+                ? launch<float>(*spec,*bindings)
+                : launch<__half>(*spec, *bindings));
   });
 }

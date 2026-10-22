@@ -1,8 +1,10 @@
+mod complex;
 pub(crate) mod contracts;
 mod decode;
 pub(crate) mod launch;
 mod multimodal;
 mod rope;
+pub use complex::{complex_rotary, ComplexRotaryTable};
 
 pub use contracts::{RopeArgs, RopeSemantic};
 pub use decode::{decode_rope, DecodeRopeArgs};

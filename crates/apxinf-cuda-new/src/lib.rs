@@ -15,16 +15,18 @@ pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use graph::{capture, CapturedGraph};
 pub use ops::{
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, attention, bias_residual,
-    bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, concat_rows, decode_rope,
-    gather, kv_cache_attention, layer_norm, multimodal_rope, packed_qkv_attention, pointwise,
-    quantization, reserve_prefix, rms_norm, rope, segmented_attention, split_qkv_axial_rope,
-    AdaGateResidualArgs, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs, AttentionArgs,
-    AttentionMask, AttentionPolicy, AxialRopeArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-    BiasResidualRmsNormArgs, BiasThenResidualArgs, DecodeRopeArgs, ExecutionSession, GatherArgs,
+    bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, complex_rotary,
+    concat_rows, decode_rope, gather, kv_cache_attention, l2_norm_rounded, layer_norm,
+    multimodal_rope, packed_qkv_attention, permute, pointwise, quantization, reserve_prefix,
+    resize_bicubic, rms_norm, rms_norm_rounded, rope, rounded_additive_attention,
+    segmented_attention, split_qkv_axial_rope, unfold3d, unfold3d_blocked, AdaGateResidualArgs,
+    AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs, AttentionArgs, AttentionMask, AttentionPolicy,
+    AxialRopeArgs, BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
+    BiasThenResidualArgs, ComplexRotaryTable, DecodeRopeArgs, ExecutionSession, GatherArgs,
     GatherPatchGeometry, GatherSemantic, GraphWorkspace, KvCacheAttentionArgs, KvCacheDecodeMeta,
     LayerNormArgs, MultimodalRopeArgs, PackedQkvAttentionArgs, PointwiseActivation, PointwiseArgs,
     PointwiseSemantic, QuantizationArgs, QuantizationSemantic, RmsNormArgs, RopeArgs, RopeSemantic,
-    SegmentedAttentionArgs,
+    RoundedAttentionBiasArgs, SegmentedAttentionArgs, Unfold3dGeometry,
 };
 pub use phase::PreparedPhase;
 pub use stream::CudaStream;

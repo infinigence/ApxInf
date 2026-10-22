@@ -297,6 +297,7 @@ fn main() {
         "attention/autotune.cpp",
         "attention/execution.cpp",
         "attention/providers/custom.cu",
+        "attention/providers/rounded.cu",
         "elementwise/execution.cpp",
         "linear_attention/execution.cpp",
         "attn_helpers/execution.cpp",
@@ -537,6 +538,26 @@ fn main() {
                 .into_iter()
                 .map(|source| (source, false, false, false, false, false, true)),
         )
+        .chain(std::iter::once((
+            adapters.join("convolution.cu"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )))
+        .chain(has_fa2.then(|| {
+            (
+                adapters.join("attention/providers/efficient.cu"),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+        }))
         .enumerate()
     {
         let (
@@ -572,7 +593,27 @@ fn main() {
                 command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
             }
         }
-        command.args(if is_sm110 {
+        let is_efficient = source
+            .file_name()
+            .is_some_and(|name| name == "efficient.cu");
+        if is_efficient {
+            command
+                .arg("--expt-relaxed-constexpr")
+                .arg(format!(
+                    "-I{}",
+                    native.join("kernels/efficient_compat").display()
+                ))
+                .arg(format!(
+                    "-I{}",
+                    native
+                        .join("kernels/efficient_attention/aten/src")
+                        .display()
+                ))
+                .arg(format!("-I{}", cutlass_root.join("include").display()));
+        }
+        command.args(if is_efficient {
+            &fa2_codegen
+        } else if is_sm110 {
             &sm110_codegen
         } else if is_cutlass || is_fa2_e4m3 {
             &cutlass_codegen
@@ -702,7 +743,6 @@ fn main() {
             command.args([
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
-                "--use_fast_math",
                 "-U__CUDA_NO_HALF_OPERATORS__",
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -765,6 +805,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

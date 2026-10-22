@@ -14,6 +14,7 @@ typedef enum {
   APXINF_ATTENTION_SEMANTIC_KV_CACHE = 1,
   APXINF_ATTENTION_SEMANTIC_SEGMENTED = 2,
   APXINF_ATTENTION_SEMANTIC_PACKED_QKV = 3,
+  APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE = 4,
 } apxinf_attention_semantic_t;
 
 typedef struct {
@@ -27,6 +28,7 @@ typedef struct {
   uint32_t v_alignment;
   uint32_t output_alignment;
   uint32_t offsets_alignment;
+  uint32_t bias_alignment;
   int64_t batch;
   int64_t query_tokens;
   int64_t key_tokens;
@@ -50,6 +52,8 @@ typedef struct {
   const void* value;
   const void* offsets;
   const uint32_t* decode_meta;
+  /* ROUNDED_ADDITIVE: [batch, heads, queries, keys], input dtype. */
+  const void* bias;
   void* output;
   apxinf_cuda_stream_t stream;
   float scale;
