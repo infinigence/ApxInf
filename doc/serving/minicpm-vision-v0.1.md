@@ -130,6 +130,28 @@ Greedy requests carry only `mode: greedy`. Greedy selection retains the fixed re
 Public defaults are temperature 1 and top-p 0.95. Public seed derivation retains the existing request-ID rule.
 The worker must apply the supplied selection mode explicitly.
 
+### Service selection
+
+The service selects this worker only with explicit provider `mlx-vlm-minicpmv47`.
+This selection requires an explicit Python interpreter path for the separate environment.
+The default worker path is `python/apxinf/apxinf/serving/vision_worker.py` for this provider.
+Other providers retain their existing worker defaults and interpreter behavior.
+The public profile is `apxinf-minicpm-vision-v0.1`.
+Readiness reports image support with restriction `anthropic_base64_png_user_and_tool_result` and the media limits below.
+It reports the existing Qwen-compatible tool format.
+
+The gateway rejects positive temperatures below 0.01 before conversion to its existing float32 selection type.
+Submission serializes the accepted lower bound as at least float64 value 0.01.
+This representation rule prevents float32 rounding from violating the worker's lower bound.
+Other profiles retain their existing sampling representation.
+
+The supervisor checks every source digest, recorded runtime file, processor document, and request-state schema before public readiness.
+Execution limits equal the selected launch configuration.
+Prepared media equal the original ordered occurrences, including repeats.
+Processor and capability revisions equal the ready worker's selected identities.
+These checks also apply to late preparation responses before their disposal.
+Submit retains the exact checked replay object. Count-only requests stop before submit.
+
 ## Capabilities
 
 The capability object retains all serial text capability fields and adds `media_limits`.
