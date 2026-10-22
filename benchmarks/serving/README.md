@@ -152,6 +152,9 @@ These bounded tasks disable automatic client compaction.
 The 16K MiniCPM run otherwise entered repeated compaction after a successful file edit.
 The service still rejects requests that exceed the actual input and output allowance.
 These tests do not measure automatic compaction quality or unbounded agent sessions.
+The client disables Anthropic extended-thinking requests in its isolated environment.
+An explicitly selected native model-thinking deployment still enables its model template.
+Its output allowance includes hidden reasoning tokens.
 The `--max-tokens` option limits request output. It does not declare model capabilities in client metadata.
 
 Anthropic does not officially support Claude Code with non-Claude models.

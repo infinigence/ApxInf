@@ -20,6 +20,8 @@ mod rotation_pressure_regressions;
 mod shutdown_regressions;
 #[cfg(test)]
 mod submit_regressions;
+#[cfg(test)]
+mod thinking_regressions;
 use crate::{
     contracts,
     diagnostics::{self, WorkerDiagnostics},
@@ -90,6 +92,10 @@ pub enum WorkerRuntime {
         executable: PathBuf,
         metal_library: PathBuf,
     },
+    NativeMiniCpm5Thinking {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
 }
 
 impl WorkerRuntime {
@@ -98,6 +104,7 @@ impl WorkerRuntime {
             Self::Python => PROTOCOL,
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
             Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
+            Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
         }
     }
 }
@@ -124,7 +131,9 @@ impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
         if matches!(
             self.runtime,
-            WorkerRuntime::NativeMiniCpm5 { .. } | WorkerRuntime::NativeMiniCpm5Sampled { .. }
+            WorkerRuntime::NativeMiniCpm5 { .. }
+                | WorkerRuntime::NativeMiniCpm5Sampled { .. }
+                | WorkerRuntime::NativeMiniCpm5Thinking { .. }
         ) && (self.max_context > 16384
             || self.output_batch_tokens != 1
             || self.prefill_step_size != 256)
@@ -245,10 +254,16 @@ pub struct Service {
 }
 
 impl Service {
+    pub(crate) fn model_thinking(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_THINKING_PROTOCOL
+    }
+
+    pub(crate) fn sampling_enabled(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_SAMPLED_PROTOCOL || self.model_thinking()
+    }
+
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
-        request
-            .selection
-            .validate(self.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL)?;
+        request.selection.validate(self.sampling_enabled())?;
         if !self.available.load(Ordering::Acquire) {
             if self.rotating.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -539,7 +554,8 @@ async fn launch_worker_until(
             command
         }
         WorkerRuntime::NativeMiniCpm5 { executable, .. }
-        | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. } => Command::new(executable),
+        | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. } => Command::new(executable),
     };
     command
         .arg("--protocol")
@@ -569,7 +585,8 @@ async fn launch_worker_until(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
-    | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. } = &config.runtime
+    | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. } = &config.runtime
     {
         command.arg("--metal-library").arg(metal_library).env(
             "DYLD_LIBRARY_PATH",
@@ -1137,7 +1154,7 @@ async fn prepare_request(
     prepare["model_revision"] = service.ready["model_revision"].clone();
     prepare["messages"] = json!(job.request.messages);
     prepare["tools"] = json!(job.request.tools);
-    prepare["template_options"] = json!({"enable_thinking":false});
+    prepare["template_options"] = json!({"enable_thinking":service.model_thinking()});
     let mut stopped: Option<Instant> = None;
     wait_for_preparation(worker.send(&prepare), service, job, timeout, &mut stopped).await?;
     loop {
@@ -1444,16 +1461,29 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
     | WorkerRuntime::NativeMiniCpm5Sampled {
         executable,
         metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5Thinking {
+        executable,
+        metal_library,
     } = &config.runtime
     {
         let expected = crate::native_identity::runtime(executable, metal_library)?;
+        let thinking = config.runtime.protocol() == contracts::NATIVE_THINKING_PROTOCOL;
         let sampled = config.runtime.protocol() == contracts::NATIVE_SAMPLED_PROTOCOL;
-        let adapter = if sampled {
+        let adapter = if thinking {
+            "apxinf-native-minicpm5-thinking-v1"
+        } else if sampled {
             "apxinf-native-minicpm5-sampled-v1"
         } else {
             "apxinf-native-minicpm5-v1"
         };
-        let execution = if sampled {
+        let execution = if thinking {
+            crate::native_identity::thinking_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else if sampled {
             crate::native_identity::sampled_execution(
                 config.max_context,
                 config.max_output,
@@ -1578,7 +1608,7 @@ async fn execute(
         .max(1) as u64);
     submit["eos_token_ids"] = service.ready["eos_token_ids"].clone();
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
-    if worker.protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+    if service.sampling_enabled() {
         submit["sampling"] = job.request.selection.submission(&job.id);
     }
     let mut tracker = contracts::AttemptTracker::new(&submit)
@@ -1593,7 +1623,9 @@ async fn execute(
     let mut public = GenerationPublic::new(&mut job, begin);
     let profile = if matches!(
         worker.protocol,
-        contracts::NATIVE_PROTOCOL | contracts::NATIVE_SAMPLED_PROTOCOL
+        contracts::NATIVE_PROTOCOL
+            | contracts::NATIVE_SAMPLED_PROTOCOL
+            | contracts::NATIVE_THINKING_PROTOCOL
     ) {
         OutputProfile::MiniCpm5
     } else {
@@ -1601,6 +1633,9 @@ async fn execute(
     };
     let mut parser = OutputParser::with_profile(job.request.tools.clone(), profile);
     let mut stops = StopMatcher::new(job.request.stops.clone());
+    let mut thinking_prefix = service
+        .model_thinking()
+        .then(crate::output::InitialThinkingPrefix::new);
     let mut output_tokens = 0;
     let mut control_sent = false;
     let mut cancelled_at = None;
@@ -1679,11 +1714,20 @@ async fn execute(
                     ));
                 }
                 if public_error.is_none() && public.status.is_none() {
-                    let text = stops.push(
-                        frame["text_delta"].as_str().unwrap_or(""),
-                        kind == "terminal",
-                    );
-                    match parser.push(&text, kind == "terminal" && frame["status"] == "completed") {
+                    let raw = frame["text_delta"].as_str().unwrap_or("");
+                    let text = match &mut thinking_prefix {
+                        Some(prefix) => prefix.push(raw),
+                        None => raw.to_owned(),
+                    };
+                    let incomplete_reasoning = thinking_prefix.as_ref().is_some_and(|prefix| !prefix.is_open())
+                        && kind == "terminal" && frame["status"] == "completed" && frame["cause"] == "eos";
+                    let parsed = if incomplete_reasoning {
+                        Err("The model ended before closing its initial reasoning block.".to_owned())
+                    } else {
+                        let text = stops.push(&text, kind == "terminal");
+                        parser.push(&text, kind == "terminal" && frame["status"] == "completed")
+                    };
+                    match parsed {
                         Ok(parts) => {
                             public.expire(&job, service, timeout, public_error.as_ref(),
                                 if kind == "terminal" { Some(&frame) } else { terminal.as_ref() });
@@ -1736,7 +1780,7 @@ async fn execute(
                                 "stop_generation",
                                 "stop_sequence",
                                 output_tokens,
-                                stops.cutoff,
+                                stops.cutoff + thinking_prefix.as_ref().map_or(0, |prefix| prefix.suppressed_bytes()),
                             ), &job, service, &mut public, timeout, at, public_error.as_ref(), terminal.as_ref()).await?;
                         control_sent = true;
                     }

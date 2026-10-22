@@ -21,7 +21,7 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5", "native-minicpm5-sampled"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking"])]
     provider: String,
     #[arg(long)]
     native_worker: Option<PathBuf>,
@@ -104,7 +104,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = if matches!(
         args.provider.as_str(),
-        "native-minicpm5" | "native-minicpm5-sampled"
+        "native-minicpm5" | "native-minicpm5-sampled" | "native-minicpm5-thinking"
     ) {
         let executable = std::fs::canonicalize(
             args.native_worker
@@ -114,7 +114,12 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.metal_library
                 .ok_or("Native provider requires --metal-library.")?,
         )?;
-        if args.provider == "native-minicpm5-sampled" {
+        if args.provider == "native-minicpm5-thinking" {
+            WorkerRuntime::NativeMiniCpm5Thinking {
+                executable,
+                metal_library,
+            }
+        } else if args.provider == "native-minicpm5-sampled" {
             WorkerRuntime::NativeMiniCpm5Sampled {
                 executable,
                 metal_library,
