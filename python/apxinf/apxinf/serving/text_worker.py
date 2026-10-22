@@ -1,9 +1,3 @@
-"""Run one resident MLX text model through the worker/2.0 protocol.
-
-The main thread owns all MLX objects. Reader and writer threads handle bytes only.
-This file also supports direct execution without importing the policy package.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -377,7 +371,12 @@ class TextWorker:
         *,
         max_output_tokens: int = 2048,
         output_batch_tokens: int = 1,
+        protocol: str = contracts.PROTOCOL,
+        capabilities: dict[str, Any] | None = None,
     ):
+        if protocol not in {contracts.PROTOCOL, contracts.VISION_PROTOCOL}:
+            raise ValueError("The Python worker protocol is unsupported.")
+        self.protocol = protocol
         self.runtime = runtime
         self.worker_epoch = worker_epoch
         self.emit = emit
@@ -395,7 +394,7 @@ class TextWorker:
         self.draining = False
         self.shutdown_requested = False
         self.drained_sent = False
-        self.capabilities = {
+        self.capabilities = dict(capabilities) if capabilities is not None else {
             "text": True, "image": False, "greedy": True, "sampling": False,
             "token_events": True, "cancel_granularity": "token_or_prefill_chunk",
             "max_active_sequences": 1, "max_context": runtime.max_context,
@@ -410,7 +409,7 @@ class TextWorker:
         )
 
     def frame(self, kind: str, **fields: Any) -> dict[str, Any]:
-        return {"protocol": "apxinf-worker/2.0", "kind": kind,
+        return {"protocol": self.protocol, "kind": kind,
                 "worker_epoch": self.worker_epoch, **fields}
 
     @staticmethod
@@ -444,7 +443,7 @@ class TextWorker:
                     contracts.validate_command_envelope(error.frame)
                     command = error.frame
                     invalid = True
-                if command["worker_epoch"] != self.worker_epoch or command["protocol"] != "apxinf-worker/2.0":
+                if command["worker_epoch"] != self.worker_epoch or command["protocol"] != self.protocol:
                     raise ChannelFailure("The command has a different worker epoch.")
                 if command["kind"] not in {
                     "submit", "prepare_input", "cancel_request", "stop_generation",
@@ -705,10 +704,13 @@ class TextWorker:
                      finalize_text=decoder_valid and not output_rejected)
         self.active = None
 
+    def _terminal_metrics(self, attempt: Attempt, mutated: bool) -> dict[str, int]:
+        return {}
+
     def _finish(self, attempt: Attempt, status: str, cause: str,
                 error: dict | None, *, mutated: bool, finalize_text: bool = True) -> None:
         tail = ""
-        consumed = 0
+        consumed = None if self.protocol == contracts.VISION_PROTOCOL else 0
         peak = 0
         if mutated:
             try:
@@ -720,7 +722,7 @@ class TextWorker:
                 error = self.error("internal_error", "The output finalization failed.")
         history = len(attempt.command["token_ids"]) + attempt.output_count
         # An aborted internal lookahead cannot establish reusable state.
-        if consumed > history:
+        if consumed is not None and consumed > history:
             consumed = 0
         now = time.monotonic_ns()
         fields = {
@@ -730,7 +732,7 @@ class TextWorker:
             "text_delta": tail,
             "metrics": {"elapsed_ns": now - attempt.started_ns,
                         "ttft_ns": (attempt.first_token_ns - attempt.started_ns) if attempt.output_count else 0,
-                        "peak_memory_bytes": peak},
+                        "peak_memory_bytes": peak, **self._terminal_metrics(attempt, mutated)},
         }
         if error is not None:
             fields["error"] = error
@@ -775,7 +777,7 @@ class TextWorker:
             self._invalid(command.frame)
             return
         contracts.validate_frame(command)
-        if command["worker_epoch"] != self.worker_epoch or command["protocol"] != "apxinf-worker/2.0":
+        if command["worker_epoch"] != self.worker_epoch or command["protocol"] != self.protocol:
             raise ChannelFailure("The command has a different worker epoch.")
         if command["kind"] not in {"submit", "prepare_input"}:
             self._control(command)

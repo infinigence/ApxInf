@@ -552,6 +552,8 @@ def validate_frame(frame: dict) -> None:
         _vision_replay(frame)
         if kind == "submit":
             _int(frame["max_tokens"], 0, 8192)
+            _require(frame["sampling"]["mode"] != "random" or frame["sampling"]["temperature"] >= 0.01,
+                     "vision temperature is below the supported minimum")
     if vision and kind == "terminal":
         _int(frame["metrics"]["source_media_bytes"], 0, 262144)
         _int(frame["metrics"]["peak_host_array_bytes"], 0, 67108864)

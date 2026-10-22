@@ -928,6 +928,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
         vision::replay(frame)?;
         if kind == "submit" {
             integer(&frame["max_tokens"], 0, 8192)?;
+            require(
+                frame["sampling"]["mode"] != "random"
+                    || frame["sampling"]["temperature"].as_f64().unwrap() >= 0.01,
+                "vision temperature is below the supported minimum",
+            )?;
         }
     }
     if vision && kind == "terminal" {

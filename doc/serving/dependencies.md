@@ -7,6 +7,37 @@ All new ApxInf source, tests, and fixtures are handwritten.
 The [serial profile](serial-profile-v0.1.md) defines the wire interface.
 `Cargo.lock` records the resolved Rust dependency versions.
 
+## Separate MiniCPM-V candidate runtime
+
+The [vision profile](minicpm-vision-v0.1.md) defines a separately selected runtime.
+Its worker uses public dependency APIs. No dependency implementation enters first-party source.
+The existing text runtime retains its existing versions.
+The vision worker requires Python 3.14.3 and these exact package versions.
+Runtime qualification remains pending until the P2c execution gates pass.
+
+| Package | Version | Role |
+| --- | --- | --- |
+| `mlx` | `0.32.4` | Device arrays, streams, and allocator measurements. |
+| `mlx-metal` | `0.32.4` | Apple Metal runtime library. |
+| `mlx-vlm` | `0.7.10` | Public MiniCPM-V loader, processor selection, and serial generation. |
+| `transformers` | `5.18.0` | Checkpoint configuration, processor base classes, and tokenizer interfaces. |
+| `numpy` | `2.5.4` | Host processor arrays and canonical byte digests. |
+| `Pillow` | `13.0.0` | PNG decoding and RGB image inputs. |
+| `torch` | `2.12.1` | Processor dependency for image conversion. |
+| `torchvision` | `0.27.1` | Processor image utilities. |
+| `tokenizers` | `0.23.3` | Incremental Unicode decoding through `DecodeStream`. |
+| `safetensors` | `0.8.0` | Checkpoint tensor format used by the public loader. |
+| `huggingface-hub` | `2.2.0` | Local checkpoint APIs used by the loader. |
+
+The worker disables remote code and network model resolution.
+It checks complete local artifact identities before model loading.
+It checks package versions and resolved module and MLX library files before readiness.
+The public processor supplies NumPy arrays with explicit image positions.
+The worker calls the processor directly because the public preparation helper drops required options for this processor.
+The public generation API supplies its generation stream for synchronization.
+Cancellation remains limited to yielded boundaries or process recovery.
+The allocator memory limit is a guideline. It does not bound total process memory.
+
 ## Rust gateway
 
 The optional native worker uses existing workspace libraries through their public Rust APIs.
