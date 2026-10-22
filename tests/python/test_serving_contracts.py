@@ -40,6 +40,11 @@ class ServingContractTests(unittest.TestCase):
         corpus = json.loads((ROOT / "tests/fixtures/serving/native-thinking-v0.1.json").read_text())
         self.check_sampled_profile(corpus)
 
+    def test_shared_native_bounded_thinking_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-bounded-thinking-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+        self.check_event_transcripts(corpus)
+
     def check_sampled_profile(self, corpus):
         for case in corpus["frame_cases"]:
             with self.subTest(case["name"]):
@@ -123,14 +128,17 @@ class ServingContractTests(unittest.TestCase):
                         contracts.decode_frame(raw)
 
     def test_shared_event_transcripts(self):
-        for case in CORPUS["stream_cases"]:
+        self.check_event_transcripts(CORPUS)
+
+    def check_event_transcripts(self, corpus):
+        for case in corpus["stream_cases"]:
             with self.subTest(case["name"]):
-                tracker = contracts.AttemptTracker(CORPUS["templates"]["submit"])
+                tracker = contracts.AttemptTracker(corpus["templates"]["submit"])
                 failure = None
                 for index, selected in enumerate(case["events"]):
                     before = copy.deepcopy(tracker.__dict__)
                     try:
-                        tracker.observe(fixture(selected))
+                        tracker.observe(fixture(selected, corpus))
                     except contracts.ContractError:
                         self.assertEqual(tracker.__dict__, before, "invalid event changed state")
                         failure = index
