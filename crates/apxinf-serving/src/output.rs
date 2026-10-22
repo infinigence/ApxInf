@@ -1,4 +1,3 @@
-//! Incremental output parsing for declared text profiles.
 use serde_json::{json, Map, Value};
 
 mod minicpm;
