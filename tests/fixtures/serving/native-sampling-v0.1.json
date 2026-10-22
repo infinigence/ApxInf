@@ -1,0 +1,131 @@
+{
+  "format": "apxinf-native-sampling-conformance-v1",
+  "templates": {
+    "ready": {
+      "protocol": "apxinf-worker/2.2",
+      "kind": "ready",
+      "worker_epoch": "aa000000-0000-4000-8000-000000000001",
+      "model_revision": "c14e4d84b2dd43565cdee46437a425e250b48f37730be31187de6b327ea41f68",
+      "capability_revision": "7c0fcea27baee22239ddb10a42c057897658cc87275565de44d49a7722e590fe",
+      "model_manifest": {
+        "adapter_revision": "apxinf-native-minicpm5-sampled-v1",
+        "artifacts": [],
+        "runtime": {
+          "kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.31.2",
+          "executable_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "metal_library_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "execution": {
+          "provider": "metal_minicpm5", "precision": "bf16", "variant": "bf16-compiled",
+          "parser": "minicpm5_xml", "enable_thinking": false,
+          "max_context": 16384, "max_output_tokens": 64, "memory_limit_bytes": 1048576,
+          "sampling": {
+            "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1", "top_p": "0.95",
+            "seed_policy": "request-id-sha256-v1"
+          }
+        }
+      },
+      "capabilities": {
+        "text": true, "image": false, "greedy": true, "sampling": true,
+        "token_events": true, "cancel_granularity": "token_or_prefill_chunk",
+        "max_active_sequences": 1, "max_context": 16384, "max_output_tokens": 64,
+        "exact_append": false, "state_schema": "none"
+      },
+      "runtime": {
+        "kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.31.2",
+        "executable_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "metal_library_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "limits": {"max_frame_bytes": 1048576, "max_depth": 16, "max_commands": 10000},
+      "model_path": "/models/sampling-fixture", "eos_token_ids": [3], "vocab_size": 4,
+      "memory": {"active_bytes": 0, "peak_bytes": 0, "cache_bytes": 0}
+    },
+    "submit": {
+      "protocol": "apxinf-worker/2.2", "kind": "submit",
+      "worker_epoch": "aa000000-0000-4000-8000-000000000001",
+      "command_id": "aa000000-0000-4000-8000-000000000002",
+      "request_id": "aa000000-0000-4000-8000-000000000003", "attempt": 1,
+      "model_revision": "c14e4d84b2dd43565cdee46437a425e250b48f37730be31187de6b327ea41f68", "capability_revision": "7c0fcea27baee22239ddb10a42c057897658cc87275565de44d49a7722e590fe",
+      "token_ids": [1], "max_tokens": 4, "remaining_timeout_ms": 250,
+      "eos_token_ids": [3], "capacity_lease_ids": [], "sampling": {"mode": "greedy"}
+    }
+  },
+  "frame_cases": [
+    {"name": "sampled_ready", "template": "ready", "valid": true},
+    {"name": "greedy_submit", "template": "submit", "valid": true, "envelope_valid": true},
+    {"name": "random_submit", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1.0, "top_p": 0.95, "seed": 19}}, "valid": true, "envelope_valid": true},
+    {"name": "random_integer_numbers_and_maximum_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 2, "top_p": 1, "seed": 9007199254740991}}, "valid": true},
+    {"name": "positive_binary32_subnormals_and_zero_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1e-45, "top_p": 1e-45, "seed": 0}}, "valid": true},
+    {"name": "missing_sampling", "template": "submit", "remove": ["sampling"], "valid": false, "envelope_valid": false},
+    {"name": "extra_submit_field", "template": "submit", "set": {"/temperature": 1}, "valid": false, "envelope_valid": false},
+    {"name": "python_protocol_rejects_sampling", "template": "submit", "set": {"/protocol": "apxinf-worker/2.0"}, "valid": false, "envelope_valid": false},
+    {"name": "native_greedy_protocol_rejects_sampling", "template": "submit", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false, "envelope_valid": false},
+    {"name": "python_submit_unchanged", "template": "submit", "set": {"/protocol": "apxinf-worker/2.0"}, "remove": ["sampling"], "valid": true, "envelope_valid": true},
+    {"name": "native_greedy_submit_unchanged", "template": "submit", "set": {"/protocol": "apxinf-worker/2.1"}, "remove": ["sampling"], "valid": true, "envelope_valid": true},
+    {"name": "sampling_null", "template": "submit", "set": {"/sampling": null}, "valid": false, "envelope_valid": true},
+    {"name": "sampling_array", "template": "submit", "set": {"/sampling": []}, "valid": false},
+    {"name": "missing_mode", "template": "submit", "set": {"/sampling": {}}, "valid": false},
+    {"name": "unknown_mode", "template": "submit", "set": {"/sampling/mode": "categorical"}, "valid": false},
+    {"name": "boolean_mode", "template": "submit", "set": {"/sampling/mode": true}, "valid": false},
+    {"name": "greedy_temperature_conflict", "template": "submit", "set": {"/sampling/temperature": 0}, "valid": false},
+    {"name": "greedy_top_p_conflict", "template": "submit", "set": {"/sampling/top_p": 1}, "valid": false},
+    {"name": "greedy_seed_conflict", "template": "submit", "set": {"/sampling/seed": 0}, "valid": false},
+    {"name": "greedy_unknown_field", "template": "submit", "set": {"/sampling/top_k": 5}, "valid": false},
+    {"name": "random_missing_temperature", "template": "submit", "set": {"/sampling": {"mode": "random", "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "random_missing_top_p", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "seed": 0}}, "valid": false},
+    {"name": "random_missing_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1}}, "valid": false},
+    {"name": "random_extra_field", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": 0, "top_k": 5}}, "valid": false},
+    {"name": "boolean_temperature", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": true, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "boolean_top_p", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": true, "seed": 0}}, "valid": false},
+    {"name": "string_temperature", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": "1", "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "null_top_p", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": null, "seed": 0}}, "valid": false},
+    {"name": "zero_temperature", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 0, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "negative_temperature", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": -0.5, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "temperature_above_limit_before_narrowing", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 2.0000000001, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "temperature_overflows_binary32", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1e300, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "temperature_underflows_binary32", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1e-46, "top_p": 1, "seed": 0}}, "valid": false},
+    {"name": "zero_top_p", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 0, "seed": 0}}, "valid": false},
+    {"name": "negative_top_p", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": -0.5, "seed": 0}}, "valid": false},
+    {"name": "top_p_above_limit_before_narrowing", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1.0000000001, "seed": 0}}, "valid": false},
+    {"name": "top_p_underflows_binary32", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1e-46, "seed": 0}}, "valid": false},
+    {"name": "boolean_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": false}}, "valid": false},
+    {"name": "fractional_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": 1.5}}, "valid": false},
+    {"name": "float_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": 2.0}}, "valid": false},
+    {"name": "negative_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": -1}}, "valid": false},
+    {"name": "unsafe_seed", "template": "submit", "set": {"/sampling": {"mode": "random", "temperature": 1, "top_p": 1, "seed": 9007199254740992}}, "valid": false},
+    {"name": "sampling_capability_required", "template": "ready", "set": {"/capabilities/sampling": false}, "refresh_identity": true, "valid": false},
+    {"name": "greedy_capability_required", "template": "ready", "set": {"/capabilities/greedy": false}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_capability_boolean", "template": "ready", "set": {"/capabilities/sampling": 1}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_requires_chunk_cancel", "template": "ready", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_context_bounded", "template": "ready", "set": {"/capabilities/max_context": 16385}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_requires_serial_capacity", "template": "ready", "set": {"/capabilities/max_active_sequences": 2}, "refresh_identity": true, "valid": false},
+    {"name": "native_kind_required", "template": "ready", "set": {"/runtime/kind": "python"}, "refresh_identity": true, "valid": false},
+    {"name": "native_version_required", "template": "ready", "set": {"/runtime/mlx": "0.31.3", "/model_manifest/runtime/mlx": "0.31.3"}, "refresh_identity": true, "valid": false},
+    {"name": "native_executable_digest_required", "template": "ready", "set": {"/runtime/executable_sha256": "invalid", "/model_manifest/runtime/executable_sha256": "invalid"}, "refresh_identity": true, "valid": false},
+    {"name": "native_library_digest_required", "template": "ready", "set": {"/runtime/metal_library_sha256": "invalid", "/model_manifest/runtime/metal_library_sha256": "invalid"}, "refresh_identity": true, "valid": false},
+    {"name": "native_runtime_identity_matches", "template": "ready", "set": {"/runtime/apxinf": "different"}, "valid": false},
+    {"name": "native_library_identity_matches", "template": "ready", "set": {"/runtime/metal_library_sha256": "3333333333333333333333333333333333333333333333333333333333333333"}, "valid": false},
+    {"name": "sampled_adapter_required", "template": "ready", "set": {"/model_manifest/adapter_revision": "apxinf-native-minicpm5-v1"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_provider_required", "template": "ready", "set": {"/model_manifest/execution/provider": "mlx-lm"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_precision_required", "template": "ready", "set": {"/model_manifest/execution/precision": "fp32"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_variant_required", "template": "ready", "set": {"/model_manifest/execution/variant": "other"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_thinking_disabled", "template": "ready", "set": {"/model_manifest/execution/enable_thinking": true}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_thinking_boolean", "template": "ready", "set": {"/model_manifest/execution/enable_thinking": 0}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_algorithm_required", "template": "ready", "set": {"/model_manifest/execution/sampling/algorithm": "other"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_seed_policy_required", "template": "ready", "set": {"/model_manifest/execution/sampling/seed_policy": "other"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_default_temperature_required", "template": "ready", "set": {"/model_manifest/execution/sampling/temperature": "2"}, "refresh_identity": true, "valid": false},
+    {"name": "sampled_default_top_p_required", "template": "ready", "set": {"/model_manifest/execution/sampling/top_p": "1"}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_description_complete", "template": "ready", "set": {"/model_manifest/execution/sampling": {"algorithm": "apxinf-cpu-categorical-v1"}}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_description_exact", "template": "ready", "set": {"/model_manifest/execution/sampling/extra": "field"}, "refresh_identity": true, "valid": false},
+    {"name": "sampling_identity_excludes_float", "template": "ready", "set": {"/model_manifest/execution/sampling/temperature": 1.0}, "valid": false},
+    {"name": "model_digest_checked", "template": "ready", "set": {"/model_revision": "3333333333333333333333333333333333333333333333333333333333333333"}, "valid": false},
+    {"name": "capability_digest_checked", "template": "ready", "set": {"/capability_revision": "3333333333333333333333333333333333333333333333333333333333333333"}, "valid": false},
+    {"name": "old_native_ready_rejects_sampling", "template": "ready", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false}
+  ],
+  "invalid_number_literals": ["NaN", "Infinity", "-Infinity", "1e309", "-1e309"],
+  "identity_digests": [
+    {"template": "ready", "pointer": "/model_manifest", "domain": "apxinf-model-identity-v1", "digest": "c14e4d84b2dd43565cdee46437a425e250b48f37730be31187de6b327ea41f68"},
+    {"template": "ready", "pointer": "/capabilities", "domain": "apxinf-capability-v1", "digest": "7c0fcea27baee22239ddb10a42c057897658cc87275565de44d49a7722e590fe"},
+    {"template": "ready", "pointer": "/model_manifest/execution/sampling", "domain": "apxinf-sampling-identity-test-v1", "digest": "ab60369577d8a0996447858cc43770192a9f8afd47d528d3ebbd0abe298b790e"}
+  ]
+}
