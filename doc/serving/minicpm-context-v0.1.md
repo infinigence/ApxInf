@@ -1,6 +1,7 @@
 # Native MiniCPM5 context profile
 
-Status: implementation profile 0.1. Longer context acceptance remains pending.
+Status: implementation profile 0.1. Measured 16K factual, memory, cancellation, and fault gates passed.
+Drawing quality and general long-context quality remain unverified.
 The [serving contract](contracts-v0.1.md) controls admission, cancellation, and resource settlement.
 This profile introduces no runtime dependency and changes no v1 protocol.
 The model tests call the existing `apxinf-tokenizer` crate to encode original prompt fixtures.
@@ -50,10 +51,11 @@ Chunked prefill does not establish DSpark support at larger lengths.
 ## Context limits
 
 The initial equivalence gate passed with the existing 4096-position limit.
-The ordinary BF16 model now permits a 16384-position candidate profile.
-The candidate applies to `bf16-public` and `bf16-compiled` only.
+The ordinary BF16 model permits a 16384-position profile.
+The limit applies to `bf16-public` and `bf16-compiled` only.
 Variant limits control RoPE table size, preparation, and token admission together.
-The service must retain its accepted deployment limit until the larger profile passes its quality and memory gates.
+The [native validation report](minicpm-native-validation-20261022.md) records measured gates for the `bf16-compiled` deployment.
+These gates do not establish equivalent quality for every task or variant.
 A 32768-position profile remains deferred.
 
 Admission includes the complete prepared input and maximum output allowance.
@@ -105,3 +107,6 @@ The four CPU shape tests passed after the 16384-position candidate change.
 These tests include variant limits and insufficient checkpoint positions.
 The structural document check reported zero findings.
 These results do not establish larger context quality, memory coverage, or latency acceptance.
+The separate validation report covers HTTP requests with 2040, 8190, and 15998 input tokens.
+It also records host memory, long-prefill cancellation, and fault settlement.
+No latency target or general quality claim follows from those measurements.

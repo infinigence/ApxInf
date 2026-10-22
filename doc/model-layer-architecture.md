@@ -179,7 +179,7 @@ renamed as part of unrelated work.
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
-| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B; `bf16-public` and `bf16-compiled` support 16384 positions; explicit `dspark` retains 4096 positions. |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
