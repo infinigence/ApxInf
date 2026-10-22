@@ -86,6 +86,10 @@ pub enum WorkerRuntime {
         executable: PathBuf,
         metal_library: PathBuf,
     },
+    NativeMiniCpm5Sampled {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
 }
 
 impl WorkerRuntime {
@@ -93,6 +97,7 @@ impl WorkerRuntime {
         match self {
             Self::Python => PROTOCOL,
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
+            Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
         }
     }
 }
@@ -117,8 +122,12 @@ pub struct Config {
 
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
-        if matches!(self.runtime, WorkerRuntime::NativeMiniCpm5 { .. })
-            && (self.max_context > 16384 || self.output_batch_tokens != 1 || self.prefill_step_size != 256)
+        if matches!(
+            self.runtime,
+            WorkerRuntime::NativeMiniCpm5 { .. } | WorkerRuntime::NativeMiniCpm5Sampled { .. }
+        ) && (self.max_context > 16384
+            || self.output_batch_tokens != 1
+            || self.prefill_step_size != 256)
         {
             return Err(
                 "Native MiniCPM5 requires at most 16384 positions, 256-token prefill chunks, and one token per output frame."
@@ -162,6 +171,7 @@ fn ready_memory_totals(ready: &Value) -> Result<(u64, u64), String> {
 
 #[derive(Clone)]
 pub struct Request {
+    pub selection: crate::sampling::Selection,
     pub messages: Vec<Value>,
     pub tools: Vec<Value>,
     pub max_tokens: usize,
@@ -236,6 +246,9 @@ pub struct Service {
 
 impl Service {
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
+        request
+            .selection
+            .validate(self.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL)?;
         if !self.available.load(Ordering::Acquire) {
             if self.rotating.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -525,7 +538,8 @@ async fn launch_worker_until(
             command.arg("-u").arg(&config.worker);
             command
         }
-        WorkerRuntime::NativeMiniCpm5 { executable, .. } => Command::new(executable),
+        WorkerRuntime::NativeMiniCpm5 { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. } => Command::new(executable),
     };
     command
         .arg("--protocol")
@@ -554,7 +568,9 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. } = &config.runtime {
+    if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. } = &config.runtime
+    {
         command.arg("--metal-library").arg(metal_library).env(
             "DYLD_LIBRARY_PATH",
             metal_library
@@ -1424,17 +1440,35 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
     if let WorkerRuntime::NativeMiniCpm5 {
         executable,
         metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5Sampled {
+        executable,
+        metal_library,
     } = &config.runtime
     {
         let expected = crate::native_identity::runtime(executable, metal_library)?;
+        let sampled = config.runtime.protocol() == contracts::NATIVE_SAMPLED_PROTOCOL;
+        let adapter = if sampled {
+            "apxinf-native-minicpm5-sampled-v1"
+        } else {
+            "apxinf-native-minicpm5-v1"
+        };
+        let execution = if sampled {
+            crate::native_identity::sampled_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else {
+            crate::native_identity::execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        };
         if manifest["runtime"] != expected
-            || manifest["adapter_revision"] != "apxinf-native-minicpm5-v1"
-            || manifest["execution"]
-                != crate::native_identity::execution(
-                    config.max_context,
-                    config.max_output,
-                    config.memory_budget,
-                )
+            || manifest["adapter_revision"] != adapter
+            || manifest["execution"] != execution
         {
             return Err(
                 "The native execution identity differs from the selected configuration.".into(),
@@ -1544,6 +1578,9 @@ async fn execute(
         .max(1) as u64);
     submit["eos_token_ids"] = service.ready["eos_token_ids"].clone();
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
+    if worker.protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+        submit["sampling"] = job.request.selection.submission(&job.id);
+    }
     let mut tracker = contracts::AttemptTracker::new(&submit)
         .map_err(|e| ApiError::new(500, "protocol_fault", e.to_string()))
         .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
@@ -1554,7 +1591,10 @@ async fn execute(
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
-    let profile = if worker.protocol == contracts::NATIVE_PROTOCOL {
+    let profile = if matches!(
+        worker.protocol,
+        contracts::NATIVE_PROTOCOL | contracts::NATIVE_SAMPLED_PROTOCOL
+    ) {
         OutputProfile::MiniCpm5
     } else {
         OutputProfile::Qwen
@@ -1913,6 +1953,24 @@ pub(crate) fn gateway_test_service() -> (Arc<Service>, mpsc::UnboundedReceiver<R
 pub(crate) fn gateway_test_service_with_pressure(
     pressure: Arc<HostPressure>,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_config(pressure, PROTOCOL)
+}
+
+#[cfg(test)]
+pub(crate) fn gateway_test_service_with_protocol(
+    protocol: &str,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_config(
+        Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
+        protocol,
+    )
+}
+
+#[cfg(test)]
+fn gateway_test_service_config(
+    pressure: Arc<HostPressure>,
+    protocol: &str,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
     let service = Arc::new(Service {
         queue: PendingQueue::new(8),
@@ -1920,7 +1978,7 @@ pub(crate) fn gateway_test_service_with_pressure(
         stopped: watch::channel(None).1,
         ready_state: RwLock::new(json!({"worker_epoch":"00000000-0000-4000-8000-000000000001"})),
         ready: json!({
-            "protocol": PROTOCOL,
+            "protocol": protocol,
             "worker_epoch": "00000000-0000-4000-8000-000000000001",
             "model_revision": "1111111111111111111111111111111111111111111111111111111111111111",
             "capabilities": {"max_context": 4096, "max_output_tokens": 1024}
@@ -1969,6 +2027,7 @@ mod lifecycle_tests {
 
     fn idle_request() -> Request {
         Request {
+            selection: crate::sampling::Selection::Greedy,
             messages: vec![json!({"role": "user", "content": "hello"})],
             tools: Vec::new(),
             max_tokens: 1,

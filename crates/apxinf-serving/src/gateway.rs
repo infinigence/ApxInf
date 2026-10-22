@@ -74,12 +74,21 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let tools = if service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL {
+    let sampled = service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL;
+    let tools = if service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL || sampled {
         "minicpm5_xml"
     } else {
         "qwen_xml_or_json"
     };
-    (status, Json(json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":"apxinf-serial-v0.1","public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":false,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}}))).into_response()
+    (status, Json(json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}}))).into_response()
+}
+
+fn public_profile(service: &Service) -> &'static str {
+    if service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL {
+        "apxinf-native-sampled-v0.1"
+    } else {
+        "apxinf-serial-v0.1"
+    }
 }
 async fn models(State(service): State<Arc<Service>>) -> Json<Value> {
     Json(
@@ -158,7 +167,10 @@ async fn handle(
             .parse()
             .unwrap(),
     );
-    headers.insert("x-apxinf-profile", "apxinf-serial-v0.1".parse().unwrap());
+    headers.insert(
+        "x-apxinf-profile",
+        public_profile(&service).parse().unwrap(),
+    );
     if stream {
         let include_usage = value["stream_options"]["include_usage"] == true;
         let stream = PublicStream::new(
@@ -289,24 +301,10 @@ fn normalize(
             "Select the model listed by /v1/models.",
         ));
     }
-    for (key, expected) in [("temperature", 0.0), ("top_p", 1.0)] {
-        if let Some(v) = value.get(key) {
-            if v.as_f64() != Some(expected) {
-                return Err(ApiError::new(
-                    400,
-                    "unsupported_feature",
-                    format!("This profile requires {key}={expected}."),
-                ));
-            }
-        }
-    }
-    if value.get("top_k").is_some() {
-        return Err(ApiError::new(
-            400,
-            "unsupported_feature",
-            "This profile does not support top_k.",
-        ));
-    }
+    let selection = crate::sampling::Selection::from_request(
+        value,
+        service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL,
+    )?;
     if let Some(thinking) = value.get("thinking") {
         if thinking != &json!({"type":"disabled"}) {
             return Err(ApiError::new(
@@ -592,6 +590,7 @@ fn normalize(
     }
     Ok((
         Request {
+            selection,
             messages,
             tools,
             max_tokens,
@@ -811,6 +810,96 @@ impl Stream for PublicStream {
 mod tests {
     use super::*;
     use crate::supervisor::gateway_test_service;
+
+    #[tokio::test]
+    async fn sampled_profile_preserves_policy_through_public_admission() {
+        use crate::sampling::Selection;
+        let (service, mut observed) = crate::supervisor::gateway_test_service_with_protocol(
+            crate::contracts::NATIVE_SAMPLED_PROTOCOL,
+        );
+        for api in [Api::OpenAi, Api::Anthropic] {
+            for (parameters, expected) in [
+                (
+                    json!({}),
+                    Selection::Random {
+                        temperature: 1.0,
+                        top_p: 0.95,
+                    },
+                ),
+                (json!({"temperature":0}), Selection::Greedy),
+                (
+                    json!({"temperature":0.7,"top_p":0.8}),
+                    Selection::Random {
+                        temperature: 0.7,
+                        top_p: 0.8,
+                    },
+                ),
+                (
+                    json!({"top_p":0.6}),
+                    Selection::Random {
+                        temperature: 1.0,
+                        top_p: 0.6,
+                    },
+                ),
+            ] {
+                let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(parameters.as_object().unwrap().clone());
+                let error = request_error(service.clone(), value, api).await;
+                assert_eq!(error.message, "Test coordinator observed admission.");
+                assert_eq!(observed.try_recv().unwrap().selection, expected);
+            }
+            let mut invalid = openai_request(json!([{"role":"user","content":"hello"}]));
+            invalid["top_p"] = json!(0);
+            assert_eq!(
+                request_error(service.clone(), invalid, api).await.code,
+                "invalid_request"
+            );
+            assert!(observed.try_recv().is_err());
+        }
+        let response = ready(State(service.clone())).await;
+        let body = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["profile"], "apxinf-native-sampled-v0.1");
+        assert_eq!(body["public_capabilities"]["sampling"], true);
+        assert_eq!(body["public_capabilities"]["tools"], "minicpm5_xml");
+        assert_eq!(body["public_capabilities"]["thinking"], false);
+        service.shutdown();
+    }
+
+    #[tokio::test]
+    async fn direct_admission_rejects_unsupported_or_invalid_selection() {
+        use crate::sampling::Selection;
+        for protocol in [
+            crate::contracts::PROTOCOL,
+            crate::contracts::NATIVE_PROTOCOL,
+            crate::contracts::NATIVE_SAMPLED_PROTOCOL,
+        ] {
+            let (service, mut observed) =
+                crate::supervisor::gateway_test_service_with_protocol(protocol);
+            let value = openai_request(json!([{"role":"user","content":"hello"}]));
+            let (mut request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+            request.selection = Selection::Random {
+                temperature: f32::NAN,
+                top_p: 0.95,
+            };
+            assert!(service.enqueue(request).is_err());
+            if protocol != crate::contracts::NATIVE_SAMPLED_PROTOCOL {
+                let (mut request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
+                request.selection = Selection::Random {
+                    temperature: 1.0,
+                    top_p: 0.95,
+                };
+                assert!(service.enqueue(request).is_err());
+            }
+            assert!(observed.try_recv().is_err());
+            service.shutdown();
+        }
+    }
 
     #[tokio::test]
     async fn readiness_separates_host_pressure_from_worker_availability() {
