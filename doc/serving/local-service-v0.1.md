@@ -8,7 +8,9 @@ The measurement report records actual model and client results separately.
 ## Components
 
 `apxinf-serve` owns HTTP, request admission, deadlines, output parsing, and worker supervision.
-One Python worker owns the model and all MLX operations.
+One selected worker owns the model and all MLX operations.
+The default provider uses Python and MLX-LM.
+The explicit native provider uses the [MiniCPM5 profile](native-minicpm-v0.1.md).
 One bounded queue precedes that worker.
 The default queue holds 16 waiting requests.
 The worker executes one request at a time.
@@ -71,6 +73,34 @@ Writer availability does not establish destination progress.
 Loss counters exclude unread stderr bytes and records without final accounting when the process exits.
 
 ## Build and start
+
+### Native MiniCPM5
+
+Build the native executable with the existing MLX 0.31.2 C++ SDK.
+Select the provider and runtime files explicitly.
+The native provider does not fall back to Python.
+Its initial context limit is 4096 positions.
+This limit includes the input and output reservation.
+
+```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
+export MLX_ROOT=/absolute/path/to/mlx-0.31.2
+cargo build -p apxinf-serving --features native-minicpm5 --release
+DYLD_LIBRARY_PATH="$MLX_ROOT/lib" target/release/apxinf-serve \
+  --provider native-minicpm5 \
+  --native-worker "$PWD/target/release/apxinf-native-worker" \
+  --metal-library "$MLX_ROOT/lib/libmlx.dylib" \
+  --model /absolute/path/to/MiniCPM5-2B \
+  --model-id minicpm5 --max-context 4096 --max-output-tokens 1024
+```
+
+`/readyz` reports `minicpm5_xml` for native tools and binds the selected runtime identity.
+The worker hides all checkpoint EOS tokens, including token 130073.
+The worker reports allocator bytes after each request through stderr diagnostics.
+These observations do not measure total process memory.
+Live model and client qualification remains a separate deployment gate.
+
+### Python MLX-LM
 
 Run the following commands from the repository root on an Apple Silicon Mac.
 The worker requires the exact interpreter and package versions below.

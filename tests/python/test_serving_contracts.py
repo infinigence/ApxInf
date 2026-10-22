@@ -32,6 +32,30 @@ def fixture(case: dict) -> dict:
 
 
 class ServingContractTests(unittest.TestCase):
+    def test_shared_native_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-v0.1.json").read_text())
+        base = copy.deepcopy(CORPUS["templates"]["ready"])
+        base["protocol"] = "apxinf-worker/2.1"
+        base["runtime"] = corpus["runtime"]
+        base["capabilities"] = corpus["capabilities"]
+        base["model_manifest"]["runtime"] = corpus["runtime"]
+        base["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", base["model_manifest"])
+        base["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", base["capabilities"])
+        for case in corpus["cases"]:
+            with self.subTest(case["name"]):
+                frame = copy.deepcopy(base)
+                for pointer, replacement in case["set"].items():
+                    keys = pointer.split("/")[1:]
+                    target = frame
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = replacement
+                if case["valid"]:
+                    contracts.validate_frame(frame)
+                else:
+                    with self.assertRaises(contracts.ContractError):
+                        contracts.validate_frame(frame)
+
     def test_shared_document_cases(self):
         for case in CORPUS["document_cases"]:
             with self.subTest(case["name"]):

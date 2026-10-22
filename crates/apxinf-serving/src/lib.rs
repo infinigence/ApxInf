@@ -5,4 +5,5 @@ pub mod gateway;
 pub mod host_pressure;
 mod metrics;
 pub mod output;
+pub mod native_identity;
 pub mod supervisor;

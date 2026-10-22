@@ -37,6 +37,7 @@ impl Fixture {
         assert!(python.status.success());
         let python = fs::canonicalize(String::from_utf8(python.stdout).unwrap().trim()).unwrap();
         let config = Config {
+            runtime: Default::default(),
             python,
             worker,
             model: root.join("model"),

@@ -154,13 +154,13 @@ def _messages(messages: Any, tools: Any) -> None:
             _require(type(function["strict"]) is bool, "tool strict must be Boolean")
 
 
-def _capabilities(value: Any) -> None:
+def _capabilities(value: Any, native: bool = False) -> None:
     _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"})
     for name, expected in {"text": True, "image": False, "greedy": True, "sampling": False, "token_events": True, "exact_append": False}.items():
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
-    _enum(value["cancel_granularity"], {"token", "token_or_prefill_chunk"})
+    _enum(value["cancel_granularity"], {"end_prefill_or_token"} if native else {"token", "token_or_prefill_chunk"})
     _int(value["max_active_sequences"], 1, 1)
-    _int(value["max_context"], 1, MAX_PROMPT_TOKENS)
+    _int(value["max_context"], 1, 4096 if native else MAX_PROMPT_TOKENS)
     _int(value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)
     _enum(value["state_schema"], {"none"})
 
@@ -175,7 +175,7 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") == PROTOCOL, "unsupported protocol")
+    _require(frame.get("protocol") == PROTOCOL or frame.get("protocol") == "apxinf-worker/2.1", "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
@@ -201,7 +201,8 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] == PROTOCOL, "unsupported protocol")
+    _require(frame["protocol"] == PROTOCOL or frame["protocol"] == "apxinf-worker/2.1", "unsupported protocol")
+    native = frame["protocol"] == "apxinf-worker/2.1"
     _uuid(frame["worker_epoch"])
     kind = frame["kind"]
     _str(kind)
@@ -214,12 +215,20 @@ def validate_frame(frame: dict) -> None:
         _int(frame.get("event_seq"))
     if kind == "ready":
         _keys(frame, BASE | {"model_revision", "capability_revision", "model_manifest", "capabilities", "limits", "model_path", "eos_token_ids", "vocab_size", "runtime", "memory"})
-        _capabilities(frame["capabilities"])
+        _capabilities(frame["capabilities"], native)
         _keys(frame["limits"], {"max_frame_bytes", "max_depth", "max_commands"})
         _require(frame["limits"] == {"max_frame_bytes": MAX_FRAME_BYTES, "max_depth": MAX_DEPTH, "max_commands": MAX_COMMANDS}, "incompatible transport limits")
         for value in frame["limits"].values():
             _int(value)
-        _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
+        if native:
+            _keys(frame["runtime"], {"kind", "apxinf", "mlx", "executable_sha256", "metal_library_sha256"})
+            _require(frame["runtime"]["kind"] == "native_minicpm5" and frame["runtime"]["apxinf"] == "0.1.0" and frame["runtime"]["mlx"] == "0.31.2", "unsupported native runtime")
+            _digest(frame["runtime"]["executable_sha256"])
+            _digest(frame["runtime"]["metal_library_sha256"])
+            _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
+            _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
+        else:
+            _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
         for value in frame["runtime"].values():
             _str(value)
         _counts(frame["memory"], {"active_bytes", "peak_bytes", "cache_bytes"})
@@ -409,6 +418,7 @@ class AttemptTracker:
         validate_frame(submit)
         _require(submit["kind"] == "submit", "tracker requires submit")
         self.key = tuple(submit[key] for key in ("worker_epoch", "request_id", "attempt"))
+        self.protocol = submit["protocol"]
         self.input_tokens = len(submit["token_ids"])
         self.max_tokens = submit["max_tokens"]
         self.leases = set(submit["capacity_lease_ids"])
@@ -424,7 +434,7 @@ class AttemptTracker:
     def observe(self, event: dict) -> None:
         validate_frame(event)
         _require(event["kind"] in ATTEMPT_EVENTS, "not an attempt event")
-        _require(tuple(event[key] for key in ("worker_epoch", "request_id", "attempt")) == self.key, "attempt identity mismatch")
+        _require(event["protocol"] == self.protocol and tuple(event[key] for key in ("worker_epoch", "request_id", "attempt")) == self.key, "attempt identity mismatch")
         _require(event["event_seq"] == self.next_seq, "event sequence mismatch")
         kind = event["kind"]
         phase = self.phase

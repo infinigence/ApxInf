@@ -20,7 +20,7 @@
     {"name":"float_is_not_integer","template":"submit","set":{"/max_tokens":2.0},"valid":false},
     {"name":"unknown_outer_key","template":"submit","set":{"/temperature":0},"valid":false},
     {"name":"missing_timeout","template":"submit","remove":["remaining_timeout_ms"],"valid":false},
-    {"name":"invalid_protocol","template":"submit","set":{"/protocol":"apxinf-worker/2.1"},"valid":false},
+    {"name":"invalid_protocol","template":"submit","set":{"/protocol":"apxinf-worker/2.2"},"valid":false},
     {"name":"empty_prompt","template":"submit","set":{"/token_ids":[]},"valid":false},
     {"name":"negative_token","template":"submit","set":{"/token_ids":[-1]},"valid":false},
     {"name":"duplicate_lease","template":"submit","set":{"/capacity_lease_ids":["00000000-0000-4000-8000-000000000004","00000000-0000-4000-8000-000000000004"]},"valid":false},
@@ -57,6 +57,7 @@
     {"name":"escaped_backslash_ends_before_integer","raw":"{\"text\":\"\\\\\",\"value\":18446744073709551617}","valid":false}
   ],
   "stream_cases": [
+    {"name":"changed_protocol","events":[{"template":"accepted","set":{"/protocol":"apxinf-worker/2.1"}}],"failure_at":0,"done":false},
     {"name":"successful_cleanup","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"cleanup"}],"failure_at":null,"done":true},
     {"name":"rejected_reservation_settles","events":[{"template":"rejected"},{"template":"failure"},{"template":"cleanup","set":{"/event_seq":2}}],"failure_at":null,"done":true},
     {"name":"stale_epoch","events":[{"template":"accepted","set":{"/worker_epoch":"00000000-0000-4000-8000-000000000009"}}],"failure_at":0,"done":false},

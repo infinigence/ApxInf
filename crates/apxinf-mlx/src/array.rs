@@ -76,6 +76,14 @@ pub fn set_cache_limit(limit: usize) -> Result<usize> {
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
 }
+
+/// Set the process-wide MLX allocation limit and return the previous limit.
+/// This controls the MLX allocator, not total process or physical memory.
+pub fn set_memory_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_memory_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
         n.checked_mul(d).ok_or_else(|| error("MLX shape overflow"))

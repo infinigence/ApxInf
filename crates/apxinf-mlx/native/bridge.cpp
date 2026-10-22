@@ -50,6 +50,7 @@ int apx_mlx_device_info(int32_t index,const char** name,const char** architectur
  const auto& info=mx::gpu::device_info(index);
  *name=std::get<std::string>(info.at("device_name")).c_str();
  *architecture=std::get<std::string>(info.at("architecture")).c_str();CATCH}
+int apx_mlx_set_memory_limit(size_t limit,size_t* previous){TRY *previous=mx::set_memory_limit(limit);CATCH}
 int apx_mlx_array_new(void*,const int32_t* dims,size_t rank,int32_t dt,const uint8_t* bytes,size_t len,void** out){TRY
  auto sh=shape(dims,rank);size_t count=1;for(auto d:sh){if(d&&count>SIZE_MAX/size_t(d))throw std::overflow_error("shape overflow");count*=d;}
  if(count>SIZE_MAX/mx::size_of(dtype(dt))||count*mx::size_of(dtype(dt))!=len)throw std::invalid_argument("upload byte length mismatch");

@@ -16,6 +16,7 @@ extern "C" {
         name: *mut *const c_char,
         architecture: *mut *const c_char,
     ) -> i32;
+    pub fn apx_mlx_set_memory_limit(limit: usize, previous: *mut usize) -> i32;
     pub fn apx_mlx_array_new(
         stream: Handle,
         shape: *const i32,

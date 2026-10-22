@@ -1,0 +1,3 @@
+{
+  "chat_template": "{% for message in messages %}{{ message.content }} {% if message.tool_calls is defined %}{% for call in message.tool_calls %}{{ call.function.arguments.path }} {% endfor %}{% endif %}{% endfor %}"
+}

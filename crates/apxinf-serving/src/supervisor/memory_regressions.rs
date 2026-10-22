@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Config {
     Config {
+        runtime: WorkerRuntime::Python,
         python: PathBuf::from("/missing/apxinf-memory-test-python"),
         worker: PathBuf::from("/missing/apxinf-memory-test-worker"),
         model: PathBuf::from("/missing/apxinf-memory-test-model"),
@@ -17,6 +18,38 @@ pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Co
         sequence_reservation,
         host_pressure_policy: crate::host_pressure::HostPressurePolicy::Disabled,
     }
+}
+
+#[test]
+fn native_manifest_checks_selected_runtime_and_execution_profile() {
+    let mut config = configuration(4096, 1024);
+    config.model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/serving/native-tokenizer");
+    let executable = std::env::current_exe().unwrap();
+    let library = config.model.join("tokenizer_config.json");
+    config.runtime = WorkerRuntime::NativeMiniCpm5 {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    let runtime = crate::native_identity::runtime(&executable, &library).unwrap();
+    let mut manifest = crate::native_identity::manifest(
+        &config.model,
+        runtime,
+        crate::native_identity::execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["runtime"]["executable_sha256"] = "0".repeat(64).into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest["runtime"] = crate::native_identity::runtime(&executable, &library).unwrap();
+    manifest["execution"]["precision"] = "auto".into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    config.max_context = 4097;
+    assert!(config.validate_memory().is_err());
 }
 
 #[tokio::test]
