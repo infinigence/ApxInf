@@ -85,7 +85,10 @@ def read_ready(base_url, request):
     status, ready = request(base_url, "/readyz")
     if status != 200 or not isinstance(ready, dict) or ready.get("ready") is not True:
         raise ValueError(f"Service is not ready: HTTP {status}: {ready!r}")
-    if ready.get("profile") != "apxinf-serial-v0.1":
+    if ready.get("profile") not in (
+        "apxinf-serial-v0.1", "apxinf-native-sampled-v0.1",
+        "apxinf-native-thinking-v0.1", "apxinf-native-bounded-thinking-v0.1",
+    ):
         raise ValueError("The service has an unsupported profile.")
     identity(ready)
     return ready
@@ -151,6 +154,8 @@ def run_case(base_url, target, max_tokens, request=request_json, metrics=metrics
             case["reason"] = "The response input count differs from the measured count."
         elif case["stop_reason"] != "end_turn":
             case["reason"] = "Generation did not end normally."
+        elif case["observed_facts"] is None:
+            case["reason"] = "The response is not a plain JSON object with the required string facts."
         elif case["observed_facts"] != facts:
             case["reason"] = "The response has missing or incorrect nonce facts."
         else:
@@ -164,6 +169,7 @@ def run_case(base_url, target, max_tokens, request=request_json, metrics=metrics
             case["ready_after"] = after
             if case["ready_before"] is not None and (
                 after.get("model") != case["ready_before"].get("model")
+                or after.get("profile") != case["ready_before"].get("profile")
                 or identity(after) != identity(case["ready_before"])
             ):
                 case.update(status="failed", reason="Readiness identity changed during the case.")
