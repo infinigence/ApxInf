@@ -8,7 +8,8 @@ use super::{
     weights::Weights,
 };
 use crate::{
-    LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
+    GenerationBoundary, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState,
+    TextPreparationStatus,
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
@@ -19,6 +20,12 @@ use std::{collections::HashMap, rc::Rc};
 struct LocalMath {
     norm: Compiled,
     rope: Compiled,
+}
+
+#[derive(Clone, Copy)]
+enum TokenPass {
+    Forward,
+    PrefillChunk,
 }
 
 pub struct MiniCpm5 {
@@ -414,6 +421,16 @@ impl MiniCpm5 {
         position: usize,
         last_only: bool,
     ) -> Result<Array> {
+        self.run_tokens_for(ids, position, last_only, TokenPass::Forward)
+    }
+
+    fn run_tokens_for(
+        &mut self,
+        ids: &[u32],
+        position: usize,
+        last_only: bool,
+        pass: TokenPass,
+    ) -> Result<Array> {
         if let Some(failure) = &self.failure {
             return Err(Error::Other(format!(
                 "MiniCPM state invalid: {failure}; reset and prepare again"
@@ -433,13 +450,14 @@ impl MiniCpm5 {
         if self.states.is_empty() || self.prepared_prompt.is_none() {
             return Err(Error::Contract("prepare MiniCPM before inference"));
         }
-        let prompt = self.prepared_prompt.unwrap();
-        let admitted = if prompt > DSPARK_CONTEXT_CAPACITY && position < prompt {
-            position % PREFILL_CHUNK == 0 && ids.len() == PREFILL_CHUNK.min(prompt - position)
-        } else if position == 0 {
-            prompt == ids.len()
-        } else {
-            ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
+        let admitted = match pass {
+            TokenPass::PrefillChunk => self.prepared_prompt.is_some_and(|prompt| {
+                self.variant.prefill_rows(prompt, position) == Some(ids.len())
+            }),
+            TokenPass::Forward if position == 0 => self.prepared_prompt == Some(ids.len()),
+            TokenPass::Forward => {
+                ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
+            }
         };
         if !admitted {
             return Err(Error::Contract(
@@ -447,12 +465,17 @@ impl MiniCpm5 {
             ));
         }
         let result = (|| {
-            let tokens = Array::from_i32(
-                self.backend.stream(),
-                &[1, ids.len()],
-                &ids.iter().map(|&v| v as i32).collect::<Vec<_>>(),
-            )?;
-            let output = self.run_graph(tokens, position, last_only)?;
+            let ids = ids.iter().map(|&v| v as i32).collect::<Vec<_>>();
+            let tokens = Array::from_i32(self.backend.stream(), &[1, ids.len()], &ids)?;
+            let compiled = matches!(pass, TokenPass::Forward)
+                && position > 0
+                && (ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8));
+            let output = match (&self.step, compiled) {
+                (Some(step), true) => {
+                    step.call(&self.step_inputs(tokens, position, ids.len())?)?
+                }
+                _ => self.eager(&tokens, position, last_only)?,
+            };
             self.backend.stream().eval(&output)?;
             Ok::<_, Error>(self.install_output(output, position + ids.len()))
         })();
@@ -492,6 +515,56 @@ impl MiniCpm5 {
         self.states = output;
         self.offset = end;
         logits
+    }
+
+    fn prefill_chunks(
+        &mut self,
+        input: LlmInput<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<Option<Tensor>> {
+        if input.image.is_some() {
+            return Err(Error::Contract("MiniCPM5 is text-only"));
+        }
+        let ids = input.token_ids;
+        if ids.is_empty()
+            || ids.iter().any(|&id| id >= self.config.vocab_size as u32)
+            || self.offset != 0
+            || self.prepared_prompt != Some(ids.len())
+            || self.states.is_empty()
+            || self.failure.is_some()
+            || ids.len() > self.capacity
+            || ids.len() > self.variant.context_capacity()
+        {
+            return Err(Error::Contract(
+                "invalid or unprepared MiniCPM prefill input",
+            ));
+        }
+        if !boundary(GenerationBoundary::PrefillStart)? {
+            return Ok(None);
+        }
+        while let Some(rows) = self.variant.prefill_rows(ids.len(), self.offset) {
+            let end = self.offset + rows;
+            let logits = self.run_tokens_for(
+                &ids[self.offset..end],
+                self.offset,
+                true,
+                TokenPass::PrefillChunk,
+            )?;
+            if !boundary(GenerationBoundary::PrefillProgress {
+                consumed_tokens: end,
+            })? {
+                return Ok(None);
+            }
+            if end == ids.len() {
+                return self
+                    .backend
+                    .from_array(logits.reshape(&[1, self.vocab_size()])?)
+                    .map(Some);
+            }
+        }
+        Err(Error::Contract(
+            "MiniCPM prefill did not consume its complete prompt",
+        ))
     }
 
     pub(crate) fn trim_to(&mut self, position: usize) -> Result<()> {
@@ -645,9 +718,8 @@ impl LlmTrait for MiniCpm5 {
         self.last_taps = None;
         self.local = None;
         let stream = self.backend.stream();
-        self.swiglu = Compiled::with_shapeless(stream, 1, true, |a| {
-            Ok(vec![math::swiglu(&a[0], &a[1])?])
-        })?;
+        self.swiglu =
+            Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
         if self.variant != Variant::Public {
             let eps = self.epsilon.clone();
             self.local = Some(LocalMath {
@@ -673,32 +745,14 @@ impl LlmTrait for MiniCpm5 {
         self.config.vocab_size
     }
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
-        if input.image.is_some() {
-            return Err(Error::Contract("MiniCPM5 is text-only"));
-        }
-        if self.offset != 0
-            || self.prepared_prompt != Some(input.token_ids.len())
-            || input.token_ids.is_empty()
-            || input
-                .token_ids
-                .iter()
-                .any(|&id| id as usize >= self.config.vocab_size)
-        {
-            return Err(Error::Contract(
-                "MiniCPM prefill requires the complete prepared prompt and valid token IDs",
-            ));
-        }
-        let chunk_size = if input.token_ids.len() > DSPARK_CONTEXT_CAPACITY {
-            PREFILL_CHUNK
-        } else {
-            input.token_ids.len()
-        };
-        let mut logits = None;
-        for chunk in input.token_ids.chunks(chunk_size) {
-            logits = Some(self.run_tokens(chunk, self.offset, true)?);
-        }
-        let logits = logits.unwrap();
-        self.backend
-            .from_array(logits.reshape(&[1, self.vocab_size()])?)
+        self.prefill_chunks(input, &mut |_| Ok(true))?
+            .ok_or(Error::Contract("uncontrolled MiniCPM prefill stopped"))
+    }
+    fn prefill_controlled(
+        &mut self,
+        input: LlmInput<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<Option<Tensor>> {
+        self.prefill_chunks(input, boundary)
     }
 }

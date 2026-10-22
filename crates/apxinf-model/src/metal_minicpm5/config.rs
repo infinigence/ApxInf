@@ -24,6 +24,8 @@ pub(super) fn prefill_lengths(prompt: usize) -> Vec<usize> {
     }
 }
 
+pub const PREFILL_CHUNK_TOKENS: usize = 256;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub model_type: String,
@@ -109,6 +111,53 @@ pub enum Variant {
 }
 
 impl Variant {
+    pub const fn context_capacity(self) -> usize {
+        match self {
+            Self::Public | Self::Compiled => CONTEXT_CAPACITY,
+            Self::DSpark => DSPARK_CONTEXT_CAPACITY,
+        }
+    }
+
+    pub(crate) fn request_capacity(self, prompt: usize, output: usize) -> Result<usize> {
+        let total = prompt
+            .checked_add(output)
+            .ok_or(Error::Contract("MiniCPM context overflow"))?;
+        if prompt == 0 || total > self.context_capacity() {
+            return Err(Error::Other(format!(
+                "MiniCPM5 supports B1 with at most {} consumed positions for {self:?}",
+                self.context_capacity()
+            )));
+        }
+        Ok(total.div_ceil(PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS)
+    }
+
+    pub(crate) fn prefill_rows(self, prompt: usize, position: usize) -> Option<usize> {
+        if position >= prompt {
+            return None;
+        }
+        if self == Self::DSpark {
+            return (position == 0).then_some(prompt);
+        }
+        (position % PREFILL_CHUNK_TOKENS == 0)
+            .then_some((prompt - position).min(PREFILL_CHUNK_TOKENS))
+    }
+
+    pub(crate) fn prepared_lengths(self, prompt: usize) -> Vec<usize> {
+        let max_decode_rows = if self == Self::DSpark { 8 } else { 1 };
+        let mut lengths = (1..=max_decode_rows).collect::<Vec<_>>();
+        lengths.push(prompt);
+        if self != Self::DSpark {
+            lengths.push(prompt.min(PREFILL_CHUNK_TOKENS));
+            let tail = prompt % PREFILL_CHUNK_TOKENS;
+            if tail > 0 {
+                lengths.push(tail);
+            }
+        }
+        lengths.sort_unstable();
+        lengths.dedup();
+        lengths
+    }
+
     pub fn parse(name: Option<&str>) -> Result<Self> {
         match name.unwrap_or("bf16-compiled") {
             "bf16-public" => Ok(Self::Public),
