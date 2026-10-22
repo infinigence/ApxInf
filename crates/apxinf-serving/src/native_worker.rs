@@ -410,7 +410,8 @@ fn read_commands(
 
 fn run(args: Args) -> Result<()> {
     if args.protocol != contracts::NATIVE_PROTOCOL
-        || !(1..=4096).contains(&args.max_context)
+        || !(1..=16384).contains(&args.max_context)
+        || args.prefill_step_size != 256
         || args.output_batch_tokens != 1
         || args.max_output_tokens > 65536
     {
@@ -433,7 +434,7 @@ fn run(args: Args) -> Result<()> {
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
     let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":false,"token_events":true,
-        "cancel_granularity":"end_prefill_or_token","max_active_sequences":1,"max_context":args.max_context,
+        "cancel_granularity":"token_or_prefill_chunk","max_active_sequences":1,"max_context":args.max_context,
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
         contracts::canonical_identity_digest("apxinf-capability-v1", &capabilities)?;
@@ -697,6 +698,7 @@ fn submit(
             let generated = model.text_mut()?.generate_streaming_controlled_dyn(GenerationRequest {input:LlmInput::text(&tokens), options:&options}, &mut |boundary| {
                 let result = (|| -> Result<bool> {
                     match boundary {
+                        GenerationBoundary::PrefillStart => {}
                         GenerationBoundary::PrefillProgress {consumed_tokens} => {
                             state.active.as_mut().unwrap().consumed = consumed_tokens;
                             state.event("prefill_progress",json!({"consumed_tokens":consumed_tokens}))?;
