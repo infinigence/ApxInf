@@ -6,7 +6,7 @@ The runner creates `drawing-brief.txt` in a new task directory. Claude Code rece
 
 The brief asks for an original pelican riding a bicycle. It requires an SVG root with `viewBox="0 0 640 480"` and a direct `<title>Pelican Riding a Bicycle</title>` child. It asks for a long beak, a pouch, wings, and feet on the pedals. The bicycle must have two wheels, a connected frame, a saddle, handlebars, and pedals. The pelican must sit on the saddle and reach the handlebars with a wing.
 
-The task passes only when all conditions below hold.
+The automated checks pass only when all conditions below hold.
 
 - Claude Code exits with status zero and reports a successful final result.
 - A Read call receives a successful result with the same tool use ID.
@@ -17,6 +17,8 @@ The task passes only when all conditions below hold.
 - The file has no processing instruction other than an XML declaration.
 
 The SVG check is structural. It does not prove that the image depicts a pelican riding a bicycle. A reviewer must inspect the rendered image before visual acceptance. The report records that visual review remains pending.
+
+Successful automated checks set `automated_passed` to `true` and `passed` to `null`. A failed check sets both fields to `false`. Exit code 2 means visual review remains pending with no automated failure. Exit code 1 means at least one task failed. A separate review record must bind its verdict to the actual SVG file and its digest.
 
 The runner records input token usage only when Claude Code reports it. A brief length or character count does not establish observed context use. This task makes no long-context claim.
 

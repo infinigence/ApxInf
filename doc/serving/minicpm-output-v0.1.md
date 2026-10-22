@@ -28,7 +28,7 @@ The parser rejects unknown entities, invalid character references, and raw `<` c
 
 For a property with type `string`, the decoded value is a string. For every other declared type, the decoded value must be one JSON document.
 
-The parser validates the resulting argument object against the declared schema. It rejects missing required properties and mismatched types.
+The parser checks basic argument types, required properties, enums, and additional properties. It checks declared nested properties and array items with the same rules. It does not enforce general JSON Schema constraints, such as `minLength`, `pattern`, or union type arrays.
 
 The parser rejects malformed tags, undeclared tools, undeclared parameters, duplicate parameters, and incomplete calls. A completed call emits one `Part::Tool`.
 
