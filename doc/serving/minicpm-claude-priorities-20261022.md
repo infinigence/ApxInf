@@ -51,6 +51,10 @@ The model recovers from two path errors, but its drawing fails visual acceptance
 This result does not qualify literal Edit recovery or arbitrary long sessions.
 A direct request without Claude or tools exhausts 4096 output tokens and returns no usable drawing.
 Tool mediation alone therefore does not explain the task failures.
+The [calculation diagnostic](minicpm-reference-validation-20261023.md) compares identical token histories with an explicit CPU BF16 reference.
+Five selected positions have matching greedy IDs, but their probability distributions differ.
+The diagnostic does not establish general numerical equivalence or drawing capability.
+It identifies an abrupt forced reasoning boundary that requires a separate controlled task comparison.
 The current MiniCPM5-2B profile remains text-only and rejects image input.
 A vision model requires a separate declared provider and interface qualification.
 KV reuse remains lower priority than these task gates.
