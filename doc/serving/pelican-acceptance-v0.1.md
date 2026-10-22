@@ -12,6 +12,23 @@ The observed Claude Code 2.1.289 client exposes Read and Edit when the earlier a
 The task therefore uses the available Edit tool explicitly.
 The validator still recognizes saved transcripts that used Write.
 
+The capture checks named tools requested through the runner's `--tools` argument.
+The client's actual `system/init` event must advertise every requested tool.
+A missing tool stops the owned client and fails the task.
+An invalid or absent initial tool inventory also fails the task.
+The capture records the requested, advertised, and missing tools separately.
+This check does not establish tool permissions, successful execution, or later tool availability.
+
+The capture adds `tool_inventory` to its result.
+This object contains `requested`, `advertised`, `missing`, and `status`.
+`requested` and `missing` contain tool names.
+`advertised` retains the client list or remains null without a valid list.
+The status is `not_requested`, `unreported`, `verified`, `mismatch`, or `invalid`.
+`not_requested` means the command does not request named tools.
+`invalid` includes malformed lists and generated output before the initial list.
+Only `not_requested` and `verified` permit new task acceptance.
+Earlier saved captures without this field retain their existing validation behavior.
+
 The brief asks for an original pelican riding a bicycle. It requires an SVG root with `viewBox="0 0 640 480"` and a direct `<title>Pelican Riding a Bicycle</title>` child. It asks for a long beak, a pouch, wings, and feet on the pedals. The bicycle must have two wheels, a connected frame, a saddle, handlebars, and pedals. The pelican must sit on the saddle and reach the handlebars with a wing.
 
 The automated checks pass only when all conditions below hold.
