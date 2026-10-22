@@ -15,7 +15,9 @@ The output directory contains one `report.json` file.
 The optional Metal lock uses the existing measurement lock file.
 
 The probe reads `/readyz` before each target.
-It requires the serial profile, a ready worker, and positive context and output limits.
+It requires a declared supported profile, a ready worker, and positive context and output limits.
+The supported profiles are `apxinf-serial-v0.1`, `apxinf-native-sampled-v0.1`, `apxinf-native-thinking-v0.1`, and `apxinf-native-bounded-thinking-v0.1`.
+An unknown profile fails the probe.
 It uses the smaller context limit reported by the ready worker.
 It rejects a target when the target plus `--max-tokens` exceeds that limit.
 It rejects `--max-tokens` above the reported output limit.
@@ -47,6 +49,8 @@ The raw response retains a service error or the complete response body.
 The probe passes only when all three nonce values match exactly.
 It also requires `stop_reason=end_turn` and equal counted and reported input tokens.
 It requires the response model and the model, capability, and worker revisions to match readiness.
+The profile must remain unchanged between the ready snapshots.
+Markdown fences fail the required plain JSON format, even when all values are correct.
 A missing field, truncated response, HTTP error, identity change, or wrong nonce fails the case.
 Unsupported limits and targets receive `unsupported` with a reason.
 The process exits with a nonzero status unless every requested target passes.
