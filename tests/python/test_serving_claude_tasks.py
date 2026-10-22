@@ -66,8 +66,10 @@ class PelicanTaskTests(unittest.TestCase):
         self.assertIn("riding a bicycle", brief)
         self.assertIn("feet on the pedals", brief)
         self.assertIn('viewBox="0 0 640 480"', brief)
-        self.assertEqual(self.spec["tools"], ["Read", "Write", "Edit"])
-        self.assertEqual(self.spec["allowed"], ["Read", "Write", "Edit"])
+        self.assertEqual(self.spec["tools"], ["Read", "Edit"])
+        self.assertEqual(self.spec["allowed"], ["Read", "Edit"])
+        self.assertEqual((self.directory / "pelican.svg").read_text(), "")
+        self.assertIn(str(self.directory / "pelican.svg"), self.spec["prompt"])
 
     def test_valid_svg_and_matched_read_write_cycle_pass_structurally(self):
         self.save_svg()
