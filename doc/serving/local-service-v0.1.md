@@ -125,7 +125,8 @@ The closing token uses one position within the existing output allowance.
 Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
 The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
 The original thinking provider retains its behavior without a separate reasoning budget.
-Runtime and visual acceptance for the bounded profile remain pending.
+The [validation record](native-bounded-thinking-validation-20261023.md) covers native controls and a completed real client tool cycle.
+The original pelican output still fails visual acceptance.
 
 ### Python MLX-LM
 

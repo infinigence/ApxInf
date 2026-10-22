@@ -26,7 +26,32 @@ The captured request exposed `Read` and `Edit` tools. A reference tokenizer coun
 
 The baseline serving tests passed 135 Rust checks and 240 Python checks. The runners skipped one Rust check and six Python checks. These checks do not establish native MiniCPM serving acceptance.
 
-## Gaps and acceptance order
+## Current acceptance state
+
+The explicit native provider, MiniCPM tool grammar, controlled cancellation, and 16K context path now have runtime evidence.
+The [native record](minicpm-native-validation-20261022.md) retains the earlier qualification steps.
+The [bounded profile record](native-bounded-thinking-validation-20261023.md) adds worker 2.4 and exact reasoning-budget accounting.
+Its real Claude client completed Read, Read, and Edit, but the drawing failed visual acceptance.
+
+The bounded long-context run returned the expected values at 15354 input tokens.
+Markdown fences still failed the strict JSON check.
+The feedback revision made three unsuccessful Edit attempts and ended at the context limit.
+It retained the failed drawing unchanged.
+
+| Open item | Required evidence |
+| --- | --- |
+| MC-01. Recognizable pelican and bicycle. | The real client produces a visually accepted SVG through actual tools. |
+| MC-02. Literal Edit parameters and error recovery. | The model repairs a failed Edit and checks the file after its final successful change. |
+| MC-03. Strict JSON in long context. | The model returns the expected facts without Markdown fences or schema errors. |
+| MC-04. Client output reservation and portability. | A 4096-token output candidate completes under the default client policy without the private compatibility hook. |
+
+The 4096-token candidate retains the separate 512-token initial reasoning budget.
+It has no accepted result yet.
+The current MiniCPM5-2B profile remains text-only and rejects image input.
+A vision model requires a separate declared provider and interface qualification.
+KV reuse remains lower priority than these task gates.
+
+## Baseline gaps and acceptance order
 
 | Priority | Observed gap | Required evidence |
 | --- | --- | --- |
@@ -40,7 +65,7 @@ The baseline serving tests passed 135 Rust checks and 240 Python checks. The run
 | 2 | Prefill consumes the complete prompt in one call. | Evaluated chunks bound temporary work and provide cancellation checkpoints. |
 | 3 | Each HTTP request starts without reused KV state. | A bounded prefix policy preserves uncached output and accounts for retained memory. |
 
-The first native implementation keeps the 4096-position limit. The checkpoint's larger positional limit does not establish engine support. The service must reject excess input instead of removing history.
+The first native implementation retained the 4096-position limit. The checkpoint's larger positional limit does not establish engine support. The service must reject excess input instead of removing history.
 
 ## Execution and recovery
 
