@@ -1,6 +1,7 @@
 # Serial MiniCPM-V protocol 0.1
 
-Status: P2c interface. Runtime qualification remains pending. Date: 2026-10-23.
+Status: P2c candidate interface. Date: 2026-10-23.
+Selected runtime and HTTP checks pass. Full workload qualification remains pending.
 This profile defines `apxinf-worker/2.5` for a separately selected MiniCPM-V worker.
 It does not replace any text protocol or establish production image readiness.
 The [main contract](contracts-v0.1.md) defines common identity, lifecycle, transport, and settlement rules.
