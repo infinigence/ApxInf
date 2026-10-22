@@ -9,6 +9,7 @@ use std::fmt;
 
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
 pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
+pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
@@ -273,7 +274,54 @@ fn messages(value: &Value, tool_values: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn capabilities(value: &Value, native: bool) -> Result<()> {
+fn sampling(value: &Value) -> Result<()> {
+    match string(&value["mode"])? {
+        "greedy" => fields(value, &[], &["mode"], &[]),
+        "random" => {
+            fields(value, &[], &["mode", "temperature", "top_p", "seed"], &[])?;
+            for (key, maximum) in [("temperature", 2.0), ("top_p", 1.0)] {
+                let number = value[key]
+                    .as_f64()
+                    .ok_or_else(|| ContractError("expected sampling number".into()))?;
+                require(
+                    number.is_finite()
+                        && number > 0.0
+                        && number <= maximum
+                        && (number as f32).is_finite()
+                        && (number as f32) > 0.0,
+                    "sampling number outside allowed range",
+                )?;
+            }
+            integer(&value["seed"], 0, MAX_SAFE_INTEGER)?;
+            Ok(())
+        }
+        _ => Err(ContractError("unsupported sampling mode".into())),
+    }
+}
+
+fn submit_fields(frame: &Value) -> Result<()> {
+    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL;
+    fields(
+        frame,
+        REQUEST,
+        &[
+            "model_revision",
+            "capability_revision",
+            "token_ids",
+            "max_tokens",
+            "remaining_timeout_ms",
+            "eos_token_ids",
+            "capacity_lease_ids",
+        ],
+        if sampled { &["sampling"] } else { &[] },
+    )?;
+    require(
+        !sampled || frame.get("sampling").is_some(),
+        "missing sampling policy",
+    )
+}
+
+fn capabilities(value: &Value, native: bool, sampled: bool) -> Result<()> {
     fields(
         value,
         &[],
@@ -296,7 +344,7 @@ fn capabilities(value: &Value, native: bool) -> Result<()> {
         ("text", true),
         ("image", false),
         ("greedy", true),
-        ("sampling", false),
+        ("sampling", sampled),
         ("token_events", true),
         ("exact_append", false),
     ] {
@@ -307,7 +355,9 @@ fn capabilities(value: &Value, native: bool) -> Result<()> {
     }
     choice(
         &value["cancel_granularity"],
-        if native {
+        if sampled {
+            &["token_or_prefill_chunk"]
+        } else if native {
             &["end_prefill_or_token", "token_or_prefill_chunk"]
         } else {
             &["token", "token_or_prefill_chunk"]
@@ -318,8 +368,14 @@ fn capabilities(value: &Value, native: bool) -> Result<()> {
         &value["max_context"],
         1,
         if native {
-            if value["cancel_granularity"] == "token_or_prefill_chunk" { 16384 } else { 4096 }
-        } else { MAX_PROMPT_TOKENS },
+            if value["cancel_granularity"] == "token_or_prefill_chunk" {
+                16384
+            } else {
+                4096
+            }
+        } else {
+            MAX_PROMPT_TOKENS
+        },
     )?;
     integer(&value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
     choice(&value["state_schema"], &["none"])
@@ -341,7 +397,9 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
     tree(frame, 1, false)?;
     object(frame)?;
     require(
-        frame["protocol"] == PROTOCOL || frame["protocol"] == NATIVE_PROTOCOL,
+        frame["protocol"] == PROTOCOL
+            || frame["protocol"] == NATIVE_PROTOCOL
+            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL,
         "unsupported protocol",
     )?;
     uuid(&frame["worker_epoch"])?;
@@ -354,20 +412,7 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
             &["model_revision", "messages", "tools", "template_options"],
             &[],
         )?,
-        "submit" => fields(
-            frame,
-            REQUEST,
-            &[
-                "model_revision",
-                "capability_revision",
-                "token_ids",
-                "max_tokens",
-                "remaining_timeout_ms",
-                "eos_token_ids",
-                "capacity_lease_ids",
-            ],
-            &[],
-        )?,
+        "submit" => submit_fields(frame)?,
         "cancel_request" => fields(frame, REQUEST, &["reason"], &[])?,
         "stop_generation" => fields(
             frame,
@@ -393,10 +438,13 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
     tree(frame, 1, false)?;
     object(frame)?;
     require(
-        frame["protocol"] == PROTOCOL || frame["protocol"] == NATIVE_PROTOCOL,
+        frame["protocol"] == PROTOCOL
+            || frame["protocol"] == NATIVE_PROTOCOL
+            || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL,
         "unsupported protocol",
     )?;
-    let native = frame["protocol"] == NATIVE_PROTOCOL;
+    let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL;
+    let native = frame["protocol"] == NATIVE_PROTOCOL || sampled;
     uuid(&frame["worker_epoch"])?;
     let kind = string(&frame["kind"])?;
     if let Some(id) = frame.get("command_id") {
@@ -428,7 +476,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 ],
                 &[],
             )?;
-            capabilities(&frame["capabilities"], native)?;
+            capabilities(&frame["capabilities"], native, sampled)?;
             counts(
                 &frame["limits"],
                 &["max_frame_bytes", "max_depth", "max_commands"],
@@ -464,6 +512,24 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     frame["model_manifest"]["runtime"] == frame["runtime"],
                     "native runtime mismatch",
                 )?;
+                if sampled {
+                    let manifest = &frame["model_manifest"];
+                    let execution = &manifest["execution"];
+                    require(
+                        manifest["adapter_revision"] == "apxinf-native-minicpm5-sampled-v1"
+                            && execution["provider"] == "metal_minicpm5"
+                            && execution["precision"] == "bf16"
+                            && execution["variant"] == "bf16-compiled"
+                            && execution["enable_thinking"] == false
+                            && execution["sampling"]
+                                == serde_json::json!({
+                                    "algorithm": "apxinf-cpu-categorical-v1",
+                                    "temperature": "1", "top_p": "0.95",
+                                    "seed_policy": "request-id-sha256-v1",
+                                }),
+                        "unsupported native sampling identity",
+                    )?;
+                }
             } else {
                 fields(&frame["runtime"], &[], &["python", "mlx", "mlx_lm"], &[])?;
             }
@@ -550,20 +616,10 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             )?;
         }
         "submit" => {
-            fields(
-                frame,
-                REQUEST,
-                &[
-                    "model_revision",
-                    "capability_revision",
-                    "token_ids",
-                    "max_tokens",
-                    "remaining_timeout_ms",
-                    "eos_token_ids",
-                    "capacity_lease_ids",
-                ],
-                &[],
-            )?;
+            submit_fields(frame)?;
+            if sampled {
+                sampling(&frame["sampling"])?;
+            }
             digest(&frame["model_revision"])?;
             digest(&frame["capability_revision"])?;
             tokens(&frame["token_ids"], 1, MAX_PROMPT_TOKENS as usize)?;
@@ -1081,6 +1137,69 @@ mod tests {
             "../../../tests/fixtures/serving/serial-v0.1.json"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn shared_native_sampling_profile() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-sampling-v0.1.json"
+        ))
+        .unwrap();
+        for case in corpus["frame_cases"].as_array().unwrap() {
+            let mut frame = fixture(&corpus, case);
+            if case["refresh_identity"] == true {
+                frame["model_revision"] =
+                    canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"])
+                        .unwrap()
+                        .into();
+                frame["capability_revision"] =
+                    canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"])
+                        .unwrap()
+                        .into();
+            }
+            let before = frame.clone();
+            assert_eq!(
+                validate_frame(&frame).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+            if case["valid"] == true {
+                assert!(
+                    decode_frame(&encode_frame(&frame).unwrap()).is_ok(),
+                    "{}",
+                    case["name"]
+                );
+            }
+            if let Some(valid) = case["envelope_valid"].as_bool() {
+                assert_eq!(
+                    validate_command_envelope(&frame).is_ok(),
+                    valid,
+                    "{}",
+                    case["name"]
+                );
+            }
+            assert_eq!(frame, before, "validator changed frame");
+        }
+        for vector in corpus["identity_digests"].as_array().unwrap() {
+            let value = corpus["templates"][vector["template"].as_str().unwrap()]
+                .pointer(vector["pointer"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                canonical_identity_digest(vector["domain"].as_str().unwrap(), value).unwrap(),
+                vector["digest"]
+            );
+        }
+        let mut frame = corpus["templates"]["submit"].clone();
+        frame["sampling"] = serde_json::json!({
+            "mode": "random", "temperature": "number-literal", "top_p": 1, "seed": 0,
+        });
+        for literal in corpus["invalid_number_literals"].as_array().unwrap() {
+            let raw = serde_json::to_string(&frame)
+                .unwrap()
+                .replace("\"number-literal\"", literal.as_str().unwrap());
+            assert!(decode_frame(raw.as_bytes()).is_err(), "{literal}");
+        }
     }
 
     #[test]
