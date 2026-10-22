@@ -1,4 +1,3 @@
-//! Public API profiles for local text and tool requests.
 mod vision;
 use crate::{
     output::{anthropic_blocks, Part},
