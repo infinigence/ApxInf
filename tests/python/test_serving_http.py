@@ -271,7 +271,35 @@ class LifecycleGuardTests(unittest.TestCase):
                                base_url="http://127.0.0.1:8080")
 
     def readiness(self):
-        return {"worker": {"worker_epoch": "original-epoch", "model_path": "/original/model"}}
+        return {"worker": {"protocol": "apxinf-worker/2.0", "worker_epoch": "original-epoch", "model_path": "/original/model"}}
+
+    def test_native_target_requires_matching_launch_artifacts(self):
+        ready = self.readiness()
+        ready["worker"]["protocol"] = "apxinf-worker/2.1"
+        identities = self.identities()
+        identities[0]["command"] += (" --provider native-minicpm5 --native-worker /original/apxinf-native-worker"
+                                     " --metal-library /original/libmlx.dylib")
+        identities[1]["command"] = ("/original/apxinf-native-worker --protocol apxinf-worker/2.1"
+                                     " --worker-epoch original-epoch --model /original/model"
+                                     " --metal-library /original/libmlx.dylib")
+        with patch.object(lifecycle, "process_identity", side_effect=identities), \
+                patch.object(lifecycle.subprocess, "run", return_value=SimpleNamespace(stdout="p400\n")):
+            self.assertEqual(lifecycle.verify_worker_target(self.arguments(), ready)["worker"]["pid"], 401)
+        for before, after in (("/original/apxinf-native-worker", "/unrelated/apxinf-native-worker"),
+                              ("/original/libmlx.dylib", "/unrelated/libmlx.dylib"),
+                              ("apxinf-worker/2.1", "apxinf-worker/2.0")):
+            wrong = [dict(identity) for identity in identities]
+            wrong[1]["command"] = wrong[1]["command"].replace(before, after)
+            with patch.object(lifecycle, "process_identity", side_effect=wrong):
+                with self.assertRaises(RuntimeError):
+                    lifecycle.verify_worker_target(self.arguments(), ready)
+
+    def test_unknown_ready_protocol_prevents_a_target(self):
+        ready = self.readiness()
+        ready["worker"]["protocol"] = "apxinf-worker/future"
+        with patch.object(lifecycle, "process_identity", side_effect=self.identities()):
+            with self.assertRaisesRegex(RuntimeError, "supported worker protocol"):
+                lifecycle.verify_worker_target(self.arguments(), ready)
 
     def test_worker_fault_requires_explicit_flag_before_process_inspection(self):
         with patch.object(lifecycle, "process_identity") as inspection:
