@@ -18,8 +18,8 @@ SPEC.loader.exec_module(contracts)
 CORPUS = json.loads((ROOT / "tests/fixtures/serving/serial-v0.1.json").read_text())
 
 
-def fixture(case: dict) -> dict:
-    value = copy.deepcopy(CORPUS["templates"][case["template"]])
+def fixture(case: dict, corpus: dict = CORPUS) -> dict:
+    value = copy.deepcopy(corpus["templates"][case["template"]])
     for pointer, replacement in case.get("set", {}).items():
         keys = pointer.split("/")[1:]
         target = value
@@ -32,6 +32,42 @@ def fixture(case: dict) -> dict:
 
 
 class ServingContractTests(unittest.TestCase):
+    def test_shared_native_sampling_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-sampling-v0.1.json").read_text())
+        for case in corpus["frame_cases"]:
+            with self.subTest(case["name"]):
+                frame = fixture(case, corpus)
+                if case.get("refresh_identity"):
+                    frame["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"])
+                    frame["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", frame["capabilities"])
+                before = copy.deepcopy(frame)
+                if case["valid"]:
+                    contracts.validate_frame(frame)
+                    self.assertEqual(contracts.decode_frame(contracts.encode_frame(frame)), frame)
+                else:
+                    with self.assertRaises(contracts.ContractError):
+                        contracts.validate_frame(frame)
+                if "envelope_valid" in case:
+                    if case["envelope_valid"]:
+                        contracts.validate_command_envelope(frame)
+                    else:
+                        with self.assertRaises(contracts.ContractError):
+                            contracts.validate_command_envelope(frame)
+                self.assertEqual(frame, before, "validator changed frame")
+        for vector in corpus["identity_digests"]:
+            value = corpus["templates"][vector["template"]]
+            for key in vector["pointer"].split("/")[1:]:
+                value = value[key]
+            self.assertEqual(contracts.canonical_identity_digest(vector["domain"], value), vector["digest"])
+        frame = fixture({"template": "submit", "set": {"/sampling": {
+            "mode": "random", "temperature": "number-literal", "top_p": 1, "seed": 0,
+        }}}, corpus)
+        for literal in corpus["invalid_number_literals"]:
+            with self.subTest(literal):
+                raw = json.dumps(frame).replace('"number-literal"', literal)
+                with self.assertRaises(contracts.ContractError):
+                    contracts.decode_frame(raw)
+
     def test_shared_native_profile(self):
         corpus = json.loads((ROOT / "tests/fixtures/serving/native-v0.1.json").read_text())
         base = copy.deepcopy(CORPUS["templates"]["ready"])

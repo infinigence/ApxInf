@@ -9,6 +9,8 @@ import struct
 from typing import Any
 
 PROTOCOL = "apxinf-worker/2.0"
+NATIVE_PROTOCOL = "apxinf-worker/2.1"
+NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
 MAX_FRAME_BYTES = 1_048_576
 MAX_DEPTH = 16
 MAX_COMMANDS = 10_000
@@ -154,11 +156,35 @@ def _messages(messages: Any, tools: Any) -> None:
             _require(type(function["strict"]) is bool, "tool strict must be Boolean")
 
 
-def _capabilities(value: Any, native: bool = False) -> None:
+def _sampling(value: Any) -> None:
+    _require(type(value) is dict, "expected sampling object")
+    _enum(value.get("mode"), {"greedy", "random"})
+    if value["mode"] == "greedy":
+        _keys(value, {"mode"})
+        return
+    _keys(value, {"mode", "temperature", "top_p", "seed"})
+    for key, maximum in (("temperature", 2.0), ("top_p", 1.0)):
+        number = value[key]
+        _require(type(number) in (int, float) and 0 < number <= maximum,
+                 "sampling number outside allowed range")
+        narrowed = struct.unpack("!f", struct.pack("!f", number))[0]
+        _require(0 < narrowed < float("inf"), "sampling number underflows binary32")
+    _int(value["seed"])
+
+
+def _submit_fields(frame: dict) -> set[str]:
+    fields = {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}
+    if frame["protocol"] == NATIVE_SAMPLED_PROTOCOL:
+        fields.add("sampling")
+    return fields
+
+
+def _capabilities(value: Any, native: bool = False, sampled: bool = False) -> None:
     _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"})
-    for name, expected in {"text": True, "image": False, "greedy": True, "sampling": False, "token_events": True, "exact_append": False}.items():
+    for name, expected in {"text": True, "image": False, "greedy": True, "sampling": sampled, "token_events": True, "exact_append": False}.items():
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
-    _enum(value["cancel_granularity"], {"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})
+    cancellation = {"token_or_prefill_chunk"} if sampled else ({"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})
+    _enum(value["cancel_granularity"], cancellation)
     _int(value["max_active_sequences"], 1, 1)
     context_limit = (16384 if value["cancel_granularity"] == "token_or_prefill_chunk" else 4096) if native else MAX_PROMPT_TOKENS
     _int(value["max_context"], 1, context_limit)
@@ -176,13 +202,13 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") == PROTOCOL or frame.get("protocol") == "apxinf-worker/2.1", "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
     shapes = {
         "prepare_input": (COMMAND, {"model_revision", "messages", "tools", "template_options"}),
-        "submit": (REQUEST_COMMAND, {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}),
+        "submit": (REQUEST_COMMAND, _submit_fields(frame)),
         "cancel_request": (REQUEST_COMMAND, {"reason"}),
         "stop_generation": (REQUEST_COMMAND, {"cause", "output_token_count", "text_byte_cutoff"}),
         "query_stats": (COMMAND, set()), "drain": (COMMAND, set()), "shutdown": (COMMAND, set()),
@@ -202,8 +228,9 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] == PROTOCOL or frame["protocol"] == "apxinf-worker/2.1", "unsupported protocol")
-    native = frame["protocol"] == "apxinf-worker/2.1"
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL), "unsupported protocol")
+    sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
+    native = frame["protocol"] == NATIVE_PROTOCOL or sampled
     _uuid(frame["worker_epoch"])
     kind = frame["kind"]
     _str(kind)
@@ -216,7 +243,7 @@ def validate_frame(frame: dict) -> None:
         _int(frame.get("event_seq"))
     if kind == "ready":
         _keys(frame, BASE | {"model_revision", "capability_revision", "model_manifest", "capabilities", "limits", "model_path", "eos_token_ids", "vocab_size", "runtime", "memory"})
-        _capabilities(frame["capabilities"], native)
+        _capabilities(frame["capabilities"], native, sampled)
         _keys(frame["limits"], {"max_frame_bytes", "max_depth", "max_commands"})
         _require(frame["limits"] == {"max_frame_bytes": MAX_FRAME_BYTES, "max_depth": MAX_DEPTH, "max_commands": MAX_COMMANDS}, "incompatible transport limits")
         for value in frame["limits"].values():
@@ -228,6 +255,19 @@ def validate_frame(frame: dict) -> None:
             _digest(frame["runtime"]["metal_library_sha256"])
             _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
             _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
+            if sampled:
+                manifest = frame["model_manifest"]
+                execution = manifest.get("execution")
+                _require(type(execution) is dict, "expected execution identity")
+                _require(manifest.get("adapter_revision") == "apxinf-native-minicpm5-sampled-v1"
+                         and execution.get("provider") == "metal_minicpm5"
+                         and execution.get("precision") == "bf16"
+                         and execution.get("variant") == "bf16-compiled"
+                         and execution.get("enable_thinking") is False
+                         and execution.get("sampling") == {
+                             "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1",
+                             "top_p": "0.95", "seed_policy": "request-id-sha256-v1",
+                         }, "unsupported native sampling identity")
         else:
             _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
         for value in frame["runtime"].values():
@@ -255,7 +295,9 @@ def validate_frame(frame: dict) -> None:
         _require(frame["effective_input_tokens"] == len(frame["token_ids"]), "prepared input count mismatch")
         _require(frame["prompt_digest"] == token_prefix_digest(frame["token_ids"]), "prepared input digest mismatch")
     elif kind == "submit":
-        _keys(frame, REQUEST_COMMAND | {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"})
+        _keys(frame, REQUEST_COMMAND | _submit_fields(frame))
+        if sampled:
+            _sampling(frame["sampling"])
         _digest(frame["model_revision"])
         _digest(frame["capability_revision"])
         _tokens(frame["token_ids"], MAX_PROMPT_TOKENS, 1)
