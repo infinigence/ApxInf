@@ -7,10 +7,12 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "python/apxinf/apxinf/serving/contracts.py"
+sys.path.insert(0, str(MODULE.parent))
 SPEC = importlib.util.spec_from_file_location("serving_contracts_under_test", MODULE)
 assert SPEC is not None and SPEC.loader is not None
 contracts = importlib.util.module_from_spec(SPEC)
@@ -20,18 +22,59 @@ CORPUS = json.loads((ROOT / "tests/fixtures/serving/serial-v0.1.json").read_text
 
 def fixture(case: dict, corpus: dict = CORPUS) -> dict:
     value = copy.deepcopy(corpus["templates"][case["template"]])
+    if "image_occurrences" in case:
+        count = case["image_occurrences"]
+        if value["kind"] == "prepare_input":
+            part = value["messages"][0]["content"][1]
+            value["messages"] = [{"role": "tool", "tool_call_id": "pixel-tool", "content": [copy.deepcopy(part) for _ in range(count)]}]
+        else:
+            replay = value["replay"]
+            image = replay["media"][0]
+            replay["media"] = [copy.deepcopy(image) for _ in range(count)]
+            replay["image_bindings"] = [{"source_index": index, "token_start": index + 1, "token_end": index + 2, "pixel_shape": [3, 14, 14], "target_size": [1, 1]} for index in range(count)]
+            value["token_ids"] = [1] + [248056] * count + [3]
+    if "rendered_bytes" in case:
+        value["replay"]["rendered_prompt"] = "x" * case["rendered_bytes"]
+    if "image_tokens" in case:
+        value["token_ids"] = [1] + [248056] * case["image_tokens"] + [3]
+        value["replay"]["image_bindings"][0]["token_end"] = case["image_tokens"] + 1
     for pointer, replacement in case.get("set", {}).items():
         keys = pointer.split("/")[1:]
         target = value
         for key in keys[:-1]:
-            target = target[key]
-        target[keys[-1]] = copy.deepcopy(replacement)
+            target = target[int(key) if type(target) is list else key]
+        target[int(keys[-1]) if type(target) is list else keys[-1]] = copy.deepcopy(replacement)
     for key in case.get("remove", []):
         del value[key]
     return value
 
 
 class ServingContractTests(unittest.TestCase):
+    def test_shared_vision_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/minicpm-vision-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+        self.check_event_transcripts(corpus)
+
+    def test_text_contracts_import_without_media_dependencies(self):
+        result = subprocess.run([sys.executable, "-S", "-c",
+                                 "import contracts, sys; assert 'PIL' not in sys.modules; assert 'owned_media' not in sys.modules"],
+                                cwd=MODULE.parent, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_vision_identity_cannot_use_old_protocols(self):
+        for protocol in (contracts.PROTOCOL, contracts.NATIVE_PROTOCOL, contracts.NATIVE_SAMPLED_PROTOCOL,
+                         contracts.NATIVE_THINKING_PROTOCOL, contracts.NATIVE_BOUNDED_THINKING_PROTOCOL):
+            for identity in ("adapter", "provider"):
+                frame = copy.deepcopy(CORPUS["templates"]["ready"])
+                frame["protocol"] = protocol
+                if identity == "adapter":
+                    frame["model_manifest"]["adapter_revision"] = "apxinf-mlx-minicpmv47-vision-v1"
+                else:
+                    frame["model_manifest"]["execution"] = {"provider": "mlx-vlm-minicpmv47"}
+                frame["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"])
+                with self.assertRaises(contracts.ContractError):
+                    contracts.validate_frame(frame)
+
     def test_shared_native_sampling_profile(self):
         corpus = json.loads((ROOT / "tests/fixtures/serving/native-sampling-v0.1.json").read_text())
         self.check_sampled_profile(corpus)
