@@ -172,6 +172,7 @@ name = "apxinf-serving"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-loader",
  "apxinf-mlx",
  "apxinf-model",
  "apxinf-tokenizer",

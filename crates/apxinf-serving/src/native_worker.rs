@@ -24,6 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod native_bounded_thinking;
+
+use native_bounded_thinking::{qualify_tokenizer, BoundedThinkingSampler};
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +35,7 @@ enum NativeProfile {
     Greedy,
     Sampled,
     Thinking,
+    BoundedThinking,
 }
 
 impl NativeProfile {
@@ -39,6 +44,7 @@ impl NativeProfile {
             contracts::NATIVE_PROTOCOL => Some(Self::Greedy),
             contracts::NATIVE_SAMPLED_PROTOCOL => Some(Self::Sampled),
             contracts::NATIVE_THINKING_PROTOCOL => Some(Self::Thinking),
+            contracts::NATIVE_BOUNDED_THINKING_PROTOCOL => Some(Self::BoundedThinking),
             _ => None,
         }
     }
@@ -48,11 +54,14 @@ impl NativeProfile {
             Self::Greedy => native_identity::execution(context, output, memory),
             Self::Sampled => native_identity::sampled_execution(context, output, memory),
             Self::Thinking => native_identity::thinking_execution(context, output, memory),
+            Self::BoundedThinking => {
+                native_identity::bounded_thinking_execution(context, output, memory)
+            }
         }
     }
 
     fn enable_thinking(self) -> bool {
-        self == Self::Thinking
+        matches!(self, Self::Thinking | Self::BoundedThinking)
     }
 
     fn sampling(self) -> bool {
@@ -498,6 +507,10 @@ fn run(args: Args) -> Result<()> {
     if !eos.contains(&1) || !eos.contains(&130073) {
         return Err("Unexpected MiniCPM EOS identity".into());
     }
+    if profile == NativeProfile::BoundedThinking {
+        let document = serde_json::from_slice(&std::fs::read(args.model.join("tokenizer.json"))?)?;
+        qualify_tokenizer(&tokenizer, &document, &eos)?;
+    }
     model.text_mut()?.backend().synchronize()?;
     apxinf_mlx::clear_cache()?;
     let resident = apxinf_mlx::memory_stats()?;
@@ -701,12 +714,12 @@ fn prepare(
     Ok(tokens)
 }
 
-struct NativeSampler {
+struct NativeSampler<'a> {
     backend: apxinf_mlx::MlxBackend,
-    cpu: Box<dyn TokenSampler>,
+    cpu: Box<dyn TokenSampler + 'a>,
 }
 
-impl NativeSampler {
+impl NativeSampler<'_> {
     fn new(backend: apxinf_mlx::MlxBackend, spec: TokenSamplingSpec) -> apxinf_core::Result<Self> {
         Ok(Self {
             backend,
@@ -715,7 +728,7 @@ impl NativeSampler {
     }
 }
 
-impl TokenSampler for NativeSampler {
+impl TokenSampler for NativeSampler<'_> {
     fn spec(&self) -> TokenSamplingSpec {
         self.cpu.spec()
     }
@@ -872,7 +885,9 @@ fn submit(
                     input: LlmInput::text(&tokens),
                     options: &options,
                 };
-                if options.sampling_mode == Some(SamplingMode::Random) {
+                let bounded = NativeProfile::from_protocol(&args.protocol)
+                    == Some(NativeProfile::BoundedThinking);
+                if bounded || options.sampling_mode == Some(SamplingMode::Random) {
                     let backend = text_model
                         .backend()
                         .as_any()
@@ -881,13 +896,18 @@ fn submit(
                             Error::Other("Native sampling requires an MLX backend".into())
                         })?
                         .clone();
-                    let mut sampler = NativeSampler::new(
-                        backend,
-                        TokenSamplingSpec {
-                            vocab_size: tokenizer.vocab_size(),
-                            max_sequence_len: args.max_context,
-                        },
-                    )?;
+                    let spec = TokenSamplingSpec {
+                        vocab_size: tokenizer.vocab_size(),
+                        max_sequence_len: args.max_context,
+                    };
+                    let mut sampler = if bounded {
+                        NativeSampler {
+                            backend,
+                            cpu: Box::new(BoundedThinkingSampler::new(spec, tokenizer, eos)?),
+                        }
+                    } else {
+                        NativeSampler::new(backend, spec)?
+                    };
                     generate_streaming_controlled_with_sampler(
                         text_model,
                         request,
@@ -1036,6 +1056,7 @@ mod tests {
             contracts::NATIVE_PROTOCOL,
             contracts::NATIVE_SAMPLED_PROTOCOL,
             contracts::NATIVE_THINKING_PROTOCOL,
+            contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
         ] {
             let mut command = fixture("submit");
             command["protocol"] = protocol.into();
@@ -1053,6 +1074,7 @@ mod tests {
                 contracts::NATIVE_PROTOCOL,
                 contracts::NATIVE_SAMPLED_PROTOCOL,
                 contracts::NATIVE_THINKING_PROTOCOL,
+                contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
             ]
             .into_iter()
             .filter(|other| *other != protocol)
@@ -1085,6 +1107,7 @@ mod tests {
             contracts::NATIVE_PROTOCOL,
             contracts::NATIVE_SAMPLED_PROTOCOL,
             contracts::NATIVE_THINKING_PROTOCOL,
+            contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
         ] {
             state.protocol = protocol.into();
             let frame = state.frame("drained");
@@ -1112,6 +1135,11 @@ mod tests {
                 NativeProfile::Thinking,
                 native_identity::thinking_execution(16384, 128, 2097152),
             ),
+            (
+                contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
+                NativeProfile::BoundedThinking,
+                native_identity::bounded_thinking_execution(16384, 128, 2097152),
+            ),
         ] {
             let profile = NativeProfile::from_protocol(protocol).unwrap();
             assert_eq!(profile, expected);
@@ -1120,32 +1148,40 @@ mod tests {
             assert_eq!(profile.sampling(), execution.get("sampling").is_some());
         }
         assert!(NativeProfile::from_protocol(contracts::PROTOCOL).is_none());
-        assert!(NativeProfile::from_protocol("apxinf-worker/2.4").is_none());
+        assert!(NativeProfile::from_protocol("apxinf-worker/2.5").is_none());
     }
 
     #[test]
     fn thinking_fixture_preserves_prepare_errors_and_raw_output_frames() {
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
-        ))
-        .unwrap();
-        let mut command = corpus["templates"]["prepare"].clone();
-        let (fault, commands, _) = input(contracts::NATIVE_THINKING_PROTOCOL, command.clone());
-        assert!(!fault);
-        assert!(commands[0].valid);
-        command["template_options"]["enable_thinking"] = false.into();
-        let (fault, commands, _) = input(contracts::NATIVE_THINKING_PROTOCOL, command);
-        assert!(!fault);
-        assert!(!commands[0].valid);
+        for (protocol, source) in [
+            (
+                contracts::NATIVE_THINKING_PROTOCOL,
+                include_str!("../../../tests/fixtures/serving/native-thinking-v0.1.json"),
+            ),
+            (
+                contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
+                include_str!("../../../tests/fixtures/serving/native-bounded-thinking-v0.1.json"),
+            ),
+        ] {
+            let corpus: Value = serde_json::from_str(source).unwrap();
+            let mut command = corpus["templates"]["prepare"].clone();
+            let (fault, commands, _) = input(protocol, command.clone());
+            assert!(!fault);
+            assert!(commands[0].valid);
+            command["template_options"]["enable_thinking"] = false.into();
+            let (fault, commands, _) = input(protocol, command);
+            assert!(!fault);
+            assert!(!commands[0].valid);
 
-        let (mut state, _controls, capture) = state();
-        state.protocol = contracts::NATIVE_THINKING_PROTOCOL.into();
-        let expected = ["tokens", "terminal"].map(|name| corpus["templates"][name].clone());
-        for frame in &expected {
-            state.send(frame.clone()).unwrap();
+            let (mut state, _controls, capture) = state();
+            state.protocol = protocol.into();
+            let expected = ["tokens", "terminal"].map(|name| corpus["templates"][name].clone());
+            for frame in &expected {
+                state.send(frame.clone()).unwrap();
+            }
+            state.output.finish().unwrap();
+            assert_eq!(frames(capture), expected);
         }
-        state.output.finish().unwrap();
-        assert_eq!(frames(capture), expected);
     }
 
     #[test]
@@ -1178,12 +1214,19 @@ mod tests {
         assert_eq!(random.return_logprob, Some(false));
         assert_eq!(random.max_new_tokens, Some(7));
         assert_eq!(random.eos_token_ids, Some(vec![1, 130073]));
-        command["protocol"] = contracts::NATIVE_THINKING_PROTOCOL.into();
-        contracts::validate_frame(&command).unwrap();
-        assert_eq!(generation_options(&command, 7, &[1, 130073]), random);
-        command["sampling"] = json!({"mode":"greedy"});
-        contracts::validate_frame(&command).unwrap();
-        assert_eq!(generation_options(&command, 7, &[1, 130073]), greedy);
+        for protocol in [
+            contracts::NATIVE_THINKING_PROTOCOL,
+            contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
+        ] {
+            command["protocol"] = protocol.into();
+            command["sampling"] = json!({"mode":"random", "temperature":0.7, "top_p":0.8,
+            "seed":9007199254740991u64});
+            contracts::validate_frame(&command).unwrap();
+            assert_eq!(generation_options(&command, 7, &[1, 130073]), random);
+            command["sampling"] = json!({"mode":"greedy"});
+            contracts::validate_frame(&command).unwrap();
+            assert_eq!(generation_options(&command, 7, &[1, 130073]), greedy);
+        }
     }
 
     #[test]

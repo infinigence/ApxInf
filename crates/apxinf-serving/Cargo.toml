@@ -28,3 +28,6 @@ apxinf-model = { path = "../apxinf-model", features = ["mlx"], optional = true }
 apxinf-core = { path = "../apxinf-core", optional = true }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }
 apxinf-mlx = { path = "../apxinf-mlx", features = ["native"], optional = true }
+
+[dev-dependencies]
+apxinf-loader = { path = "../apxinf-loader" }
