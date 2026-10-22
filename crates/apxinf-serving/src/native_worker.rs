@@ -26,6 +26,40 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeProfile {
+    Greedy,
+    Sampled,
+    Thinking,
+}
+
+impl NativeProfile {
+    fn from_protocol(protocol: &str) -> Option<Self> {
+        match protocol {
+            contracts::NATIVE_PROTOCOL => Some(Self::Greedy),
+            contracts::NATIVE_SAMPLED_PROTOCOL => Some(Self::Sampled),
+            contracts::NATIVE_THINKING_PROTOCOL => Some(Self::Thinking),
+            _ => None,
+        }
+    }
+
+    fn execution(self, context: usize, output: usize, memory: u64) -> Value {
+        match self {
+            Self::Greedy => native_identity::execution(context, output, memory),
+            Self::Sampled => native_identity::sampled_execution(context, output, memory),
+            Self::Thinking => native_identity::thinking_execution(context, output, memory),
+        }
+    }
+
+    fn enable_thinking(self) -> bool {
+        self == Self::Thinking
+    }
+
+    fn sampling(self) -> bool {
+        self != Self::Greedy
+    }
+}
+
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
@@ -414,10 +448,9 @@ fn read_commands(
 }
 
 fn run(args: Args) -> Result<()> {
-    if !matches!(
-        args.protocol.as_str(),
-        contracts::NATIVE_PROTOCOL | contracts::NATIVE_SAMPLED_PROTOCOL
-    ) || !(1..=16384).contains(&args.max_context)
+    let profile =
+        NativeProfile::from_protocol(&args.protocol).ok_or("Unsupported native launch profile")?;
+    if !(1..=16384).contains(&args.max_context)
         || args.prefill_step_size != 256
         || args.output_batch_tokens != 1
         || args.max_output_tokens > 65536
@@ -429,16 +462,10 @@ fn run(args: Args) -> Result<()> {
         return Err("Loaded MLX library differs from the selected runtime.".into());
     }
     let runtime = native_identity::runtime(&std::env::current_exe()?, &loaded_library)?;
-    let sampled = args.protocol == contracts::NATIVE_SAMPLED_PROTOCOL;
-    let execution = if sampled {
-        native_identity::sampled_execution
-    } else {
-        native_identity::execution
-    };
     let manifest = native_identity::manifest(
         &args.model,
         runtime.clone(),
-        execution(
+        profile.execution(
             args.max_context,
             args.max_output_tokens,
             args.memory_limit_bytes,
@@ -446,7 +473,7 @@ fn run(args: Args) -> Result<()> {
     )?;
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
-    let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":sampled,"token_events":true,
+    let capabilities = json!({"text":true,"image":false,"greedy":true,"sampling":profile.sampling(),"token_events":true,
         "cancel_granularity":"token_or_prefill_chunk","max_active_sequences":1,"max_context":args.max_context,
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
@@ -530,7 +557,13 @@ fn run(args: Args) -> Result<()> {
                     continue;
                 }
                 if command["kind"] == "prepare_input" {
-                    let prepared = prepare(&tokenizer, &command, &model_revision, args.max_context);
+                    let prepared = prepare(
+                        &tokenizer,
+                        &command,
+                        &model_revision,
+                        args.max_context,
+                        profile.enable_thinking(),
+                    );
                     match prepared {
                         Ok(tokens) => {
                             let mut frame = state.frame("prepared_input");
@@ -622,9 +655,10 @@ fn prepare(
     command: &Value,
     revision: &str,
     limit: usize,
+    enable_thinking: bool,
 ) -> std::result::Result<Vec<u32>, Value> {
     if command["model_revision"] != revision
-        || command["template_options"]["enable_thinking"] != false
+        || command["template_options"]["enable_thinking"] != enable_thinking
     {
         return Err(error("invalid_request", "Preparation identity differs."));
     }
@@ -645,10 +679,16 @@ fn prepare(
             }
         }
     }
-    let options = json!({"enable_thinking":false,"tools":command["tools"]});
+    let options = json!({"enable_thinking":enable_thinking,"tools":command["tools"]});
     let prompt = tokenizer
         .apply_rich_chat_template(&messages, options.as_object().unwrap())
         .map_err(|e| error("invalid_request", &e.to_string()))?;
+    if enable_thinking && !prompt.ends_with("<think>\n") {
+        return Err(error(
+            "invalid_request",
+            "The template lacks the initial thinking prefix.",
+        ));
+    }
     let tokens = tokenizer
         .encode(&prompt)
         .map_err(|e| error("invalid_request", &e.to_string()))?;
@@ -995,10 +1035,11 @@ mod tests {
         for protocol in [
             contracts::NATIVE_PROTOCOL,
             contracts::NATIVE_SAMPLED_PROTOCOL,
+            contracts::NATIVE_THINKING_PROTOCOL,
         ] {
             let mut command = fixture("submit");
             command["protocol"] = protocol.into();
-            if protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+            if protocol != contracts::NATIVE_PROTOCOL {
                 command["sampling"] = json!({"mode":"greedy"});
             }
             let (fault, commands, controls) = input(protocol, command.clone());
@@ -1008,17 +1049,21 @@ mod tests {
             assert_eq!(controls.len(), 1);
             assert_eq!(controls[0]["kind"], "shutdown");
 
-            let other = if protocol == contracts::NATIVE_PROTOCOL {
-                contracts::NATIVE_SAMPLED_PROTOCOL
-            } else {
-                contracts::NATIVE_PROTOCOL
-            };
-            let (fault, commands, controls) = input(other, command.clone());
-            assert!(fault);
-            assert!(commands.is_empty());
-            assert!(controls.is_empty());
+            for other in [
+                contracts::NATIVE_PROTOCOL,
+                contracts::NATIVE_SAMPLED_PROTOCOL,
+                contracts::NATIVE_THINKING_PROTOCOL,
+            ]
+            .into_iter()
+            .filter(|other| *other != protocol)
+            {
+                let (fault, commands, controls) = input(other, command.clone());
+                assert!(fault);
+                assert!(commands.is_empty());
+                assert!(controls.is_empty());
+            }
 
-            if protocol == contracts::NATIVE_SAMPLED_PROTOCOL {
+            if protocol != contracts::NATIVE_PROTOCOL {
                 command["sampling"] =
                     json!({"mode":"random", "temperature":true, "top_p":0.95, "seed":1});
             } else {
@@ -1036,15 +1081,71 @@ mod tests {
     #[test]
     fn selected_protocol_is_used_for_worker_events() {
         let (mut state, _controls, _capture) = state();
-        assert_eq!(
-            state.frame("drained")["protocol"],
-            contracts::NATIVE_PROTOCOL
-        );
-        state.protocol = contracts::NATIVE_SAMPLED_PROTOCOL.into();
-        let frame = state.frame("drained");
-        assert_eq!(frame["protocol"], contracts::NATIVE_SAMPLED_PROTOCOL);
-        contracts::validate_frame(&frame).unwrap();
+        for protocol in [
+            contracts::NATIVE_PROTOCOL,
+            contracts::NATIVE_SAMPLED_PROTOCOL,
+            contracts::NATIVE_THINKING_PROTOCOL,
+        ] {
+            state.protocol = protocol.into();
+            let frame = state.frame("drained");
+            assert_eq!(frame["protocol"], protocol);
+            contracts::validate_frame(&frame).unwrap();
+        }
         state.output.finish().unwrap();
+    }
+
+    #[test]
+    fn launch_profile_binds_protocol_identity_and_template_mode() {
+        for (protocol, expected, execution) in [
+            (
+                contracts::NATIVE_PROTOCOL,
+                NativeProfile::Greedy,
+                native_identity::execution(16384, 128, 2097152),
+            ),
+            (
+                contracts::NATIVE_SAMPLED_PROTOCOL,
+                NativeProfile::Sampled,
+                native_identity::sampled_execution(16384, 128, 2097152),
+            ),
+            (
+                contracts::NATIVE_THINKING_PROTOCOL,
+                NativeProfile::Thinking,
+                native_identity::thinking_execution(16384, 128, 2097152),
+            ),
+        ] {
+            let profile = NativeProfile::from_protocol(protocol).unwrap();
+            assert_eq!(profile, expected);
+            assert_eq!(profile.execution(16384, 128, 2097152), execution);
+            assert_eq!(profile.enable_thinking(), execution["enable_thinking"]);
+            assert_eq!(profile.sampling(), execution.get("sampling").is_some());
+        }
+        assert!(NativeProfile::from_protocol(contracts::PROTOCOL).is_none());
+        assert!(NativeProfile::from_protocol("apxinf-worker/2.4").is_none());
+    }
+
+    #[test]
+    fn thinking_fixture_preserves_prepare_errors_and_raw_output_frames() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
+        ))
+        .unwrap();
+        let mut command = corpus["templates"]["prepare"].clone();
+        let (fault, commands, _) = input(contracts::NATIVE_THINKING_PROTOCOL, command.clone());
+        assert!(!fault);
+        assert!(commands[0].valid);
+        command["template_options"]["enable_thinking"] = false.into();
+        let (fault, commands, _) = input(contracts::NATIVE_THINKING_PROTOCOL, command);
+        assert!(!fault);
+        assert!(!commands[0].valid);
+
+        let (mut state, _controls, capture) = state();
+        state.protocol = contracts::NATIVE_THINKING_PROTOCOL.into();
+        let expected = ["tokens", "terminal"].map(|name| corpus["templates"][name].clone());
+        for frame in &expected {
+            state.send(frame.clone()).unwrap();
+        }
+        state.output.finish().unwrap();
+        assert_eq!(frames(capture), expected);
     }
 
     #[test]
@@ -1077,6 +1178,12 @@ mod tests {
         assert_eq!(random.return_logprob, Some(false));
         assert_eq!(random.max_new_tokens, Some(7));
         assert_eq!(random.eos_token_ids, Some(vec![1, 130073]));
+        command["protocol"] = contracts::NATIVE_THINKING_PROTOCOL.into();
+        contracts::validate_frame(&command).unwrap();
+        assert_eq!(generation_options(&command, 7, &[1, 130073]), random);
+        command["sampling"] = json!({"mode":"greedy"});
+        contracts::validate_frame(&command).unwrap();
+        assert_eq!(generation_options(&command, 7, &[1, 130073]), greedy);
     }
 
     #[test]
@@ -1209,17 +1316,89 @@ mod tests {
             {"role":"assistant","content":"hello","tool_calls":[{"id":"a","type":"function","function":{"name":"Read","arguments":{"path":"brief"}}}]},
             {"role":"tool","tool_call_id":"a","content":"hello"}]});
         assert_eq!(
-            prepare(&tokenizer, &command, "revision", 3).unwrap(),
+            prepare(&tokenizer, &command, "revision", 3, false).unwrap(),
             vec![1, 2, 1]
         );
         assert_eq!(
-            prepare(&tokenizer, &command, "revision", 2).unwrap_err()["code"],
+            prepare(&tokenizer, &command, "revision", 2, false).unwrap_err()["code"],
             "context_limit"
         );
         assert_eq!(
-            prepare(&tokenizer, &command, "other", 3).unwrap_err()["code"],
+            prepare(&tokenizer, &command, "other", 3, false).unwrap_err()["code"],
             "invalid_request"
         );
+    }
+
+    fn template_tokenizer(template: &str) -> Tokenizer {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../devlocal/serving-thinking/worker-fixtures")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("tokenizer.json"), r#"{
+            "version":"1.0", "added_tokens":[],
+            "pre_tokenizer":{"type":"WhitespaceSplit"},
+            "model":{"type":"WordLevel", "vocab":{"[UNK]":0,"hello":1,"brief":2,"<think>":3}, "unk_token":"[UNK]"}
+        }"#).unwrap();
+        std::fs::write(
+            directory.join("tokenizer_config.json"),
+            serde_json::to_vec(&json!({"chat_template":template})).unwrap(),
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::from_file(directory.join("tokenizer.json")).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        tokenizer
+    }
+
+    #[test]
+    fn preparation_enforces_deployment_mode_before_template_execution() {
+        let tokenizer = template_tokenizer("{{ raise_exception('must not render') }}");
+        for enable_thinking in [false, true] {
+            let command = json!({"model_revision":"revision", "messages":[], "tools":[],
+                "template_options":{"enable_thinking":!enable_thinking}});
+            assert_eq!(
+                prepare(&tokenizer, &command, "revision", 8, enable_thinking).unwrap_err(),
+                error("invalid_request", "Preparation identity differs.")
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_renders_the_profile_flag_and_checks_exact_thinking_suffix() {
+        let tokenizer =
+            template_tokenizer("{% if enable_thinking %}hello <think>\n{% else %}brief{% endif %}");
+        for enable_thinking in [false, true] {
+            let command = json!({"model_revision":"revision", "messages":[], "tools":[],
+                "template_options":{"enable_thinking":enable_thinking}});
+            let expected = if enable_thinking { vec![1, 3] } else { vec![2] };
+            assert_eq!(
+                prepare(&tokenizer, &command, "revision", 2, enable_thinking).unwrap(),
+                expected
+            );
+            if enable_thinking {
+                assert_eq!(
+                    prepare(&tokenizer, &command, "revision", 1, true).unwrap_err()["code"],
+                    "context_limit"
+                );
+            }
+        }
+        let command = json!({"model_revision":"revision", "messages":[], "tools":[],
+            "template_options":{"enable_thinking":true}});
+        for template in [
+            "hello",
+            "hello <think>",
+            "hello <think>\nbrief",
+            "{{ 'hello <think>\\n\\n' }}",
+        ] {
+            let tokenizer = template_tokenizer(template);
+            assert_eq!(
+                prepare(&tokenizer, &command, "revision", 0, true).unwrap_err(),
+                error(
+                    "invalid_request",
+                    "The template lacks the initial thinking prefix."
+                ),
+                "template: {template:?}"
+            );
+        }
     }
     #[test]
     fn output_backpressure_returns_without_waiting_for_writer() {

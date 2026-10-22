@@ -48,6 +48,13 @@ pub fn sampled_execution(context: usize, output: usize, memory: u64) -> Value {
     value
 }
 
+pub fn thinking_execution(context: usize, output: usize, memory: u64) -> Value {
+    let mut value = sampled_execution(context, output, memory);
+    value["enable_thinking"] = true.into();
+    value["output_policy"] = "minicpm5-initial-thinking-v1".into();
+    value
+}
+
 pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value, String> {
     let mut entries = std::fs::read_dir(model)
         .map_err(|e| e.to_string())?
@@ -66,7 +73,9 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
         }
         artifacts.push(json!({"path":path.file_name().and_then(|v|v.to_str()).ok_or("Invalid artifact name.")?, "size_bytes":size, "sha256":sha256}));
     }
-    let adapter_revision = if execution.get("sampling").is_some() {
+    let adapter_revision = if execution.get("output_policy").is_some() {
+        "apxinf-native-minicpm5-thinking-v1"
+    } else if execution.get("sampling").is_some() {
         "apxinf-native-minicpm5-sampled-v1"
     } else {
         "apxinf-native-minicpm5-v1"
@@ -99,6 +108,27 @@ mod tests {
     }
 
     #[test]
+    fn thinking_identity_changes_only_the_declared_fields() {
+        let sampled = sampled_execution(16384, 1024, 9000000000);
+        let mut thinking = thinking_execution(16384, 1024, 9000000000);
+        assert_eq!(thinking["enable_thinking"], true);
+        assert_eq!(
+            thinking.as_object_mut().unwrap().remove("output_policy"),
+            Some(json!("minicpm5-initial-thinking-v1"))
+        );
+        thinking["enable_thinking"] = false.into();
+        assert_eq!(thinking, sampled);
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            thinking_execution(16384, 128, 2097152),
+            corpus["templates"]["ready"]["model_manifest"]["execution"]
+        );
+    }
+
+    #[test]
     fn manifest_revision_and_digest_follow_sampling_identity() {
         let model = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -107,12 +137,29 @@ mod tests {
         let greedy = manifest(model, json!({}), execution(16384, 1024, 9000000000)).unwrap();
         let sampled =
             manifest(model, json!({}), sampled_execution(16384, 1024, 9000000000)).unwrap();
+        let thinking = manifest(
+            model,
+            json!({}),
+            thinking_execution(16384, 1024, 9000000000),
+        )
+        .unwrap();
         assert_eq!(greedy["adapter_revision"], "apxinf-native-minicpm5-v1");
         assert_eq!(
             sampled["adapter_revision"],
             "apxinf-native-minicpm5-sampled-v1"
         );
         assert_eq!(greedy["artifacts"], sampled["artifacts"]);
+        assert_eq!(
+            thinking["adapter_revision"],
+            "apxinf-native-minicpm5-thinking-v1"
+        );
+        assert_eq!(thinking["artifacts"], sampled["artifacts"]);
+        assert_ne!(
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &thinking)
+                .unwrap(),
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &sampled)
+                .unwrap()
+        );
         assert_ne!(
             crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &greedy)
                 .unwrap(),
