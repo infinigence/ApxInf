@@ -3,7 +3,8 @@
 Status: implementation contract. Runtime acceptance remains pending.
 The [serving contract](contracts-v0.1.md) retains precedence.
 Protocols 2.0 through 2.3 retain their existing behavior and identities.
-This profile adds no dependency.
+This profile adds no runtime dependency.
+Its CPU generation tests use the existing workspace crate `apxinf-loader` as a test dependency.
 
 ## Deployment and identity
 

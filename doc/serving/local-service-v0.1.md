@@ -118,6 +118,15 @@ All generated reasoning tokens count toward the output allowance.
 For a larger allowance within 16K total context, select `--max-output-tokens 8192` explicitly.
 The service still rejects a prompt and requested output allowance that exceed 16384 positions.
 
+Select `--provider native-minicpm5-thinking-bounded` for the [bounded thinking profile](native-bounded-thinking-v0.1.md).
+This separate profile limits initial reasoning to 512 generated tokens before it selects the closing token.
+An earlier termination or shorter output allowance can end generation before closure.
+The closing token uses one position within the existing output allowance.
+Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
+The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
+The original thinking provider retains its behavior without a separate reasoning budget.
+Runtime and visual acceptance for the bounded profile remain pending.
+
 ### Python MLX-LM
 
 Run the following commands from the repository root on an Apple Silicon Mac.

@@ -13,6 +13,7 @@
 | [实施计划](implementation-plan.md) | 模块边界、阶段依赖、交付内容和验收门 | 规定实施顺序 |
 | [串行协议](serial-profile-v0.1.md) | 首个实现子集的完整字段、限额和事件顺序 | Rust／Python 共同校验 |
 | [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
+| [有界初始思考](native-bounded-thinking-v0.1.md) | 显式 worker 2.4 配置、512-token 预算和完整用量计数 | 接口规范，运行验收待完成 |
 | [依赖边界](dependencies.md) | 依赖版本、公开 API 和替换边界 | 独立实现审计 |
 | [Metal 实验](metal-experiments.md) | M4 上的实验矩阵与创新候选 | 测量方案 |
 | [Metal 参数实测](metal-results-20261009.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
