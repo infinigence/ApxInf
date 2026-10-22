@@ -2,7 +2,15 @@
 
 Status: local Claude Code task definition. This task checks one P2a tool cycle and one saved artifact.
 
-The runner creates `drawing-brief.txt` in a new task directory. Claude Code receives one instruction to read that file and create `pelican.svg`. The runner permits only the Read, Write, and Edit tools.
+The runner creates `drawing-brief.txt` and an empty `pelican.svg` in a new task directory.
+Claude Code receives an instruction to read both files and fill the empty SVG with Edit.
+The instruction identifies the output path and empty replacement target.
+The runner permits only Read and Edit.
+The initial SVG contains no drawing content.
+
+The observed Claude Code 2.1.289 client exposes Read and Edit when the earlier allowlist also requests Write.
+The task therefore uses the available Edit tool explicitly.
+The validator still recognizes saved transcripts that used Write.
 
 The brief asks for an original pelican riding a bicycle. It requires an SVG root with `viewBox="0 0 640 480"` and a direct `<title>Pelican Riding a Bicycle</title>` child. It asks for a long beak, a pouch, wings, and feet on the pedals. The bicycle must have two wheels, a connected frame, a saddle, handlebars, and pedals. The pelican must sit on the saddle and reach the handlebars with a wing.
 

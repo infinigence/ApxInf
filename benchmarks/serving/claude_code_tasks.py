@@ -91,9 +91,13 @@ def prepare_task(name, directory):
             'Use an SVG root with xmlns="http://www.w3.org/2000/svg" and viewBox="0 0 640 480".\n'
             f"Add a direct <title> child with the exact text {PELICAN_TITLE}.\n"
             "Keep the SVG self-contained. Do not use scripts, links, images, styles, or external assets.\n")
-        return {"prompt": "Use Read to inspect drawing-brief.txt. After Read finishes, use Write or Edit "
-                          "to create pelican.svg from that brief. Reply when the file is saved.",
-                "tools": ["Read", "Write", "Edit"], "allowed": ["Read", "Write", "Edit"]}
+        target = directory / "pelican.svg"
+        target.write_text("")
+        return {"prompt": "Use Read to inspect drawing-brief.txt and the empty pelican.svg. "
+                          "Then use Edit to fill pelican.svg with the complete SVG drawing from the brief. "
+                          f"Set file_path to {target}, old_string to an empty string, and new_string to the complete SVG. "
+                          "Keep drawing-brief.txt unchanged. Reply when pelican.svg is saved.",
+                "tools": ["Read", "Edit"], "allowed": ["Read", "Edit"]}
     raise ValueError(f"Unknown task: {name}")
 
 
