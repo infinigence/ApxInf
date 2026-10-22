@@ -14,6 +14,9 @@ The native `runtime` object contains exactly these string fields:
 Both digest fields contain lowercase SHA-256 hexadecimal strings.
 The manifest repeats this runtime object and includes the sorted bundle artifact records.
 The service checks each artifact and runtime file digest before readiness.
+The selected library filename must be `libmlx.dylib`.
+The worker checks its loaded library path before it loads the model.
+A different loaded library prevents readiness.
 
 The manifest declares `adapter_revision=apxinf-native-minicpm5-v1`.
 Its execution object declares `provider=metal_minicpm5`, `precision=bf16`, and `variant=bf16-compiled`.

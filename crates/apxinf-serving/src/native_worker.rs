@@ -416,7 +416,11 @@ fn run(args: Args) -> Result<()> {
     {
         return Err("Unsupported native launch profile".into());
     }
-    let runtime = native_identity::runtime(&std::env::current_exe()?, &args.metal_library)?;
+    let loaded_library = std::fs::canonicalize(apxinf_mlx::loaded_library_path()?)?;
+    if loaded_library != std::fs::canonicalize(&args.metal_library)? {
+        return Err("Loaded MLX library differs from the selected runtime.".into());
+    }
+    let runtime = native_identity::runtime(&std::env::current_exe()?, &loaded_library)?;
     let manifest = native_identity::manifest(
         &args.model,
         runtime.clone(),

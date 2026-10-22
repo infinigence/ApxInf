@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 const char* apx_mlx_error(void);
+int apx_mlx_loaded_library_path(const char** out);
 int apx_mlx_stream_new(int32_t gpu, int32_t index, void** out);
 void apx_mlx_stream_free(void* stream);
 int apx_mlx_sync(void* stream);
