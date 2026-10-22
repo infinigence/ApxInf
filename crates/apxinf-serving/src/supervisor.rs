@@ -118,10 +118,10 @@ pub struct Config {
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
         if matches!(self.runtime, WorkerRuntime::NativeMiniCpm5 { .. })
-            && (self.max_context > 4096 || self.output_batch_tokens != 1)
+            && (self.max_context > 16384 || self.output_batch_tokens != 1 || self.prefill_step_size != 256)
         {
             return Err(
-                "Native MiniCPM5 requires at most 4096 positions and one token per output frame."
+                "Native MiniCPM5 requires at most 16384 positions, 256-token prefill chunks, and one token per output frame."
                     .into(),
             );
         }

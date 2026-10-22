@@ -8,8 +8,8 @@
   },
   "capabilities": {
     "text": true, "image": false, "greedy": true, "sampling": false,
-    "token_events": true, "cancel_granularity": "end_prefill_or_token",
-    "max_active_sequences": 1, "max_context": 4096, "max_output_tokens": 1024,
+    "token_events": true, "cancel_granularity": "token_or_prefill_chunk",
+    "max_active_sequences": 1, "max_context": 16384, "max_output_tokens": 1024,
     "exact_append": false, "state_schema": "none"
   },
   "cases": [
@@ -19,8 +19,10 @@
     {"name": "wrong MLX version", "set": {"/runtime/mlx": "0.32.1"}, "valid": false},
     {"name": "invalid executable digest", "set": {"/runtime/executable_sha256": "bad"}, "valid": false},
     {"name": "runtime declaration differs", "set": {"/runtime/metal_library_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}, "valid": false},
-    {"name": "unqualified context", "set": {"/capabilities/max_context": 4097}, "valid": false},
-    {"name": "false chunk cancellation claim", "set": {"/capabilities/cancel_granularity": "token_or_prefill_chunk"}, "valid": false},
+    {"name": "unqualified context", "set": {"/capabilities/max_context": 16385}, "valid": false},
+    {"name": "earlier native profile", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token", "/capabilities/max_context": 4096}, "valid": true},
+    {"name": "earlier native context overflow", "set": {"/capabilities/cancel_granularity": "end_prefill_or_token", "/capabilities/max_context": 4097}, "valid": false},
+    {"name": "unsupported cancellation claim", "set": {"/capabilities/cancel_granularity": "token"}, "valid": false},
     {"name": "unqualified sampling", "set": {"/capabilities/sampling": true}, "valid": false}
   ]
 }
