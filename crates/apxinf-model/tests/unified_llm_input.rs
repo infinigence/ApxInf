@@ -74,6 +74,61 @@ fn load_generation_config_test_model(
     Ok(LoadedModel::text(Box::new(TextOnlyModel::default())))
 }
 
+#[test]
+fn controlled_generation_stops_after_prefill_without_sampling_a_token() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut boundaries = Vec::new();
+    let output = model
+        .generate_streaming_controlled_dyn(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert!(output.tokens.is_empty());
+    assert_eq!(
+        boundaries,
+        vec![apxinf_model::GenerationBoundary::PrefillProgress { consumed_tokens: 2 }]
+    );
+    assert_eq!(model.forward_calls, vec![(vec![0, 1], 0)]);
+}
+
+#[test]
+fn controlled_generation_preserves_tokens_and_stops_before_another_decode() {
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut model = TextOnlyModel::default();
+    let request = GenerationRequest {
+        input: LlmInput::text(&[0]),
+        options: &options,
+    };
+    let baseline = model
+        .generate_streaming_with_options(request, |_| {})
+        .unwrap()
+        .token_ids();
+    let controlled = model
+        .generate_streaming_controlled_dyn(request, &mut |_| Ok(true))
+        .unwrap()
+        .token_ids();
+    assert_eq!(baseline, controlled);
+    let stopped = model
+        .generate_streaming_controlled_dyn(request, &mut |boundary| {
+            Ok(!matches!(
+                boundary,
+                apxinf_model::GenerationBoundary::Token(_)
+            ))
+        })
+        .unwrap()
+        .token_ids();
+    assert_eq!(stopped, vec![2]);
+    assert_eq!(model.forward_calls.len(), 1);
+}
+
 struct DummyVlaModel;
 
 impl VlaRuntime for DummyVlaModel {

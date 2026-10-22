@@ -518,6 +518,32 @@ impl LlmTrait for MiniCpm5 {
             .err()
             .map(|e| e.to_string());
     }
+    fn release_request_state(&mut self) -> Result<()> {
+        self.backend.stream().synchronize()?;
+        self.states.clear();
+        self.step = None;
+        self.last_taps = None;
+        self.local = None;
+        let stream = self.backend.stream();
+        self.swiglu = Compiled::with_shapeless(stream, 1, true, |a| {
+            Ok(vec![math::swiglu(&a[0], &a[1])?])
+        })?;
+        if self.variant != Variant::Public {
+            let eps = self.epsilon.clone();
+            self.local = Some(LocalMath {
+                norm: Compiled::with_shapeless(stream, 1, true, move |a| {
+                    Ok(vec![math::norm(&a[0], &a[1], &eps)?])
+                })?,
+                rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
+            });
+        }
+        self.capacity = 0;
+        self.offset = 0;
+        self.prepared_prompt = None;
+        stream.synchronize()?;
+        self.failure = None;
+        Ok(())
+    }
     fn prewarm_decode(&mut self, prompt: usize, output: usize) {
         if let Err(e) = self.prepare(prompt, output) {
             self.failure = Some(e.to_string());
