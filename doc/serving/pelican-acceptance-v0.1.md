@@ -4,7 +4,7 @@ Status: local Claude Code task definition. This task checks one P2a tool cycle a
 
 The runner creates `drawing-brief.txt` in a new task directory. Claude Code receives one instruction to read that file and create `pelican.svg`. The runner permits only the Read, Write, and Edit tools.
 
-The brief asks for an original pelican beside a harbor buoy. It requires an SVG root with `viewBox="0 0 640 480"` and a direct `<title>Pelican at the Harbor</title>` child. It asks for a visible pelican with a long beak, a pouch, a body, and feet. It also asks for water and a buoy. The drawing content remains the model's choice.
+The brief asks for an original pelican riding a bicycle. It requires an SVG root with `viewBox="0 0 640 480"` and a direct `<title>Pelican Riding a Bicycle</title>` child. It asks for a long beak, a pouch, wings, and feet on the pedals. The bicycle must have two wheels, a connected frame, a saddle, handlebars, and pedals. The pelican must sit on the saddle and reach the handlebars with a wing.
 
 The task passes only when all conditions below hold.
 
@@ -16,7 +16,7 @@ The task passes only when all conditions below hold.
 - The file has no document type, entity declaration, script, external reference, or embedded active content.
 - The file has no processing instruction other than an XML declaration.
 
-The SVG check is structural. It does not prove that the image depicts a pelican or looks good. A person must review a rendered image before visual acceptance. The report records that visual review remains pending.
+The SVG check is structural. It does not prove that the image depicts a pelican riding a bicycle. A reviewer must inspect the rendered image before visual acceptance. The report records that visual review remains pending.
 
 The runner records input token usage only when Claude Code reports it. A brief length or character count does not establish observed context use. This task makes no long-context claim.
 

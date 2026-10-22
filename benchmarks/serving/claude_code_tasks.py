@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from http_benchmark import local_url, metal_measurement_lock, metrics_snapshot, request_json
 
 
-PELICAN_TITLE = "Pelican at the Harbor"
+PELICAN_TITLE = "Pelican Riding a Bicycle"
 SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 SVG_ELEMENTS = {"svg", "title", "desc", "g", "path", "circle", "ellipse", "rect",
                 "line", "polyline", "polygon", "text", "tspan"}
@@ -84,8 +84,10 @@ def prepare_task(name, directory):
                 "tools": [], "allowed": []}
     if name == "pelican":
         (directory / "drawing-brief.txt").write_text(
-            "Draw an original pelican beside a harbor buoy. Use plain SVG shapes and colors.\n"
-            "Show a long beak, a throat pouch, a body, feet, water, and one buoy.\n"
+            "Draw an original pelican riding a bicycle. Use plain SVG shapes and colors.\n"
+            "Show a long beak, a throat pouch, a body, wings, and feet on the pedals.\n"
+            "Show two bicycle wheels, a connected frame, a saddle, handlebars, and pedals.\n"
+            "Place the pelican on the saddle with a wing reaching the handlebars.\n"
             'Use an SVG root with xmlns="http://www.w3.org/2000/svg" and viewBox="0 0 640 480".\n'
             f"Add a direct <title> child with the exact text {PELICAN_TITLE}.\n"
             "Keep the SVG self-contained. Do not use scripts, links, images, styles, or external assets.\n")
