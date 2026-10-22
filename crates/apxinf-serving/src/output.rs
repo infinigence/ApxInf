@@ -1,5 +1,13 @@
-//! Incremental output parsing for the declared Qwen text profile.
+//! Incremental output parsing for declared text profiles.
 use serde_json::{json, Map, Value};
+
+mod minicpm;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputProfile {
+    Qwen,
+    MiniCpm5,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Part {
@@ -79,6 +87,8 @@ enum Mode {
     Text,
     Thinking,
     Tool(ToolBoundary),
+    MiniOpening(minicpm::OpeningBoundary),
+    MiniTool(minicpm::ToolBoundary),
 }
 
 #[derive(Default)]
@@ -125,15 +135,21 @@ impl ToolBoundary {
 pub struct OutputParser {
     pending: String,
     mode: Mode,
+    profile: OutputProfile,
     tools: Vec<Value>,
     pub tool_count: usize,
 }
 
 impl OutputParser {
     pub fn new(tools: Vec<Value>) -> Self {
+        Self::with_profile(tools, OutputProfile::Qwen)
+    }
+
+    pub fn with_profile(tools: Vec<Value>, profile: OutputProfile) -> Self {
         Self {
             pending: String::new(),
             mode: Mode::Text,
+            profile,
             tools,
             tool_count: 0,
         }
@@ -148,7 +164,10 @@ impl OutputParser {
         loop {
             match &mut self.mode {
                 Mode::Text => {
-                    let markers = ["<tool_call>", "<think>"];
+                    let markers = match self.profile {
+                        OutputProfile::Qwen => ["<tool_call>", "<think>"],
+                        OutputProfile::MiniCpm5 => ["<function name=\"", "<think>"],
+                    };
                     let found = markers
                         .iter()
                         .filter_map(|m| self.pending.find(m).map(|i| (i, *m)))
@@ -158,10 +177,15 @@ impl OutputParser {
                             parts.push(Part::Text(self.pending[..i].to_owned()));
                         }
                         self.pending.drain(..i + marker.len());
-                        self.mode = if marker == markers[0] {
-                            Mode::Tool(ToolBoundary::default())
-                        } else {
+                        self.mode = if marker == markers[1] {
                             Mode::Thinking
+                        } else {
+                            match self.profile {
+                                OutputProfile::Qwen => Mode::Tool(ToolBoundary::default()),
+                                OutputProfile::MiniCpm5 => {
+                                    Mode::MiniOpening(minicpm::OpeningBoundary::default())
+                                }
+                            }
                         };
                     } else {
                         let keep = if last {
@@ -191,6 +215,37 @@ impl OutputParser {
                     if let Some(i) = boundary.find_end(&self.pending) {
                         let (name, input) = parse_tool(&self.pending[..i], &self.tools)?;
                         self.pending.drain(..i + "</tool_call>".len());
+                        parts.push(Part::Tool {
+                            id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
+                            name,
+                            input,
+                        });
+                        self.tool_count += 1;
+                        self.mode = Mode::Text;
+                    } else {
+                        break;
+                    }
+                }
+                Mode::MiniOpening(boundary) => match boundary.check(&self.pending) {
+                    minicpm::Opening::Complete => {
+                        self.mode = Mode::MiniTool(minicpm::ToolBoundary::default());
+                    }
+                    minicpm::Opening::Invalid => {
+                        parts.push(Part::Text("<function name=\"".into()));
+                        self.mode = Mode::Text;
+                    }
+                    minicpm::Opening::Incomplete if last => {
+                        parts.push(Part::Text(format!("<function name=\"{}", self.pending)));
+                        self.pending.clear();
+                        self.mode = Mode::Text;
+                        break;
+                    }
+                    minicpm::Opening::Incomplete => break,
+                },
+                Mode::MiniTool(boundary) => {
+                    if let Some(i) = boundary.find_end(&self.pending) {
+                        let (name, input) = minicpm::parse_tool(&self.pending[..i], &self.tools)?;
+                        self.pending.drain(..i + "</function>".len());
                         parts.push(Part::Tool {
                             id: format!("toolu_{}", uuid::Uuid::new_v4().simple()),
                             name,
@@ -392,6 +447,17 @@ mod tests {
             .is_err());
         let mut p = OutputParser::new(vec![]);
         assert!(p.push("<tool_call>{", true).is_err());
+    }
+
+    #[test]
+    fn default_profile_leaves_minicpm_calls_as_text() {
+        let output = "<function name=\"Read\"><param name=\"file_path\">x</param></function>";
+        let mut parser = OutputParser::new(vec![]);
+        assert_eq!(
+            parser.push(output, true).unwrap(),
+            vec![Part::Text(output.into())]
+        );
+        assert_eq!(parser.tool_count, 0);
     }
 
     fn typed_parameter_tools() -> Vec<Value> {
