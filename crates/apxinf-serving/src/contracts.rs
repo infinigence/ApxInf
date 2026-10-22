@@ -1,5 +1,3 @@
-//! Handwritten wire checks for the serial apxinf-worker/2.0 profile.
-
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
@@ -462,7 +460,7 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Check a frame against the serial profile without changing the frame.
+/// Check a frame against its selected worker protocol without changing the frame.
 pub fn validate_frame(frame: &Value) -> Result<()> {
     tree(frame, 1, false)?;
     object(frame)?;
@@ -1166,6 +1164,7 @@ pub struct AttemptTracker {
     key: (String, String, u64),
     input_tokens: u64,
     max_tokens: u64,
+    source_media_bytes: Option<u64>,
     leases: BTreeSet<String>,
     pub next_seq: u64,
     pub output_tokens: u64,
@@ -1186,6 +1185,18 @@ impl AttemptTracker {
             ),
             input_tokens: submit["token_ids"].as_array().unwrap().len() as u64,
             max_tokens: submit["max_tokens"].as_u64().unwrap(),
+            source_media_bytes: if submit["protocol"] == VISION_PROTOCOL {
+                Some(
+                    submit["replay"]["media"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|source| source["byte_count"].as_u64().unwrap())
+                        .sum(),
+                )
+            } else {
+                None
+            },
             leases: leases(&submit["capacity_lease_ids"])?,
             next_seq: 0,
             output_tokens: 0,
@@ -1248,6 +1259,12 @@ impl AttemptTracker {
                         == Some(self.input_tokens + output),
                     "history count mismatch",
                 )?;
+                if let Some(source_bytes) = self.source_media_bytes {
+                    require(
+                        event["metrics"]["source_media_bytes"].as_u64() == Some(source_bytes),
+                        "terminal source media byte count mismatch",
+                    )?;
+                }
                 require(
                     output != 0 || event["metrics"]["ttft_ns"].as_u64() == Some(0),
                     "empty output must have zero TTFT",
@@ -1547,7 +1564,11 @@ mod tests {
 
     fn check_event_transcripts(corpus: &Value) {
         for case in corpus["stream_cases"].as_array().unwrap() {
-            let mut tracker = AttemptTracker::new(&corpus["templates"]["submit"]).unwrap();
+            let submit = case.get("submit").map_or_else(
+                || corpus["templates"]["submit"].clone(),
+                |selected| fixture(corpus, selected),
+            );
+            let mut tracker = AttemptTracker::new(&submit).unwrap();
             let mut failure = None;
             for (index, selected) in case["events"].as_array().unwrap().iter().enumerate() {
                 let before = format!("{tracker:?}");
