@@ -41,6 +41,13 @@ pub fn execution(context: usize, output: usize, memory: u64) -> Value {
         "max_output_tokens":output, "memory_limit_bytes":memory})
 }
 
+pub fn sampled_execution(context: usize, output: usize, memory: u64) -> Value {
+    let mut value = execution(context, output, memory);
+    value["sampling"] = json!({"algorithm":"apxinf-cpu-categorical-v1",
+        "temperature":"1", "top_p":"0.95", "seed_policy":"request-id-sha256-v1"});
+    value
+}
+
 pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value, String> {
     let mut entries = std::fs::read_dir(model)
         .map_err(|e| e.to_string())?
@@ -59,7 +66,58 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
         }
         artifacts.push(json!({"path":path.file_name().and_then(|v|v.to_str()).ok_or("Invalid artifact name.")?, "size_bytes":size, "sha256":sha256}));
     }
+    let adapter_revision = if execution.get("sampling").is_some() {
+        "apxinf-native-minicpm5-sampled-v1"
+    } else {
+        "apxinf-native-minicpm5-v1"
+    };
     Ok(
-        json!({"artifacts":artifacts, "runtime":runtime, "execution":execution, "adapter_revision":"apxinf-native-minicpm5-v1"}),
+        json!({"artifacts":artifacts, "runtime":runtime, "execution":execution,
+        "adapter_revision":adapter_revision}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampled_identity_adds_only_the_declared_policy() {
+        let greedy = execution(16384, 1024, 9000000000);
+        let mut sampled = sampled_execution(16384, 1024, 9000000000);
+        assert_eq!(
+            sampled.as_object_mut().unwrap().remove("sampling"),
+            Some(json!({
+                "algorithm":"apxinf-cpu-categorical-v1", "temperature":"1", "top_p":"0.95",
+                "seed_policy":"request-id-sha256-v1"
+            }))
+        );
+        assert_eq!(sampled, greedy);
+        assert_eq!(greedy["enable_thinking"], false);
+        assert_eq!(greedy["precision"], "bf16");
+        assert_eq!(greedy["variant"], "bf16-compiled");
+    }
+
+    #[test]
+    fn manifest_revision_and_digest_follow_sampling_identity() {
+        let model = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/serving/native-tokenizer"
+        ));
+        let greedy = manifest(model, json!({}), execution(16384, 1024, 9000000000)).unwrap();
+        let sampled =
+            manifest(model, json!({}), sampled_execution(16384, 1024, 9000000000)).unwrap();
+        assert_eq!(greedy["adapter_revision"], "apxinf-native-minicpm5-v1");
+        assert_eq!(
+            sampled["adapter_revision"],
+            "apxinf-native-minicpm5-sampled-v1"
+        );
+        assert_eq!(greedy["artifacts"], sampled["artifacts"]);
+        assert_ne!(
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &greedy)
+                .unwrap(),
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &sampled)
+                .unwrap()
+        );
+    }
 }
