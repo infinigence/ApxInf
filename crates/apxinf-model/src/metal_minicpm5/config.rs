@@ -2,7 +2,7 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-pub const CONTEXT_CAPACITY: usize = 4096;
+pub const CONTEXT_CAPACITY: usize = 16384;
 pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
 pub const PREFILL_CHUNK_TOKENS: usize = 256;
 
@@ -46,7 +46,7 @@ impl Config {
                 self.head_dim,
                 self.vocab_size,
             ) != (2048, 6144, 42, 16, 2, 128, 130560)
-            || self.max_position_embeddings < CONTEXT_CAPACITY
+            || self.max_position_embeddings < DSPARK_CONTEXT_CAPACITY
             || self.rms_norm_eps != 1e-6
             || self.rope_theta != 5_000_000.0
             || self.tie_word_embeddings
@@ -56,6 +56,16 @@ impl Config {
         {
             return Err(Error::Other(
                 "MiniCPM5 MLX supports the official 2B BF16 geometry, unscaled NeoX RoPE and untied head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_variant(&self, variant: Variant) -> Result<()> {
+        self.validate()?;
+        if self.max_position_embeddings < variant.context_capacity() {
+            return Err(Error::Contract(
+                "MiniCPM checkpoint positions do not cover the selected variant",
             ));
         }
         Ok(())
@@ -180,6 +190,23 @@ mod tests {
             assert_eq!(variant.request_capacity(256, 1).unwrap(), 512);
         }
         assert_eq!(Variant::DSpark.context_capacity(), 4096);
+        assert_eq!(Variant::Compiled.context_capacity(), 16384);
+        assert_eq!(Variant::Public.context_capacity(), 16384);
+        assert!(Variant::Compiled.request_capacity(32767, 1).is_err());
+    }
+
+    #[test]
+    fn checkpoint_positions_must_cover_the_selected_variant() {
+        let mut c = config();
+        c.max_position_embeddings = 4096;
+        assert!(c.validate_variant(Variant::DSpark).is_ok());
+        assert!(c.validate_variant(Variant::Public).is_err());
+        assert!(c.validate_variant(Variant::Compiled).is_err());
+        c.max_position_embeddings = 16384;
+        assert!(c.validate_variant(Variant::Public).is_ok());
+        assert!(c.validate_variant(Variant::Compiled).is_ok());
+        c.max_position_embeddings = 4095;
+        assert!(c.validate_variant(Variant::DSpark).is_err());
     }
 
     #[test]
