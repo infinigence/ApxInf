@@ -67,6 +67,8 @@ A vision model requires a separate declared provider and interface qualification
 The [real client image probe](minicpm-vision-transport-validation-20261023.md) shows that Read returns PNG bytes in a Messages tool result.
 The current gateway rejects that result before worker preparation.
 Visual feedback therefore requires explicit serving media support as well as a vision model.
+The [separate vision candidate](minicpm-vision-probe-validation-20261023.md) describes the failed PNG and distinguishes an original control image.
+Those direct observations do not qualify a serving profile or the real Claude revision loop.
 KV reuse remains lower priority than these task gates.
 
 ## Baseline gaps and acceptance order
