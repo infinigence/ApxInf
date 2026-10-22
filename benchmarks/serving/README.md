@@ -157,6 +157,19 @@ An explicitly selected native model-thinking deployment still enables its model 
 Its output allowance includes hidden reasoning tokens.
 The `--max-tokens` option limits request output. It does not declare model capabilities in client metadata.
 
+Claude Code 2.1.289 can count hidden output usage as retained context and block a later request locally.
+For this version, `--acceptance-claude-context-compat` enables a separate acceptance mode.
+The runner verifies the client version and requires a positive deployment context limit from readiness.
+It sets the internal `CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE` to the effective client window.
+The report records the version, deployment window, effective window, and threshold.
+The default mode does not set this override.
+
+This control is an undocumented client test hook, not a stable public interface.
+The compatibility mode supports only bounded loopback acceptance runs.
+It does not change model capacity, requested output, or reported usage.
+The service still rejects an exact prepared input plus output allowance above its context limit.
+The mode does not provide automatic compaction or indefinite sessions.
+
 Anthropic does not officially support Claude Code with non-Claude models.
 These tasks measure observed behavior with the installed client version.
 They do not establish complete Claude Code compatibility.
