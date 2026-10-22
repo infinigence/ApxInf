@@ -308,7 +308,7 @@ fn capabilities(value: &Value, native: bool) -> Result<()> {
     choice(
         &value["cancel_granularity"],
         if native {
-            &["end_prefill_or_token"]
+            &["end_prefill_or_token", "token_or_prefill_chunk"]
         } else {
             &["token", "token_or_prefill_chunk"]
         },
@@ -317,7 +317,9 @@ fn capabilities(value: &Value, native: bool) -> Result<()> {
     integer(
         &value["max_context"],
         1,
-        if native { 4096 } else { MAX_PROMPT_TOKENS },
+        if native {
+            if value["cancel_granularity"] == "token_or_prefill_chunk" { 16384 } else { 4096 }
+        } else { MAX_PROMPT_TOKENS },
     )?;
     integer(&value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
     choice(&value["state_schema"], &["none"])
@@ -1105,6 +1107,9 @@ mod tests {
             for (pointer, value) in case["set"].as_object().unwrap() {
                 *frame.pointer_mut(pointer).unwrap() = value.clone();
             }
+            frame["capability_revision"] = canonical_identity_digest(
+                "apxinf-capability-v1", &frame["capabilities"],
+            ).unwrap().into();
             assert_eq!(
                 validate_frame(&frame).is_ok(),
                 case["valid"].as_bool().unwrap(),

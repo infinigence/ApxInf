@@ -26,8 +26,10 @@ Its `memory_limit_bytes`, `max_context`, and `max_output_tokens` match the launc
 ## Capabilities and preparation
 
 The capability fields retain their 2.0 meanings.
-The native cancellation granularity is `end_prefill_or_token`.
-The native context limit must not exceed 4096 positions.
+The native worker declares `token_or_prefill_chunk` cancellation with 256-token prefill chunks.
+This candidate permits at most 16384 positions.
+Long-context acceptance requires the separate quality and memory gates in the context profile.
+Validators also accept earlier 2.1 workers with `end_prefill_or_token` and at most 4096 positions.
 Only one greedy text sequence can execute.
 The worker does not support state reuse, image input, or sampling.
 
@@ -41,7 +43,8 @@ The worker must not emit EOS text.
 
 ## Controlled execution and settlement
 
-`GenerationBoundary` identifies completed prefill progress or an emitted token.
+`GenerationBoundary` identifies prefill start, completed prefill progress, or an emitted token.
+Prefill start checks controls without emitting a progress frame.
 A callback returns false to stop generation at that boundary.
 The existing generation wrapper always continues through this callback.
 The worker checks controls before generation and at each boundary.
