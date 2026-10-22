@@ -14,6 +14,8 @@ The public profile is `apxinf-native-bounded-thinking-v0.1`.
 The deployment retains the [thinking profile](native-thinking-v0.1.md) model, precision, context, and execution limits.
 The initial reasoning budget is 512 generated tokens.
 Prompt tokens do not consume this budget.
+The budget constrains only the initial delimited prefix.
+It does not classify later public text or guarantee useful final content.
 The closing token consumes one additional position within the existing output allowance.
 This profile adds no request setting for the initial reasoning budget.
 

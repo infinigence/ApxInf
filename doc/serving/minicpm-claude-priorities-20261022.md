@@ -1,6 +1,6 @@
 # MiniCPM and Claude Code priorities
 
-Status: active acceptance plan, 2026-10-22. This document records the selected workload and its remaining gates.
+Status: active acceptance plan, updated 2026-10-23. This document records the selected workload and its remaining gates.
 
 The [serving contract](contracts-v0.1.md) remains authoritative. The [implementation plan](implementation-plan.md) defines the full roadmap. This workload prioritizes stateless P1a and P2a. It does not require all roadmap features.
 
@@ -43,10 +43,14 @@ It retained the failed drawing unchanged.
 | MC-01. Recognizable pelican and bicycle. | The real client produces a visually accepted SVG through actual tools. |
 | MC-02. Literal Edit parameters and error recovery. | The model repairs a failed Edit and checks the file after its final successful change. |
 | MC-03. Strict JSON in long context. | The model returns the expected facts without Markdown fences or schema errors. |
-| MC-04. Client output reservation and portability. | A 4096-token output candidate completes under the default client policy without the private compatibility hook. |
+| MC-04. Client output reservation and portability. | Longer tool conversations complete without the private blocking-limit override. |
 
-The 4096-token candidate retains the separate 512-token initial reasoning budget.
-It has no accepted result yet.
+The [4096-token default-policy run](minicpm-default-context-validation-20261023.md) retains the separate 512-token initial reasoning budget.
+Its short Read and Edit cycle completes without the private blocking-limit override.
+The model recovers from two path errors, but its drawing fails visual acceptance.
+This result does not qualify literal Edit recovery or arbitrary long sessions.
+A direct request without Claude or tools exhausts 4096 output tokens and returns no usable drawing.
+Tool mediation alone therefore does not explain the task failures.
 The current MiniCPM5-2B profile remains text-only and rejects image input.
 A vision model requires a separate declared provider and interface qualification.
 KV reuse remains lower priority than these task gates.
