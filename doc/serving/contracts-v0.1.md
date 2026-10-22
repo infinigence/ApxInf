@@ -253,6 +253,8 @@ The later vision variant contains tokens and owned media descriptors.
 Each descriptor defines content identity, format, shape, position, byte count, and lifetime.
 The vision adapter defines the effective input count.
 P2c must define that descriptor schema before implementation.
+The [owned PNG source contract](owned-media-v0.1.md) defines the standalone source component.
+It does not define the complete vision prepared input or enable a vision protocol.
 
 **IN-01.** One `PromptAdapter` must produce the authoritative input for each request.
 
