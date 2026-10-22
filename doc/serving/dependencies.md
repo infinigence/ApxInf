@@ -39,6 +39,22 @@ The diagnostic module uses Rust standard library threads, bounded channels, atom
 Tokio reads worker stderr through a separate pipe with bounded chunks.
 These calls add no package dependency and do not change the worker protocol.
 
+## Owned PNG sources
+
+The standalone [owned PNG component](owned-media-v0.1.md) adds these Rust dependencies:
+
+| Dependency | Exact version | Public API and role | Replacement boundary |
+| --- | --- | --- | --- |
+| `base64` | `0.22.1` | `Engine::decode`, `Engine::encode` for canonical source encoding | `owned_media.rs` |
+| `crc32fast` | `1.5.0` | `hash` for every PNG chunk, including `IEND` | `owned_media.rs` |
+| `flate2` | `1.1.10` | `Decompress` for bounded output and complete zlib stream checks | `owned_media.rs` |
+| `png` | `0.18.0` | Bounded `Decoder`, `Reader::next_frame`, and `Reader::finish` for pixel decoding | `owned_media.rs` |
+
+The paired Python component calls standard-library base64, hashlib, and zlib APIs.
+It also calls `Image.open`, `verify`, and `load` from the existing Pillow dependency.
+The component imports no MLX module and enables no worker protocol or image capability.
+`Cargo.lock` retains the resolved decoder dependencies and the existing base64 0.13.1 record.
+
 ## Host pressure sensor
 
 The macOS policy calls the system `sysctlbyname` C interface without an additional package dependency.
