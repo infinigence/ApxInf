@@ -9,6 +9,7 @@ import struct
 from typing import Any
 
 PROTOCOL = "apxinf-worker/2.0"
+VISION_PROTOCOL = "apxinf-worker/2.5"
 NATIVE_PROTOCOL = "apxinf-worker/2.1"
 NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
 NATIVE_THINKING_PROTOCOL = "apxinf-worker/2.3"
@@ -124,12 +125,16 @@ def _error(value: Any) -> None:
     _enum(value["state_validity"], {"unchanged", "committed", "invalid", "none"})
 
 
-def _messages(messages: Any, tools: Any) -> None:
+def _messages(messages: Any, tools: Any, vision: bool = False) -> None:
+    images = []
     _require(type(messages) is list and 1 <= len(messages) <= 256, "invalid messages array")
     for message in messages:
         _keys(message, {"role", "content"}, {"tool_call_id", "name", "tool_calls"})
         _enum(message["role"], {"system", "user", "assistant", "tool"})
-        _str(message["content"])
+        if vision:
+            _vision_content(message["content"], message["role"], images)
+        else:
+            _str(message["content"])
         for key in ("tool_call_id", "name"):
             if key in message:
                 _str(message[key])
@@ -143,6 +148,8 @@ def _messages(messages: Any, tools: Any) -> None:
                 _keys(call["function"], {"name", "arguments"})
                 _str(call["function"]["name"])
                 _require(type(call["function"]["arguments"]) in (dict, str), "invalid tool arguments")
+    if vision:
+        _vision_media(images)
     _require(type(tools) is list and len(tools) <= 256, "invalid tools array")
     for tool in tools:
         _keys(tool, {"type", "function"})
@@ -176,9 +183,137 @@ def _sampling(value: Any) -> None:
 
 def _submit_fields(frame: dict) -> set[str]:
     fields = {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}
-    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL):
+    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL):
         fields.add("sampling")
+    if frame["protocol"] == VISION_PROTOCOL:
+        fields.add("replay")
     return fields
+
+
+def _vision_media(value: Any) -> None:
+    if __package__:
+        from .owned_media import MediaBatch, MediaError
+    else:
+        from owned_media import MediaBatch, MediaError
+    try:
+        MediaBatch.from_descriptors(value)
+    except MediaError as error:
+        raise ContractError(str(error)) from error
+
+
+def _vision_content(value: Any, role: str, images: list) -> None:
+    if type(value) is str:
+        _str(value)
+        return
+    _enum(role, {"user", "tool"})
+    _require(type(value) is list and 1 <= len(value) <= 256, "invalid content array")
+    for part in value:
+        _require(type(part) is dict, "expected content part")
+        _enum(part.get("type"), {"text", "image"})
+        if part["type"] == "text":
+            _keys(part, {"type", "text"})
+            _str(part["text"])
+        else:
+            _keys(part, {"type", "media"})
+            images.append(part["media"])
+
+
+def _vision_ready(frame: dict) -> None:
+    runtime = {"python": "3.14.3", "mlx": "0.32.4", "mlx_vlm": "0.7.10", "transformers": "5.18.0"}
+    _require(frame["runtime"] == runtime, "unsupported vision runtime")
+    manifest = frame["model_manifest"]
+    _require(manifest.get("runtime") == runtime
+             and manifest.get("checkpoint") == "openbmb/MiniCPM-V-4.7-1B"
+             and manifest.get("checkpoint_revision") == "379f120c2ff3588e6e06559ec6b9ec15cc05114e"
+             and manifest.get("adapter_revision") == "apxinf-mlx-minicpmv47-vision-v1",
+             "unsupported vision identity")
+    _require(type(manifest.get("processor")) is dict, "expected processor identity")
+    _require(manifest.get("processor_revision") == canonical_identity_digest("apxinf-vision-processor-v1", manifest["processor"]), "processor revision mismatch")
+    artifacts = manifest.get("artifacts")
+    _require(type(artifacts) is list and 1 <= len(artifacts) <= MAX_PROMPT_TOKENS, "invalid artifacts")
+    previous = ""
+    weights = False
+    for artifact in artifacts:
+        _keys(artifact, {"path", "size_bytes", "sha256"})
+        path = artifact["path"]
+        _str(path)
+        _require(path > previous and not path.startswith("/") and all(part not in {"", ".", ".."} for part in path.split("/")), "invalid artifact path order")
+        previous = path
+        _int(artifact["size_bytes"])
+        _digest(artifact["sha256"])
+        if path == "model.safetensors":
+            _require(artifact["size_bytes"] == 3109054480 and artifact["sha256"] == "8c4921ac83182c85190ad10c3aeb118d51e385d2d98ec13b88b514bbf6cac002", "vision weight identity mismatch")
+            weights = True
+    _require(weights, "missing vision weight identity")
+    execution = manifest.get("execution")
+    _keys(execution, {"provider", "precision", "enable_thinking", "kv_reuse", "max_context", "max_output_tokens", "prefill_step_size", "output_batch_tokens", "memory_limit_bytes", "selection"})
+    _require(execution["provider"] == "mlx-vlm-minicpmv47" and execution["precision"] == "bf16"
+             and execution["enable_thinking"] is False and execution["kv_reuse"] is False,
+             "unsupported vision execution")
+    _int(execution["prefill_step_size"], 256, 256)
+    _int(execution["output_batch_tokens"], 1, 1)
+    _int(execution["memory_limit_bytes"], 1)
+    _int(execution["max_context"], 1, 16384)
+    _int(execution["max_output_tokens"], 0, 8192)
+    selection = execution["selection"]
+    _require(selection == {"algorithm": "mlx-vlm-fixed-controls-v1", "top_k": 100, "min_p": "0", "repetition_penalty": "1.03", "repetition_context_size": 8192, "presence_penalty": "0", "frequency_penalty": "0", "seed_policy": "request-id-sha256-v1"}, "unsupported vision selection")
+    _int(selection["top_k"], 100, 100)
+    _int(selection["repetition_context_size"], 8192, 8192)
+    caps = frame["capabilities"]
+    _keys(caps, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema", "media_limits"})
+    for key, expected in {"text": True, "image": True, "greedy": True, "sampling": True, "token_events": True, "exact_append": False}.items():
+        _require(caps[key] is expected, "unsupported vision capability")
+    _require(caps["cancel_granularity"] == "yield_or_process_exit" and caps["state_schema"] == "none", "unsupported vision lifecycle")
+    _int(caps["max_active_sequences"], 1, 1)
+    for key in ("max_context", "max_output_tokens"):
+        _int(caps[key])
+        _require(caps[key] == execution[key], "vision capability bound mismatch")
+    _require(caps["media_limits"] == {"max_images": 4, "max_image_bytes": 131072, "max_total_bytes": 262144, "max_dimension": 1024, "max_host_array_bytes": 67108864}, "unsupported vision media limits")
+    for value in caps["media_limits"].values():
+        _int(value)
+    _int(frame["vocab_size"], 248057, 2_147_483_648)
+
+
+def _vision_replay(frame: dict) -> None:
+    replay = frame.get("replay")
+    _keys(replay, {"worker_epoch", "model_revision", "capability_revision", "preparation_id", "rendered_prompt", "processor_revision", "processing_digest", "media", "image_bindings", "host_array_bytes"})
+    _uuid(replay["worker_epoch"])
+    _digest(replay["model_revision"])
+    _digest(replay["capability_revision"])
+    _require(replay["worker_epoch"] == frame["worker_epoch"] and replay["model_revision"] == frame["model_revision"], "replay identity mismatch")
+    _require(frame["kind"] != "submit" or replay["capability_revision"] == frame["capability_revision"], "replay capability mismatch")
+    _uuid(replay["preparation_id"])
+    _require((replay["preparation_id"] == frame["command_id"]) == (frame["kind"] == "prepared_input"), "invalid replay command identity")
+    _str(replay["rendered_prompt"])
+    _require(len(replay["rendered_prompt"].encode("utf-8")) <= 131072, "rendered prompt exceeds byte limit")
+    _digest(replay["processor_revision"])
+    _digest(replay["processing_digest"])
+    _int(replay["host_array_bytes"], 0, 67108864)
+    _vision_media(replay["media"])
+    bindings = replay["image_bindings"]
+    _require(type(bindings) is list and len(bindings) == len(replay["media"]), "image binding count mismatch")
+    ids = frame["token_ids"]
+    _tokens(ids, 16384, 1)
+    previous = 0
+    for index, binding in enumerate(bindings):
+        _keys(binding, {"source_index", "token_start", "token_end", "pixel_shape", "target_size"})
+        _int(binding["source_index"], index, index)
+        start, end = binding["token_start"], binding["token_end"]
+        _int(start, previous, len(ids))
+        _int(end, start + 1, len(ids))
+        _require(end - start <= 1024 and all(token != 248056 for token in ids[previous:start]) and all(token == 248056 for token in ids[start:end]), "image token correspondence mismatch")
+        previous = end
+        target = binding["target_size"]
+        _require(type(target) is list and len(target) == 2, "invalid target size")
+        for dimension in target:
+            _int(dimension, 1, 1024)
+        height, width = target
+        _require(height * width <= 4096, "image target exceeds layout limit")
+        shape = binding["pixel_shape"]
+        _require(type(shape) is list and len(shape) == 3, "invalid pixel shape")
+        for value, expected in zip(shape, (3, 14, 14 * height * width)):
+            _int(value, expected, expected)
+    _require(all(token != 248056 for token in ids[previous:]), "unbound image token")
 
 
 def _capabilities(value: Any, native: bool = False, sampled: bool = False) -> None:
@@ -204,7 +339,7 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
@@ -230,7 +365,8 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
+    vision = frame["protocol"] == VISION_PROTOCOL
     bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
     thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL or bounded
     sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL or thinking
@@ -256,7 +392,14 @@ def validate_frame(frame: dict) -> None:
                          execution.get("output_policy") == "minicpm5-initial-thinking-fixed512-v1"
                          or "initial_reasoning" in execution)),
                      "bounded thinking identity requires protocol 2.4")
-        _capabilities(frame["capabilities"], native, sampled)
+        if vision:
+            _vision_ready(frame)
+        else:
+            execution = manifest.get("execution")
+            _require(manifest.get("adapter_revision") != "apxinf-mlx-minicpmv47-vision-v1"
+                     and not (type(execution) is dict and execution.get("provider") == "mlx-vlm-minicpmv47"),
+                     "vision identity requires protocol 2.5")
+            _capabilities(frame["capabilities"], native, sampled)
         _keys(frame["limits"], {"max_frame_bytes", "max_depth", "max_commands"})
         _require(frame["limits"] == {"max_frame_bytes": MAX_FRAME_BYTES, "max_depth": MAX_DEPTH, "max_commands": MAX_COMMANDS}, "incompatible transport limits")
         for value in frame["limits"].values():
@@ -298,7 +441,7 @@ def validate_frame(frame: dict) -> None:
                              "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1",
                              "top_p": "0.95", "seed_policy": "request-id-sha256-v1",
                          }, "unsupported native sampling identity")
-        else:
+        elif not vision:
             _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
         for value in frame["runtime"].values():
             _str(value)
@@ -317,13 +460,14 @@ def validate_frame(frame: dict) -> None:
     elif kind == "prepare_input":
         _keys(frame, COMMAND | {"model_revision", "messages", "tools", "template_options"})
         _digest(frame["model_revision"])
-        _messages(frame["messages"], frame["tools"])
+        _messages(frame["messages"], frame["tools"], vision)
         _keys(frame["template_options"], {"enable_thinking"})
+        _require(not vision or frame["template_options"]["enable_thinking"] is False, "vision preparation disables thinking")
         _require(type(frame["template_options"]["enable_thinking"]) is bool, "enable_thinking must be Boolean")
         _require(not thinking or frame["template_options"]["enable_thinking"] is True,
                  "protocol 2.4 requires thinking preparation" if bounded else "protocol 2.3 requires thinking preparation")
     elif kind == "prepared_input":
-        _keys(frame, COMMAND | {"model_revision", "token_ids", "effective_input_tokens", "prompt_digest"})
+        _keys(frame, COMMAND | {"model_revision", "token_ids", "effective_input_tokens", "prompt_digest"} | ({"replay"} if vision else set()))
         _digest(frame["model_revision"])
         _tokens(frame["token_ids"], MAX_PROMPT_TOKENS, 1)
         _int(frame["effective_input_tokens"], 1, MAX_PROMPT_TOKENS)
@@ -331,7 +475,7 @@ def validate_frame(frame: dict) -> None:
         _require(frame["prompt_digest"] == token_prefix_digest(frame["token_ids"]), "prepared input digest mismatch")
     elif kind == "submit":
         _keys(frame, REQUEST_COMMAND | _submit_fields(frame))
-        if sampled:
+        if sampled or vision:
             _sampling(frame["sampling"])
         _digest(frame["model_revision"])
         _digest(frame["capability_revision"])
@@ -357,7 +501,7 @@ def validate_frame(frame: dict) -> None:
         _error(frame["error"])
     elif kind == "prefill_progress":
         _keys(frame, EVENT | {"consumed_tokens"})
-        _int(frame["consumed_tokens"], 0, MAX_PROMPT_TOKENS)
+        _int(frame["consumed_tokens"], 0, 0 if vision else MAX_PROMPT_TOKENS)
     elif kind == "tokens":
         _keys(frame, EVENT | {"output_index", "token_ids", "text_delta"})
         _int(frame["output_index"], 0, MAX_OUTPUT_TOKENS)
@@ -376,9 +520,12 @@ def validate_frame(frame: dict) -> None:
         _keys(frame["state_result"], {"validity", "consumed_position", "history_count"})
         _enum(frame["state_result"]["validity"], {"none"})
         _int(frame["state_result"]["history_count"])
-        _int(frame["state_result"]["consumed_position"], 0, frame["state_result"]["history_count"])
+        if vision:
+            _require(frame["state_result"]["consumed_position"] is None, "vision consumed position must be null")
+        else:
+            _int(frame["state_result"]["consumed_position"], 0, frame["state_result"]["history_count"])
         _str(frame["text_delta"])
-        _counts(frame["metrics"], {"elapsed_ns", "ttft_ns", "peak_memory_bytes"})
+        _counts(frame["metrics"], {"elapsed_ns", "ttft_ns", "peak_memory_bytes"} | ({"source_media_bytes", "peak_host_array_bytes"} if vision else set()))
         _require(frame["metrics"]["ttft_ns"] <= frame["metrics"]["elapsed_ns"], "TTFT exceeds elapsed time")
     elif kind == "resources_released":
         _keys(frame, EVENT | {"released_lease_ids", "retained_lease_ids"})
@@ -403,6 +550,13 @@ def validate_frame(frame: dict) -> None:
         _keys(frame, BASE)
     else:
         raise ContractError("unknown frame kind")
+    if vision and kind in {"prepared_input", "submit"}:
+        _vision_replay(frame)
+        if kind == "submit":
+            _int(frame["max_tokens"], 0, 8192)
+    if vision and kind == "terminal":
+        _int(frame["metrics"]["source_media_bytes"], 0, 262144)
+        _int(frame["metrics"]["peak_host_array_bytes"], 0, 67108864)
 
 
 def _pairs(pairs: list[tuple[str, Any]]) -> dict:

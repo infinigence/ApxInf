@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
+mod vision;
+
+pub const VISION_PROTOCOL: &str = "apxinf-worker/2.5";
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
 pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
@@ -223,7 +226,8 @@ fn error_record(value: &Value) -> Result<()> {
         &["unchanged", "committed", "invalid", "none"],
     )
 }
-fn messages(value: &Value, tool_values: &Value) -> Result<()> {
+fn messages(value: &Value, tool_values: &Value, vision: bool) -> Result<()> {
+    let mut images = Vec::new();
     for message in array(value, 1, 256)? {
         fields(
             message,
@@ -232,7 +236,11 @@ fn messages(value: &Value, tool_values: &Value) -> Result<()> {
             &["tool_call_id", "name", "tool_calls"],
         )?;
         choice(&message["role"], &["system", "user", "assistant", "tool"])?;
-        string(&message["content"])?;
+        if vision {
+            vision::content(&message["content"], &message["role"], &mut images)?;
+        } else {
+            string(&message["content"])?;
+        }
         for key in ["tool_call_id", "name"] {
             if let Some(value) = message.get(key) {
                 string(value)?;
@@ -252,6 +260,9 @@ fn messages(value: &Value, tool_values: &Value) -> Result<()> {
                 )?;
             }
         }
+    }
+    if vision {
+        vision::media(&Value::Array(images))?;
     }
     for tool in array(tool_values, 0, 256)? {
         fields(tool, &[], &["type", "function"], &[])?;
@@ -304,7 +315,8 @@ fn sampling(value: &Value) -> Result<()> {
 fn submit_fields(frame: &Value) -> Result<()> {
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
         || frame["protocol"] == NATIVE_THINKING_PROTOCOL
-        || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL;
+        || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+        || frame["protocol"] == VISION_PROTOCOL;
     fields(
         frame,
         REQUEST,
@@ -317,11 +329,21 @@ fn submit_fields(frame: &Value) -> Result<()> {
             "eos_token_ids",
             "capacity_lease_ids",
         ],
-        if sampled { &["sampling"] } else { &[] },
+        if frame["protocol"] == VISION_PROTOCOL {
+            &["sampling", "replay"]
+        } else if sampled {
+            &["sampling"]
+        } else {
+            &[]
+        },
     )?;
     require(
         !sampled || frame.get("sampling").is_some(),
         "missing sampling policy",
+    )?;
+    require(
+        frame["protocol"] != VISION_PROTOCOL || frame.get("replay").is_some(),
+        "missing vision replay",
     )
 }
 
@@ -405,7 +427,8 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
-            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL,
+            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+            || frame["protocol"] == VISION_PROTOCOL,
         "unsupported protocol",
     )?;
     uuid(&frame["worker_epoch"])?;
@@ -448,9 +471,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
-            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL,
+            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+            || frame["protocol"] == VISION_PROTOCOL,
         "unsupported protocol",
     )?;
+    let vision = frame["protocol"] == VISION_PROTOCOL;
     let bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL;
     let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL || bounded;
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL || thinking;
@@ -497,7 +522,16 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     "bounded thinking identity requires protocol 2.4",
                 )?;
             }
-            capabilities(&frame["capabilities"], native, sampled)?;
+            if vision {
+                vision::ready(frame)?;
+            } else {
+                require(
+                    manifest["adapter_revision"] != "apxinf-mlx-minicpmv47-vision-v1"
+                        && manifest["execution"]["provider"] != "mlx-vlm-minicpmv47",
+                    "vision identity requires protocol 2.5",
+                )?;
+                capabilities(&frame["capabilities"], native, sampled)?;
+            }
             counts(
                 &frame["limits"],
                 &["max_frame_bytes", "max_depth", "max_commands"],
@@ -552,11 +586,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                                 "sampling",
                                 "output_policy",
                             ],
-                            if bounded {
-                                &["initial_reasoning"]
-                            } else {
-                                &[]
-                            },
+                            if bounded { &["initial_reasoning"] } else { &[] },
                         )?;
                         require(
                             execution["output_policy"]
@@ -602,7 +632,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                         "unsupported native sampling identity",
                     )?;
                 }
-            } else {
+            } else if !vision {
                 fields(&frame["runtime"], &[], &["python", "mlx", "mlx_lm"], &[])?;
             }
             for value in object(&frame["runtime"])?.values() {
@@ -659,7 +689,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 &[],
             )?;
             digest(&frame["model_revision"])?;
-            messages(&frame["messages"], &frame["tools"])?;
+            messages(&frame["messages"], &frame["tools"], vision)?;
+            require(
+                !vision || frame["template_options"]["enable_thinking"] == false,
+                "vision preparation disables thinking",
+            )?;
             fields(&frame["template_options"], &[], &["enable_thinking"], &[])?;
             require(
                 frame["template_options"]["enable_thinking"].is_boolean(),
@@ -684,7 +718,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     "effective_input_tokens",
                     "prompt_digest",
                 ],
-                &[],
+                if vision { &["replay"] } else { &[] },
             )?;
             digest(&frame["model_revision"])?;
             tokens(&frame["token_ids"], 1, MAX_PROMPT_TOKENS as usize)?;
@@ -707,7 +741,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
         }
         "submit" => {
             submit_fields(frame)?;
-            if sampled {
+            if sampled || vision {
                 sampling(&frame["sampling"])?;
             }
             digest(&frame["model_revision"])?;
@@ -749,7 +783,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
         }
         "prefill_progress" => {
             fields(frame, EVENT, &["consumed_tokens"], &[])?;
-            integer(&frame["consumed_tokens"], 0, MAX_PROMPT_TOKENS)?;
+            integer(
+                &frame["consumed_tokens"],
+                0,
+                if vision { 0 } else { MAX_PROMPT_TOKENS },
+            )?;
         }
         "tokens" => {
             fields(
@@ -806,11 +844,28 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             )?;
             choice(&state["validity"], &["none"])?;
             let history = integer(&state["history_count"], 0, MAX_SAFE_INTEGER)?;
-            integer(&state["consumed_position"], 0, history)?;
+            if vision {
+                require(
+                    state["consumed_position"].is_null(),
+                    "vision consumed position must be null",
+                )?;
+            } else {
+                integer(&state["consumed_position"], 0, history)?;
+            }
             string(&frame["text_delta"])?;
             counts(
                 &frame["metrics"],
-                &["elapsed_ns", "ttft_ns", "peak_memory_bytes"],
+                if vision {
+                    &[
+                        "elapsed_ns",
+                        "ttft_ns",
+                        "peak_memory_bytes",
+                        "source_media_bytes",
+                        "peak_host_array_bytes",
+                    ]
+                } else {
+                    &["elapsed_ns", "ttft_ns", "peak_memory_bytes"]
+                },
             )?;
             require(
                 frame["metrics"]["ttft_ns"].as_u64() <= frame["metrics"]["elapsed_ns"].as_u64(),
@@ -870,6 +925,16 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
         }
         "drained" => fields(frame, BASE, &[], &[])?,
         _ => return Err(ContractError("unknown frame kind".into())),
+    }
+    if vision && ["prepared_input", "submit"].contains(&kind) {
+        vision::replay(frame)?;
+        if kind == "submit" {
+            integer(&frame["max_tokens"], 0, 8192)?;
+        }
+    }
+    if vision && kind == "terminal" {
+        integer(&frame["metrics"]["source_media_bytes"], 0, 262144)?;
+        integer(&frame["metrics"]["peak_host_array_bytes"], 0, 67108864)?;
     }
     Ok(())
 }
@@ -1230,6 +1295,44 @@ mod tests {
     }
 
     #[test]
+    fn shared_vision_profile() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/minicpm-vision-v0.1.json"
+        ))
+        .unwrap();
+        check_sampled_profile(&corpus);
+        check_event_transcripts(&corpus);
+    }
+
+    #[test]
+    fn vision_identity_requires_its_protocol() {
+        for protocol in [
+            PROTOCOL,
+            NATIVE_PROTOCOL,
+            NATIVE_SAMPLED_PROTOCOL,
+            NATIVE_THINKING_PROTOCOL,
+            NATIVE_BOUNDED_THINKING_PROTOCOL,
+        ] {
+            for adapter in [true, false] {
+                let mut frame = corpus()["templates"]["ready"].clone();
+                frame["protocol"] = protocol.into();
+                if adapter {
+                    frame["model_manifest"]["adapter_revision"] =
+                        "apxinf-mlx-minicpmv47-vision-v1".into();
+                } else {
+                    frame["model_manifest"]["execution"] =
+                        serde_json::json!({"provider":"mlx-vlm-minicpmv47"});
+                }
+                frame["model_revision"] =
+                    canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"])
+                        .unwrap()
+                        .into();
+                assert!(validate_frame(&frame).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn shared_native_sampling_profile() {
         let corpus: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/serving/native-sampling-v0.1.json"
@@ -1338,9 +1441,10 @@ mod tests {
             for (pointer, value) in case["set"].as_object().unwrap() {
                 *frame.pointer_mut(pointer).unwrap() = value.clone();
             }
-            frame["capability_revision"] = canonical_identity_digest(
-                "apxinf-capability-v1", &frame["capabilities"],
-            ).unwrap().into();
+            frame["capability_revision"] =
+                canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"])
+                    .unwrap()
+                    .into();
             assert_eq!(
                 validate_frame(&frame).is_ok(),
                 case["valid"].as_bool().unwrap(),
@@ -1352,6 +1456,30 @@ mod tests {
 
     fn fixture(corpus: &Value, case: &Value) -> Value {
         let mut value = corpus["templates"][case["template"].as_str().unwrap()].clone();
+        if let Some(count) = case["image_occurrences"].as_u64() {
+            if value["kind"] == "prepare_input" {
+                let part = value["messages"][0]["content"][1].clone();
+                value["messages"] = serde_json::json!([{"role":"tool", "tool_call_id":"pixel-tool", "content":vec![part; count as usize]}]);
+            } else {
+                let image = value["replay"]["media"][0].clone();
+                value["replay"]["media"] = vec![image; count as usize].into();
+                value["replay"]["image_bindings"] = (0..count).map(|index| serde_json::json!({"source_index":index,"token_start":index+1,"token_end":index+2,"pixel_shape":[3,14,14],"target_size":[1,1]})).collect::<Vec<_>>().into();
+                let mut ids = vec![Value::from(1)];
+                ids.extend(vec![Value::from(248056); count as usize]);
+                ids.push(3.into());
+                value["token_ids"] = ids.into();
+            }
+        }
+        if let Some(bytes) = case["rendered_bytes"].as_u64() {
+            value["replay"]["rendered_prompt"] = "x".repeat(bytes as usize).into();
+        }
+        if let Some(count) = case["image_tokens"].as_u64() {
+            let mut ids = vec![Value::from(1)];
+            ids.extend(vec![Value::from(248056); count as usize]);
+            ids.push(3.into());
+            value["token_ids"] = ids.into();
+            value["replay"]["image_bindings"][0]["token_end"] = (count + 1).into();
+        }
         if let Some(changes) = case.get("set") {
             for (pointer, replacement) in changes.as_object().unwrap() {
                 let (parent, key) = pointer.rsplit_once('/').unwrap();
