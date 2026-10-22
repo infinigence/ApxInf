@@ -41,7 +41,8 @@ The native serving owner can stop at these boundaries.
 It preserves fixed weights and position tables.
 The existing `reset` operation retains prepared state and cannot establish resource release.
 
-The supported workload is one text sequence with at most 4096 consumed positions.
+The ordinary BF16 model admits one text sequence with at most 16384 consumed positions.
+This model limit is a candidate for serving until the production quality and memory gates pass.
 DSpark retains its complete prompt taps and 4096-position limit.
 The [context profile](../../../../doc/serving/minicpm-context-v0.1.md) defines preparation shapes, cancellation, and longer context gates.
 Only greedy sampling without penalties/log-probability is currently implemented
