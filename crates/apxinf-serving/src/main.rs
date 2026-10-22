@@ -21,7 +21,7 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5", "native-minicpm5-sampled"])]
     provider: String,
     #[arg(long)]
     native_worker: Option<PathBuf>,
@@ -102,20 +102,32 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("A service limit is outside the supported range.".into());
     }
-    let runtime = if args.provider == "native-minicpm5" {
-        WorkerRuntime::NativeMiniCpm5 {
-            executable: std::fs::canonicalize(
-                args.native_worker
-                    .ok_or("Native provider requires --native-worker.")?,
-            )?,
-            metal_library: std::fs::canonicalize(
-                args.metal_library
-                    .ok_or("Native provider requires --metal-library.")?,
-            )?,
+    let runtime = if matches!(
+        args.provider.as_str(),
+        "native-minicpm5" | "native-minicpm5-sampled"
+    ) {
+        let executable = std::fs::canonicalize(
+            args.native_worker
+                .ok_or("Native provider requires --native-worker.")?,
+        )?;
+        let metal_library = std::fs::canonicalize(
+            args.metal_library
+                .ok_or("Native provider requires --metal-library.")?,
+        )?;
+        if args.provider == "native-minicpm5-sampled" {
+            WorkerRuntime::NativeMiniCpm5Sampled {
+                executable,
+                metal_library,
+            }
+        } else {
+            WorkerRuntime::NativeMiniCpm5 {
+                executable,
+                metal_library,
+            }
         }
     } else {
         if args.native_worker.is_some() || args.metal_library.is_some() {
-            return Err("Native runtime paths require --provider native-minicpm5.".into());
+            return Err("Native runtime paths require a native MiniCPM provider.".into());
         }
         WorkerRuntime::Python
     };

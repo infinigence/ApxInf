@@ -147,6 +147,7 @@ while True:
 
 fn request() -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"original generation deadline probe"})],
         tools: vec![],
         max_tokens: 1,

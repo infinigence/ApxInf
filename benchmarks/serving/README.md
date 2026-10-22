@@ -148,6 +148,10 @@ The `--bare` and `--restricted` flags limit client features and file access.
 Explicit tool lists and permission rules limit each task.
 The harness reads the deployment context limit from readiness and sets the client window for that process.
 The `--max-context` option permits a smaller explicit window.
+These bounded tasks disable automatic client compaction.
+The 16K MiniCPM run otherwise entered repeated compaction after a successful file edit.
+The service still rejects requests that exceed the actual input and output allowance.
+These tests do not measure automatic compaction quality or unbounded agent sessions.
 The `--max-tokens` option limits request output. It does not declare model capabilities in client metadata.
 
 Anthropic does not officially support Claude Code with non-Claude models.

@@ -213,6 +213,7 @@ mod tests {
             Job {
                 observation: Arc::new(crate::metrics::RequestObservation::new(ingress, false)),
                 request: Request {
+                    selection: crate::sampling::Selection::Greedy,
                     messages: vec![json!({"role": "user", "content": "hello"})],
                     tools: Vec::new(),
                     max_tokens: 1,

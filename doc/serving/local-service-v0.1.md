@@ -79,8 +79,8 @@ Loss counters exclude unread stderr bytes and records without final accounting w
 Build the native executable with the existing MLX 0.31.2 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
-Its context candidate permits 16384 positions with fixed 256-token prefill chunks.
-The qualification report determines the tested deployment limit.
+Its context limit permits 16384 positions with fixed 256-token prefill chunks.
+The [validation report](minicpm-native-validation-20261022.md) records measured deployment gates.
 This limit includes the input and output reservation.
 
 ```sh
@@ -100,6 +100,15 @@ The worker hides all checkpoint EOS tokens, including token 130073.
 The worker reports allocator bytes after each request through stderr diagnostics.
 These observations do not measure total process memory.
 Live model and client qualification remains a separate deployment gate.
+
+Select `--provider native-minicpm5-sampled` to use the explicit [sampling profile](native-sampling-v0.1.md).
+Keep the same native worker, runtime library, model, and precision.
+This profile uses temperature 1 and top-p 0.95 when the request omits both parameters.
+Set request temperature to zero to select greedy generation.
+The ready response reports `sampling=true` and public profile `apxinf-native-sampled-v0.1`.
+Model thinking and image input remain disabled in this profile.
+For the measured 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
+The total includes prompt tokens and the requested output allowance.
 
 ### Python MLX-LM
 

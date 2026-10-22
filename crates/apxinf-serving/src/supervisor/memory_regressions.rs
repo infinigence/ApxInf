@@ -26,7 +26,8 @@ fn native_manifest_checks_selected_runtime_and_execution_profile() {
     config.model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/serving/native-tokenizer");
     let executable = std::env::current_exe().unwrap();
-    let directory = std::env::temp_dir().join(format!("apxinf-native-identity-{}", uuid::Uuid::new_v4()));
+    let directory =
+        std::env::temp_dir().join(format!("apxinf-native-identity-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
     let library = directory.join("libmlx.dylib");
     std::fs::write(&library, b"original runtime identity fixture").unwrap();
@@ -51,6 +52,25 @@ fn native_manifest_checks_selected_runtime_and_execution_profile() {
     manifest["runtime"] = crate::native_identity::runtime(&executable, &library).unwrap();
     manifest["execution"]["precision"] = "auto".into();
     assert!(verify_manifest(&manifest, &config).is_err());
+    manifest["execution"]["precision"] = "bf16".into();
+    config.runtime = WorkerRuntime::NativeMiniCpm5Sampled {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest = crate::native_identity::manifest(
+        &config.model,
+        crate::native_identity::runtime(&executable, &library).unwrap(),
+        crate::native_identity::sampled_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["execution"]["sampling"]["top_p"] = "1".into();
+    assert!(verify_manifest(&manifest, &config).is_err());
     config.prefill_step_size = 256;
     config.max_context = 16384;
     assert!(config.validate_memory().is_ok());
@@ -59,7 +79,11 @@ fn native_manifest_checks_selected_runtime_and_execution_profile() {
     config.max_context = 4096;
     config.prefill_step_size = 128;
     assert!(config.validate_memory().is_err());
-    assert!(crate::native_identity::runtime(&executable, &config.model.join("tokenizer_config.json")).is_err());
+    assert!(crate::native_identity::runtime(
+        &executable,
+        &config.model.join("tokenizer_config.json")
+    )
+    .is_err());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
