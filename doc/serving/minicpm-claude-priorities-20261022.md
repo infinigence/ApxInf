@@ -69,6 +69,8 @@ The current gateway rejects that result before worker preparation.
 Visual feedback therefore requires explicit serving media support as well as a vision model.
 The [separate vision candidate](minicpm-vision-probe-validation-20261023.md) describes the failed PNG and distinguishes an original control image.
 Those direct observations do not qualify a serving profile or the real Claude revision loop.
+The [owned PNG source component](owned-media-v0.1.md) now checks bounded image bytes through paired Rust and Python implementations.
+It enables neither an image gateway nor a vision worker protocol.
 KV reuse remains lower priority than these task gates.
 
 ## Baseline gaps and acceptance order
