@@ -106,6 +106,8 @@ pub(super) fn parse_tool(body: &str, tools: &[Value]) -> Result<(String, Value),
         let (raw, remaining) = parse_value(rest)?;
         let value = if property["type"] == "string" {
             Value::String(raw)
+        } else if property["type"] == "boolean" && matches!(raw.trim(), "True" | "False") {
+            Value::Bool(raw.trim() == "True")
         } else {
             crate::contracts::parse_document(raw.as_bytes()).map_err(|error| {
                 format!("The tool parameter {key} contains invalid JSON: {error}")
@@ -212,6 +214,7 @@ mod tests {
                 "file_path":{"type":"string"},
                 "source":{"type":"string"},
                 "count":{"type":"integer"},
+                "replace_all":{"type":"boolean"},
                 "settings":{"type":"object","additionalProperties":false,
                     "properties":{"enabled":{"type":"boolean"}}}
             }
@@ -307,6 +310,22 @@ mod tests {
             assert_eq!(blocks[3]["input"]["file_path"], "second");
             assert_eq!(blocks[4]["text"], "D");
             assert_eq!(count, 2);
+        }
+    }
+
+    #[test]
+    fn checkpoint_boolean_literals_preserve_typed_values() {
+        for (literal, expected) in [("True", true), ("False", false), ("true", true), ("false", false)] {
+            let output = format!("<function name=\"Read\"><param name=\"file_path\">False</param><param name=\"replace_all\"> {literal}\n</param></function>");
+            for split in [false, true] {
+                let (parts, count) = parse(&output, split).unwrap();
+                assert_eq!(count, 1);
+                assert_eq!(anthropic_blocks(&parts)[0]["input"], json!({"file_path":"False", "replace_all":expected}));
+            }
+        }
+        for literal in ["FALSE", "yes", "0", "False or True", "\"False\"", "None", ""] {
+            let output = format!("<function name=\"Read\"><param name=\"file_path\">x</param><param name=\"replace_all\">{literal}</param></function>");
+            assert!(parse(&output, true).is_err(), "Accepted {literal}");
         }
     }
 
