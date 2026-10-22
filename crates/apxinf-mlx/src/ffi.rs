@@ -4,6 +4,7 @@ pub type Callback =
     unsafe extern "C" fn(Handle, *const *const c_void, usize, *mut Handle, usize) -> i32;
 extern "C" {
     pub fn apx_mlx_error() -> *const c_char;
+    pub fn apx_mlx_loaded_library_path(out: *mut *const c_char) -> i32;
     pub fn apx_mlx_stream_new(gpu: i32, index: i32, out: *mut Handle) -> i32;
     pub fn apx_mlx_stream_free(stream: Handle);
     pub fn apx_mlx_sync(stream: Handle) -> i32;
