@@ -11,6 +11,7 @@ from typing import Any
 PROTOCOL = "apxinf-worker/2.0"
 NATIVE_PROTOCOL = "apxinf-worker/2.1"
 NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
+NATIVE_THINKING_PROTOCOL = "apxinf-worker/2.3"
 MAX_FRAME_BYTES = 1_048_576
 MAX_DEPTH = 16
 MAX_COMMANDS = 10_000
@@ -174,7 +175,7 @@ def _sampling(value: Any) -> None:
 
 def _submit_fields(frame: dict) -> set[str]:
     fields = {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}
-    if frame["protocol"] == NATIVE_SAMPLED_PROTOCOL:
+    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL):
         fields.add("sampling")
     return fields
 
@@ -202,7 +203,7 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL), "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
@@ -228,8 +229,9 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL), "unsupported protocol")
-    sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL), "unsupported protocol")
+    thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL
+    sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL or thinking
     native = frame["protocol"] == NATIVE_PROTOCOL or sampled
     _uuid(frame["worker_epoch"])
     kind = frame["kind"]
@@ -259,11 +261,17 @@ def validate_frame(frame: dict) -> None:
                 manifest = frame["model_manifest"]
                 execution = manifest.get("execution")
                 _require(type(execution) is dict, "expected execution identity")
-                _require(manifest.get("adapter_revision") == "apxinf-native-minicpm5-sampled-v1"
+                if thinking:
+                    _keys(execution, {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
+                                      "max_output_tokens", "memory_limit_bytes", "sampling", "output_policy"})
+                    _require(execution["output_policy"] == "minicpm5-initial-thinking-v1",
+                             "unsupported native thinking output policy")
+                adapter = "apxinf-native-minicpm5-thinking-v1" if thinking else "apxinf-native-minicpm5-sampled-v1"
+                _require(manifest.get("adapter_revision") == adapter
                          and execution.get("provider") == "metal_minicpm5"
                          and execution.get("precision") == "bf16"
                          and execution.get("variant") == "bf16-compiled"
-                         and execution.get("enable_thinking") is False
+                         and execution.get("enable_thinking") is thinking
                          and execution.get("sampling") == {
                              "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1",
                              "top_p": "0.95", "seed_policy": "request-id-sha256-v1",
@@ -287,6 +295,8 @@ def validate_frame(frame: dict) -> None:
         _messages(frame["messages"], frame["tools"])
         _keys(frame["template_options"], {"enable_thinking"})
         _require(type(frame["template_options"]["enable_thinking"]) is bool, "enable_thinking must be Boolean")
+        _require(not thinking or frame["template_options"]["enable_thinking"] is True,
+                 "protocol 2.3 requires thinking preparation")
     elif kind == "prepared_input":
         _keys(frame, COMMAND | {"model_revision", "token_ids", "effective_input_tokens", "prompt_digest"})
         _digest(frame["model_revision"])
