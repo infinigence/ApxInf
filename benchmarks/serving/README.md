@@ -138,6 +138,8 @@ Set `APXINF_HTTP_TEST_OUTPUT` to select another output directory.
 
 `http_benchmark.py` measures HTTP requests and streamed responses.
 `claude_code_tasks.py` runs the installed Claude Code CLI against the local Messages endpoint.
+The runner flushes captured stdout and stderr after each received chunk.
+The captured files remain available for inspection while the client runs.
 The client task report records actual tool calls, tool results, and task assertions.
 The fixture files contain no repository content or credentials.
 
