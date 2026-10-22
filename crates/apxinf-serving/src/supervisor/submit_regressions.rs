@@ -109,6 +109,7 @@ sys.stdin.buffer.readline()
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let worker = Worker {
+        protocol: PROTOCOL,
         child,
         _diagnostics: None,
         input,
