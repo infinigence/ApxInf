@@ -5,6 +5,7 @@
 #include <mlx/version.h>
 #include <mlx/memory.h>
 #include <cstring>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +28,11 @@ template<class T>A upload(const uint8_t* bytes,size_t len,mx::Shape sh,mx::Dtype
 }
 extern "C" {
 const char* apx_mlx_error(void){return last_error.c_str();}
+int apx_mlx_loaded_library_path(const char** out){TRY
+ Dl_info image{};
+ if(!dladdr(reinterpret_cast<const void*>(&mx::get_active_memory),&image)||!image.dli_fname)
+   throw std::runtime_error("Cannot identify loaded MLX library");
+ *out=image.dli_fname;CATCH}
 int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
  if(std::string(mx::version())!="0.31.2")throw std::runtime_error("linked MLX runtime differs from pinned 0.31.2 SDK");
  mx::Device d(gpu?mx::Device::gpu:mx::Device::cpu,index);
