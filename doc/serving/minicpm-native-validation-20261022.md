@@ -120,10 +120,11 @@ The current client task reads SVG source. It does not receive rendered image pix
 A visual revision loop requires a vision-capable model and image transport through the serving and tool interfaces.
 
 The checkpoint supports its thinking template option.
-The deployed native profile currently sets that option to false.
-It also rejects client requests that enable Anthropic thinking.
+The greedy and sampled native profiles set that option to false.
+The separate native thinking profile enables the template and hides the initial reasoning prefix.
+All three profiles reject client requests that enable Anthropic extended thinking.
 Internal model reasoning and the Anthropic thinking API are separate integration contracts.
-Diagnostic reasoning output does not establish support for either through the current HTTP profile.
+The HTTP checks below establish initial hidden reasoning support for the explicit thinking profile.
 
 The official [model card](https://huggingface.co/openbmb/MiniCPM5-2B) recommends temperature 1.0 and top-p 0.95.
 Its example enables the thinking template.
@@ -174,6 +175,36 @@ The final executable passed ten HTTP policy cases, including temperature `1e-40`
 Client disconnect released capacity, and the verified owned worker fault correctly ended the service.
 The fault test required no forced process-group termination.
 
+## Explicit thinking profile follow-up
+
+The separate 2.3 profile enables the checkpoint's thinking template without changing the model revision or BF16 precision.
+The [thinking contract](native-thinking-v0.1.md) defines its output boundary, token accounting, and identity.
+The integrated Rust serving suite passed 177 checks and skipped one.
+The Python serving suite ran 270 checks, with six skipped.
+Independent reviews found no remaining correctness or comment issues in this integration.
+
+The real native service passed ten sampling policy cases across both HTTP endpoints.
+A one-token output allowance returned empty content, `max_tokens`, and one output token in usage.
+A larger allowance returned the requested marker without initial reasoning text or tags.
+These checks exercise the actual model template, native worker, and HTTP output path.
+
+A client disconnected before the first public content event, after the worker generated 16 internal tokens.
+The request ended as cancelled, released capacity, and left the same worker ready.
+The older cancellation probe waits for public content before disconnecting.
+That trigger cannot test a response that spends its entire output allowance on hidden reasoning.
+The separate scratch probe records its different trigger explicitly.
+
+The real Claude Code task used an 8192-token output allowance within the 16384-position context limit.
+The client completed Read, Read, Edit, and Read, then exited successfully after 172.37 seconds.
+The artifact passed the structural SVG checks.
+Its rendered image did not show a recognizable pelican riding a bicycle, so visual acceptance failed.
+The recorded visual verdict identifies the SVG by its SHA-256 digest.
+This single run does not establish a quality improvement from thinking or a larger output allowance.
+
+The subsequent verified worker fault correctly ended the service without forced process-group termination.
+The HTTP, cancellation, and tool checks therefore pass for this executable.
+The pelican task remains incomplete because its visual gate failed.
+
 ## Local evidence records
 
 The working directory retains complete diagnostic records under `devlocal/serving-minicpm/`.
@@ -196,6 +227,10 @@ This ignored directory is not part of the source checkout distributed through Gi
 | `sampling-temperature-repro.log` | Tiny-temperature regression before correction |
 | `sampling-core-tests-final.log` | Final CPU sampling checks |
 | `sampling-tests-final.log` | Integrated Rust serving checks |
+| `thinking-tests.log` | Integrated Rust thinking checks |
+| `thinking-python-tests.log` | Python serving checks after thinking integration |
+| `native-thinking-claude/` | Hidden output checks and incompatible content-triggered cancellation probe |
+| `native-thinking-claude-recheck/` | Native thinking HTTP, cancellation, and real client evidence |
 | `chunk-cli-smoke.log` | Native CLI regression after chunk integration |
 
 The [context profile](minicpm-context-v0.1.md) records the separate numerical equivalence gate.
