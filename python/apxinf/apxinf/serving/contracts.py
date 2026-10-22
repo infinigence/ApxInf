@@ -158,9 +158,10 @@ def _capabilities(value: Any, native: bool = False) -> None:
     _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"})
     for name, expected in {"text": True, "image": False, "greedy": True, "sampling": False, "token_events": True, "exact_append": False}.items():
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
-    _enum(value["cancel_granularity"], {"end_prefill_or_token"} if native else {"token", "token_or_prefill_chunk"})
+    _enum(value["cancel_granularity"], {"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})
     _int(value["max_active_sequences"], 1, 1)
-    _int(value["max_context"], 1, 4096 if native else MAX_PROMPT_TOKENS)
+    context_limit = (16384 if value["cancel_granularity"] == "token_or_prefill_chunk" else 4096) if native else MAX_PROMPT_TOKENS
+    _int(value["max_context"], 1, context_limit)
     _int(value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)
     _enum(value["state_schema"], {"none"})
 

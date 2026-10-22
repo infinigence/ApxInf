@@ -50,6 +50,7 @@ class ServingContractTests(unittest.TestCase):
                     for key in keys[:-1]:
                         target = target[key]
                     target[keys[-1]] = replacement
+                frame["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", frame["capabilities"])
                 if case["valid"]:
                     contracts.validate_frame(frame)
                 else:

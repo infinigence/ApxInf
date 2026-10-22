@@ -79,7 +79,8 @@ Loss counters exclude unread stderr bytes and records without final accounting w
 Build the native executable with the existing MLX 0.31.2 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
-Its initial context limit is 4096 positions.
+Its context candidate permits 16384 positions with fixed 256-token prefill chunks.
+The qualification report determines the tested deployment limit.
 This limit includes the input and output reservation.
 
 ```sh
