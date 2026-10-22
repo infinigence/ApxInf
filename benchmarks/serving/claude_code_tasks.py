@@ -46,6 +46,7 @@ def client_environment(base_url, model, config_dir, max_tokens=512, max_context=
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_tokens),
         "CLAUDE_CODE_MAX_RETRIES": "0",
         "DISABLE_PROMPT_CACHING": "1",
+        "DISABLE_AUTO_COMPACT": "1",
     })
     if max_context is not None:
         environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context)

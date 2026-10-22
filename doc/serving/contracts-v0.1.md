@@ -5,6 +5,7 @@ Status: Design draft 0.1. Date: 2026-10-09.
 This document defines the proposed serving interfaces.
 The [serial profile](serial-profile-v0.1.md) selects the first implementation subset.
 The [native MiniCPM5 profile](native-minicpm-v0.1.md) defines the explicit native worker variant.
+The [native sampling profile](native-sampling-v0.1.md) defines the explicitly selected worker 2.2 extension.
 The full contract includes future capabilities.
 The existing v1 protocols retain their existing behavior.
 The [system design](../serving-system-design-20261009.md) explains the design choices.
