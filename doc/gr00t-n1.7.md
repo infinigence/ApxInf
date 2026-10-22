@@ -20,7 +20,7 @@ graph lifetime, and the flow schedule.
 | Jetson AGX Thor (SM110) | BF16, calibrated FP8 |
 | Jetson AGX Orin (SM87) | BF16, INT8/W8A8 |
 
-`precision="auto"` selects BF16 on both platforms. Unsupported combinations
+`model_variant="auto"` selects BF16 on both platforms. Unsupported combinations
 fail at load time; they never silently fall back to another precision.
 
 The loader selects the precision exactly once and constructs a concrete
@@ -80,7 +80,7 @@ from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
-    precision="bf16",
+    model_variant="bf16",
 )
 
 result = policy.infer({
@@ -122,7 +122,7 @@ The generic command-line example uses the same default resource directory:
 
 ```bash
 python python/apxinf/examples/autopolicy_infer.py \
-  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --precision bf16
+  --model-dir /models/GR00T-N1.7-LIBERO/libero_10 --model-variant bf16
 ```
 
 For LIBERO, GR00T's official state contract has eight values: XYZ, axis-angle
@@ -229,7 +229,7 @@ Build the example once; later runs reuse it:
 cargo build --release -p apxinf-model --features cuda --example gr00t_bench
 python scripts/bench_gr00t.py \
   --model-dir /models/GR00T-N1.7-LIBERO/libero_10 \
-  --precision bf16 --views 2 --warmup 30 --samples 200 \
+  --model-variant bf16 --views 2 --warmup 30 --samples 200 \
   --tactics devlocal/gr00t-bench/thor-bf16-2v.json --autotune \
   --binary target/release/examples/gr00t_bench \
   --out devlocal/gr00t-bench/thor-bf16-2v-results.json
@@ -237,12 +237,12 @@ python scripts/bench_gr00t.py \
 
 Run `--views 1` and `--views 2` for every supported table row:
 
-| Hardware | `--precision` | Additional input |
+| Hardware | `--model-variant` | Additional input |
 |---|---|---|
 | Thor | `bf16` | None |
-| Thor | `fp8` | `--calibration /path/to/matching-calibration.json` |
+| Thor | `fp8_static` | `--calibration /path/to/matching-calibration.json` |
 | Orin | `bf16` | None |
-| Orin | `int8` | None |
+| Orin | `int8_dynamic` | None |
 
 Give each hardware/precision/view combination its own tactic and output path.
 The first run uses `--autotune`; repeat with the same `--tactics` and omit

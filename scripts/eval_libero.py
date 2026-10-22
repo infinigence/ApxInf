@@ -507,10 +507,12 @@ class InProcessBackend:
         from apxinf.policies.auto import _read_model_type
         model_type = args.model_type or _read_model_type(pathlib.Path(args.model_dir))
         # Campaign precision is a numerical comparison category in the ledger.
-        # PI0.5 loading uses a model-local implementation ID instead.
+        # Every policy loads through a model-local implementation ID.
         selector = (
-            {"model_variant": {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]}
-            if model_type == "pi05" else {"precision": args.precision}
+            {"model_variant": (
+                "fp8_dynamic" if model_type in ("walloss", "wall_oss_05", "wall-oss") and args.precision == "fp8"
+                else {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]
+            )}
         )
         self._policy = AutoPolicy.from_pretrained(
             args.model_dir,

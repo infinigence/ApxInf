@@ -29,7 +29,7 @@ CUDA Graph replay.
 
 ```sh
 python scripts/bench_pi0_fast.py \
-  --model-dir /models/pi0fast-libero-v044 --precision bf16 \
+  --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
   --state-key observation/state --layer l1 --mode latency \
   --frames-count 10 --warmup 10 --samples 30 \
   --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json --autotune \
@@ -38,7 +38,7 @@ python scripts/bench_pi0_fast.py \
 
 This input-free command measures complete-request latency. It does not produce
 the README's Prefix and Per Token values. Run it on Thor, Orin and RTX 4090 for
-the corresponding latency check. For Thor FP8, use `--precision fp8
+the corresponding latency check. For Thor FP8, use `--model-variant fp8_static
 --calibration /path/to/matching-calibration.json` and a separate output path.
 `--calibration` supplies FP8 activation scales. `--tactics` reaches the native
 GEMV/GEMM selector. This command creates a device-specific database with
@@ -55,7 +55,7 @@ with `base_raw` or `base_flipped`, `wrist_raw` or `wrist_flipped`, `state`, and
 
 ```sh
 python scripts/bench_pi0_fast.py \
-  --model-dir /models/pi0fast-libero-v044 --precision bf16 \
+  --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
   --state-key observation/state --layer l1 --mode ar \
   --frames /path/to/libero_frames.npz --frame-variant raw \
   --survey 20 --repeats 5 \

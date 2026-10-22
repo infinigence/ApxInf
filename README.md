@@ -595,7 +595,7 @@ entry point — the raw tokens — and L2 turns them into actions:
 ```python
 from apxinf import AutoPolicy
 
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
+policy = AutoPolicy.from_pretrained("<path-to-model>", model_variant="bf16")
 
 # L1: raw FAST action tokens, uint32 [max_action_tokens]
 tokens = policy.model.infer_action_tokens_rgb(rgb, "nhwc", token_ids)
@@ -670,8 +670,8 @@ benchmark uses their normal preprocessing, including WallOSS grids and masks.
 The legacy `l0` patch diagnostic remains PI0.5-only.
 
 Use `--model-variant bf16` for either model, or `--model-variant fp8_dynamic`
-for WallOSS dynamic FP8. WallOSS retains `precision=` as a compatible Python
-alias; conflicting selections fail. Its specialized shape/stage benchmark is
+for WallOSS dynamic FP8. All built-in policy loaders use `model_variant`;
+unsupported variants fail explicitly. Its specialized shape/stage benchmark is
 `scripts/bench_walloss.py --model-dir <path> --model-variant bf16`.
 Other families' maintained benchmark commands are linked in their model docs;
 registration alone does not guarantee compatibility with this script's

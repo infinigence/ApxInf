@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--views", type=int, choices=(1, 2), default=2)
-    parser.add_argument("--precision", choices=("bf16", "fp8", "int8"), required=True)
+    parser.add_argument("--model-variant", choices=("bf16", "fp8_static", "int8_dynamic"), required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=50)
@@ -68,7 +68,7 @@ def main() -> None:
         *executable,
         str(args.model_dir.resolve()),
         str(args.views),
-        args.precision,
+        args.model_variant,
         str(args.device),
         str(args.warmup),
         str(args.samples),

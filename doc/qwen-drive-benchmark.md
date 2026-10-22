@@ -100,7 +100,7 @@ inputs. Model and planner weights remain real checkpoint weights.
 
 ```sh
 python scripts/bench_qwen_drive.py \
-  --model-dir /models/Qwen-Drive-1.0-4B --precision bf16 \
+  --model-dir /models/Qwen-Drive-1.0-4B --model-variant bf16 \
   --warmup 10 --samples 30 --seed 0 \
   --out devlocal/qwen-drive-bench/results/latency.json
 ```

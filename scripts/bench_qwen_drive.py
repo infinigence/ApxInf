@@ -38,10 +38,10 @@ def synthetic_observation(seed=0):
     return observation, noise
 
 
-def main(policy_loader=None):
+def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model-dir', type=Path, required=True)
-    p.add_argument('--precision', choices=['bf16'], default='bf16')
+    p.add_argument('--model-variant', choices=['bf16'], default='bf16')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--warmup', type=int, default=10)
     p.add_argument('--samples', type=int, default=30)
@@ -51,8 +51,13 @@ def main(policy_loader=None):
     a = p.parse_args()
     if a.warmup < 1 or a.samples < 1:
         p.error('--warmup and --samples must be positive')
+    return a
+
+
+def main(policy_loader=None):
+    a = parse_args()
     from apxinf import AutoPolicy
-    options = dict(model_type='qwen_drive', model_variant=a.precision,
+    options = dict(model_type='qwen_drive', model_variant=a.model_variant,
                    device=a.device, mode='direct_planning', num_steps=10,
                    planner=a.model_dir / 'planner-sft', tactics=a.tactics)
     policy = (policy_loader or AutoPolicy.from_pretrained)(a.model_dir, **options)
@@ -73,9 +78,9 @@ def main(policy_loader=None):
                 first = actions
             elif not np.array_equal(first, actions):
                 raise ValueError('identical input produced different trajectories')
-        report = dict(schema='apxinf.qwen-drive.benchmark.v1', input_source='synthetic',
+        report = dict(schema='apxinf.qwen-drive.benchmark.v2', input_source='synthetic',
                       input_profile='three-cameras-four-frames-3387-capacity', seed=a.seed,
-                      model_dir=str(a.model_dir), precision=a.precision,
+                      model_dir=str(a.model_dir), model_variant=a.model_variant,
                       tactics=str(a.tactics) if a.tactics else None,
                       timing_boundary='resident RGB through policy and trajectory D2H',
                       warmup=a.warmup, samples_ms=samples,

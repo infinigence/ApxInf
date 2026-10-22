@@ -40,9 +40,10 @@ views, 18x18 grids); other shapes need the built-in RGB route.
 ## Public loading and benchmark inputs
 
 `WallossPolicy.from_pretrained` and `AutoPolicy.from_pretrained` accept
-`model_variant="bf16"` or `"fp8_dynamic"` (`"fp8"` is an alias); omission/`"auto"`
-selects the native default. Existing `precision=` calls remain supported, but
-conflicting `precision` and `model_variant` values fail before loading weights.
+`model_variant="bf16"` or `"fp8_dynamic"`; omission/`"auto"` selects BF16.
+The value is passed unchanged to `ModelRunner.load` and parsed by WallOSS's
+Rust loader to select `ModelVariant`. Public `precision` and ambiguous `fp8`
+selection are rejected. No legacy precision conversion is used for WallOSS.
 
 `policy.prepare_rgb_inputs(observation, noise=...)` returns keyword arguments
 for `policy.model_runner.infer_rgb(**inputs)`. It performs the same preprocessing
@@ -52,8 +53,7 @@ WallOSS patch processors do not expose the RGB path.
 
 The shared benchmark accepts either checkpoint with
 `python scripts/bench_pi05.py --model-dir <checkpoint> --model-variant bf16 --layer l1,l2`.
-The specialized `bench_walloss.py` also accepts `--model-variant`; `--precision`
-remains a CLI alias. CPU CI checks command parsing, real policy dispatch and
+The specialized `bench_walloss.py` also uses `--model-variant`. CPU CI checks command parsing, real policy dispatch and
 native-call arguments with GPU/assets stubbed; it does not measure performance.
 
 ## Preparation and shape changes
@@ -81,7 +81,7 @@ pays that cost again. The first request of a new plan is also the one that
 - Checkpoint: `wall-oss-0.5` without `config.yml` (raw images smart-resize), so
   256, 224 and 448 inputs run at grids 18x18, 16x16 and 32x32.
 - Recipe: `python scripts/bench_walloss.py --model-dir <ckpt> --views V --height H --width W
-  [--resolution R] [--precision fp8] [--profile]`. Fixed random images, state
+  [--resolution R] [--model-variant fp8_dynamic] [--profile]`. Fixed random images, state
   and noise; 20-30 timed calls after warm-up.
 
 ### Refactor parity
@@ -215,7 +215,7 @@ Follow-up verification on Jetson AGX Thor (sm_110, CUDA 13.2):
   The real CLI also rejected an environment-forced eager fallback when a graph
   benchmark was requested. Use default arguments or
   `--height 480 --width 640 --resolution 448`, select
-  `--precision`, toggle `--eager`, and save full arrays with `--dump-actions`.
+  `--model-variant`, toggle `--eager`, and save full arrays with `--dump-actions`.
 - Local model CPU tests: 148 passed, one ignored. Workspace and benchmark
   regression tests fail with the old implementations and pass with the fixes.
   CUDA-feature workspace type checks and family/module boundary guards pass.

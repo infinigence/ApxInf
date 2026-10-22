@@ -107,3 +107,18 @@ def test_pi0fast_forwards_tactics_and_autotune_to_native(tmp_path, monkeypatch):
     assert captured['tactics'] == str(tmp_path/'tactics.json')
     assert captured['calibration'] == str(tmp_path/'calibration.json')
     assert captured['autotune'] is True
+
+
+@pytest.mark.parametrize('variant', ['bf16', 'fp8_static', 'int8_dynamic'])
+def test_gr00t_cli_passes_variant_unchanged_to_rust(tmp_path, monkeypatch, variant):
+    bench = load('bench_gr00t')
+    output = tmp_path / 'report.json'
+    binary = tmp_path / 'gr00t_bench'
+    monkeypatch.setattr(sys, 'argv', ['bench_gr00t', '--model-dir', str(tmp_path),
+                        '--model-variant', variant, '--binary', str(binary), '--out', str(output)])
+    def run(command, **kwargs):
+        assert command[3] == variant
+        output.write_text('{}')
+    monkeypatch.setattr(bench.subprocess, 'run', run)
+    monkeypatch.setattr(bench, 'provenance', lambda *a, **kw: {})
+    bench.main()

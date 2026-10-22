@@ -118,7 +118,7 @@ class Gr00tPolicy:
         backbone=None,
         model_runner: Optional[Any] = None,
         device: str = "cuda:0",
-        precision: str = "auto",
+        model_variant: str = "auto",
         calibration=None,
         tactics=None,
         embodiment: str = "libero_sim",
@@ -148,12 +148,12 @@ class Gr00tPolicy:
         """
         model_dir = Path(model_dir)
         backbone = resolve_assets(model_dir, backbone)
-        if precision not in ("auto", "bf16", "fp8", "int8"):
+        if model_variant not in ("auto", "bf16", "fp8_static", "int8_dynamic"):
             raise ValueError(
-                "Gr00tPolicy: precision must be 'auto', 'bf16', 'fp8', or 'int8'"
+                "Gr00tPolicy: model_variant must be auto, bf16, fp8_static or int8_dynamic"
             )
-        if precision == "fp8" and calibration is None:
-            raise ValueError("Gr00tPolicy: precision='fp8' requires calibration=")
+        if model_variant == "fp8_static" and calibration is None:
+            raise ValueError("Gr00tPolicy: model_variant='fp8_static' requires calibration=")
 
         adapter = _NvidiaProcessorAdapter.load(
             model_dir,
@@ -175,7 +175,7 @@ class Gr00tPolicy:
                 "gr00t",
                 str(model_dir),
                 device=device,
-                precision=precision,
+                model_variant=model_variant,
                 **({"calibration": str(calibration)} if calibration is not None else {}),
                 **({"tactics": str(tactics)} if tactics is not None else {}),
                 assets={"backbone": str(backbone)},
@@ -187,7 +187,7 @@ class Gr00tPolicy:
             noise_mode=noise_mode,
             action_horizon=resolved_action_horizon,
             action_dim=resolved_action_dim,
-            metadata={"precision": precision, "embodiment": embodiment, **(dict(metadata) if metadata else {})},
+            metadata={"model_variant": getattr(model_runner, "model_variant", None) or model_variant, "embodiment": embodiment, **(dict(metadata) if metadata else {})},
         )
 
     @staticmethod

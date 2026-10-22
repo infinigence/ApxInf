@@ -113,9 +113,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--layer", default="l1,l2", help="comma list of l1,l2 or `all`")
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
-        "--precision",
+        "--model-variant",
+        choices=("auto", "bf16", "fp8_static"),
         default="auto",
-        help="runtime precision: auto, bf16 or fp8 (requires calibration)",
+        help="model variant: auto, bf16 or fp8_static (requires calibration)",
     )
     p.add_argument(
         "--state-key",
@@ -331,7 +332,7 @@ def main(policy_loader=None) -> None:
     from apxinf import AutoPolicy
 
     options = {
-        "precision": args.precision,
+        "model_variant": args.model_variant,
         "calibration": str(args.calibration) if args.calibration else None,
         "tactics": str(args.tactics) if args.tactics else None,
         "autotune": args.autotune,
@@ -367,9 +368,9 @@ def main(policy_loader=None) -> None:
         return policy.infer(observation)["action_tokens"]
 
     result = {
-        "schema": "apxinf.pi0_fast.latency.v1",
+        "schema": "apxinf.pi0_fast.latency.v2",
         "git_commit": _git_commit(),
-        "precision": args.precision,
+        "model_variant": args.model_variant,
         "device": args.device,
         "model_dir": str(args.model_dir),
         "layers": layers,
@@ -428,7 +429,7 @@ def main(policy_loader=None) -> None:
         result["ar"] = {"layer": ar_layer, **_run_ar(call, stream, args.survey, args.repeats)}
 
     print(
-        f"\nin-process latency  |  {args.precision}  checkpoint  "
+        f"\nin-process latency  |  {args.model_variant}  checkpoint  "
         f"tokens={result['workload']['max_action_tokens']} "
         f"D={result['workload']['action_dim']} H={result['workload']['action_horizon']} "
         f"views={result['workload']['num_views']}"

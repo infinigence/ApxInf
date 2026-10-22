@@ -467,7 +467,7 @@ class Pi0FastPolicy:
         model=None,
         checkpoint=None,
         device: str = "cuda:0",
-        precision: str = "auto",
+        model_variant: str = "auto",
         action_dim: Optional[int] = None,
         action_horizon: Optional[int] = None,
         num_views: Optional[int] = None,
@@ -497,6 +497,8 @@ class Pi0FastPolicy:
         dropped calibration file or normalization override would look like an
         accuracy result.
         """
+        if model_variant not in ("auto", "bf16", "fp8_static"):
+            raise ValueError("Pi0FastPolicy model_variant must be auto, bf16 or fp8_static")
         if kwargs:
             raise TypeError(
                 f"Pi0FastPolicy.from_pretrained: unsupported options {sorted(kwargs)}"
@@ -545,7 +547,7 @@ class Pi0FastPolicy:
 
             path = str(checkpoint) if checkpoint is not None else str(model_dir / "model.safetensors")
             model = apxinf_py.ModelRunner.load(
-                "pi0_fast-cuda", path, device=device, precision=precision,
+                "pi0_fast-cuda", path, device=device, model_variant=model_variant,
                 sampling_seed=int(seed), autotune=bool(autotune),
                 **({"tactics": str(tactics)} if tactics is not None else {}),
                 # FP8 needs measured activation scales; the native loader reads
@@ -666,7 +668,7 @@ class Pi0FastPolicy:
             fast_skip_tokens=int(config.get("fast_skip_tokens", _DEFAULT_FAST_SKIP_TOKENS)),
             max_state_dim=int(config.get("max_state_dim", _DEFAULT_MAX_STATE_DIM)),
             max_action_tokens=int(config.get("max_action_tokens", _DEFAULT_MAX_ACTION_TOKENS)),
-            metadata=metadata,
+            metadata={"model_variant": getattr(model, "model_variant", None) or ("bf16" if model_variant == "auto" else model_variant), **(dict(metadata) if metadata else {})},
         )
 
     # --- inference ---------------------------------------------------------

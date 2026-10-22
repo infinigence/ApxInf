@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use apxinf_core::{Device, Tensor};
 use apxinf_model::{
-    AutoModel, LoadOptions, ModelPrecision, Observation, VisionObservation, VlaMetadata, VlaRequest,
+    AutoModel, LoadOptions, Observation, VisionObservation, VlaMetadata, VlaRequest,
 };
 use half::bf16;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use serde_json::Value;
 struct Arguments {
     checkpoint: PathBuf,
     views: usize,
-    precision: ModelPrecision,
+    model_variant: &'static str,
     device: usize,
     warmup: usize,
     iterations: usize,
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = generated_inputs(&args)?;
     let options = LoadOptions {
         model_name: Some("gr00t".into()),
-        precision: args.precision,
+        model_variant: Some(args.model_variant.into()),
         calibration_path: args.calibration.clone(),
         tuning_path: args.tactics.clone(),
         autotune: args.autotune,
@@ -96,11 +96,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let summary = latency_summary(&samples)?;
     let report = serde_json::json!({
-        "schema": "apxinf.gr00t-n1.7.benchmark.v2",
+        "schema": "apxinf.gr00t-n1.7.benchmark.v3",
         "input_profile": input.name,
         "checkpoint": args.checkpoint,
         "device": args.device,
-        "precision": precision_name(args.precision),
+        "model_variant": args.model_variant,
         "execution": execution,
         "timing_boundary": "constructed host tensors through synchronized model core and action D2H",
         "warmup": args.warmup,
@@ -142,7 +142,7 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     let values = std::env::args().collect::<Vec<_>>();
     if !(4..=11).contains(&values.len()) {
         return Err(format!(
-            "usage: {} <model-dir> <views:1|2> <bf16|fp8|int8> [device=0] [warmup=10] [iterations=50] [calibration|-] [tactics|-] [output|-] [--autotune]",
+            "usage: {} <model-dir> <views:1|2> <bf16|fp8_static|int8_dynamic> [device=0] [warmup=10] [iterations=50] [calibration|-] [tactics|-] [output|-] [--autotune]",
             values.first().map(String::as_str).unwrap_or("gr00t_bench")
         )
         .into());
@@ -164,11 +164,11 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
             .filter(|value| value.as_str() != "-")
             .map(PathBuf::from)
     };
-    let precision = match values[3].as_str() {
-        "bf16" => ModelPrecision::Bf16,
-        "fp8" => ModelPrecision::Fp8,
-        "int8" => ModelPrecision::W8A8,
-        value => return Err(format!("invalid precision {value:?}; expected bf16|fp8|int8").into()),
+    let model_variant = match values[3].as_str() {
+        "bf16" => "bf16",
+        "fp8_static" => "fp8_static",
+        "int8_dynamic" => "int8_dynamic",
+        value => return Err(format!("invalid model_variant {value:?}; expected bf16|fp8_static|int8_dynamic").into()),
     };
     let iterations = integer(6, 50, "iteration count")?;
     if iterations == 0 {
@@ -184,7 +184,7 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     Ok(Arguments {
         checkpoint: PathBuf::from(&values[1]),
         views: integer(2, 2, "view count")?,
-        precision,
+        model_variant,
         device: integer(4, 0, "CUDA device")?,
         warmup: integer(5, 10, "warmup count")?,
         iterations,
@@ -263,13 +263,4 @@ fn latency_summary(samples: &[f64]) -> Result<Value, Box<dyn std::error::Error>>
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     let rank = ((sorted.len() as f64) * quantile).ceil() as usize;
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
-}
-
-fn precision_name(precision: ModelPrecision) -> &'static str {
-    match precision {
-        ModelPrecision::Auto => "auto",
-        ModelPrecision::Bf16 => "bf16",
-        ModelPrecision::Fp8 => "fp8",
-        ModelPrecision::W8A8 => "int8",
-    }
 }

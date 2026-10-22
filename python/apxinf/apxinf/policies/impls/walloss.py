@@ -534,8 +534,7 @@ class WallossPolicy:
         model_runner=None,
         checkpoint=None,
         device="cuda:0",
-        model_variant=None,
-        precision=None,
+        model_variant="auto",
         tactics=None,
         autotune=False,
         norm_key="x2_normal",
@@ -551,14 +550,8 @@ class WallossPolicy:
         metadata=None,
         **kwargs,
     ):
-        variants = {"auto": "auto", "bf16": "bf16", "fp8": "fp8", "fp8_dynamic": "fp8"}
-        selected = model_variant if model_variant is not None else precision
-        selected = "auto" if selected is None else selected
-        if selected not in variants:
-            raise ValueError("WallOSS model_variant must be auto, bf16 or fp8_dynamic (fp8 alias)")
-        if precision is not None and (precision not in variants or variants[precision] != variants[selected]):
-            raise ValueError("model_variant and precision select conflicting WallOSS variants")
-        precision = variants[selected]
+        if model_variant not in ("auto", "bf16", "fp8_dynamic"):
+            raise ValueError("WallOSS model_variant must be auto, bf16 or fp8_dynamic")
         if kwargs:
             raise TypeError(f"unsupported WallossPolicy options: {sorted(kwargs)}")
         if discrete_state is False:
@@ -588,7 +581,7 @@ class WallossPolicy:
                 "walloss",
                 ckpt,
                 device=device,
-                precision=precision,
+                model_variant=model_variant,
                 **({"tactics": str(tactics)} if tactics else {}),
                 autotune=bool(autotune),
                 sampling_seed=int(seed),
@@ -628,6 +621,7 @@ class WallossPolicy:
         elif not callable(processor):
             raise TypeError("processor must be callable")
         processor_metadata = {
+            "model_variant": getattr(model_runner, "model_variant", None) or ("bf16" if model_variant == "auto" else model_variant),
             "image_keys": list(getattr(processor, "image_keys", image_keys)),
             "state_key": getattr(processor, "state_key", state_key),
             "prompt_key": getattr(processor, "prompt_key", prompt_key),

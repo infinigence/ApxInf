@@ -125,6 +125,14 @@ impl<E: Gr00tPrecisionExecution> PreparedInference for Gr00tPreparedInference<E>
 }
 
 impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tVlaRuntime<E> {
+    fn model_variant(&self) -> Option<&'static str> {
+        Some(match E::NAME {
+            "fp8" => "fp8_static",
+            "int8" => "int8_dynamic",
+            _ => E::NAME,
+        })
+    }
+
     fn contract(&self) -> VlaContract {
         let engine = self.engine.borrow();
         let config = engine.config();
@@ -252,7 +260,7 @@ pub(super) fn load_registered(
     )?;
     let backend: Arc<RuntimeBackend> = downcast_arc(backend)
         .ok_or_else(|| Error::Other("GR00T is only registered for CUDA".into()))?;
-    let precision = resolve_precision(options.precision, backend.context().caps().sm)?;
+    let precision = resolve_precision(super::config::load_precision(options)?, backend.context().caps().sm)?;
     let config = Gr00tConfig::from_json_file(&path.join("config.json"))?;
     let (backbone_config, weights) = Gr00tWeights::from_safetensors(&config, &backbone_path, path)?;
     let runtime: Box<dyn VlaRuntime> = match precision {

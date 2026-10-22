@@ -205,6 +205,13 @@ impl Pi0FastVlaRuntime {
 }
 
 impl VlaRuntime for Pi0FastVlaRuntime {
+    fn model_variant(&self) -> Option<&'static str> {
+        Some(match &self.runtime {
+            RuntimeVariant::Bf16(_) => "bf16",
+            RuntimeVariant::Fp8(_) => "fp8_static",
+        })
+    }
+
     fn contract(&self) -> VlaContract {
         VlaContract {
             action_shape: [1, self.config.max_action_tokens],
@@ -367,6 +374,7 @@ pub(super) fn load_registered(
             "π0-FAST does not support synthetic weights yet".into(),
         ));
     }
+    let precision = resolve_precision(super::config::load_precision(options)?)?;
     let root = artifact_root(path);
     let config_path = root.join("config.json");
     let config = Arc::new(if config_path.is_file() {
@@ -375,7 +383,7 @@ pub(super) fn load_registered(
         Pi0FastConfig::default()
     });
     let host_weights = Pi0FastWeights::from_safetensors(&config, path)?;
-    let runtime = match resolve_precision(options.precision)? {
+    let runtime = match precision {
         ModelPrecision::Fp8 => {
             let weights = Arc::new(StaticFp8Pi0FastWeights::from_host(
                 &host_weights,

@@ -29,8 +29,8 @@ def checkpoint(tmp_path, monkeypatch):
         accepts_rgb_u8 = True
 
         @staticmethod
-        def load(model, path, *, device, precision, autotune, sampling_seed, tactics=None):
-            calls.append(('load', precision, autotune, tactics))
+        def load(model, path, *, device, model_variant, autotune, sampling_seed, tactics=None):
+            calls.append(('load', model_variant, autotune, tactics))
             return Runner()
 
         def infer_rgb(self, rgb_u8, layout, token_ids, noise=None, action_mask=None,
@@ -68,27 +68,27 @@ def test_documented_benchmark_real_policy_dispatch(checkpoint, monkeypatch, vari
                         '--samples', '1', '--out', str(output), '--autotune',
                         '--tactics', str(path / 'tactics.json')])
     load_script('bench_pi05').main()
-    assert calls[0] == ('load', precision, True, str(path / 'tactics.json'))
+    assert calls[0] == ('load', variant, True, str(path / 'tactics.json'))
     assert sum(call[0] == 'infer' for call in calls) == len(layer.split(','))
     assert json.loads(output.read_text())['layers'] == layer.split(',')
 
 
-def test_variant_alias_and_conflicts(checkpoint):
+def test_variant_rejects_legacy_precision(checkpoint):
     from apxinf import AutoPolicy
     path, calls = checkpoint
-    AutoPolicy.from_pretrained(path, precision='fp8')
-    assert calls[-1][1] == 'fp8'
-    AutoPolicy.from_pretrained(path, model_variant='fp8_dynamic', precision='fp8')
-    with pytest.raises(ValueError, match='conflicting'):
-        AutoPolicy.from_pretrained(path, model_variant='bf16', precision='fp8')
+    with pytest.raises(TypeError, match='precision'):
+        AutoPolicy.from_pretrained(path, precision='bf16')
     with pytest.raises(ValueError, match='model_variant'):
         AutoPolicy.from_pretrained(path, model_variant='fp8_static')
+    assert not calls
 
 
-@pytest.mark.parametrize('flag', ['--model-variant', '--precision'])
-def test_walloss_cli_variant_alias(monkeypatch, flag):
-    monkeypatch.setattr(sys, 'argv', ['bench_walloss.py', '--model-dir', '/checkpoint', flag, 'bf16'])
-    assert load_script('bench_walloss').parse_args().precision == 'bf16'
+def test_walloss_cli_variant(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['bench_walloss.py', '--model-dir', '/checkpoint', '--model-variant', 'bf16'])
+    assert load_script('bench_walloss').parse_args().model_variant == 'bf16'
+    monkeypatch.setattr(sys, 'argv', ['bench_walloss.py', '--model-dir', '/checkpoint', '--precision', 'bf16'])
+    with pytest.raises(SystemExit):
+        load_script('bench_walloss').parse_args()
 
 
 def test_benchmark_scripts_compile():
@@ -115,3 +115,20 @@ def test_rgb_keyword_contract_matches_native_binding(checkpoint):
     namespace = {}
     exec(compile(ast.parse(f'def native({args}): pass'), '<native signature>', 'exec'), namespace)
     inspect.signature(namespace['native']).bind(**inputs)
+
+
+@pytest.mark.parametrize('script,variant,extra', [
+    ('bench_qwen_drive', 'bf16', []),
+    ('bench_pi05', 'bf16', []), ('bench_pi05', 'fp8_static', []),
+    ('bench_pi05', 'fp8_dynamic', []), ('bench_pi05', 'int8_dynamic', []),
+    ('bench_walloss', 'bf16', []), ('bench_walloss', 'fp8_dynamic', []),
+    ('bench_smolvla', 'bf16', []), ('bench_smolvla', 'fp16', []),
+    ('bench_gr00t', 'bf16', []), ('bench_gr00t', 'fp8_static', []),
+    ('bench_gr00t', 'int8_dynamic', []),
+    ('bench_pi0_fast', 'bf16', ['--state-key', 'observation/state']),
+    ('bench_pi0_fast', 'fp8_static', ['--state-key', 'observation/state']),
+])
+def test_benchmark_cli_variant_matrix(monkeypatch, script, variant, extra):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    monkeypatch.setattr(sys, 'argv', [script, '--model-dir', '/checkpoint', '--model-variant', variant, *extra])
+    assert load_script(script).parse_args().model_variant == variant
