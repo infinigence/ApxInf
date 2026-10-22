@@ -51,6 +51,56 @@ def successful_events():
 
 
 class ClientCaptureTests(unittest.TestCase):
+    def test_missing_requested_tool_stops_before_the_deadline(self):
+        producer = '''import time
+print('{"type":"system","subtype":"init","tools":["Read","Edit"]}', flush=True)
+time.sleep(15)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read,Edit,Write"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result.get("tool_inventory", {}).get("missing", []), ["Write"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["tool_inventory"]["status"], "mismatch")
+        self.assertEqual(result["events"][0]["event"]["tools"], ["Read", "Edit"])
+
+    def test_available_named_tools_preserve_normal_capture(self):
+        producer = '''print('{"type":"system","subtype":"init","tools":["Edit","Read"]}', flush=True)
+print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read,Edit"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["tool_inventory"], {"requested": ["Edit", "Read"],
+                         "advertised": ["Edit", "Read"], "missing": [], "status": "verified"})
+
+    def test_malformed_initial_tool_list_stops_the_client(self):
+        producer = '''import time
+print('{"type":"system","subtype":"init","tools":null}', flush=True)
+time.sleep(15)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["tool_inventory"]["status"], "invalid")
+        self.assertIsNone(result["tool_inventory"]["advertised"])
+        self.assertFalse(result["timed_out"])
+
+    def test_late_inventory_cannot_repair_output_before_initialization(self):
+        producer = '''print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+print('{"type":"system","subtype":"init","tools":["Read"]}', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["tool_inventory"]["status"], "invalid")
+        self.assertIn("before advertising", " ".join(result["diagnostics"]))
+
     def test_output_is_visible_before_the_client_exits(self):
         producer = '''import pathlib, sys, time
 print('{"type":"system","subtype":"capture_probe"}', flush=True)
@@ -118,6 +168,16 @@ class PelicanTaskTests(unittest.TestCase):
         events = [tool_call("read-1", "Read"), tool_result("read-1"),
                   tool_call("edit-1", "Edit"), tool_result("edit-1")]
         self.assertTrue(self.outcome(events)["automated_passed"])
+
+    def test_inventory_failure_rejects_an_otherwise_successful_capture(self):
+        self.save_svg()
+        for status in ("unreported", "mismatch", "invalid", "unknown"):
+            with self.subTest(status=status):
+                recorded = capture(successful_events())
+                recorded["tool_inventory"] = {"status": status}
+                result = client.task_outcome("pelican", self.spec, self.directory, recorded)
+                self.assertFalse(result["automated_passed"])
+                self.assertFalse(result["passed"])
 
     def test_standard_xml_declaration_does_not_reject_svg(self):
         self.save_svg('<?xml version="1.0" encoding="UTF-8"?>' + VALID_SVG)

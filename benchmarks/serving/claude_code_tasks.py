@@ -289,6 +289,10 @@ def stop_child(process):
 def capture_client(command, directory, environment, timeout, cancel_after_content):
     start = time.perf_counter()
     events, diagnostics = [], []
+    tools_index = command.index("--tools") + 1 if "--tools" in command else len(command)
+    requested = sorted(set(filter(None, command[tools_index].split(",")))) if tools_index < len(command) else []
+    inventory = {"requested": requested, "advertised": None, "missing": [],
+                 "status": "unreported" if requested else "not_requested"}
     first_content = None
     cancelled = timed_out = False
     stdout_path = directory / "client.stdout.jsonl"
@@ -336,6 +340,28 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                             continue
                         now = time.perf_counter() - start
                         events.append({"elapsed_s": now, "event": event})
+                        if event.get("type") == "system" and event.get("subtype") == "init":
+                            advertised = event.get("tools")
+                            valid = isinstance(advertised, list) and all(isinstance(name, str) and name for name in advertised)
+                            if inventory["status"] in ("unreported", "not_requested"):
+                                if valid:
+                                    inventory["advertised"] = advertised
+                                if requested:
+                                    if valid:
+                                        inventory["missing"] = sorted(set(requested) - set(advertised))
+                                        inventory["status"] = "mismatch" if inventory["missing"] else "verified"
+                                    else:
+                                        inventory["status"] = "invalid"
+                                    if inventory["status"] != "verified":
+                                        reason = ("The client did not advertise all requested tools: " + ", ".join(inventory["missing"])
+                                                  if valid else "The client emitted an invalid initial tool inventory.")
+                                        diagnostics.append(reason)
+                                        stop_child(process)
+                        elif inventory["status"] == "unreported" and event.get("type") in (
+                                "assistant", "stream_event", "result"):
+                            inventory["status"] = "invalid"
+                            diagnostics.append("The client generated output before advertising its requested tools.")
+                            stop_child(process)
                         if has_content_delta(event):
                             first_content = now if first_content is None else first_content
             process.wait(timeout=3)
@@ -346,14 +372,17 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
             process.stderr.close()
     return {"exit_code": process.returncode, "elapsed_s": time.perf_counter() - start,
             "first_content_s": first_content, "cancel_sent": cancelled, "timed_out": timed_out,
-            "events": events, "diagnostics": diagnostics,
+            "events": events, "diagnostics": diagnostics, "tool_inventory": inventory,
             "stdout_path": str(stdout_path), "stderr_path": str(stderr_path)}
 
 
 def task_outcome(name, spec, directory, capture):
     tools, results, final = inspect_events(capture["events"])
     names = {tool["name"] for tool in tools}
-    finished = bool(final and not final.get("is_error") and capture["exit_code"] == 0)
+    inventory_ok = "tool_inventory" not in capture or (
+        isinstance(capture["tool_inventory"], dict) and
+        capture["tool_inventory"].get("status") in ("not_requested", "verified"))
+    finished = bool(final and not final.get("is_error") and capture["exit_code"] == 0 and inventory_ok)
     final_text = final.get("result", "") if final else ""
     if name == "read":
         assertion = "Read" in names and spec["marker"] in final_text
@@ -382,7 +411,7 @@ def task_outcome(name, spec, directory, capture):
                 "observed_input_usage": observed_input_usage or None}
     else:
         assertion = capture["cancel_sent"] and capture["first_content_s"] is not None
-        finished = assertion
+        finished = assertion and inventory_ok
     return {"passed": bool(finished and assertion), "assertion_passed": bool(assertion),
             "tool_calls": tools, "tool_results": results, "result": final}
 
