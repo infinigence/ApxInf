@@ -25,7 +25,7 @@ use crate::{
     diagnostics::{self, WorkerDiagnostics},
     host_pressure::{HostPressure, HostPressurePolicy},
     metrics::{ObservationMetrics, Outcome, RequestObservation},
-    output::{OutputParser, Part, StopMatcher},
+    output::{OutputParser, OutputProfile, Part, StopMatcher},
 };
 use generation::{wait_for_generation_control, GenerationPublic};
 use pending_queue::PendingQueue;
@@ -78,8 +78,28 @@ impl ApiError {
     }
 }
 
+#[derive(Clone, Default)]
+pub enum WorkerRuntime {
+    #[default]
+    Python,
+    NativeMiniCpm5 {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
+}
+
+impl WorkerRuntime {
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::Python => PROTOCOL,
+            Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
+    pub runtime: WorkerRuntime,
     pub python: PathBuf,
     pub worker: PathBuf,
     pub model: PathBuf,
@@ -97,6 +117,14 @@ pub struct Config {
 
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
+        if matches!(self.runtime, WorkerRuntime::NativeMiniCpm5 { .. })
+            && (self.max_context > 4096 || self.output_batch_tokens != 1)
+        {
+            return Err(
+                "Native MiniCPM5 requires at most 4096 positions and one token per output frame."
+                    .into(),
+            );
+        }
         if !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.memory_budget)
             || !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.sequence_reservation)
         {
@@ -299,6 +327,7 @@ impl Service {
 }
 
 struct Worker {
+    protocol: &'static str,
     child: Child,
     _diagnostics: Option<WorkerDiagnostics>,
     input: Option<ChildStdin>,
@@ -334,7 +363,7 @@ impl Worker {
         self.sent_commands > contracts::MAX_COMMANDS - REQUEST_COMMAND_ALLOWANCE
     }
     fn command(&self, kind: &str) -> Value {
-        json!({"protocol":PROTOCOL,"kind":kind,"worker_epoch":self.epoch,"command_id":uuid::Uuid::new_v4().to_string()})
+        json!({"protocol":self.protocol,"kind":kind,"worker_epoch":self.epoch,"command_id":uuid::Uuid::new_v4().to_string()})
     }
     async fn receive(&mut self, timeout: Duration) -> Result<Value, ApiError> {
         let value = tokio::time::timeout(timeout, self.frames.recv())
@@ -342,7 +371,7 @@ impl Worker {
             .map_err(|_| ApiError::worker("The worker response timed out."))?
             .ok_or_else(|| ApiError::worker("The worker output pipe closed."))?
             .map_err(ApiError::worker)?;
-        if value["worker_epoch"] != self.epoch {
+        if value["worker_epoch"] != self.epoch || value["protocol"] != self.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -394,7 +423,7 @@ impl Worker {
         Ok(false)
     }
     fn consume_idle_frame(&mut self, value: &Value) -> Result<(), ApiError> {
-        if value["worker_epoch"] != self.epoch {
+        if value["worker_epoch"] != self.epoch || value["protocol"] != self.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -490,12 +519,17 @@ async fn launch_worker_until(
     }
     pressure.require_load().map_err(LaunchError::Pressure)?;
     let epoch = uuid::Uuid::new_v4().to_string();
-    let mut command = Command::new(&config.python);
+    let mut command = match &config.runtime {
+        WorkerRuntime::Python => {
+            let mut command = Command::new(&config.python);
+            command.arg("-u").arg(&config.worker);
+            command
+        }
+        WorkerRuntime::NativeMiniCpm5 { executable, .. } => Command::new(executable),
+    };
     command
-        .arg("-u")
-        .arg(&config.worker)
         .arg("--protocol")
-        .arg(PROTOCOL)
+        .arg(config.runtime.protocol())
         .arg("--worker-epoch")
         .arg(&epoch)
         .arg("--model")
@@ -520,6 +554,14 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. } = &config.runtime {
+        command.arg("--metal-library").arg(metal_library).env(
+            "DYLD_LIBRARY_PATH",
+            metal_library
+                .parent()
+                .ok_or_else(|| "The Metal library needs a parent directory.".to_owned())?,
+        );
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("Cannot start worker: {e}"))?;
@@ -538,6 +580,7 @@ async fn launch_worker_until(
     };
     let frames = read_worker_frames(stdout);
     let mut worker = Worker {
+        protocol: config.runtime.protocol(),
         child,
         _diagnostics: Some(diagnostic_reader),
         input: Some(input),
@@ -1100,7 +1143,7 @@ async fn prepare_request(
         )
         .await?;
         let result = (|| {
-            if event["worker_epoch"] != worker.epoch {
+            if event["worker_epoch"] != worker.epoch || event["protocol"] != worker.protocol {
                 return Err(ApiError::new(
                     500,
                     "protocol_fault",
@@ -1275,7 +1318,7 @@ async fn settle_stopped_submission(
                     ApiError::worker("The worker output closed during submission settlement.")
                 })?
                 .map_err(ApiError::worker)?;
-            if frame["worker_epoch"] != worker.epoch {
+            if frame["worker_epoch"] != worker.epoch || frame["protocol"] != worker.protocol {
                 return Err(ApiError::new(
                     500,
                     "protocol_fault",
@@ -1377,6 +1420,27 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         {
             return Err(format!("The model artifact identity differs: {name}"));
         }
+    }
+    if let WorkerRuntime::NativeMiniCpm5 {
+        executable,
+        metal_library,
+    } = &config.runtime
+    {
+        let expected = crate::native_identity::runtime(executable, metal_library)?;
+        if manifest["runtime"] != expected
+            || manifest["adapter_revision"] != "apxinf-native-minicpm5-v1"
+            || manifest["execution"]
+                != crate::native_identity::execution(
+                    config.max_context,
+                    config.max_output,
+                    config.memory_budget,
+                )
+        {
+            return Err(
+                "The native execution identity differs from the selected configuration.".into(),
+            );
+        }
+        return Ok(());
     }
     let root = config
         .worker
@@ -1490,7 +1554,12 @@ async fn execute(
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
-    let mut parser = OutputParser::new(job.request.tools.clone());
+    let profile = if worker.protocol == contracts::NATIVE_PROTOCOL {
+        OutputProfile::MiniCpm5
+    } else {
+        OutputProfile::Qwen
+    };
+    let mut parser = OutputParser::with_profile(job.request.tools.clone(), profile);
     let mut stops = StopMatcher::new(job.request.stops.clone());
     let mut output_tokens = 0;
     let mut control_sent = false;
@@ -1541,7 +1610,7 @@ async fn execute(
         public.expire(&job, service, timeout, public_error.as_ref(), terminal.as_ref());
         let frame = event.ok_or_else(|| ApiError::worker("The worker output closed during execution."))?
             .map_err(ApiError::worker)?;
-        if frame["worker_epoch"] != worker.epoch {
+        if frame["worker_epoch"] != worker.epoch || frame["protocol"] != worker.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -1851,6 +1920,7 @@ pub(crate) fn gateway_test_service_with_pressure(
         stopped: watch::channel(None).1,
         ready_state: RwLock::new(json!({"worker_epoch":"00000000-0000-4000-8000-000000000001"})),
         ready: json!({
+            "protocol": PROTOCOL,
             "worker_epoch": "00000000-0000-4000-8000-000000000001",
             "model_revision": "1111111111111111111111111111111111111111111111111111111111111111",
             "capabilities": {"max_context": 4096, "max_output_tokens": 1024}
@@ -2073,6 +2143,7 @@ mod lifecycle_tests {
         let input = child.stdin.take().unwrap();
         let frames = read_worker_frames(child.stdout.take().unwrap());
         Worker {
+            protocol: PROTOCOL,
             child,
             _diagnostics: None,
             input: Some(input),

@@ -57,6 +57,7 @@ pub(super) async fn cpu_worker(model: PathBuf) -> Result<(Worker, Value), String
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let mut worker = Worker {
+        protocol: PROTOCOL,
         child,
         _diagnostics: None,
         input,
@@ -619,6 +620,7 @@ sys.stdin.readline()
         let input = child.stdin.take().unwrap();
         let frames = read_worker_frames(child.stdout.take().unwrap());
         let mut worker = Worker {
+            protocol: PROTOCOL,
             child,
             _diagnostics: None,
             input: Some(input),

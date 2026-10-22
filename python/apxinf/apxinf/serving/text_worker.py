@@ -444,7 +444,7 @@ class TextWorker:
                     contracts.validate_command_envelope(error.frame)
                     command = error.frame
                     invalid = True
-                if command["worker_epoch"] != self.worker_epoch:
+                if command["worker_epoch"] != self.worker_epoch or command["protocol"] != "apxinf-worker/2.0":
                     raise ChannelFailure("The command has a different worker epoch.")
                 if command["kind"] not in {
                     "submit", "prepare_input", "cancel_request", "stop_generation",
@@ -775,7 +775,7 @@ class TextWorker:
             self._invalid(command.frame)
             return
         contracts.validate_frame(command)
-        if command["worker_epoch"] != self.worker_epoch:
+        if command["worker_epoch"] != self.worker_epoch or command["protocol"] != "apxinf-worker/2.0":
             raise ChannelFailure("The command has a different worker epoch.")
         if command["kind"] not in {"submit", "prepare_input"}:
             self._control(command)

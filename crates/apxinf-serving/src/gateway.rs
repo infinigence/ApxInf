@@ -74,7 +74,12 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":"apxinf-serial-v0.1","public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":"qwen_xml_or_json","tool_choice":["auto","none"],"thinking":false,"sampling":false,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}}))).into_response()
+    let tools = if service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL {
+        "minicpm5_xml"
+    } else {
+        "qwen_xml_or_json"
+    };
+    (status, Json(json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":"apxinf-serial-v0.1","public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":false,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}}))).into_response()
 }
 async fn models(State(service): State<Arc<Service>>) -> Json<Value> {
     Json(
@@ -128,7 +133,7 @@ async fn handle(
     let value = crate::contracts::parse_document(&body)
         .map_err(|e| ApiError::invalid(format!("The request is not valid JSON: {e}")))?;
     let (request, stream) = normalize(&value, api, count_only, &service)?;
-    let preparation = json!({"protocol":crate::supervisor::PROTOCOL,"kind":"prepare_input","worker_epoch":service.ready["worker_epoch"],"command_id":uuid::Uuid::new_v4().to_string(),"model_revision":service.ready["model_revision"],"messages":request.messages,"tools":request.tools,"template_options":{"enable_thinking":false}});
+    let preparation = json!({"protocol":service.ready["protocol"],"kind":"prepare_input","worker_epoch":service.ready["worker_epoch"],"command_id":uuid::Uuid::new_v4().to_string(),"model_revision":service.ready["model_revision"],"messages":request.messages,"tools":request.tools,"template_options":{"enable_thinking":false}});
     crate::contracts::encode_frame(&preparation)
         .map_err(|e| ApiError::invalid(format!("The normalized input is invalid: {e}")))?;
     let ticket = service.enqueue(request)?;

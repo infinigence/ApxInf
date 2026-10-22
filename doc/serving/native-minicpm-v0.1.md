@@ -31,7 +31,7 @@ The worker does not support state reuse, image input, or sampling.
 The worker renders the checkpoint template with structured tool calls and tool messages.
 Tool arguments remain JSON objects during rendering.
 The worker returns exact token IDs, their count, and their digest through `prepared_input`.
-The coordinator validates this result before capacity reservation and submission.
+The coordinator checks this result before capacity reservation and submission.
 The worker must consume the submitted tokens without another template operation.
 The native profile requires all checkpoint EOS tokens, including 1 and 130073.
 The worker must not emit EOS text.
