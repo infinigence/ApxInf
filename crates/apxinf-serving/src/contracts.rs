@@ -11,6 +11,7 @@ pub const PROTOCOL: &str = "apxinf-worker/2.0";
 pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
 pub const NATIVE_THINKING_PROTOCOL: &str = "apxinf-worker/2.3";
+pub const NATIVE_BOUNDED_THINKING_PROTOCOL: &str = "apxinf-worker/2.4";
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
@@ -302,7 +303,8 @@ fn sampling(value: &Value) -> Result<()> {
 
 fn submit_fields(frame: &Value) -> Result<()> {
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
-        || frame["protocol"] == NATIVE_THINKING_PROTOCOL;
+        || frame["protocol"] == NATIVE_THINKING_PROTOCOL
+        || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL;
     fields(
         frame,
         REQUEST,
@@ -402,7 +404,8 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
         frame["protocol"] == PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
-            || frame["protocol"] == NATIVE_THINKING_PROTOCOL,
+            || frame["protocol"] == NATIVE_THINKING_PROTOCOL
+            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL,
         "unsupported protocol",
     )?;
     uuid(&frame["worker_epoch"])?;
@@ -444,10 +447,12 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
         frame["protocol"] == PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
-            || frame["protocol"] == NATIVE_THINKING_PROTOCOL,
+            || frame["protocol"] == NATIVE_THINKING_PROTOCOL
+            || frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL,
         "unsupported protocol",
     )?;
-    let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL;
+    let bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL;
+    let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL || bounded;
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL || thinking;
     let native = frame["protocol"] == NATIVE_PROTOCOL || sampled;
     uuid(&frame["worker_epoch"])?;
@@ -481,6 +486,17 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 ],
                 &[],
             )?;
+            let manifest = &frame["model_manifest"];
+            object(manifest)?;
+            if !bounded {
+                require(
+                    manifest["adapter_revision"] != "apxinf-native-minicpm5-bounded-thinking-v1"
+                        && manifest["execution"]["output_policy"]
+                            != "minicpm5-initial-thinking-fixed512-v1"
+                        && manifest["execution"].get("initial_reasoning").is_none(),
+                    "bounded thinking identity requires protocol 2.4",
+                )?;
+            }
             capabilities(&frame["capabilities"], native, sampled)?;
             counts(
                 &frame["limits"],
@@ -536,16 +552,39 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                                 "sampling",
                                 "output_policy",
                             ],
-                            &[],
+                            if bounded {
+                                &["initial_reasoning"]
+                            } else {
+                                &[]
+                            },
                         )?;
                         require(
-                            execution["output_policy"] == "minicpm5-initial-thinking-v1",
+                            execution["output_policy"]
+                                == if bounded {
+                                    "minicpm5-initial-thinking-fixed512-v1"
+                                } else {
+                                    "minicpm5-initial-thinking-v1"
+                                },
                             "unsupported native thinking output policy",
                         )?;
                     }
+                    if bounded {
+                        let reasoning = &execution["initial_reasoning"];
+                        fields(
+                            reasoning,
+                            &[],
+                            &["budget_tokens", "close_token_id", "selection"],
+                            &[],
+                        )?;
+                        integer(&reasoning["budget_tokens"], 512, 512)?;
+                        integer(&reasoning["close_token_id"], 9, 9)?;
+                        choice(&reasoning["selection"], &["cpu-constrained-close-v1"])?;
+                    }
                     require(
                         manifest["adapter_revision"]
-                            == if thinking {
+                            == if bounded {
+                                "apxinf-native-minicpm5-bounded-thinking-v1"
+                            } else if thinking {
                                 "apxinf-native-minicpm5-thinking-v1"
                             } else {
                                 "apxinf-native-minicpm5-sampled-v1"
@@ -587,6 +626,16 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     .all(|token| token.as_u64().unwrap() < vocabulary),
                 "EOS outside vocabulary",
             )?;
+            if bounded {
+                require(
+                    vocabulary > 9
+                        && !frame["eos_token_ids"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&serde_json::json!(9)),
+                    "initial reasoning close token must be inside vocabulary and outside EOS",
+                )?;
+            }
             object(&frame["model_manifest"])?;
             require(
                 frame["model_revision"]
@@ -618,7 +667,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             )?;
             require(
                 !thinking || frame["template_options"]["enable_thinking"] == true,
-                "protocol 2.3 requires thinking preparation",
+                if bounded {
+                    "protocol 2.4 requires thinking preparation"
+                } else {
+                    "protocol 2.3 requires thinking preparation"
+                },
             )?;
         }
         "prepared_input" => {
@@ -1194,6 +1247,16 @@ mod tests {
         check_sampled_profile(&corpus);
     }
 
+    #[test]
+    fn shared_native_bounded_thinking_profile() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-bounded-thinking-v0.1.json"
+        ))
+        .unwrap();
+        check_sampled_profile(&corpus);
+        check_event_transcripts(&corpus);
+    }
+
     fn check_sampled_profile(corpus: &Value) {
         for case in corpus["frame_cases"].as_array().unwrap() {
             let mut frame = fixture(corpus, case);
@@ -1351,12 +1414,16 @@ mod tests {
     #[test]
     fn shared_event_transcripts() {
         let corpus = corpus();
+        check_event_transcripts(&corpus);
+    }
+
+    fn check_event_transcripts(corpus: &Value) {
         for case in corpus["stream_cases"].as_array().unwrap() {
             let mut tracker = AttemptTracker::new(&corpus["templates"]["submit"]).unwrap();
             let mut failure = None;
             for (index, selected) in case["events"].as_array().unwrap().iter().enumerate() {
                 let before = format!("{tracker:?}");
-                if tracker.observe(&fixture(&corpus, selected)).is_err() {
+                if tracker.observe(&fixture(corpus, selected)).is_err() {
                     assert_eq!(
                         format!("{tracker:?}"),
                         before,
