@@ -164,8 +164,8 @@ This run identifies two remaining constraints.
 The model needs accurate literal Edit parameters and recovery from tool errors.
 A fixed 8192-token output reservation reduces the input capacity for later tool turns.
 The next candidate uses a 4096-token output allowance with the separate 512-token initial reasoning budget.
-That candidate needs its own real client and default-policy validation.
-It has no accepted quality or compatibility result yet.
+Those runs established no default-policy result for that candidate.
+The [later default-policy record](minicpm-default-context-validation-20261023.md) tests its short client tool cycle and retains the failed visual verdict.
 
 ## Evidence
 

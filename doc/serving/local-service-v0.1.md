@@ -127,6 +127,8 @@ The profile retains exact usage, the 16K total limit, and the unsupported Anthro
 The original thinking provider retains its behavior without a separate reasoning budget.
 The [validation record](native-bounded-thinking-validation-20261023.md) covers native controls and a completed real client tool cycle.
 The original pelican output still fails visual acceptance.
+The [default-policy record](minicpm-default-context-validation-20261023.md) tests 4096 output tokens without the private blocking-limit override.
+Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
 
 ### Python MLX-LM
 
