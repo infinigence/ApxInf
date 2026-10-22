@@ -13,7 +13,7 @@ import claude_code_tasks as client
 
 VALID_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">'
-    '<title>Pelican at the Harbor</title>'
+    '<title>Pelican Riding a Bicycle</title>'
     '<ellipse cx="240" cy="220" rx="100" ry="60" fill="white"/>'
     '<path d="M 280 220 L 420 240 L 300 260 Z" fill="orange"/>'
     '</svg>'
@@ -65,6 +65,8 @@ class PelicanTaskTests(unittest.TestCase):
     def test_task_creates_an_original_brief_and_narrow_tool_set(self):
         brief = (self.directory / "drawing-brief.txt").read_text()
         self.assertIn("pelican", brief)
+        self.assertIn("riding a bicycle", brief)
+        self.assertIn("feet on the pedals", brief)
         self.assertIn('viewBox="0 0 640 480"', brief)
         self.assertEqual(self.spec["tools"], ["Read", "Write", "Edit"])
         self.assertEqual(self.spec["allowed"], ["Read", "Write", "Edit"])
@@ -153,7 +155,7 @@ class PelicanTaskTests(unittest.TestCase):
                 self.assertFalse(self.outcome(successful_events())["passed"])
 
     def test_title_and_viewbox_are_required(self):
-        for source in (VALID_SVG.replace("Pelican at the Harbor", "Other title"),
+        for source in (VALID_SVG.replace("Pelican Riding a Bicycle", "Other title"),
                        VALID_SVG.replace("0 0 640 480", "0 0 600 480")):
             with self.subTest(source=source):
                 self.save_svg(source)
