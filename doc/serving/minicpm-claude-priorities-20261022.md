@@ -20,6 +20,10 @@ The test computer has an Apple M4 and 16 GiB of memory. The installed Claude Cod
 
 The native CLI produced the requested short text. It also produced a `Read` function call in the checkpoint's tool grammar. These results do not establish HTTP compatibility or successful tool execution.
 
+A client-only probe set the reported window to 4096 tokens. Claude Code rejected the request before sending it to the model endpoint. The same probe sent a request with a 16384-token window. No model inference ran during this probe.
+
+The captured request exposed `Read` and `Edit` tools. A reference tokenizer counted 710 input tokens, with 1024 requested output tokens. This count describes the captured input rather than a completed native request. The client rejection therefore does not demonstrate that the model input exceeded 4096 tokens.
+
 The baseline serving tests passed 135 Rust checks and 240 Python checks. The runners skipped one Rust check and six Python checks. These checks do not establish native MiniCPM serving acceptance.
 
 ## Gaps and acceptance order
