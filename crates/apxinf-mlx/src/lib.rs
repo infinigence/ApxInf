@@ -7,7 +7,7 @@ mod backend;
 mod ffi;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{
-    clear_cache, memory_stats, reset_peak_memory, Array, Compiled, MemoryStats, MetalKernel,
+    clear_cache, memory_stats, reset_peak_memory, set_memory_limit, Array, Compiled, MemoryStats, MetalKernel,
     MlxDType, Stream, StreamCounters,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]

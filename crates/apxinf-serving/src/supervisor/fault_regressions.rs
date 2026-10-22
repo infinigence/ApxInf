@@ -53,6 +53,7 @@ for line in sys.stdin:
         .spawn()
         .unwrap();
     let worker = Worker {
+        protocol: PROTOCOL,
         input: child.stdin.take(),
         frames: read_worker_frames(child.stdout.take().unwrap()),
         child,

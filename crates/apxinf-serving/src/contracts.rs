@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
+pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_DEPTH: usize = 16;
 pub const MAX_COMMANDS: u64 = 10_000;
@@ -272,7 +273,7 @@ fn messages(value: &Value, tool_values: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn capabilities(value: &Value) -> Result<()> {
+fn capabilities(value: &Value, native: bool) -> Result<()> {
     fields(
         value,
         &[],
@@ -306,10 +307,18 @@ fn capabilities(value: &Value) -> Result<()> {
     }
     choice(
         &value["cancel_granularity"],
-        &["token", "token_or_prefill_chunk"],
+        if native {
+            &["end_prefill_or_token"]
+        } else {
+            &["token", "token_or_prefill_chunk"]
+        },
     )?;
     integer(&value["max_active_sequences"], 1, 1)?;
-    integer(&value["max_context"], 1, MAX_PROMPT_TOKENS)?;
+    integer(
+        &value["max_context"],
+        1,
+        if native { 4096 } else { MAX_PROMPT_TOKENS },
+    )?;
     integer(&value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
     choice(&value["state_schema"], &["none"])
 }
@@ -329,7 +338,10 @@ fn is_event(kind: &str) -> bool {
 pub fn validate_command_envelope(frame: &Value) -> Result<()> {
     tree(frame, 1, false)?;
     object(frame)?;
-    require(frame["protocol"] == PROTOCOL, "unsupported protocol")?;
+    require(
+        frame["protocol"] == PROTOCOL || frame["protocol"] == NATIVE_PROTOCOL,
+        "unsupported protocol",
+    )?;
     uuid(&frame["worker_epoch"])?;
     uuid(&frame["command_id"])?;
     let kind = string(&frame["kind"])?;
@@ -378,7 +390,11 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
 pub fn validate_frame(frame: &Value) -> Result<()> {
     tree(frame, 1, false)?;
     object(frame)?;
-    require(frame["protocol"] == PROTOCOL, "unsupported protocol")?;
+    require(
+        frame["protocol"] == PROTOCOL || frame["protocol"] == NATIVE_PROTOCOL,
+        "unsupported protocol",
+    )?;
+    let native = frame["protocol"] == NATIVE_PROTOCOL;
     uuid(&frame["worker_epoch"])?;
     let kind = string(&frame["kind"])?;
     if let Some(id) = frame.get("command_id") {
@@ -410,7 +426,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 ],
                 &[],
             )?;
-            capabilities(&frame["capabilities"])?;
+            capabilities(&frame["capabilities"], native)?;
             counts(
                 &frame["limits"],
                 &["max_frame_bytes", "max_depth", "max_commands"],
@@ -421,7 +437,34 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     && frame["limits"]["max_commands"].as_u64() == Some(MAX_COMMANDS),
                 "incompatible transport limits",
             )?;
-            fields(&frame["runtime"], &[], &["python", "mlx", "mlx_lm"], &[])?;
+            if native {
+                fields(
+                    &frame["runtime"],
+                    &[],
+                    &[
+                        "kind",
+                        "apxinf",
+                        "mlx",
+                        "executable_sha256",
+                        "metal_library_sha256",
+                    ],
+                    &[],
+                )?;
+                require(
+                    frame["runtime"]["kind"] == "native_minicpm5"
+                        && frame["runtime"]["apxinf"] == "0.1.0"
+                        && frame["runtime"]["mlx"] == "0.31.2",
+                    "unsupported native runtime",
+                )?;
+                digest(&frame["runtime"]["executable_sha256"])?;
+                digest(&frame["runtime"]["metal_library_sha256"])?;
+                require(
+                    frame["model_manifest"]["runtime"] == frame["runtime"],
+                    "native runtime mismatch",
+                )?;
+            } else {
+                fields(&frame["runtime"], &[], &["python", "mlx", "mlx_lm"], &[])?;
+            }
             for value in object(&frame["runtime"])?.values() {
                 string(value)?;
             }
@@ -906,6 +949,7 @@ pub fn token_prefix_digest(tokens: &[u32]) -> Result<String> {
 
 #[derive(Debug, Clone)]
 pub struct AttemptTracker {
+    protocol: String,
     key: (String, String, u64),
     input_tokens: u64,
     max_tokens: u64,
@@ -921,6 +965,7 @@ impl AttemptTracker {
         validate_frame(submit)?;
         require(submit["kind"] == "submit", "tracker requires submit")?;
         Ok(Self {
+            protocol: string(&submit["protocol"])?.into(),
             key: (
                 string(&submit["worker_epoch"])?.into(),
                 string(&submit["request_id"])?.into(),
@@ -943,7 +988,8 @@ impl AttemptTracker {
         let kind = string(&event["kind"])?;
         require(is_event(kind), "not an attempt event")?;
         require(
-            event["worker_epoch"] == self.key.0
+            event["protocol"] == self.protocol
+                && event["worker_epoch"] == self.key.0
                 && event["request_id"] == self.key.1
                 && event["attempt"].as_u64() == Some(self.key.2),
             "attempt identity mismatch",
@@ -1033,6 +1079,39 @@ mod tests {
             "../../../tests/fixtures/serving/serial-v0.1.json"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn shared_native_profile() {
+        let native: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-v0.1.json"
+        ))
+        .unwrap();
+        let mut base = corpus()["templates"]["ready"].clone();
+        base["protocol"] = NATIVE_PROTOCOL.into();
+        base["runtime"] = native["runtime"].clone();
+        base["capabilities"] = native["capabilities"].clone();
+        base["model_manifest"]["runtime"] = native["runtime"].clone();
+        base["model_revision"] =
+            canonical_identity_digest("apxinf-model-identity-v1", &base["model_manifest"])
+                .unwrap()
+                .into();
+        base["capability_revision"] =
+            canonical_identity_digest("apxinf-capability-v1", &base["capabilities"])
+                .unwrap()
+                .into();
+        for case in native["cases"].as_array().unwrap() {
+            let mut frame = base.clone();
+            for (pointer, value) in case["set"].as_object().unwrap() {
+                *frame.pointer_mut(pointer).unwrap() = value.clone();
+            }
+            assert_eq!(
+                validate_frame(&frame).is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     fn fixture(corpus: &Value, case: &Value) -> Value {

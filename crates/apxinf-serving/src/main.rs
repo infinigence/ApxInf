@@ -1,7 +1,7 @@
 use apxinf_serving::{
     diagnostics, gateway,
     host_pressure::HostPressurePolicy,
-    supervisor::{self, Config},
+    supervisor::{self, Config, WorkerRuntime},
 };
 use clap::Parser;
 use futures_util::FutureExt;
@@ -21,6 +21,12 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5"])]
+    provider: String,
+    #[arg(long)]
+    native_worker: Option<PathBuf>,
+    #[arg(long)]
+    metal_library: Option<PathBuf>,
     #[arg(
         long,
         default_value = ".apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python"
@@ -96,10 +102,38 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("A service limit is outside the supported range.".into());
     }
+    let runtime = if args.provider == "native-minicpm5" {
+        WorkerRuntime::NativeMiniCpm5 {
+            executable: std::fs::canonicalize(
+                args.native_worker
+                    .ok_or("Native provider requires --native-worker.")?,
+            )?,
+            metal_library: std::fs::canonicalize(
+                args.metal_library
+                    .ok_or("Native provider requires --metal-library.")?,
+            )?,
+        }
+    } else {
+        if args.native_worker.is_some() || args.metal_library.is_some() {
+            return Err("Native runtime paths require --provider native-minicpm5.".into());
+        }
+        WorkerRuntime::Python
+    };
+    let python = if matches!(runtime, WorkerRuntime::Python) {
+        std::fs::canonicalize(args.python)?
+    } else {
+        args.python
+    };
+    let worker = if matches!(runtime, WorkerRuntime::Python) {
+        std::fs::canonicalize(args.worker)?
+    } else {
+        args.worker
+    };
     let service = supervisor::start_with_shutdown(
         Config {
-            python: std::fs::canonicalize(args.python)?,
-            worker: std::fs::canonicalize(args.worker)?,
+            runtime,
+            python,
+            worker,
             model: std::fs::canonicalize(args.model)?,
             model_id: args.model_id,
             max_context: args.max_context,
