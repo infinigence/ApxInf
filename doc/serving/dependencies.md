@@ -125,3 +125,10 @@ It does not import MLX or introduce a runtime dependency.
 Explicit calibration inputs use the existing first-party `prepare_input` validator for seed messages.
 The parent records bounded JSON inputs and their SHA-256 digests before it starts the probe.
 These operations add no package dependency or worker fields.
+
+## Bounded native reasoning tests
+
+The serving crate uses the existing workspace `apxinf-loader` crate as a test dependency.
+CPU generation tests use its `ModelConfig` type to implement an original toy model.
+This dependency adds no external package or serving runtime component.
+The runtime policy calls the existing CPU sampler and native model generation interfaces.
