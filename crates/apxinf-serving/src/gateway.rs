@@ -74,17 +74,23 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let sampled = service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL;
+    let sampled = service.sampling_enabled();
     let tools = if service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL || sampled {
         "minicpm5_xml"
     } else {
         "qwen_xml_or_json"
     };
-    (status, Json(json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}}))).into_response()
+    let mut body = json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}});
+    if service.model_thinking() {
+        body["public_capabilities"]["model_thinking"] = json!("initial_hidden");
+    }
+    (status, Json(body)).into_response()
 }
 
 fn public_profile(service: &Service) -> &'static str {
-    if service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL {
+    if service.model_thinking() {
+        "apxinf-native-thinking-v0.1"
+    } else if service.sampling_enabled() {
         "apxinf-native-sampled-v0.1"
     } else {
         "apxinf-serial-v0.1"
@@ -142,7 +148,7 @@ async fn handle(
     let value = crate::contracts::parse_document(&body)
         .map_err(|e| ApiError::invalid(format!("The request is not valid JSON: {e}")))?;
     let (request, stream) = normalize(&value, api, count_only, &service)?;
-    let preparation = json!({"protocol":service.ready["protocol"],"kind":"prepare_input","worker_epoch":service.ready["worker_epoch"],"command_id":uuid::Uuid::new_v4().to_string(),"model_revision":service.ready["model_revision"],"messages":request.messages,"tools":request.tools,"template_options":{"enable_thinking":false}});
+    let preparation = json!({"protocol":service.ready["protocol"],"kind":"prepare_input","worker_epoch":service.ready["worker_epoch"],"command_id":uuid::Uuid::new_v4().to_string(),"model_revision":service.ready["model_revision"],"messages":request.messages,"tools":request.tools,"template_options":{"enable_thinking":service.model_thinking()}});
     crate::contracts::encode_frame(&preparation)
         .map_err(|e| ApiError::invalid(format!("The normalized input is invalid: {e}")))?;
     let ticket = service.enqueue(request)?;
@@ -301,10 +307,7 @@ fn normalize(
             "Select the model listed by /v1/models.",
         ));
     }
-    let selection = crate::sampling::Selection::from_request(
-        value,
-        service.ready["protocol"] == crate::contracts::NATIVE_SAMPLED_PROTOCOL,
-    )?;
+    let selection = crate::sampling::Selection::from_request(value, service.sampling_enabled())?;
     if let Some(thinking) = value.get("thinking") {
         if thinking != &json!({"type":"disabled"}) {
             return Err(ApiError::new(
@@ -872,12 +875,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_thinking_profile_is_distinct_from_extended_thinking() {
+        let (service, mut observed) = crate::supervisor::gateway_test_service_with_protocol(
+            crate::contracts::NATIVE_THINKING_PROTOCOL,
+        );
+        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+        value["thinking"] = json!({"type":"disabled"});
+        let error = request_error(service.clone(), value.clone(), Api::Anthropic).await;
+        assert_eq!(error.message, "Test coordinator observed admission.");
+        assert!(matches!(
+            observed.try_recv().unwrap().selection,
+            crate::sampling::Selection::Random { .. }
+        ));
+        for thinking in [
+            json!({"type":"enabled","budget_tokens":1024}),
+            json!({"type":"adaptive"}),
+        ] {
+            value["thinking"] = thinking;
+            assert_eq!(
+                request_error(service.clone(), value.clone(), Api::Anthropic)
+                    .await
+                    .code,
+                "unsupported_feature"
+            );
+            assert!(observed.try_recv().is_err());
+        }
+        let response = ready(State(service.clone())).await;
+        let body = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["profile"], "apxinf-native-thinking-v0.1");
+        assert_eq!(
+            body["public_capabilities"]["model_thinking"],
+            "initial_hidden"
+        );
+        assert_eq!(body["public_capabilities"]["thinking"], false);
+        assert_eq!(body["public_capabilities"]["sampling"], true);
+        service.shutdown();
+    }
+
+    #[tokio::test]
     async fn direct_admission_rejects_unsupported_or_invalid_selection() {
         use crate::sampling::Selection;
         for protocol in [
             crate::contracts::PROTOCOL,
             crate::contracts::NATIVE_PROTOCOL,
             crate::contracts::NATIVE_SAMPLED_PROTOCOL,
+            crate::contracts::NATIVE_THINKING_PROTOCOL,
         ] {
             let (service, mut observed) =
                 crate::supervisor::gateway_test_service_with_protocol(protocol);
@@ -888,7 +933,7 @@ mod tests {
                 top_p: 0.95,
             };
             assert!(service.enqueue(request).is_err());
-            if protocol != crate::contracts::NATIVE_SAMPLED_PROTOCOL {
+            if !service.sampling_enabled() {
                 let (mut request, _) = normalize(&value, Api::OpenAi, false, &service).unwrap();
                 request.selection = Selection::Random {
                     temperature: 1.0,

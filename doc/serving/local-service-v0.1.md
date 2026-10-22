@@ -110,6 +110,14 @@ Model thinking and image input remain disabled in this profile.
 For the measured 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
 The total includes prompt tokens and the requested output allowance.
 
+Select `--provider native-minicpm5-thinking` for the explicit [model thinking profile](native-thinking-v0.1.md).
+This deployment enables the model template and hides its initial reasoning prefix from public output.
+Readiness reports `model_thinking=initial_hidden` and `thinking=false` under public capabilities.
+The latter value means that Anthropic extended-thinking blocks and budget settings remain unsupported.
+All generated reasoning tokens count toward the output allowance.
+For a larger allowance within 16K total context, select `--max-output-tokens 8192` explicitly.
+The service still rejects a prompt and requested output allowance that exceed 16384 positions.
+
 ### Python MLX-LM
 
 Run the following commands from the repository root on an Apple Silicon Mac.
