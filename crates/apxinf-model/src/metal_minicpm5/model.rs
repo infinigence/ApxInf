@@ -59,7 +59,7 @@ impl MiniCpm5 {
         backend: MlxBackend,
         variant: Variant,
     ) -> Result<Self> {
-        config.validate()?;
+        config.validate_variant(variant)?;
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
         let (cos, sin) = math::tables(stream, 256)?;

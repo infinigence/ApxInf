@@ -101,6 +101,16 @@ impl Config {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_variant(&self, variant: Variant) -> Result<()> {
+        self.validate()?;
+        if self.max_position_embeddings < variant.context_capacity() {
+            return Err(Error::Contract(
+                "MiniCPM checkpoint positions do not cover the selected variant",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

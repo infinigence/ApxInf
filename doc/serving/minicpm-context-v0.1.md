@@ -49,8 +49,8 @@ Chunked prefill does not establish DSpark support at larger lengths.
 
 ## Context limits
 
-The initial equivalence gate uses the existing 4096-position limit.
-A later ordinary BF16 candidate permits 16384 positions after that gate passes.
+The initial equivalence gate passed with the existing 4096-position limit.
+The ordinary BF16 model now permits a 16384-position candidate profile.
 The candidate applies to `bf16-public` and `bf16-compiled` only.
 Variant limits control RoPE table size, preparation, and token admission together.
 The service must retain its accepted deployment limit until the larger profile passes its quality and memory gates.
@@ -100,6 +100,8 @@ Cancellation after the first chunk consumed 256 tokens without sampling an outpu
 Release and subsequent prefill and generation succeeded on the same instance.
 The recovered 257-token request retained its original greedy token and emitted one progress boundary per chunk.
 
-The three CPU shape tests and 15 shared input tests passed.
+The initial three CPU shape tests and 15 shared input tests passed.
+The four CPU shape tests passed after the 16384-position candidate change.
+These tests include variant limits and insufficient checkpoint positions.
 The structural document check reported zero findings.
 These results do not establish larger context quality, memory coverage, or latency acceptance.
