@@ -255,6 +255,26 @@ The final Python serving suite ran 272 checks, with six skipped.
 Independent review found no material correctness issues in the client compatibility change.
 The full pelican revision task still requires a successful visual result and final checker execution.
 
+## Compatible revision timeout
+
+A focused revision run selected the verified client compatibility mode and retained the pinned native thinking profile.
+The first startup encountered host memory pressure and stopped before model loading.
+After the macOS pressure sensor returned normal, a separate recorded retry loaded the model successfully.
+
+The client completed Read, Read, Read, Bash, and Read.
+It did not complete an Edit call.
+One request expired after 600073 milliseconds with 2977 input tokens and 7433 output tokens.
+The service then received another request with the same input token count.
+The complete capture reached its 1200-second deadline and terminated the client.
+The report records `timed_out=true`, no final client result, and failed automated acceptance.
+
+The SVG digest equals the failed baseline digest, so the visual result remains failed.
+No checker ran after a successful final edit.
+The last request cancelled, capacity returned to idle, and the service exited normally without forced termination.
+The compatibility option therefore permits continuation but does not establish successful task completion.
+This result motivates a separate investigation of bounded model reasoning, rather than another increase in total output allowance.
+The existing 2.3 profile retains its declared generation behavior.
+
 ## Local evidence records
 
 The working directory retains complete diagnostic records under `devlocal/serving-minicpm/`.
@@ -288,6 +308,8 @@ This ignored directory is not part of the source checkout distributed through Gi
 | `client-context-probe-5b75b7e4/` | Full runner default and compatibility comparison |
 | `native-thinking-context-rejection/` | Exact native context rejection, cancellation, and worker fault checks |
 | `client-compat-tests.log` | Python checks for the bounded client option |
+| `native-thinking-revision-compatible/` | Host pressure rejection before model loading |
+| `native-thinking-revision-compatible-retry/` | Compatible client revision timeout and unchanged artifact digest |
 | `chunk-cli-smoke.log` | Native CLI regression after chunk integration |
 
 The [context profile](minicpm-context-v0.1.md) records the separate numerical equivalence gate.
