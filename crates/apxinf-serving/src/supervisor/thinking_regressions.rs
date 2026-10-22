@@ -2,7 +2,12 @@ use super::lifecycle_regressions::cpu_service;
 use super::*;
 use futures_util::FutureExt;
 
-async fn thinking_output(mode: &str) -> Vec<Event> {
+const THINKING_PROTOCOLS: [&str; 2] = [
+    contracts::NATIVE_THINKING_PROTOCOL,
+    contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
+];
+
+async fn thinking_output(protocol: &'static str, mode: &str) -> Vec<Event> {
     let script = r#"
 import hashlib, json, struct, sys
 mode = sys.argv[1]
@@ -63,7 +68,7 @@ while True:
         .spawn()
         .unwrap();
     let worker = Worker {
-        protocol: contracts::NATIVE_THINKING_PROTOCOL,
+        protocol,
         input: child.stdin.take(),
         frames: read_worker_frames(child.stdout.take().unwrap()),
         child,
@@ -72,7 +77,7 @@ while True:
         controls: Default::default(),
         sent_commands: 0,
     };
-    let ready = json!({"protocol":contracts::NATIVE_THINKING_PROTOCOL,"worker_epoch":epoch,
+    let ready = json!({"protocol":protocol,"worker_epoch":epoch,
         "model_revision":"1".repeat(64),"capability_revision":"2".repeat(64),
         "eos_token_ids":[2],"capabilities":{"max_context":64}});
     let mut service = cpu_service(
@@ -129,50 +134,58 @@ while True:
 
 #[tokio::test]
 async fn initial_thinking_does_not_match_stops_and_preserves_raw_cutoff() {
-    let events = thinking_output("stop").await;
-    let text = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::Part(Part::Text(value)) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    assert_eq!(text, "visible ");
-    assert!(
-        matches!(events.last(), Some(Event::Done { cause, output_tokens: 4, matched_stop: Some(stop), .. })
+    for protocol in THINKING_PROTOCOLS {
+        let events = thinking_output(protocol, "stop").await;
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Part(Part::Text(value)) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "visible ");
+        assert!(
+            matches!(events.last(), Some(Event::Done { cause, output_tokens: 4, matched_stop: Some(stop), .. })
         if cause == "stop_sequence" && stop == "STOP")
-    );
+        );
+    }
 }
 
 #[tokio::test]
 async fn hidden_output_budget_completion_remains_length_with_full_usage() {
-    let events = thinking_output("length").await;
-    assert_eq!(events.len(), 1);
-    assert!(
-        matches!(&events[0], Event::Done { cause, input_tokens: 2, output_tokens: 1, .. } if cause == "length")
-    );
+    for protocol in THINKING_PROTOCOLS {
+        let events = thinking_output(protocol, "length").await;
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], Event::Done { cause, input_tokens: 2, output_tokens: 1, .. } if cause == "length")
+        );
+    }
 }
 
 #[tokio::test]
 async fn hidden_eos_is_invalid_but_terminal_decoder_close_is_accepted() {
-    let events = thinking_output("eos").await;
-    assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], Event::Error(error) if error.code == "internal_error"));
-    let events = thinking_output("terminal_close").await;
-    assert!(matches!(&events[0], Event::Part(Part::Text(text)) if text == "final answer"));
-    assert!(
-        matches!(events.last(), Some(Event::Done { cause, output_tokens: 1, .. }) if cause == "eos")
-    );
+    for protocol in THINKING_PROTOCOLS {
+        let events = thinking_output(protocol, "eos").await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Event::Error(error) if error.code == "internal_error"));
+        let events = thinking_output(protocol, "terminal_close").await;
+        assert!(matches!(&events[0], Event::Part(Part::Text(text)) if text == "final answer"));
+        assert!(
+            matches!(events.last(), Some(Event::Done { cause, output_tokens: 1, .. }) if cause == "eos")
+        );
+    }
 }
 
 #[tokio::test]
 async fn hidden_reasoning_preserves_cancel_and_deadline_outcomes() {
-    for (mode, code) in [("cancel", "cancelled"), ("expired", "deadline_exceeded")] {
-        let events = thinking_output(mode).await;
-        assert_eq!(events.len(), 1);
-        assert!(
-            matches!(&events[0], Event::Error(error) if error.code == code),
-            "unexpected outcome for {mode}"
-        );
+    for protocol in THINKING_PROTOCOLS {
+        for (mode, code) in [("cancel", "cancelled"), ("expired", "deadline_exceeded")] {
+            let events = thinking_output(protocol, mode).await;
+            assert_eq!(events.len(), 1);
+            assert!(
+                matches!(&events[0], Event::Error(error) if error.code == code),
+                "unexpected outcome for {mode}"
+            );
+        }
     }
 }
