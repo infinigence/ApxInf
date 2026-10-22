@@ -75,9 +75,46 @@ They do not establish an optimal reasoning allowance or general model capability
 The earlier 1253-token calculation case remains separate from this 158-token request.
 
 The [pinned model card](https://huggingface.co/openbmb/MiniCPM5-2B/blob/f97400052a43d642bbc6e9975e2397e3ae6a6b52/README.md) suggests repetition penalty 1.05 for repeated output.
-The current paired observation uses neutral repetition and does not test that suggestion.
-A separate diagnostic must check its effect before any serving-policy proposal.
+The paired worker observation uses neutral repetition.
+A separate public-API probe tests that suggestion without changing a serving profile.
 The original real Claude task and rendered drawing remain mandatory acceptance gates.
+
+## Repetition and output allowance
+
+The private probe uses the existing native model and CPU sampler APIs.
+Its neutral control reproduces all 158 prepared IDs and all 4096 selected IDs from the natural worker.
+This control checks one request and seed, rather than general provider equivalence.
+The separate repetition run changes only the penalty to the nearest F32 value of 1.05.
+That value is 1.0499999523162842.
+
+| Repetition penalty | Output allowance | Native capacity | Selected tokens | Initial closure or EOS |
+| --- | --- | --- | --- | --- |
+| 1 | 4096 | 4352 | 4096 | Neither |
+| 1.05, rounded to F32 | 4096 | 4352 | 4096 | Neither |
+| 1.05, rounded to F32 | 8192 | 8448 | 8192 | Neither |
+
+The repetition run first differs from the neutral run at generated index 10.
+The larger run uses a fresh process and increases both output allowance and reserved capacity.
+Its first 4096 selected IDs exactly match the smaller repetition run.
+The changed capacity therefore causes no observed prefix divergence in this pair.
+Neither repetition run delivers final content after initial reasoning.
+
+All three probes use the pinned BF16 model, seed 42, temperature 1, and top-p 0.95.
+They use the same probe executable and loaded MLX library.
+Their final summaries follow request-state release.
+The parent observes all three wrappers exit zero, and the independent reviewer checks completed records and child absence.
+These observations do not measure allocator release or qualify KV reuse.
+
+The independent reviewer checks complete IDs, source and library hashes, preparation, and counting semantics.
+The event stream includes EOS, while the old probe summary count excludes EOS.
+No EOS occurs in these runs, so both counts agree here.
+The reviewer labels wrapper exit codes and lock serialization as parent observations.
+The records reside in the three `repetition-direct*` directories and `repetition-evidence-review.md` under the ignored feature directory.
+
+For this request and seed, the optional penalty and larger allowance do not resolve missing final output.
+These results reject another budget increase as a demonstrated fix.
+They do not establish general model inability or identify a native calculation defect.
+The next comparison must test a qualified reference generation path before another production policy change.
 
 ## Lifecycle, review, and records
 
