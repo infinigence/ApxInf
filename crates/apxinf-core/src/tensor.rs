@@ -40,7 +40,9 @@ impl Tensor {
     /// This compatibility constructor is retained while the existing CUDA
     /// backend and `apxinf-cuda-new` coexist. New device backends should call
     /// [`Tensor::from_raw_parts_unchecked`] so the raw-storage safety boundary
-    /// remains explicit at their call site.
+    /// remains explicit at their call site. Lazy array backends should use
+    /// `from_opaque_parts` instead. This constructor does not validate opaque
+    /// metadata; the owning backend must validate it before every use.
     pub fn from_raw_parts(shape: Shape, dtype: DType, device: Device, storage: Storage) -> Self {
         // This method intentionally preserves the legacy API. The old backend
         // owns its allocation through `GpuStorageHandle::_prevent_leak`.
@@ -51,9 +53,14 @@ impl Tensor {
     ///
     /// # Safety
     ///
-    /// `storage` must belong to `device`, remain valid for the returned
-    /// tensor's lifetime, and contain at least `shape.numel() *
-    /// dtype.size_in_bytes()` accessible bytes without arithmetic overflow.
+    /// `storage` must belong to `device` and remain valid for the returned
+    /// tensor's lifetime. CPU/GPU storage must contain at least
+    /// `shape.numel() * dtype.size_in_bytes()` accessible bytes without
+    /// arithmetic overflow. For opaque storage, the owner must retain a native
+    /// array matching `device`, `dtype` and element count, with its recorded
+    /// logical byte extent equal to that product. No allocation pointer or
+    /// accessible-byte guarantee is required for a lazy array. Its owning
+    /// backend must still validate the native representation before every use.
     pub unsafe fn from_raw_parts_unchecked(
         shape: Shape,
         dtype: DType,
@@ -66,6 +73,49 @@ impl Tensor {
             device,
             storage,
         }
+    }
+
+    /// Retain a thread-affine backend array without pretending it is a pointer.
+    ///
+    /// Checks that `device` is Metal and `num_bytes` exactly matches the
+    /// metadata's logical byte extent, not an allocation capacity. This is an
+    /// advisory metadata check: core cannot inspect `owner`, and the legacy
+    /// raw-parts constructor can rebuild different metadata around the same
+    /// storage. The owning backend's downcast and native dtype/device/extent
+    /// validation before every use is authoritative. CPU data uses `from_raw`.
+    #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+    pub fn from_opaque_parts(
+        shape: Shape,
+        dtype: DType,
+        device: Device,
+        num_bytes: usize,
+        owner: std::rc::Rc<dyn std::any::Any>,
+    ) -> Result<Self> {
+        if !matches!(device, Device::Metal(_)) {
+            return Err(Error::UnsupportedDevice(device));
+        }
+        let expected = shape.dims().iter().try_fold(dtype.size_in_bytes(), |n, &d| {
+            if d == 0 {
+                return Err(Error::Contract("opaque storage rejects empty dimensions"));
+            }
+            n.checked_mul(d)
+                .ok_or(Error::Contract("opaque storage byte size overflow"))
+        })?;
+        if num_bytes != expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                got: num_bytes,
+            });
+        }
+        Ok(Self {
+            shape,
+            dtype,
+            device,
+            storage: Storage::Opaque {
+                device,
+                handle: crate::storage::OpaqueStorageHandle::new(owner, num_bytes),
+            },
+        })
     }
 
     /// Create a zero-filled tensor on CPU.
@@ -284,10 +334,18 @@ impl Tensor {
     /// Reshape the tensor (must preserve total element count).
     pub fn reshape(&self, new_shape: impl Into<Shape>) -> Result<Self> {
         let new_shape = new_shape.into();
-        if new_shape.numel() != self.shape.numel() {
+        let count = |shape: &Shape| {
+            shape.dims().iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d)
+                    .ok_or(Error::Contract("reshape element count overflow"))
+            })
+        };
+        let dst_numel = count(&new_shape)?;
+        let src_numel = count(&self.shape)?;
+        if dst_numel != src_numel {
             return Err(Error::ReshapeError {
-                src_numel: self.shape.numel(),
-                dst_numel: new_shape.numel(),
+                src_numel,
+                dst_numel,
             });
         }
         // For CPU tensors, share the data (clone the bytes).
@@ -304,6 +362,16 @@ impl Tensor {
                 dtype: self.dtype,
                 device: *device,
                 storage: Storage::Gpu {
+                    device: *device,
+                    handle: handle.clone(),
+                },
+            }),
+            #[cfg(all(feature = "opaque-storage", target_os = "macos", target_arch = "aarch64"))]
+            Storage::Opaque { device, handle } => Ok(Self {
+                shape: new_shape,
+                dtype: self.dtype,
+                device: *device,
+                storage: Storage::Opaque {
                     device: *device,
                     handle: handle.clone(),
                 },
@@ -404,8 +472,13 @@ impl Tensor {
     ///
     /// # Safety
     ///
-    /// `storage` must belong to `device`, remain alive for this tensor, and
-    /// contain enough accessible bytes for this tensor's shape and dtype.
+    /// `storage` must belong to `device` and remain alive for this tensor.
+    /// CPU/GPU storage must contain enough accessible bytes for its shape and
+    /// dtype, without arithmetic overflow. An opaque owner must instead retain
+    /// a native array matching this tensor's dtype and element count on `device`,
+    /// with exactly the corresponding logical byte extent. The owning backend
+    /// must validate that representation before every use; a lazy array does
+    /// not promise accessible allocation bytes.
     pub unsafe fn set_device_and_storage(&mut self, device: Device, storage: Storage) {
         self.device = device;
         self.storage = storage;

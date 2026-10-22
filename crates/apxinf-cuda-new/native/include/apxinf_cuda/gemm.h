@@ -57,6 +57,16 @@ apxinf_status_t apxinf_gemm_nvfp4_quantize_swiglu(
     float input_scale, int32_t row_major_scales,
     apxinf_cuda_stream_t stream);
 
+/* NVFP4 GEMM + SwiGLU + NVFP4 requantization. Block-scale tensors use the
+   GEMM atom layout. This fixed ABI is separate from ordinary GEMM because the
+   output has its own scale tensor and three runtime calibration scalars. */
+apxinf_status_t apxinf_gemm_nvfp4_swiglu(
+    const void* activation, const void* weight,
+    const void* activation_scales, const void* weight_scales,
+    void* output, void* output_scales, const void* alpha,
+    const void* input_global_scale, const void* down_inverse_global_scale,
+    int64_t rows, int64_t n, int64_t k, apxinf_cuda_stream_t stream);
+
 uint64_t apxinf_gemm_execution_weight_prepack_count(
     apxinf_gemm_execution_t execution);
 apxinf_status_t apxinf_gemm_test_validate_candidates(

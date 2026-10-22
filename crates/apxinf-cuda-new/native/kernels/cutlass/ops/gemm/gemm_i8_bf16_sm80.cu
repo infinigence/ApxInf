@@ -33,6 +33,7 @@
 #include "extensions/epilogue/epilogue_per_row_per_col_scale.h"
 #include "extensions/gemm/gemm_universal_base_compat.h"
 #include "extensions/gemm/gemm_with_epilogue_visitor.h"
+#include "gemm_i8_bf16_sm80.h"
 
 namespace apxinf::cuda_new::cutlass_ops {
 

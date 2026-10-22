@@ -2,7 +2,7 @@
 
 This document lists the model-independent L3 semantics currently exposed by `apxinf-cuda-new`. Model code must match the complete mathematical semantic and tensor contract, not only the operator name. If no interface matches completely, record an operator gap and follow [`doc/adding-new-kernels.md`](../../doc/adding-new-kernels.md).
 
-This document describes only public contracts and does not promise a specific provider, candidate, or autotune winner. Every operator supports eager execution and `prepare_with_session` → capture → replay.
+This document describes only public contracts and does not promise a specific provider, candidate, or autotune winner. The tunable operators listed here support eager execution and `prepare_with_session` → capture → replay. Fixed model-building kernels are not required to own a session or a graph; the surrounding model/phase captures their direct stream enqueues.
 
 ## Shared Constraints
 
@@ -11,6 +11,10 @@ This document describes only public contracts and does not promise a specific pr
 - Shapes must be nonempty, and dimensions passed to the native layer must not exceed `i32::MAX`.
 - Policy fields such as workspace, graph-safe, and deterministic affect only candidate eligibility and the recipe; they do not change the L3 mathematical semantic.
 - `l3-operator` comments are machine-readable markers. A unit test compares them with the Rust semantic metadata registered by each operator family to ensure that every public semantic appears exactly once; a new family must be added to that set.
+
+## Representation Conversion
+
+`ops::quantization(ctx, QuantizationArgs)` also owns shape-preserving representation conversions used between L3 operators. `CastF16ToBf16` converts F16 to BF16 and `CastBf16ToF32` converts BF16 to F32; both require identical nonempty input/output shapes and distinct device buffers. The latter is the standard boundary for a BF16 backbone feeding an FP32 readout GEMM.
 
 ## Shared GEMM Contract
 
@@ -52,6 +56,18 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
 | Reference test | `gemm_bias_all_candidates_match_torch` |
 
+<!-- l3-operator:gemm_bias_residual -->
+### `gemm_bias_residual`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_bias_residual(ctx, GemmBiasResidualArgs { gemm, bias, residual })` |
+| Inputs | `A=[M,K]`, `B=[K,N]`, optional `bias=[N]`, `residual=[M,N]`; supports `Fp8UnitScale` only |
+| Output | `Y=[M,N]` |
+| Mathematical semantic | `Y = alpha * projection(A,B) + bias + residual`, with bias broadcast across M |
+| Constraints | Requires unit-scale FP8 inputs and F16 output; bias and residual dtypes match the projection dtype; the residual must not alias the output |
+| Reference test | `zero_weight_language_layer_is_residual_identity` (model-level; candidate parity is covered by the tuner's capture-replay output validation) |
+
 <!-- l3-operator:gemm_bias_gelu -->
 ### `gemm_bias_gelu`
 
@@ -74,7 +90,8 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = GELU_tanh(alpha*(A@B_gate)) * (alpha*(A@B_up)) / output_scale` |
 | Constraints | The second dimension of B is even; FP8 with row/channel scales and W8A8 are unsupported; candidate-specific packing may occur only internally |
-| Reference test | `gemm_geglu_all_candidates_match_torch` |
+| FP8 candidates | Vendor decomposition (FP16 projection for E4M3 output); dual-GeGLU at M522/M533; SM100-family split-GeGLU at M778, 2N32768, K2048; eligible decomposed candidates remain available to autotune |
+| Reference tests | `gemm_geglu_all_candidates_match_torch`, `gemm_geglu_three_view_all_candidates_match_torch` (unit/non-unit scales, eager/graph) |
 
 ## Shared Attention Contract
 

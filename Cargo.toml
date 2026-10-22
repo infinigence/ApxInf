@@ -3,6 +3,8 @@ members = [
     "crates/apxinf-core",
     "crates/apxinf-cuda",
     "crates/apxinf-cuda-new",
+    "crates/apxinf-hip",
+    "crates/apxinf-mlx",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
@@ -18,6 +20,8 @@ license = "Apache-2.0"
 
 [features]
 default = []
+# Native Apple Metal execution through an explicitly configured MLX C++ SDK.
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "apxinf-model/mlx"]
 # CUDA GPU inference. NVTX profiling markers auto-detect the lib name at
 # build time: desktop CUDA 12.x uses libnvtx3interop; Drive OS / embedded
 # CUDA uses libnvToolsExt. Both are handled transparently — see
@@ -26,6 +30,13 @@ cuda = ["dep:apxinf-cuda", "apxinf-cuda/nvtx", "apxinf-model/cuda"]
 # Same as `cuda` but with NVTX compiled out entirely (no-op stubs). Use
 # when the target has no NVTX library installed at all.
 cuda-no-nvtx = ["dep:apxinf-cuda", "apxinf-model/cuda"]
+# Deprecated alias of `cuda`, kept so existing build commands keep working.
+# `cuda` already links both CUDA runtimes and enables every CUDA model family,
+# Qwen3.8 included — see crates/apxinf-model/Cargo.toml.
+cuda-new = ["cuda", "apxinf-model/cuda-new"]
+# AMD ROCm/HIP inference. Independent of `cuda`: both may be enabled, and
+# a process can then hold a CUDA and a HIP backend at once.
+hip = ["dep:apxinf-hip", "apxinf-model/hip"]
 # CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
 # if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
 # libopenblas — leave this off on Thor.
@@ -33,7 +44,9 @@ openblas = ["apxinf-core/openblas"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
+apxinf-mlx = { path = "crates/apxinf-mlx", optional = true }
 apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
+apxinf-hip = { path = "crates/apxinf-hip", optional = true }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }
 apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }

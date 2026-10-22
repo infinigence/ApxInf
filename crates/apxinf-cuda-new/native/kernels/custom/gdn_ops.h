@@ -27,6 +27,12 @@ int gdn_gated_norm(const void* input, const void* gate, const void* weight,
                    void* output, int heads, int head_dim, float epsilon,
                    cudaStream_t stream);
 
+int gdn_gated_norm_quantize(const void* input, const void* gate,
+                            const void* weight, void* output, void* quantized,
+                            int rows, bool fp16_input, float epsilon,
+                            float input_scale,
+                            cudaStream_t stream);
+
 // Causal depthwise conv1d advanced by one token, then SiLU.
 //
 // `window` is [channels, kernel_width] f32 recurrent state holding the last
@@ -60,12 +66,12 @@ int gdn_causal_conv_forward(const void* input, const void* weight,
 int gdn_widen_f16_to_bf16(const void* input, void* output, long long count,
                           cudaStream_t stream);
 
-int gdn_prepare_flashinfer(const void* fused, void* q_out, void* k_out,
+int gdn_prepare_prefill(const void* fused, void* q_out, void* k_out,
                            void* v_out, const void* g, void* alpha, int tokens,
                            int row_width, int k_heads, int v_heads, int dim,
                            float epsilon, cudaStream_t stream);
 
-int gdn_conv_prepare_flashinfer(const void* input, const void* weight,
+int gdn_conv_prepare(const void* input, const void* weight,
                                void* window, void* q_out, void* k_out,
                                void* v_out, const void* decay, void* alpha,
                                int tokens, int k_heads, int v_heads,

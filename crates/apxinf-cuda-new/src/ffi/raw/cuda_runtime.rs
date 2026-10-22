@@ -48,7 +48,14 @@ pub const cudaHostAllocWriteCombined: u32 = 4;
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
-
+    /// Free and total device memory for the *current* device.
+    ///
+    /// Per-arena accounting cannot stand in for this: graph instantiation and
+    /// the native GEMM/Attention libraries allocate outside our workspaces, so
+    /// only the driver's own figure shows whether a change moved the process
+    /// footprint. On unified-memory parts (Tegra/Thor) `total` is system
+    /// memory rather than discrete VRAM — read the delta, not the absolute.
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     /// Allocate page-locked (pinned) host memory. With `cudaHostAllocMapped`
     /// the buffer is also directly accessible from the GPU via
     /// `cudaHostGetDevicePointer` — on unified-memory GPUs (Tegra/Thor) this
@@ -122,6 +129,7 @@ extern "C" {
     pub fn cudaStreamEndCapture(stream: cudaStream_t, pGraph: *mut *mut c_void) -> cudaError_t;
 
     pub fn cudaGetLastError() -> cudaError_t;
+    pub fn cudaPeekAtLastError() -> cudaError_t;
     pub fn cudaGetErrorString(error: cudaError_t) -> *const std::ffi::c_char;
 
     pub fn cudaSetDevice(device: i32) -> cudaError_t;

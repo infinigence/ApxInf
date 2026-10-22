@@ -13,7 +13,7 @@ extern "C" {
    has not yet been checked against a reference engine running this
    checkpoint. */
 
-apxinf_status_t apxinf_gdn_conv_prepare_flashinfer(
+apxinf_status_t apxinf_gdn_conv_prepare(
     const void* input, const void* weight, void* window, void* q_out,
     void* k_out, void* v_out, const void* decay, void* alpha,
     int64_t tokens, int64_t k_heads, int64_t v_heads, float epsilon,
@@ -31,6 +31,12 @@ apxinf_status_t apxinf_gdn_gated_norm(const void* input, const void* gate,
                                       float epsilon,
                                       apxinf_cuda_stream_t stream);
 
+apxinf_status_t apxinf_gdn_gated_norm_quantize(
+    const void* input, const void* gate, const void* weight, void* output,
+    void* quantized, int64_t rows, int32_t fp16_input, float epsilon,
+    float input_scale,
+    apxinf_cuda_stream_t stream);
+
 apxinf_status_t apxinf_gdn_causal_conv_step(void* window, const void* input,
                                             const void* weight, void* output,
                                             int64_t channels,
@@ -45,20 +51,20 @@ apxinf_status_t apxinf_gdn_widen_f16_to_bf16(const void* input, void* output,
                                              int64_t count,
                                              apxinf_cuda_stream_t stream);
 
-apxinf_status_t apxinf_gdn_prepare_flashinfer(
+apxinf_status_t apxinf_gdn_prepare_prefill(
     const void* fused, void* q_out, void* k_out, void* v_out, const void* g,
     void* alpha, int64_t tokens, int64_t row_width, int64_t k_heads,
     int64_t v_heads, int64_t dim, float epsilon, apxinf_cuda_stream_t stream);
 
-apxinf_status_t apxinf_flashinfer_gdn_prefill(
+apxinf_status_t apxinf_gdn_prefill(
     const void* q, const void* k, const void* v, void* out,
     const void* gate_log, const void* beta, const void* cu_seqlens,
     void* state, void* tensor_map_workspace, int64_t tokens, int64_t q_heads,
     int64_t v_heads, int64_t num_seqs, float scale,
     apxinf_cuda_stream_t stream);
 
-// Scratch bytes apxinf_flashinfer_gdn_prefill needs for TMA rewrites.
-int64_t apxinf_flashinfer_gdn_workspace_bytes(int64_t v_heads,
+// Scratch bytes apxinf_gdn_prefill needs for TMA rewrites.
+int64_t apxinf_gdn_prefill_workspace_bytes(int64_t v_heads,
                                               int64_t num_seqs);
 
 apxinf_status_t apxinf_gdn_causal_conv_forward(

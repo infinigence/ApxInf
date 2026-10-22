@@ -99,6 +99,24 @@ fn graph_safe_autotune_captures_the_winner() {
     });
 }
 
+#[test]
+fn merged_gemm_contract_rejects_pre_merge_spec_version() {
+    let ctx = CudaContext::new(0).unwrap();
+    let activation = zeros_tensor(0, vec![1, 16], DType::BF16);
+    let weight = zeros_tensor(0, vec![16, 16], DType::BF16);
+    let mut output = zeros_tensor(0, vec![1, 16], DType::BF16);
+    let args = GemmArgs::new(&activation, &weight, &mut output);
+    let mut normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    assert_eq!(normalized.spec.version, 6);
+    normalized.spec.version = 5;
+    let error = match super::execution::prepare(&ctx, normalized) {
+        Ok(_) => panic!("pre-merge GEMM spec must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid GEMM Spec"), "{error}");
+}
+
 fn hardware_fingerprint(
     uuid: [u8; 16],
     sms: i32,
@@ -285,6 +303,9 @@ fn gpu_e2e_candidate_alignment_is_selected_and_keyed_from_actual_bindings() {
     let mut aligned_args = GemmArgs::new(&a, &b, &mut aligned_out);
     aligned_args.quantization = GemmQuantization::Fp8UnitScale;
     aligned_args.policy.allow_fallback = false;
+    // Empty cache_dir disables recipe persistence; this test must observe a
+    // fresh tune, not a recipe left in the default shared directory.
+    aligned_args.policy.cache_dir = Some(String::new());
     let aligned =
         super::contracts::normalize(&ctx, aligned_args, super::contracts::Semantic::Gemm, None)
             .unwrap();
@@ -304,6 +325,7 @@ fn gpu_e2e_candidate_alignment_is_selected_and_keyed_from_actual_bindings() {
     let mut misaligned_args = GemmArgs::new(&a, &b, &mut misaligned_out);
     misaligned_args.quantization = GemmQuantization::Fp8UnitScale;
     misaligned_args.policy.allow_fallback = false;
+    misaligned_args.policy.cache_dir = Some(String::new());
     let misaligned = super::contracts::normalize(
         &ctx,
         misaligned_args,
@@ -478,6 +500,7 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     args.alpha = alpha;
     args.policy.online_tune = true;
     args.policy.allow_fallback = false;
+    args.policy.cache_dir = Some(String::new());
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
     super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
@@ -520,6 +543,9 @@ fn gpu_e2e_autotune_times_candidates_and_checks_winner_capture() {
     args.policy.online_tune = true;
     args.policy.allow_fallback = false;
     args.policy.graph_safe = true;
+    // Empty cache_dir disables recipe persistence; this test asserts on a
+    // fresh tune summary and must not read the default shared directory.
+    args.policy.cache_dir = Some(String::new());
 
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
@@ -804,6 +830,138 @@ fn gpu_e2e_persisted_recipe_restores_in_new_process() {
 }
 
 #[test]
+fn gpu_e2e_default_cache_and_autotune_switches() {
+    const CHILD_PHASE: &str = "APXINF_DEFAULT_RECIPE_CHILD";
+    if let Ok(phase) = std::env::var(CHILD_PHASE) {
+        let allow_tune = !matches!(phase.as_str(), "cold" | "restore" | "override-restore");
+        let ctx = CudaContext::new_with_autotune(0, allow_tune).unwrap();
+        let default_dir = std::path::Path::new(ctx.default_cache_dir());
+        assert!(default_dir.starts_with("configs/tuning/nvidia"));
+        if phase == "cold" {
+            std::fs::create_dir_all(default_dir).unwrap();
+            std::fs::write(default_dir.join("tactics.json"), "not a recipe database").unwrap();
+        } else if phase == "restore" {
+            std::fs::remove_file(default_dir.join("tactics.json")).unwrap();
+        }
+        let cache_dir = match phase.as_str() {
+            "override" | "override-restore" => Some("explicit-recipes".to_owned()),
+            "no-persistence" => Some(String::new()),
+            _ => None,
+        };
+        let online_tune = phase != "policy-off";
+        let expected = match phase.as_str() {
+            "cold" | "policy-off" => "source=fallback",
+            "restore" | "warm-enabled" | "override-restore" => "source=recipe",
+            _ => "source=tuned",
+        };
+        let input = tensor(0, vec![4, 8], &[0.5; 32]);
+        let weight = tensor(0, vec![8, 6], &[0.25; 48]);
+        let mut output = tensor(0, vec![4, 6], &[0.0; 24]);
+        let mut args = GemmArgs::new(&input, &weight, &mut output);
+        args.policy.cache_dir = cache_dir.clone();
+        args.policy.online_tune = online_tune;
+        let execution = prepare_test_gemm(&ctx, args).unwrap();
+        eprintln!("{phase} GEMM: {}", execution.summary());
+        assert!(
+            execution.summary().contains(expected),
+            "{}",
+            execution.summary()
+        );
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(values(&output)
+            .iter()
+            .all(|value| (*value - 1.0).abs() < 0.01));
+
+        let query = tensor(0, vec![1, 4, 1, 32], &[0.5; 128]);
+        let key = tensor(0, vec![1, 4, 1, 32], &[0.25; 128]);
+        let value = tensor(0, vec![1, 4, 1, 32], &[0.75; 128]);
+        let mut output = tensor(0, vec![1, 4, 1, 32], &[0.0; 128]);
+        let mut args = AttentionArgs::new(&query, &key, &value, &mut output);
+        args.policy.cache_dir = cache_dir;
+        args.policy.online_tune = online_tune;
+        let normalized = crate::ops::attention::contracts::normalize(&ctx, args).unwrap();
+        let execution = crate::ops::attention::execution::prepare(&ctx, normalized).unwrap();
+        eprintln!("{phase} Attention: {}", execution.summary());
+        assert!(
+            execution.summary().contains(expected),
+            "{}",
+            execution.summary()
+        );
+        execution.enqueue_for_test().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(values(&output)
+            .iter()
+            .all(|value| (*value - 0.75).abs() < 0.01));
+        return;
+    }
+
+    fn recipes(
+        directory: &std::path::Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                snapshot.extend(recipes(&path));
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("recipe") {
+                snapshot.insert(
+                    path.clone(),
+                    (
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(path).unwrap().modified().unwrap(),
+                    ),
+                );
+            }
+        }
+        snapshot
+    }
+
+    let directory = FrameworkTestDirectory::new();
+    let mut previous: std::collections::BTreeMap<PathBuf, (Vec<u8>, SystemTime)> =
+        std::collections::BTreeMap::new();
+    for (phase, expected_count) in [
+        ("cold", 0),
+        ("policy-off", 0),
+        ("tune", 2),
+        ("restore", 2),
+        ("warm-enabled", 2),
+        ("override", 4),
+        ("override-restore", 4),
+        ("no-persistence", 4),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ops::tests::framework::gpu_e2e_default_cache_and_autotune_switches",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_PHASE, phase)
+            .current_dir(&directory.0)
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let current = recipes(&directory.0);
+        assert_eq!(current.len(), expected_count, "{phase}");
+        for (path, content) in &previous {
+            assert_eq!(
+                current.get(path),
+                Some(content),
+                "{phase} rewrote {}",
+                path.display()
+            );
+        }
+        previous = current;
+    }
+}
+
+#[test]
 fn gpu_e2e_invalid_persisted_recipe_is_retuned() {
     let cache_dir = scratch_cache_dir("gemm-invalid-recipe");
     let cache = cache_dir.to_string_lossy().into_owned();
@@ -939,39 +1097,68 @@ fn scaled_fp8_and_w8a8_use_the_canonical_kn_weight_contract() {
 }
 
 #[test]
-fn w8a8_orin_shape_uses_cublas_dequantization_fallback() {
+fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
     let ctx = CudaContext::new(0).unwrap();
     let (m, k, n) = (41, 1536, 6144);
-    let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
-    let b = bytes_tensor(0, vec![k, n], DType::I8, &vec![1; k * n]);
-    let row_scales = scales(0, &vec![0.5; m]);
-    let channel_scales = scales(0, &vec![2.0; n]);
+    let mut a_data = vec![0; m * k];
+    for row in 0..m {
+        a_data[row * k + (row * 37) % k] = 1;
+    }
+    let b_data = (0..k * n)
+        .map(|index| ((3 * (index / n) + 5 * (index % n)) % 7 + 1) as u8)
+        .collect::<Vec<_>>();
+    let row_scale_values = (0..m)
+        .map(|row| if row % 2 == 0 { 0.5 } else { 1.0 })
+        .collect::<Vec<_>>();
+    let channel_scale_values = (0..n)
+        .map(|column| if column % 2 == 0 { 2.0 } else { 1.0 })
+        .collect::<Vec<_>>();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &a_data);
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &b_data);
+    let row_scales = scales(0, &row_scale_values);
+    let channel_scales = scales(0, &channel_scale_values);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
-    let mut args = GemmArgs::w8a8(
-        &a,
-        &row_scales,
-        &b,
-        &channel_scales,
-        &mut out,
-    );
+    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out)
+        .with_immutable_weight(WeightVersion::new(1));
     args.policy.online_tune = false;
-    args.policy.allow_fallback = true;
+    args.policy.allow_fallback = ctx.caps().sm != 87;
+    let cache_dir = scratch_cache_dir("w8a8-sm87-cutlass");
+    args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    if ctx.caps().sm == 87 {
+        super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+    }
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
-    assert!(
-        execution
+    if ctx.caps().sm == 87 {
+        assert!(execution
             .summary()
-            .starts_with("cublas+custom-epilogue config=0 "),
-        "unexpected W8A8 fallback: {}",
-        execution.summary()
-    );
-    assert!(execution.summary().contains("source=fallback"));
+            .starts_with("cutlass-w8a8-sm87 config=0 "));
+        assert!(execution.summary().contains("source=recipe"));
+    } else {
+        assert!(execution
+            .summary()
+            .starts_with("cublas+custom-epilogue config=0 "));
+        assert!(execution.summary().contains("source=fallback"));
+    }
 
     execution.enqueue().unwrap();
+    let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+    graph.replay().unwrap();
+    graph.replay().unwrap();
     ctx.synchronize().unwrap();
-    assert!(values(&out).iter().all(|&value| value == k as f32));
+    let actual = values(&out);
+    for row in 0..m {
+        let input = (row * 37) % k;
+        for column in 0..n {
+            let expected = b_data[input * n + column] as f32
+                * row_scale_values[row]
+                * channel_scale_values[column];
+            assert_eq!(actual[row * n + column], expected);
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
 }
 
 #[test]
@@ -1102,6 +1289,77 @@ fn tuning_isolated_from_user_buffers_and_replay_results() {
     assert_eq!(&final_bytes[..2], &guard_word);
     assert_eq!(&final_bytes[final_bytes.len() - 2..], &guard_word);
     std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
+    let ctx = CudaContext::new(0).unwrap();
+    let directory = FrameworkTestDirectory::new();
+    let activation = zeros_tensor(0, vec![778, 2048], DType::F8E4M3);
+    let weight = zeros_tensor(0, vec![2048, 32768], DType::F8E4M3);
+    let mut output = zeros_tensor(0, vec![778, 16384], DType::F8E4M3);
+    let mut normalize = |workspace_limit, allow_fallback| {
+        let mut args = GemmArgs::new(&activation, &weight, &mut output)
+            .with_immutable_weight(WeightVersion::new(1));
+        args.quantization = GemmQuantization::Fp8UnitScale;
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = allow_fallback;
+        args.policy.workspace_limit = workspace_limit;
+        args.policy.cache_dir = Some(directory.0.to_string_lossy().into_owned());
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
+            .unwrap()
+    };
+    let budget = 256 * 1024 * 1024;
+    let fallback = super::execution::prepare(&ctx, normalize(budget, true)).unwrap();
+    assert!(fallback.summary().contains("cublas+custom-epilogue"));
+    fallback.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    drop(fallback);
+    for configuration in 0..3 {
+        let normalized = normalize(budget, false);
+        super::execution::seed_recipe(&ctx, &normalized, 3, 5, 1, configuration).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(execution.summary().contains("cublasLt+cutlass-split-geglu"));
+        execution.enqueue().unwrap();
+        let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+        graph.replay().unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+    }
+    let normalized = normalize(budget, false);
+    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 5, 1, 24).is_err());
+    let insufficient = normalize(778 * 32768 * 2 - 1, false);
+    super::execution::seed_recipe(&ctx, &insufficient, 3, 5, 1, 0).unwrap();
+    assert!(super::execution::prepare(&ctx, insufficient).is_err());
+    let mut negative_alpha = normalize(budget, false);
+    negative_alpha.bindings.alpha = -1.0;
+    negative_alpha.spec.alpha_is_unit = 0;
+    super::execution::seed_recipe(&ctx, &negative_alpha, 3, 5, 1, 0).unwrap();
+    assert!(super::execution::prepare(&ctx, negative_alpha).is_err());
+    drop(normalize);
+    ctx.synchronize().unwrap();
+    let host = crate::transfers::to_cpu(&output).unwrap();
+    assert!(host.as_f8_e4m3().unwrap().iter().all(|value| *value == 0));
+    // T21 three-view rows (M=789) are also a pinned production shape; the
+    // split-GeGLU candidate accepts them. An unrelated M stays rejected.
+    let activation = zeros_tensor(0, vec![789, 2048], DType::F8E4M3);
+    let mut output = zeros_tensor(0, vec![789, 16384], DType::F8E4M3);
+    let mut args = GemmArgs::new(&activation, &weight, &mut output);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    args.policy.cache_dir = Some(directory.0.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
+            .unwrap();
+    super::execution::seed_recipe(&ctx, &normalized, 3, 5, 1, 0).unwrap();
+    let activation = zeros_tensor(0, vec![800, 2048], DType::F8E4M3);
+    let mut output = zeros_tensor(0, vec![800, 16384], DType::F8E4M3);
+    let mut args = GemmArgs::new(&activation, &weight, &mut output);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    args.policy.cache_dir = Some(directory.0.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
+            .unwrap();
+    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 5, 1, 0).is_err());
 }
 
 #[test]

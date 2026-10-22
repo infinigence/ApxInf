@@ -137,7 +137,8 @@ struct NormalizedTemporalMergedPreprocessDimensions {
     patch_rows: usize,
     patch_width: usize,
     views: i32,
-    image_size: i32,
+    image_height: i32,
+    image_width: i32,
     patch_size: i32,
     temporal_patch_size: i32,
     merge_size: i32,
@@ -145,13 +146,15 @@ struct NormalizedTemporalMergedPreprocessDimensions {
 
 fn normalized_temporal_merged_preprocess_dimensions(
     views: usize,
-    image_size: usize,
+    image_height: usize,
+    image_width: usize,
     patch_size: usize,
     temporal_patch_size: usize,
     merge_size: usize,
 ) -> Result<NormalizedTemporalMergedPreprocessDimensions> {
     if views == 0
-        || image_size == 0
+        || image_height == 0
+        || image_width == 0
         || patch_size == 0
         || temporal_patch_size == 0
         || merge_size == 0
@@ -163,7 +166,10 @@ fn normalized_temporal_merged_preprocess_dimensions(
 
     let views_abi = i32::try_from(views)
         .map_err(|_| Error::Other("temporal-merged views exceed the CUDA ABI range".into()))?;
-    let image_size_abi = i32::try_from(image_size).map_err(|_| {
+    let image_height_abi = i32::try_from(image_height).map_err(|_| {
+        Error::Other("temporal-merged image size exceeds the CUDA ABI range".into())
+    })?;
+    let image_width_abi = i32::try_from(image_width).map_err(|_| {
         Error::Other("temporal-merged image size exceeds the CUDA ABI range".into())
     })?;
     let patch_size_abi = i32::try_from(patch_size).map_err(|_| {
@@ -182,7 +188,7 @@ fn normalized_temporal_merged_preprocess_dimensions(
     i32::try_from(patch_merge).map_err(|_| {
         Error::Other("temporal-merged patch/merge size exceeds the CUDA kernel range".into())
     })?;
-    if image_size % patch_merge != 0 {
+    if image_height % patch_merge != 0 || image_width % patch_merge != 0 {
         return Err(Error::Other(
             "invalid temporal-merged BF16 image preprocessing dimensions".into(),
         ));
@@ -190,16 +196,15 @@ fn normalized_temporal_merged_preprocess_dimensions(
 
     let expected_bytes = views
         .checked_mul(3)
-        .and_then(|value| value.checked_mul(image_size))
-        .and_then(|value| value.checked_mul(image_size))
+        .and_then(|value| value.checked_mul(image_height))
+        .and_then(|value| value.checked_mul(image_width))
         .ok_or_else(|| Error::Other("temporal-merged raw image size overflow".into()))?;
     i64::try_from(expected_bytes).map_err(|_| {
         Error::Other("temporal-merged raw image size exceeds the CUDA index range".into())
     })?;
 
-    let grid_size = image_size / patch_size;
-    let rows_per_view = grid_size
-        .checked_mul(grid_size)
+    let rows_per_view = (image_height / patch_size)
+        .checked_mul(image_width / patch_size)
         .ok_or_else(|| Error::Other("temporal-merged per-view patch row count overflow".into()))?;
     i32::try_from(rows_per_view).map_err(|_| {
         Error::Other(
@@ -239,7 +244,8 @@ fn normalized_temporal_merged_preprocess_dimensions(
         patch_rows,
         patch_width,
         views: views_abi,
-        image_size: image_size_abi,
+        image_height: image_height_abi,
+        image_width: image_width_abi,
         patch_size: patch_size_abi,
         temporal_patch_size: temporal_patch_size_abi,
         merge_size: merge_size_abi,
@@ -569,7 +575,8 @@ pub fn rgb_u8_to_normalized_temporal_merged_patches_bf16(
     images: &CudaBuffer,
     patches: &Tensor,
     views: usize,
-    image_size: usize,
+    image_height: usize,
+    image_width: usize,
     patch_size: usize,
     temporal_patch_size: usize,
     merge_size: usize,
@@ -591,7 +598,8 @@ pub fn rgb_u8_to_normalized_temporal_merged_patches_bf16(
     }
     let dimensions = normalized_temporal_merged_preprocess_dimensions(
         views,
-        image_size,
+        image_height,
+        image_width,
         patch_size,
         temporal_patch_size,
         merge_size,
@@ -625,7 +633,8 @@ pub fn rgb_u8_to_normalized_temporal_merged_patches_bf16(
                 images.ptr(),
                 gpu_ptr(patches)?,
                 dimensions.views,
-                dimensions.image_size,
+                dimensions.image_height,
+                dimensions.image_width,
                 dimensions.patch_size,
                 dimensions.temporal_patch_size,
                 dimensions.merge_size,
@@ -655,32 +664,34 @@ mod tests {
     #[test]
     fn normalized_temporal_merged_dimensions_accept_representative_shape() {
         let dimensions =
-            normalized_temporal_merged_preprocess_dimensions(2, 252, 14, 2, 2).unwrap();
+            normalized_temporal_merged_preprocess_dimensions(2, 252, 252, 14, 2, 2).unwrap();
         assert_eq!(dimensions.expected_bytes, 381_024);
         assert_eq!(dimensions.patch_rows, 648);
         assert_eq!(dimensions.patch_width, 1_176);
         assert_eq!(dimensions.views, 2);
-        assert_eq!(dimensions.image_size, 252);
+        assert_eq!(dimensions.image_height, 252);
+        assert_eq!(dimensions.image_width, 252);
     }
 
     #[test]
     fn normalized_temporal_merged_dimensions_reject_int_kernel_intermediate_overflow() {
         let patch_merge = error_message(normalized_temporal_merged_preprocess_dimensions(
-            1, 1, 50_000, 1, 50_000,
+            1, 1, 1, 50_000, 1, 50_000,
         ));
         assert!(patch_merge.contains("patch/merge size exceeds the CUDA kernel range"));
 
         let patch_area = error_message(normalized_temporal_merged_preprocess_dimensions(
-            1, 46_341, 46_341, 1, 1,
+            1, 46_341, 46_341, 46_341, 1, 1,
         ));
         assert!(patch_area.contains("patch area exceeds the CUDA kernel range"));
 
         let rows = error_message(normalized_temporal_merged_preprocess_dimensions(
-            1, 46_341, 1, 1, 1,
+            1, 46_341, 46_341, 1, 1, 1,
         ));
         assert!(rows.contains("per-view patch row count exceeds the CUDA kernel range"));
 
         let width = error_message(normalized_temporal_merged_preprocess_dimensions(
+            1,
             1,
             1,
             1,
@@ -690,7 +701,7 @@ mod tests {
         assert!(width.contains("patch width exceeds the CUDA kernel range"));
 
         let total_rows = error_message(normalized_temporal_merged_preprocess_dimensions(
-            2, 46_340, 1, 1, 1,
+            2, 46_340, 46_340, 1, 1, 1,
         ));
         assert!(total_rows.contains("patch row count exceeds the CUDA kernel range"));
     }
@@ -700,6 +711,7 @@ mod tests {
     fn normalized_temporal_merged_dimensions_reject_values_outside_ffi_abi() {
         let views = error_message(normalized_temporal_merged_preprocess_dimensions(
             i32::MAX as usize + 1,
+            1,
             1,
             1,
             1,

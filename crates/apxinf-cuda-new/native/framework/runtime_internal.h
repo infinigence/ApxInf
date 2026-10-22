@@ -82,4 +82,6 @@ struct apxinf_runtime {
   std::map<std::string, apxinf::framework::Recipe> gemm_recipes;
   std::mutex attention_mutex;
   std::map<std::string, apxinf::framework::Recipe> attention_recipes;
+  std::string default_cache_dir;
+  bool allow_online_tune = true;
 };

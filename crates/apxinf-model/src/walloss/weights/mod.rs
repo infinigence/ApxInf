@@ -1,11 +1,24 @@
 //! Checkpoint mapping for the Walloss dual-stream execution graph.
 
+#[cfg(feature = "cuda")]
+mod device;
+#[cfg(feature = "cuda")]
+mod fp8;
+
+#[cfg(feature = "cuda")]
+pub use device::DynamicFp8LinearWeights;
+#[cfg(feature = "cuda")]
+pub use fp8::{
+    WallossDynamicFp8LayerWeights, WallossDynamicFp8VisionBlockWeights,
+    WallossDynamicFp8VisionWeights, WallossDynamicFp8Weights,
+};
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use apxinf_core::{Backend, DType, Error, Result, Tensor};
 
-use super::WallossConfig;
+use crate::walloss::WallossConfig;
 
 pub struct WallossWeights {
     pub token_embedding: Tensor,
@@ -201,6 +214,8 @@ impl WallossVisionWeights {
 
 impl WallossVisionBlockWeights {
     fn to_bf16_device(&self, backend: &dyn Backend) -> Result<Self> {
+        let (gate_up, gate_up_bias, down) =
+            pad_swiglu_inner(&self.gate_up, &self.gate_up_bias, &self.down, 64)?;
         Ok(Self {
             input_norm: bf16_to_device(&self.input_norm, backend)?,
             qkv: bf16_to_device(&self.qkv, backend)?,
@@ -208,12 +223,47 @@ impl WallossVisionBlockWeights {
             output: bf16_to_device(&self.output, backend)?,
             output_bias: bf16_to_device(&self.output_bias, backend)?,
             post_attention_norm: bf16_to_device(&self.post_attention_norm, backend)?,
-            gate_up: bf16_to_device(&self.gate_up, backend)?,
-            gate_up_bias: bf16_to_device(&self.gate_up_bias, backend)?,
-            down: bf16_to_device(&self.down, backend)?,
+            gate_up: bf16_to_device(&gate_up, backend)?,
+            gate_up_bias: bf16_to_device(&gate_up_bias, backend)?,
+            down: bf16_to_device(&down, backend)?,
             down_bias: bf16_to_device(&self.down_bias, backend)?,
         })
     }
+}
+
+/// Zero-pad the SwiGLU inner width of `gate_up` `[hidden, 2*inner]`, its bias
+/// and `down` `[inner, out]` to a multiple of `align`. Padded gate/up columns
+/// and down rows are zero, so the block output is unchanged; the aligned
+/// reduction dimension lets the down projection use full-width GEMM tiles
+/// (the vision inner width 3420 is not a multiple of 16 elements).
+fn pad_swiglu_inner(
+    gate_up: &Tensor,
+    gate_up_bias: &Tensor,
+    down: &Tensor,
+    align: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let [hidden, twice_inner] = gate_up.shape().dims() else {
+        return Err(Error::Other("walloss gate/up weight must be rank 2".into()));
+    };
+    let (hidden, inner) = (*hidden, *twice_inner / 2);
+    let out = down.shape().dims()[1];
+    let padded = inner.div_ceil(align) * align;
+    let pad_halves = |values: &[f32], rows: usize| {
+        let mut output = vec![0.0; rows * 2 * padded];
+        for row in 0..rows {
+            let (source, target) = (&values[row * 2 * inner..], &mut output[row * 2 * padded..]);
+            target[..inner].copy_from_slice(&source[..inner]);
+            target[padded..padded + inner].copy_from_slice(&source[inner..2 * inner]);
+        }
+        output
+    };
+    let mut down_values = down.to_f32_vec()?;
+    down_values.resize(padded * out, 0.0);
+    Ok((
+        Tensor::from_f32(vec![hidden, 2 * padded], &pad_halves(&gate_up.to_f32_vec()?, hidden))?,
+        Tensor::from_f32(vec![2 * padded], &pad_halves(&gate_up_bias.to_f32_vec()?, 1))?,
+        Tensor::from_f32(vec![padded, out], &down_values)?,
+    ))
 }
 
 impl WallossActionWeights {
@@ -604,5 +654,28 @@ mod tests {
             Tensor::zeros((1024, 15), DType::BF16),
         );
         assert!(checkpoint_action_dim(&tensors, 1024).is_err());
+    }
+
+    #[test]
+    fn swiglu_padding_keeps_gate_and_up_halves_and_zero_fills() {
+        // hidden 2, inner 3 -> padded 4; gate columns g*, up columns u*.
+        let gate_up = Tensor::from_f32(
+            vec![2, 6],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )
+        .unwrap();
+        let bias = Tensor::from_f32(vec![6], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap();
+        let down = Tensor::from_f32(vec![3, 1], &[1.0, 2.0, 3.0]).unwrap();
+        let (gate_up, bias, down) = pad_swiglu_inner(&gate_up, &bias, &down, 4).unwrap();
+        assert_eq!(gate_up.shape().dims(), [2, 8]);
+        assert_eq!(
+            gate_up.to_f32_vec().unwrap(),
+            [1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0, 7.0, 8.0, 9.0, 0.0, 10.0, 11.0, 12.0, 0.0]
+        );
+        assert_eq!(
+            bias.to_f32_vec().unwrap(),
+            [0.1, 0.2, 0.3, 0.0, 0.4, 0.5, 0.6, 0.0]
+        );
+        assert_eq!(down.to_f32_vec().unwrap(), [1.0, 2.0, 3.0, 0.0]);
     }
 }

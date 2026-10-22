@@ -7,6 +7,27 @@ on Jetson AGX Thor (sm_110): batch 1, BF16 KV cache, CUDA-graph decode.
 Implementation: `crates/apxinf-model/src/qwen38/`, organized per
 [Model Layer Architecture](model-layer-architecture.md).
 
+## Optimizations are always on
+
+There is no environment variable that turns a Qwen3.8 optimization on. The
+validated configuration — fused NVFP4 FC1 with SwiGLU and requantization,
+merged GDN decay projections, fused GDN norm + FP8 quantization, split-KV FA2
+decode, CUDA-graph decode, batched FlashInfer GDN prefill — is the default code
+path, selected by checkpoint shape and by what the build linked, not by the
+caller's environment.
+
+The two selection inputs that do exist are build- or shape-derived:
+
+| Input | Effect |
+|---|---|
+| `sm_110` build target | compiles the native NVFP4 GEMM + SwiGLU kernel, surfaced as `apxinf_cuda_new::NVFP4_GEMM_SWIGLU`; other targets use the generic quantize → GEMM → quantize sequence. |
+| prompt length = 2048 tokens | the fused kernel is specialized to M=2048; other prefill lengths take the generic path. |
+
+`APXINF_QWEN38_GEMM_TUNE_CACHE` / `APXINF_QWEN38_TUNE_CACHE` still override the
+autotune recipe directory, and the `qwen38_*` test harnesses keep their own
+switches for A/B comparison, but neither changes which product path runs. See
+[Qwen3.8 env-gate audit](qwen38-env-gates-audit.md).
+
 ## Requirements
 
 - Jetson AGX Thor (sm_110) with the CUDA toolkit; ~20 GiB free device memory.
@@ -80,6 +101,10 @@ Jetson AGX Thor, locked clocks (1575 MHz GPC):
 
 - Quantizer contract suites: `qwen38_fp8_quant_contract`,
   `qwen38_nvfp4_quant_contract` (`apxinf-cuda-new`).
+- The 2048-token end-to-end benchmark exercises `ops::nvfp4_gemm_swiglu` in
+  every layer, checks deterministic generated tokens, and compares the token
+  hash with the accepted reference run. Other prompt lengths exercise the
+  generic fallback.
 
 ## Limitations
 

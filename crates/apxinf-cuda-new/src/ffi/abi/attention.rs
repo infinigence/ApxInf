@@ -7,6 +7,7 @@ pub(crate) const SPEC_VERSION: u32 = 4;
 pub(crate) const SEMANTIC_DENSE: u32 = 0;
 pub(crate) const SEMANTIC_KV_CACHE: u32 = 1;
 pub(crate) const SEMANTIC_SEGMENTED: u32 = 2;
+pub(crate) const SEMANTIC_PACKED_QKV: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,6 +54,19 @@ pub(crate) struct Bindings {
 pub(crate) type Execution = *mut c_void;
 
 unsafe extern "C" {
+    pub(crate) fn apxinf_decode_attention_workspace_bytes() -> i64;
+    pub(crate) fn apxinf_decode_attention(
+        runtime: Runtime,
+        query: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        output: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: i64,
+        key_tokens: i64,
+        scale: f32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_attention_prepare(
         runtime: Runtime,
         spec: *const Spec,

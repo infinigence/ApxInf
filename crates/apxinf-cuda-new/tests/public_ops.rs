@@ -8,7 +8,7 @@ use apxinf_core::{DType, Shape, Tensor};
 use apxinf_cuda_new::{
     capture,
     ops::{gemm, prepare_with_session, with_session, ExecutionSession, GemmArgs},
-    CudaBuffer, CudaContext,
+    CudaBuffer, CudaContext, PreparedPhase,
 };
 use half::bf16;
 
@@ -72,6 +72,36 @@ fn same_public_l3_forward_prepares_captures_and_replays() {
 
     assert!(values(&out).iter().all(|&value| value == 3.0));
     drop(graph);
+}
+
+#[test]
+fn prepared_phase_runs_the_same_forward_for_prepare_and_capture() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = bf16_tensor(0, vec![2, 3], &[1.0; 6]);
+    let b = bf16_tensor(0, vec![3, 4], &[1.0; 12]);
+    let mut out = bf16_tensor(0, vec![2, 4], &[0.0; 8]);
+    let observed = CudaBuffer::from_tensor(&out).unwrap();
+    let mut traversals = 0;
+
+    let phase = PreparedPhase::prepare_and_capture(
+        &ctx,
+        ExecutionSession::with_capacity(4096, 0).unwrap(),
+        || {
+            traversals += 1;
+            run_gemm(&ctx, &a, &b, &mut out)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(traversals, 2);
+    let sentinel: Vec<u8> = (0..8)
+        .flat_map(|_| bf16::from_f32(-123.0).to_bits().to_ne_bytes())
+        .collect();
+    observed.copy_from_host(&sentinel).unwrap();
+    phase.replay().unwrap();
+    ctx.synchronize().unwrap();
+
+    assert!(values(&out).iter().all(|&value| value == 3.0));
 }
 
 #[test]

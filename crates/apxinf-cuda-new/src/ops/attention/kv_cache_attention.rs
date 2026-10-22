@@ -6,7 +6,7 @@ use super::contracts::{
     alignment, dtype_code, invalid, range, required_bytes, tensor_storage, Normalized, Semantic,
 };
 use super::{execution, AttentionMask, AttentionPolicy};
-use crate::ffi::abi::attention as abi;
+use crate::ffi::abi::{attention as abi, status};
 use crate::{CudaBuffer, CudaContext, HostMappedBuffer};
 
 /// Fixed-address runtime metadata for CUDA Graph-safe KV-cache decoding.
@@ -314,4 +314,58 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
 
 pub fn kv_cache_attention(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Result<()> {
     execution::execute(ctx, normalize(ctx, args)?)
+}
+
+/// Workspace required by the allocation-free Qwen3.8 FA2 decode path.
+pub fn decode_attention_workspace_bytes() -> usize {
+    usize::try_from(unsafe { abi::apxinf_decode_attention_workspace_bytes() })
+        .expect("FA2 decode workspace size must fit usize")
+}
+
+/// Enqueue the fixed Qwen3.8 single-token FA2 kernel using caller-owned
+/// workspace. This path is deliberately narrow: `[1,1,24,256]` queries and
+/// `[1,capacity,4,256]` BF16 caches.
+pub fn decode_attention(
+    ctx: &CudaContext,
+    query: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    output: &Tensor,
+    workspace: &Tensor,
+    key_tokens: usize,
+    scale: f32,
+) -> Result<()> {
+    let q_shape = [1, 1, 24, 256];
+    let q = tensor_storage(ctx, query, DType::BF16, &q_shape)?;
+    let out = tensor_storage(ctx, output, DType::BF16, &q_shape)?;
+    let k_shape = key_cache.shape().dims();
+    if k_shape.len() != 4 || k_shape[0] != 1 || k_shape[2] != 4 || k_shape[3] != 256 {
+        return Err(invalid("FA2 decode key cache must be [1, capacity, 4, 256]"));
+    }
+    if value_cache.shape().dims() != k_shape || key_tokens < 128 || key_tokens > k_shape[1] {
+        return Err(invalid("FA2 decode requires matching caches and 128 <= key_tokens <= capacity"));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(invalid("FA2 decode scale must be finite and positive"));
+    }
+    let key = tensor_storage(ctx, key_cache, DType::BF16, k_shape)?;
+    let value = tensor_storage(ctx, value_cache, DType::BF16, k_shape)?;
+    let workspace_shape = workspace.shape().dims();
+    let workspace_buffer = tensor_storage(ctx, workspace, DType::F32, workspace_shape)?;
+    let workspace_bytes = workspace_shape.iter().try_fold(4usize, |bytes, dim| {
+        bytes.checked_mul(*dim)
+            .ok_or_else(|| invalid("FA2 decode workspace size overflow"))
+    })?;
+    let required = decode_attention_workspace_bytes();
+    if workspace_bytes < required {
+        return Err(invalid(format!(
+            "FA2 decode workspace has {workspace_bytes} bytes, need {required}"
+        )));
+    }
+    unsafe {
+        status::check(abi::apxinf_decode_attention(
+            ctx.runtime(), q.ptr(), key.ptr(), value.ptr(), out.ptr(), workspace_buffer.ptr(),
+            workspace_bytes as i64, key_tokens as i64, scale, ctx.stream().handle(),
+        ))
+    }
 }

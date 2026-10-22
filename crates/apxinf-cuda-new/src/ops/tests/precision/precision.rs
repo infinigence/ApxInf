@@ -17,6 +17,9 @@ use std::time::Instant;
 #[path = "torch_l3_fixtures.rs"]
 mod torch_fixture;
 
+#[path = "torch_split_geglu_fixtures.rs"]
+mod split_fixture;
+
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
         .iter()
@@ -280,7 +283,8 @@ fn attention_f16_action_cache_uses_fa2() {
     let normalized = super::normalize_kv_cache_attention(&ctx, args).unwrap();
     let execution = super::attention_execution::prepare(&ctx, normalized).unwrap();
     assert!(
-        execution.summary().starts_with("flash-attention-2-kv-cache "),
+        execution.summary().starts_with("flash-attention-2-split-kv ")
+            || execution.summary().starts_with("flash-attention-2-kv-cache "),
         "unexpected F16 action KV-cache provider: {}",
         execution.summary()
     );
@@ -635,4 +639,51 @@ fn gemm_geglu_all_candidates_match_torch() {
         f::FP8_UNIT_GEMM_GEGLU,
     )
     .unwrap();
+}
+
+#[test]
+fn gemm_geglu_three_view_all_candidates_match_torch() {
+    use split_fixture as fixture;
+
+    let ctx = CudaContext::new(0).unwrap();
+    // T10 (768 patches + 10) and T21 (768 patches + 21) three-view rows.
+    for rows in [778usize, 789] {
+        let (inner, width) = (2048, 16384);
+        let mut activation = vec![0u8; rows * inner];
+        let mut weight = vec![0u8; inner * width * 2];
+        for row in 0..rows {
+            activation[row * inner + row % 8] = 0x38;
+        }
+        for channel in 0..8 {
+            for column in 0..width {
+                weight[channel * width * 2 + column] = fixture::SPLIT_GEGLU_VALUES[channel];
+                weight[channel * width * 2 + width + column] =
+                    fixture::SPLIT_GEGLU_VALUES[column % 8];
+            }
+        }
+        let activation = bytes_tensor(0, vec![rows, inner], DType::F8E4M3, &activation);
+        let weight = bytes_tensor(0, vec![inner, width * 2], DType::F8E4M3, &weight);
+        let mut output = zeros_tensor(0, vec![rows, width], DType::F8E4M3);
+        for (alpha, scale, golden) in [
+            (1.0, 1.0, fixture::SPLIT_GEGLU_UNIT),
+            (0.75, 1.25, fixture::SPLIT_GEGLU_SCALED),
+        ] {
+            let expected: Vec<_> = (0..rows * width)
+                .map(|index| golden[(index / width % 8) * 8 + index % 8])
+                .collect();
+            let mut args = GemmArgs::new(&activation, &weight, &mut output)
+                .with_immutable_weight(WeightVersion::new(1));
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            configure_torch_case(&mut args, alpha, scale);
+            args.policy.workspace_limit = 1024 * 1024 * 1024;
+            validate_all_candidates(
+                &ctx,
+                args,
+                super::contracts::Semantic::GemmGeglu,
+                None,
+                &expected,
+            )
+            .unwrap();
+        }
+    }
 }

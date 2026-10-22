@@ -2,18 +2,19 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
-use super::backend::{kernels, Context, DeviceBuffer};
-use super::WallossActionWeights;
-use super::{
-    DeviceVisionGeometry, WallossDynamicFp8LayerWeights, WallossDynamicFp8VisionBlockWeights,
-    WallossDynamicFp8VisionWeights, WallossLayerWeights, WallossTextConfig,
-    WallossVisionBlockWeights, WallossVisionConfig, WallossVisionWeights,
+use crate::walloss::backend::{kernels, Context, DeviceBuffer};
+use crate::walloss::geometry::DeviceVisionGeometry;
+use crate::walloss::weights::{
+    DynamicFp8LinearWeights, WallossActionWeights, WallossDynamicFp8LayerWeights,
+    WallossDynamicFp8VisionBlockWeights, WallossDynamicFp8VisionWeights, WallossLayerWeights,
+    WallossVisionBlockWeights, WallossVisionWeights,
 };
+use crate::walloss::{WallossTextConfig, WallossVisionConfig};
 
 #[derive(Clone, Copy)]
 pub(super) enum MatrixRef<'a> {
     Bf16(&'a Tensor),
-    DynamicFp8(&'a super::DynamicFp8LinearWeights),
+    DynamicFp8(&'a DynamicFp8LinearWeights),
 }
 
 pub(super) trait TransformerWeights {
@@ -60,7 +61,7 @@ fn linear(context: &Context, input: &Tensor, weights: MatrixRef<'_>) -> Result<T
 fn dynamic_linear(
     context: &Context,
     input: &Tensor,
-    weight: &super::DynamicFp8LinearWeights,
+    weight: &DynamicFp8LinearWeights,
 ) -> Result<Tensor> {
     let input_shape = input.shape().dims();
     if input_shape.len() != 2 || input_shape[1] != weight.input_features {
@@ -81,7 +82,7 @@ fn dynamic_linear(
 fn dynamic_linear_prequantized(
     context: &Context,
     activation: &kernels::quantization::DynamicFp8Tensor,
-    weight: &super::DynamicFp8LinearWeights,
+    weight: &DynamicFp8LinearWeights,
     keep_padded_output: bool,
 ) -> Result<Tensor> {
     let activation_shape = activation.values.shape().dims();
@@ -639,7 +640,8 @@ pub(super) fn action_stack<W: TransformerWeights>(
         noisy_action,
         dof_mask,
         time_embedding,
-    )?;
+    )
+    .map_err(|e| Error::Other(format!("action_embedding: {e}")))?;
     for (index, layer) in transformer_weights.iter().enumerate() {
         hidden = action_layer(
             context,
@@ -651,11 +653,14 @@ pub(super) fn action_stack<W: TransformerWeights>(
             prefix.prefix_tokens,
             prefix.cache_tokens,
             action_position_ids,
-        )?
+        )
+        .map_err(|e| Error::Other(format!("action_layer {index}: {e}")))?
         .hidden;
     }
-    let hidden = kernels::norm::rms_bf16(context, &hidden, final_norm, config.rms_norm_eps)?;
+    let hidden = kernels::norm::rms_bf16(context, &hidden, final_norm, config.rms_norm_eps)
+        .map_err(|e| Error::Other(format!("action final rms: {e}")))?;
     velocity(context, action_weights, &hidden)
+        .map_err(|e| Error::Other(format!("velocity: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,15 +806,23 @@ pub fn action_embedding(
             dof_mask.shape().dims()
         )));
     }
-    let action = kernels::gemm::bf16(context, noisy_action, &weights.noisy_action_projection)?;
-    let mask = kernels::gemm::bf16(context, dof_mask, &weights.dof_projection)?;
-    let action = kernels::elementwise::add(context, &action, &mask)?;
+    let action = kernels::gemm::bf16(context, noisy_action, &weights.noisy_action_projection)
+        .map_err(|e| Error::Other(format!("noisy_action_projection gemm: {e}")))?;
+    let mask = kernels::gemm::bf16(context, dof_mask, &weights.dof_projection)
+        .map_err(|e| Error::Other(format!("dof_projection gemm: {e}")))?;
+    let action = kernels::elementwise::add(context, &action, &mask)
+        .map_err(|e| Error::Other(format!("action+mask add: {e}")))?;
 
-    let action_part = kernels::gemm::bf16(context, &action, &weights.action_projection)?;
-    let time_part = kernels::gemm::bf16(context, time_embedding, &weights.time_projection)?;
-    let fused = kernels::elementwise::add(context, &action_part, &time_part)?;
-    let activated = kernels::activation::silu(context, &fused)?;
+    let action_part = kernels::gemm::bf16(context, &action, &weights.action_projection)
+        .map_err(|e| Error::Other(format!("action_projection gemm: {e}")))?;
+    let time_part = kernels::gemm::bf16(context, time_embedding, &weights.time_projection)
+        .map_err(|e| Error::Other(format!("time_projection gemm: {e}")))?;
+    let fused = kernels::elementwise::add(context, &action_part, &time_part)
+        .map_err(|e| Error::Other(format!("fused add: {e}")))?;
+    let activated = kernels::activation::silu(context, &fused)
+        .map_err(|e| Error::Other(format!("silu: {e}")))?;
     kernels::gemm::bf16(context, &activated, &weights.action_embedding_projection)
+        .map_err(|e| Error::Other(format!("action_embedding_projection gemm: {e}")))
 }
 
 pub fn velocity(

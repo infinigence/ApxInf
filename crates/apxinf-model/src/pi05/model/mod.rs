@@ -9,15 +9,22 @@ use blocks::Blocks;
 mod blocks;
 mod calibration;
 mod model;
+pub(in crate::pi05) use blocks::L3Policies;
+#[cfg(test)]
+pub(in crate::pi05) use blocks::L3PolicySnapshot;
 pub use calibration::Pi05CalibrationObserver;
 pub use model::{
     build_bf16_model, build_fp8_static_model, build_int8_dynamic_model,
     upload_time_embeddings_bf16, upload_time_embeddings_fp8_static,
     upload_time_embeddings_int8_dynamic,
 };
+pub(in crate::pi05) use model::{
+    build_bf16_model_with_policies, build_fp8_static_model_with_policies,
+    build_int8_dynamic_model_with_policies,
+};
 pub(super) use model::{ModelOperation, ModelVariant};
 
-use crate::pi05::backend::{DeviceBuffer, RuntimeBackend};
+use crate::pi05::backend::{Context, DeviceBuffer};
 use crate::pi05::Pi05ImageLayout;
 use apxinf_core::DType;
 use std::sync::Arc;
@@ -25,10 +32,9 @@ use std::sync::Arc;
 /// allocation, warmup, capture and lifetime; this description allocates nothing.
 pub struct WorkspaceRequirements {
     pub bytes: usize,
-    pub fp8_scratch: Option<(usize, usize)>,
 }
 pub trait PrepareBlocks: Blocks + 'static {
-    fn backend(&self) -> &Arc<RuntimeBackend>;
+    fn backend(&self) -> &Arc<Context>;
     fn workspace_requirements(&self, tokens: usize) -> Result<WorkspaceRequirements>;
     fn raw_patch_dtype(&self) -> DType;
     fn preprocess(
@@ -40,7 +46,7 @@ pub trait PrepareBlocks: Blocks + 'static {
 }
 
 impl<B: PrepareBlocks> Pi05Model<B> {
-    pub(in crate::pi05) fn backend(&self) -> &Arc<RuntimeBackend> {
+    pub(in crate::pi05) fn backend(&self) -> &Arc<Context> {
         self.blocks.backend()
     }
     pub(in crate::pi05) fn config(&self) -> &crate::pi05::Pi05Config {
@@ -61,7 +67,7 @@ pub use blocks::bf16::{
 pub use blocks::fp8_static::{
     action_layer_fp8_static, language_layer_fp8_static, vision_layer_fp8_static,
     vision_patch_embed_fp8_static, vision_patch_embed_fp8_static_native,
-    vision_qkv_packed_from_env, Fp8StaticActionLayerOutput, Fp8StaticLanguageLayerOutput,
+    Fp8StaticActionLayerOutput, Fp8StaticLanguageLayerOutput,
 };
 pub use blocks::int8_dynamic::{
     action_layer_int8_dynamic, language_layer_int8_dynamic, vision_layer_int8_dynamic,

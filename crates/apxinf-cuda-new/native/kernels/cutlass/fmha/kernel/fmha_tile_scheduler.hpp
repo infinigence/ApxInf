@@ -85,6 +85,62 @@ struct IndividualTileScheduler {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// apxinf: PURELY ADDITIVE.  Same mapping as IndividualTileScheduler but with
+// the m-tile index reversed.  For a causal problem, CTA (m, h) costs m+1 KV
+// tiles, and the hardware dispatches CTAs in roughly linear blockIdx order;
+// with one resident CTA per SM (the D=256 collective uses 192 KiB of smem) the
+// cheapest tiles run first and the most expensive ones land in the tail.
+// Reversing puts the long jobs first, which is the textbook
+// longest-processing-time-first fix.  Nothing selects it unless a consumer
+// names the type.
+struct ReverseIndividualTileScheduler {
+
+  struct Params {
+    dim3 grid;
+    int num_m_blocks;
+  };
+
+  bool valid_ = true;
+  int num_m_blocks_ = 1;
+
+  CUTLASS_DEVICE
+  ReverseIndividualTileScheduler(Params const& params)
+      : num_m_blocks_(params.num_m_blocks) {}
+
+  template<class ProblemSize, class ClusterShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemSize const& problem_size, KernelHardwareInfo hw_info,
+      ClusterShape const& cluster_shape, TileShape const& tile_shape) {
+    using namespace cute;
+    dim3 grid(round_up(ceil_div(size<0>(problem_size), size<0>(tile_shape)), size<0>(cluster_shape)), size<3,0>(problem_size), size<3,1>(problem_size));
+    return Params{ grid, int(grid.x) };
+  }
+
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    return make_coord(num_m_blocks_ - 1 - int(blockIdx.x), _0{},
+                      make_coord(blockIdx.y, blockIdx.z));
+  }
+
+  CUTLASS_DEVICE
+  ReverseIndividualTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct PersistentTileScheduler {
 
   struct Params {

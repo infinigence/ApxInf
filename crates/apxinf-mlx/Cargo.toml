@@ -1,0 +1,14 @@
+[package]
+name = "apxinf-mlx"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+build = "build.rs"
+[features]
+default = []
+native = ["apxinf-core/opaque-storage"]
+[dependencies]
+apxinf-core = { path = "../apxinf-core" }
+half = "2"
+[build-dependencies]
+cc = "1"

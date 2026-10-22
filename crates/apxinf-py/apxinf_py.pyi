@@ -195,5 +195,50 @@ class ModelRunner:
     @property
     def accepts_rgb_u8(self) -> bool: ...
 
+class DecisionRunner:
+    """A loaded decision model handle (d3-mini, etc.)."""
+
+    @staticmethod
+    def load(
+        model_path: str,
+        device: str = ...,
+        autotune: bool = ...,
+        tuning_dir: str | None = ...,
+    ) -> "DecisionRunner":
+        """Load a decision model checkpoint.
+
+        ``model_path`` — directory containing decision_config.json and tokenizer.json.
+        ``device`` — ``cuda:N`` (default ``cuda:0``). d3 is CUDA-only.
+        ``autotune`` — tune missing GEMM recipes from the first request.
+        ``tuning_dir`` — directory to persist tuning recipes.
+        """
+        ...
+
+    def decide(
+        self,
+        token_ids: npt.NDArray[np.uint32],
+        candidate_count: int,
+    ) -> dict:
+        """Run a text decision and return scored codes.
+
+        Returns:
+            dict with ``selected_index`` (int) and ``scores``
+            (list of ``{"code": str, "token_id": int, "probability": float}``).
+        """
+        ...
+
+    @property
+    def codes(self) -> list[str]:
+        """Available code names in the package code table."""
+        ...
+    @property
+    def num_codes(self) -> int:
+        """Total number of codes."""
+        ...
+    @property
+    def device(self) -> str: ...
+    @property
+    def model_path(self) -> str: ...
+
 # Exported by CUDA builds; shared fixed-profile geometry.
 QWEN_DRIVE_FIXED_SCENE_TOKENS: int

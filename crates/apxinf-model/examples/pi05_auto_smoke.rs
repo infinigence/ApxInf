@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     let eager_values =
-        apxinf_cuda::transfers::to_cpu(eager.run(&request)?.tensor())?.to_f32_vec()?;
+        apxinf_cuda_new::transfers::to_cpu(eager.run(&request)?.tensor())?.to_f32_vec()?;
     drop(eager);
     let prepared = model.prepare_for(&request, ExecutionPolicy::RequireGraph)?;
     assert_eq!(
@@ -97,7 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run(&VlaRequest::provided(&invalid, &noise))
         .is_err());
     let prepared_action = prepared.run(&request)?;
-    let graph_values = apxinf_cuda::transfers::to_cpu(prepared_action.tensor())?.to_f32_vec()?;
+    let graph_values =
+        apxinf_cuda_new::transfers::to_cpu(prepared_action.tensor())?.to_f32_vec()?;
     let eager_graph_max_abs = eager_values
         .iter()
         .zip(&graph_values)
@@ -184,11 +185,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rgb_spec = rgb_observation.inference_spec();
     let rgb_eager = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::Eager)?;
     let rgb_eager_values =
-        apxinf_cuda::transfers::to_cpu(rgb_eager.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+        apxinf_cuda_new::transfers::to_cpu(rgb_eager.run(&rgb_request)?.tensor())?.to_f32_vec()?;
     drop(rgb_eager);
     let rgb_graph = model.prepare_with_policy(&rgb_spec, ExecutionPolicy::RequireGraph)?;
     let rgb_graph_values =
-        apxinf_cuda::transfers::to_cpu(rgb_graph.run(&rgb_request)?.tensor())?.to_f32_vec()?;
+        apxinf_cuda_new::transfers::to_cpu(rgb_graph.run(&rgb_request)?.tensor())?.to_f32_vec()?;
     let rgb_max_abs = rgb_eager_values
         .iter()
         .zip(&rgb_graph_values)

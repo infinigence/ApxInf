@@ -24,6 +24,8 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          constexpr uint64_t kDeviceFeatureNativeFp8 = UINT64_C(1) << 0;\n\
          constexpr uint64_t kDeviceFeatureCutlassSm100 = UINT64_C(1) << 1;\n\
          constexpr uint64_t kDeviceFeatureFa2 = UINT64_C(1) << 2;\n\
+         constexpr uint64_t kDeviceFeatureCutlassSm89Bf16Geglu = UINT64_C(1) << 3;\n\
+         constexpr uint64_t kDeviceFeatureCutlassSm87W8A8 = UINT64_C(1) << 4;\n\
          struct CompiledTarget { int sm; uint64_t features; };\n\
          constexpr CompiledTarget kCompiledTargets[] = {\n",
     );
@@ -177,6 +179,8 @@ fn run(command: &mut Command, action: &str) {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(apxinf_nvfp4_gemm_swiglu)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_decode)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -239,6 +243,16 @@ fn main() {
         .join(", ");
     println!("cargo:warning=GEMM targets: {target_summary}");
 
+    let native_sm110 = selection.targets.iter().any(|target| target.sm() == 110)
+        && selection
+            .targets
+            .iter()
+            .any(|target| is_cutlass_sm100_family(&target.cutlass_arch));
+    let nvfp4_gemm_swiglu = native_sm110;
+    if nvfp4_gemm_swiglu {
+        println!("cargo:rustc-cfg=apxinf_nvfp4_gemm_swiglu");
+    }
+
     let id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
         gemm_fingerprint::build_id(
             &native,
@@ -285,8 +299,14 @@ fn main() {
         "attention/providers/custom.cu",
         "elementwise/execution.cpp",
         "linear_attention/execution.cpp",
-        "rope/execution.cpp",
+        "attn_helpers/execution.cpp",
         "reduction/execution.cpp",
+        "sampling.cu",
+        "norm.cu",
+        "pointwise.cu",
+        "rope.cu",
+        "gather.cu",
+        "quantization.cu",
     ]
     .map(|source| adapters.join(source))
     .to_vec();
@@ -301,6 +321,27 @@ fn main() {
     let fa2_compat_root = native.join("kernels/fa2_compat");
     let attention_kernel_root = native.join("kernels/attention");
     let mut cutlass_sources = Vec::new();
+    let mut sm110_sources = Vec::new();
+    let mut cutlass_sm87_sources = Vec::new();
+    let mut cutlass_sm89_sources = Vec::new();
+    if selection
+        .targets
+        .iter()
+        .any(|target| target.cutlass_arch == "sm_87")
+    {
+        cutlass_sm87_sources.push(cutlass_root.join("ops/gemm").join("gemm_i8_bf16_sm80.cu"));
+    }
+    if selection
+        .targets
+        .iter()
+        .any(|target| target.cutlass_arch == "sm_89")
+    {
+        cutlass_sm89_sources.push(
+            cutlass_root
+                .join("ops/gemm")
+                .join("gemm_bf16_geglu_sm89.cu"),
+        );
+    }
     if selection
         .targets
         .iter()
@@ -317,14 +358,43 @@ fn main() {
             ]
             .map(|source| operators.join(source)),
         );
+        if native_sm110 {
+            sm110_sources.push(operators.join("gemm_nvfp4_swiglu_sm100.cu"));
+            let attention = cutlass_root.join("ops/attention");
+            sm110_sources.extend(
+                [
+                    "fmha_d256_causal_sm110.cu",
+                    "fmha_d256_split_batch_sm110.cu",
+                    "fmha_strided_groups_sm110.cu",
+                ]
+                .map(|source| attention.join(source)),
+            );
+            sm110_sources.extend([
+                native.join("kernels/custom/gdn_bf16_prefill_prologue.cu"),
+                native.join(
+                    "adapters/linear_attention/providers/gdn_bf16_prefill_sm110.cu",
+                ),
+                native.join("kernels/flashinfer_gdn/gdn_bf16_prefill_sm110_launch.cu"),
+            ]);
+        }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources
-            .push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+    } else {
+        // The descriptor-side wrapper is part of the stable ABI on every CUDA
+        // target, but the generated Cake kernel itself requires Blackwell.
+        // Keep non-Blackwell builds linkable and report unsupported at launch.
+        generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_stub.cpp"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
+    // The allocation-free FA2 decode ABI is a stub that returns
+    // APXINF_STATUS_UNSUPPORTED unless FA2 was compiled in; surface that so a
+    // dependent crate can select the fallback without a runtime failure path.
+    if has_fa2 {
+        println!("cargo:rustc-cfg=apxinf_fa2_decode");
+    }
     let mut fa2_sources = Vec::new();
     if has_fa2 {
         generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
@@ -334,12 +404,19 @@ fn main() {
                 "fa2_decode_splitkv.cu",
                 "flash_attn/flash_fwd_hdim128_bf16_sm80.cu",
                 "flash_attn/flash_fwd_hdim256_bf16_sm80.cu",
+                "flash_attn/flash_fwd_split_hdim256_bf16_sm80.cu",
             ]
             .map(|source| fa2_root.join(source)),
         );
         fa2_sources.extend(
-            ["fa2_fwd_hdim128_extra.cu", "fa2_fwd_hdim256_extra.cu"]
-                .map(|source| attention_kernel_root.join(source)),
+            [
+                "fa2_fwd_hdim96_f16.cu",
+                "fa2_fwd_hdim96_bf16.cu",
+                "fa2_fwd_hdim128_extra.cu",
+                "fa2_fwd_hdim256_extra.cu",
+                "fa2_fwd_split_hdim256_f16.cu",
+            ]
+            .map(|source| attention_kernel_root.join(source)),
         );
     }
     let mut fa2_e4m3_sources = Vec::new();
@@ -353,12 +430,15 @@ fn main() {
                 .map(|source| attention_kernel_root.join(source)),
         );
     }
-    let patched_fa2_root = (!fa2_e4m3_sources.is_empty())
-        .then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let patched_fa2_root =
+        (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
     assert!(
         generic_sources
             .iter()
             .chain(&cutlass_sources)
+            .chain(&sm110_sources)
+            .chain(&cutlass_sm87_sources)
+            .chain(&cutlass_sm89_sources)
             .chain(&fa2_sources)
             .chain(&fa2_e4m3_sources)
             .all(|path| path.is_file()),
@@ -378,6 +458,8 @@ fn main() {
         cutlass_root.join("tools/util/include"),
     ];
     let has_cutlass = !cutlass_sources.is_empty();
+    let has_cutlass_sm87 = !cutlass_sm87_sources.is_empty();
+    let has_cutlass_sm89 = !cutlass_sm89_sources.is_empty();
     let generic_codegen = gencode_args(
         selection
             .targets
@@ -389,6 +471,27 @@ fn main() {
             .targets
             .iter()
             .filter(|target| is_cutlass_sm100_family(&target.cutlass_arch))
+            .map(|target| target.cutlass_arch.clone()),
+    );
+    let sm110_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| target.sm() == 110)
+            .map(|target| target.cutlass_arch.clone()),
+    );
+    let cutlass_sm89_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| target.cutlass_arch == "sm_89")
+            .map(|target| target.cutlass_arch.clone()),
+    );
+    let cutlass_sm87_codegen = gencode_args(
+        selection
+            .targets
+            .iter()
+            .filter(|target| target.cutlass_arch == "sm_87")
             .map(|target| target.cutlass_arch.clone()),
     );
     let fa2_codegen = gencode_args(
@@ -403,25 +506,48 @@ fn main() {
     let mut jobs: Vec<nvcc_build::CompileJob> = Vec::new();
     for (index, source) in generic_sources
         .drain(..)
-        .map(|source| (source, false, false, false))
+        .map(|source| (source, false, false, false, false, false, false))
         .chain(
             cutlass_sources
                 .into_iter()
-                .map(|source| (source, true, false, false)),
+                .map(|source| (source, true, false, false, false, false, false)),
+        )
+        .chain(
+            sm110_sources
+                .into_iter()
+                .map(|source| (source, false, true, false, false, false, false)),
+        )
+        .chain(
+            cutlass_sm87_sources
+                .into_iter()
+                .map(|source| (source, false, false, true, false, false, false)),
+        )
+        .chain(
+            cutlass_sm89_sources
+                .into_iter()
+                .map(|source| (source, false, false, false, true, false, false)),
         )
         .chain(
             fa2_sources
                 .into_iter()
-                .map(|source| (source, false, true, false)),
+                .map(|source| (source, false, false, false, false, true, false)),
         )
         .chain(
             fa2_e4m3_sources
                 .into_iter()
-                .map(|source| (source, false, false, true)),
+                .map(|source| (source, false, false, false, false, false, true)),
         )
         .enumerate()
     {
-        let (source, is_cutlass, is_fa2, is_fa2_e4m3) = source;
+        let (
+            source,
+            is_cutlass,
+            is_sm110,
+            is_cutlass_sm87,
+            is_cutlass_sm89,
+            is_fa2,
+            is_fa2_e4m3,
+        ) = source;
         let object = out.join(format!(
             "gemm-{index}-{}.o",
             source.file_stem().unwrap().to_string_lossy()
@@ -446,8 +572,14 @@ fn main() {
                 command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
             }
         }
-        command.args(if is_cutlass || is_fa2_e4m3 {
+        command.args(if is_sm110 {
+            &sm110_codegen
+        } else if is_cutlass || is_fa2_e4m3 {
             &cutlass_codegen
+        } else if is_cutlass_sm87 {
+            &cutlass_sm87_codegen
+        } else if is_cutlass_sm89 {
+            &cutlass_sm89_codegen
         } else if is_fa2 {
             &fa2_codegen
         } else {
@@ -460,14 +592,28 @@ fn main() {
             command.arg("-DAPXINF_GEMM_CUTLASS=1");
             command.arg("-DAPXINF_ATTENTION_CUTLASS=1");
         }
+        if nvfp4_gemm_swiglu {
+            command.arg("-DAPXINF_NVFP4_GEMM_SWIGLU=1");
+        }
+        if has_cutlass_sm89 {
+            command.arg("-DAPXINF_GEMM_CUTLASS_SM89=1");
+        }
+        if has_cutlass_sm87 {
+            command.arg("-DAPXINF_GEMM_CUTLASS_SM87_W8A8=1");
+        }
         if has_fa2 {
             command.arg("-DAPXINF_ATTENTION_FA2=1");
         }
         if !cutlass_codegen.is_empty() {
             command.arg("-DAPXINF_ATTENTION_FA2_E4M3=1");
         }
-        if is_cutlass {
+        if is_cutlass || is_sm110 || is_cutlass_sm87 || is_cutlass_sm89 {
             command.args(["--expt-relaxed-constexpr", "--expt-extended-lambda"]);
+            // `nvcc -O3` does not imply `-DNDEBUG`, so every `CUTLASS_ASSERT`
+            // survives into device code (97 `BPT.TRAP` instructions in the
+            // FMHA family before this). Scoped to the CUTLASS translation
+            // units so the other adapters keep their asserts.
+            command.arg("-DNDEBUG");
             for include in &cutlass_includes {
                 command.arg(format!("-I{}", include.display()));
             }
@@ -483,6 +629,74 @@ fn main() {
             {
                 command.arg("-DAPXINF_BF16_DUAL_GEGLU_PRODUCTION=1");
             }
+            let file_name = source.file_name().and_then(|name| name.to_str());
+            const D256_COMMON: &[&str] = &[
+                "-DAPXINF_EX2_APPROX=1",
+                "-DAPXINF_EX2_FTZ=1",
+                "-DAPXINF_DEBUG_SHOW_SO=0",
+                "-DAPXINF_FUSE_ROWSUM=1",
+                "-DAPXINF_P_FLUSH_HALF=1",
+                "-DAPXINF_CORR_RING2=1",
+                "-DAPXINF_LOAD_SHAPE_PER_MODE=1",
+            ];
+            if file_name == Some("fmha_d256_causal_sm110.cu") {
+                command.args(D256_COMMON).args([
+                    "-DAPXINF_EX2_EMU_FREQ=14",
+                    "-DAPXINF_EX2_EMU_RES=6",
+                    "-DAPXINF_EX2_EMU_START_FRG=0",
+                    "-DAPXINF_RESCALE_THRESHOLD=0.0f",
+                    "-DAPXINF_KV_DESCENDING=0",
+                    "-DAPXINF_ROWSUM_QUARTERS=1",
+                    "-DAPXINF_ACC_SCALE_HALF=1",
+                    "-DAPXINF_ROWSUM_RESCALE_RN=1",
+                    "-DAPXINF_FINAL_NORM=3",
+                    "-DAPXINF_S_PIPE_STAGES=2",
+                ]);
+            }
+            if file_name == Some("fmha_d256_split_batch_sm110.cu") {
+                command.args(D256_COMMON).args([
+                    "-DAPXINF_EX2_EMU_RES=0",
+                    "-DAPXINF_RESCALE_THRESHOLD=8.0f",
+                    "-DAPXINF_KV_DESCENDING=1",
+                    "-DAPXINF_ROWSUM_QUARTERS=0",
+                    "-DAPXINF_ACC_SCALE_HALF=0",
+                    "-DAPXINF_ROWSUM_RESCALE_RN=0",
+                    "-DAPXINF_FINAL_NORM=2",
+                    "-DAPXINF_LSE_FA4=1",
+                ]);
+            }
+            if file_name == Some("fmha_strided_groups_sm110.cu") {
+                command.args([
+                    "-DAPXINF_MASK_R2P=1",
+                    "-DAPXINF_KV_DESCENDING=1",
+                    "-DAPXINF_RESCALE_THRESHOLD=8.0f",
+                    "-DAPXINF_EX2_APPROX=1",
+                    "-DAPXINF_EX2_FTZ=1",
+                    "-DAPXINF_DEBUG_SHOW_SO=0",
+                    "-DAPXINF_FUSE_ROWSUM=1",
+                    "-DAPXINF_EX2_EMU_FREQ=16",
+                    "-DAPXINF_EX2_EMU_RES=4",
+                    "-DAPXINF_EX2_EMU_START_FRG=1",
+                    "-DAPXINF_ACC_SCALE_HALF=0",
+                    "-DAPXINF_FINAL_NORM=1",
+                    "-DAPXINF_NO_LSE=1",
+                    "-DAPXINF_PERSISTENT=1",
+                    "-DAPXINF_NUM_REGS_SOFTMAX=200",
+                    "-DAPXINF_NUM_REGS_CORRECTION=64",
+                    "-DAPXINF_NUM_REGS_OTHER=48",
+                    "-DAPXINF_FMHA_KV_STAGES=4",
+                    "-DAPXINF_SKIP_PAD_QSTAGE=1",
+                    "-DAPXINF_P_CHUNKS16=1",
+                    "-DAPXINF_ROWSUM_RESCALE_RN=1",
+                ]);
+            }
+            if file_name == Some("gdn_bf16_prefill_sm110_launch.cu") {
+                command.args([
+                    "-DHEAD_GROUP_LOG2=1",
+                    "-DNUM_O_HEADS_LOG2=5",
+                    "-DIS_GQA=0",
+                ]);
+            }
         }
         if is_fa2 || is_fa2_e4m3 {
             command.args([
@@ -494,19 +708,19 @@ fn main() {
                 "-U__CUDA_NO_HALF2_OPERATORS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             ]);
+            // The runtime never enables these FA2 feature axes. Keep the
+            // legacy compile-time pruning so every compiled specialization
+            // matches the contract and split-KV does not instantiate an
+            // unused combinatorial kernel set. The shared constant makes the
+            // exact compile policy part of the Attention build fingerprint.
+            command.args(attention_fingerprint::FA2_FIXED_FEATURE_DEFINES);
             command.arg(if is_fa2_e4m3 {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2_direct_e4m3"
             } else {
                 "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2"
             });
             if is_fa2_e4m3 {
-                command.args([
-                    "-DAPXINF_FA2_DIRECT_E4M3=1",
-                    "-DFLASHATTENTION_DISABLE_DROPOUT",
-                    "-DFLASHATTENTION_DISABLE_ALIBI",
-                    "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                    "-DFLASHATTENTION_DISABLE_LOCAL",
-                ]);
+                command.arg("-DAPXINF_FA2_DIRECT_E4M3=1");
             }
             command.arg(format!("-I{}", fa2_compat_root.display()));
             if is_fa2_e4m3 {

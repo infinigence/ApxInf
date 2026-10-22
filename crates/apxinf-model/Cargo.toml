@@ -6,19 +6,34 @@ license = "Apache-2.0"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
+apxinf-mlx = { path = "../apxinf-mlx", optional = true }
 apxinf-cuda = { path = "../apxinf-cuda", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
+apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
 thiserror = "1"
 once_cell = "1"
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
-cuda = ["dep:apxinf-cuda"]
-cuda-new = ["cuda", "dep:apxinf-cuda-new"]
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2"]
+# Full NVIDIA CUDA inference: links both the legacy (`apxinf-cuda`) and the
+# current (`apxinf-cuda-new`) runtimes and enables every CUDA model family.
+cuda = ["dep:apxinf-cuda", "dep:apxinf-cuda-new"]
+# Deprecated alias of `cuda`, kept so existing build commands keep working.
+# It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
+# the model code that used to hide behind this flag now follows `cuda`.
+cuda-new = ["cuda"]
+# Deprecated alias of `cuda`. It gates nothing — `cuda` has always compiled the
+# other model families too — and is kept only for existing build commands.
+pi05-only = ["cuda"]
+# AMD ROCm/HIP inference, independent of both CUDA features: either, both or
+# neither can be enabled.
+hip = ["dep:apxinf-hip"]
 
 [[example]]
 name = "pi05_bench"
@@ -50,4 +65,24 @@ required-features = ["cuda"]
 
 [[example]]
 name = "qwen38_bench"
-required-features = ["cuda-new"]
+required-features = ["cuda"]
+
+[[example]]
+name = "d3_smoke"
+required-features = ["cuda"]
+
+[[example]]
+name = "d3_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "d3_vision_smoke"
+required-features = ["cuda"]
+
+[[example]]
+name = "d3_eval"
+required-features = ["cuda"]
+
+[[example]]
+name = "d3_decision_index"
+required-features = ["cuda"]

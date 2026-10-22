@@ -3,16 +3,42 @@
 use std::sync::Arc;
 
 use apxinf_core::{Backend, Device, Result};
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(all(feature = "cuda", feature = "hip", feature = "mlx", target_os = "macos", target_arch = "aarch64")))]
 use apxinf_core::Error;
 
 pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {
         Device::Cpu => Ok(Arc::new(apxinf_core::CpuBackend)),
+        #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+        Device::Metal(id) => Ok(Arc::new(apxinf_mlx::MlxBackend::new(id)?)),
+        #[cfg(not(all(feature = "mlx", target_os = "macos", target_arch = "aarch64")))]
+        Device::Metal(_) => Err(Error::Other("MLX support not compiled in; enable the mlx feature".into())),
         #[cfg(feature = "cuda")]
         Device::Cuda(id) => cuda::create(id),
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) => Err(Error::Other("CUDA support not compiled in".into())),
+        #[cfg(feature = "hip")]
+        Device::Hip(id) => hip::create(id),
+        #[cfg(not(feature = "hip"))]
+        Device::Hip(_) => Err(Error::Other("HIP support not compiled in".into())),
+    }
+}
+
+/// AMD ROCm/HIP seam.
+///
+/// Deliberately thin compared to [`cuda`]: models reach this backend only
+/// through `dyn Backend`, so there is no downcast helper. A family that needs
+/// HIP-specific fused kernels would add one here, the same way PI0.5 does for
+/// CUDA — but nothing needs that yet, and adding it before something does would
+/// invite the coupling this backend was built to avoid.
+#[cfg(feature = "hip")]
+pub(crate) mod hip {
+    use std::sync::Arc;
+
+    use apxinf_core::{Backend, Result};
+
+    pub(crate) fn create(device_id: usize) -> Result<Arc<dyn Backend>> {
+        Ok(Arc::new(apxinf_hip::HipBackend::new(device_id)?))
     }
 }
 

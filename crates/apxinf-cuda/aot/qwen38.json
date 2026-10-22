@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "target": "aarch64-unknown-linux-gnu",
+  "sm": "sm_110",
+  "cuda": "13.2",
+  "cutlass_dsl": "4.7.0",
+  "kernels": [
+    {
+      "id": "qwen38-dense-swiglu-nvfp4",
+      "exporter": "export_qwen38_nvfp4_swiglu.py",
+      "symbol": "dense_swiglu",
+      "inputs": {
+        "--edge-src": "tensorrt_edge_nvfp4_moe_source",
+        "--cutlass-deps": "cutlass_dependencies"
+      },
+      "args": [],
+      "contract": {
+        "input_dtype": "nvfp4-e2m1",
+        "scale_dtype": "fp8-e4m3",
+        "tokens": 2048,
+        "hidden": 5120,
+        "projection": 34816,
+        "output": 17408,
+        "experts": 1,
+        "top_k": 1,
+        "activation": "swiglu-bf16-boundaries",
+        "output_layout": "nvfp4-atom-scales"
+      },
+      "source": {
+        "project": "NVIDIA TensorRT-Edge-LLM",
+        "revision": "e8b29522938901f6df19ebeedd4b69bc8edbcd97",
+        "license": "BSD-3-Clause",
+        "repository": "https://github.com/NVIDIA/TensorRT-Edge-LLM"
+      },
+      "exporter_sha256": "801672594e23d05e28d8ae90c81db11ff8c496cce955440fe58a93f574cd744d",
+      "specialization": {
+        "original_m": 2048,
+        "trace_m": 128,
+        "n": 34816,
+        "k": 5120,
+        "l": 1,
+        "mma_tile": [
+          256,
+          256
+        ],
+        "cluster": [
+          2,
+          1
+        ],
+        "scale_vector": 16,
+        "max_active_clusters": "runtime"
+      }
+    }
+  ]
+}
