@@ -140,7 +140,11 @@ fn parse_value(mut rest: &str) -> Result<(String, &str), String> {
             let end = cdata
                 .find("]]>")
                 .ok_or("The parameter CDATA section has no end.")?;
-            value.push_str(&cdata[..end]);
+            let literal = &cdata[..end];
+            if !literal.chars().all(xml_character) {
+                return Err("The parameter contains an invalid XML character.".into());
+            }
+            value.push_str(literal);
             rest = &cdata[end + 3..];
             continue;
         }
@@ -332,6 +336,7 @@ mod tests {
             "<function name=\"Read\"><param name=\"file_path\">x</param><wrong/></function>",
             "<function name=\"Read\"><param name=\"file_path\">&unknown;</param></function>",
             "<function name=\"Read\"><param name=\"file_path\">&#0;</param></function>",
+            "<function name=\"Read\"><param name=\"file_path\"><![CDATA[\u{1}]]></param></function>",
             "<function name=\"Read\"><param name=\"file_path\"><svg/></param></function>",
             "<function name=\"Read\"><param name=\"count\">2</param></function>",
             "<function name=\"Read\"><param name=\"file_path\">x</param><param name=\"count\">2.5</param></function>",

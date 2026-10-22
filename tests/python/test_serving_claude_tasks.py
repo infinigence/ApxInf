@@ -1,5 +1,3 @@
-"""Check the original pelican task without starting Claude Code or a model."""
-
 from pathlib import Path
 import sys
 import tempfile
@@ -74,7 +72,8 @@ class PelicanTaskTests(unittest.TestCase):
     def test_valid_svg_and_matched_read_write_cycle_pass_structurally(self):
         self.save_svg()
         result = self.outcome(successful_events())
-        self.assertTrue(result["passed"], result)
+        self.assertTrue(result["automated_passed"], result)
+        self.assertIsNone(result["passed"])
         self.assertEqual(result["visual_review"], "pending")
         self.assertEqual(result["observed_input_usage"], {"input_tokens": 123})
 
@@ -82,11 +81,11 @@ class PelicanTaskTests(unittest.TestCase):
         self.save_svg()
         events = [tool_call("read-1", "Read"), tool_result("read-1"),
                   tool_call("edit-1", "Edit"), tool_result("edit-1")]
-        self.assertTrue(self.outcome(events)["passed"])
+        self.assertTrue(self.outcome(events)["automated_passed"])
 
     def test_standard_xml_declaration_does_not_reject_svg(self):
         self.save_svg('<?xml version="1.0" encoding="UTF-8"?>' + VALID_SVG)
-        self.assertTrue(self.outcome(successful_events())["passed"])
+        self.assertTrue(self.outcome(successful_events())["automated_passed"])
 
     def test_a_write_before_the_brief_read_does_not_count(self):
         self.save_svg()
