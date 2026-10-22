@@ -27,7 +27,8 @@ SVG_ELEMENTS = {"svg", "title", "desc", "g", "path", "circle", "ellipse", "rect"
 SVG_GRAPHICS = {"path", "circle", "ellipse", "rect", "line", "polyline", "polygon", "text"}
 
 
-def client_environment(base_url, model, config_dir, max_tokens=512, max_context=None):
+def client_environment(base_url, model, config_dir, max_tokens=512, max_context=None,
+                       *, acceptance_context_compat=False):
     """Keep machine basics and replace all provider configuration for this child."""
     keep = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "TERM")
     environment = {key: os.environ[key] for key in keep if key in os.environ}
@@ -50,7 +51,22 @@ def client_environment(base_url, model, config_dir, max_tokens=512, max_context=
     })
     if max_context is not None:
         environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_context)
+    if acceptance_context_compat:
+        if type(max_context) is not int or max_context <= 0:
+            raise ValueError("Context compatibility requires a positive client context limit.")
+        environment["CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE"] = str(max_context)
     return environment
+
+
+def context_compatibility_version(executable, server_context, client_context):
+    if (type(server_context) is not int or server_context <= 0 or
+            type(client_context) is not int or not 0 < client_context <= server_context):
+        raise ValueError("Context compatibility requires a client window within the verified deployment limit.")
+    result = subprocess.run([str(executable), "--version"], check=True, capture_output=True,
+                            text=True, timeout=10)
+    if result.stdout.strip() != "2.1.289 (Claude Code)":
+        raise ValueError("Acceptance context compatibility requires Claude Code 2.1.289.")
+    return "2.1.289"
 
 
 def prepare_task(name, directory):
@@ -404,12 +420,20 @@ def run(args):
         if max_context is not None and max_context > server_context:
             raise ValueError("The client context limit exceeds the deployment limit.")
         max_context = max_context or server_context
+    context_compat = args.acceptance_claude_context_compat
+    client_version = (context_compatibility_version(args.claude, server_context, max_context)
+                      if context_compat else None)
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {"format": "apxinf-claude-code-tasks-v1", "created_at": datetime.now(timezone.utc).isoformat(),
               "model": model, "client": str(args.claude), "tasks": [],
               "deployment_limits": capabilities, "client_context_limit": max_context,
               "client_request_output_limit": args.max_tokens,
+              "client_context_policy": {
+                  "mode": "acceptance_compatibility" if context_compat else "default",
+                  "verified_client_version": client_version,
+                  "deployment_window": server_context, "effective_window": max_context,
+                  "blocking_threshold": max_context if context_compat else None},
               "profile": "bare, restricted, local dummy credential, isolated configuration, narrow tool allowlists",
               "limitations": ["Anthropic does not officially support Claude Code with non-Claude models.",
                               "These small tasks measure observed compatibility, not general coding quality.",
@@ -422,7 +446,8 @@ def run(args):
                 spec = prepare_task(name, directory)
                 config_dir = directory / "client-config"
                 config_dir.mkdir()
-                environment = client_environment(args.base_url, model, config_dir, args.max_tokens, max_context)
+                environment = client_environment(args.base_url, model, config_dir, args.max_tokens, max_context,
+                                                 acceptance_context_compat=context_compat)
                 command = [str(args.claude), "--bare", "--restricted", "-p", spec["prompt"],
                            "--model", model, "--output-format", "stream-json", "--verbose",
                            "--include-partial-messages", "--no-session-persistence",
@@ -463,6 +488,8 @@ def parser():
     result.add_argument("--max-tokens", type=int, default=512)
     result.add_argument("--max-context", type=int,
                         help="Set the client window. By default, use the deployment readiness limit.")
+    result.add_argument("--acceptance-claude-context-compat", action="store_true",
+                        help="Use the internal Claude Code 2.1.289 blocking threshold for local acceptance only.")
     result.add_argument("--metal-lock", type=Path)
     result.add_argument("--output-dir", type=Path, required=True)
     return result

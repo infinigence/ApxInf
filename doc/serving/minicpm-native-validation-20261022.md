@@ -205,6 +205,56 @@ The subsequent verified worker fault correctly ended the service without forced 
 The HTTP, cancellation, and tool checks therefore pass for this executable.
 The pelican task remains incomplete because its visual gate failed.
 
+## Executable feedback diagnostic
+
+A separate scratch variant exposes Read, Edit, and a narrowly allowed Bash command to Claude Code.
+An original Python checker reports XML errors and checks the SVG root, viewBox, and title.
+The variant asks the model to run the checker after editing and correct reported errors.
+It retains the original drawing brief and verifies that the checker remains unchanged.
+This diagnostic does not replace the baseline pelican task.
+
+The first checked run completed Read, Read, Edit, and Bash in 132.11 seconds.
+The checker reported success, and the parent runner independently accepted the SVG structure.
+The model did not change the checker or the brief.
+The first artifact passed, so this run does not establish error correction.
+Rendered inspection found a large green disk with overlapping shapes, without a recognizable pelican or bicycle.
+Structural feedback alone did not satisfy the visual gate in this run.
+
+A further scratch run supplied the failed baseline SVG and an external visual review as text.
+The model read the review, checked the original file, and edited the SVG.
+Claude Code then stopped locally with `Prompt is too long` and terminal reason `blocking_limit`.
+The client did not send the next generation request to ApxInf.
+The successful checker call preceded the edit, so the model did not complete the required final check.
+The revised SVG also failed rendered visual inspection.
+
+An original local-response probe reproduced the client limit without a large response body.
+Both cases returned the same short Read call and reported 2695 input tokens.
+Output usage of 50 permitted the next request, but output usage of 6986 caused a local block.
+The latter count matches the real run's final generation, which includes hidden reasoning.
+These results distinguish generated token usage from retained visible context.
+
+## Bounded client compatibility mode
+
+The runner now provides the explicit `--acceptance-claude-context-compat` option.
+It requires Claude Code 2.1.289 and a positive context limit from successful deployment readiness.
+The internal blocking threshold equals the effective client window, which cannot exceed the deployment window.
+The default mode remains unchanged.
+The [runner documentation](../../benchmarks/serving/README.md) records the internal client dependency and limits.
+
+The original local-response probe also exercised the full acceptance runner, including discovery, readiness, version validation, task execution, and reporting.
+The default run stopped after one request with `blocking_limit`.
+The compatibility run completed two requests and returned the fixture's original marker through real Claude Code.
+Both runs used a 16384-position window and an 8192-token output allowance.
+The synthetic response supplied the same 6986-token output usage in both runs.
+This probe checks client compatibility, not model generation quality.
+
+A separate native run counted 9011 input tokens and rejected an additional 8192-token output allowance with HTTP 400 and `context_limit`.
+The same executable passed hidden-output cancellation and the verified worker fault check.
+No forced process-group termination occurred.
+The final Python serving suite ran 272 checks, with six skipped.
+Independent review found no material correctness issues in the client compatibility change.
+The full pelican revision task still requires a successful visual result and final checker execution.
+
 ## Local evidence records
 
 The working directory retains complete diagnostic records under `devlocal/serving-minicpm/`.
@@ -231,6 +281,13 @@ This ignored directory is not part of the source checkout distributed through Gi
 | `thinking-python-tests.log` | Python serving checks after thinking integration |
 | `native-thinking-claude/` | Hidden output checks and incompatible content-triggered cancellation probe |
 | `native-thinking-claude-recheck/` | Native thinking HTTP, cancellation, and real client evidence |
+| `native-thinking-checked-pelican/` | Checker tool execution and failed visual review |
+| `checked_pelican.py` | Scratch runner for executable and external visual feedback |
+| `native-thinking-visual-feedback/` | Model revision, local client block, and failed visual review |
+| `client-context-probe-74f03bd5/` | Local client reproduction with controlled output usage |
+| `client-context-probe-5b75b7e4/` | Full runner default and compatibility comparison |
+| `native-thinking-context-rejection/` | Exact native context rejection, cancellation, and worker fault checks |
+| `client-compat-tests.log` | Python checks for the bounded client option |
 | `chunk-cli-smoke.log` | Native CLI regression after chunk integration |
 
 The [context profile](minicpm-context-v0.1.md) records the separate numerical equivalence gate.
