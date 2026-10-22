@@ -26,6 +26,9 @@ pub fn digest(path: &Path) -> Result<(u64, String), String> {
 }
 
 pub fn runtime(executable: &Path, library: &Path) -> Result<Value, String> {
+    if library.file_name().and_then(|name| name.to_str()) != Some("libmlx.dylib") {
+        return Err("The native runtime requires libmlx.dylib.".into());
+    }
     Ok(
         json!({"kind":"native_minicpm5", "apxinf":"0.1.0", "mlx":"0.31.2",
         "executable_sha256":digest(executable)?.1, "metal_library_sha256":digest(library)?.1}),
