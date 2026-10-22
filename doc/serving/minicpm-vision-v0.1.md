@@ -206,6 +206,8 @@ The supervisor retains its existing public deadline, settlement grace, and proce
 
 Terminal metrics retain elapsed time, TTFT, and device peak memory, and add `source_media_bytes` and `peak_host_array_bytes`.
 `source_media_bytes` is the logical sum of request source-file lengths.
+The attempt tracker must compare this count with submitted source occurrences before it accepts a terminal event.
+Repeated images contribute their byte counts separately. A text-only request contributes zero bytes.
 `peak_host_array_bytes` is the maximum measured retained host array storage for the attempt.
 These counts exclude queue copies, wire buffers, decoder temporaries, and allocator reserve.
 Readiness memory retains the existing device allocator fields.
