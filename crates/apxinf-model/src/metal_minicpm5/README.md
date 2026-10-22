@@ -34,6 +34,12 @@ only to its final normalized hidden row. This distinction retains the accepted
 prefill optimization without weakening the full forward contract. Ordinary
 generation uses ApxInf's shared sampler/EOS loop.
 
+The shared controlled loop exposes completed prefill and token boundaries.
+The native serving owner can stop at these boundaries.
+`release_request_state` checks device synchronization before it releases request KV and compiled traces.
+It preserves fixed weights and position tables.
+The existing `reset` operation retains prepared state and cannot establish resource release.
+
 The supported workload is one text sequence with at most 4096 consumed positions.
 Only greedy sampling without penalties/log-probability is currently implemented
 by the native backend. Unsupported sampling requests fail explicitly. DSpark is
