@@ -275,6 +275,25 @@ The compatibility option therefore permits continuation but does not establish s
 This result motivates a separate investigation of bounded model reasoning, rather than another increase in total output allowance.
 The existing 2.3 profile retains its declared generation behavior.
 
+## Bounded initial reasoning diagnostic
+
+An isolated native prototype tested an independent limit on the initial reasoning segment.
+Both runs used the same 1253-token input, seed 42, 8192-token capacity reservation, and 2048-token generation limit.
+The input retained extra composition guidance from an earlier diagnostic.
+This experiment did not execute Claude Code or the HTTP worker protocol.
+
+The unrestricted run exhausted 2048 tokens without closing initial reasoning or reaching EOS.
+The bounded run selected the same first 512 tokens, then forced the closing delimiter token at index 512.
+Its initial reasoning segment closed after 513 selected tokens.
+It reached EOS after 1378 selected tokens, including the forced delimiter and EOS.
+The older scratch summary excludes EOS from its output count. The recorded token list preserves the complete count.
+
+The bounded output contained a complete SVG in an Edit parameter, and the extracted SVG passed structural validation.
+Rendered inspection still found disconnected shapes without a recognizable pelican riding a bicycle.
+The visual verdict records the SVG digest.
+These single-run results establish the control mechanism, not general quality or latency improvements.
+A production implementation requires an explicit profile, identity, accounting contract, and real client validation.
+
 ## Local evidence records
 
 The working directory retains complete diagnostic records under `devlocal/serving-minicpm/`.
@@ -310,6 +329,8 @@ This ignored directory is not part of the source checkout distributed through Gi
 | `client-compat-tests.log` | Python checks for the bounded client option |
 | `native-thinking-revision-compatible/` | Host pressure rejection before model loading |
 | `native-thinking-revision-compatible-retry/` | Compatible client revision timeout and unchanged artifact digest |
+| `sampling-probe/budget-unrestricted-42/` | Unrestricted initial reasoning diagnostic |
+| `sampling-probe/budget-512-42/` | Bounded reasoning diagnostic, token comparison, and failed visual review |
 | `chunk-cli-smoke.log` | Native CLI regression after chunk integration |
 
 The [context profile](minicpm-context-v0.1.md) records the separate numerical equivalence gate.
