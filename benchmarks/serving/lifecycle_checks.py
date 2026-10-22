@@ -214,10 +214,11 @@ def verify_worker_target(args, ready):
     if protocol == "apxinf-worker/2.0":
         if not any(Path(part).name == "text_worker.py" for part in worker_command):
             raise RuntimeError("The explicit worker does not run text_worker.py.")
-    elif protocol in ("apxinf-worker/2.1", "apxinf-worker/2.2", "apxinf-worker/2.3"):
+    elif protocol in ("apxinf-worker/2.1", "apxinf-worker/2.2", "apxinf-worker/2.3", "apxinf-worker/2.4"):
         expected_provider = {"apxinf-worker/2.1": "native-minicpm5",
                              "apxinf-worker/2.2": "native-minicpm5-sampled",
-                             "apxinf-worker/2.3": "native-minicpm5-thinking"}[protocol]
+                             "apxinf-worker/2.3": "native-minicpm5-thinking",
+                             "apxinf-worker/2.4": "native-minicpm5-thinking-bounded"}[protocol]
         expected_executable = argument_value(service_command, "--native-worker")
         expected_library = argument_value(service_command, "--metal-library")
         if (argument_value(service_command, "--provider") != expected_provider

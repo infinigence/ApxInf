@@ -96,6 +96,10 @@ pub enum WorkerRuntime {
         executable: PathBuf,
         metal_library: PathBuf,
     },
+    NativeMiniCpm5BoundedThinking {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
 }
 
 impl WorkerRuntime {
@@ -105,6 +109,9 @@ impl WorkerRuntime {
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
             Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
             Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
+            Self::NativeMiniCpm5BoundedThinking { .. } => {
+                contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
+            }
         }
     }
 }
@@ -134,6 +141,7 @@ impl Config {
             WorkerRuntime::NativeMiniCpm5 { .. }
                 | WorkerRuntime::NativeMiniCpm5Sampled { .. }
                 | WorkerRuntime::NativeMiniCpm5Thinking { .. }
+                | WorkerRuntime::NativeMiniCpm5BoundedThinking { .. }
         ) && (self.max_context > 16384
             || self.output_batch_tokens != 1
             || self.prefill_step_size != 256)
@@ -255,7 +263,11 @@ pub struct Service {
 
 impl Service {
     pub(crate) fn model_thinking(&self) -> bool {
-        self.ready["protocol"] == contracts::NATIVE_THINKING_PROTOCOL
+        self.ready["protocol"] == contracts::NATIVE_THINKING_PROTOCOL || self.bounded_thinking()
+    }
+
+    pub(crate) fn bounded_thinking(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
     }
 
     pub(crate) fn sampling_enabled(&self) -> bool {
@@ -555,7 +567,10 @@ async fn launch_worker_until(
         }
         WorkerRuntime::NativeMiniCpm5 { executable, .. }
         | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. }
-        | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. } => Command::new(executable),
+        | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5BoundedThinking { executable, .. } => {
+            Command::new(executable)
+        }
     };
     command
         .arg("--protocol")
@@ -586,7 +601,8 @@ async fn launch_worker_until(
         .kill_on_drop(true);
     if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
-    | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. } = &config.runtime
+    | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5BoundedThinking { metal_library, .. } = &config.runtime
     {
         command.arg("--metal-library").arg(metal_library).env(
             "DYLD_LIBRARY_PATH",
@@ -1465,19 +1481,32 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
     | WorkerRuntime::NativeMiniCpm5Thinking {
         executable,
         metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5BoundedThinking {
+        executable,
+        metal_library,
     } = &config.runtime
     {
         let expected = crate::native_identity::runtime(executable, metal_library)?;
+        let bounded = config.runtime.protocol() == contracts::NATIVE_BOUNDED_THINKING_PROTOCOL;
         let thinking = config.runtime.protocol() == contracts::NATIVE_THINKING_PROTOCOL;
         let sampled = config.runtime.protocol() == contracts::NATIVE_SAMPLED_PROTOCOL;
-        let adapter = if thinking {
+        let adapter = if bounded {
+            "apxinf-native-minicpm5-bounded-thinking-v1"
+        } else if thinking {
             "apxinf-native-minicpm5-thinking-v1"
         } else if sampled {
             "apxinf-native-minicpm5-sampled-v1"
         } else {
             "apxinf-native-minicpm5-v1"
         };
-        let execution = if thinking {
+        let execution = if bounded {
+            crate::native_identity::bounded_thinking_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else if thinking {
             crate::native_identity::thinking_execution(
                 config.max_context,
                 config.max_output,
@@ -1626,6 +1655,7 @@ async fn execute(
         contracts::NATIVE_PROTOCOL
             | contracts::NATIVE_SAMPLED_PROTOCOL
             | contracts::NATIVE_THINKING_PROTOCOL
+            | contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
     ) {
         OutputProfile::MiniCpm5
     } else {

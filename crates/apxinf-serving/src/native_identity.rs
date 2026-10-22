@@ -55,6 +55,15 @@ pub fn thinking_execution(context: usize, output: usize, memory: u64) -> Value {
     value
 }
 
+pub fn bounded_thinking_execution(context: usize, output: usize, memory: u64) -> Value {
+    let mut value = thinking_execution(context, output, memory);
+    value["output_policy"] = "minicpm5-initial-thinking-fixed512-v1".into();
+    value["initial_reasoning"] = json!({
+        "budget_tokens":512, "close_token_id":9, "selection":"cpu-constrained-close-v1"
+    });
+    value
+}
+
 pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value, String> {
     let mut entries = std::fs::read_dir(model)
         .map_err(|e| e.to_string())?
@@ -73,7 +82,9 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
         }
         artifacts.push(json!({"path":path.file_name().and_then(|v|v.to_str()).ok_or("Invalid artifact name.")?, "size_bytes":size, "sha256":sha256}));
     }
-    let adapter_revision = if execution.get("output_policy").is_some() {
+    let adapter_revision = if execution.get("initial_reasoning").is_some() {
+        "apxinf-native-minicpm5-bounded-thinking-v1"
+    } else if execution.get("output_policy").is_some() {
         "apxinf-native-minicpm5-thinking-v1"
     } else if execution.get("sampling").is_some() {
         "apxinf-native-minicpm5-sampled-v1"
@@ -89,6 +100,31 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_thinking_identity_preserves_the_underlying_deployment() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-bounded-thinking-v0.1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            bounded_thinking_execution(16384, 1024, 4194304),
+            corpus["templates"]["ready"]["model_manifest"]["execution"]
+        );
+        let mut bounded = bounded_thinking_execution(16384, 1024, 9000000000);
+        assert_eq!(
+            bounded.as_object_mut().unwrap().remove("initial_reasoning"),
+            Some(
+                json!({"budget_tokens":512,"close_token_id":9,"selection":"cpu-constrained-close-v1"})
+            )
+        );
+        assert_eq!(
+            bounded["output_policy"],
+            "minicpm5-initial-thinking-fixed512-v1"
+        );
+        bounded["output_policy"] = "minicpm5-initial-thinking-v1".into();
+        assert_eq!(bounded, thinking_execution(16384, 1024, 9000000000));
+    }
 
     #[test]
     fn sampled_identity_adds_only_the_declared_policy() {
@@ -143,6 +179,12 @@ mod tests {
             thinking_execution(16384, 1024, 9000000000),
         )
         .unwrap();
+        let bounded = manifest(
+            model,
+            json!({}),
+            bounded_thinking_execution(16384, 1024, 9000000000),
+        )
+        .unwrap();
         assert_eq!(greedy["adapter_revision"], "apxinf-native-minicpm5-v1");
         assert_eq!(
             sampled["adapter_revision"],
@@ -154,6 +196,17 @@ mod tests {
             "apxinf-native-minicpm5-thinking-v1"
         );
         assert_eq!(thinking["artifacts"], sampled["artifacts"]);
+        assert_eq!(
+            bounded["adapter_revision"],
+            "apxinf-native-minicpm5-bounded-thinking-v1"
+        );
+        assert_eq!(bounded["artifacts"], thinking["artifacts"]);
+        assert_ne!(
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &bounded)
+                .unwrap(),
+            crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &thinking)
+                .unwrap()
+        );
         assert_ne!(
             crate::contracts::canonical_identity_digest("apxinf-model-identity-v1", &thinking)
                 .unwrap(),

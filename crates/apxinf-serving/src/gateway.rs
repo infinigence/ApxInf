@@ -84,11 +84,16 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
     if service.model_thinking() {
         body["public_capabilities"]["model_thinking"] = json!("initial_hidden");
     }
+    if service.bounded_thinking() {
+        body["public_capabilities"]["initial_reasoning_budget_tokens"] = json!(512);
+    }
     (status, Json(body)).into_response()
 }
 
 fn public_profile(service: &Service) -> &'static str {
-    if service.model_thinking() {
+    if service.bounded_thinking() {
+        "apxinf-native-bounded-thinking-v0.1"
+    } else if service.model_thinking() {
         "apxinf-native-thinking-v0.1"
     } else if service.sampling_enabled() {
         "apxinf-native-sampled-v0.1"
@@ -876,43 +881,59 @@ mod tests {
 
     #[tokio::test]
     async fn model_thinking_profile_is_distinct_from_extended_thinking() {
-        let (service, mut observed) = crate::supervisor::gateway_test_service_with_protocol(
-            crate::contracts::NATIVE_THINKING_PROTOCOL,
-        );
-        let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
-        value["thinking"] = json!({"type":"disabled"});
-        let error = request_error(service.clone(), value.clone(), Api::Anthropic).await;
-        assert_eq!(error.message, "Test coordinator observed admission.");
-        assert!(matches!(
-            observed.try_recv().unwrap().selection,
-            crate::sampling::Selection::Random { .. }
-        ));
-        for thinking in [
-            json!({"type":"enabled","budget_tokens":1024}),
-            json!({"type":"adaptive"}),
+        for (protocol, profile, budget) in [
+            (
+                crate::contracts::NATIVE_THINKING_PROTOCOL,
+                "apxinf-native-thinking-v0.1",
+                None,
+            ),
+            (
+                crate::contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
+                "apxinf-native-bounded-thinking-v0.1",
+                Some(512),
+            ),
         ] {
-            value["thinking"] = thinking;
+            let (service, mut observed) =
+                crate::supervisor::gateway_test_service_with_protocol(protocol);
+            let mut value = openai_request(json!([{"role":"user","content":"hello"}]));
+            value["thinking"] = json!({"type":"disabled"});
+            let error = request_error(service.clone(), value.clone(), Api::Anthropic).await;
+            assert_eq!(error.message, "Test coordinator observed admission.");
+            assert!(matches!(
+                observed.try_recv().unwrap().selection,
+                crate::sampling::Selection::Random { .. }
+            ));
+            for thinking in [
+                json!({"type":"enabled","budget_tokens":1024}),
+                json!({"type":"adaptive"}),
+            ] {
+                value["thinking"] = thinking;
+                assert_eq!(
+                    request_error(service.clone(), value.clone(), Api::Anthropic)
+                        .await
+                        .code,
+                    "unsupported_feature"
+                );
+                assert!(observed.try_recv().is_err());
+            }
+            let response = ready(State(service.clone())).await;
+            let body = axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["profile"], profile);
             assert_eq!(
-                request_error(service.clone(), value.clone(), Api::Anthropic)
-                    .await
-                    .code,
-                "unsupported_feature"
+                body["public_capabilities"]["initial_reasoning_budget_tokens"].as_u64(),
+                budget
             );
-            assert!(observed.try_recv().is_err());
+            assert_eq!(
+                body["public_capabilities"]["model_thinking"],
+                "initial_hidden"
+            );
+            assert_eq!(body["public_capabilities"]["thinking"], false);
+            assert_eq!(body["public_capabilities"]["sampling"], true);
+            service.shutdown();
         }
-        let response = ready(State(service.clone())).await;
-        let body = axum::body::to_bytes(response.into_body(), 10000)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["profile"], "apxinf-native-thinking-v0.1");
-        assert_eq!(
-            body["public_capabilities"]["model_thinking"],
-            "initial_hidden"
-        );
-        assert_eq!(body["public_capabilities"]["thinking"], false);
-        assert_eq!(body["public_capabilities"]["sampling"], true);
-        service.shutdown();
     }
 
     #[tokio::test]
@@ -923,6 +944,7 @@ mod tests {
             crate::contracts::NATIVE_PROTOCOL,
             crate::contracts::NATIVE_SAMPLED_PROTOCOL,
             crate::contracts::NATIVE_THINKING_PROTOCOL,
+            crate::contracts::NATIVE_BOUNDED_THINKING_PROTOCOL,
         ] {
             let (service, mut observed) =
                 crate::supervisor::gateway_test_service_with_protocol(protocol);

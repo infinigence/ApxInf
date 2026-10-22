@@ -331,7 +331,8 @@ class LifecycleGuardTests(unittest.TestCase):
 
     def test_native_sampling_and_thinking_require_the_selected_provider(self):
         for protocol, provider in (("apxinf-worker/2.2", "native-minicpm5-sampled"),
-                                   ("apxinf-worker/2.3", "native-minicpm5-thinking")):
+                                   ("apxinf-worker/2.3", "native-minicpm5-thinking"),
+                                   ("apxinf-worker/2.4", "native-minicpm5-thinking-bounded")):
             ready = self.readiness()
             ready["worker"]["protocol"] = protocol
             identities = self.identities()
