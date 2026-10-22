@@ -13,6 +13,38 @@ pub enum Selection {
 }
 
 impl Selection {
+    pub(crate) fn validate_vision(self) -> Result<(), ApiError> {
+        self.validate(true)?;
+        if matches!(self, Self::Random { temperature, .. } if temperature < 0.01_f32) {
+            return Err(ApiError::invalid(
+                "Vision temperature must be zero or at least 0.01.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_vision_request(value: &Value) -> Result<Self, ApiError> {
+        if value["temperature"]
+            .as_f64()
+            .is_some_and(|temperature| temperature > 0.0 && temperature < 0.01)
+        {
+            return Err(ApiError::invalid(
+                "Vision temperature must be zero or at least 0.01.",
+            ));
+        }
+        let selection = Self::from_request(value, true)?;
+        selection.validate_vision()?;
+        Ok(selection)
+    }
+
+    pub(crate) fn vision_submission(self, request_id: &str) -> Value {
+        let mut submission = self.submission(request_id);
+        if let Self::Random { temperature, .. } = self {
+            submission["temperature"] = json!((temperature as f64).max(0.01));
+        }
+        submission
+    }
+
     pub(crate) fn validate(self, sampled: bool) -> Result<(), ApiError> {
         if let Self::Random { temperature, top_p } = self {
             if !sampled {
@@ -101,6 +133,34 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_temperature_checks_raw_input_and_serializes_the_inclusive_minimum() {
+        for temperature in [0.009, 0.0099999999, 1e-100] {
+            assert!(Selection::from_vision_request(&json!({"temperature":temperature})).is_err());
+        }
+        let selection = Selection::from_vision_request(&json!({"temperature":0.01})).unwrap();
+        assert!(
+            selection.submission("request")["temperature"]
+                .as_f64()
+                .unwrap()
+                < 0.01
+        );
+        let submission = selection.vision_submission("request");
+        assert_eq!(submission["temperature"].as_f64(), Some(0.01));
+        assert_eq!(submission["seed"], selection.submission("request")["seed"]);
+        assert_eq!(
+            Selection::from_vision_request(&json!({"temperature":0})).unwrap(),
+            Selection::Greedy
+        );
+        assert!(Selection::Random {
+            temperature: 0.009,
+            top_p: 0.95
+        }
+        .validate_vision()
+        .is_err());
+        assert!(Selection::from_request(&json!({"temperature":0.009}), true).is_ok());
+    }
 
     #[test]
     fn explicit_profile_controls_defaults_and_overrides() {

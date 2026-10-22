@@ -9,3 +9,4 @@ pub mod native_identity;
 pub mod owned_media;
 pub mod sampling;
 pub mod supervisor;
+mod vision_identity;
