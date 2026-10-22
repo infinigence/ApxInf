@@ -59,6 +59,9 @@ The [closure comparison with one seed](minicpm-closure-validation-20261023.md) c
 Natural closure exhausts 4096 output tokens.
 Bounded closure yields an extracted SVG that still fails visual review.
 Removing the boundary alone has no demonstrated task-quality benefit in this pair.
+The separate repetition probe reproduces the natural worker before changing its penalty.
+Repetition 1.05 and an 8192-token allowance still produce no initial reasoning closure for the same request and seed.
+A qualified reference generation path remains necessary before attributing this behavior to the model or native execution.
 The current MiniCPM5-2B profile remains text-only and rejects image input.
 A vision model requires a separate declared provider and interface qualification.
 KV reuse remains lower priority than these task gates.
