@@ -1,5 +1,3 @@
-"""Original cross-language conformance cases for the serial worker profile."""
-
 from __future__ import annotations
 
 import copy
@@ -176,7 +174,8 @@ class ServingContractTests(unittest.TestCase):
     def check_event_transcripts(self, corpus):
         for case in corpus["stream_cases"]:
             with self.subTest(case["name"]):
-                tracker = contracts.AttemptTracker(corpus["templates"]["submit"])
+                submit = fixture(case["submit"], corpus) if "submit" in case else corpus["templates"]["submit"]
+                tracker = contracts.AttemptTracker(submit)
                 failure = None
                 for index, selected in enumerate(case["events"]):
                     before = copy.deepcopy(tracker.__dict__)

@@ -1,5 +1,3 @@
-"""Handwritten validators for the serial apxinf-worker/2.0 profile."""
-
 from __future__ import annotations
 
 import hashlib
@@ -653,6 +651,10 @@ class AttemptTracker:
         self.protocol = submit["protocol"]
         self.input_tokens = len(submit["token_ids"])
         self.max_tokens = submit["max_tokens"]
+        self.source_media_bytes = (
+            sum(source["byte_count"] for source in submit["replay"]["media"])
+            if self.protocol == VISION_PROTOCOL else None
+        )
         self.leases = set(submit["capacity_lease_ids"])
         self.next_seq = 0
         self.output_tokens = 0
@@ -686,6 +688,8 @@ class AttemptTracker:
             _require(phase != "rejected" or event["status"] == "failed", "rejection requires failed terminal")
             _require(event["usage"] == {"input_tokens": self.input_tokens, "output_tokens": output}, "terminal usage mismatch")
             _require(event["state_result"]["history_count"] == self.input_tokens + output, "history count mismatch")
+            if self.source_media_bytes is not None:
+                _require(event["metrics"]["source_media_bytes"] == self.source_media_bytes, "terminal source media byte count mismatch")
             _require(output != 0 or event["metrics"]["ttft_ns"] == 0, "empty output must have zero TTFT")
             if event["status"] == "completed" and event["cause"] == "length":
                 _require(output == self.max_tokens, "length completion requires full allowance")
