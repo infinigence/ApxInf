@@ -4,6 +4,8 @@ mod generation;
 mod pending_queue;
 
 #[cfg(test)]
+mod cache_regressions;
+#[cfg(test)]
 mod diagnostic_regressions;
 #[cfg(test)]
 mod fault_regressions;
