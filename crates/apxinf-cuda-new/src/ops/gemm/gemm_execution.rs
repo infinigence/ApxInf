@@ -162,7 +162,10 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     let execution = Rc::new(Execution {
         raw,
         stream: ctx.shared_stream(),
-        _storage: storage,
+        _storage: storage
+            .iter()
+            .map(CudaBuffer::retained_for_execution)
+            .collect(),
         #[cfg(test)]
         summary,
         _not_send: PhantomData,
@@ -180,9 +183,11 @@ pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
     )?;
     execution.stream.set_current_device().map_err(Error::Cuda)?;
     unsafe { status::check(abi::apxinf_gemm_enqueue(execution.raw))? };
-    if crate::workspace::is_capturing()
-        || (crate::workspace::has_active_session() && !crate::workspace::is_preparing_session())
-    {
+    // A prepare traversal builds the session cache but is still ordered on the
+    // same CUDA stream. Synchronizing every prepared GEMM defeats whole-model
+    // preparation; the model synchronizes once at the session boundary before
+    // capture or host observation.
+    if crate::workspace::is_capturing() || crate::workspace::has_active_session() {
         Ok(())
     } else {
         #[cfg(test)]
@@ -259,7 +264,10 @@ pub(crate) fn validate_candidates(
     normalized: &Normalized,
     expected: &[f32],
 ) -> Result<()> {
-    let output_width = if normalized.spec.semantic == super::contracts::Semantic::GemmGeglu as u32 {
+    let output_width = if normalized.spec.semantic == super::contracts::Semantic::GemmGeglu as u32
+        || normalized.spec.semantic
+            == super::contracts::Semantic::GemmSwiGluPairInterleaved256 as u32
+    {
         normalized.spec.n as usize / 2
     } else {
         normalized.spec.n as usize

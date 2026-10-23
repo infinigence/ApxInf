@@ -2,7 +2,7 @@
 //! The caller owns backbone state and chooses how GDN blocks execute.
 use super::blocks::bf16::{expert, upload_u32, BackboneBf16, BackboneState, PlannerBf16};
 use super::{PlanningState, VisionState};
-use crate::qwen_drive::backend::kernels::linear_attention;
+use crate::qwen_drive::backend::ops::linear_attention;
 use crate::qwen_drive::inputs::ExpertConditioning;
 use apxinf_core::{
     NextTokenLogits, Result, RngKey, SamplingBackend, Tensor, TokenSamplingInit,
@@ -19,7 +19,7 @@ pub(crate) struct PlanningInput<'a> {
     pub token_ids: &'a [u32],
     /// Unmasked tokens in `token_ids`. Equal to `token_ids.len()` for an unpadded
     /// prompt, smaller when the caller padded to a fixed width to keep the
-    /// shape-specialised kernels reachable. Everything semantic — the expert's
+    /// shape-specialised ops reachable. Everything semantic — the expert's
     /// scene extent, the planner KV offset, the attention key count — uses this;
     /// buffer shapes use `token_ids.len()`.
     pub prompt_len: usize,

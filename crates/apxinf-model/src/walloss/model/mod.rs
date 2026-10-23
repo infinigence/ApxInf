@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use apxinf_core::{Error, Result, Tensor};
 
-use super::backend::{kernels, transfers, CudaEventTimer, DeviceBuffer, RuntimeBackend};
+use super::backend::{ops, transfers, CudaEventTimer, DeviceBuffer, RuntimeBackend};
 use super::geometry::{DeviceVisionGeometry, RgbViews, VisionGeometry};
 use super::schedule::{sinusoidal_time_embedding, solver_times};
 use super::weights::WallossActionWeights;
@@ -196,7 +196,7 @@ impl WallossModel {
         let image_processor = self.image_processor.as_ref().ok_or_else(|| {
             Error::Other("walloss RGB input requires checkpoint preprocessor_config.json".into())
         })?;
-        kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+        ops::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
             self.backend.context(),
             raw_images,
             patches,
@@ -381,10 +381,10 @@ impl WallossModel {
     }
 }
 
-fn kernel_image_layout(layout: crate::vla::ImageLayout) -> kernels::preprocess::ImageLayout {
+fn kernel_image_layout(layout: crate::vla::ImageLayout) -> ops::preprocess::ImageLayout {
     match layout {
-        crate::vla::ImageLayout::Nhwc => kernels::preprocess::ImageLayout::Nhwc,
-        crate::vla::ImageLayout::Nchw => kernels::preprocess::ImageLayout::Nchw,
+        crate::vla::ImageLayout::Nhwc => ops::preprocess::ImageLayout::Nhwc,
+        crate::vla::ImageLayout::Nchw => ops::preprocess::ImageLayout::Nchw,
     }
 }
 
@@ -392,7 +392,7 @@ fn kernel_image_layout(layout: crate::vla::ImageLayout) -> kernels::preprocess::
 mod tests {
     use apxinf_core::{Backend, DType, Tensor};
 
-    use super::kernels;
+    use super::ops;
     use crate::walloss::backend::{DeviceBuffer, RuntimeBackend};
 
     const VIEWS: usize = 2;
@@ -403,7 +403,7 @@ mod tests {
     const MERGE: usize = 2;
 
     fn preprocess(backend: &RuntimeBackend, input: &DeviceBuffer, output: &Tensor) {
-        kernels::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
+        ops::preprocess::rgb_u8_to_normalized_temporal_merged_patches_bf16(
             backend.context(),
             input,
             output,
@@ -413,7 +413,7 @@ mod tests {
             PATCH,
             TEMPORAL,
             MERGE,
-            kernels::preprocess::ImageLayout::Nhwc,
+            ops::preprocess::ImageLayout::Nhwc,
             1.0 / 255.0,
             [0.481_454_66, 0.457_827_5, 0.408_210_72],
             [0.268_629_55, 0.261_302_6, 0.275_777_1],

@@ -2,7 +2,7 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
-use crate::walloss::backend::{kernels, Context, DeviceBuffer};
+use crate::walloss::backend::{ops, Context, DeviceBuffer};
 use crate::walloss::geometry::DeviceVisionGeometry;
 use crate::walloss::weights::{
     DynamicFp8LinearWeights, WallossActionWeights, WallossDynamicFp8LayerWeights,
@@ -53,7 +53,7 @@ pub(super) trait VisionTowerWeights {
 
 fn linear(context: &Context, input: &Tensor, weights: MatrixRef<'_>) -> Result<Tensor> {
     match weights {
-        MatrixRef::Bf16(weight) => kernels::gemm::bf16(context, input, weight),
+        MatrixRef::Bf16(weight) => ops::gemm::bf16(context, input, weight),
         MatrixRef::DynamicFp8(weight) => dynamic_linear(context, input, weight),
     }
 }
@@ -70,8 +70,8 @@ fn dynamic_linear(
             weight.input_features, input_shape
         )));
     }
-    let padded_input_features = weight.weight.shape().dims()[1];
-    let activation = kernels::quantization::quantize_rows_bf16_e4m3_padded(
+    let padded_input_features = weight.padded_input_features();
+    let activation = ops::quantization::quantize_rows_bf16_e4m3_padded(
         context,
         input,
         padded_input_features,
@@ -81,7 +81,7 @@ fn dynamic_linear(
 
 fn dynamic_linear_prequantized(
     context: &Context,
-    activation: &kernels::quantization::DynamicFp8Tensor,
+    activation: &ops::quantization::DynamicFp8Tensor,
     weight: &DynamicFp8LinearWeights,
     keep_padded_output: bool,
 ) -> Result<Tensor> {
@@ -89,24 +89,27 @@ fn dynamic_linear_prequantized(
     let weight_shape = weight.weight.shape().dims();
     if activation_shape.len() != 2
         || weight_shape.len() != 2
-        || activation_shape[1] != weight_shape[1]
+        || activation_shape[1] != weight_shape[0]
     {
         return Err(Error::Other(format!(
-            "prequantized dynamic FP8 linear shape mismatch: {:?} @ {:?}",
+            "prequantized dynamic FP8 linear shape mismatch: {:?} @ KN {:?}",
             activation_shape, weight_shape
         )));
     }
-    let output = kernels::gemm::gemm_fp8_dynamic_bf16(
+    let output = ops::gemm::gemm_fp8_dynamic_bf16(
         context,
         &activation.values,
         &activation.scales,
         weight.as_kernel_view(),
         None,
     )?;
-    if keep_padded_output {
+    // Most WallOSS projection widths are already 16-aligned. In that case
+    // the GEMM output already has the logical width, and launching a separate
+    // slice/copy kernel only adds graph nodes and replay latency.
+    if keep_padded_output || output.shape().dims()[1] == weight.output_features {
         Ok(output)
     } else {
-        kernels::quantization::slice_columns_bf16(context, &output, weight.output_features)
+        ops::quantization::slice_columns_bf16(context, &output, weight.output_features)
     }
 }
 
@@ -119,16 +122,16 @@ fn qkv_after_rms(
 ) -> Result<Tensor> {
     match weights {
         MatrixRef::Bf16(weight) => {
-            let normalized = kernels::norm::rms_bf16(context, input, norm_weight, eps)?;
-            kernels::gemm::bf16(context, &normalized, weight)
+            let normalized = ops::norm::rms_bf16(context, input, norm_weight, eps)?;
+            ops::gemm::bf16(context, &normalized, weight)
         }
         MatrixRef::DynamicFp8(weight) => {
-            let normalized = kernels::norm::rms_quantize_rows_bf16_e4m3(
+            let normalized = ops::norm::rms_quantize_rows_bf16_e4m3(
                 context,
                 input,
                 norm_weight,
                 eps,
-                weight.weight.shape().dims()[1],
+                weight.padded_input_features(),
             )?;
             dynamic_linear_prequantized(context, &normalized, weight, false)
         }
@@ -144,8 +147,8 @@ fn dynamic_residual_norm(
     post_attention_norm: &Tensor,
     eps: f32,
     output_cols: usize,
-) -> Result<(Tensor, kernels::quantization::DynamicFp8Tensor)> {
-    let fused = kernels::fused::bias_residual_rms_quantize_rows_bf16_e4m3(
+) -> Result<(Tensor, ops::quantization::DynamicFp8Tensor)> {
+    let fused = ops::fused::bias_residual_rms_quantize_rows_bf16_e4m3(
         context,
         projected,
         output_bias,
@@ -163,8 +166,8 @@ fn dynamic_swiglu(
     gate_up_bias: Option<&Tensor>,
     logical_inner: usize,
     output_cols: usize,
-) -> Result<kernels::quantization::DynamicFp8Tensor> {
-    kernels::activation::swiglu_quantize_rows_bf16_e4m3(
+) -> Result<ops::quantization::DynamicFp8Tensor> {
+    ops::activation::swiglu_quantize_rows_bf16_e4m3(
         context,
         gate_up,
         gate_up_bias,
@@ -189,8 +192,8 @@ fn residual_mlp(
 ) -> Result<Tensor> {
     match (output, gate_up, down) {
         (MatrixRef::Bf16(output), MatrixRef::Bf16(gate_up), MatrixRef::Bf16(down)) => {
-            let projected = kernels::gemm::bf16(context, attention, output)?;
-            let fused = kernels::fused::bias_residual_rms_bf16(
+            let projected = ops::gemm::bf16(context, attention, output)?;
+            let fused = ops::fused::bias_residual_rms_bf16(
                 context,
                 &projected,
                 output_bias,
@@ -198,14 +201,14 @@ fn residual_mlp(
                 post_attention_norm,
                 eps,
             )?;
-            let gate_up = kernels::gemm::bf16(context, &fused.normalized, gate_up)?;
+            let gate_up = ops::gemm::bf16(context, &fused.normalized, gate_up)?;
             let gate_up = match gate_up_bias {
-                Some(bias) => kernels::elementwise::bias_bf16(context, &gate_up, Some(bias))?,
+                Some(bias) => ops::elementwise::bias_bf16(context, &gate_up, Some(bias))?,
                 None => gate_up,
             };
-            let activated = kernels::activation::swiglu_bf16(context, &gate_up)?;
-            let down = kernels::gemm::bf16(context, &activated, down)?;
-            kernels::fused::bias_residual_bf16(context, &down, down_bias, &fused.hidden)
+            let activated = ops::activation::swiglu_bf16(context, &gate_up)?;
+            let down = ops::gemm::bf16(context, &activated, down)?;
+            ops::fused::bias_residual_bf16(context, &down, down_bias, &fused.hidden)
         }
         (
             MatrixRef::DynamicFp8(output),
@@ -220,7 +223,7 @@ fn residual_mlp(
                 input,
                 post_attention_norm,
                 eps,
-                gate_up.weight.shape().dims()[1],
+                gate_up.padded_input_features(),
             )?;
             let gate_up_output = dynamic_linear_prequantized(context, &normalized, gate_up, true)?;
             if gate_up.output_features % 2 != 0
@@ -236,14 +239,14 @@ fn residual_mlp(
                 &gate_up_output,
                 gate_up_bias,
                 gate_up.output_features / 2,
-                down.weight.shape().dims()[1],
+                down.padded_input_features(),
             )?;
             let down = dynamic_linear_prequantized(context, &activated, down, false)?;
-            kernels::fused::bias_residual_bf16(context, &down, down_bias, &hidden)
+            ops::fused::bias_residual_bf16(context, &down, down_bias, &hidden)
         }
         (MatrixRef::DynamicFp8(output), MatrixRef::Bf16(gate_up), MatrixRef::Bf16(down)) => {
             let projected = dynamic_linear(context, attention, output)?;
-            let fused = kernels::fused::bias_residual_rms_bf16(
+            let fused = ops::fused::bias_residual_rms_bf16(
                 context,
                 &projected,
                 output_bias,
@@ -251,17 +254,17 @@ fn residual_mlp(
                 post_attention_norm,
                 eps,
             )?;
-            let gate_up = kernels::gemm::bf16(context, &fused.normalized, gate_up)?;
+            let gate_up = ops::gemm::bf16(context, &fused.normalized, gate_up)?;
             let gate_up = match gate_up_bias {
-                Some(bias) => kernels::elementwise::bias_bf16(context, &gate_up, Some(bias))?,
+                Some(bias) => ops::elementwise::bias_bf16(context, &gate_up, Some(bias))?,
                 None => gate_up,
             };
-            let activated = kernels::activation::swiglu_bf16(context, &gate_up)?;
-            let down = kernels::gemm::bf16(context, &activated, down)?;
-            kernels::fused::bias_residual_bf16(context, &down, down_bias, &fused.hidden)
+            let activated = ops::activation::swiglu_bf16(context, &gate_up)?;
+            let down = ops::gemm::bf16(context, &activated, down)?;
+            ops::fused::bias_residual_bf16(context, &down, down_bias, &fused.hidden)
         }
         (MatrixRef::Bf16(output), MatrixRef::DynamicFp8(gate_up), MatrixRef::DynamicFp8(down)) => {
-            let projected = kernels::gemm::bf16(context, attention, output)?;
+            let projected = ops::gemm::bf16(context, attention, output)?;
             let (hidden, normalized) = dynamic_residual_norm(
                 context,
                 &projected,
@@ -269,7 +272,7 @@ fn residual_mlp(
                 input,
                 post_attention_norm,
                 eps,
-                gate_up.weight.shape().dims()[1],
+                gate_up.padded_input_features(),
             )?;
             let gate_up_output = dynamic_linear_prequantized(context, &normalized, gate_up, true)?;
             if gate_up.output_features % 2 != 0
@@ -285,10 +288,10 @@ fn residual_mlp(
                 &gate_up_output,
                 gate_up_bias,
                 gate_up.output_features / 2,
-                down.weight.shape().dims()[1],
+                down.padded_input_features(),
             )?;
             let down = dynamic_linear_prequantized(context, &activated, down, false)?;
-            kernels::fused::bias_residual_bf16(context, &down, down_bias, &hidden)
+            ops::fused::bias_residual_bf16(context, &down, down_bias, &hidden)
         }
         _ => Err(Error::Other(
             "walloss transformer matrix precisions must be uniform within one layer".into(),
@@ -489,9 +492,9 @@ pub(super) fn language_prefix<W: TransformerWeights>(
     tokens: usize,
     cache_tokens: usize,
 ) -> Result<PrefixCache> {
-    let embedded = kernels::embedding::lookup(context, token_embedding, token_ids, tokens)?;
+    let embedded = ops::embedding::lookup(context, token_embedding, token_ids, tokens)?;
     let mut hidden =
-        kernels::elementwise::replace_rows_bf16(context, &embedded, vision_tokens, vision_row_map)?;
+        ops::elementwise::replace_rows_bf16(context, &embedded, vision_tokens, vision_row_map)?;
     let mut keys = Vec::with_capacity(weights.len());
     let mut values = Vec::with_capacity(weights.len());
     for layer in weights {
@@ -524,7 +527,7 @@ fn language_layer<W: TransformerWeights>(
         config.rms_norm_eps,
         weights.qkv(),
     )?;
-    let qkv = kernels::attention::split_gqa_qkv_mrope_cache_bf16(
+    let qkv = ops::attention::split_gqa_qkv_mrope_cache_bf16(
         context,
         &qkv,
         Some(weights.qkv_bias()),
@@ -537,7 +540,7 @@ fn language_layer<W: TransformerWeights>(
         cache_tokens,
         None,
     )?;
-    let attention = kernels::attention::causal_gqa_bf16(context, &qkv.q, &qkv.k, &qkv.v, tokens)?
+    let attention = ops::attention::causal_gqa_bf16(context, &qkv.q, &qkv.k, &qkv.v, tokens)?
         .reshape(vec![tokens, config.num_attention_heads * config.head_dim])?;
     let hidden = residual_mlp(
         context,
@@ -579,7 +582,7 @@ fn action_layer<W: TransformerWeights>(
         config.rms_norm_eps,
         weights.qkv(),
     )?;
-    let qkv = kernels::attention::split_gqa_qkv_mrope_cache_bf16(
+    let qkv = ops::attention::split_gqa_qkv_mrope_cache_bf16(
         context,
         &qkv,
         Some(weights.qkv_bias()),
@@ -593,7 +596,7 @@ fn action_layer<W: TransformerWeights>(
         Some((prefix_key, prefix_value, prefix_tokens)),
     )?;
     let attention =
-        kernels::attention::causal_gqa_bf16(context, &qkv.q, &qkv.k, &qkv.v, cache_tokens)?
+        ops::attention::causal_gqa_bf16(context, &qkv.q, &qkv.k, &qkv.v, cache_tokens)?
             .reshape(vec![
                 action_tokens,
                 config.num_attention_heads * config.head_dim,
@@ -657,10 +660,9 @@ pub(super) fn action_stack<W: TransformerWeights>(
         .map_err(|e| Error::Other(format!("action_layer {index}: {e}")))?
         .hidden;
     }
-    let hidden = kernels::norm::rms_bf16(context, &hidden, final_norm, config.rms_norm_eps)
+    let hidden = ops::norm::rms_bf16(context, &hidden, final_norm, config.rms_norm_eps)
         .map_err(|e| Error::Other(format!("action final rms: {e}")))?;
-    velocity(context, action_weights, &hidden)
-        .map_err(|e| Error::Other(format!("velocity: {e}")))
+    velocity(context, action_weights, &hidden).map_err(|e| Error::Other(format!("velocity: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,7 +686,7 @@ fn vision_layer<W: VisionBlockWeights>(
         config.rms_norm_eps,
         weights.qkv(),
     )?;
-    let qkv = kernels::attention::split_vision_qkv_rope_bf16(
+    let qkv = ops::attention::split_vision_qkv_rope_bf16(
         context,
         &qkv,
         Some(weights.qkv_bias()),
@@ -693,7 +695,7 @@ fn vision_layer<W: VisionBlockWeights>(
         head_dim,
         config.rope_theta,
     )?;
-    let attention = kernels::attention::segmented_mha_bf16(
+    let attention = ops::attention::segmented_mha_bf16(
         context,
         &qkv.q,
         &qkv.k,
@@ -726,7 +728,7 @@ pub(super) fn vision_tower<W: VisionTowerWeights>(
     geometry: &DeviceVisionGeometry,
     patches: &Tensor,
 ) -> Result<Tensor> {
-    let ordered_patches = kernels::elementwise::gather_rows_bf16(
+    let ordered_patches = ops::elementwise::gather_rows_bf16(
         context,
         patches,
         &geometry.patch_order,
@@ -781,15 +783,15 @@ fn vision_merger<W: VisionTowerWeights>(
     }
     let merged_tokens = tokens / merge_unit;
     let normalized =
-        kernels::norm::rms_bf16(context, input, weights.merger_norm(), config.rms_norm_eps)?
+        ops::norm::rms_bf16(context, input, weights.merger_norm(), config.rms_norm_eps)?
             .reshape(vec![merged_tokens, merge_unit * config.hidden_size])?;
     let hidden = linear(context, &normalized, weights.merger_hidden())?;
     let hidden =
-        kernels::activation::bias_gelu_bf16(context, &hidden, Some(weights.merger_hidden_bias()))?;
+        ops::activation::bias_gelu_bf16(context, &hidden, Some(weights.merger_hidden_bias()))?;
     let output = linear(context, &hidden, weights.merger_output())?;
     let output =
-        kernels::elementwise::bias_bf16(context, &output, Some(weights.merger_output_bias()))?;
-    kernels::elementwise::gather_rows_bf16(context, &output, reverse_indices, merged_tokens)
+        ops::elementwise::bias_bf16(context, &output, Some(weights.merger_output_bias()))?;
+    ops::elementwise::gather_rows_bf16(context, &output, reverse_indices, merged_tokens)
 }
 
 pub fn action_embedding(
@@ -806,22 +808,22 @@ pub fn action_embedding(
             dof_mask.shape().dims()
         )));
     }
-    let action = kernels::gemm::bf16(context, noisy_action, &weights.noisy_action_projection)
+    let action = ops::gemm::bf16(context, noisy_action, &weights.noisy_action_projection)
         .map_err(|e| Error::Other(format!("noisy_action_projection gemm: {e}")))?;
-    let mask = kernels::gemm::bf16(context, dof_mask, &weights.dof_projection)
+    let mask = ops::gemm::bf16(context, dof_mask, &weights.dof_projection)
         .map_err(|e| Error::Other(format!("dof_projection gemm: {e}")))?;
-    let action = kernels::elementwise::add(context, &action, &mask)
+    let action = ops::elementwise::add(context, &action, &mask)
         .map_err(|e| Error::Other(format!("action+mask add: {e}")))?;
 
-    let action_part = kernels::gemm::bf16(context, &action, &weights.action_projection)
+    let action_part = ops::gemm::bf16(context, &action, &weights.action_projection)
         .map_err(|e| Error::Other(format!("action_projection gemm: {e}")))?;
-    let time_part = kernels::gemm::bf16(context, time_embedding, &weights.time_projection)
+    let time_part = ops::gemm::bf16(context, time_embedding, &weights.time_projection)
         .map_err(|e| Error::Other(format!("time_projection gemm: {e}")))?;
-    let fused = kernels::elementwise::add(context, &action_part, &time_part)
+    let fused = ops::elementwise::add(context, &action_part, &time_part)
         .map_err(|e| Error::Other(format!("fused add: {e}")))?;
-    let activated = kernels::activation::silu(context, &fused)
+    let activated = ops::activation::silu(context, &fused)
         .map_err(|e| Error::Other(format!("silu: {e}")))?;
-    kernels::gemm::bf16(context, &activated, &weights.action_embedding_projection)
+    ops::gemm::bf16(context, &activated, &weights.action_embedding_projection)
         .map_err(|e| Error::Other(format!("action_embedding_projection gemm: {e}")))
 }
 
@@ -830,7 +832,7 @@ pub fn velocity(
     weights: &WallossActionWeights,
     action_hidden: &Tensor,
 ) -> Result<Tensor> {
-    kernels::gemm::bf16(context, action_hidden, &weights.velocity_projection)
+    ops::gemm::bf16(context, action_hidden, &weights.velocity_projection)
 }
 
 pub fn solver_update(
@@ -839,5 +841,5 @@ pub fn solver_update(
     velocity: &Tensor,
     dt: f32,
 ) -> Result<Tensor> {
-    kernels::elementwise::euler_update_bf16(context, state, velocity, dt)
+    ops::elementwise::euler_update_bf16(context, state, velocity, dt)
 }

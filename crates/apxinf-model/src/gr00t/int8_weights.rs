@@ -1,9 +1,9 @@
 //! W8A8 INT8 GR00T device weights for Orin-class GPUs.
 
-use apxinf_core::{Backend, DType, Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::action_weights::Gr00tLinearWeights;
-use super::backend::{kernels, DeviceBuffer, RuntimeBackend};
+use super::backend::{ops, DeviceBuffer, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
 pub(super) struct Gr00tInt8LinearWeights {
@@ -78,24 +78,24 @@ impl Gr00tInt8LinearWeights {
         Self::from_host(weight, None, backend)
     }
 
-    fn as_kernel_view(&self) -> kernels::gemm::W8A8WeightView<'_> {
-        kernels::gemm::W8A8WeightView {
+    fn as_kernel_view(&self) -> ops::gemm::W8A8WeightView<'_> {
+        ops::gemm::W8A8WeightView {
             values_i8: &self.weight_output_major,
             scales_f32: &self.weight_scales,
             input_dim: self.input_dim,
             output_dim: self.output_dim,
-            scale_mode: kernels::gemm::W8A8ScaleMode::DynamicRowPerOutputChannel,
-            layout: kernels::gemm::W8A8Layout::OutputMajor,
+            scale_mode: ops::gemm::W8A8ScaleMode::DynamicRowPerOutputChannel,
+            layout: ops::gemm::W8A8Layout::OutputMajor,
         }
     }
 }
 
 impl DeviceLinearWeights for Gr00tInt8LinearWeights {
-    type ReusableInput = kernels::gemm::W8A8Activation;
+    type ReusableInput = ops::gemm::W8A8Activation;
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
         if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
-            if let Some(output) = kernels::gemm::try_gemm_w8a8_m41_n6144_k1536(
+            if let Some(output) = ops::gemm::try_gemm_w8a8_m41_n6144_k1536(
                 backend.context(),
                 input,
                 self.as_kernel_view(),
@@ -103,7 +103,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
                 return Ok(output);
             }
         }
-        kernels::gemm::w8a8(backend.context(), input, self.as_kernel_view())
+        ops::gemm::w8a8(backend.context(), input, self.as_kernel_view())
     }
 
     fn bias(&self) -> Option<&Tensor> {
@@ -119,7 +119,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::gemm::quantize_w8a8_activation(
+        Ok(Some(ops::gemm::quantize_w8a8_activation(
             backend.context(),
             input,
         )?))
@@ -131,7 +131,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         bias: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::gemm::bias_gelu_quantize_w8a8_activation(
+        Ok(Some(ops::gemm::bias_gelu_quantize_w8a8_activation(
             backend.context(),
             input,
             bias,
@@ -151,7 +151,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         // Its decomposed/legacy path keeps the measured plain INT8 schedule
         // through an explicit model choice, without changing generic tactics.
         if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
-            if let Some(output) = kernels::gemm::try_gemm_quantized_w8a8_m41_n6144_k1536(
+            if let Some(output) = ops::gemm::try_gemm_quantized_w8a8_m41_n6144_k1536(
                 backend.context(),
                 input,
                 self.as_kernel_view(),
@@ -159,7 +159,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
                 return Ok(output);
             }
         }
-        kernels::gemm::gemm_quantized_w8a8(backend.context(), input, self.as_kernel_view())
+        ops::gemm::gemm_quantized_w8a8(backend.context(), input, self.as_kernel_view())
     }
 
     fn forward_reusable_quantized_bias_gelu_quantized(
@@ -176,7 +176,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         ) {
             return Ok(None);
         }
-        kernels::gemm::try_gemm_quantized_w8a8_bias_gelu_quantized(
+        ops::gemm::try_gemm_quantized_w8a8_bias_gelu_quantized(
             backend.context(),
             input,
             self.as_kernel_view(),
@@ -201,7 +201,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         {
             return Ok(None);
         }
-        kernels::gemm::try_gemm_quantized_w8a8_bias(
+        ops::gemm::try_gemm_quantized_w8a8_bias(
             backend.context(),
             input,
             self.as_kernel_view(),
@@ -219,11 +219,11 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
             && gate.shape().dims() == [156, 6144]
             && std::env::var_os("APXINF_GR00T_W8A8_LEGACY_SILU_MUL_PACKED4").is_none()
         {
-            kernels::gemm::quantize_w8a8_silu_mul_activation_packed4(backend.context(), gate, up)?
+            ops::gemm::quantize_w8a8_silu_mul_activation_packed4(backend.context(), gate, up)?
         } else {
-            kernels::gemm::quantize_w8a8_silu_mul_activation(backend.context(), gate, up)?
+            ops::gemm::quantize_w8a8_silu_mul_activation(backend.context(), gate, up)?
         };
-        Ok(Some(kernels::gemm::gemm_quantized_w8a8(
+        Ok(Some(ops::gemm::gemm_quantized_w8a8(
             backend.context(),
             &activation,
             self.as_kernel_view(),
@@ -245,7 +245,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         {
             return Ok(None);
         }
-        Ok(Some(kernels::fused::bias_then_residual_bf16_packed4(
+        Ok(Some(ops::fused::bias_then_residual_bf16_packed4(
             backend.context(),
             projection,
             bias,
@@ -263,7 +263,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         if backend.context().caps().sm != 87 {
             return Ok(None);
         }
-        let (normalized, quantized) = kernels::gemm::adaptive_layer_norm_quantize_w8a8_activation(
+        let (normalized, quantized) = ops::gemm::adaptive_layer_norm_quantize_w8a8_activation(
             backend.context(),
             input,
             modulation,
@@ -288,7 +288,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         {
             return Ok(None);
         }
-        let (normalized, quantized) = kernels::gemm::layer_norm_quantize_w8a8_activation(
+        let (normalized, quantized) = ops::gemm::layer_norm_quantize_w8a8_activation(
             backend.context(),
             input,
             weight,

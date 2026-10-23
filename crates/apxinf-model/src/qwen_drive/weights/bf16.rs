@@ -1,5 +1,5 @@
 //! BF16 weights and load-time physical layouts.
-use crate::qwen_drive::backend::RuntimeBackend;
+use crate::qwen_drive::backend::{ops, RuntimeBackend};
 use std::collections::HashMap;
 
 use apxinf_core::{Backend, Error, Result, Tensor};
@@ -53,6 +53,20 @@ fn narrow_to_bf16(tensor: &Tensor) -> Result<Tensor> {
 /// Store checkpoint `[out, in]` weights as `[in, out]` for row-major GEMM.
 fn projection(tensor: &Tensor) -> Result<Tensor> {
     transpose_2d(tensor)
+}
+
+/// Materialize cuda-new's candidate-independent `[K,2I]` gate/up encoding,
+/// with each gate256 tile followed by its matching up256 tile.
+fn swiglu_layout_gate_up(_backend: &dyn Backend, gate_up: Tensor) -> Result<Tensor> {
+    let dims = gate_up.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Other(
+            "qwen_drive: gate/up weight must be 2-D".into(),
+        ));
+    }
+    let (full_n, k) = (dims[0], dims[1]);
+    let packed = ops::pack_bf16_swiglu_weight_host(&gate_up.to_f32_vec()?, full_n, k)?;
+    Tensor::from_bf16(vec![k, full_n], &packed)
 }
 
 fn concat_rows_bf16(parts: &[&Tensor]) -> Result<Tensor> {
@@ -339,8 +353,12 @@ impl BackboneDeviceWeights {
             )?;
             let gate = take(&mut language, &format!("{p}.mlp.gate_proj.weight"))?;
             let up_w = take(&mut language, &format!("{p}.mlp.up_proj.weight"))?;
-            // One checkpoint-row-major representation for the fused gate/up operator.
-            let gate_up_w = up(backend, &concat_rows_bf16(&[&gate, &up_w])?)?;
+            // One resident representation serves both the native fused
+            // prefill and the generic variable-row fallback.
+            let gate_up_w = up(
+                backend,
+                &swiglu_layout_gate_up(backend, concat_rows_bf16(&[&gate, &up_w])?)?,
+            )?;
             let down_w = up(
                 backend,
                 &projection(&take(&mut language, &format!("{p}.mlp.down_proj.weight"))?)?,

@@ -22,7 +22,7 @@ use super::backbone::vision_weights::transfer_vision_weights;
 use super::backbone::{
     transfer_text_weights, Qwen3VLConfig, Qwen3VLTextWeights, Qwen3VLVisionWeights,
 };
-use super::backend::{kernels, transfers, DeviceBuffer, RuntimeBackend, TuningMode};
+use super::backend::{ops, transfers, DeviceBuffer, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 use super::geometry::{
     build_backbone_token_groups, dit_attention_source, Gr00tBackboneTokenGroups,
@@ -281,13 +281,13 @@ struct Gr00tRowIndexCache {
     token_count: usize,
     image_rows: Vec<usize>,
     non_image_rows: Vec<usize>,
-    image_indices: kernels::elementwise::PreparedRowIndices,
-    non_image_indices: kernels::elementwise::PreparedRowIndices,
+    image_indices: ops::elementwise::PreparedRowIndices,
+    non_image_indices: ops::elementwise::PreparedRowIndices,
 }
 
 struct Gr00tCapturedGraph {
     graph: Box<dyn Graph>,
-    _workspace: kernels::GraphWorkspace,
+    _workspace: ops::ExecutionSession,
     output: Tensor,
     inputs: Gr00tGraphInputs,
 }
@@ -540,17 +540,6 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             // and selected embodiment tensors. Destroy an obsolete graph
             // before replacing any of those resources.
             drop(self.captured_graph.take());
-            if self.backend.context().tuning().mode() == TuningMode::AutoTune {
-                // Online tuning requires the real request operands and is
-                // intentionally disabled while sizing or capturing a graph.
-                // Traverse once eagerly, just as the shared PI0.5 runtime
-                // does, so every exact GEMM shape is persisted before graph
-                // preparation freezes the selected plans.
-                self.prepare_fixed_inputs(observation, None)?;
-                let tuned_output = self.infer_device(observation)?;
-                self.backend.synchronize()?;
-                drop(tuned_output);
-            }
             match self.capture_graph(observation) {
                 Ok(graph) => {
                     let result = graph.run(observation, &*self.backend, &self.config);
@@ -632,13 +621,13 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             .backbone_row_index_cache
             .as_ref()
             .ok_or_else(|| Error::Other("GR00T row indices were not prepared".into()))?;
-        let non_image_backbone = kernels::elementwise::gather_rows_bf16_prepared(
+        let non_image_backbone = ops::elementwise::gather_rows_bf16_prepared(
             self.backend.context(),
             &backbone,
             &row_indices.non_image_indices,
         )
         .map_err(|error| Error::Other(format!("GR00T non-image gather failed: {error}")))?;
-        let image_backbone = kernels::elementwise::gather_rows_bf16_prepared(
+        let image_backbone = ops::elementwise::gather_rows_bf16_prepared(
             self.backend.context(),
             &backbone,
             &row_indices.image_indices,
@@ -786,12 +775,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 && cache.non_image_rows == token_groups.non_image
         });
         if !row_cache_matches {
-            let image_indices = kernels::elementwise::prepare_row_indices(
+            let image_indices = ops::elementwise::prepare_row_indices(
                 self.backend.context(),
                 &token_groups.image,
                 observation.token_ids.len(),
             )?;
-            let non_image_indices = kernels::elementwise::prepare_row_indices(
+            let non_image_indices = ops::elementwise::prepare_row_indices(
                 self.backend.context(),
                 &token_groups.non_image,
                 observation.token_ids.len(),
@@ -819,12 +808,14 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         inputs: Gr00tGraphInputs,
         device_observation: Gr00tObservation,
     ) -> Result<Gr00tCapturedGraph> {
-        let workspace =
-            kernels::GraphWorkspace::new(INITIAL_GRAPH_WORKSPACE_BYTES, self.backend.device_id())?;
+        let workspace = ops::ExecutionSession::with_capacity(
+            INITIAL_GRAPH_WORKSPACE_BYTES,
+            self.backend.device_id(),
+        )?;
 
         let preflight_start = Instant::now();
         let eager_output =
-            kernels::prepare_with_workspace(&workspace, || self.infer_device(&device_observation))
+            ops::prepare_with_session(&workspace, || self.infer_device(&device_observation))
                 .map_err(|error| Error::Other(format!("whole-graph preflight failed: {error}")))?;
         self.backend.synchronize()?;
         let preflight_seconds = preflight_start.elapsed().as_secs_f64();
@@ -833,7 +824,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         let capture_start = Instant::now();
         self.backend.begin_capture()?;
         let output =
-            match kernels::with_workspace(&workspace, || self.infer_device(&device_observation)) {
+            match ops::with_session(&workspace, || self.infer_device(&device_observation)) {
                 Ok(output) => output,
                 Err(error) => {
                     let _ = self.backend.end_capture();
@@ -922,7 +913,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     let scale = linear
                         .activation_scale()
                         .ok_or_else(|| Error::Other(format!("{name} is not an FP8 linear")))?;
-                    let quantized = kernels::norm::layer_quant_bf16_e4m3(
+                    let quantized = ops::norm::layer_quant_bf16_e4m3(
                         self.backend.context(),
                         input,
                         norm_weight,
@@ -951,7 +942,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 let output_name = format!("{prefix}.fc2");
                 if let Some(linear) = self.backbone_linears.get(&output_name) {
                     if let Some(scale) = linear.activation_scale() {
-                        return kernels::activation::bias_gelu_quant_bf16_e4m3(
+                        return ops::activation::bias_gelu_quant_bf16_e4m3(
                             self.backend.context(),
                             input,
                             bias,
@@ -963,7 +954,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             if use_vision_pointwise_pack
                 && matches!(input.shape().dims(), [512, 4096] | [128, 4096])
             {
-                return kernels::activation::bias_gelu_bf16_packed8(
+                return ops::activation::bias_gelu_bf16_packed8(
                     self.backend.context(),
                     input,
                     bias,
@@ -976,7 +967,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     return Ok(output);
                 }
             }
-            kernels::activation::bias_gelu_bf16(self.backend.context(), input, Some(bias))
+            ops::activation::bias_gelu_bf16(self.backend.context(), input, Some(bias))
         };
         // BF16 explicitly opts into this exact-shape path. The legacy composed
         // path remains in the same ELF for controlled benchmark comparisons.
@@ -994,7 +985,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
              n_heads: usize,
              head_dim: usize| {
                 if use_direct_bf16_vision_segment_output {
-                    return kernels::attention::segmented_noncausal_contiguous_output_bf16(
+                    return ops::attention::segmented_noncausal_contiguous_output_bf16(
                         self.backend.context(),
                         q,
                         k,
@@ -1013,7 +1004,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             if use_fused_vision_concat_quant {
                 if let Some(linear) = self.backbone_linears.get(name) {
                     if let Some(scale) = linear.activation_scale() {
-                        return kernels::quantization::concat_rows_quantize_bf16_e4m3(
+                        return ops::quantization::concat_rows_quantize_bf16_e4m3(
                             self.backend.context(),
                             first,
                             second,
@@ -1042,7 +1033,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 if use_fused_vision_residual_norm_quant {
                     if let Some(linear) = self.backbone_linears.get(name) {
                         if let Some(scale) = linear.activation_scale() {
-                            let fused = kernels::fused::bias_residual_layer_quant_bf16_e4m3(
+                            let fused = ops::fused::bias_residual_layer_quant_bf16_e4m3(
                                 self.backend.context(),
                                 projection,
                                 Some(projection_bias),
@@ -1058,7 +1049,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                         }
                     }
                 }
-                let fused = kernels::fused::bias_residual_layer_bf16(
+                let fused = ops::fused::bias_residual_layer_bf16(
                     self.backend.context(),
                     projection,
                     Some(projection_bias),
@@ -1083,14 +1074,14 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     && projection.shape().dims() == [512, 1024]
                     && std::env::var_os("APXINF_GR00T_LEGACY_VISION_FC2_RESIDUAL").is_none()
                 {
-                    kernels::fused::bias_residual_bf16_packed4(
+                    ops::fused::bias_residual_bf16_packed4(
                         self.backend.context(),
                         projection,
                         bias,
                         residual,
                     )
                 } else {
-                    kernels::fused::bias_residual_bf16(
+                    ops::fused::bias_residual_bf16(
                         self.backend.context(),
                         projection,
                         Some(bias),
@@ -1144,7 +1135,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             .as_ref()
             .ok_or_else(|| Error::Other("GR00T token IDs were not prepared".into()))?
             .1;
-        let embedded = kernels::embedding::lookup(
+        let embedded = ops::embedding::lookup(
             self.backend.context(),
             &self.backbone_text.token_embedding,
             token_buffer,
@@ -1259,7 +1250,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             .ok_or_else(|| {
                 Error::Other(format!("missing GR00T action time embedding {step_index}"))
             })?;
-        action_features = kernels::elementwise::concat_columns_bf16(
+        action_features = ops::elementwise::concat_columns_bf16(
             self.backend.context(),
             &[&action_features, time_features],
         )?;
@@ -1279,7 +1270,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             // positional embedding.
             action_features = self.backend.add(&action_features, position)?;
         }
-        let mut hidden = kernels::elementwise::concat_rows_bf16(
+        let mut hidden = ops::elementwise::concat_rows_bf16(
             self.backend.context(),
             state,
             &action_features,
@@ -1420,7 +1411,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     (normalized, Some(quantized), None)
                 } else {
                     (
-                        kernels::norm::adaptive_layer(
+                        ops::norm::adaptive_layer(
                             self.backend.context(),
                             &hidden,
                             modulation,
@@ -1521,7 +1512,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     normalized_quantized = None;
                 } else {
                     residual = if fuse_attention_bias_residual {
-                        kernels::fused::bias_then_residual_bf16_packed4(
+                        ops::fused::bias_then_residual_bf16_packed4(
                             self.backend.context(),
                             &attention,
                             block.attention.output.bias(),
@@ -1622,18 +1613,18 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 })?;
             normalized
         } else {
-            kernels::norm::adaptive_layer(self.backend.context(), &hidden, output_modulation, 1e-6)?
+            ops::norm::adaptive_layer(self.backend.context(), &hidden, output_modulation, 1e-6)?
         };
         let hidden = linear(&*self.backend, &hidden, &self.action.output_projection)?;
         let decoded = linear_relu(&*self.backend, &hidden, &selected.action_decoder.input)?;
         let decoded = linear(&*self.backend, &decoded, &selected.action_decoder.output)?;
-        let velocity = kernels::elementwise::contiguous_rows(
+        let velocity = ops::elementwise::contiguous_rows(
             self.backend.context(),
             &decoded,
             1,
             self.config.action_horizon,
         )?;
-        kernels::elementwise::euler_update_bf16(
+        ops::elementwise::euler_update_bf16(
             self.backend.context(),
             actions,
             &velocity,
@@ -2069,11 +2060,11 @@ fn linear<L: DeviceLinearWeights>(
     if let Some(output) = weights.packed8_bias(&output, backend)? {
         return Ok(output);
     }
-    kernels::elementwise::bias_bf16(backend.context(), &output, weights.bias())
+    ops::elementwise::bias_bf16(backend.context(), &output, weights.bias())
 }
 
 fn rms_norm(backend: &RuntimeBackend, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    kernels::norm::rms_bf16(backend.context(), input, weight, eps)
+    ops::norm::rms_bf16(backend.context(), input, weight, eps)
 }
 
 fn layer_norm(
@@ -2083,7 +2074,7 @@ fn layer_norm(
     bias: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    kernels::norm::layer_bf16(backend.context(), input, weight, bias, eps)
+    ops::norm::layer_bf16(backend.context(), input, weight, bias, eps)
 }
 
 fn linear_quantized<L: DeviceLinearWeights>(
@@ -2095,7 +2086,7 @@ fn linear_quantized<L: DeviceLinearWeights>(
     if let Some(output) = weights.packed8_bias(&output, backend)? {
         return Ok(output);
     }
-    kernels::elementwise::bias_bf16(backend.context(), &output, weights.bias())
+    ops::elementwise::bias_bf16(backend.context(), &output, weights.bias())
 }
 
 fn linear_relu<L: DeviceLinearWeights>(
@@ -2104,7 +2095,7 @@ fn linear_relu<L: DeviceLinearWeights>(
     weights: &L,
 ) -> Result<Tensor> {
     let output = weights.forward(input, backend)?;
-    kernels::activation::bias_relu_bf16(backend.context(), &output, weights.bias())
+    ops::activation::bias_relu_bf16(backend.context(), &output, weights.bias())
 }
 
 fn linear_silu<L: DeviceLinearWeights>(
@@ -2113,7 +2104,7 @@ fn linear_silu<L: DeviceLinearWeights>(
     weights: &L,
 ) -> Result<Tensor> {
     let output = weights.forward(input, backend)?;
-    kernels::activation::bias_silu_bf16(backend.context(), &output, weights.bias())
+    ops::activation::bias_silu_bf16(backend.context(), &output, weights.bias())
 }
 
 fn linear_gelu<L: DeviceLinearWeights>(
@@ -2125,7 +2116,7 @@ fn linear_gelu<L: DeviceLinearWeights>(
     if let Some(output) = weights.packed8_bias_gelu(&output, backend)? {
         return Ok(output);
     }
-    kernels::activation::bias_gelu_bf16(backend.context(), &output, weights.bias())
+    ops::activation::bias_gelu_bf16(backend.context(), &output, weights.bias())
 }
 
 fn forward_feed_forward<E: Gr00tPrecisionExecution>(
@@ -2137,7 +2128,7 @@ fn forward_feed_forward<E: Gr00tPrecisionExecution>(
     if let Some(output) = weights.output.packed8_bias(&output, backend)? {
         return Ok(output);
     }
-    kernels::elementwise::bias_bf16(backend.context(), &output, weights.output.bias())
+    ops::elementwise::bias_bf16(backend.context(), &output, weights.output.bias())
 }
 
 fn forward_feed_forward_projection<E: Gr00tPrecisionExecution>(
@@ -2195,7 +2186,7 @@ fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecuti
         let hidden = weights
             .input
             .forward_reusable_quantized(quantized, backend)?;
-        kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
+        ops::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
     } else {
         linear_gelu(backend, input, &weights.input)?
     };
@@ -2239,7 +2230,7 @@ fn forward_feed_forward_residual_quantized<E: Gr00tPrecisionExecution>(
     let output = weights
         .output
         .forward_reusable_quantized(&hidden, backend)?;
-    kernels::fused::bias_then_residual_bf16(
+    ops::fused::bias_then_residual_bf16(
         backend.context(),
         &output,
         weights.output.bias(),
@@ -2277,7 +2268,7 @@ fn forward_feed_forward_residual_with_quantized_input<E: Gr00tPrecisionExecution
     )? {
         return Ok(output);
     }
-    kernels::fused::bias_then_residual_bf16(
+    ops::fused::bias_then_residual_bf16(
         backend.context(),
         &output,
         weights.output.bias(),
@@ -2297,7 +2288,7 @@ fn noncausal_attention<E: Gr00tPrecisionExecution>(
         && E::OPTIMIZED_SMS.contains(&backend.context().caps().sm)
         && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
     {
-        if let Some(output) = kernels::attention::noncausal_hdim96_bm64(
+        if let Some(output) = ops::attention::noncausal_hdim96_bm64(
             backend.context(),
             query,
             key,
@@ -2308,7 +2299,7 @@ fn noncausal_attention<E: Gr00tPrecisionExecution>(
             return Ok(output);
         }
     }
-    kernels::attention::noncausal(backend.context(), query, key, value, heads, head_dim)
+    ops::attention::noncausal(backend.context(), query, key, value, heads, head_dim)
 }
 
 fn noncausal_strided_qkv_attention<E: Gr00tPrecisionExecution>(
@@ -2321,7 +2312,7 @@ fn noncausal_strided_qkv_attention<E: Gr00tPrecisionExecution>(
         && E::OPTIMIZED_SMS.contains(&backend.context().caps().sm)
         && std::env::var_os("APXINF_GR00T_LEGACY_FA2_BM64").is_none()
     {
-        if let Some(output) = kernels::attention::noncausal_strided_qkv_hdim96_bm64(
+        if let Some(output) = ops::attention::noncausal_strided_qkv_hdim96_bm64(
             backend.context(),
             qkv,
             heads,
@@ -2330,7 +2321,7 @@ fn noncausal_strided_qkv_attention<E: Gr00tPrecisionExecution>(
             return Ok(output);
         }
     }
-    kernels::attention::noncausal_strided_qkv(backend.context(), qkv, heads, head_dim)
+    ops::attention::noncausal_strided_qkv(backend.context(), qkv, heads, head_dim)
 }
 
 fn forward_attention<E: Gr00tPrecisionExecution>(
@@ -2373,7 +2364,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                         if let Some(output) = fused_qkv.packed8_bias(&projected, backend)? {
                             output
                         } else {
-                            kernels::elementwise::bias_bf16(
+                            ops::elementwise::bias_bf16(
                                 backend.context(),
                                 &projected,
                                 fused_qkv.bias(),
@@ -2386,7 +2377,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
                 let output = if USE_STRIDED_FUSED_QKV_ATTENTION {
                     noncausal_strided_qkv_attention::<E>(backend, &qkv, heads, head_dim)?
                 } else {
-                    let qkv = kernels::attention::split_qkv_bias_bf16(
+                    let qkv = ops::attention::split_qkv_bias_bf16(
                         backend.context(),
                         &qkv,
                         None,
@@ -2436,7 +2427,7 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
         let key = weights.key.forward_reusable_quantized(input, backend)?;
         let value = weights.value.forward_reusable_quantized(input, backend)?;
         let (query, key, value) =
-            kernels::elementwise::bias_qkv_in_place_bf16(
+            ops::elementwise::bias_qkv_in_place_bf16(
                 backend.context(),
                 query,
                 key,
@@ -2668,7 +2659,13 @@ fn qwen_matmul<L: DeviceLinearWeights>(
         return weights.forward(input, backend);
     }
     super::calibration::observe(name, input)?;
-    kernels::gemm::bf16(backend.context(), input, bf16_weight)
+    let direct_vision_fc2 = name.starts_with("backbone.vision.blocks.") && name.ends_with(".fc2");
+    let direct_text_value = name.starts_with("backbone.text.") && name.ends_with(".value");
+    if direct_text_value || direct_vision_fc2 {
+        ops::gemm::bf16_direct(backend.context(), input, bf16_weight)
+    } else {
+        ops::gemm::bf16(backend.context(), input, bf16_weight)
+    }
 }
 
 fn forward_qwen_layer<L: DeviceLinearWeights>(
@@ -2710,7 +2707,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
     let shared_qkv_input = shared_qkv
         .map(|((query, _), _)| {
             if fused_qkv_norm {
-                kernels::norm::rms_quant_bf16_e4m3(
+                ops::norm::rms_quant_bf16_e4m3(
                     backend.context(),
                     input,
                     &layer.attn_norm_weight,
@@ -2796,7 +2793,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             text.n_kv_heads,
             legacy_threads,
         );
-        kernels::rope::rms_norm_apply_mrope_qk_with_block_threads(
+        ops::rope::rms_norm_apply_mrope_qk_with_block_threads(
             backend.context(),
             &query,
             &layer.q_norm_weight,
@@ -2817,7 +2814,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             .reshape(vec![sequence_len, text.n_heads, text.head_dim])?;
         let key = rms_norm(backend, &key, &layer.k_norm_weight, text.rms_norm_eps)?
             .reshape(vec![sequence_len, text.n_kv_heads, text.head_dim])?;
-        let query = kernels::rope::apply_mrope(
+        let query = ops::rope::apply_mrope(
             backend.context(),
             &query,
             text.n_heads,
@@ -2826,7 +2823,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             text.mrope_section,
             position_ids,
         )?;
-        let key = kernels::rope::apply_mrope(
+        let key = ops::rope::apply_mrope(
             backend.context(),
             &key,
             text.n_kv_heads,
@@ -2838,7 +2835,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         (query, key)
     };
     let attention =
-        kernels::attention::causal_gqa_prefill_bf16(backend.context(), &query, &key, &value)?
+        ops::attention::causal_gqa_prefill_bf16(backend.context(), &query, &key, &value)?
             .ok_or_else(|| {
                 Error::Other(
                     "GR00T Qwen prefill requires the in-tree BF16 causal GQA attention backend"
@@ -2931,7 +2928,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         .get(&down_name)
         .filter(|down| down.activation_scale().is_some())
     {
-        let gated = kernels::activation::silu_mul_quant_bf16_e4m3(
+        let gated = ops::activation::silu_mul_quant_bf16_e4m3(
             backend.context(),
             &gate,
             &up,
@@ -2951,7 +2948,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
             output
         } else {
             let gated = if USE_FUSED_BF16_SILU_MUL {
-                kernels::activation::silu_mul_bf16(backend.context(), &gate, &up)?
+                ops::activation::silu_mul_bf16(backend.context(), &gate, &up)?
             } else {
                 let gate = backend.silu(&gate)?;
                 backend.mul(&gate, &up)?
@@ -3058,9 +3055,9 @@ fn scatter_rows(
     destination: &Tensor,
     source: &Tensor,
     add: bool,
-    indices: &kernels::elementwise::PreparedRowIndices,
+    indices: &ops::elementwise::PreparedRowIndices,
 ) -> Result<Tensor> {
-    kernels::elementwise::scatter_rows_bf16_prepared(
+    ops::elementwise::scatter_rows_bf16_prepared(
         backend.context(),
         destination,
         indices,

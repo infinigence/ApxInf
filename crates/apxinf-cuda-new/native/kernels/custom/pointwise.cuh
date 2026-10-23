@@ -48,6 +48,7 @@ enum Activation : int {
   kActivationGelu = 1,
   kActivationSilu = 2,
   kActivationGeluExact = 3,
+  kActivationRelu = 4,
 };
 
 __device__ __forceinline__ float apply_activation(float value, int activation) {
@@ -56,6 +57,7 @@ __device__ __forceinline__ float apply_activation(float value, int activation) {
   if (activation == kActivationGeluExact) {
     return 0.5f * value * (1.0f + erff(value * 0.7071067811865475f));
   }
+  if (activation == kActivationRelu) return fmaxf(value, 0.0f);
   return value;
 }
 

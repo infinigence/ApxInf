@@ -11,19 +11,18 @@
 //!    token_embedding (cached at model load), passed via
 //!    `Qwen3VLDecodeGraphWeights::lm_head`.
 //!
-//! CUDA + bf16 only. Uses the same fused kernels as Llama:
+//! CUDA + bf16 only. Uses the same fused ops as Llama:
 //! flash_attn_decode_bf16, rms_norm_add_bf16, silu_mul_bf16, plus
 //! rope_mrope_decode_bf16 for the mRoPE step. Cannot use rope_k_write_bf16
 //! (K goes through QK-norm first, so RoPE can't fuse with cache write).
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, Shape, Tensor};
+use apxinf_core::{Backend as _, DType, Error, Graph, KvCache, Result, Shape, Tensor};
 
-use crate::accelerator::cuda::{
-    kernels, Context as CudaContext, DeviceAddress,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer,
-    RuntimeBackend as CudaBackend,
+use apxinf_cuda_new::{
+    ops, CudaBuffer, CudaContext, CudaDeviceAddress as DeviceAddress,
+    CudaKvCache as CudaKVCache, CudaNewBackend as CudaBackend, HostMappedBuffer,
 };
 
 // ── Config + weight views ────────────────────────────────────────────────
@@ -194,7 +193,7 @@ fn decode_forward_capturable(
 
     // Embedding lookup
     let token_embedding = weight_view(weights.token_embedding, device_id)?;
-    kernels::embedding::lookup_into(
+    ops::embedding::lookup_into(
         ctx,
         dtype,
         &token_embedding,
@@ -207,7 +206,7 @@ fn decode_forward_capturable(
     // Layer 0 pre-attention norm (standalone). Subsequent layers' pre-attn
     // norms are fused into the previous layer's post-FFN rms_norm_add.
     let first_norm = weight_view(weights.layers[0].attn_norm_weight, device_id)?;
-    kernels::norm::rms_into(
+    ops::norm::rms_into(
         ctx,
         dtype,
         &ws.x,
@@ -224,7 +223,7 @@ fn decode_forward_capturable(
             let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
             let qkv_wv = weight_view(qkv_w, device_id)?;
             let fused_n = q_dim + 2 * kv_proj;
-            kernels::gemm::write(ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv)
+            ops::gemm::write(ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv)
                 ?;
             (
                 ws.qkv.view(0, q_dim * elem).map_err(Error::Cuda)?,
@@ -238,9 +237,9 @@ fn decode_forward_capturable(
             let wq_v = weight_view(layer.wq, device_id)?;
             let wk_v = weight_view(layer.wk, device_id)?;
             let wv_v = weight_view(layer.wv, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, q_dim, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v)?;
+            ops::gemm::write(ctx, dtype, 1, q_dim, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
+            ops::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k)?;
+            ops::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v)?;
             (
                 ws.q.view(0, ws.q.len()).map_err(Error::Cuda)?,
                 ws.k.view(0, ws.k.len()).map_err(Error::Cuda)?,
@@ -254,7 +253,7 @@ fn decode_forward_capturable(
         // the head_dim-length weight per row. Output to ws.q_normed / ws.k_normed.
         let q_norm_weight = weight_view(layer.q_norm_weight, device_id)?;
         let k_norm_weight = weight_view(layer.k_norm_weight, device_id)?;
-        kernels::norm::rms_into(
+        ops::norm::rms_into(
             ctx,
             dtype,
             &q_view,
@@ -264,7 +263,7 @@ fn decode_forward_capturable(
             n_heads,
             cfg.rms_norm_eps,
         )?;
-        kernels::norm::rms_into(
+        ops::norm::rms_into(
             ctx,
             dtype,
             &k_view,
@@ -277,7 +276,7 @@ fn decode_forward_capturable(
 
         // ── mRoPE on Q and K ──
         // sections is [T, H, W] but the kernel takes sec_h, sec_w (T is implicit).
-        kernels::rope::apply_mrope_bf16_into(
+        ops::rope::apply_mrope_bf16_into(
             ctx,
             &ws.q_normed,
             &ws.q_rope,
@@ -288,7 +287,7 @@ fn decode_forward_capturable(
             cfg.mrope_section[1],
             cfg.mrope_section[2],
         )?;
-        kernels::rope::apply_mrope_bf16_into(
+        ops::rope::apply_mrope_bf16_into(
             ctx,
             &ws.k_normed,
             &ws.k_rope,
@@ -329,7 +328,7 @@ fn decode_forward_capturable(
         // I'll extend the workspace with `cache_pos_buf`.
         // (See DecodeGraph::decode below for how the caller populates it.)
         let cache_position = cache_pos_view(ws)?;
-        kernels::cache::append_at(
+        ops::cache::append_at(
             ctx,
             dtype,
             cache.k_buffer(i),
@@ -339,7 +338,7 @@ fn decode_forward_capturable(
             max_seq,
             cache_position,
         )?;
-        kernels::cache::append_at(
+        ops::cache::append_at(
             ctx,
             dtype,
             cache.v_buffer(i),
@@ -351,7 +350,7 @@ fn decode_forward_capturable(
         )?;
 
         // ── Flash Attention decode ──
-        kernels::attention::flash_bf16_into(
+        ops::attention::flash_bf16_into(
             ctx,
             &ws.q_rope,
             cache.k_buffer(i),
@@ -371,11 +370,11 @@ fn decode_forward_capturable(
         // always hidden_size (Qwen3-VL-4B: 32*128=4096 vs hidden 2560).
         let ao_view = ws.attn_out.view(0, q_dim * elem).map_err(Error::Cuda)?;
         let wo_v = weight_view(layer.wo, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, q_dim, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
+        ops::gemm::write(ctx, dtype, 1, hidden, q_dim, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
 
         // ── Fused post-attn residual add + pre-FFN norm ──
         let ffn_norm_weight = weight_view(layer.ffn_norm_weight, device_id)?;
-        kernels::norm::residual_add_rms_bf16_into(
+        ops::norm::residual_add_rms_bf16_into(
             ctx,
             &ws.x,
             &ws.attn_proj,
@@ -390,9 +389,9 @@ fn decode_forward_capturable(
         let fn_view = ws.ffn_norm_out.view(0, ws.ffn_norm_out.len()).map_err(Error::Cuda)?;
         if let Some(gate_up_w) = layer.gate_up_packed {
             let gu_wv = weight_view(gate_up_w, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, 2 * inter, hidden, 1.0, &fn_view, &gu_wv, 0.0, &ws.gate_up)
+            ops::gemm::write(ctx, dtype, 1, 2 * inter, hidden, 1.0, &fn_view, &gu_wv, 0.0, &ws.gate_up)
                 ?;
-            kernels::activation::silu_mul_bf16_into(ctx, &ws.gate_up, &ws.mlp_hidden, inter)?;
+            ops::activation::silu_mul_bf16_into(ctx, &ws.gate_up, &ws.mlp_hidden, inter)?;
         } else {
             // Fallback path: separate gate/up GEMMs + silu + mul. We don't
             // have a dedicated `ws.gate` in the Qwen3-VL workspace (packed is
@@ -403,7 +402,7 @@ fn decode_forward_capturable(
         // ── down GEMM ──
         let mh_view = ws.mlp_hidden.view(0, ws.mlp_hidden.len()).map_err(Error::Cuda)?;
         let wd_v = weight_view(layer.w_down, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, inter, 1.0, &mh_view, &wd_v, 0.0, &ws.mlp_out)?;
+        ops::gemm::write(ctx, dtype, 1, hidden, inter, 1.0, &mh_view, &wd_v, 0.0, &ws.mlp_out)?;
 
         // ── Fused post-FFN residual add + next layer's pre-attn norm
         //    (or the final output norm for the last layer) ──
@@ -413,7 +412,7 @@ fn decode_forward_capturable(
             weights.output_norm_weight
         };
         let next_norm_weight = weight_view(next_norm_w, device_id)?;
-        kernels::norm::residual_add_rms_bf16_into(
+        ops::norm::residual_add_rms_bf16_into(
             ctx,
             &ws.x,
             &ws.mlp_out,
@@ -429,7 +428,7 @@ fn decode_forward_capturable(
     //    token_embedding, passed in Qwen3VLDecodeGraphWeights) ──
     let no_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
     let lm_v = weight_view(weights.lm_head, device_id)?;
-    kernels::gemm::write(ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &lm_v, 0.0, &ws.logits)?;
+    ops::gemm::write(ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &lm_v, 0.0, &ws.logits)?;
 
     Ok(())
 }
@@ -498,7 +497,7 @@ impl Qwen3VLDecodeGraph {
             backend.synchronize()?;
             let logits = device_logits(&self.workspace, vocab)?;
 
-            backend.begin_capture_relaxed()?;
+            backend.begin_capture()?;
             let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
             let graph = backend.end_capture()?;
             cap_res?;

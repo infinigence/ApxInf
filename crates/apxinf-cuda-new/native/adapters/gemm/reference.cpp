@@ -151,7 +151,9 @@ void validate_candidates(const Spec& spec,
                          int device, const float* expected,
                          size_t expected_len) {
   const size_t count = static_cast<size_t>(
-      spec.m * (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
+      spec.m * ((spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+                 spec.semantic ==
+                     APXINF_GEMM_SEMANTIC_GEMM_SWIGLU_PAIR_INTERLEAVED_256)
                     ? spec.n / 2
                     : spec.n));
   if (expected == nullptr || expected_len != count) {

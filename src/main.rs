@@ -880,10 +880,8 @@ fn run_test() {
 #[cfg(feature = "cuda")]
 fn cuda_test() {
     use apxinf_core::Tensor;
-    use apxinf_cuda::{
-        kernels::{activation, attention, elementwise, gemm, norm, rope},
-        transfers, CudaContext,
-    };
+    use apxinf_cuda_new::{transfers, CudaContext};
+    use half::bf16;
 
     let ctx = match CudaContext::new(0) {
         Ok(ctx) => ctx,
@@ -894,74 +892,41 @@ fn cuda_test() {
     };
     println!("[CUDA] Device: {}", ctx.device_id());
 
-    // Matmul test
-    let a = Tensor::from_f32(vec![2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-    let b = Tensor::from_f32(vec![3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-
+    // BF16 matmul smoke through the cuda-new kernel surface.
+    let to_bf16 = |values: &[f32]| values.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>();
+    let a = Tensor::from_bf16(vec![2, 3], &to_bf16(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])).unwrap();
+    let b = Tensor::from_bf16(vec![3, 2], &to_bf16(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0])).unwrap();
     let a_gpu = transfers::to_cuda(&a, 0).unwrap();
     let b_gpu = transfers::to_cuda(&b, 0).unwrap();
-
-    let c_gpu = gemm::matmul(&ctx, &a_gpu, &b_gpu).unwrap();
+    let c_gpu = apxinf_cuda_new::kernels::gemm::matmul(&ctx, &a_gpu, &b_gpu).unwrap();
     let c_cpu = transfers::to_cpu(&c_gpu).unwrap();
-    let data = c_cpu.as_f32().unwrap();
-    println!("[CUDA] matmul: {:?}", data);
+    println!("[CUDA] matmul (bf16): {:?}", c_cpu.as_f32().unwrap());
 
-    // SiLU test
-    let x = Tensor::from_f32(vec![4], &[1.0, -1.0, 0.0, 2.0]).unwrap();
+    // SiLU
+    let x = Tensor::from_bf16(vec![1, 4], &to_bf16(&[1.0, -1.0, 0.0, 2.0])).unwrap();
     let x_gpu = transfers::to_cuda(&x, 0).unwrap();
-    let silu_gpu = activation::silu(&ctx, &x_gpu).unwrap();
+    let silu_gpu = apxinf_cuda_new::kernels::activation::silu(&ctx, &x_gpu).unwrap();
     let silu_cpu = transfers::to_cpu(&silu_gpu).unwrap();
-    let silu_data = silu_cpu.as_f32().unwrap();
-    let _silu_expected: Vec<f32> = [1.0f32, -1.0, 0.0, 2.0]
-        .iter()
-        .map(|x| x / (1.0 + (-x).exp()))
-        .collect();
-    println!("[CUDA] silu: {:?}", silu_data);
+    println!("[CUDA] silu: {:?}", silu_cpu.as_f32().unwrap());
 
-    // Add test
-    let a2 = Tensor::from_f32(vec![4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
-    let b2 = Tensor::from_f32(vec![4], &[5.0, 6.0, 7.0, 8.0]).unwrap();
+    // Add
+    let a2 = Tensor::from_bf16(vec![1, 4], &to_bf16(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    let b2 = Tensor::from_bf16(vec![1, 4], &to_bf16(&[5.0, 6.0, 7.0, 8.0])).unwrap();
     let a2_gpu = transfers::to_cuda(&a2, 0).unwrap();
     let b2_gpu = transfers::to_cuda(&b2, 0).unwrap();
-    let add_gpu = elementwise::add(&ctx, &a2_gpu, &b2_gpu).unwrap();
+    let add_gpu = apxinf_cuda_new::kernels::elementwise::add(&ctx, &a2_gpu, &b2_gpu).unwrap();
     let add_cpu = transfers::to_cpu(&add_gpu).unwrap();
     println!("[CUDA] add: {:?}", add_cpu.as_f32().unwrap());
 
-    // Mul test
-    let mul_gpu = elementwise::mul(&ctx, &a2_gpu, &b2_gpu).unwrap();
-    let mul_cpu = transfers::to_cpu(&mul_gpu).unwrap();
-    println!("[CUDA] mul: {:?}", mul_cpu.as_f32().unwrap());
-
-    // RMSNorm test
-    let input = Tensor::from_f32(vec![1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
-    let weight = Tensor::from_f32(vec![4], &[1.0, 1.0, 1.0, 1.0]).unwrap();
+    // RMSNorm
+    let input = Tensor::from_bf16(vec![1, 4], &to_bf16(&[1.0, 2.0, 3.0, 4.0])).unwrap();
+    let weight = Tensor::from_bf16(vec![4], &to_bf16(&[1.0, 1.0, 1.0, 1.0])).unwrap();
     let input_gpu = transfers::to_cuda(&input, 0).unwrap();
     let weight_gpu = transfers::to_cuda(&weight, 0).unwrap();
-    let norm_gpu = norm::rms(&ctx, &input_gpu, &weight_gpu, 1e-5).unwrap();
+    let norm_gpu =
+        apxinf_cuda_new::kernels::norm::rms_bf16(&ctx, &input_gpu, &weight_gpu, 1e-5).unwrap();
     let norm_cpu = transfers::to_cpu(&norm_gpu).unwrap();
     println!("[CUDA] rms_norm: {:?}", norm_cpu.as_f32().unwrap());
-
-    // Softmax test
-    let sm_input = Tensor::from_f32(vec![1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
-    let sm_gpu = transfers::to_cuda(&sm_input, 0).unwrap();
-    let softmax_gpu = attention::softmax(&ctx, &sm_gpu).unwrap();
-    let softmax_cpu = transfers::to_cpu(&softmax_gpu).unwrap();
-    println!("[CUDA] softmax: {:?}", softmax_cpu.as_f32().unwrap());
-
-    // RoPE test
-    let rope_input =
-        Tensor::from_f32(vec![2, 4], &[1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0]).unwrap();
-    let rope_gpu = transfers::to_cuda(&rope_input, 0).unwrap();
-    let rope_out = rope::apply(&ctx, &rope_gpu, 2, 4, 10000.0, 0).unwrap();
-    let rope_cpu = transfers::to_cpu(&rope_out).unwrap();
-    println!("[CUDA] rope: {:?}", rope_cpu.as_f32().unwrap());
-
-    // Causal mask test
-    let mask_input = Tensor::from_f32(vec![2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-    let mask_gpu = transfers::to_cuda(&mask_input, 0).unwrap();
-    let mask_out = attention::causal_mask(&ctx, &mask_gpu, 0).unwrap();
-    let mask_cpu = transfers::to_cpu(&mask_out).unwrap();
-    println!("[CUDA] causal_mask: {:?}", mask_cpu.as_f32().unwrap());
 
     println!("[CUDA] All kernel tests completed.");
 }

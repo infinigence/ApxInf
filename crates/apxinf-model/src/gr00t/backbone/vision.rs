@@ -13,7 +13,7 @@
 use apxinf_core::{Backend, Error, Result, Tensor};
 
 #[cfg(feature = "cuda")]
-use super::super::backend::{kernels, CudaBackend, DeviceBuffer};
+use super::super::backend::{ops, CudaBackend, DeviceBuffer};
 use super::config::Qwen3VLConfig;
 use super::vision_weights::Qwen3VLVisionWeights;
 
@@ -58,7 +58,7 @@ fn fused_vision_mlp_residual_norm_shape_supported(
 fn add_bias(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        return kernels::elementwise::bias_bf16(cuda.context(), input, Some(bias));
+        return ops::elementwise::bias_bf16(cuda.context(), input, Some(bias));
     }
     b.add_bias(input, bias)
 }
@@ -72,7 +72,7 @@ fn layer_norm(
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        return kernels::norm::layer_bf16(cuda.context(), input, weight, bias, eps);
+        return ops::norm::layer_bf16(cuda.context(), input, weight, bias, eps);
     }
     b.layer_norm(input, weight, bias, eps)
 }
@@ -88,7 +88,7 @@ fn vision_attention(
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        return kernels::attention::noncausal(cuda.context(), query, key, value, n_heads, head_dim);
+        return ops::attention::noncausal(cuda.context(), query, key, value, n_heads, head_dim);
     }
     b.vision_sdpa(query, key, value, sequence_len, n_heads, head_dim)
 }
@@ -132,7 +132,7 @@ pub(crate) fn prepare_positions(
                 .as_any()
                 .downcast_ref::<CudaBackend>()
                 .ok_or_else(|| Error::Other("Qwen3-VL CUDA position/backend mismatch".into()))?;
-            let table = kernels::rope::prepare_vision_2d_rotation_table(
+            let table = ops::rope::prepare_vision_2d_rotation_table(
                 cuda.context(),
                 position_ids.len() / 2,
                 cfg.vision.head_dim(),
@@ -385,7 +385,7 @@ fn forward_impl(
                                     && n_heads == 16
                                     && head_dim == 64
                                 {
-                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed_vec2(
+                                    ops::rope::split_qkv_bias_apply_vision_2d_precomputed_vec2(
                                         cuda.context(),
                                         &qkv,
                                         &blk.qkv_b,
@@ -394,7 +394,7 @@ fn forward_impl(
                                         rotation_table,
                                     )
                                 } else {
-                                    kernels::rope::split_qkv_bias_apply_vision_2d_precomputed(
+                                    ops::rope::split_qkv_bias_apply_vision_2d_precomputed(
                                         cuda.context(),
                                         &qkv,
                                         &blk.qkv_b,
@@ -404,7 +404,7 @@ fn forward_impl(
                                     )
                                 }
                             }
-                            _ => kernels::rope::split_qkv_bias_apply_vision_2d(
+                            _ => ops::rope::split_qkv_bias_apply_vision_2d(
                                 cuda.context(),
                                 &qkv,
                                 &blk.qkv_b,
@@ -685,7 +685,7 @@ fn merge_deepstack(
 fn apply_bias_gelu(b: &dyn Backend, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        return kernels::activation::bias_gelu_bf16(cuda.context(), input, Some(bias));
+        return ops::activation::bias_gelu_bf16(cuda.context(), input, Some(bias));
     }
 
     let biased = add_bias(b, input, bias)?;
@@ -713,7 +713,7 @@ fn apply_bias_residual(
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        return kernels::fused::bias_residual_bf16(
+        return ops::fused::bias_residual_bf16(
             cuda.context(),
             projection,
             Some(bias),
@@ -753,7 +753,7 @@ fn apply_bias_residual_layer_norm(
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
         let fused = if use_cached_1024 {
-            kernels::fused::bias_residual_layer_bf16_cached_1024(
+            ops::fused::bias_residual_layer_bf16_cached_1024(
                 cuda.context(),
                 projection,
                 Some(projection_bias),
@@ -763,7 +763,7 @@ fn apply_bias_residual_layer_norm(
                 eps,
             )?
         } else {
-            kernels::fused::bias_residual_layer_bf16(
+            ops::fused::bias_residual_layer_bf16(
                 cuda.context(),
                 projection,
                 Some(projection_bias),
@@ -857,7 +857,7 @@ fn split_vision_qkv(
 ) -> Result<(Tensor, Tensor, Tensor)> {
     #[cfg(feature = "cuda")]
     if let Some(cuda) = b.as_any().downcast_ref::<CudaBackend>() {
-        let split = kernels::attention::split_qkv_bias_bf16(
+        let split = ops::attention::split_qkv_bias_bf16(
             cuda.context(),
             qkv,
             Some(bias),
@@ -933,7 +933,7 @@ fn apply_vision_rope_pair(
             .as_any()
             .downcast_ref::<CudaBackend>()
             .ok_or_else(|| Error::Other("Qwen3-VL CUDA position/backend mismatch".into()))?;
-        return kernels::rope::apply_vision_2d_pair(
+        return ops::rope::apply_vision_2d_pair(
             cuda.context(),
             q,
             k,
@@ -1035,7 +1035,7 @@ fn segmented_vision_sdpa(
             && head_dim == 64
             && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
         {
-            if let Some(output) = kernels::attention::try_noncausal_batched_equal(
+            if let Some(output) = ops::attention::try_noncausal_batched_equal(
                 cuda.context(),
                 q,
                 k,
@@ -1056,13 +1056,13 @@ fn segmented_vision_sdpa(
         for &row_count in segment_lengths {
             let shape = vec![row_count, n_heads, head_dim];
             let q_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &q, first_row, row_count)?
+                ops::elementwise::contiguous_rows(cuda.context(), &q, first_row, row_count)?
                     .reshape(shape.clone())?;
             let k_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &k, first_row, row_count)?
+                ops::elementwise::contiguous_rows(cuda.context(), &k, first_row, row_count)?
                     .reshape(shape.clone())?;
             let v_segment =
-                kernels::elementwise::contiguous_rows(cuda.context(), &v, first_row, row_count)?
+                ops::elementwise::contiguous_rows(cuda.context(), &v, first_row, row_count)?
                     .reshape(shape)?;
             segments.push(vision_attention(
                 b, &q_segment, &k_segment, &v_segment, row_count, n_heads, head_dim,
@@ -1080,7 +1080,7 @@ fn segmented_vision_sdpa(
         }
         let mut output = segments.remove(0);
         for segment in segments {
-            output = kernels::elementwise::concat_rows_bf16(cuda.context(), &output, &segment)?;
+            output = ops::elementwise::concat_rows_bf16(cuda.context(), &output, &segment)?;
         }
         return Ok(output);
     }

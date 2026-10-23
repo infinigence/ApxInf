@@ -459,11 +459,9 @@ fn e4m3_value(code: u8) -> f32 {
 /// `fp8_unit_scale_bf16_output_does_not_round_through_f16` also runs
 /// `validate_candidates`, but at M=1, K=16, N=16 -- one tile, one K iteration,
 /// and a single output row. A mainloop or epilogue that indexes wrongly
-/// across tiles passes that and fails here. This matters because the CUTLASS
-/// FP8 candidate accepts BF16 outputs, which is every projection in the
-/// Qwen3.8 checkpoint, and `validate_candidates` rejects an implementation
-/// that has no executable configuration -- so this also proves the candidate
-/// is genuinely reached rather than silently skipped.
+/// across tiles passes that and fails here. The translated CUTLASS FP8 kernel
+/// deliberately remains F16-only: its BF16 template is not production-safe,
+/// so BF16 projections must stay on the validated vendor candidates.
 #[test]
 fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     let ctx = CudaContext::new(0).unwrap();
@@ -471,8 +469,12 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // A spread of finite E4M3 codes. Constant operands would hide an indexing
     // fault, because every element of the result would be identical.
     const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
-    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
-    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a_codes: Vec<u8> = (0..m * k)
+        .map(|i| CODES[(i * 7 + 1) % CODES.len()])
+        .collect();
+    let b_codes: Vec<u8> = (0..k * n)
+        .map(|i| CODES[(i * 5 + 3) % CODES.len()])
+        .collect();
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
@@ -484,8 +486,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
         for column in 0..n {
             let mut accumulator = 0.0f32;
             for index in 0..k {
-                accumulator += e4m3_value(a_codes[row * k + index])
-                    * e4m3_value(b_codes[index * n + column]);
+                accumulator +=
+                    e4m3_value(a_codes[row * k + index]) * e4m3_value(b_codes[index * n + column]);
             }
             expected[row * n + column] = accumulator * alpha;
         }
@@ -493,7 +495,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // Guard the magnitude as well as the direction: a candidate that is the
     // right shape and the wrong scale scores near-perfect cosine.
     let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
-    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+    assert!(
+        peak > 0.1 && peak < 1.0e4,
+        "degenerate reference peak {peak}"
+    );
 
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.quantization = GemmQuantization::Fp8UnitScale;
@@ -510,8 +515,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     let summary = execution.summary().to_owned();
     eprintln!("GPU_BF16_FP8_CANDIDATES {summary}");
     assert!(
-        summary.contains("cutlass-fp8#"),
-        "the CUTLASS FP8 candidate was not reached for a BF16 output: {summary}"
+        summary.contains("cutlass-fp8=skip(contract)"),
+        "the F16-only CUTLASS candidate was admitted for BF16: {summary}"
     );
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
@@ -526,7 +531,42 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
     // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
     // bound is deliberately far above that and far below any real fault.
-    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+    assert!(
+        relative_l2 < 0.01,
+        "winner drifted by relative L2 {relative_l2}"
+    );
+}
+
+#[test]
+fn gr00t_m41_fp8_down_projection_rejects_the_unvalidated_cutlass_bf16_candidate() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (41, 6144, 1536);
+    let a = zeros_tensor(0, vec![m, k], DType::F8E4M3);
+    let b = zeros_tensor(0, vec![k, n], DType::F8E4M3);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let cache_dir = scratch_cache_dir("gr00t-fp8-down-projection");
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    args.alpha = 0.0123;
+    args.policy.online_tune = false;
+    args.policy.allow_fallback = true;
+    args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+
+    assert!(
+        super::execution::seed_recipe(&ctx, &normalized, 3, 1, 1, 0).is_err(),
+        "the unvalidated CUTLASS BF16 recipe must not be restorable"
+    );
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    assert!(
+        !execution.summary().starts_with("cutlass-fp8 "),
+        "unsafe candidate selected: {}",
+        execution.summary()
+    );
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    std::fs::remove_dir_all(cache_dir).unwrap();
 }
 
 #[test]
@@ -1170,6 +1210,7 @@ fn execution_session_reuses_one_native_execution_across_forward_traversals() {
     let session = ExecutionSession::with_capacity(4096, 0).unwrap();
 
     super::execution::reset_execution_create_count();
+    super::execution::reset_execution_sync_count();
     prepare_with_session(&session, || {
         let mut args = GemmArgs::new(&a, &b, &mut out);
         args.policy.online_tune = false;
@@ -1177,6 +1218,11 @@ fn execution_session_reuses_one_native_execution_across_forward_traversals() {
     })
     .unwrap();
     assert_eq!(super::execution::execution_create_count(), 1);
+    assert_eq!(
+        super::execution::execution_sync_count(),
+        0,
+        "prepare should queue work on the session stream and let the session boundary synchronize"
+    );
     super::execution::reset_execution_sync_count();
 
     for _ in 0..2 {

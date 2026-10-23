@@ -114,9 +114,9 @@ fn fused_conv_prepare_matches_separate_and_continues_decode() {
             }).collect();
             ops::gdn_causal_conv_forward(&ctx, &input, &weight, &convolved,
                 Some(&reference[4]), tokens, channels, 4).unwrap();
-            ops::gdn_prepare_flashinfer(&ctx, &convolved, &reference[0], &reference[1],
+            ops::gdn_prepare_prefill(&ctx, &convolved, &reference[0], &reference[1],
                 &reference[2], &decay, &reference[3], tokens, channels, k_heads, v_heads, 128, 1e-6).unwrap();
-            ops::gdn_conv_prepare_flashinfer(&ctx, &input, &weight, &candidate[4],
+            ops::gdn_conv_prepare(&ctx, &input, &weight, &candidate[4],
                 &candidate[0], &candidate[1], &candidate[2], &decay, &candidate[3],
                 tokens, k_heads, v_heads, 1e-6).unwrap();
             ctx.synchronize().unwrap();
@@ -181,7 +181,7 @@ fn fused_fp16_gated_norm_matches_explicit_bf16_conversion() {
         let actual = zeros(&ctx, dims, DType::BF16);
         CudaBuffer::from_tensor(&expected).unwrap().copy_from_host(&vec![0xaa; count * 2]).unwrap();
         CudaBuffer::from_tensor(&actual).unwrap().copy_from_host(&vec![0x55; count * 2]).unwrap();
-        ops::convert_f16_to_bf16(&ctx, &input, &wide, count).unwrap();
+        ops::gdn_widen_f16_to_bf16(&ctx, &input, &wide, count).unwrap();
         ops::gdn_gated_norm_seq(&ctx, &wide, &gate, &weight, &expected, tokens, heads, head_dim, 1e-6).unwrap();
         ops::gdn_gated_norm_seq(&ctx, &input, &gate, &weight, &actual, tokens, heads, head_dim, 1e-6).unwrap();
         ctx.synchronize().unwrap();
@@ -223,7 +223,7 @@ fn preserved_warp_prepare_matches_four_warp_reduction() {
                 let storage = CudaBuffer::from_tensor(output).unwrap();
                 storage.copy_from_host(&vec![if variant == "0" { 0xaa } else { 0x55 }; storage.len()]).unwrap();
             }
-            ops::gdn_prepare_flashinfer(&ctx, &fused, &outputs[0], &outputs[1], &outputs[2],
+            ops::gdn_prepare_prefill(&ctx, &fused, &outputs[0], &outputs[1], &outputs[2],
                 &decay, &outputs[3], tokens, row_width, key_heads, value_heads, dim, 1e-6).unwrap();
         }
         ctx.synchronize().unwrap();

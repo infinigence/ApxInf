@@ -43,6 +43,9 @@ typedef enum {
   APXINF_GEMM_SEMANTIC_GEMM_GEGLU = 2,
   APXINF_GEMM_SEMANTIC_GEMM_BIAS = 3,
   APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL = 4,
+  /* BF16 GEMM followed by rounded SwiGLU. B is [K,2N] with each 256-column
+     gate tile immediately followed by its matching up tile. Output is [M,N]. */
+  APXINF_GEMM_SEMANTIC_GEMM_SWIGLU_PAIR_INTERLEAVED_256 = 5,
 } apxinf_gemm_semantic_t;
 
 typedef struct {

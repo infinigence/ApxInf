@@ -31,6 +31,7 @@ bool supports_vendor(const Spec& spec) {
 
 bool supports_native_fp8(const Spec& spec) {
   return supports_vendor(spec) && spec.a_dtype == APXINF_DTYPE_E4M3 &&
+         spec.quantization != APXINF_GEMM_QUANT_FP8_ROW_CHANNEL &&
          spec.k % 16 == 0 && spec.n % 16 == 0;
 }
 
@@ -109,6 +110,13 @@ AlignmentRequirements cutlass_fp8_alignment(const Spec&) {
   return requirements;
 }
 
+AlignmentRequirements cutlass_fp8_rowwise_alignment(const Spec& spec) {
+  auto requirements = cutlass_fp8_alignment(spec);
+  requirements.a_scales = alignof(float);
+  requirements.b_scales = alignof(float);
+  return requirements;
+}
+
 AlignmentRequirements cutlass_geglu_alignment(const Spec& spec) {
   AlignmentRequirements requirements{};
   if (spec.a_dtype == APXINF_DTYPE_E4M3) {
@@ -158,27 +166,44 @@ void cublaslt_configurations(const Spec&,
 }
 
 #ifdef APXINF_GEMM_CUTLASS
-// Escape hatch for the pre-change candidate set, kept so the F16-only and the
-// F16-or-BF16 registries can be compared inside one binary.
-bool cutlass_fp8_bf16_disabled() {
-  static const bool disabled =
-      std::getenv("APXINF_GEMM_FP8_NO_CUTLASS_BF16") != nullptr;
-  return disabled;
-}
-
 bool supports_cutlass_fp8(const Spec& spec) {
-  // The kernel is one template over the epilogue output element, so BF16 is
-  // the same candidate rather than a second implementation id.
-  const bool output_supported =
-      spec.output_dtype == APXINF_DTYPE_F16 ||
-      (spec.output_dtype == APXINF_DTYPE_BF16 && !cutlass_fp8_bf16_disabled());
+  // Keep the translated CUTLASS kernel on its original F16 contract.  Its
+  // templated BF16 epilogue passes isolated synthetic checks, but cold
+  // tuning can select tactics that either fault under repeated graph
+  // preflight or drift badly on production inputs (cosine 0.9517 versus the
+  // migration baseline).  cuBLASLt provides the stable BF16 candidate until
+  // the CUTLASS BF16 family has a production-shape validation matrix.
   return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
          spec.a_dtype == APXINF_DTYPE_E4M3 &&
          spec.b_dtype == APXINF_DTYPE_E4M3 &&
-         output_supported &&
+         spec.output_dtype == APXINF_DTYPE_F16 &&
          spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
          spec.n % 16 == 0 &&
          spec.k % 16 == 0 && spec.output_scale_is_unit != 0;
+}
+
+bool supports_cutlass_fp8_rowwise(const Spec& spec) {
+  // Dynamic row/channel FP8: CUTLASS consumes the row and
+  // channel scales in its epilogue, avoiding the generic GEMM + finish pass.
+  // The kernel has no separate scalar-alpha or output-scale input.
+  return (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM ||
+          spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS) &&
+         spec.a_dtype == APXINF_DTYPE_E4M3 &&
+         spec.b_dtype == APXINF_DTYPE_E4M3 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_FP8_ROW_CHANNEL &&
+         spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
+         spec.n % 16 == 0 && spec.k % 16 == 0;
+}
+
+void cutlass_fp8_rowwise_configurations(const Spec&,
+                                         std::vector<int>& configs) {
+  // These are the legacy CUTLASS rowwise tactics, now autotuned and persisted
+  // through the regular GEMM candidate/recipe lifecycle.
+  for (int tactic = 0; tactic < 15; ++tactic) {
+    configs.push_back(tactic);
+  }
 }
 
 bool supports_cutlass_fp8_geglu(const Spec& spec) {
@@ -221,6 +246,18 @@ bool supports_cutlass_bf16_geglu(const Spec& spec) {
          spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
          spec.quantization == APXINF_GEMM_QUANT_NONE &&
          spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU;
+}
+
+bool supports_cutlass_bf16_swiglu_sm110(const Spec& spec) {
+  return spec.m == 3387 && spec.n == 18432 && spec.k == 2560 &&
+         spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.semantic ==
+             APXINF_GEMM_SEMANTIC_GEMM_SWIGLU_PAIR_INTERLEAVED_256;
 }
 
 void cutlass_configurations(const Spec&,
@@ -391,6 +428,12 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
+      {kProviderCutlass, 7, 1, "cutlass-fp8-row-channel",
+       kDeviceFeatureCutlassSm100, true, true, false,
+       supports_cutlass_fp8_rowwise, cutlass_fp8_rowwise_alignment,
+       cutlass_fp8_resource_requirements, cutlass_fp8_rowwise_configurations,
+       prepare_cutlass_fp8_gemm, launch_cutlass_fp8_rowwise_gemm,
+       destroy_cutlass},
       {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled",
        kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_nvfp4, cutlass_nvfp4_alignment,
@@ -444,6 +487,23 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        destroy_cutlass},
 #endif
   };
+  static const ImplementationRegistry gemm_swiglu_entries = {
+      {kProviderCublas, 1, 1, "cublas+rounded-swiglu", 0, true, true, true,
+       supports_vendor, vendor_alignment, cublas_resource_requirements,
+       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+      {kProviderCublasLt, 1, 1, "cublasLt+rounded-swiglu", 0, true, false,
+       false, supports_vendor, cublaslt_alignment,
+       cublaslt_resource_requirements, cublaslt_configurations,
+       prepare_cublaslt, launch_cublaslt, destroy_cublaslt},
+#if defined(APXINF_GEMM_CUTLASS) && defined(APXINF_SEGMENTED_ATTENTION_SM110)
+      {kProviderCutlass, 7, 1, "cutlass-bf16-swiglu-sm110",
+       kDeviceFeatureQwenDriveSm110, true, true, false,
+       supports_cutlass_bf16_swiglu_sm110, cutlass_geglu_alignment,
+       cutlass_bf16_swiglu_resource_requirements, one_configuration,
+       prepare_cutlass_bf16_swiglu, launch_cutlass_bf16_swiglu,
+       destroy_cutlass},
+#endif
+  };
   const ImplementationRegistry* selected = nullptr;
   switch (semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM:
@@ -460,6 +520,9 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL:
       selected = &gemm_bias_residual_entries;
+      break;
+    case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU_PAIR_INTERLEAVED_256:
+      selected = &gemm_swiglu_entries;
       break;
     default:
       throw Failure(APXINF_STATUS_INTERNAL_ERROR,

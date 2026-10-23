@@ -12,6 +12,9 @@ constexpr uint32_t kProviderFa2 = 2;
 #if defined(APXINF_ATTENTION_CUTLASS)
 constexpr uint32_t kProviderCutlass = 3;
 #endif
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+constexpr uint32_t kProviderQwenDriveSm110 = 4;
+#endif
 
 bool supports_custom(const Spec& spec) {
   return (spec.dtype == APXINF_DTYPE_F16 ||
@@ -131,10 +134,63 @@ AlignmentRequirements cutlass_alignment(const Spec&) {
 }
 #endif
 
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+bool supports_qwen_d256_causal(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+         spec.dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.mask == APXINF_ATTENTION_MASK_CAUSAL && spec.batch == 1 &&
+         spec.query_tokens == 3387 && spec.key_tokens == 3387 &&
+         spec.key_capacity == 3387 && spec.query_heads == 16 &&
+         spec.kv_heads == 4 && spec.head_dim == 256 &&
+         spec.query_start == 0 && spec.scale_is_default != 0;
+}
+
+bool supports_qwen_d256_split(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
+         spec.dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.mask == APXINF_ATTENTION_MASK_NONE && spec.batch == 1 &&
+         spec.query_tokens == 50 && spec.key_tokens >= 3433 &&
+         spec.key_tokens <= 3437 && spec.key_capacity == 3438 &&
+         spec.query_heads == 16 && spec.kv_heads == 4 &&
+         spec.head_dim == 256 && spec.query_start == 0 &&
+         spec.dynamic_decode == 0 && spec.scale_is_default != 0;
+}
+
+bool supports_qwen_vision_segmented(const Spec& spec) {
+  // README 12-frame fixture: each camera contributes three 624-token frames
+  // and one 2200-token frame, in camera-major order. Keep the fingerprint in
+  // sync with the host_offsets consumed by the fixed-stride launcher below.
+  constexpr uint64_t kOffsetsHash = UINT64_C(0x5febecb608d78843);
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_SEGMENTED &&
+         spec.dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.mask == APXINF_ATTENTION_MASK_NONE && spec.batch == 1 &&
+         spec.query_tokens == 12216 && spec.key_tokens == 12216 &&
+         spec.key_capacity == 12216 && spec.query_heads == 16 &&
+         spec.kv_heads == 16 && spec.head_dim == 64 &&
+         spec.segments == 12 && spec.max_segment_tokens == 2200 &&
+         spec.offsets_hash == kOffsetsHash && spec.scale_is_default != 0;
+}
+
+AlignmentRequirements qwen_d256_alignment(const Spec&) {
+  return {16, 16, 16, 16};
+}
+#endif
+
 }  // namespace
 
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+      {kProviderQwenDriveSm110, 1, 1, "qwen-d256-causal-sm110",
+       apxinf::gemm::kDeviceFeatureQwenDriveSm110, true, true, false,
+       supports_qwen_d256_causal, qwen_d256_alignment,
+       qwen_d256_causal_resource_requirements, one_configuration,
+       prepare_qwen_d256_causal, launch_qwen_d256_causal,
+       destroy_qwen_d256_causal},
+#endif
 #if defined(APXINF_ATTENTION_CUTLASS)
       {kProviderCutlass, 1, 1, "cutlass-fmha-sm100",
        apxinf::gemm::kDeviceFeatureCutlassSm100, true, true, false,
@@ -165,6 +221,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_custom, destroy_custom},
   };
   static const ImplementationRegistry kv_cache_entries = {
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+      {kProviderQwenDriveSm110, 2, 1, "qwen-d256-split-sm110",
+       apxinf::gemm::kDeviceFeatureQwenDriveSm110, true, true, false,
+       supports_qwen_d256_split, qwen_d256_alignment,
+       qwen_d256_split_resource_requirements, one_configuration,
+       prepare_qwen_d256_split, launch_qwen_d256_split,
+       destroy_qwen_d256_split},
+#endif
 #if defined(APXINF_ATTENTION_FA2)
       {kProviderFa2, 3, 1, "flash-attention-2-split-kv",
        apxinf::gemm::kDeviceFeatureFa2, true, true, false,
@@ -182,6 +246,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_custom, destroy_custom},
   };
   static const ImplementationRegistry segmented_entries = {
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+      {kProviderQwenDriveSm110, 3, 1, "qwen-vision-segmented-sm110",
+       apxinf::gemm::kDeviceFeatureQwenDriveSm110, true, true, false,
+       supports_qwen_vision_segmented, qwen_d256_alignment,
+       qwen_vision_segmented_resource_requirements, one_configuration,
+       prepare_qwen_vision_segmented, launch_qwen_vision_segmented,
+       destroy_qwen_vision_segmented},
+#endif
       {kProviderCustom, 3, 1, "custom-segmented-attention", 0, true, true,
        true, supports_segmented_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,

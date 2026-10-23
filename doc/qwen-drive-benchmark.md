@@ -58,14 +58,10 @@ continuous resource telemetry; its exact transient cause remains unproven.
 
 ## Build and load
 
-Use Linux AArch64, CUDA 13.2 and the native SM110 operator artifacts. The offline
-exporter requires CuTe DSL 4.7.0 and pinned upstream sources; normal engine builds
-consume the generated artifacts. Follow the
-[AOT export instructions](../crates/apxinf-cuda/aot/README.md), then build:
+Use Linux AArch64, CUDA 13.2 and the in-tree native SM110 operators:
 
 ```sh
 APXINF_CUDA_ARCH=sm_110 \
-APXINF_CUDA_AOT_MANIFEST=/path/to/artifacts/manifest.json \
   maturin build --release --features cuda,extension-module \
   --compatibility linux -m crates/apxinf-py/Cargo.toml
 ```
@@ -171,7 +167,7 @@ calls, invalid masks and logical-length switching. Portable checks:
 PYTHONPATH=python/apxinf python -m pytest \
   python/apxinf/tests/test_qwen_drive_policy.py \
   python/apxinf/tests/test_qwen_drive_padding.py
-cargo test --release -p apxinf-cuda --test aot_bundle --test cuda_arch
+cargo test --release -p apxinf-cuda-new --lib
 cargo test --release -p apxinf-model --features cuda --lib capture_rejects_changed_phase_extent_or_count
 bash scripts/check_model_family_boundaries.sh
 ```
@@ -180,7 +176,7 @@ bash scripts/check_model_family_boundaries.sh
 
 - Python with the native extension: 33 passed; isolated CPU environment:
   30 passed, 3 native-only checks skipped.
-- Cargo AOT bundle/geometry checks: 8 passed; architecture checks: 5 passed.
+- cuda-new native operator and architecture checks passed.
 - GDN policy/operator checks: 9 passed. BF16/PTX chunk-state relative L1 error
   against the FP64 reference: 0.001419 (limit 0.01).
 - Convolution boundary, AdaLN fusion and Pillow axis rejection: all passed.
@@ -218,15 +214,15 @@ bash scripts/check_model_family_boundaries.sh
 
 ### Native regression commands
 
-Run GPU tests explicitly on an idle Thor with the same AOT build inputs above;
+Run GPU tests explicitly on an idle Thor with `APXINF_CUDA_ARCH=sm_110`;
 `--include-ignored` enables the tests marked as requiring CUDA. Serialize GPU
 work with the shared device lock.
 
 ```sh
-cargo test --release -p apxinf-cuda --lib gdn_ -- --include-ignored --test-threads=1
-cargo test --release -p apxinf-cuda --lib causal_conv_tiling -- --ignored
-cargo test --release -p apxinf-cuda --lib weighted_adaln_residual -- --ignored
-cargo test --release -p apxinf-cuda --lib pillow_axis_rejects -- --ignored
+cargo test --release -p apxinf-cuda-new --lib gdn_ -- --include-ignored --test-threads=1
+cargo test --release -p apxinf-cuda-new --lib causal_conv_tiling -- --ignored
+cargo test --release -p apxinf-cuda-new --lib weighted_adaln_residual -- --ignored
+cargo test --release -p apxinf-cuda-new --lib pillow_axis_rejects -- --ignored
 cargo test --release -p apxinf-py --features cuda --lib packed_rgb
 ```
 
@@ -262,9 +258,8 @@ Qwen-Drive has no production `APXINF_QWEN_*` or GDN experiment environment
 switches. Direct planning uses its maintained prepared path; reasoning retains
 eager execution. Diagnostic branches that changed fusion/capture were removed.
 `OnceLock` remains valid for immutable data caches such as the position table.
-The two checkpoint/fixture variables above are test inputs; the AOT manifest
-variable is a build input. Generic device/tactic infrastructure is shared with
-other model families.
+The two checkpoint/fixture variables above are test inputs. Generic
+device/recipe infrastructure is shared with other model families.
 
 Canonical conditioning packs, in order: flattened historical pose (excluding
 the final/current entry), flattened historical velocity, flattened historical
@@ -272,13 +267,12 @@ acceleration, current velocity and acceleration plus the one-hot command,
 and the scalar navigation command. The native boundary validates dimensions
 against the checkpoint before any execution.
 
-Tactic-store reuse is scoped to the toolkit/device/kernel identity recorded by
-the tuning infrastructure. AOT identity includes artifact and exporter/contract
-hashes; use a compatible explicit store, or the empty vendor store used here.
-Do not carry an unrelated measured tactic file across toolkit or kernel changes.
+Recipe reuse is scoped to the toolkit/device/kernel identity recorded by the
+tuning infrastructure. Do not carry an unrelated measured recipe across
+toolkit or kernel changes.
 
 The model architecture owns composition and preparation. The
-[CUDA adapter boundary](../crates/apxinf-cuda/adapters/README.md) owns exported
+[cuda-new adapter boundary](../crates/apxinf-cuda-new/native/adapters) owns exported
 module lifetime, tensor descriptors and launch ABI. NVTX markers use the existing
 profiling feature and do not select different numerical implementations.
 

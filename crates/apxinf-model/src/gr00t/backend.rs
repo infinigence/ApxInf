@@ -1,11 +1,15 @@
 //! CUDA-facing seam for the GR00T runtime.
+//!
+//! GR00T uses cuda-new's public `ops` surface and runtime backend.
 
 #[cfg(feature = "cuda")]
-pub(crate) use crate::accelerator::cuda::{
-    downcast_arc, kernels, transfers, DeviceBuffer, RuntimeBackend,
-};
+pub(crate) use crate::accelerator::downcast_cuda_new_arc as downcast_arc;
 #[cfg(feature = "cuda")]
-pub(crate) use apxinf_cuda::{tuning::TuningMode, CudaBackend};
+pub(crate) use apxinf_cuda_new::CudaNewBackend as CudaBackend;
+#[cfg(feature = "cuda")]
+pub(crate) use apxinf_cuda_new::{
+    ops, transfers, CudaBuffer as DeviceBuffer, CudaNewBackend as RuntimeBackend,
+};
 
 /// The model opts into packed8 only for its measured BF16 epilogues.
 const fn use_packed8_bias_activation(
@@ -44,7 +48,7 @@ pub(super) fn try_packed8_bias_activation(
     ) {
         return Ok(None);
     }
-    kernels::activation::try_bias_activation_bf16_packed8(
+    ops::activation::try_bias_activation_bf16_packed8(
         backend.context(),
         input,
         bias,

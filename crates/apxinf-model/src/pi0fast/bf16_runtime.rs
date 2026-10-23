@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Backend, Error, Result, Tensor};
-use kernels::{cache, elementwise, embedding, gemm, norm, sampling, GraphWorkspace};
+use super::backend::{ops, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use apxinf_core::{Error, Result, Tensor};
+use ops::{cache, elementwise, embedding, gemm, norm, sampling, ExecutionSession};
 
 use super::calibration::Pi0FastCalibrationObserver;
 use super::{
@@ -30,7 +30,7 @@ use super::{
 
 /// Conservative arena reservation for one `infer` traversal.
 ///
-/// [`GraphWorkspace`] is a bump arena: every buffer `output_buffer` hands out
+/// [`ExecutionSession`] is a bump arena: every buffer `output_buffer` hands out
 /// during a call stays live until the scope ends, so the capacity has to cover
 /// the *sum* of the call's intermediates rather than their peak. The estimate
 /// follows `infer_arena` op by op and is deliberately generous; an
@@ -111,7 +111,7 @@ pub struct Pi0FastBf16Runtime {
     lm_head_remap: CudaBuffer,
     /// Persistent arena for the per-call intermediates. Without it every
     /// intermediate is a raw `cudaMalloc`/`cudaFree` pair.
-    arena: Mutex<Option<GraphWorkspace>>,
+    arena: Mutex<Option<ExecutionSession>>,
 }
 
 impl Pi0FastBf16Runtime {
@@ -158,12 +158,9 @@ impl Pi0FastBf16Runtime {
             .as_ref()
             .is_none_or(|workspace| workspace.capacity() < capacity)
         {
-            *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
+            *arena = Some(ExecutionSession::with_capacity(capacity, self.ctx().device_id())?);
         }
-        kernels::with_workspace_eager(
-            arena.as_ref().expect("arena is populated above"),
-            operation,
-        )
+        ops::prepare_with_session(arena.as_ref().expect("arena is populated above"), operation)
     }
 
     /// Bytes of the arena the last call used.
@@ -185,7 +182,7 @@ impl Pi0FastBf16Runtime {
     ///
     /// `patches` is the FP32 patch-major tensor PaliGemma's SigLIP tower
     /// consumes; the BF16 encoder input is produced inside the patch embedding.
-    
+
     fn embed_images(&self, patches: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let weights = &self.weights;
@@ -255,8 +252,7 @@ impl Pi0FastBf16Runtime {
             &self.config,
             &self.weights,
         )?);
-        let _guard =
-            kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard = ops::gemm::install_bf16_observer(observer.clone())?;
         let _ = self.infer(patches, token_ids, token_count, stop_token)?;
         self.backend.synchronize()?;
         observer.records()
@@ -287,9 +283,11 @@ impl Pi0FastBf16Runtime {
         let prefix_len = token_count + config.patch_tokens();
 
         let step_bytes = std::mem::size_of::<u32>();
-        let tokens =
-            CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
-                .map_err(Error::Cuda)?;
+        let tokens = CudaBuffer::alloc(
+            config.max_action_tokens * step_bytes,
+            self.ctx().device_id(),
+        )
+        .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
         // One generated token per step: argmax on device, feed the id straight
@@ -302,13 +300,13 @@ impl Pi0FastBf16Runtime {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_remapped_into(
-                self.ctx(),
-                &logits,
-                &self.lm_head_remap,
-                &slot,
-            )?;
+            sampling::argmax_bf16_remapped_into(self.ctx(), &logits, &self.lm_head_remap, &slot)?;
             if let Some(stop) = stop_token {
+                // cuda-new launches argmax on its non-default context stream,
+                // while CudaBuffer::copy_to_host uses a synchronous default-
+                // stream copy.  Unlike the legacy runtime, that copy does not
+                // order itself after work on a non-blocking stream.
+                self.ctx().synchronize().map_err(Error::Cuda)?;
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;
                 if u32::from_ne_bytes(raw) == stop {
@@ -394,7 +392,11 @@ impl Pi0FastBf16Runtime {
             &self.weights.language_final_norm_scale,
             self.config.rms_norm_eps,
         )?;
-        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
+        super::bf16_executor::decode_projection(
+            self.ctx(),
+            &normalized,
+            &self.weights.lm_head.weight,
+        )
     }
 
     /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
@@ -405,7 +407,8 @@ impl Pi0FastBf16Runtime {
     /// action token, and the autoregressive feedback loop all share this path.
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
+        let tensor =
+            embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
         elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
     }
 }

@@ -6,11 +6,324 @@
 //! checkpoint. The tests here establish that the kernels compute the stated
 //! recurrence, not that the recurrence is the model's.
 
-use apxinf_core::{DType, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use crate::ffi::abi::{gdn as abi, status};
 use crate::ops::gemm::contracts::{invalid, tensor_storage};
-use crate::CudaContext;
+use crate::{CudaBuffer, CudaContext};
+
+const FIRST_PREFILL_CHUNK: usize = 64;
+
+/// Complete first-prefill causal-convolution + gated-delta scan semantic.
+///
+/// Candidate support and fallback are internal: callers always receive the
+/// same logical `[tokens, value_heads * value_dim]` output and state updates.
+pub struct GdnFirstPrefillArgs<'a> {
+    pub zba: &'a Tensor,
+    pub conv_weight: &'a Tensor,
+    pub new_conv_state: &'a Tensor,
+    pub a_log: &'a Tensor,
+    pub dt_bias: &'a Tensor,
+    pub final_state: &'a Tensor,
+    pub output: &'a Tensor,
+    /// `[key_heads, value_heads, key_dim, value_dim]`.
+    pub geometry: [usize; 4],
+}
+
+fn scan_scratch(
+    ctx: &CudaContext,
+    heads: usize,
+    seq_pad: usize,
+    seq: usize,
+    width_bytes: usize,
+) -> Result<CudaBuffer> {
+    if seq_pad == seq {
+        return crate::ops::scratch_buffer(ctx, (heads * seq_pad * width_bytes).max(1));
+    }
+    crate::ops::scratch_buffer_tail_zeroed(ctx, heads, seq_pad * width_bytes, seq * width_bytes)
+}
+
+fn zeroed(ctx: &CudaContext, bytes: usize) -> Result<CudaBuffer> {
+    crate::ops::scratch_buffer_zeroed(ctx, bytes.max(1))
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn gdn_first_prefill(ctx: &CudaContext, args: GdnFirstPrefillArgs<'_>) -> Result<()> {
+    let [key_heads, value_heads, key_dim, value_dim] = args.geometry;
+    let seq = args.zba.shape().dims().first().copied().unwrap_or(0);
+    let key_width = key_heads
+        .checked_mul(key_dim)
+        .ok_or_else(|| invalid("GDN key width overflow"))?;
+    let value_width = value_heads
+        .checked_mul(value_dim)
+        .ok_or_else(|| invalid("GDN value width overflow"))?;
+    let conv_width = 2 * key_width + value_width;
+    let row_width = conv_width + value_width + 2 * value_heads;
+    if seq == 0
+        || key_heads == 0
+        || value_heads == 0
+        || value_heads % key_heads != 0
+        || key_dim != value_dim
+        || args.zba.shape().dims() != [seq, row_width]
+        || args.conv_weight.shape().dims() != [conv_width, 4]
+        || args.new_conv_state.shape().dims() != [conv_width, 4]
+        || args.a_log.shape().dims() != [value_heads]
+        || args.dt_bias.shape().dims() != [value_heads]
+        || args.final_state.shape().dims() != [value_heads, value_dim, key_dim]
+        || args.output.shape().dims() != [seq, value_width]
+    {
+        return Err(invalid("invalid first-prefill GDN contract"));
+    }
+    let final_state = CudaBuffer::from_tensor(args.final_state).map_err(Error::Cuda)?;
+    if let Some(fast) = crate::ops::linear_attention::try_causal_conv_gdn_prefill_bf16(
+        ctx,
+        args.zba,
+        args.conv_weight,
+        args.new_conv_state,
+        args.a_log,
+        args.dt_bias,
+        &final_state,
+        args.geometry,
+    )? {
+        let source = CudaBuffer::from_tensor(&fast).map_err(Error::Cuda)?;
+        let destination = CudaBuffer::from_tensor(args.output).map_err(Error::Cuda)?;
+        destination
+            .copy_from_device_async(&source, args.output.size_in_bytes(), ctx.stream())
+            .map_err(Error::Cuda)?;
+        return Ok(());
+    }
+
+    use crate::ops::linear_attention as la;
+    let conv_out =
+        ctx.allocate_output(apxinf_core::Shape::new(vec![seq, conv_width]), DType::BF16)?;
+    la::causal_conv1d_silu_bf16(
+        ctx,
+        args.zba,
+        args.conv_weight,
+        None,
+        &conv_out,
+        args.new_conv_state,
+        4,
+    )?;
+
+    let seq_pad = seq.div_ceil(FIRST_PREFILL_CHUNK) * FIRST_PREFILL_CHUNK;
+    let f32_bytes = DType::F32.size_in_bytes();
+    let qk_bf16 =
+        la::gdn_qk_bf16_prefill_supported(ctx, false, key_dim, value_dim, FIRST_PREFILL_CHUNK);
+    let qk_bytes = if qk_bf16 {
+        DType::BF16.size_in_bytes()
+    } else {
+        f32_bytes
+    };
+    let q_buf = scan_scratch(ctx, value_heads, seq_pad, seq, key_dim * qk_bytes)?;
+    let k_buf = scan_scratch(ctx, value_heads, seq_pad, seq, key_dim * qk_bytes)?;
+    let v_buf = if qk_bf16 {
+        None
+    } else {
+        Some(scan_scratch(
+            ctx,
+            value_heads,
+            seq_pad,
+            seq,
+            value_dim * DType::BF16.size_in_bytes(),
+        )?)
+    };
+    let beta_buf = scan_scratch(ctx, value_heads, seq_pad, seq, f32_bytes)?;
+    let g_buf = scan_scratch(ctx, value_heads, seq_pad, seq, f32_bytes)?;
+
+    if qk_bf16 {
+        la::gdn_qk_prep_qk_bf16(
+            ctx,
+            &conv_out,
+            &q_buf,
+            &k_buf,
+            seq_pad,
+            key_heads,
+            value_heads,
+            key_dim,
+            key_width,
+            false,
+            1e-6,
+        )?;
+        la::gdn_gate_prep(
+            ctx,
+            args.zba,
+            conv_width + value_width,
+            conv_width + value_width + value_heads,
+            args.dt_bias,
+            args.a_log,
+            &beta_buf,
+            &g_buf,
+            seq_pad,
+            value_heads,
+        )?;
+    } else {
+        la::gdn_qk_prep(
+            ctx,
+            &conv_out,
+            &q_buf,
+            &k_buf,
+            seq_pad,
+            key_heads,
+            value_heads,
+            key_dim,
+            key_width,
+            false,
+            1e-6,
+        )?;
+        la::gdn_vb_prep(
+            ctx,
+            &conv_out,
+            args.zba,
+            conv_width + value_width,
+            conv_width + value_width + value_heads,
+            args.dt_bias,
+            args.a_log,
+            v_buf
+                .as_ref()
+                .ok_or_else(|| invalid("GDN V scratch missing"))?,
+            &beta_buf,
+            &g_buf,
+            seq_pad,
+            value_heads,
+            value_dim,
+            2 * key_width,
+        )?;
+    }
+
+    let chunks = seq_pad / FIRST_PREFILL_CHUNK;
+    let g_cum = zeroed(ctx, value_heads * seq_pad * f32_bytes)?;
+    let a_buf = zeroed(
+        ctx,
+        value_heads * chunks * FIRST_PREFILL_CHUNK * FIRST_PREFILL_CHUNK * f32_bytes,
+    )?;
+    let t_buf = zeroed(
+        ctx,
+        value_heads
+            * chunks
+            * FIRST_PREFILL_CHUNK
+            * FIRST_PREFILL_CHUNK
+            * DType::BF16.size_in_bytes(),
+    )?;
+    let vt_buf = scan_scratch(
+        ctx,
+        value_heads,
+        seq_pad,
+        seq,
+        value_dim * DType::BF16.size_in_bytes(),
+    )?;
+    let kcd_buf = scan_scratch(
+        ctx,
+        value_heads,
+        seq_pad,
+        seq,
+        key_dim * DType::BF16.size_in_bytes(),
+    )?;
+    la::gdn_cumsum(
+        ctx,
+        &g_buf,
+        &g_cum,
+        seq_pad,
+        value_heads,
+        FIRST_PREFILL_CHUNK,
+    )?;
+    if qk_bf16 {
+        la::gdn_attn_raw_solve_f1_qk_bf16(
+            ctx,
+            &q_buf,
+            &k_buf,
+            &beta_buf,
+            &g_cum,
+            &a_buf,
+            &t_buf,
+            seq_pad,
+            value_heads,
+            key_dim,
+            FIRST_PREFILL_CHUNK,
+        )?;
+        la::gdn_chunk_gemm_tri_k_bf16_direct_v(
+            ctx,
+            &a_buf,
+            &conv_out,
+            &k_buf,
+            &beta_buf,
+            &g_cum,
+            &vt_buf,
+            &kcd_buf,
+            seq_pad,
+            value_heads,
+            key_dim,
+            value_dim,
+            FIRST_PREFILL_CHUNK,
+            2 * key_width,
+        )?;
+        la::gdn_chunk_state_qk_bf16(
+            ctx,
+            &q_buf,
+            &k_buf,
+            &g_cum,
+            &t_buf,
+            &vt_buf,
+            &kcd_buf,
+            &final_state,
+            args.output,
+            seq_pad,
+            value_heads,
+            key_dim,
+            value_dim,
+            FIRST_PREFILL_CHUNK,
+        )?;
+    } else {
+        la::gdn_attn_raw(
+            ctx,
+            &q_buf,
+            &k_buf,
+            &beta_buf,
+            &g_cum,
+            &a_buf,
+            &t_buf,
+            seq_pad,
+            value_heads,
+            key_dim,
+            FIRST_PREFILL_CHUNK,
+        )?;
+        la::gdn_tri_solve(ctx, &a_buf, value_heads * chunks, FIRST_PREFILL_CHUNK)?;
+        la::gdn_chunk_gemm(
+            ctx,
+            &a_buf,
+            v_buf
+                .as_ref()
+                .ok_or_else(|| invalid("GDN V scratch missing"))?,
+            &k_buf,
+            &beta_buf,
+            &g_cum,
+            &vt_buf,
+            &kcd_buf,
+            seq_pad,
+            value_heads,
+            key_dim,
+            value_dim,
+            FIRST_PREFILL_CHUNK,
+        )?;
+        la::gdn_chunk_state(
+            ctx,
+            &q_buf,
+            &k_buf,
+            &g_cum,
+            &t_buf,
+            &vt_buf,
+            &kcd_buf,
+            &final_state,
+            args.output,
+            seq_pad,
+            value_heads,
+            key_dim,
+            value_dim,
+            FIRST_PREFILL_CHUNK,
+        )?;
+    }
+    Ok(())
+}
 
 /// Shape of the recurrent state a GDN layer carries between tokens.
 ///
@@ -446,7 +759,9 @@ pub fn gdn_chunk_scan(
     }
     let (sv_heads, v_dim, k_dim) = (state_dims[0], state_dims[1], state_dims[2]);
     if sv_heads != v_heads || v_dim != k_dim {
-        return Err(invalid("GDN chunk scan expects square v_dim == k_dim state"));
+        return Err(invalid(
+            "GDN chunk scan expects square v_dim == k_dim state",
+        ));
     }
     if k_heads == 0 || v_heads % k_heads != 0 {
         return Err(invalid("GDN value heads must be a multiple of key heads"));
@@ -460,7 +775,9 @@ pub fn gdn_chunk_scan(
     }
     let seq_padded = q_dims[0];
     if seq_padded % chunk_size != 0 {
-        return Err(invalid("GDN chunk scan seq must be a multiple of chunk_size"));
+        return Err(invalid(
+            "GDN chunk scan seq must be a multiple of chunk_size",
+        ));
     }
     let num_chunks = seq_padded / chunk_size;
 
@@ -537,8 +854,7 @@ pub fn gdn_chunk_scan_interleaved(
     let fused_buffer = tensor_storage(ctx, fused, DType::BF16, &[seq_padded, row_width])?;
     let g_buffer = tensor_storage(ctx, g, DType::F32, &[seq_padded, v_heads])?;
     let beta_buffer = tensor_storage(ctx, beta, DType::F32, &[seq_padded, v_heads])?;
-    let out_buffer =
-        tensor_storage(ctx, out, DType::BF16, &[seq_padded, v_heads, k_dim])?;
+    let out_buffer = tensor_storage(ctx, out, DType::BF16, &[seq_padded, v_heads, k_dim])?;
     let state_buffer = tensor_storage(ctx, state, DType::F32, &[v_heads, k_dim, k_dim])?;
 
     // Byte offsets into the one fused allocation; the kernel walks rows itself.
@@ -618,13 +934,11 @@ pub fn gdn_prefill(
     let gate_buffer = tensor_storage(ctx, gate_log, DType::F32, &[tokens, v_heads])?;
     let beta_buffer = tensor_storage(ctx, beta, DType::F32, &[tokens, v_heads])?;
     let seqlens_buffer = tensor_storage(ctx, cu_seqlens, DType::I32, &[num_seqs + 1])?;
-    let state_buffer =
-        tensor_storage(ctx, state, DType::F32, &[v_heads, head_dim, head_dim])?;
+    let state_buffer = tensor_storage(ctx, state, DType::F32, &[v_heads, head_dim, head_dim])?;
     // The kernel treats this as raw bytes; validating it against its own
     // declared shape keeps the check meaningful without inventing a dtype.
     let workspace_dims = workspace.shape().dims().to_vec();
-    let workspace_buffer =
-        tensor_storage(ctx, workspace, workspace.dtype(), &workspace_dims)?;
+    let workspace_buffer = tensor_storage(ctx, workspace, workspace.dtype(), &workspace_dims)?;
 
     unsafe {
         status::check(abi::apxinf_gdn_prefill(
@@ -650,8 +964,7 @@ pub fn gdn_prefill(
 /// Scratch bytes `gdn_prefill` needs for its TMA rewrites.
 pub fn gdn_prefill_workspace_bytes(v_heads: usize, num_seqs: usize) -> usize {
     unsafe {
-        abi::apxinf_gdn_prefill_workspace_bytes(v_heads as i64, num_seqs as i64)
-            .max(0) as usize
+        abi::apxinf_gdn_prefill_workspace_bytes(v_heads as i64, num_seqs as i64).max(0) as usize
     }
 }
 
@@ -721,12 +1034,19 @@ pub fn gdn_conv_prepare(
     v_heads: usize,
     epsilon: f32,
 ) -> Result<()> {
-    let channels = k_heads.checked_mul(2)
+    let channels = k_heads
+        .checked_mul(2)
         .and_then(|heads| heads.checked_add(v_heads))
         .and_then(|heads| heads.checked_mul(128))
         .ok_or_else(|| invalid("fused GDN channel count overflow"))?;
-    if tokens == 0 || tokens > i32::MAX as usize || k_heads == 0 || v_heads == 0
-        || channels > 536_870_911 || !epsilon.is_finite() || epsilon <= 0.0 {
+    if tokens == 0
+        || tokens > i32::MAX as usize
+        || k_heads == 0
+        || v_heads == 0
+        || channels > 536_870_911
+        || !epsilon.is_finite()
+        || epsilon <= 0.0
+    {
         return Err(invalid("invalid fused GDN dimensions or epsilon"));
     }
     let input_buffer = tensor_storage(ctx, input, DType::BF16, &[tokens, channels])?;
@@ -739,10 +1059,19 @@ pub fn gdn_conv_prepare(
     let alpha_buffer = tensor_storage(ctx, alpha, DType::F32, &[tokens, v_heads])?;
     unsafe {
         status::check(abi::apxinf_gdn_conv_prepare(
-            input_buffer.ptr(), weight_buffer.ptr(), window_buffer.ptr(),
-            q_buffer.ptr(), k_buffer.ptr(), v_buffer.ptr(), decay_buffer.ptr(),
-            alpha_buffer.ptr(), tokens as i64, k_heads as i64, v_heads as i64,
-            epsilon, ctx.stream().handle(),
+            input_buffer.ptr(),
+            weight_buffer.ptr(),
+            window_buffer.ptr(),
+            q_buffer.ptr(),
+            k_buffer.ptr(),
+            v_buffer.ptr(),
+            decay_buffer.ptr(),
+            alpha_buffer.ptr(),
+            tokens as i64,
+            k_heads as i64,
+            v_heads as i64,
+            epsilon,
+            ctx.stream().handle(),
         ))
     }
 }

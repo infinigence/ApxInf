@@ -2,9 +2,13 @@
 //!
 //! Executor code depends on this model-local alias and the model-neutral
 //! kernel contract; adding another accelerator backend changes this seam,
-//! not the layer topology. Mirrors the maintained pi05 pattern.
+//! not the layer topology.
+//!
+//! Qwen-Drive uses cuda-new's public `ops` surface and runtime backend.
 
-pub(crate) use crate::accelerator::cuda::{
-    downcast_arc, kernels, nvtx, transfers, tuning, Context, CublasTranspose, DeviceBuffer,
-    RuntimeBackend,
+pub(crate) use apxinf_cuda_new::{
+    nvtx, ops, transfers, CublasTranspose, CudaBuffer as DeviceBuffer,
+    CudaContext as Context, CudaNewBackend as RuntimeBackend,
 };
+
+pub(crate) use crate::accelerator::downcast_cuda_new_arc as downcast_arc;

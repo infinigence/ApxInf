@@ -115,6 +115,26 @@ cudaError_t launch_cutlass(Execution& execution);
 void destroy_cutlass(Execution& execution) noexcept;
 #endif
 
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+size_t qwen_d256_causal_resource_requirements(const Spec& spec,
+                                               int configuration);
+void prepare_qwen_d256_causal(Execution& execution);
+cudaError_t launch_qwen_d256_causal(Execution& execution);
+void destroy_qwen_d256_causal(Execution& execution) noexcept;
+
+size_t qwen_d256_split_resource_requirements(const Spec& spec,
+                                              int configuration);
+void prepare_qwen_d256_split(Execution& execution);
+cudaError_t launch_qwen_d256_split(Execution& execution);
+void destroy_qwen_d256_split(Execution& execution) noexcept;
+
+size_t qwen_vision_segmented_resource_requirements(const Spec& spec,
+                                                    int configuration);
+void prepare_qwen_vision_segmented(Execution& execution);
+cudaError_t launch_qwen_vision_segmented(Execution& execution);
+void destroy_qwen_vision_segmented(Execution& execution) noexcept;
+#endif
+
 }  // namespace apxinf::attention
 
 struct apxinf_attention_execution {

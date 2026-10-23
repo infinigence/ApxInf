@@ -36,6 +36,19 @@ bool needs_safe_dequantization(const Spec& spec) {
   return spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL;
 }
 
+cudaDataType_t input_cuda_dtype(uint32_t dtype) {
+  switch (dtype) {
+    case APXINF_DTYPE_F32: return CUDA_R_32F;
+    case APXINF_DTYPE_F16: return CUDA_R_16F;
+    case APXINF_DTYPE_BF16: return CUDA_R_16BF;
+    case APXINF_DTYPE_E4M3: return CUDA_R_8F_E4M3;
+    case APXINF_DTYPE_I8: return CUDA_R_8I;
+    default:
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "cuBLAS GEMM input dtype is unsupported");
+  }
+}
+
 Spec cublas_compute_spec(const Spec& spec) {
   Spec compute = spec;
   if (needs_safe_dequantization(spec)) {
@@ -143,6 +156,10 @@ cudaError_t launch_cublas(Execution& state) {
                 : resources.common.projection_dtype == APXINF_DTYPE_F16
                       ? CUDA_R_16F
                       : CUDA_R_16BF;
+  const cudaDataType_t input_type =
+      resources.common.unpack_a != nullptr
+          ? data_type
+          : input_cuda_dtype(compute_spec.a_dtype);
   check_cublas(cublasSetStream(resources.handle, stream));
   check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
                                   resources.workspace_bytes));
@@ -150,9 +167,9 @@ cudaError_t launch_cublas(Execution& state) {
       resources.handle, CUBLAS_OP_N, CUBLAS_OP_N, compute_spec.n,
       compute_spec.m, compute_spec.k,
       alpha_pointer, weight,
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
+      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : input_type,
       compute_spec.n, activation,
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
+      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : input_type,
       compute_spec.k, beta_pointer, projection, data_type, compute_spec.n,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                               : CUBLAS_COMPUTE_32F,

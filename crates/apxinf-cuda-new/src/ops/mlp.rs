@@ -10,7 +10,11 @@ use crate::ffi::abi::{mlp as abi, status};
 use crate::ops::gemm::contracts::{invalid, tensor_storage};
 use crate::CudaContext;
 
-/// `y[r,c] = x[r,c] / sqrt(mean(x[r,:]^2) + epsilon) * weight[c]`
+/// `y[r,c] = x[r,c] / sqrt(mean(x[r,:]^2) + epsilon) * (1 + weight[c])`
+///
+/// This is the zero-centered (Gemma / Qwen3.5) RMSNorm: the checkpoint stores
+/// centering weights and the applied scale is `1 + weight`. The plain
+/// `x/rms * weight` form lives in `ops::norm::rms_norm`.
 ///
 /// The reduction runs in f32 regardless of the BF16 storage.
 pub fn rms_norm(

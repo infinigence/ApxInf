@@ -64,11 +64,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
-    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
-        rows: i64,
-        k: i64,
-        sf_vec_size: u32,
-    ) -> u64;
+    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
         source_row_major: *const c_void,
         destination: *mut c_void,

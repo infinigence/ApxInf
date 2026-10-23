@@ -1,9 +1,9 @@
 //! Native-BF16 GR00T device weights.
 
-use apxinf_core::{Backend, Result, Tensor};
+use apxinf_core::{Result, Tensor};
 
 use super::action_weights::Gr00tLinearWeights;
-use super::backend::{kernels, RuntimeBackend};
+use super::backend::{ops, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
 #[derive(Debug)]
@@ -33,7 +33,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
         super::calibration::observe(&self.calibration_name, input)?;
-        kernels::gemm::bf16(backend.context(), input, &self.weights.weight)
+        ops::gemm::bf16(backend.context(), input, &self.weights.weight)
     }
 
     fn bias(&self) -> Option<&Tensor> {
@@ -68,7 +68,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         {
             return Ok(None);
         }
-        let fused = kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        let fused = ops::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
             backend.context(),
             projection,
             &self.weights.bias,
@@ -97,7 +97,7 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         {
             return Ok(None);
         }
-        let fused = kernels::fused::bias_then_residual_layer_bf16_cached_1536(
+        let fused = ops::fused::bias_then_residual_layer_bf16_cached_1536(
             backend.context(),
             projection,
             &self.weights.bias,

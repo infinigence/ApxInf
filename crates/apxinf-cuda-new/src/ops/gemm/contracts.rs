@@ -222,6 +222,7 @@ pub(crate) enum Semantic {
     GemmGeglu = 2,
     GemmBias = 3,
     GemmBiasResidual = 4,
+    GemmSwiGluPairInterleaved256 = 5,
 }
 
 #[cfg(test)]
@@ -234,6 +235,7 @@ impl Semantic {
         Self::GemmBiasGelu,
         Self::GemmGeglu,
         Self::GemmBiasResidual,
+        Self::GemmSwiGluPairInterleaved256,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -246,6 +248,7 @@ impl Semantic {
             Self::GemmBiasGelu => "gemm_bias_gelu",
             Self::GemmGeglu => "gemm_geglu",
             Self::GemmBiasResidual => "gemm_bias_residual",
+            Self::GemmSwiGluPairInterleaved256 => "gemm_swiglu_pair_interleaved_256",
         }
     }
 }
@@ -366,13 +369,7 @@ pub(crate) fn normalize_bias_residual<'a>(
     bias: Option<&'a Tensor>,
     residual: &'a Tensor,
 ) -> Result<Normalized> {
-    normalize_fused(
-        ctx,
-        args,
-        Semantic::GemmBiasResidual,
-        bias,
-        Some(residual),
-    )
+    normalize_fused(ctx, args, Semantic::GemmBiasResidual, bias, Some(residual))
 }
 
 fn normalize_fused<'a>(
@@ -416,16 +413,29 @@ fn normalize_fused<'a>(
     {
         return Err(invalid("invalid GEMM dimensions"));
     }
-    if semantic == Semantic::GemmGeglu && n % 2 != 0 {
-        return Err(invalid("GEMM+GeGLU requires an even projection width"));
+    if matches!(
+        semantic,
+        Semantic::GemmGeglu | Semantic::GemmSwiGluPairInterleaved256
+    ) && n % 2 != 0
+    {
+        return Err(invalid("gated GEMM requires an even projection width"));
+    }
+    if semantic == Semantic::GemmSwiGluPairInterleaved256
+        && (args.a.dtype() != DType::BF16
+            || args.b.dtype() != DType::BF16
+            || args.out.dtype() != DType::BF16
+            || n % 512 != 0
+            || args.alpha != 1.0
+            || args.output_scale != 1.0)
+    {
+        return Err(invalid(
+            "pair-interleaved SwiGLU requires BF16, 256-column gate/up pairs, and unit scales",
+        ));
     }
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
-    let needs_bias = matches!(
-        semantic,
-        Semantic::GemmBias | Semantic::GemmBiasGelu
-    );
+    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu);
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
         return Err(invalid("fused operands do not match the semantic operator"));
@@ -482,9 +492,7 @@ fn normalize_fused<'a>(
             if args.a.dtype() != DType::E2M1Pair || args.b.dtype() != DType::E2M1Pair {
                 return Err(invalid("NVFP4 GEMM requires two packed E2M1 tensors"));
             }
-            if a_block_scales.dtype() != DType::F8E4M3
-                || b_block_scales.dtype() != DType::F8E4M3
-            {
+            if a_block_scales.dtype() != DType::F8E4M3 || b_block_scales.dtype() != DType::F8E4M3 {
                 // The kernel reads these as unsigned E4M3. For the non-negative
                 // values a scale tensor holds, that encoding is bit-identical
                 // to signed E4M3, so the checkpoint bytes pass through as-is.
@@ -500,8 +508,12 @@ fn normalize_fused<'a>(
         }
     };
     let has_row_channel_scales = matches!(quantization, 2 | 3);
-    if semantic == Semantic::GemmGeglu && has_row_channel_scales {
-        return Err(invalid("scaled GEMM+GeGLU is unsupported"));
+    if matches!(
+        semantic,
+        Semantic::GemmGeglu | Semantic::GemmSwiGluPairInterleaved256
+    ) && has_row_channel_scales
+    {
+        return Err(invalid("scaled gated GEMM is unsupported"));
     }
     if semantic == Semantic::GemmBiasResidual
         && (quantization != 1 || args.out.dtype() != DType::F16)
@@ -515,7 +527,10 @@ fn normalize_fused<'a>(
         tensor_storage(ctx, args.a, args.a.dtype(), a_shape)?,
         tensor_storage(ctx, args.b, args.b.dtype(), b_shape)?,
     ];
-    let output_width = if semantic == Semantic::GemmGeglu {
+    let output_width = if matches!(
+        semantic,
+        Semantic::GemmGeglu | Semantic::GemmSwiGluPairInterleaved256
+    ) {
         n / 2
     } else {
         n
@@ -573,7 +588,11 @@ fn normalize_fused<'a>(
                 output_bytes,
                 &buffer,
                 bytes,
-                if slot == 0 { "A block scale" } else { "B block scale" },
+                if slot == 0 {
+                    "A block scale"
+                } else {
+                    "B block scale"
+                },
             )?;
             if slot == 0 {
                 bindings.a_block_scales = buffer.ptr();

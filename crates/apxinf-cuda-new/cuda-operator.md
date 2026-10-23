@@ -93,6 +93,18 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | FP8 candidates | Vendor decomposition (FP16 projection for E4M3 output); dual-GeGLU at M522/M533; SM100-family split-GeGLU at M778, 2N32768, K2048; eligible decomposed candidates remain available to autotune |
 | Reference tests | `gemm_geglu_all_candidates_match_torch`, `gemm_geglu_three_view_all_candidates_match_torch` (unit/non-unit scales, eager/graph) |
 
+<!-- l3-operator:gemm_swiglu_pair_interleaved_256 -->
+### `gemm_swiglu_pair_interleaved_256`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_swiglu_pair_interleaved_256(ctx, GemmSwiGluArgs { gemm })` |
+| Inputs | BF16 `A=[M,K]`, `B=[K,2N]`; every 256 gate columns in B are immediately followed by the matching 256 up columns |
+| Output | BF16 `Y=[M,N]` |
+| Mathematical semantic | rounded `SiLU(A@B_gate) * (A@B_up)` for each 256-column pair |
+| Constraints | `2N` is divisible by 512; scales are unit; provider padding is private and never changes the output shape |
+| Candidates | cuBLAS fallback, cuBLASLt, and fixed SM110 CUTLASS at M3387/N9216/K2560 |
+
 ## Shared Attention Contract
 
 Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same dtype, and `scale` is finite and positive with a default of `1/sqrt(head_dim)`. Dense and KV-cache support MHA, GQA, and MQA and require `query_heads % kv_heads == 0`.
@@ -139,3 +151,9 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+The translated fixed-shape implementations are not separate model APIs.
+D256 attention and the 624/2200 vision schedule are candidates in the existing
+Attention registries. BF16 SwiGLU is the GEMM semantic above. First-prefill GDN
+is `ops::gdn_first_prefill`; it owns both the fixed SM110 launch and the generic
+decomposition, so candidate misses never escape to model code.

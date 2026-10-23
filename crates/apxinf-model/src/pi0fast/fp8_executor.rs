@@ -11,9 +11,9 @@
 //! the `[1, 2*mlp]` gate/up result is a few tens of kilobytes against a hundred
 //! megabytes of weights.
 
-use super::backend::{kernels, Context};
+use super::backend::{ops, Context};
 use apxinf_core::{Result, Tensor};
-use kernels::{activation, attention, fused, gemm, norm, quantization, rope};
+use ops::{activation, attention, fused, gemm, norm, quantization, rope};
 
 use super::{
     Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, Pi0FastLanguageConfig,

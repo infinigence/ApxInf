@@ -32,7 +32,7 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda / apxinf-mlx
+apxinf-core / apxinf-cuda-new / apxinf-mlx
   tensors, devices, model-neutral operators, kernel APIs
 ```
 
@@ -43,12 +43,11 @@ implemented. The selection table defines each family's supported geometry,
 precision and compilation scopes; a compiled callable alone does not establish
 hardware or workload acceptance.
 
-Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
-private `src/ffi/` declarations. The C/C++ boundary in
-[`adapters/`](../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
-launches; device implementations belong in `kernels/`, and offline CuTe export
-belongs in `aot/`. These are backend implementation details, not additional
-model-layer interfaces.
+Within the CUDA backend, safe Rust L3 operators call private `src/ffi/`
+declarations. The C/C++ L1 boundary in
+[`native/adapters/`](../crates/apxinf-cuda-new/native/adapters) selects and
+launches in-tree L0 kernels from `native/kernels/`. These are backend
+implementation details, not additional model-layer interfaces.
 
 ## Runtime contracts
 
@@ -95,7 +94,7 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
-| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
+| `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
@@ -246,7 +245,7 @@ library. During an initial port, dependencies follow this matrix:
 | Dependency | Allowed |
 |---|---|
 | `<new_model>` → `apxinf-core` contracts | yes |
-| `<new_model>` → safe `apxinf-cuda` kernel interfaces | yes |
+| `<new_model>` → safe `apxinf-cuda-new` kernel interfaces | yes |
 | `<new_model>` → explicitly shared top-level model modules | yes |
 | `<new_model>` → another model-family directory | no |
 | another model-family directory changed to accommodate `<new_model>` | no by default; requires a separate shared-seam design and review |
