@@ -40,6 +40,14 @@ name = "pi05_bench"
 required-features = ["cuda"]
 
 [[example]]
+name = "pi05_stage_dump"
+required-features = ["cuda"]
+
+[[example]]
+name = "pi05_hip_bench"
+required-features = ["hip"]
+
+[[example]]
 name = "gr00t_bench"
 required-features = ["cuda"]
 

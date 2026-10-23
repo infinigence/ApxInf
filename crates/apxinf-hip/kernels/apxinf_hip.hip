@@ -8,81 +8,21 @@
 //
 // Numerics follow apxinf-cuda's kernels, which are the reference for this
 // backend: BF16 and F32 storage, F32 arithmetic, one rounding at the final
-// store. BF16 conversion is done by hand rather than through <hip/hip_bf16.h>
-// so the rounding is exactly IEEE round-to-nearest-even with quiet NaNs, the
-// same as `half::bf16::from_f32` on the host.
+// store. The BF16 conversion and the wave-size rules live in `common.h`.
 //
-// No kernel uses wave intrinsics or assumes a wave size. Reductions go through
-// shared memory with power-of-two block sizes, so the same code is correct on
-// wave32 (RDNA, e.g. gfx1151) and wave64 (CDNA) devices.
+// The operators `apxinf_hip::native` composes into pi05 live in the sibling
+// translation units (`norm.hip`, `elementwise.hip`, `native_attention.hip`);
+// this file keeps the runtime, hipBLAS and the `Backend` operators.
 
-#include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
-#include <math.h>
-#include <stdint.h>
 #include <stdio.h>
+
+#include "common.h"
 
 namespace {
 
-constexpr int kDTypeF32 = 0;
-constexpr int kDTypeBF16 = 1;
-
-constexpr int kBlasStatusBase = 100000;
-constexpr int kInvalidArgument = 200000;
-
-constexpr int kElementwiseBlock = 256;
-constexpr int kReduceBlock = 256;
-constexpr int kAttentionBlock = 128;
-// Grid-stride loops cover any element count; capping the grid keeps launch
-// dimensions far from the hardware limit without affecting correctness.
-constexpr int64_t kMaxGrid = 1 << 20;
-
-__device__ __forceinline__ float bf16_to_f32(uint16_t bits) {
-  return __uint_as_float(static_cast<uint32_t>(bits) << 16);
-}
-
-__device__ __forceinline__ uint16_t f32_to_bf16(float value) {
-  uint32_t bits = __float_as_uint(value);
-  if ((bits & 0x7fffffffu) > 0x7f800000u) {
-    return static_cast<uint16_t>((bits >> 16) | 0x40u);  // quiet NaN
-  }
-  bits += 0x7fffu + ((bits >> 16) & 1u);
-  return static_cast<uint16_t>(bits >> 16);
-}
-
-template <typename T>
-struct Elem;
-
-template <>
-struct Elem<float> {
-  __device__ static float load(const float* p, int64_t i) { return p[i]; }
-  __device__ static void store(float* p, int64_t i, float v) { p[i] = v; }
-};
-
-template <>
-struct Elem<uint16_t> {
-  __device__ static float load(const uint16_t* p, int64_t i) { return bf16_to_f32(p[i]); }
-  __device__ static void store(uint16_t* p, int64_t i, float v) { p[i] = f32_to_bf16(v); }
-};
-
-__device__ __forceinline__ int64_t global_index() {
-  return static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-}
-
-__device__ __forceinline__ int64_t grid_stride() {
-  return static_cast<int64_t>(gridDim.x) * blockDim.x;
-}
-
-unsigned grid_for(int64_t n, int block) {
-  int64_t blocks = (n + block - 1) / block;
-  if (blocks > kMaxGrid) blocks = kMaxGrid;
-  return static_cast<unsigned>(blocks < 1 ? 1 : blocks);
-}
-
-int last_launch_status() { return static_cast<int>(hipGetLastError()); }
-
-hipStream_t as_stream(void* stream) { return static_cast<hipStream_t>(stream); }
+using namespace apxinf_hip;
 
 // ── Elementwise ─────────────────────────────────────────────────────
 
