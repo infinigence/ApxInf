@@ -133,7 +133,10 @@ def runtime_files(modules: dict[str, Any]) -> dict:
 
 
 def load_dependency(loader_path: Path) -> Any:
-    if not loader_path.is_absolute() or not loader_path.is_file() or file_digest(loader_path) != schema.LOADER_SHA256:
+    if not loader_path.is_absolute() or not loader_path.is_file():
+        raise ClefError("model_unavailable", "The external Clef loader must be a local absolute file.")
+    source = loader_path.read_bytes()
+    if hashlib.sha256(source).hexdigest() != schema.LOADER_SHA256:
         raise ClefError("model_unavailable", "The external Clef loader differs from the pinned dependency.")
     spec = importlib.util.spec_from_file_location("apxinf_selected_clef_dependency", loader_path)
     if spec is None or spec.loader is None:
@@ -143,7 +146,7 @@ def load_dependency(loader_path: Path) -> Any:
     previous_bytecode = sys.dont_write_bytecode
     try:
         sys.dont_write_bytecode = True
-        spec.loader.exec_module(module)
+        exec(compile(source, str(loader_path), "exec", dont_inherit=True), module.__dict__)
     finally:
         sys.dont_write_bytecode = previous_bytecode
     if file_digest(loader_path) != schema.LOADER_SHA256:
