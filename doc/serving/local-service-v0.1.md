@@ -19,6 +19,13 @@ The text provider rejects bundles with `joint_head_config.json` or `joint_head.s
 This provider does not execute a decision head.
 The worker returns `model_unavailable` before model identity hashing or loading.
 
+The separate [Clef text profile](clef-text-v0.1.md) uses the explicit `python-clef` provider.
+It exposes typed decisions through `POST /v1/systemone` and rejects chat requests.
+Its worker exits after each decision, including an input context rejection.
+The supervisor publishes success after checked worker termination and reaping.
+It then loads a replacement with the same approved identity.
+Readiness remains unavailable during replacement loading.
+
 The coordinator removes cancelled and expired waiting requests every 20 milliseconds and before enqueue.
 This cleanup proceeds during active execution and retains FIFO order for remaining requests.
 Queue and public result counters change once for each removed request.
@@ -77,6 +84,42 @@ Writer availability does not establish destination progress.
 Loss counters exclude unread stderr bytes and records without final accounting when the process exits.
 
 ## Build and start
+
+### Clef text decisions
+
+Build the default binary without native model features.
+Select the existing pinned Python environment and external loader explicitly.
+The [dependency record](dependencies.md#clef-text-runtime) lists their roles and versions.
+The model bundle must match the approved artifact digests.
+The external loader remains an installed dependency outside this repository.
+
+```sh
+cargo build --release --locked -p apxinf-serving
+target/release/apxinf-serve \
+  --provider python-clef \
+  --python /absolute/path/to/clef-env/bin/python \
+  --clef-loader /absolute/path/to/clef-model/clef_mlx.py \
+  --model /absolute/path/to/clef-model \
+  --model-id clef-flash \
+  --max-context 4096 --max-output-tokens 0 \
+  --memory-budget-bytes 8589934592 \
+  --host-pressure-policy macos
+```
+
+Send a text decision request to the selected local port.
+This request uses an original example, independent of dependency examples.
+
+```json
+{"model":"clef-flash","state":"The local database connection failed.","questions":{"retry":{"type":"noul","instructions":"Does this state require another connection attempt?"}}}
+```
+
+The worker performs one bounded forward pass without truncation.
+The configured context limit includes the state, question descriptions, and schema encoding.
+Input overflow returns `context_limit` with HTTP 400.
+Requests with images, streaming, or generation controls fail validation.
+The profile reserves no generated tokens and retains no KV cache between requests.
+Replacement loading adds latency to repeated decisions.
+Allocator limits do not guarantee a hard process memory limit.
 
 ### Native MiniCPM5
 
