@@ -13,7 +13,7 @@ The [vision profile](minicpm-vision-v0.1.md) defines a separately selected runti
 Its worker uses public dependency APIs. No dependency implementation enters first-party source.
 The existing text runtime retains its existing versions.
 The vision worker requires Python 3.14.3 and these exact package versions.
-Runtime qualification remains pending until the P2c execution gates pass.
+The [worker report](minicpm-vision-worker-validation-20261023.md) records the selected runtime checks and remaining limits.
 
 | Package | Version | Role |
 | --- | --- | --- |
@@ -86,6 +86,9 @@ It also calls `Image.open`, `verify`, and `load` from the existing Pillow depend
 The component imports no MLX module and enables no worker protocol or image capability.
 `Cargo.lock` retains the resolved decoder dependencies and the existing base64 0.13.1 record.
 
+The CPU workflow installs NumPy 2.5.4 and Pillow 13.0.0 for processor and PNG tests.
+These tests require no model weights or MLX installation.
+
 ## Host pressure sensor
 
 The macOS policy calls the system `sysctlbyname` C interface without an additional package dependency.
@@ -148,7 +151,8 @@ It also records runtime versions, adapter revision, adapter digest, Python diges
 The execution record includes provider, precision, prefill chunk size, output batch size, and memory limit.
 The supervisor checks local artifact digests before it accepts the worker identity.
 
-The Python validators use only the standard library.
+The Python text-protocol validators use only the standard library.
+Vision media validation also uses the recorded Pillow dependency.
 The original CPU tests inject a runtime stub without loading MLX.
 Passing these tests does not prove device execution or model quality.
 
