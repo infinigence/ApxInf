@@ -1,7 +1,9 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -114,10 +116,54 @@ print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}',
         self.assertFalse(result["timed_out"])
         self.assertEqual(live, [])
 
+    def test_escaped_pipe_holder_fails_bounded_drain_without_being_signaled(self):
+        producer = '''import pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'], start_new_session=True)
+pathlib.Path('escaped.pid').write_text(str(child.pid))
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(RuntimeError, "pipes did not close"):
+                    client.capture_client([sys.executable, "-c", producer], directory,
+                                          dict(os.environ), .2, False)
+                self.assertLess(time.monotonic() - started, 1.5)
+                escaped = int((directory / "escaped.pid").read_text())
+                self.assertTrue(any(not member["state"].startswith("Z")
+                                    for member in group_members(escaped)))
+            finally:
+                pid_file = directory / "escaped.pid"
+                if pid_file.exists():
+                    try:
+                        os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_cleanup_failure_cannot_return_a_successful_capture(self):
         with patch.object(client, "stop_child", side_effect=RuntimeError("Unconfirmed cleanup.")):
             with self.assertRaisesRegex(RuntimeError, "Unconfirmed cleanup"):
                 self.capture_owned_probe("print('{}', flush=True)", timeout=2)
+
+    def test_permission_race_recovers_only_a_confirmed_exited_group(self):
+        for alive in (False, True):
+            with self.subTest(alive=alive):
+                process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)" if alive else "pass"],
+                                           start_new_session=True)
+                try:
+                    if not alive:
+                        process.wait(timeout=2)
+                    with patch.object(client, "stop_owned_group", side_effect=PermissionError("Signal denied.")):
+                        if alive:
+                            with self.assertRaises(PermissionError):
+                                client.stop_child(process)
+                        else:
+                            client.stop_child(process)
+                            self.assertEqual(process.returncode, 0)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=2)
 
     def test_missing_requested_tool_stops_before_the_deadline(self):
         producer = '''import time
@@ -190,12 +236,18 @@ while not pathlib.Path('release-producer').exists():
                         break
                     time.sleep(.01)
                 self.assertFalse(future.done())
+                identity = json.loads((directory / "client.process.json").read_text())
+                self.assertGreater(identity["pid"], 0)
+                self.assertEqual(identity["pgid"], identity["pid"])
+                self.assertEqual(os.getpgid(identity["pid"]), identity["pgid"])
                 self.assertIn(b'"capture_probe"', stdout.read_bytes())
                 self.assertEqual(stderr.read_text(), "capture stderr probe\n")
             finally:
                 (directory / "release-producer").touch()
                 result = future.result(timeout=5)
             self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(result["pid"], identity["pid"])
+            self.assertEqual(result["pgid"], identity["pgid"])
             self.assertEqual(result["events"][0]["event"]["subtype"], "capture_probe")
 
 
