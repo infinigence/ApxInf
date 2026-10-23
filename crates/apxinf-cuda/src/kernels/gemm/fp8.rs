@@ -2345,6 +2345,86 @@ pub fn cublaslt_fp8_gemm_split_first_f16(
     ffi::check_cublas(status).map_err(Error::Cuda)
 }
 
+pub fn gemm_fp8_self_qkv_bf16_m41(
+    ctx: &CudaContext,
+    activation: &Tensor,
+    weight: &Tensor,
+    alpha: &Tensor,
+    bias: &Tensor,
+) -> Result<Tensor> {
+    const M: usize = 41;
+    const N: usize = 4608;
+    const K: usize = 1536;
+    if ctx.caps().sm != 110 {
+        return Err(Error::Other(
+            "GR00T FP8 self-QKV fusion requires exact SM110 hardware".into(),
+        ));
+    }
+    if activation.dtype() != DType::F8E4M3
+        || weight.dtype() != DType::F8E4M3
+        || alpha.dtype() != DType::F32
+        || bias.dtype() != DType::BF16
+    {
+        return Err(Error::Other(
+            "GR00T FP8 self-QKV fusion requires E4M3 operands, F32 alpha and BF16 bias".into(),
+        ));
+    }
+    if activation.shape().dims() != [M, K]
+        || weight.shape().dims() != [K, N]
+        || alpha.shape().dims() != [N]
+        || bias.shape().dims() != [N]
+    {
+        return Err(Error::Other(format!(
+            "GR00T FP8 self-QKV fusion requires [{M},{K}] @ [{K},{N}], alpha [{N}], bias [{N}]"
+        )));
+    }
+    let expected_device = Device::Cuda(ctx.device_id());
+    for tensor in [activation, weight, alpha, bias] {
+        if tensor.device() != expected_device {
+            return Err(Error::DeviceMismatch {
+                expected: expected_device,
+                got: tensor.device(),
+            });
+        }
+    }
+
+    #[cfg(not(apxinf_cutlass_gemm))]
+    {
+        return Err(Error::Other(
+            "GR00T FP8 self-QKV fusion requires the SM100-family CUTLASS backend".into(),
+        ));
+    }
+
+    #[cfg(apxinf_cutlass_gemm)]
+    {
+        let output_bytes = M * N * DType::BF16.size_in_bytes();
+        let output = crate::workspace::output_buffer(ctx, output_bytes)?;
+        let activation = CudaBuffer::from_tensor(activation).map_err(Error::Cuda)?;
+        let weight = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
+        let alpha = CudaBuffer::from_tensor(alpha).map_err(Error::Cuda)?;
+        let bias = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
+        let status = unsafe {
+            ffi::apxinf_static_cutlass_fp8_gemm_self_qkv_bf16_m41(
+                activation.ptr(),
+                weight.ptr(),
+                alpha.ptr() as *const f32,
+                bias.ptr(),
+                output.ptr(),
+                M as i32,
+                N as i32,
+                K as i32,
+                ctx.stream().handle(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Cuda(format!(
+                "GR00T FP8 self-QKV CUTLASS launch failed ({status})"
+            )));
+        }
+        Ok(output.into_tensor(Shape::new(vec![M, N]), DType::BF16))
+    }
+}
+
 #[cfg(test)]
 mod fp8_dual_geglu_tests {
     use super::*;

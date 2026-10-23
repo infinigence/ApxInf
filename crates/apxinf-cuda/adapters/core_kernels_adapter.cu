@@ -762,7 +762,29 @@ extern "C" cudaError_t apxinf_build_vision_rotation_table_f32(
     return cudaGetLastError();
 }
 
+static cudaError_t launch_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream);
+
 extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream)
+{
+    if (qkv == nullptr || bias == nullptr || q_out == nullptr || k_out == nullptr ||
+        v_out == nullptr || rotation_table == nullptr || head_dim == 0 ||
+        (head_dim % 2) != 0 || n_heads == 0 || seq_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    return launch_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
+        qkv, bias, q_out, k_out, v_out, head_dim, n_heads, seq_len,
+        rotation_table, stream);
+}
+
+// Scalar (one pair per thread) form; also the bitwise reference in tests.
+static cudaError_t launch_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
     const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
     uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
     const void* rotation_table, void* stream)
@@ -927,5 +949,46 @@ extern "C" cudaError_t apxinf_argmax_remap_bf16(
     argmax_remap_bf16_kernel<<<1, 256, 0, s>>>(
         (const __nv_bfloat16*)logits, n, (const uint32_t*)remap,
         (uint32_t*)out);
+    return cudaGetLastError();
+}
+
+// Regression-test reference only; not a supported production C ABI.
+extern "C" cudaError_t apxinf_reference_qkv_split_bias_vision_rope_precomputed_bf16(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream) {
+  return launch_qkv_split_bias_vision_rope_precomputed_scalar_bf16(
+      qkv, bias, q_out, k_out, v_out, head_dim, n_heads, seq_len,
+      rotation_table, stream);
+}
+
+// Explicit SM110 specialization; the caller selects this entry point.
+extern "C" cudaError_t apxinf_qkv_split_bias_vision_rope_precomputed_bf16_sm110(
+    const void* qkv, const void* bias, void* q_out, void* k_out, void* v_out,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    const void* rotation_table, void* stream) {
+    if (qkv == nullptr || bias == nullptr || q_out == nullptr || k_out == nullptr ||
+        v_out == nullptr || rotation_table == nullptr || head_dim == 0 ||
+        (head_dim % 2) != 0 || n_heads == 0 || seq_len == 0) {
+        return cudaErrorInvalidValue;
+    }
+    // Four rotary pairs per thread with 8-byte BF16 and 32-byte table
+    // accesses; same per-element arithmetic as the scalar kernel below.
+
+  const bool supported = (head_dim / 2) % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(qkv) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(bias) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(q_out) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(k_out) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(v_out) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(rotation_table) % 32 == 0;
+  if (!supported) return cudaErrorInvalidValue;
+
+    const uint64_t groups = (uint64_t)seq_len * n_heads * (head_dim / 8);
+    qkv_split_bias_vision_rope_bf16_vec_kernel<4><<<
+        (uint32_t)((groups + 127) / 128), 128, 0, (cudaStream_t)stream>>>(
+        (const __nv_bfloat16*)qkv, (const __nv_bfloat16*)bias,
+        (__nv_bfloat16*)q_out, (__nv_bfloat16*)k_out, (__nv_bfloat16*)v_out,
+        head_dim, n_heads, seq_len, (const float2*)rotation_table);
     return cudaGetLastError();
 }

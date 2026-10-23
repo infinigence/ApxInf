@@ -13,6 +13,8 @@ mod cutlass;
 mod driver;
 mod fa2;
 mod linear_attention;
+#[cfg(test)]
+pub(crate) mod reference;
 
 pub(crate) use cublas::*;
 pub(crate) use cublaslt::*;

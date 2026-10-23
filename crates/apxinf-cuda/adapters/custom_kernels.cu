@@ -57,6 +57,34 @@ extern "C" cudaError_t apxinf_sinusoidal_embedding_bf16(const void* positions,vo
   return cudaGetLastError();
 }
 
+// L2 warm-up hint for a read-only weight that a later kernel will stream.
+// Issued on a forked side stream inside the CUDA graph so it overlaps
+// DRAM-light work on the main stream; it never changes any data.
+__global__ void l2_bulk_prefetch_kernel(const char* base, uint64_t bytes, uint32_t chunk) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint64_t count = (bytes + chunk - 1) / chunk;
+  for (uint64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+    const uint64_t offset = i * chunk;
+    const uint32_t size = static_cast<uint32_t>(
+        (bytes - offset) < chunk ? (bytes - offset) : chunk);
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                 :: "l"(base + offset), "r"(size) : "memory");
+  }
+#endif
+}
+
+extern "C" cudaError_t apxinf_l2_bulk_prefetch(
+    const void* base, uint64_t bytes, uint32_t chunk, uint32_t blocks,
+    uint32_t threads, cudaStream_t stream) {
+  if (!base || bytes == 0 || chunk == 0 || chunk % 16 != 0 || bytes % 16 != 0 ||
+      reinterpret_cast<uintptr_t>(base) % 16 != 0 || blocks == 0 || threads == 0)
+    return cudaErrorInvalidValue;
+  l2_bulk_prefetch_kernel<<<blocks, threads, 0, stream>>>(
+      static_cast<const char*>(base), bytes, chunk);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t apxinf_relu_bf16(const void* x,void* y,int64_t count,cudaStream_t stream) {
   if(!x||!y||count<=0) return cudaErrorInvalidValue;
   relu_bf16_kernel<<<256,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_bfloat16*)y,count);
@@ -93,6 +121,10 @@ extern "C" cudaError_t apxinf_channel_layer_norm_bf16_rounded(const void* x,
 }
 
 namespace {
+
+bool aligned16(const void* pointer) {
+  return reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
+}
 
 // Resolve the validated action Ada packed8 route before CUDA graph capture.
 // Auto enables it only for the exact supported shape.
@@ -231,6 +263,7 @@ extern "C" cudaError_t apxinf_static_concat_rows_quantize_bf16_e4m3(
   const int64_t first_count = static_cast<int64_t>(first_rows) * cols;
   const int64_t total_count =
       static_cast<int64_t>(first_rows + second_rows) * cols;
+
   int blocks = static_cast<int>((total_count + 255) / 256);
   blocks = blocks > 4096 ? 4096 : blocks;
   concat_rows_quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
@@ -739,7 +772,26 @@ extern "C" cudaError_t apxinf_static_rms_norm_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+static cudaError_t launch_static_layer_norm_quant_bf16_e4m3_generic(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream);
+
 extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+
+  return launch_static_layer_norm_quant_bf16_e4m3_generic(
+      input, weight, bias, output, rows, cols, eps, scale, stream);
+}
+
+// Generic shared-memory kernel for any width; also the bitwise reference
+// for the fixed-width specialization in tests.
+static cudaError_t launch_static_layer_norm_quant_bf16_e4m3_generic(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, float scale, cudaStream_t stream) {
   if (input == nullptr || weight == nullptr || bias == nullptr ||
@@ -781,7 +833,25 @@ extern "C" cudaError_t apxinf_static_bias_gelu_quant_f16_e4m3(
   return cudaGetLastError();
 }
 
+static cudaError_t launch_static_bias_gelu_quant_packed4_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream);
+
 extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+
+  return launch_static_bias_gelu_quant_packed4_bf16_e4m3(
+      input, bias, output, rows, cols, scale, stream);
+}
+
+// The original packed-4 kernel; also the reference for the vec8 kernel's test.
+static cudaError_t launch_static_bias_gelu_quant_packed4_bf16_e4m3(
     const void* input, const void* bias, void* output, int rows, int cols,
     float scale, cudaStream_t stream) {
   if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
@@ -2081,5 +2151,98 @@ extern "C" cudaError_t apxinf_pillow_bicubic_u8_axis(
       static_cast<const int64_t*>(output_offsets),
       static_cast<const int32_t*>(bounds), static_cast<const int32_t*>(weights),
       ksize, in_w, in_h, out_w, out_h, horizontal);
+  return cudaGetLastError();
+}
+
+// Regression-test reference only; not a supported production C ABI.
+extern "C" cudaError_t apxinf_reference_layer_norm_quant_bf16_e4m3(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  return launch_static_layer_norm_quant_bf16_e4m3_generic(
+      input, weight, bias, output, rows, cols, eps, scale, stream);
+}
+
+// Regression-test reference only; not a supported production C ABI.
+extern "C" cudaError_t apxinf_reference_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  return launch_static_bias_gelu_quant_packed4_bf16_e4m3(
+      input, bias, output, rows, cols, scale, stream);
+}
+
+// Explicit SM110 specialization; the caller selects this entry point.
+extern "C" cudaError_t apxinf_static_layer_norm_quant_bf16_e4m3_sm110(
+    const void* input, const void* weight, const void* bias, void* output,
+    int rows, int cols, float eps, float scale, cudaStream_t stream) {
+  if (input == nullptr || weight == nullptr || bias == nullptr ||
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f) ||
+      !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  // GR00T vision width (Qwen3-VL ViT hidden 1024): register-resident form,
+  // bitwise identical to the generic kernel.
+
+  const bool supported = cols == 1024;
+  if (!supported) return cudaErrorInvalidValue;
+
+  layer_norm_quant_bf16_e4m3_fixed_kernel<1024><<<rows, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(weight),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), rows, eps, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+// Explicit SM110 specialization; the caller selects this entry point.
+extern "C" cudaError_t apxinf_static_bias_gelu_quant_bf16_e4m3_sm110(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, cudaStream_t stream) {
+  if (!input || !bias || !output || rows <= 0 || cols <= 0 || cols % 4 != 0 ||
+      !(scale > 0.0f) || reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) != 0 ||
+      reinterpret_cast<uintptr_t>(output) % alignof(uint32_t) != 0)
+    return cudaErrorInvalidValue;
+
+  const bool supported = cols % 8 == 0 && rows <= 65535 &&
+      reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(bias) % 16 == 0 &&
+      reinterpret_cast<uintptr_t>(output) % 8 == 0;
+  if (!supported) return cudaErrorInvalidValue;
+
+  const int groups_per_row = cols / 8;
+  const int threads = groups_per_row < 256 ? groups_per_row : 256;
+  const dim3 grid((groups_per_row + threads - 1) / threads, rows);
+  bias_gelu_quant_bf16_e4m3_vec8_kernel<<<grid, threads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input),
+      static_cast<const __nv_bfloat16*>(bias),
+      static_cast<__nv_fp8_e4m3*>(output), cols, 1.0f / scale);
+  return cudaGetLastError();
+}
+
+// Explicit SM110 specialization; the caller selects this entry point.
+extern "C" cudaError_t apxinf_static_concat_rows_quantize_bf16_e4m3_sm110(
+    const void* first, const void* second, void* output,
+    int first_rows, int second_rows, int cols, float scale,
+    cudaStream_t stream) {
+  if (first == nullptr || second == nullptr || output == nullptr ||
+      first_rows <= 0 || second_rows <= 0 || cols <= 0 || !(scale > 0.0f)) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t first_count = static_cast<int64_t>(first_rows) * cols;
+  const int64_t total_count =
+      static_cast<int64_t>(first_rows + second_rows) * cols;
+
+  const bool supported = first_count % 8 == 0 && total_count % 8 == 0 &&
+      aligned16(first) && aligned16(second) && aligned16(output);
+  if (!supported) return cudaErrorInvalidValue;
+
+  const int64_t total_vectors = total_count / 8;
+  int vector_blocks = static_cast<int>((total_vectors + 255) / 256);
+  vector_blocks = vector_blocks > 4096 ? 4096 : vector_blocks;
+  concat_rows_quantize_bf16_e4m3_packed8_kernel<<<vector_blocks, 256, 0, stream>>>(
+      static_cast<const Bf16Pack8*>(first),
+      static_cast<const Bf16Pack8*>(second),
+      static_cast<Fp8Pack8*>(output), first_count / 8, total_vectors,
+      1.0f / scale);
   return cudaGetLastError();
 }
