@@ -33,6 +33,18 @@ fn values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
+fn write_bf16(tensor: &Tensor, values: &[f32]) {
+    let words: Vec<u16> = values
+        .iter()
+        .map(|&value| bf16::from_f32(value).to_bits())
+        .collect();
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    CudaBuffer::from_tensor(tensor)
+        .unwrap()
+        .copy_from_host(&bytes)
+        .unwrap();
+}
+
 fn run_gemm(
     ctx: &CudaContext,
     a: &Tensor,
@@ -105,6 +117,93 @@ fn prepared_phase_runs_the_same_forward_for_prepare_and_capture() {
 }
 
 #[test]
+fn prepared_phase_uses_one_plan_for_eager_and_graph_execution() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = bf16_tensor(0, vec![2, 3], &[1.0; 6]);
+    let b = bf16_tensor(0, vec![3, 4], &[1.0; 12]);
+    let mut out = bf16_tensor(0, vec![2, 4], &[0.0; 8]);
+    let mut traversals = 0;
+
+    let mut phase = PreparedPhase::prepare(
+        &ctx,
+        ExecutionSession::with_capacity(4096, 0).unwrap(),
+        || {
+            traversals += 1;
+            run_gemm(&ctx, &a, &b, &mut out)
+        },
+    )
+    .unwrap();
+    assert_eq!(traversals, 1);
+    assert!(!phase.is_captured());
+
+    // Runtime values may change while the prepared Spec and addresses stay
+    // fixed. Eager execution reuses the prepared native execution.
+    write_bf16(&a, &[2.0; 6]);
+    phase
+        .run_eager(|| {
+            traversals += 1;
+            run_gemm(&ctx, &a, &b, &mut out)
+        })
+        .unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(traversals, 2);
+    assert!(values(&out).iter().all(|&value| value == 6.0));
+
+    phase
+        .capture(&ctx, || {
+            traversals += 1;
+            run_gemm(&ctx, &a, &b, &mut out)
+        })
+        .unwrap();
+    assert_eq!(traversals, 3);
+    assert!(phase.is_captured());
+
+    write_bf16(&a, &[4.0; 6]);
+    phase.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&value| value == 12.0));
+
+    // Capturing does not disable the same plan's eager path.
+    write_bf16(&a, &[5.0; 6]);
+    phase
+        .run_eager(|| run_gemm(&ctx, &a, &b, &mut out))
+        .unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&out).iter().all(|&value| value == 15.0));
+}
+
+#[test]
+fn prepared_phase_eager_rejects_an_unprepared_binding() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = bf16_tensor(0, vec![2, 3], &[1.0; 6]);
+    let b = bf16_tensor(0, vec![3, 4], &[1.0; 12]);
+    let mut prepared_out = bf16_tensor(0, vec![2, 4], &[0.0; 8]);
+    let mut other_out = bf16_tensor(0, vec![2, 4], &[0.0; 8]);
+
+    let phase = PreparedPhase::prepare(
+        &ctx,
+        ExecutionSession::with_capacity(4096, 0).unwrap(),
+        || run_gemm(&ctx, &a, &b, &mut prepared_out),
+    )
+    .unwrap();
+
+    let error = phase
+        .run_eager(|| run_gemm(&ctx, &a, &b, &mut other_out))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cache miss in a prepared phase"),
+        "unexpected error: {error}"
+    );
+
+    // A rejected binding must not poison the original fixed plan.
+    phase
+        .run_eager(|| run_gemm(&ctx, &a, &b, &mut prepared_out))
+        .unwrap();
+    ctx.synchronize().unwrap();
+    assert!(values(&prepared_out).iter().all(|&value| value == 3.0));
+}
+
+#[test]
 fn public_l3_capture_rejects_cached_instance_from_another_stream() {
     let capture_ctx = CudaContext::new(0).unwrap();
     let execution_ctx = CudaContext::new(0).unwrap();
@@ -153,7 +252,7 @@ fn public_l3_capture_rejects_an_unprepared_cache_miss() {
         Err(error) => error,
     };
     assert!(
-        error.to_string().contains("cache miss during capture"),
+        error.to_string().contains("cache miss in a prepared phase"),
         "unexpected error: {error}"
     );
 }
