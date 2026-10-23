@@ -33,8 +33,9 @@ def event(kind, blocks=None, **fields):
     return {"elapsed_s": .1, "event": item}
 
 
-def call(tool_id, name, path):
-    return event("assistant", [{"type": "tool_use", "id": tool_id, "name": name, "input": {"file_path": str(path)}}])
+def call(tool_id, name, path, **arguments):
+    return event("assistant", [{"type": "tool_use", "id": tool_id, "name": name,
+                               "input": {"file_path": str(path), **arguments}}])
 
 
 def result(tool_id):
@@ -55,7 +56,7 @@ class PracticalCaseTests(unittest.TestCase):
         events = [event("system", subtype="init", tools=["Read", "Edit"])]
         for index, path in enumerate(spec["input_files"]):
             events += [call(f"r{index}", "Read", path), result(f"r{index}")]
-        events += [call("e0", "Edit", directory / spec["output_path"]), result("e0"),
+        events += [call("e0", "Edit", directory / spec["output_path"], old_string="", new_string=json.dumps(expected)), result("e0"),
                    event("result", subtype="success", is_error=False, result="Saved.", usage={"input_tokens": 501})]
         capture = {"events": events, "exit_code": 0, "timed_out": False, "cancel_sent": False,
                    "tool_inventory": {"status": "verified", "requested": ["Edit", "Read"]}, "diagnostics": []}
@@ -84,6 +85,41 @@ class PracticalCaseTests(unittest.TestCase):
         spec = client.prepare_task("expenses", directory)
         self.assertEqual((directory / spec["output_path"]).read_bytes(), b"")
         self.assertEqual(spec["input_files"]["transactions.csv"]["bytes"], (directory / "transactions.csv").read_bytes())
+
+    def test_edit_payload_must_save_the_independent_expected_json(self):
+        directory, spec, capture = self.fixture()
+        payloads = ({}, {"old_string": "", "new_string": "unrelated"},
+                    {"old_string": "existing", "new_string": json.dumps(EXPENSES)},
+                    {"old_string": "", "new_string": {}},
+                    {"old_string": "", "new_string": " " * 8193},
+                    {"old_string": "", "new_string": '{"total_cents":31650,"total_cents":0}'},
+                    {"old_string": "", "new_string": json.dumps({**EXPENSES, "total_cents": 31650.0})},
+                    {"old_string": "", "new_string": json.dumps({**EXPENSES, "total_cents": 0})})
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                current = deepcopy(capture)
+                current["events"][5]["event"]["message"]["content"][0]["input"] = {
+                    "file_path": spec["output_path"], **payload}
+                outcome = self.outcome(directory, spec, current)
+                self.assertTrue(outcome["artifact_check"]["valid"])
+                self.assertFalse(outcome["tool_cycle_passed"])
+                self.assertFalse(outcome["passed"])
+
+    def test_edit_json_whitespace_and_object_key_order_are_free(self):
+        directory, spec, capture = self.fixture()
+        replacement = json.dumps(EXPENSES, indent=2, sort_keys=True) + "\n"
+        capture["events"][5]["event"]["message"]["content"][0]["input"]["new_string"] = replacement
+        self.assertTrue(self.outcome(directory, spec, capture)["passed"])
+
+    def test_malformed_content_returns_a_failed_sample(self):
+        directory, spec, capture = self.fixture()
+        for block in (None, "not a block", 7):
+            with self.subTest(block=block):
+                current = deepcopy(capture)
+                current["events"][1]["event"]["message"]["content"] = [block]
+                outcome = self.outcome(directory, spec, current)
+                self.assertFalse(outcome["passed"])
+                self.assertFalse(outcome["tool_cycle_passed"])
 
     def test_wrong_totals_refund_inclusion_or_type_fails(self):
         directory, spec, capture = self.fixture()
