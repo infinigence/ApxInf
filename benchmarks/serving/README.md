@@ -457,6 +457,8 @@ The report adds `calculation_receipt` and `tool_cycle_reason` to the existing ev
 
 Run these cases with `--tasks expenses-tools-cny expenses-tools-usd`.
 CPU tests verify calculator behavior and trace rejection. Actual model completion requires a separate captured client run.
+The [M4 expense trial report](../../doc/serving/expense-tools-validation-20261023.md) records six failed MiniCPM5-2B task attempts.
+Successful HTTP requests and CPU arithmetic do not establish task completion.
 The evidence assumes trusted capture and no external writer. Tool permissions do not provide an operating-system sandbox.
 These cases do not establish long-context capacity or general financial quality.
 
