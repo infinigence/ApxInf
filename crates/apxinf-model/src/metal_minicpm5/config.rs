@@ -2,9 +2,28 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-pub const CONTEXT_CAPACITY: usize = 16384;
-pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
+pub const CONTEXT_CAPACITY: usize = 65536;
 pub const PREFILL_CHUNK_TOKENS: usize = 256;
+pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
+pub(super) const PREFILL_CHUNK: usize = 512;
+
+pub(super) fn attention_width(variant: Variant, end: usize, capacity: usize) -> usize {
+    if variant == Variant::DSpark || capacity <= DSPARK_CONTEXT_CAPACITY {
+        capacity
+    } else {
+        (end.div_ceil(256) * 256).min(capacity)
+    }
+}
+
+pub(super) fn prefill_lengths(prompt: usize) -> Vec<usize> {
+    if prompt <= DSPARK_CONTEXT_CAPACITY {
+        vec![prompt]
+    } else if prompt % PREFILL_CHUNK == 0 {
+        vec![PREFILL_CHUNK]
+    } else {
+        vec![PREFILL_CHUNK, prompt % PREFILL_CHUNK]
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -28,6 +47,27 @@ pub struct Config {
 }
 
 impl Config {
+    pub(super) fn request_capacity(
+        &self,
+        variant: Variant,
+        prompt: usize,
+        output: usize,
+    ) -> Result<usize> {
+        let total = prompt
+            .checked_add(output)
+            .ok_or(Error::Contract("MiniCPM context overflow"))?;
+        let limit = self.max_position_embeddings.min(match variant {
+            Variant::DSpark => DSPARK_CONTEXT_CAPACITY,
+            _ => CONTEXT_CAPACITY,
+        });
+        if prompt == 0 || total > limit {
+            return Err(Error::Other(format!(
+                "MiniCPM5 {variant:?} requires a nonempty prompt and prompt + output <= {limit}"
+            )));
+        }
+        Ok((total.div_ceil(256) * 256).min(limit))
+    }
+
     pub fn from_json(raw: &str) -> Result<Self> {
         let config: Self =
             serde_json::from_str(raw).map_err(|e| Error::Other(format!("MiniCPM5 config: {e}")))?;
@@ -61,15 +101,7 @@ impl Config {
         Ok(())
     }
 
-    pub(crate) fn validate_variant(&self, variant: Variant) -> Result<()> {
-        self.validate()?;
-        if self.max_position_embeddings < variant.context_capacity() {
-            return Err(Error::Contract(
-                "MiniCPM checkpoint positions do not cover the selected variant",
-            ));
-        }
-        Ok(())
-    }
+
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,46 +117,6 @@ impl Variant {
             Self::Public | Self::Compiled => CONTEXT_CAPACITY,
             Self::DSpark => DSPARK_CONTEXT_CAPACITY,
         }
-    }
-
-    pub(crate) fn request_capacity(self, prompt: usize, output: usize) -> Result<usize> {
-        let total = prompt
-            .checked_add(output)
-            .ok_or(Error::Contract("MiniCPM context overflow"))?;
-        if prompt == 0 || total > self.context_capacity() {
-            return Err(Error::Other(format!(
-                "MiniCPM5 supports B1 with at most {} consumed positions for {self:?}",
-                self.context_capacity()
-            )));
-        }
-        Ok(total.div_ceil(PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS)
-    }
-
-    pub(crate) fn prefill_rows(self, prompt: usize, position: usize) -> Option<usize> {
-        if position >= prompt {
-            return None;
-        }
-        if self == Self::DSpark {
-            return (position == 0).then_some(prompt);
-        }
-        (position % PREFILL_CHUNK_TOKENS == 0)
-            .then_some((prompt - position).min(PREFILL_CHUNK_TOKENS))
-    }
-
-    pub(crate) fn prepared_lengths(self, prompt: usize) -> Vec<usize> {
-        let max_decode_rows = if self == Self::DSpark { 8 } else { 1 };
-        let mut lengths = (1..=max_decode_rows).collect::<Vec<_>>();
-        lengths.push(prompt);
-        if self != Self::DSpark {
-            lengths.push(prompt.min(PREFILL_CHUNK_TOKENS));
-            let tail = prompt % PREFILL_CHUNK_TOKENS;
-            if tail > 0 {
-                lengths.push(tail);
-            }
-        }
-        lengths.sort_unstable();
-        lengths.dedup();
-        lengths
     }
 
     pub fn parse(name: Option<&str>) -> Result<Self> {
@@ -180,64 +172,35 @@ mod tests {
     }
 
     #[test]
-    fn request_capacity_checks_empty_edges_and_overflow() {
-        for variant in [Variant::Public, Variant::Compiled, Variant::DSpark] {
-            let limit = variant.context_capacity();
-            assert!(variant.request_capacity(0, 1).is_err());
-            assert_eq!(variant.request_capacity(limit - 1, 1).unwrap(), limit);
-            assert!(variant.request_capacity(limit, 1).is_err());
-            assert!(variant.request_capacity(usize::MAX, 1).is_err());
-            assert_eq!(variant.request_capacity(256, 1).unwrap(), 512);
-        }
-        assert_eq!(Variant::DSpark.context_capacity(), 4096);
-        assert_eq!(Variant::Compiled.context_capacity(), 16384);
-        assert_eq!(Variant::Public.context_capacity(), 16384);
-        assert!(Variant::Compiled.request_capacity(32767, 1).is_err());
-    }
-
-    #[test]
-    fn checkpoint_positions_must_cover_the_selected_variant() {
-        let mut c = config();
-        c.max_position_embeddings = 4096;
-        assert!(c.validate_variant(Variant::DSpark).is_ok());
-        assert!(c.validate_variant(Variant::Public).is_err());
-        assert!(c.validate_variant(Variant::Compiled).is_err());
-        c.max_position_embeddings = 16384;
-        assert!(c.validate_variant(Variant::Public).is_ok());
-        assert!(c.validate_variant(Variant::Compiled).is_ok());
-        c.max_position_embeddings = 4095;
-        assert!(c.validate_variant(Variant::DSpark).is_err());
-    }
-
-    #[test]
-    fn prefill_admits_only_exact_chunk_offsets_and_shapes() {
-        for variant in [Variant::Public, Variant::Compiled] {
-            for (prompt, expected) in [
-                (1, vec![(0, 1)]),
-                (255, vec![(0, 255)]),
-                (256, vec![(0, 256)]),
-                (257, vec![(0, 256), (256, 1)]),
-                (513, vec![(0, 256), (256, 256), (512, 1)]),
-            ] {
-                let actual = (0..=prompt)
-                    .filter_map(|position| {
-                        variant
-                            .prefill_rows(prompt, position)
-                            .map(|rows| (position, rows))
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(actual, expected);
-            }
-            assert_eq!(variant.prefill_rows(0, 0), None);
-            assert_eq!(variant.prefill_rows(257, usize::MAX), None);
-            assert_eq!(variant.prepared_lengths(513), vec![1, 256, 513]);
-            assert_eq!(variant.prepared_lengths(511), vec![1, 255, 256, 511]);
-        }
-        assert_eq!(Variant::DSpark.prefill_rows(513, 0), Some(513));
-        assert_eq!(Variant::DSpark.prefill_rows(513, 256), None);
+    fn ordinary_capacity_grows_without_widening_dspark() {
+        let c = config();
+        assert_eq!(c.request_capacity(Variant::Compiled, 256, 1).unwrap(), 512);
         assert_eq!(
-            Variant::DSpark.prepared_lengths(513),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 513]
+            c.request_capacity(Variant::Compiled, 65408, 128).unwrap(),
+            65536
         );
+        assert!(c.request_capacity(Variant::Compiled, 65409, 128).is_err());
+        assert!(c.request_capacity(Variant::Public, 0, 1).is_err());
+        assert!(c.request_capacity(Variant::Public, usize::MAX, 1).is_err());
+        assert_eq!(
+            c.request_capacity(Variant::DSpark, 3840, 256).unwrap(),
+            4096
+        );
+        assert!(c.request_capacity(Variant::DSpark, 3841, 256).is_err());
+        assert_eq!(prefill_lengths(4096), vec![4096]);
+        assert_eq!(prefill_lengths(4097), vec![512, 1]);
+        assert_eq!(prefill_lengths(65536), vec![512]);
+        let mut c = config();
+        c.max_position_embeddings = 5001;
+        assert_eq!(
+            c.request_capacity(Variant::Compiled, 5000, 1).unwrap(),
+            5001
+        );
+        assert!(c.request_capacity(Variant::Compiled, 5001, 1).is_err());
+        assert_eq!(attention_width(Variant::Compiled, 1, 4096), 4096);
+        assert_eq!(attention_width(Variant::Compiled, 256, 65536), 256);
+        assert_eq!(attention_width(Variant::Compiled, 257, 65536), 512);
+        assert_eq!(attention_width(Variant::Compiled, 65536, 65536), 65536);
+        assert_eq!(attention_width(Variant::DSpark, 1, 4096), 4096);
     }
 }

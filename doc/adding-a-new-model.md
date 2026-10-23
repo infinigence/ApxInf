@@ -48,8 +48,11 @@ Keep `forward(token_ids, start_pos)` full: its result is
 `[seq_len, vocab_size]`. A generation-oriented `prefill(LlmInput)` may consume
 the complete prompt into state and return only `[1, vocab_size]`; the shared
 sampler takes the last row. Qwen3's native prefill evaluates cache-only chunks
-before its final token, and MiniCPM5 applies its head only to the final prompt
-row. Specialized speculative generation belongs to the request-level hook.
+before its final token. MiniCPM5 applies its head to the final row of each
+prefill chunk and returns the last chunk's result. Long generation preparation
+may admit bounded chunk shapes without admitting a full prompt-sized forward;
+report those actual shapes in `preparation_status`. Specialized speculative
+generation belongs to the request-level hook.
 
 A small model commonly starts with:
 
