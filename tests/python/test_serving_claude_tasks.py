@@ -251,6 +251,56 @@ while not pathlib.Path('release-producer').exists():
             self.assertEqual(result["events"][0]["event"]["subtype"], "capture_probe")
 
 
+class TaskWorkspaceTests(unittest.TestCase):
+    def test_run_exposes_only_case_files_in_client_working_directory(self):
+        producer = '''import json, os, pathlib, sys
+print(json.dumps({"type": "system", "subtype": "init", "tools": ["Read", "Edit", "Bash"]}), flush=True)
+print("workspace probe stderr", file=sys.stderr, flush=True)
+observation = {"cwd": str(pathlib.Path.cwd()), "entries": sorted(os.listdir(".")),
+               "config_dir": os.environ["CLAUDE_CONFIG_DIR"]}
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": json.dumps(observation)}), flush=True)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            executable = directory / "workspace-probe"
+            executable.write_text(f"#!{sys.executable}\n" + producer)
+            executable.chmod(0o700)
+            output = directory / "run"
+            args = client.parser().parse_args([
+                "--claude", str(executable), "--output-dir", str(output),
+                "--tasks", "expenses-tools-cny", "--timeout", "5"])
+            with patch.object(client, "request_json", side_effect=[
+                    (200, {"data": [{"id": "workspace-probe-model"}]}),
+                    (200, {"worker": {"capabilities": {"max_context": 4096}}})]), \
+                    patch.object(client, "metrics_snapshot", return_value={"values": {}}):
+                self.assertEqual(client.run(args), 1)
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(len(report["tasks"]), 1)
+            record = report["tasks"][0]
+            self.assertEqual(record["exit_code"], 0)
+            self.assertFalse(record["timed_out"])
+            self.assertFalse(record["passed"])
+            self.assertTrue(record["inputs_unchanged"])
+            self.assertEqual(record["tool_inventory"]["status"], "verified")
+            observation = json.loads(record["result"]["result"])
+            workspace = Path(observation["cwd"])
+            self.assertEqual(workspace, Path(record["directory"]))
+            config = Path(observation["config_dir"])
+            self.assertTrue(config.is_dir())
+            for field in ("stdout_path", "stderr_path", "process_path"):
+                self.assertTrue(Path(record[field]).is_file(), record[field])
+            self.assertEqual(Path(record["stderr_path"]).read_text(), "workspace probe stderr\n")
+            identity = json.loads(Path(record["process_path"]).read_text())
+            self.assertEqual(identity, {"pid": record["pid"], "pgid": record["pgid"]})
+            self.assertEqual(set(observation["entries"]), {
+                "transactions.csv", "expense-rules.txt", "calculator-usage.txt",
+                "expense_calculator.py", "calculation-plan.json", "expenses.json"})
+            for path in (config, *(Path(record[field]) for field in (
+                    "stdout_path", "stderr_path", "process_path"))):
+                self.assertFalse(path.is_relative_to(workspace), str(path))
+
+
 class PelicanTaskTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
