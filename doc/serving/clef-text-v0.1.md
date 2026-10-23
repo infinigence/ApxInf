@@ -64,6 +64,7 @@ Existing text workers retain their rejection of model bundles with decision-head
 
 Invalid shape or unsupported request fields produce `invalid_request` before preparation.
 An unknown model produces `model_not_found` with HTTP status 404.
+Context overflow produces `context_limit` with HTTP status 400.
 Queue, deadline, cancellation, pressure, and worker errors retain their existing service meanings.
 
 ## Public response
@@ -126,6 +127,8 @@ The adapter calls public `clef.load(path, backend="lm")`.
 It calls public `clef.encode_record` for preparation.
 It calls public `model.logits` for the decision.
 Both encoding paths use `max_length=max_context`, `max_state_tokens=None`, `processor=None`, and `truncate=False`.
+The adapter passes `processor=None` directly to `encode_record`.
+For `model.logits`, the selected LM model supplies its own processor, which must be `None`.
 The adapter must compare the actual returned encoding with the preparation before accepting logits.
 It converts each logit vector to float32 before public `mlx.core.softmax`.
 It evaluates the vectors and converts their values to host floats.
@@ -178,9 +181,11 @@ It excludes subdirectories, symlinks, `__pycache__`, Python code, README files, 
 It includes the configuration, tokenizer, template, joint-head files, weight index, and every indexed weight shard.
 The adapter rejects missing required artifacts or index references outside that set.
 Both processes check file lengths and digests before readiness.
+The approved artifact records are in `python/apxinf/apxinf/serving/clef_artifacts.json`.
+Both implementations use that same maintained record, without replacing its expected digests from the selected model directory.
 The loader record contains exactly absolute `path` and the pinned `sha256`.
 
-`sources` has exactly `clef_worker.py`, `clef_runtime.py`, `clef_identity.py`, `clef_contracts.py`, and `contracts.py`.
+`sources` has exactly `clef_worker.py`, `clef_runtime.py`, `clef_identity.py`, `clef_contracts.py`, `contracts.py`, and `clef_artifacts.json`.
 Each source record contains exactly absolute `path` and `sha256`.
 Each filename must match its recorded file and the selected adapter source tree.
 The Python record contains exactly absolute `path` and `sha256`.
