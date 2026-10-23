@@ -154,6 +154,68 @@ async fn memory_limits_fail_before_the_worker_can_start() {
     }
 }
 
+#[tokio::test]
+async fn clef_compatibility_arguments_fail_before_the_worker_can_start() {
+    let mut late_errors = Vec::new();
+    for (prefill_step_size, output_batch_tokens, parameter) in [
+        (128, 1, "--prefill-step-size"),
+        (256, 2, "--output-batch-tokens"),
+    ] {
+        for with_shutdown in [false, true] {
+            let mut config = configuration(4096, 1024);
+            config.runtime = WorkerRuntime::PythonClef {
+                loader: PathBuf::from("/missing/apxinf-clef-test-loader"),
+            };
+            config.max_context = 4096;
+            config.max_output = 0;
+            config.prefill_step_size = prefill_step_size;
+            config.output_batch_tokens = output_batch_tokens;
+            let result = if with_shutdown {
+                start_with_shutdown(config, std::future::pending())
+                    .await
+                    .map(|_| ())
+            } else {
+                start(config).await.map(|_| ())
+            };
+            let error = result.expect_err("Unsupported Clef arguments must fail before startup.");
+            if !error.contains("Clef") || !error.contains(parameter) {
+                late_errors.push(format!("{parameter}, shutdown={with_shutdown}: {error}"));
+            }
+        }
+    }
+    assert!(
+        late_errors.is_empty(),
+        "Clef argument validation ran too late:\n{}",
+        late_errors.join("\n")
+    );
+}
+
+#[test]
+fn clef_execution_limits_preserve_the_supported_boundaries() {
+    let mut config = configuration(4096, 1024);
+    config.runtime = WorkerRuntime::PythonClef {
+        loader: PathBuf::from("/missing/apxinf-clef-test-loader"),
+    };
+    config.max_output = 0;
+    config.prefill_step_size = 256;
+    for max_context in [1, 4096] {
+        config.max_context = max_context;
+        assert!(config.validate_memory().is_ok());
+    }
+    for max_context in [0, 4097] {
+        config.max_context = max_context;
+        assert!(config.validate_memory().is_err());
+    }
+    config.max_context = 4096;
+    config.max_output = 1;
+    assert!(config.validate_memory().is_err());
+
+    config.runtime = WorkerRuntime::Python;
+    config.prefill_step_size = 128;
+    config.output_batch_tokens = 2;
+    assert!(config.validate_memory().is_ok());
+}
+
 #[test]
 fn memory_limits_accept_only_the_documented_integer_boundaries() {
     for (budget, reservation) in [
