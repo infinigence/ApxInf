@@ -140,8 +140,19 @@ Set `APXINF_HTTP_TEST_OUTPUT` to select another output directory.
 `claude_code_tasks.py` runs the installed Claude Code CLI against the local Messages endpoint.
 The runner flushes captured stdout and stderr after each received chunk.
 The captured files remain available for inspection while the client runs.
+The runner records the client PID and process group in `client.process.json` before it reads output.
 The client task report records actual tool calls, tool results, and task assertions.
 The fixture files contain no repository content or credentials.
+
+The client deadline remains active until the leader exits and both output pipes close.
+At timeout, the runner stops its client process group and confirms that no live members remain.
+Signal grace periods are 15 seconds for SIGINT, 5 seconds for SIGTERM, and 10 seconds for SIGKILL.
+These cleanup periods can extend capture beyond the task deadline.
+After group cleanup, pipe draining has a 0.5-second limit.
+An open pipe or a cleanup failure raises an error instead of returning a successful task capture.
+
+The runner does not signal descendants that create another process group.
+Such descendants can keep pipes open, which causes the bounded drain to fail.
 
 The harness gives each client process a separate configuration directory.
 It supplies a dummy local API key and excludes inherited provider credentials and proxy settings.

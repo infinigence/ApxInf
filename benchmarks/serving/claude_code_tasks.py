@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import signal
 import subprocess
 import time
 import uuid
@@ -19,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 from http_benchmark import local_url, metal_measurement_lock, metrics_snapshot, request_json
 import practical_cases
+from metal_matrix import group_members, stop_owned_group
 
 
 PELICAN_TITLE = "Pelican Riding a Bicycle"
@@ -266,27 +266,13 @@ def has_content_delta(event):
 
 def stop_child(process):
     """Stop only the process group created for this task."""
-    if process.poll() is not None:
-        return
     try:
-        os.killpg(process.pid, signal.SIGINT)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
-            process.wait(timeout=3)
+        stop_owned_group(process)
+    except PermissionError:
+        process.poll()
+        if any(not member["state"].startswith("Z") for member in group_members(process.pid)):
+            raise
+        process.wait(timeout=2)
 
 
 def capture_client(command, directory, environment, timeout, cancel_after_content):
@@ -300,21 +286,37 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
     cancelled = timed_out = False
     stdout_path = directory / "client.stdout.jsonl"
     stderr_path = directory / "client.stderr.txt"
+    process_path = directory / "client.process.json"
     with stdout_path.open("wb") as saved_stdout, stderr_path.open("wb") as saved_stderr:
         process = subprocess.Popen(command, cwd=directory, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, ("stdout", bytearray()))
-        selector.register(process.stderr, selectors.EVENT_READ, ("stderr", bytearray()))
+        drain_deadline = None
+
+        def stop_capture():
+            nonlocal drain_deadline
+            if drain_deadline is None:
+                stop_child(process)
+                drain_deadline = time.perf_counter() + .5
+
         try:
-            while selector.get_map():
+            process_temporary = directory / "client.process.json.tmp"
+            process_temporary.write_text(json.dumps({"pid": process.pid, "pgid": process.pid}) + "\n")
+            os.replace(process_temporary, process_path)
+            selector.register(process.stdout, selectors.EVENT_READ, ("stdout", bytearray()))
+            selector.register(process.stderr, selectors.EVENT_READ, ("stderr", bytearray()))
+            while selector.get_map() or process.poll() is None:
                 elapsed = time.perf_counter() - start
-                if process.poll() is None and elapsed > timeout:
+                if drain_deadline is None and elapsed > timeout:
                     timed_out = True
-                    stop_child(process)
-                if process.poll() is None and cancel_after_content and first_content is not None:
+                    stop_capture()
+                if drain_deadline is None and cancel_after_content and first_content is not None:
                     cancelled = True
-                    stop_child(process)
+                    stop_capture()
+                if drain_deadline is not None and time.perf_counter() >= drain_deadline:
+                    if selector.get_map():
+                        raise RuntimeError("The client pipes did not close after process-group cleanup.")
+                    break
                 for key, _ in selector.select(timeout=.1):
                     kind, pending = key.data
                     chunk = os.read(key.fileobj.fileno(), 65536)
@@ -359,23 +361,26 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                                         reason = ("The client did not advertise all requested tools: " + ", ".join(inventory["missing"])
                                                   if valid else "The client emitted an invalid initial tool inventory.")
                                         diagnostics.append(reason)
-                                        stop_child(process)
+                                        stop_capture()
                         elif inventory["status"] == "unreported" and event.get("type") in (
                                 "assistant", "stream_event", "result"):
                             inventory["status"] = "invalid"
                             diagnostics.append("The client generated output before advertising its requested tools.")
-                            stop_child(process)
+                            stop_capture()
                         if has_content_delta(event):
                             first_content = now if first_content is None else first_content
             process.wait(timeout=3)
         finally:
-            stop_child(process)
-            selector.close()
-            process.stdout.close()
-            process.stderr.close()
+            try:
+                stop_child(process)
+            finally:
+                selector.close()
+                process.stdout.close()
+                process.stderr.close()
     return {"exit_code": process.returncode, "elapsed_s": time.perf_counter() - start,
             "first_content_s": first_content, "cancel_sent": cancelled, "timed_out": timed_out,
             "events": events, "diagnostics": diagnostics, "tool_inventory": inventory,
+            "pid": process.pid, "pgid": process.pid, "process_path": str(process_path),
             "stdout_path": str(stdout_path), "stderr_path": str(stderr_path)}
 
 
@@ -387,7 +392,8 @@ def task_outcome(name, spec, directory, capture):
     inventory_ok = "tool_inventory" not in capture or (
         isinstance(capture["tool_inventory"], dict) and
         capture["tool_inventory"].get("status") in ("not_requested", "verified"))
-    finished = bool(final and not final.get("is_error") and capture["exit_code"] == 0 and inventory_ok)
+    finished = bool(final and not final.get("is_error") and capture["exit_code"] == 0 and inventory_ok
+                    and not capture.get("timed_out") and not capture.get("cancel_sent"))
     final_text = final.get("result", "") if final else ""
     if name == "read":
         assertion = "Read" in names and spec["marker"] in final_text
