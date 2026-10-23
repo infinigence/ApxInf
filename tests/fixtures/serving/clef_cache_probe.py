@@ -1,4 +1,3 @@
-"""Original CPU probe for normal Python bytecode lookup at worker launch."""
 import hashlib
 import json
 import os
@@ -48,7 +47,6 @@ observation = {
     "source_sha256": hashlib.sha256((root / "clef_contracts.py").read_bytes()).hexdigest(),
     "python": sys.executable,
     "argv": sys.argv,
-    "orig_argv": sys.orig_argv,
     "device_imports": sorted(
         name for name in sys.modules
         if name == "mlx" or name.startswith("mlx.") or name == "mlx_lm"
