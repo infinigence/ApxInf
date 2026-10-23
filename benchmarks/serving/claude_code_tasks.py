@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -13,6 +14,7 @@ import re
 import selectors
 import subprocess
 import time
+from typing import ClassVar
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -29,13 +31,46 @@ SVG_ELEMENTS = {"svg", "title", "desc", "g", "path", "circle", "ellipse", "rect"
 SVG_GRAPHICS = {"path", "circle", "ellipse", "rect", "line", "polyline", "polygon", "text"}
 
 
-def client_environment(base_url, model, config_dir, max_tokens=512, max_context=None,
+@dataclass(frozen=True)
+class TaskWorkspace:
+    root: Path
+    REVISION: ClassVar[str] = "task-workspace-v2"
+
+    @classmethod
+    def create(cls, root: Path) -> TaskWorkspace:
+        workspace = cls(root.resolve())
+        workspace.root.mkdir(parents=True, exist_ok=False)
+        workspace.config.mkdir()
+        return workspace
+
+    @property
+    def task(self) -> Path:
+        return self.root / "task"
+
+    @property
+    def config(self) -> Path:
+        return self.root / "client-config"
+
+    @property
+    def stdout(self) -> Path:
+        return self.root / "client.stdout.jsonl"
+
+    @property
+    def stderr(self) -> Path:
+        return self.root / "client.stderr.txt"
+
+    @property
+    def process(self) -> Path:
+        return self.root / "client.process.json"
+
+
+def client_environment(base_url, model, workspace: TaskWorkspace, max_tokens=512, max_context=None,
                        *, acceptance_context_compat=False):
     """Keep machine basics and replace all provider configuration for this child."""
     keep = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "TERM")
     environment = {key: os.environ[key] for key in keep if key in os.environ}
     environment.update({
-        "CLAUDE_CONFIG_DIR": str(config_dir.resolve()),
+        "CLAUDE_CONFIG_DIR": str(workspace.config),
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_API_KEY": "apxinf-local-test-only",
         "ANTHROPIC_MODEL": model,
@@ -280,7 +315,9 @@ def stop_child(process):
         process.wait(timeout=2)
 
 
-def capture_client(command, directory, environment, timeout, cancel_after_content):
+def capture_client(command, workspace: TaskWorkspace, environment, timeout, cancel_after_content):
+    if not workspace.task.is_dir():
+        raise ValueError("The task directory must exist before client capture.")
     start = time.perf_counter()
     events, diagnostics = [], []
     tools_index = command.index("--tools") + 1 if "--tools" in command else len(command)
@@ -289,11 +326,11 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                  "status": "unreported" if requested else "not_requested"}
     first_content = None
     cancelled = timed_out = False
-    stdout_path = directory / "client.stdout.jsonl"
-    stderr_path = directory / "client.stderr.txt"
-    process_path = directory / "client.process.json"
+    stdout_path = workspace.stdout
+    stderr_path = workspace.stderr
+    process_path = workspace.process
     with stdout_path.open("wb") as saved_stdout, stderr_path.open("wb") as saved_stderr:
-        process = subprocess.Popen(command, cwd=directory, env=environment,
+        process = subprocess.Popen(command, cwd=workspace.task, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         selector = selectors.DefaultSelector()
         drain_deadline = None
@@ -305,7 +342,7 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                 drain_deadline = time.perf_counter() + .5
 
         try:
-            process_temporary = directory / "client.process.json.tmp"
+            process_temporary = process_path.with_suffix(".json.tmp")
             process_temporary.write_text(json.dumps({"pid": process.pid, "pgid": process.pid}) + "\n")
             os.replace(process_temporary, process_path)
             selector.register(process.stdout, selectors.EVENT_READ, ("stdout", bytearray()))
@@ -382,7 +419,8 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
                 selector.close()
                 process.stdout.close()
                 process.stderr.close()
-    return {"exit_code": process.returncode, "elapsed_s": time.perf_counter() - start,
+    return {"environment_revision": TaskWorkspace.REVISION, "attempt_directory": str(workspace.root),
+            "exit_code": process.returncode, "elapsed_s": time.perf_counter() - start,
             "first_content_s": first_content, "cancel_sent": cancelled, "timed_out": timed_out,
             "events": events, "diagnostics": diagnostics, "tool_inventory": inventory,
             "pid": process.pid, "pgid": process.pid, "process_path": str(process_path),
@@ -475,6 +513,7 @@ def run(args):
     args.output_dir = args.output_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     report = {"format": "apxinf-claude-code-tasks-v1", "created_at": datetime.now(timezone.utc).isoformat(),
+              "environment_revision": TaskWorkspace.REVISION,
               "model": model, "client": str(args.claude), "tasks": [],
               "deployment_limits": capabilities, "client_context_limit": max_context,
               "client_request_output_limit": args.max_tokens,
@@ -491,11 +530,9 @@ def run(args):
     with metal_measurement_lock(args.metal_lock):
         for repeat in range(args.repeats):
             for name in args.tasks:
-                directory = args.output_dir / f"{name}-{repeat}-{uuid.uuid4().hex[:8]}"
-                spec = prepare_task(name, directory)
-                config_dir = directory / "client-config"
-                config_dir.mkdir()
-                environment = client_environment(args.base_url, model, config_dir, args.max_tokens, max_context,
+                workspace = TaskWorkspace.create(args.output_dir / f"{name}-{repeat}-{uuid.uuid4().hex[:8]}")
+                spec = prepare_task(name, workspace.task)
+                environment = client_environment(args.base_url, model, workspace, args.max_tokens, max_context,
                                                  acceptance_context_compat=context_compat)
                 command = [str(args.claude), "--bare", "--restricted", "-p", spec["prompt"],
                            "--model", model, "--output-format", "stream-json", "--verbose",
@@ -505,14 +542,14 @@ def run(args):
                 if spec["allowed"]:
                     command += ["--allowedTools", ",".join(spec["allowed"])]
                 before = metrics_snapshot(args.base_url)
-                capture = capture_client(command, directory, environment, args.timeout, name == "cancel")
-                outcome = task_outcome(name, spec, directory, capture)
+                capture = capture_client(command, workspace, environment, args.timeout, name == "cancel")
+                outcome = task_outcome(name, spec, workspace.task, capture)
                 if name == "cancel" and capture["cancel_sent"]:
                     settlement = cancellation_settlement(args.base_url, before)
                     outcome["settlement"] = settlement
                     outcome["passed"] = outcome["passed"] and settlement["settled"]
                 after = metrics_snapshot(args.base_url)
-                record = {"task": name, "repeat": repeat, "directory": str(directory),
+                record = {"task": name, "repeat": repeat, "directory": str(workspace.task),
                           "command": command, "metrics_before": before, "metrics_after": after,
                           **capture, **outcome}
                 report["tasks"].append(record)
