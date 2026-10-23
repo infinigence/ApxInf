@@ -823,6 +823,9 @@ async fn check_loaded_pressure(
     pressure: &HostPressure,
 ) -> Result<(), LaunchError> {
     if let Err(message) = pressure.require_load() {
+        let message = format!(
+            "Model loading completed, but host memory pressure blocked readiness. {message}"
+        );
         return match stop_child(&mut worker.child).await {
             Ok(()) => Err(LaunchError::Pressure(message)),
             Err(cleanup) => Err(LaunchError::Worker(startup_failure(message, Err(cleanup)))),
