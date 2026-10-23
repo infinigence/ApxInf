@@ -1,15 +1,18 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import os
+import signal
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
 import claude_code_tasks as client
+from metal_matrix import group_members
 
 
 VALID_SVG = (
@@ -51,6 +54,71 @@ def successful_events():
 
 
 class ClientCaptureTests(unittest.TestCase):
+    def capture_owned_probe(self, body, timeout=.2):
+        producer = '''import os, pathlib, subprocess, sys, time
+pathlib.Path('leader.pid').write_text(str(os.getpid()))
+''' + body
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            try:
+                result = client.capture_client([sys.executable, "-c", producer], directory,
+                                               dict(os.environ), timeout, False)
+                pgid = int((directory / "leader.pid").read_text())
+                live = [member for member in group_members(pgid)
+                        if not member["state"].startswith("Z")]
+                return result, live
+            finally:
+                pid_file = directory / "leader.pid"
+                if pid_file.exists():
+                    try:
+                        os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_exited_leader_does_not_disable_inherited_pipe_deadline(self):
+        result, live = self.capture_owned_probe('''
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'])
+print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+''')
+        self.assertTrue(result["timed_out"], result)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertLess(result["elapsed_s"], 1.5)
+        self.assertEqual(live, [])
+
+    def test_closed_pipes_do_not_complete_a_live_leader(self):
+        result, live = self.capture_owned_probe('''
+os.close(1)
+os.close(2)
+time.sleep(3)
+''')
+        self.assertTrue(result["timed_out"], result)
+        self.assertLess(result["elapsed_s"], 1.5)
+        self.assertEqual(live, [])
+
+    def test_descendant_ignoring_interrupt_does_not_escape_cleanup(self):
+        result, live = self.capture_owned_probe('''
+child = "import pathlib, signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); pathlib.Path('child-ready').touch(); time.sleep(.6)"
+subprocess.Popen([sys.executable, '-c', child])
+while not pathlib.Path('child-ready').exists():
+    time.sleep(.01)
+''')
+        self.assertTrue(result["timed_out"], result)
+        self.assertLess(result["elapsed_s"], 1.5)
+        self.assertEqual(live, [])
+
+    def test_normal_parent_remains_successful(self):
+        result, live = self.capture_owned_probe('''
+print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+''', timeout=2)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(live, [])
+
+    def test_cleanup_failure_cannot_return_a_successful_capture(self):
+        with patch.object(client, "stop_child", side_effect=RuntimeError("Unconfirmed cleanup.")):
+            with self.assertRaisesRegex(RuntimeError, "Unconfirmed cleanup"):
+                self.capture_owned_probe("print('{}', flush=True)", timeout=2)
+
     def test_missing_requested_tool_stops_before_the_deadline(self):
         producer = '''import time
 print('{"type":"system","subtype":"init","tools":["Read","Edit"]}', flush=True)
@@ -175,6 +243,16 @@ class PelicanTaskTests(unittest.TestCase):
             with self.subTest(status=status):
                 recorded = capture(successful_events())
                 recorded["tool_inventory"] = {"status": status}
+                result = client.task_outcome("pelican", self.spec, self.directory, recorded)
+                self.assertFalse(result["automated_passed"])
+                self.assertFalse(result["passed"])
+
+    def test_timeout_or_cancellation_rejects_a_successful_result(self):
+        self.save_svg()
+        for flag in ("timed_out", "cancel_sent"):
+            with self.subTest(flag=flag):
+                recorded = capture(successful_events())
+                recorded[flag] = True
                 result = client.task_outcome("pelican", self.spec, self.directory, recorded)
                 self.assertFalse(result["automated_passed"])
                 self.assertFalse(result["passed"])
