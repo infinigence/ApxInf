@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
+[dev-dependencies]
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+
 [features]
 default = []
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2"]

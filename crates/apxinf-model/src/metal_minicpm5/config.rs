@@ -2,7 +2,9 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-pub const CONTEXT_CAPACITY: usize = 4096;
+pub const CONTEXT_CAPACITY: usize = 16384;
+pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
+pub const PREFILL_CHUNK_TOKENS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -44,7 +46,7 @@ impl Config {
                 self.head_dim,
                 self.vocab_size,
             ) != (2048, 6144, 42, 16, 2, 128, 130560)
-            || self.max_position_embeddings < CONTEXT_CAPACITY
+            || self.max_position_embeddings < DSPARK_CONTEXT_CAPACITY
             || self.rms_norm_eps != 1e-6
             || self.rope_theta != 5_000_000.0
             || self.tie_word_embeddings
@@ -54,6 +56,16 @@ impl Config {
         {
             return Err(Error::Other(
                 "MiniCPM5 MLX supports the official 2B BF16 geometry, unscaled NeoX RoPE and untied head".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_variant(&self, variant: Variant) -> Result<()> {
+        self.validate()?;
+        if self.max_position_embeddings < variant.context_capacity() {
+            return Err(Error::Contract(
+                "MiniCPM checkpoint positions do not cover the selected variant",
             ));
         }
         Ok(())
@@ -68,6 +80,53 @@ pub enum Variant {
 }
 
 impl Variant {
+    pub const fn context_capacity(self) -> usize {
+        match self {
+            Self::Public | Self::Compiled => CONTEXT_CAPACITY,
+            Self::DSpark => DSPARK_CONTEXT_CAPACITY,
+        }
+    }
+
+    pub(crate) fn request_capacity(self, prompt: usize, output: usize) -> Result<usize> {
+        let total = prompt
+            .checked_add(output)
+            .ok_or(Error::Contract("MiniCPM context overflow"))?;
+        if prompt == 0 || total > self.context_capacity() {
+            return Err(Error::Other(format!(
+                "MiniCPM5 supports B1 with at most {} consumed positions for {self:?}",
+                self.context_capacity()
+            )));
+        }
+        Ok(total.div_ceil(PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS)
+    }
+
+    pub(crate) fn prefill_rows(self, prompt: usize, position: usize) -> Option<usize> {
+        if position >= prompt {
+            return None;
+        }
+        if self == Self::DSpark {
+            return (position == 0).then_some(prompt);
+        }
+        (position % PREFILL_CHUNK_TOKENS == 0)
+            .then_some((prompt - position).min(PREFILL_CHUNK_TOKENS))
+    }
+
+    pub(crate) fn prepared_lengths(self, prompt: usize) -> Vec<usize> {
+        let max_decode_rows = if self == Self::DSpark { 8 } else { 1 };
+        let mut lengths = (1..=max_decode_rows).collect::<Vec<_>>();
+        lengths.push(prompt);
+        if self != Self::DSpark {
+            lengths.push(prompt.min(PREFILL_CHUNK_TOKENS));
+            let tail = prompt % PREFILL_CHUNK_TOKENS;
+            if tail > 0 {
+                lengths.push(tail);
+            }
+        }
+        lengths.sort_unstable();
+        lengths.dedup();
+        lengths
+    }
+
     pub fn parse(name: Option<&str>) -> Result<Self> {
         match name.unwrap_or("bf16-compiled") {
             "bf16-public" => Ok(Self::Public),
@@ -118,5 +177,67 @@ mod tests {
         assert!(c.validate().is_err());
         assert_eq!(Variant::parse(None).unwrap(), Variant::Compiled);
         assert!(Variant::parse(Some("mixed-w8")).is_err());
+    }
+
+    #[test]
+    fn request_capacity_checks_empty_edges_and_overflow() {
+        for variant in [Variant::Public, Variant::Compiled, Variant::DSpark] {
+            let limit = variant.context_capacity();
+            assert!(variant.request_capacity(0, 1).is_err());
+            assert_eq!(variant.request_capacity(limit - 1, 1).unwrap(), limit);
+            assert!(variant.request_capacity(limit, 1).is_err());
+            assert!(variant.request_capacity(usize::MAX, 1).is_err());
+            assert_eq!(variant.request_capacity(256, 1).unwrap(), 512);
+        }
+        assert_eq!(Variant::DSpark.context_capacity(), 4096);
+        assert_eq!(Variant::Compiled.context_capacity(), 16384);
+        assert_eq!(Variant::Public.context_capacity(), 16384);
+        assert!(Variant::Compiled.request_capacity(32767, 1).is_err());
+    }
+
+    #[test]
+    fn checkpoint_positions_must_cover_the_selected_variant() {
+        let mut c = config();
+        c.max_position_embeddings = 4096;
+        assert!(c.validate_variant(Variant::DSpark).is_ok());
+        assert!(c.validate_variant(Variant::Public).is_err());
+        assert!(c.validate_variant(Variant::Compiled).is_err());
+        c.max_position_embeddings = 16384;
+        assert!(c.validate_variant(Variant::Public).is_ok());
+        assert!(c.validate_variant(Variant::Compiled).is_ok());
+        c.max_position_embeddings = 4095;
+        assert!(c.validate_variant(Variant::DSpark).is_err());
+    }
+
+    #[test]
+    fn prefill_admits_only_exact_chunk_offsets_and_shapes() {
+        for variant in [Variant::Public, Variant::Compiled] {
+            for (prompt, expected) in [
+                (1, vec![(0, 1)]),
+                (255, vec![(0, 255)]),
+                (256, vec![(0, 256)]),
+                (257, vec![(0, 256), (256, 1)]),
+                (513, vec![(0, 256), (256, 256), (512, 1)]),
+            ] {
+                let actual = (0..=prompt)
+                    .filter_map(|position| {
+                        variant
+                            .prefill_rows(prompt, position)
+                            .map(|rows| (position, rows))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(variant.prefill_rows(0, 0), None);
+            assert_eq!(variant.prefill_rows(257, usize::MAX), None);
+            assert_eq!(variant.prepared_lengths(513), vec![1, 256, 513]);
+            assert_eq!(variant.prepared_lengths(511), vec![1, 255, 256, 511]);
+        }
+        assert_eq!(Variant::DSpark.prefill_rows(513, 0), Some(513));
+        assert_eq!(Variant::DSpark.prefill_rows(513, 256), None);
+        assert_eq!(
+            Variant::DSpark.prepared_lengths(513),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 513]
+        );
     }
 }
