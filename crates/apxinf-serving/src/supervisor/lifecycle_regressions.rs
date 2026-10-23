@@ -427,25 +427,54 @@ async fn observations_preparation_expiry_tracks_public_result_until_settlement()
 #[tokio::test]
 async fn late_preparation_settles_before_the_next_request_and_preserves_readiness() {
     for reject in [false, true] {
-        let model = CpuModel::new(
-            json!({"prepare_delays_ms":[200], "prepare_error_indices": if reject { vec![0] } else { vec![] }}),
-        );
+        let model = CpuModel::new(json!({}));
+        let release = model.0.join("prepare.release");
+        std::fs::write(
+            model.model().join("lifecycle.json"),
+            serde_json::to_vec(&json!({
+                "prepare_release_paths": [release],
+                "prepare_error_indices": if reject { vec![0] } else { vec![] },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let (worker, ready) = cpu_worker(model.model()).await.unwrap();
-        let service = cpu_service(ready, Duration::from_millis(150), 2);
+        let service = cpu_service(ready, Duration::from_secs(3), 2);
         start_queue_sweeper(&service);
         let path = model.model();
         let task = tokio::spawn(coordinate(worker, service.clone(), 1024, move || {
             cpu_worker(path.clone())
         }));
         let first = service.enqueue(request(true)).unwrap();
+        wait_for_event(&model, "prepare_started").await;
         assert_eq!(
             first.begin.await.unwrap().err().unwrap().code,
             "deadline_exceeded"
         );
         assert_eq!(service.metrics.active.load(Ordering::Relaxed), 1);
         assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 1024);
-        let second = service.enqueue(request(true)).unwrap();
-        assert!(second.begin.await.unwrap().is_ok());
+        let mut second = service.enqueue(request(true)).unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            second.begin.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 1);
+        let events = model.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "prepare_started")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| {
+            event["event"] == "prepare_finished" || event["event"] == "prepare_rejected"
+        }));
+        std::fs::write(&release, b"release").unwrap();
+        second.begin.await.unwrap().unwrap_or_else(|error| {
+            panic!("Second request failed: {} {}", error.code, error.message)
+        });
         assert!(service.available.load(Ordering::Acquire));
         assert_eq!(service.metrics.expired.load(Ordering::Relaxed), 1);
         assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 1);
@@ -457,6 +486,7 @@ async fn late_preparation_settles_before_the_next_request_and_preserves_readines
             .filter(|(_, event)| event["event"] == "prepare_started")
             .map(|(i, _)| i)
             .collect();
+        assert_eq!(starts.len(), 2);
         let settled = events
             .iter()
             .position(|event| {
@@ -470,6 +500,9 @@ async fn late_preparation_settles_before_the_next_request_and_preserves_readines
             .unwrap();
         assert!(settled < starts[1]);
         stop_coordinator(&service, task).await;
+        assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
+        assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(service.metrics.queued.load(Ordering::Relaxed), 0);
     }
 }
 
