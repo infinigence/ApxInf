@@ -380,11 +380,7 @@ impl CpuTokenSampler {
         let mut ranked = logits
             .iter()
             .enumerate()
-            .filter_map(|(token_id, &value)| {
-                value
-                    .is_finite()
-                    .then_some((token_id as u32, value / temperature))
-            })
+            .filter_map(|(token_id, &value)| value.is_finite().then_some((token_id as u32, value)))
             .collect::<Vec<_>>();
         ranked.sort_by(|(left_id, left), (right_id, right)| {
             right.total_cmp(left).then_with(|| left_id.cmp(right_id))
@@ -398,7 +394,10 @@ impl CpuTokenSampler {
             .ok_or_else(|| Error::Other("all token logits are invalid".into()))?;
         let mut candidates = ranked
             .into_iter()
-            .map(|(token_id, value)| (token_id, (value - max).exp()))
+            .map(|(token_id, value)| {
+                let scaled = (f64::from(value) - f64::from(max)) / f64::from(temperature);
+                (token_id, scaled.exp() as f32)
+            })
             .collect::<Vec<_>>();
         let total = candidates.iter().map(|(_, weight)| *weight).sum::<f32>();
         if !total.is_finite() || total <= 0.0 {
@@ -763,6 +762,72 @@ mod tests {
         let logits = NextTokenLogits::last(&tensor, 3).unwrap();
         assert_eq!(sampler.sample(logits).unwrap().token_id, 0);
         assert_eq!(sampler.sample(logits).unwrap().token_id, 1);
+    }
+
+    #[test]
+    fn tiny_positive_temperatures_preserve_valid_probability_mass() {
+        for values in [
+            [1.0, 2.0, -1.0],
+            [-2.0, -1.0, -3.0],
+            [-f32::MAX, f32::MAX, 0.0],
+        ] {
+            let tensor = Tensor::from_f32(vec![1, 3], &values).unwrap();
+            for temperature in [f32::from_bits(1), 1e-40, f32::MIN_POSITIVE] {
+                let params = TokenSamplingParams {
+                    selection: TokenSelection::Random {
+                        temperature,
+                        top_k: None,
+                        top_p: 1.0,
+                    },
+                    return_logprob: true,
+                    ..Default::default()
+                };
+                let mut sampler = sampler(3, 2);
+                sampler
+                    .begin(TokenSamplingInit {
+                        prompt_token_ids: &[0],
+                        params: &params,
+                        rng: RngKey::new(42, 0, 0),
+                    })
+                    .unwrap();
+                let sample = sampler
+                    .sample(NextTokenLogits::last(&tensor, 3).unwrap())
+                    .unwrap();
+                assert_eq!(sample.token_id, 1);
+                assert_eq!(sample.logprob, Some(0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_finite_logits_retain_scaled_tail_probability() {
+        let tensor = Tensor::from_f32(vec![1, 2], &[-f32::MAX, f32::MAX]).unwrap();
+        let params = TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: f32::MAX,
+                top_k: None,
+                top_p: 1.0,
+            },
+            return_logprob: true,
+            ..Default::default()
+        };
+        let mut sampler = sampler(2, 2);
+        sampler
+            .begin(TokenSamplingInit {
+                prompt_token_ids: &[0],
+                params: &params,
+                rng: RngKey::new(42, 0, 0),
+            })
+            .unwrap();
+        let sample = sampler
+            .sample(NextTokenLogits::last(&tensor, 2).unwrap())
+            .unwrap();
+        let expected = if sample.token_id == 0 {
+            -2.126928
+        } else {
+            -0.126928
+        };
+        assert!((sample.logprob.unwrap() - expected).abs() < 1e-6);
     }
 
     #[test]
