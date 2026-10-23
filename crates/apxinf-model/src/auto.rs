@@ -376,12 +376,18 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+            #[cfg(feature = "hip")]
+            if matches!(device, Device::Hip(_)) {
+                let config = options.config.as_ref().map(hip_pi05_config);
+                return crate::hip_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -493,6 +499,44 @@ fn metal_registry_name(model_name: &str) -> String {
             "metal_{}",
             model_name.strip_suffix("-mlx").unwrap_or(model_name)
         )
+    }
+}
+
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the HIP port's own config. Lives here, outside both families, so
+/// neither imports the other.
+#[cfg(feature = "hip")]
+fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::hip_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::hip_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
     }
 }
 
@@ -632,6 +676,25 @@ mod tests {
                 "accepted {name}"
             );
         }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_pi05_config_converts_frontend_overrides_field_for_field() {
+        let frontend = crate::pi05::Pi05Config {
+            num_views: 2,
+            action_horizon: 10,
+            flow_start_time: 0.5,
+            ..crate::pi05::Pi05Config::default()
+        };
+        let config = hip_pi05_config(&frontend);
+        assert_eq!(
+            (config.num_views, config.action_horizon, config.flow_start_time),
+            (2, 10, 0.5)
+        );
+        assert_eq!(config.language, crate::hip_pi05::config::GemmaConfig::GEMMA_2B);
+        assert_eq!(config.vocab_size, frontend.vocab_size);
+        config.validate().unwrap();
     }
 
     #[test]
