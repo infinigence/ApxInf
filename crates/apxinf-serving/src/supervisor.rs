@@ -1129,7 +1129,6 @@ where
                 .controls
                 .insert(shutdown["command_id"].as_str().unwrap().to_owned());
         }
-        // No command can follow shutdown. Closing the pipe also releases the input reader.
         drop(worker.input.take());
         let started = Instant::now();
         loop {
