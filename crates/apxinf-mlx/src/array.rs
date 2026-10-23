@@ -48,6 +48,16 @@ pub fn memory_stats() -> Result<MemoryStats> {
     })?;
     Ok(stats)
 }
+pub fn loaded_library_path() -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = std::ptr::null();
+    check(unsafe { ffi::apx_mlx_loaded_library_path(&mut path) })?;
+    if path.is_null() {
+        return Err(error("Loaded MLX library path is absent"));
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(std::ffi::OsStr::from_bytes(bytes).into())
+}
 /// Reset the process-wide peak allocator observation. Use an isolated process
 /// for qualification; another model in this process shares the observation.
 pub fn reset_peak_memory() -> Result<()> {
@@ -57,6 +67,14 @@ pub fn reset_peak_memory() -> Result<()> {
 /// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
+}
+
+/// Set the process-wide MLX allocation guideline and return the previous value.
+/// MLX can exceed this value for one operation. It is not a physical memory cap.
+pub fn set_memory_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_memory_limit(limit, &mut previous) })?;
+    Ok(previous)
 }
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {

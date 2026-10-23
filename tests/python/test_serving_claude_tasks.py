@@ -1,0 +1,261 @@
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import os
+import sys
+import tempfile
+import time
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
+import claude_code_tasks as client
+
+
+VALID_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">'
+    '<title>Pelican Riding a Bicycle</title>'
+    '<ellipse cx="240" cy="220" rx="100" ry="60" fill="white"/>'
+    '<path d="M 280 220 L 420 240 L 300 260 Z" fill="orange"/>'
+    '</svg>'
+)
+
+
+def event(kind, blocks=None, **fields):
+    value = {"type": kind, **fields}
+    if blocks is not None:
+        value["message"] = {"content": blocks}
+    return {"elapsed_s": 0.1, "event": value}
+
+
+def tool_call(tool_id, name, path=None):
+    path = path or ("drawing-brief.txt" if name == "Read" else "pelican.svg")
+    return event("assistant", [{"type": "tool_use", "id": tool_id, "name": name,
+                                "input": {"file_path": path}}])
+
+
+def tool_result(tool_id, failed=False):
+    return event("user", [{"type": "tool_result", "tool_use_id": tool_id,
+                           "is_error": failed, "content": "Tool completed."}])
+
+
+def capture(events=None, subtype="success"):
+    return {"events": (events or []) + [event("result", result="Done.", subtype=subtype,
+                                               is_error=False, usage={"input_tokens": 123})],
+            "exit_code": 0}
+
+
+def successful_events():
+    return [tool_call("read-1", "Read"), tool_result("read-1"),
+            tool_call("write-1", "Write"), tool_result("write-1")]
+
+
+class ClientCaptureTests(unittest.TestCase):
+    def test_missing_requested_tool_stops_before_the_deadline(self):
+        producer = '''import time
+print('{"type":"system","subtype":"init","tools":["Read","Edit"]}', flush=True)
+time.sleep(15)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read,Edit,Write"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result.get("tool_inventory", {}).get("missing", []), ["Write"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["tool_inventory"]["status"], "mismatch")
+        self.assertEqual(result["events"][0]["event"]["tools"], ["Read", "Edit"])
+
+    def test_available_named_tools_preserve_normal_capture(self):
+        producer = '''print('{"type":"system","subtype":"init","tools":["Edit","Read"]}', flush=True)
+print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read,Edit"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["tool_inventory"], {"requested": ["Edit", "Read"],
+                         "advertised": ["Edit", "Read"], "missing": [], "status": "verified"})
+
+    def test_malformed_initial_tool_list_stops_the_client(self):
+        producer = '''import time
+print('{"type":"system","subtype":"init","tools":null}', flush=True)
+time.sleep(15)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["tool_inventory"]["status"], "invalid")
+        self.assertIsNone(result["tool_inventory"]["advertised"])
+        self.assertFalse(result["timed_out"])
+
+    def test_late_inventory_cannot_repair_output_before_initialization(self):
+        producer = '''print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
+print('{"type":"system","subtype":"init","tools":["Read"]}', flush=True)
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            result = client.capture_client(
+                [sys.executable, "-c", producer, "--tools", "Read"],
+                Path(temporary), dict(os.environ), 2, False)
+        self.assertEqual(result["tool_inventory"]["status"], "invalid")
+        self.assertIn("before advertising", " ".join(result["diagnostics"]))
+
+    def test_output_is_visible_before_the_client_exits(self):
+        producer = '''import pathlib, sys, time
+print('{"type":"system","subtype":"capture_probe"}', flush=True)
+print('capture stderr probe', file=sys.stderr, flush=True)
+pathlib.Path('producer-ready').touch()
+while not pathlib.Path('release-producer').exists():
+    time.sleep(0.01)
+'''
+        with tempfile.TemporaryDirectory() as temporary, ThreadPoolExecutor(max_workers=1) as executor:
+            directory = Path(temporary)
+            future = executor.submit(client.capture_client, [sys.executable, "-c", producer],
+                                     directory, dict(os.environ), 15, False)
+            try:
+                deadline = time.monotonic() + 5
+                stdout = directory / "client.stdout.jsonl"
+                stderr = directory / "client.stderr.txt"
+                while time.monotonic() < deadline:
+                    if ((directory / "producer-ready").exists() and stdout.read_bytes() and stderr.read_bytes()):
+                        break
+                    time.sleep(.01)
+                self.assertFalse(future.done())
+                self.assertIn(b'"capture_probe"', stdout.read_bytes())
+                self.assertEqual(stderr.read_text(), "capture stderr probe\n")
+            finally:
+                (directory / "release-producer").touch()
+                result = future.result(timeout=5)
+            self.assertEqual(result["exit_code"], 0)
+            self.assertEqual(result["events"][0]["event"]["subtype"], "capture_probe")
+
+
+class PelicanTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name) / "task"
+        self.spec = client.prepare_task("pelican", self.directory)
+
+    def outcome(self, events=None, subtype="success"):
+        return client.task_outcome("pelican", self.spec, self.directory, capture(events, subtype))
+
+    def save_svg(self, text=VALID_SVG):
+        (self.directory / "pelican.svg").write_text(text)
+
+    def test_task_creates_an_original_brief_and_narrow_tool_set(self):
+        brief = (self.directory / "drawing-brief.txt").read_text()
+        self.assertIn("pelican", brief)
+        self.assertIn("riding a bicycle", brief)
+        self.assertIn("feet on the pedals", brief)
+        self.assertIn('viewBox="0 0 640 480"', brief)
+        self.assertEqual(self.spec["tools"], ["Read", "Edit"])
+        self.assertEqual(self.spec["allowed"], ["Read", "Edit"])
+        self.assertEqual((self.directory / "pelican.svg").read_text(), "")
+        self.assertIn(str(self.directory / "pelican.svg"), self.spec["prompt"])
+
+    def test_valid_svg_and_matched_read_write_cycle_pass_structurally(self):
+        self.save_svg()
+        result = self.outcome(successful_events())
+        self.assertTrue(result["automated_passed"], result)
+        self.assertIsNone(result["passed"])
+        self.assertEqual(result["visual_review"], "pending")
+        self.assertEqual(result["observed_input_usage"], {"input_tokens": 123})
+
+    def test_edit_result_also_completes_the_save_cycle(self):
+        self.save_svg()
+        events = [tool_call("read-1", "Read"), tool_result("read-1"),
+                  tool_call("edit-1", "Edit"), tool_result("edit-1")]
+        self.assertTrue(self.outcome(events)["automated_passed"])
+
+    def test_inventory_failure_rejects_an_otherwise_successful_capture(self):
+        self.save_svg()
+        for status in ("unreported", "mismatch", "invalid", "unknown"):
+            with self.subTest(status=status):
+                recorded = capture(successful_events())
+                recorded["tool_inventory"] = {"status": status}
+                result = client.task_outcome("pelican", self.spec, self.directory, recorded)
+                self.assertFalse(result["automated_passed"])
+                self.assertFalse(result["passed"])
+
+    def test_standard_xml_declaration_does_not_reject_svg(self):
+        self.save_svg('<?xml version="1.0" encoding="UTF-8"?>' + VALID_SVG)
+        self.assertTrue(self.outcome(successful_events())["automated_passed"])
+
+    def test_a_write_before_the_brief_read_does_not_count(self):
+        self.save_svg()
+        events = [tool_call("write-1", "Write"), tool_result("write-1"),
+                  tool_call("read-1", "Read"), tool_result("read-1")]
+        self.assertFalse(self.outcome(events)["passed"])
+
+    def test_wrong_tool_result_id_does_not_complete_write(self):
+        self.save_svg()
+        for events in (
+            successful_events()[:-1] + [tool_result("another-id")],
+            [tool_call("read-1", "Read"), tool_result("another-id"),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_wrong_tool_paths_do_not_complete_the_cycle(self):
+        self.save_svg()
+        for events in (
+            [tool_call("read-1", "Read", "another-brief.txt"), tool_result("read-1"),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+            [tool_call("read-1", "Read"), tool_result("read-1"),
+             tool_call("write-1", "Write", "another.svg"), tool_result("write-1")],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_failed_tool_result_does_not_complete_read_or_write(self):
+        self.save_svg()
+        for events in (
+            [tool_call("read-1", "Read"), tool_result("read-1", True),
+             tool_call("write-1", "Write"), tool_result("write-1")],
+            successful_events()[:-1] + [tool_result("write-1", True)],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.outcome(events)["passed"])
+
+    def test_empty_and_malformed_artifacts_fail(self):
+        self.assertFalse(self.outcome(successful_events())["passed"])
+        for source in ("", "<svg", "not xml"):
+            with self.subTest(source=source):
+                self.save_svg(source)
+                result = self.outcome(successful_events())
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["svg_check"]["valid"])
+
+    def test_false_success_without_a_tool_cycle_or_valid_artifact_fails(self):
+        self.save_svg()
+        self.assertFalse(self.outcome([])["passed"])
+        self.assertFalse(self.outcome(successful_events(), "error")["passed"])
+        self.save_svg("<svg/>")
+        self.assertFalse(self.outcome(successful_events())["passed"])
+
+    def test_active_content_and_external_references_fail(self):
+        cases = (
+            VALID_SVG.replace("</svg>", '<script>alert(1)</script></svg>'),
+            VALID_SVG.replace("</svg>", '<image href="https://example.com/x.png"/></svg>'),
+            VALID_SVG.replace('fill="white"', 'fill="url(https://example.com/fill.svg)"'),
+            '<!DOCTYPE svg [<!ENTITY x "unsafe">]>' + VALID_SVG,
+            '<?xml-stylesheet href="https://example.com/x.css"?>' + VALID_SVG,
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.save_svg(source)
+                self.assertFalse(self.outcome(successful_events())["passed"])
+
+    def test_title_and_viewbox_are_required(self):
+        for source in (VALID_SVG.replace("Pelican Riding a Bicycle", "Other title"),
+                       VALID_SVG.replace("0 0 640 480", "0 0 600 480")):
+            with self.subTest(source=source):
+                self.save_svg(source)
+                self.assertFalse(self.outcome(successful_events())["passed"])
+
+
+if __name__ == "__main__":
+    unittest.main()
