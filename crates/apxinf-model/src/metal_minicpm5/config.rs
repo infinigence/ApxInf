@@ -2,7 +2,7 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-pub const CONTEXT_CAPACITY: usize = 65536;
+pub const CONTEXT_CAPACITY: usize = 65792;
 pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
 pub(super) const PREFILL_CHUNK: usize = 512;
 
@@ -169,7 +169,15 @@ mod tests {
             c.request_capacity(Variant::Compiled, 65408, 128).unwrap(),
             65536
         );
-        assert!(c.request_capacity(Variant::Compiled, 65409, 128).is_err());
+        assert_eq!(
+            c.request_capacity(Variant::Compiled, 65536, 128).unwrap(),
+            65792
+        );
+        assert_eq!(
+            c.request_capacity(Variant::Compiled, 65536, 256).unwrap(),
+            65792
+        );
+        assert!(c.request_capacity(Variant::Compiled, 65536, 257).is_err());
         assert!(c.request_capacity(Variant::Public, 0, 1).is_err());
         assert!(c.request_capacity(Variant::Public, usize::MAX, 1).is_err());
         assert_eq!(
@@ -191,6 +199,8 @@ mod tests {
         assert_eq!(attention_width(Variant::Compiled, 256, 65536), 256);
         assert_eq!(attention_width(Variant::Compiled, 257, 65536), 512);
         assert_eq!(attention_width(Variant::Compiled, 65536, 65536), 65536);
+        assert_eq!(attention_width(Variant::Compiled, 65536, 65792), 65536);
+        assert_eq!(attention_width(Variant::Compiled, 65537, 65792), 65792);
         assert_eq!(attention_width(Variant::DSpark, 1, 4096), 4096);
     }
 }

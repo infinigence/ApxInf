@@ -74,7 +74,7 @@ verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
 Long-context preparation distinguishes total request capacity from active
-attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65536,
+attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
 warm decode buckets before use and test crossing a bucket without retracing.
 Long generation may prepare chunk shapes without preparing full prompt logits.

@@ -37,8 +37,9 @@ chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 `forward` still returns all of its input rows. Ordinary generation uses
 ApxInf's shared sampler/EOS loop.
 
-Ordinary BF16 generation supports one sequence with at most 65536 total tokens,
+Ordinary BF16 generation supports one sequence with at most 65792 total tokens,
 including prompt and reserved output, within the checkpoint's 131072 positions.
+This admits a 65536-token prompt with up to 256 reserved output tokens.
 KV and RoPE capacity round the request up to 256 tokens. A reset request can
 grow or shrink that allocation. Compiled decode attends to the active prefix
 rounded to 256 tokens, with unwritten positions masked. Capacity at most 4096
@@ -47,16 +48,18 @@ before inference; crossing a bucket does not retrace the compiled step.
 
 On a 16 GiB host, BF16 KV uses
 `2 * 42 layers * 2 KV heads * 128 channels * 2 bytes = 42 KiB/token`.
-At 65536 tokens the live cache is 2.625 GiB and the two RoPE tables total
-32 MiB. Weights, allocator cache and temporary arrays are additional.
+At 65536 tokens the live cache is 2.625 GiB. The extra 256-token capacity bucket
+adds 10.5 MiB, allowing the 64K-input context-sweep case to reserve output.
+At the 65792-token limit, the two RoPE tables total 32.125 MiB.
+Weights, allocator cache and temporary arrays are additional.
 Execution releases prior state handles before evaluation; qualification runs
 enforce a 12 GiB physical process limit. The full checkpoint context is not
 admitted by this memory budget.
 
 For 64K on the 16 GiB M4, the process must cap the MLX allocator cache at
 2 GiB (2147483648 bytes). With the default allocator cache policy, the initial
-64K run exceeded the 12 GiB physical-process guard. The explicit 2 GiB cache
-budget completed that request in the diagnostic worker.
+65408-input/128-output diagnostic run exceeded the 12 GiB physical-process guard.
+The explicit 2 GiB cache budget completed that request in the diagnostic worker.
 Applications embedding the family must set their own process-wide MLX cache
 policy; the model does not silently change it for other resident models.
 
