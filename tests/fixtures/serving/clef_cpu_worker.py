@@ -86,6 +86,11 @@ for line in sys.stdin:
         trace("submitted")
         emit({**attempt, "kind": "accepted", "event_seq": 0,
               "model_revision": command["model_revision"], "capability_revision": command["capability_revision"]})
+        if args.mode == "inference_failure":
+            emit({**attempt, "kind": "failure", "event_seq": 1,
+                  "code": "internal_error", "message": "The decision inference failed."})
+            emit({**base, "kind": "drained", "reason": "attempt_complete"})
+            break
         if args.mode == "accepted_hold":
             hold("accepted")
         preparation = command["preparation"]
