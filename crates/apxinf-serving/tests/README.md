@@ -6,7 +6,7 @@ Each case starts a separate gateway and an original CPU worker fixture.
 The fixture sends the serial protocol through the normal process pipes.
 Startup checks the fixture manifest against local files and the actual interpreter.
 
-These checks use the existing [local HTTP profile](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/local-service-v0.1.md)
+These checks use the existing [local HTTP profile](../../../doc/serving/local-service-v0.1.md)
 and [serial worker profile](../../../doc/serving/serial-profile-v0.1.md).
 They do not load MLX, download models, execute tools, or contact external services.
 The fixture reports its runtime as `cpu-fixture` and its MLX packages as `absent`.

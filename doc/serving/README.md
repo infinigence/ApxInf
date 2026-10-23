@@ -12,12 +12,12 @@
 | [接口规范](contracts-v0.1.md) | 英文术语、所有权、字段、事件、状态、错误和兼容规则 | 新 serving 接口的语义依据 |
 | [实施计划](implementation-plan.md) | 模块边界、阶段依赖、交付内容和验收门 | 规定实施顺序 |
 | [串行协议](serial-profile-v0.1.md) | 首个实现子集的完整字段、限额和事件顺序 | Rust／Python 共同校验 |
-| [本地服务](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
-| [依赖边界](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/dependencies.md) | 依赖版本、公开 API 和替换边界 | 独立实现审计 |
+| [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
+| [依赖边界](dependencies.md) | 依赖版本、公开 API 和替换边界 | 独立实现审计 |
 | [Metal 实验](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-experiments.md) | M4 上的实验矩阵与创新候选 | 测量方案 |
 | [Metal 参数实测](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-results-20261009.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
-| [实现与验证](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/serving-validation-20261009.md) | 实际实现范围、HTTP 指标、资源边界和下一阶段 | 交付证据 |
-| [2026-10-11 验证](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/validation-20261011.md) | 当前 Rust、真实 HTTP、Claude Code、故障清理和分级内存校准结果 | 本轮验证证据与未覆盖范围 |
+| [实现与验证](text-provider-acceptance.md) | 实际实现范围、HTTP 指标、资源边界和下一阶段 | 交付证据 |
+| [2026-10-11 验证](text-provider-acceptance.md) | 当前 Rust、真实 HTTP、Claude Code、故障清理和分级内存校准结果 | 本轮验证证据与未覆盖范围 |
 | [退出与工具解析修复](supervisor-acceptance.md) | SIGINT/SIGTERM、HTTP 退出等待、工具 JSON 边界和测试同步 | 工作区修复及 PR 集成验证 |
 | [生命周期加固](supervisor-acceptance.md) | 命令轮换、准备结算、队列回收、关闭竞态和回归结果 | 本轮可靠性修复证据 |
 | [阶段观测与到达率负载](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/observability-load-20261009.md) | 阶段直方图、submit deadline、绝对 HTTP 超时及实机过载结果 | 后续内存准入和调度的测量依据 |
@@ -31,7 +31,7 @@
 | [内存实测记录](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-evidence-20261010.md) | 短请求生成、EOS 缺口、压力阻断和输入冻结 | 2026-10-10 实测与验证范围 |
 | [生产内存验证判据](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/production-memory-validation-v0.1.md) | 正常生产同步、指标口径、结算和独立输入验收 | 待执行的 P1 验证协议，无批准数值 |
 | [Qwen3.5 缓存几何](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/qwen35-memory-geometry-20261010.md) | 固定状态、KV 扩容、预计算和采样边界 | 固定版本源码推断，不替代实测 |
-| [Claude Code 验证](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/claude-code-validation-20261009.md) | 真实客户端任务、工具记录和取消检查 | Agent 路径实测 |
+| [Claude Code 验证](text-provider-acceptance.md) | 真实客户端任务、工具记录和取消检查 | Agent 路径实测 |
 | [仓库规则](../../AGENTS.md) | 独立编写、接口一致性和文档要求 | 约束后续仓库工作 |
 
 接口规范中的 `OR`、`ID`、`EV`、`SS`、`ST`、`RE`、`IC` 等规则编号用于追踪实现与测试。完整规范仍是设计草案。首个实现子集已经通过串行协议补齐字段、限额和原始样例；其余能力仍需通过各自阶段验收。

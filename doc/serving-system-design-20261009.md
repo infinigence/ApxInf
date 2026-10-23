@@ -1,8 +1,8 @@
 # ApxInf 面向 Mac 本地模型与编程 Agent 的 Serving 系统方案
 
-日期：2026-10-09。状态：系统设计提案。首个串行子集已完成实机验证，范围见[本地服务说明](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/local-service-v0.1.md)和[验证报告](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/serving-validation-20261009.md)。本文其余路线仍为规划。
+日期：2026-10-09。状态：系统设计提案。首个串行子集已完成实机验证，范围见[本地服务说明](serving/local-service-v0.1.md)和[验证报告](serving/text-provider-acceptance.md)。本文其余路线仍为规划。
 
-本方案以 Mac 本地 LLM／VLM 与编程 Agent 为优先场景，保留 CUDA／Jetson 和 PI0.5 的扩展边界。初始审计基线为 ApxInf `df5c55a06140107b24964d9e4abbefd9fa2a4733`。现状表描述该基线；外部机制依据官方文档与源码；后文的架构、阶段和验收条件属于设计建议。后续首个实现子集、已有本地模型实测和 Claude Code 结果见[实现与验证报告](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/serving-validation-20261009.md)，不将这些结果扩展到尚未实现的路线。
+本方案以 Mac 本地 LLM／VLM 与编程 Agent 为优先场景，保留 CUDA／Jetson 和 PI0.5 的扩展边界。初始审计基线为 ApxInf `df5c55a06140107b24964d9e4abbefd9fa2a4733`。现状表描述该基线；外部机制依据官方文档与源码；后文的架构、阶段和验收条件属于设计建议。后续首个实现子集、已有本地模型实测和 Claude Code 结果见[实现与验证报告](serving/text-provider-acceptance.md)，不将这些结果扩展到尚未实现的路线。
 
 该审计基线属于 `qhy991/ApxInf` 的历史 fork，不代表本次 PR 所基于的上游能力。旧 MLX 服务、会话缓存和原生 Qwen3.5 状态文件没有随本次 Serving 变更移植；相关依据链接固定到保存这些文件的历史提交 `7cee272c0d3d6c70af63d3376be0713c7c565e31`。
 

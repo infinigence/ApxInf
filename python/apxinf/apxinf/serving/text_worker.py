@@ -95,6 +95,197 @@ def model_manifest(model_path: Path, runtime: dict[str, str], execution: dict[st
     }
 
 
+class MLXRuntime:
+    """Use public MLX APIs on the thread that constructs this object."""
+
+    def __init__(self, model_path: str, max_context: int, prefill_step_size: int,
+                 output_batch_tokens: int = 1, memory_limit_bytes: int = 10 * 1024**3):
+        self.owner = threading.get_ident()
+        self.model_path = str(Path(model_path).resolve(strict=True))
+        self.runtime = {
+            "python": platform.python_version(),
+            "mlx": importlib.metadata.version("mlx"),
+            "mlx_lm": importlib.metadata.version("mlx-lm"),
+        }
+        if self.runtime != PINNED_RUNTIME:
+            raise WorkerFailure("model_unavailable", "The runtime does not match the pinned versions.")
+        helper_path = Path(__file__).resolve().parents[4] / "scripts/apxinf_mlx_generate.py"
+        helper_spec = importlib.util.spec_from_file_location("apxinf_existing_runtime_pins", helper_path)
+        if helper_spec is None or helper_spec.loader is None:
+            raise WorkerFailure("model_unavailable", "The runtime pin definitions are unavailable.")
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        packages = helper._pinned_toolchain_versions()
+        config_path = Path(self.model_path) / "config.json"
+        if config_path.stat().st_size > 2 * 1024 * 1024:
+            raise WorkerFailure("model_unavailable", "The model configuration exceeds the byte limit.")
+        source_config = helper._parse_json(config_path.read_bytes(), "config.json")
+        if source_config.get("model_file") is not None or source_config.get("auto_map") is not None:
+            raise WorkerFailure("model_unavailable", "The model configuration requests custom code.")
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+                     "HF_HUB_DISABLE_TELEMETRY", "HF_HUB_DISABLE_IMPLICIT_TOKEN"):
+            os.environ[name] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        self.manifest = model_manifest(Path(self.model_path), self.runtime, {
+            "provider": "mlx-lm", "precision": "bundle",
+            "prefill_step_size": prefill_step_size, "output_batch_tokens": output_batch_tokens,
+            "memory_limit_bytes": memory_limit_bytes,
+        })
+        self.manifest["packages"] = packages
+        self.manifest["runtime_pins_sha256"] = _file_digest(helper_path)
+        self.manifest["contracts_sha256"] = _file_digest(Path(contracts.__file__).resolve())
+        with contextlib.redirect_stdout(sys.stderr):
+            import mlx.core as mx
+            from mlx_lm import load
+            from mlx_lm.generate import generate_step
+            from mlx_lm.models.cache import make_prompt_cache
+
+            self.mx = mx
+            self._load_stream = mx.default_stream(mx.default_device())
+            self._request_stream = None
+            self._generation_stream = None
+            self._peak_epoch = 0
+            mx.set_memory_limit(memory_limit_bytes)
+            self.generate_step = generate_step
+            self.make_prompt_cache = make_prompt_cache
+            self.model, self.tokenizer, config = load(
+                self.model_path,
+                tokenizer_config={"local_files_only": True, "trust_remote_code": False},
+                lazy=False,
+                return_config=True,
+            )
+            mx.synchronize(self._load_stream)
+        text_config = config.get("text_config", config)
+        model_limit = text_config.get("max_position_embeddings", max_context)
+        self.max_context = min(max_context, int(model_limit))
+        self.vocab_size = int(text_config["vocab_size"])
+        self.eos_token_ids = sorted(int(item) for item in self.tokenizer.eos_token_ids)
+        self.prefill_step_size = prefill_step_size
+        self.consumed_position = 0
+        self._cache = None
+        self._detokenizer = None
+
+    def _check_owner(self) -> None:
+        if threading.get_ident() != self.owner:
+            raise RuntimeError("Only the execution owner can use MLX objects.")
+
+    def prepare(self, command: dict[str, Any]) -> list[int]:
+        self._check_owner()
+        with contextlib.redirect_stdout(sys.stderr):
+            tokens = self.tokenizer.apply_chat_template(
+                command["messages"],
+                tools=command["tools"] or None,
+                tokenize=True,
+                add_generation_prompt=True,
+                **command["template_options"],
+            )
+        return list(tokens)
+
+    def generate(self, command: dict[str, Any], progress: Callable[[int], None]):
+        self._check_owner()
+        self._request_stream = self.mx.default_stream(self.mx.default_device())
+        self.mx.reset_peak_memory()
+        self._peak_epoch += 1
+        self._generation_stream = None
+        self.consumed_position = 0
+        self._cache = self.make_prompt_cache(self.model)
+        self._detokenizer = self.tokenizer.detokenizer
+        self._detokenizer.reset()
+        prompt_length = len(command["token_ids"])
+
+        def prompt_progress(consumed: int, total: int) -> None:
+            if self._generation_stream is None:
+                if consumed != 0:
+                    raise RuntimeError("The generation stream was not captured before prefill.")
+                self._generation_stream = self.mx.default_stream(self.mx.default_device())
+            self.consumed_position = max(self.consumed_position, consumed)
+            progress(consumed)
+
+        with contextlib.redirect_stdout(sys.stderr):
+            generator = self.generate_step(
+                self.mx.array(command["token_ids"]),
+                self.model,
+                max_tokens=command["max_tokens"],
+                sampler=lambda logits: self.mx.argmax(logits, axis=-1),
+                prompt_cache=self._cache,
+                prefill_step_size=self.prefill_step_size,
+                prompt_progress_callback=prompt_progress,
+            )
+            try:
+                for index, (token, _) in enumerate(generator):
+                    if self._generation_stream is None:
+                        raise RuntimeError("The generation stream was not captured before output.")
+                    # The pinned generator consumes the emitted token before yield.
+                    self.consumed_position = prompt_length + index + 1
+                    yield int(token)
+            finally:
+                generator.close()
+
+    def decode(self, token: int, eos: bool = False) -> str:
+        self._check_owner()
+        if eos:
+            return ""
+        self._detokenizer.add_token(token)
+        return self._detokenizer.last_segment
+
+    def finish_text(self) -> str:
+        self._check_owner()
+        if self._detokenizer is None:
+            return ""
+        self._detokenizer.finalize()
+        return self._detokenizer.last_segment
+
+    def memory(self) -> dict[str, int]:
+        self._check_owner()
+        return {
+            "active_bytes": int(self.mx.get_active_memory()),
+            "peak_bytes": int(self.mx.get_peak_memory()),
+            "cache_bytes": int(self.mx.get_cache_memory()),
+        }
+
+    def _synchronize_owned_streams(self) -> None:
+        streams = []
+        for stream in (self._generation_stream, self._request_stream, self._load_stream):
+            if stream is not None and stream not in streams:
+                self.mx.synchronize(stream)
+                streams.append(stream)
+
+    def inspect_memory(self) -> dict[str, Any]:
+        """Observe logical cache metadata after submitted work completes."""
+        self._check_owner()
+        self._synchronize_owned_streams()
+
+        def optional_integer(layer: Any, name: str) -> int | None:
+            try:
+                value = getattr(layer, name)
+            except (AttributeError, NotImplementedError):
+                return None
+            # Do not materialize array-valued metadata or invent unsupported values.
+            return value if type(value) is int and value >= 0 else None
+
+        layers = []
+        for layer in self._cache or ():
+            layers.append({"type": type(layer).__name__,
+                           "offset": optional_integer(layer, "offset"),
+                           "nbytes": optional_integer(layer, "nbytes")})
+        sizes = [layer["nbytes"] for layer in layers]
+        return {
+            "allocator": self.memory(),
+            "peak_epoch": self._peak_epoch,
+            "runtime_consumed_position": self.consumed_position,
+            "cache_payload_bytes": sum(sizes) if all(size is not None for size in sizes) else None,
+            "layers": layers,
+        }
+
+    def settle(self) -> None:
+        self._check_owner()
+        self._synchronize_owned_streams()
+        self._cache = None
+        self._detokenizer = None
+        self.mx.clear_cache()
+        self._synchronize_owned_streams()
+        self._generation_stream = None
+        self._request_stream = None
 
 
 class ByteOutbox:
@@ -621,3 +812,54 @@ class TextWorker:
                 self._send(self.frame("worker_fault", error=self.error(
                     "protocol_fault", "The worker channel cannot continue.", "worker")))
             raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--worker-epoch", required=True)
+    parser.add_argument("--protocol", default="apxinf-worker/2.0")
+    parser.add_argument("--max-context", type=int, default=16384)
+    parser.add_argument("--max-output-tokens", type=int, default=2048)
+    parser.add_argument("--prefill-step-size", type=int, default=256)
+    parser.add_argument("--output-batch-tokens", type=int, default=1)
+    parser.add_argument("--memory-limit-bytes", type=int, default=10 * 1024**3)
+    arguments = parser.parse_args(argv)
+    if arguments.protocol != "apxinf-worker/2.0":
+        parser.error("The protocol version is not supported.")
+    try:
+        contracts.validate_frame({"protocol": arguments.protocol, "kind": "drained",
+                                  "worker_epoch": arguments.worker_epoch})
+    except contracts.ContractError:
+        parser.error("The worker epoch is invalid.")
+    if not 1 <= arguments.prefill_step_size <= 8192 or not 1 <= arguments.output_batch_tokens <= 256:
+        parser.error("The prefill or output batch size is invalid.")
+    if not 1 <= arguments.max_context <= 131072 or not 0 <= arguments.max_output_tokens <= 65536:
+        parser.error("The deployment token limits are invalid.")
+    if not 1 <= arguments.memory_limit_bytes <= 9007199254740991:
+        parser.error("The memory limit is invalid.")
+    output_fd = sys.stdout.fileno()
+
+    def write_all(payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(output_fd, view)
+            view = view[written:]
+
+    outbox = ByteOutbox(write_all)
+    try:
+        runtime = MLXRuntime(arguments.model, arguments.max_context, arguments.prefill_step_size,
+                             arguments.output_batch_tokens, arguments.memory_limit_bytes)
+        worker = TextWorker(runtime, arguments.worker_epoch, outbox.put,
+                            max_output_tokens=arguments.max_output_tokens,
+                            output_batch_tokens=arguments.output_batch_tokens)
+        worker.run(sys.stdin.buffer)
+        outbox.close()
+        return 0
+    except Exception as error:
+        print(f"Text worker stopped: {type(error).__name__}.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

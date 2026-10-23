@@ -4,7 +4,7 @@ Status: proposed work, version 0.1, 2026-10-09.
 
 This plan defines the full implementation sequence.
 The [serial profile](serial-profile-v0.1.md) defines the first implemented subset.
-The [local service](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/local-service-v0.1.md) records its boundaries.
+The [local service](local-service-v0.1.md) records its boundaries.
 P1a code and CPU checks do not complete the P1 acceptance gate.
 The plan applies structural principles from ASD-STE100 Issue 9. It does not claim full dictionary compliance or certification.
 
