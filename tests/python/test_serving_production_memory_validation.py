@@ -163,7 +163,7 @@ class ProductionMemoryTests(unittest.TestCase):
                 plan = {"format": "apxinf-production-memory-plan-v1", "expected": expected,
                         "environment": {"process_limits": "CPU fixture", "runtime_settings": "CPU fixture",
                                         "competing_workload_policy": "No device execution."},
-                        "limits": {"request_timeout_ms": 1000, "settlement_timeout_ms": 100,
+                        "limits": {"request_timeout_ms": 1000, "settlement_timeout_ms": 2000,
                                    "observation_interval_ms": 10, "observation_budget_ms": 1000,
                                    "max_sample_gap_ms": 1000, "max_response_bytes": 65536,
                                    "max_samples": 100, "max_diagnostic_bytes": 65536},
@@ -225,8 +225,8 @@ class ProductionMemoryTests(unittest.TestCase):
                 self.assertEqual(result["checks"]["runtime_peak"], "unknown")
                 self.assertIsNone(result["runtime_peak"]["bytes"])
 
-    def test_cleanup_after_settlement_deadline_stays_unknown_and_stops_progression(self):
-        with self.fixture(cleanup_delay=.15) as (fixture, plan, args):
+    def test_unsettled_request_expires_short_budget_and_stops_progression(self):
+        with self.fixture(skip_cleanup=True) as (fixture, plan, args):
             plan["limits"]["settlement_timeout_ms"] = 50
             second = copy.deepcopy(plan["cases"][0])
             second["case_id"] = "must-not-run"
@@ -234,6 +234,8 @@ class ProductionMemoryTests(unittest.TestCase):
             code, report = self.collect(fixture, plan, args)
             self.assertEqual(code, 1)
             self.assertEqual(fixture.requests, 1)
+            self.assertIsNone(report["cases"][0]["collection_error"])
+            self.assertEqual(report["cases"][0]["checks"]["execution"], "passed")
             self.assertEqual(report["cases"][0]["checks"]["settlement"], "unknown")
             self.assertEqual(report["cases"][1]["status"], "skipped")
             observations = [json.loads(line) for line in (args.output_dir / "observations.jsonl").read_text().splitlines()]
