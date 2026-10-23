@@ -16,6 +16,7 @@
 | [MiniCPM-V 配置](minicpm-vision-v0.1.md) | 独立 Python 环境、PNG 输入、准备重放和请求清理 | 显式选择，worker 2.5 |
 | [视觉 worker 验证](minicpm-vision-worker-validation-20261023.md) | 实际模型、HTTP、取消和长输入的证据边界 | HTTP 通过，Claude 图片修订未通过 |
 | [PR #116 增量汇总](serving-update-20261023.md) | 原 PR 与本轮实现、已测范围和剩余限制 | 本轮交付说明 |
+| [Clef 验证](clef-validation-20261023.md) | provider 缺口、两次参考启动、压力阻断和错误接入修复 | 正向决策 HTTP 尚未通过 |
 | [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
 | [有界初始思考](native-bounded-thinking-v0.1.md) | 显式 worker 2.4 配置、512-token 预算和完整用量计数 | 接口规范，控制机制已验证 |
 | [有界思考验证](native-bounded-thinking-validation-20261023.md) | 原生预算边界、15K 输入、真实客户端和图像检查 | 控制机制通过，视觉验收未通过 |
