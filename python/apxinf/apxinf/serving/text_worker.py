@@ -96,6 +96,9 @@ class MLXRuntime:
                  output_batch_tokens: int = 1, memory_limit_bytes: int = 10 * 1024**3):
         self.owner = threading.get_ident()
         self.model_path = str(Path(model_path).resolve(strict=True))
+        if any((Path(self.model_path) / name).exists()
+               for name in ("joint_head_config.json", "joint_head.safetensors")):
+            raise WorkerFailure("model_unavailable", "The text provider does not support a decision head.")
         self.runtime = {
             "python": platform.python_version(),
             "mlx": importlib.metadata.version("mlx"),
