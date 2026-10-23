@@ -164,6 +164,8 @@ def inspect_events(events):
         if kind in ("assistant", "user"):
             content = event.get("message", {}).get("content", [])
             for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
                 if block.get("type") == "tool_use":
                     tools.append({"id": block.get("id"), "name": block.get("name"),
                                   "input": block.get("input"), "elapsed_s": record["elapsed_s"]})

@@ -1,5 +1,3 @@
-"""Original daily file tasks and strict completion checks."""
-
 import hashlib
 import json
 import os
@@ -140,6 +138,21 @@ def artifact_check(spec, directory):
         return {"valid": False, "reason": str(error)}
 
 
+def edit_matches(arguments, spec, directory):
+    replacement = arguments.get("new_string")
+    if arguments.get("old_string") != "" or not isinstance(replacement, str):
+        return False
+    try:
+        if len(replacement.encode("utf-8")) > spec["output_limit_bytes"]:
+            return False
+        proposed = json.loads(replacement, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        saved = json.loads(read_regular(directory / spec["output_path"], spec["output_limit_bytes"]).decode("utf-8"),
+                           object_pairs_hook=unique_object, parse_constant=reject_constant)
+        return exact_value(proposed, spec["expected"]) and exact_value(proposed, saved)
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return False
+
+
 def tool_cycle(events, spec, directory):
     expected_paths = {(directory / name).resolve(): name for name in spec["input_files"]}
     output = (directory / spec["output_path"]).resolve()
@@ -180,6 +193,8 @@ def tool_cycle(events, spec, directory):
                 path = (path if path.is_absolute() else directory / path).resolve()
                 if (name == "Read" and path not in expected_paths and path != output) or (
                         name == "Edit" and (path != output or read != set(spec["input_files"]))):
+                    return False
+                if name == "Edit" and not edit_matches(arguments, spec, directory):
                     return False
                 seen.add(tool_id)
                 pending[tool_id] = (name, expected_paths.get(path))
