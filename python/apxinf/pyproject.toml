@@ -33,3 +33,6 @@ test = ["pytest>=7", "sentencepiece>=0.1.99", "torch>=2.1", "torchvision>=0.16"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["apxinf*"]
+
+[tool.setuptools.package-data]
+"apxinf.serving" = ["clef_artifacts.json"]
