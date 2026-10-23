@@ -14,26 +14,27 @@ use std::{
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod tests;
+
 #[derive(Parser)]
-#[command(about = "Serve one local MLX text model through bounded HTTP APIs.")]
+#[command(about = "Serve one local model through bounded HTTP APIs.")]
 struct Args {
     #[arg(long)]
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
     provider: String,
     #[arg(long)]
     native_worker: Option<PathBuf>,
     #[arg(long)]
     metal_library: Option<PathBuf>,
-    #[arg(
-        long,
-        default_value = ".apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python"
-    )]
-    python: PathBuf,
-    #[arg(long, default_value = "python/apxinf/apxinf/serving/text_worker.py")]
-    worker: PathBuf,
+    #[arg(long)]
+    python: Option<PathBuf>,
+    #[arg(long)]
+    worker: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
     #[arg(long, default_value_t = 8080)]
@@ -142,18 +143,13 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if args.native_worker.is_some() || args.metal_library.is_some() {
             return Err("Native runtime paths require a native MiniCPM provider.".into());
         }
-        WorkerRuntime::Python
+        if args.provider == "mlx-vlm-minicpmv47" {
+            WorkerRuntime::PythonMiniCpmVision
+        } else {
+            WorkerRuntime::Python
+        }
     };
-    let python = if matches!(runtime, WorkerRuntime::Python) {
-        std::fs::canonicalize(args.python)?
-    } else {
-        args.python
-    };
-    let worker = if matches!(runtime, WorkerRuntime::Python) {
-        std::fs::canonicalize(args.worker)?
-    } else {
-        args.worker
-    };
+    let (python, worker) = worker_paths(&runtime, args.python, args.worker)?;
     let service = supervisor::start_with_shutdown(
         Config {
             runtime,
@@ -218,6 +214,45 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn worker_paths(
+    runtime: &WorkerRuntime,
+    python: Option<PathBuf>,
+    worker: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let vision = matches!(runtime, WorkerRuntime::PythonMiniCpmVision);
+    if vision && python.is_none() {
+        return Err("The mlx-vlm-minicpmv47 provider requires an explicit --python path.".into());
+    }
+    let mut python =
+        python.unwrap_or_else(|| ".apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python".into());
+    let mut worker = worker.unwrap_or_else(|| {
+        if vision {
+            "python/apxinf/apxinf/serving/vision_worker.py".into()
+        } else {
+            "python/apxinf/apxinf/serving/text_worker.py".into()
+        }
+    });
+    if vision {
+        let absolute = std::path::absolute(&python)?;
+        let parent = absolute
+            .parent()
+            .ok_or("The Python path needs a parent directory.")?;
+        python = std::fs::canonicalize(parent)?.join(
+            absolute
+                .file_name()
+                .ok_or("The Python path needs a filename.")?,
+        );
+        if !python.is_file() {
+            return Err("The selected Python executable does not exist.".into());
+        }
+        worker = std::fs::canonicalize(worker)?;
+    } else if matches!(runtime, WorkerRuntime::Python) {
+        python = std::fs::canonicalize(python)?;
+        worker = std::fs::canonicalize(worker)?;
+    }
+    Ok((python, worker))
 }
 
 #[cfg(unix)]

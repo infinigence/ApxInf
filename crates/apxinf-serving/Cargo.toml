@@ -24,6 +24,10 @@ serde_json = "1"
 sha2 = "=0.10.9"
 uuid = { version = "=1.24.0", features = ["v4"] }
 clap = { version = "=4.5.23", features = ["derive"] }
+base64 = "=0.22.1"
+png = "=0.18.0"
+crc32fast = "=1.5.0"
+flate2 = "=1.1.10"
 apxinf-model = { path = "../apxinf-model", features = ["mlx"], optional = true }
 apxinf-core = { path = "../apxinf-core", optional = true }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }

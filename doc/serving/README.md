@@ -12,6 +12,10 @@
 | [接口规范](contracts-v0.1.md) | 英文术语、所有权、字段、事件、状态、错误和兼容规则 | 新 serving 接口的语义依据 |
 | [实施计划](implementation-plan.md) | 模块边界、阶段依赖、交付内容和验收门 | 规定实施顺序 |
 | [串行协议](serial-profile-v0.1.md) | 首个实现子集的完整字段、限额和事件顺序 | Rust／Python 共同校验 |
+| [PNG 输入契约](owned-media-v0.1.md) | 有界图片数据、完整性检查和跨语言用例 | 供显式视觉配置使用 |
+| [MiniCPM-V 配置](minicpm-vision-v0.1.md) | 独立 Python 环境、PNG 输入、准备重放和请求清理 | 显式选择，worker 2.5 |
+| [视觉 worker 验证](vision-acceptance.md) | 实际模型、HTTP、取消和长输入的证据边界 | HTTP 通过，Claude 图片修订未通过 |
+| [PR #116 增量汇总](supervisor-acceptance.md) | 原 PR 与本轮实现、已测范围和剩余限制 | 本轮交付说明 |
 | [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
 | [有界初始思考](native-bounded-thinking-v0.1.md) | 显式 worker 2.4 配置、512-token 预算和完整用量计数 | 接口规范，控制机制已验证 |
 | [有界思考验证](native-minicpm-acceptance.md) | 原生预算边界、15K 输入、真实客户端和图像检查 | 控制机制通过，视觉验收未通过 |
