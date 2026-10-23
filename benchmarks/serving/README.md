@@ -424,6 +424,44 @@ The output must be a bounded regular file without a symbolic link.
 The report separates `tool_cycle_passed`, `inputs_unchanged`, `artifact_check`, `observed_input_usage`, and `passed`.
 These checks establish exact fixture completion, not general financial or meeting analysis quality.
 
+### Expense calculation tools
+
+The `expenses-tools-cny` and `expenses-tools-usd` tasks add original cases with a calculation tool.
+Their revisions are `expenses-tools-cny-v1` and `expenses-tools-usd-v1`.
+Each workspace contains a CSV, selection rules, usage instructions, and the same standard-library calculator.
+The model reads these inputs and both empty JSON targets before its first Edit.
+The model writes `calculation-plan.json` with exactly `currency`, `status`, and `categories`.
+Category order is free, but selected transaction IDs must retain CSV source order.
+
+The model then runs exactly `python3 -I expense_calculator.py` through Bash.
+The calculator prints a receipt and writes no files.
+The model saves the receipt's `summary` into `expenses.json` with Edit.
+
+The calculator validates every CSV row before selection and uses signed integer cents.
+It includes eligible refunds and zero amounts without currency conversion or rounding.
+Limits are 100 rows, 16 categories, and 12 integer amount digits.
+Money integers must remain within the JSON safe-integer range.
+
+Byte limits are 65536 for CSV, 8192 each for rules and usage, and 32768 for calculator source.
+The plan, receipt, and artifact limits are 4096, 16384, and 8192 bytes.
+These utility limits do not measure model capacity.
+
+The checker binds the complete receipt to original file hashes, the successful plan Edit, and independent literal expectations.
+It requires successful results before dependent mutations and rejects failed attempts, pending calls, and repeated final results.
+The pinned Claude Code 2.1.289 Bash result supplies stdout, stderr, and execution flags.
+The checker requires matching stdout content, empty stderr, and false interruption, image, and no-output flags.
+It permits a bounded Bash description and timeout, and an optional false Edit `replace_all` flag.
+
+The requested inventory must contain exactly Bash, Edit, and Read. The advertised inventory may contain additional tools.
+The report adds `calculation_receipt` and `tool_cycle_reason` to the existing evidence fields.
+
+Run these cases with `--tasks expenses-tools-cny expenses-tools-usd`.
+CPU tests verify calculator behavior and trace rejection. Actual model completion requires a separate captured client run.
+The evidence assumes trusted capture and no external writer. Tool permissions do not provide an operating-system sandbox.
+These cases do not establish long-context capacity or general financial quality.
+
+The cases add no dependencies or serving protocol changes.
+
 Run the three small tasks after service readiness:
 
 ```sh
