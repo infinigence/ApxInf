@@ -1,8 +1,11 @@
 """Run the real serial protocol with an original CPU lifecycle test runtime.
 
 The model directory can contain lifecycle.json with prepare_delays_ms,
-prepare_error_indices, generation_pause_ms, token_delay_ms, and trace_path.
+prepare_release_paths, prepare_error_indices, generation_pause_ms, token_delay_ms,
+and trace_path.
 Preparation indices start at zero. All durations use milliseconds.
+Each prepare_release_paths entry names an absolute release file outside the model directory.
+Preparation waits at most ten seconds for its indexed release file.
 The trace path is absolute and outside the model directory.
 This fixture does not establish model identity or inference correctness.
 """
@@ -38,12 +41,21 @@ class LifecycleRuntime:
         self.prepare_count = 0
         settings_path = Path(self.model_path) / "lifecycle.json"
         settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
-        allowed = {"prepare_delays_ms", "prepare_error_indices", "generation_pause_ms",
-                   "token_delay_ms", "trace_path"}
+        allowed = {"prepare_delays_ms", "prepare_release_paths", "prepare_error_indices",
+                   "generation_pause_ms", "token_delay_ms", "trace_path"}
         if type(settings) is not dict or settings.keys() - allowed:
             raise ValueError("The fixture configuration has invalid fields.")
         self.prepare_delays_ms = settings.get("prepare_delays_ms", [])
         self.prepare_error_indices = settings.get("prepare_error_indices", [])
+        release_paths = settings.get("prepare_release_paths", [])
+        if type(release_paths) is not list or any(type(path) is not str for path in release_paths):
+            raise ValueError("Preparation release paths must be an array of strings.")
+        self.prepare_release_paths = [Path(path) for path in release_paths]
+        if any(
+            not path.is_absolute() or path.resolve().is_relative_to(Path(self.model_path))
+            for path in self.prepare_release_paths
+        ):
+            raise ValueError("Preparation release paths must be absolute and outside the model directory.")
         self.generation_pause_ms = settings.get("generation_pause_ms", 0)
         self.token_delay_ms = settings.get("token_delay_ms", 0)
         if type(self.prepare_delays_ms) is not list:
@@ -73,6 +85,12 @@ class LifecycleRuntime:
         self.trace("prepare_started", command_id=command["command_id"])
         index = self.prepare_count
         self.prepare_count += 1
+        if index < len(self.prepare_release_paths):
+            wait_until = time.monotonic() + 10
+            while not self.prepare_release_paths[index].is_file():
+                if time.monotonic() >= wait_until:
+                    raise WorkerFailure("internal_error", "The preparation release file did not appear.")
+                time.sleep(0.005)
         if index < len(self.prepare_delays_ms):
             time.sleep(self.prepare_delays_ms[index] / 1000)
         if index in self.prepare_error_indices:
