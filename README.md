@@ -156,6 +156,8 @@ The [system design](doc/serving-system-design-20261009.md) defines the broader
 framework and staged extensions.
 The default text profile does not accept images.
 The separate [MiniCPM-V profile](doc/serving/minicpm-vision-v0.1.md) accepts bounded PNG inputs through Anthropic Messages.
+The separate [Clef text profile](doc/serving/clef-text-v0.1.md) exposes typed decisions through `POST /v1/systemone`.
+It returns `noul`, `choice`, and `score` probabilities from the joint schema head.
 The service does not provide persistent sessions, prefix reuse, or continuous batching.
 Read the [current update report](doc/serving/serving-update-20261023.md) for tested capabilities and remaining limits.
 
