@@ -169,6 +169,64 @@ fn pending_frames(worker: &mut Worker, frames: impl IntoIterator<Item = Value>) 
 }
 
 #[tokio::test]
+async fn checked_decision_frames_preserve_preparation_and_cleanup_intervals() {
+    let probe = Probe::new();
+    let (_, service, mut tracker, submit, frames) =
+        stopped_attempt(&probe, "inference_failure").await;
+    let start = Instant::now();
+    let observation = RequestObservation::decision(start);
+    observation.preparation_start(start);
+    check_and_observe_frame(
+        &mut tracker,
+        &service,
+        &observation,
+        &frames[0],
+        start + Duration::from_millis(20),
+    )
+    .unwrap();
+    tracker.observe(&submit).unwrap();
+    for frame in &frames[1..] {
+        check_and_observe_frame(
+            &mut tracker,
+            &service,
+            &observation,
+            frame,
+            start + Duration::from_millis(60),
+        )
+        .unwrap();
+    }
+    observation.public_terminal(
+        &service.metrics.observations,
+        Outcome::Failed,
+        start + Duration::from_millis(70),
+    );
+    observation.settled(
+        &service.metrics.observations,
+        start + Duration::from_millis(90),
+    );
+    assert_eq!(
+        decision_metric(&service, "apxinf_preparation_seconds_count"),
+        1.0
+    );
+    assert_eq!(
+        decision_metric(&service, "apxinf_preparation_seconds_sum"),
+        0.02
+    );
+    assert_eq!(
+        decision_metric(&service, "apxinf_worker_terminal_to_settlement_seconds_sum"),
+        0.03
+    );
+    assert_eq!(
+        decision_metric(&service, "apxinf_public_terminal_to_settlement_seconds_sum"),
+        0.02
+    );
+    assert_eq!(
+        decision_metric(&service, "apxinf_worker_first_token_seconds_count"),
+        0.0
+    );
+}
+
+#[tokio::test]
 async fn stopped_decision_preparation_ends_before_resource_settlement() {
     let probe = Probe::new();
     let (mut worker, service, mut tracker, _, frames) = stopped_attempt(&probe, "success").await;
@@ -180,7 +238,7 @@ async fn stopped_decision_preparation_ends_before_resource_settlement() {
         Outcome::Cancelled,
         Instant::now(),
     );
-    check_stopped_frames(&mut worker, &service, &mut tracker)
+    check_stopped_frames(&mut worker, &service, &mut tracker, &observation)
         .await
         .unwrap();
     let preparation_count = decision_metric(&service, "apxinf_preparation_seconds_count");
@@ -219,7 +277,7 @@ async fn stopped_decision_terminals_record_cleanup_without_replacing_cancellatio
             Outcome::Cancelled,
             Instant::now(),
         );
-        check_stopped_frames(&mut worker, &service, &mut tracker)
+        check_stopped_frames(&mut worker, &service, &mut tracker, &observation)
             .await
             .unwrap();
         observation.settled(&service.metrics.observations, Instant::now());
@@ -290,7 +348,7 @@ async fn stopped_decision_invalid_frames_add_no_observations() {
         pending_frames(&mut worker, frames);
         let observation = RequestObservation::decision(Instant::now());
         observation.preparation_start(Instant::now());
-        let error = check_stopped_frames(&mut worker, &service, &mut tracker)
+        let error = check_stopped_frames(&mut worker, &service, &mut tracker, &observation)
             .await
             .unwrap_err();
         assert_eq!(error.code, "protocol_fault", "{invalid}");
@@ -381,16 +439,18 @@ async fn decision_context_rejection_reaps_and_loads_a_replacement() {
         .events()
         .iter()
         .any(|event| event["event"] == "submitted"));
-    assert!(
-        service.metrics_text().lines().any(|line| line
-            == "apxinf_worker_terminal_to_settlement_seconds_count{operation=\"decision\"} 1"),
-        "A checked Clef failure must contribute one worker cleanup sample.\n{}",
-        service.metrics_text()
+    let cleanup_count = decision_metric(
+        &service,
+        "apxinf_worker_terminal_to_settlement_seconds_count",
     );
     let mut next = service.enqueue_decision(request()).unwrap();
     next.begin.await.unwrap().unwrap();
     assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
     stop(&service, task).await;
+    assert_eq!(
+        cleanup_count, 1.0,
+        "A checked Clef failure must contribute one worker cleanup sample."
+    );
 }
 
 #[tokio::test]
@@ -418,6 +478,10 @@ async fn decision_inference_failure_reaps_and_records_worker_cleanup() {
     let metrics = service.metrics_text();
     assert!(metrics
         .contains("apxinf_request_outcomes_total{operation=\"decision\",status=\"failed\"} 1"));
+    let cleanup_count = decision_metric(
+        &service,
+        "apxinf_worker_terminal_to_settlement_seconds_count",
+    );
     let pid = probe
         .events()
         .iter()
@@ -441,18 +505,8 @@ async fn decision_inference_failure_reaps_and_records_worker_cleanup() {
     next.begin.await.unwrap().unwrap();
     assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
     stop(&service, task).await;
-    let cleanup_count = metrics
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix(
-                "apxinf_worker_terminal_to_settlement_seconds_count{operation=\"decision\"} ",
-            )
-        })
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
     assert_eq!(
-        cleanup_count, 1,
+        cleanup_count, 1.0,
         "A checked inference failure must contribute one worker cleanup sample."
     );
 }

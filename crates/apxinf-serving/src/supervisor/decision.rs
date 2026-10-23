@@ -162,7 +162,7 @@ pub(super) async fn execute_decision(
                         error: ApiError::worker(message),
                         reported: true,
                     })?;
-                check_stopped_frames(worker, service, &mut tracker)
+                check_stopped_frames(worker, service, &mut tracker, &job.observation)
                     .await
                     .map_err(|error| ExecutionFailure {
                         error,
@@ -184,20 +184,49 @@ async fn check_stopped_frames(
     worker: &mut Worker,
     service: &Service,
     tracker: &mut DecisionTracker,
+    observation: &RequestObservation,
 ) -> Result<(), ApiError> {
     tokio::time::timeout(SETTLEMENT_GRACE, async {
         while let Some(frame) = worker.frames.recv().await {
             let frame = frame.map_err(protocol)?;
-            tracker.observe(&frame).map_err(protocol)?;
-            if frame["kind"] == "prepared_decision" {
-                crate::clef_identity::verify_prepared(&frame["preparation"], &service.ready)
-                    .map_err(protocol)?;
-            }
+            check_and_observe_frame(tracker, service, observation, &frame, Instant::now())?;
         }
         Ok(())
     })
     .await
     .map_err(|_| ApiError::worker("The reaped decision output did not settle."))?
+}
+
+fn check_and_observe_frame(
+    tracker: &mut DecisionTracker,
+    service: &Service,
+    observation: &RequestObservation,
+    frame: &Value,
+    received_at: Instant,
+) -> Result<(), ApiError> {
+    tracker.observe(frame).map_err(protocol)?;
+    if frame["kind"] == "prepared_decision" {
+        crate::clef_identity::verify_prepared(&frame["preparation"], &service.ready)
+            .map_err(protocol)?;
+    }
+    match frame["kind"].as_str() {
+        Some("prepared_decision") => {
+            observation.preparation_end(&service.metrics.observations, received_at);
+        }
+        Some("failure") => {
+            observation.preparation_end(&service.metrics.observations, received_at);
+            observation.worker_terminal(&service.metrics.observations, received_at, None);
+        }
+        Some("decision_result") => {
+            observation.worker_terminal(&service.metrics.observations, received_at, None);
+            service.metrics.peak_bytes.fetch_max(
+                frame["metrics"]["peak_device_bytes"].as_u64().unwrap(),
+                Ordering::Relaxed,
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn drive(
@@ -219,15 +248,17 @@ async fn drive(
         timeout,
     )
     .await?;
-    tracker.observe(&prepared).map_err(protocol)?;
-    job.observation
-        .preparation_end(&service.metrics.observations, Instant::now());
+    check_and_observe_frame(
+        tracker,
+        service,
+        &job.observation,
+        &prepared,
+        Instant::now(),
+    )?;
     let mut failure = None;
     if prepared["kind"] == "failure" {
         failure = Some(failure_error(&prepared));
     } else {
-        crate::clef_identity::verify_prepared(&prepared["preparation"], &service.ready)
-            .map_err(protocol)?;
         if let Some(error) = stopped(job, service, public, timeout) {
             return Err(error);
         }
@@ -250,7 +281,7 @@ async fn drive(
                 timeout,
             )
             .await?;
-            tracker.observe(&frame).map_err(protocol)?;
+            check_and_observe_frame(tracker, service, &job.observation, &frame, Instant::now())?;
             match frame["kind"].as_str() {
                 Some("accepted") => public.accept(
                     job,
@@ -258,18 +289,7 @@ async fn drive(
                         .as_u64()
                         .unwrap(),
                 ),
-                Some("decision_result") => {
-                    job.observation.worker_terminal(
-                        &service.metrics.observations,
-                        Instant::now(),
-                        None,
-                    );
-                    service.metrics.peak_bytes.fetch_max(
-                        frame["metrics"]["peak_device_bytes"].as_u64().unwrap(),
-                        Ordering::Relaxed,
-                    );
-                    break;
-                }
+                Some("decision_result") => break,
                 Some("failure") => {
                     failure = Some(failure_error(&frame));
                     break;
@@ -286,7 +306,7 @@ async fn drive(
         timeout,
     )
     .await?;
-    tracker.observe(&drained).map_err(protocol)?;
+    check_and_observe_frame(tracker, service, &job.observation, &drained, Instant::now())?;
     let eof = wait(
         async {
             match tokio::time::timeout(SETTLEMENT_GRACE, worker.frames.recv()).await {
