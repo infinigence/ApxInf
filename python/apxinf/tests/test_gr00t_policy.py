@@ -14,8 +14,8 @@ from apxinf.calibration import CalibrationContext, CalibrationRunner, ConsumerCo
 from apxinf.policies import available_policies, get_policy
 
 
-@pytest.mark.parametrize("precision", ["bf16", "int8", "fp8"])
-def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, precision):
+@pytest.mark.parametrize("model_variant", ["bf16", "int8_dynamic", "fp8_static"])
+def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, model_variant):
     import json
     import sys
     from apxinf.policies.impls.gr00t import _NvidiaProcessorAdapter
@@ -51,9 +51,9 @@ def test_prepared_directory_loads_without_backbone(tmp_path, monkeypatch, precis
     monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=load_native)))
     calibration = model / "calibration.json"
     calibration.write_text(json.dumps({"model": {"checkpoint": identity}}))
-    kwargs = {"calibration": calibration} if precision == "fp8" else {}
-    automatic = AutoPolicy.from_pretrained(model, precision=precision, **kwargs)
-    explicit = AutoPolicy.from_pretrained(model, backbone=bundle, precision=precision, **kwargs)
+    kwargs = {"calibration": calibration} if model_variant == "fp8_static" else {}
+    automatic = AutoPolicy.from_pretrained(model, model_variant=model_variant, **kwargs)
+    explicit = AutoPolicy.from_pretrained(model, backbone=bundle, model_variant=model_variant, **kwargs)
     assert calls[0] == calls[1]
     noise = np.zeros((1, 4, 6), dtype=np.float32)
     left, right = automatic.infer({}, noise=noise), explicit.infer({}, noise=noise)
@@ -212,7 +212,7 @@ def test_int8_precision_name_is_accepted(tmp_path, monkeypatch):
         @staticmethod
         def load(model_name, checkpoint, **kwargs):
             assert model_name == "gr00t"
-            assert kwargs["precision"] == "int8"
+            assert kwargs["model_variant"] == "int8_dynamic"
             assert kwargs["assets"] == {"backbone": str(tmp_path)}
             assert "calibration" not in kwargs
             assert "tactics" not in kwargs
@@ -224,14 +224,14 @@ def test_int8_precision_name_is_accepted(tmp_path, monkeypatch):
         SimpleNamespace(ModelRunner=Native),
     )
     policy = Gr00tPolicy.from_pretrained(
-        tmp_path, backbone=tmp_path, precision="int8", action_dim=3
+        tmp_path, backbone=tmp_path, model_variant="int8_dynamic", action_dim=3
     )
-    assert policy.metadata["precision"] == "int8"
+    assert policy.metadata["model_variant"] == "int8_dynamic"
 
 
 def test_fp8_requires_calibration(tmp_path):
     with pytest.raises(ValueError, match="requires calibration"):
-        Gr00tPolicy.from_pretrained(tmp_path, backbone=tmp_path, precision="fp8")
+        Gr00tPolicy.from_pretrained(tmp_path, backbone=tmp_path, model_variant="fp8_static")
 
 
 def test_calibration_uses_common_manifest_consumer_contract():
@@ -355,8 +355,8 @@ def test_processor_mutation_changes_calibration_checkpoint(tmp_path, prepared, r
 
 
 def test_w8a8_is_not_a_public_precision_name(tmp_path):
-    with pytest.raises(ValueError, match="precision must be"):
-        Gr00tPolicy.from_pretrained(tmp_path, backbone=tmp_path, precision="w8a8")
+    with pytest.raises(ValueError, match="model_variant must be"):
+        Gr00tPolicy.from_pretrained(tmp_path, backbone=tmp_path, model_variant="w8a8")
 
 
 def test_user_noise_is_reported_exactly_as_consumed():
@@ -394,10 +394,10 @@ def test_autopolicy_dispatches_gr00t_config(tmp_path, monkeypatch):
 
     def fake_from_pretrained(cls, model_dir, **kwargs):
         assert model_dir == tmp_path
-        assert kwargs == {"backbone": "/models/backbone", "precision": "bf16"}
+        assert kwargs == {"backbone": "/models/backbone", "model_variant": "bf16"}
         return sentinel
 
     monkeypatch.setattr(Gr00tPolicy, "from_pretrained", classmethod(fake_from_pretrained))
     assert AutoPolicy.from_pretrained(
-        tmp_path, backbone="/models/backbone", precision="bf16"
+        tmp_path, backbone="/models/backbone", model_variant="bf16"
     ) is sentinel

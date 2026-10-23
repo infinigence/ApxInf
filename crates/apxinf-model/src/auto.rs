@@ -44,7 +44,8 @@ pub struct LoadOptions {
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
     /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Other families migrate separately.
+    /// variants are parsed by their family loader. Every VLA family accepts this
+    /// option; legacy executors adapt it inside their own loader.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -507,6 +508,11 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "qwen_drive-cuda"
             | "d3"
             | "d3-cuda"
+            | "walloss" | "walloss-cuda" | "wall-oss" | "wall-oss-cuda"
+            | "wall_oss_05" | "wall_oss_05-cuda"
+            | "gr00t" | "gr00t-cuda" | "gr00t_n1_7" | "gr00t_n1_7-cuda"
+            | "Gr00tN1d7" | "Gr00tN1d7-cuda"
+            | "pi0_fast" | "pi0_fast-cuda" | "pi0fast" | "pi0fast-cuda"
             | "smolvla"
             | "smolvla_libero"
     ) || (matches!(device, Device::Metal(_))
@@ -654,6 +660,11 @@ mod tests {
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+        for name in ["walloss", "walloss-cuda", "wall-oss", "wall_oss_05-cuda",
+                     "gr00t", "gr00t-cuda", "Gr00tN1d7", "gr00t_n1_7-cuda",
+                     "pi0_fast", "pi0_fast-cuda", "pi0fast", "pi0fast-cuda"] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
     #[test]

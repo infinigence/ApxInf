@@ -1015,8 +1015,8 @@ impl ModelRunner {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
-    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
+    /// * `model_variant` — family-owned implementation selection for every VLA policy.
+    /// * `precision` — legacy runtime compatibility; leave auto when using model_variant.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.

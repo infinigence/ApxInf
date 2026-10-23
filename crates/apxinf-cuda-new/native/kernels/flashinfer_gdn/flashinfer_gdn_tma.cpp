@@ -75,6 +75,11 @@ int prefill(const void* q, const void* k, const void* v, void* out,
             const void* gate_log, const void* beta, const void* cu_seqlens,
             void* state, void* tensor_map_workspace, int tokens, int q_heads,
             int v_heads, int num_seqs, float scale, cudaStream_t stream) {
+#if !defined(APXINF_GEMM_CUTLASS)
+  // build.rs compiles the launch TU only with the SM100-family CUTLASS group.
+  // Reject before constructing descriptors or modifying caller buffers.
+  return static_cast<int>(cudaErrorNotSupported);
+#else
   if (tokens <= 0 || q_heads <= 0 || v_heads <= 0 || num_seqs <= 0) return -1;
   if (v_heads % q_heads != 0) return -2;
 
@@ -112,13 +117,18 @@ int prefill(const void* q, const void* k, const void* v, void* out,
       static_cast<float*>(state), state_indices, checkpoint_state,
       cu_checkpoints, workspace, state_stride, scale, num_seqs, q_heads,
       v_heads, total_tiles, grid_x, stream);
+#endif
 }
 
 size_t tensor_map_workspace_bytes(int v_heads, int num_seqs) {
+#if !defined(APXINF_GEMM_CUTLASS)
+  return 0;
+#else
   const int grid_x = grid_for(v_heads, num_seqs, nullptr);
   return grid_x <= 0 ? 0
                      : static_cast<size_t>(grid_x) * kTensorMapWorkspacePerCta +
                            kOptionalTailBytes;
+#endif
 }
 
 }  // namespace apxinf::cuda_new::flashinfer_gdn

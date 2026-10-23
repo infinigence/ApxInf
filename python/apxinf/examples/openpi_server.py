@@ -37,8 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--tokenizer", type=pathlib.Path)
-    parser.add_argument("--precision", choices=("auto", "fp8", "bf16", "int8"), default=None)
-    parser.add_argument("--model-variant", choices=("auto", "bf16", "fp8_static", "int8_dynamic"), default=None)
+    parser.add_argument("--model-variant", choices=("auto", "bf16", "fp16", "fp8_static", "fp8_dynamic", "int8_dynamic"), default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--action-dim", type=int, default=0, help="0 keeps the full vector")
     parser.add_argument(
@@ -74,13 +73,11 @@ def main() -> None:
     options = policy_kwargs(
         args.policy_options,
         device=args.device,
-        precision=args.precision,
         model_variant=getattr(args, "model_variant", None),
         action_dim=(args.action_dim or None),
         metadata={
             "protocol": "openpi.websocket_policy",
-            **({"model_variant": args.model_variant} if getattr(args, "model_variant", None)
-               else {"precision": args.precision}),
+            **({"model_variant": args.model_variant} if args.model_variant else {}),
         },
     )
     if getattr(args, "tokenizer", None) is not None:

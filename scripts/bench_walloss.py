@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--model-variant", choices=("bf16", "fp8_dynamic"), default="bf16")
     parser.add_argument("--views", type=int, default=2)
     parser.add_argument("--height", type=int, default=256, help="raw camera height")
     parser.add_argument("--width", type=int, default=256, help="raw camera width")
@@ -88,7 +88,7 @@ def main() -> None:
     policy = WallossPolicy.from_pretrained(
         args.model_dir,
         device=args.device,
-        precision=args.precision,
+        model_variant=args.model_variant,
         tactics=args.tactics,
         image_keys=image_keys,
         camera_names=names[: args.views],
@@ -129,7 +129,7 @@ def main() -> None:
     report = {
         "commit": git_commit(),
         "model_dir": str(args.model_dir),
-        "precision": args.precision,
+        "model_variant": args.model_variant,
         "raw_image": [args.views, args.height, args.width],
         "image_grid_thw": np.asarray(grids).tolist(),
         "vision_tokens": int(sum(t * h * w for t, h, w in grids) // (merge * merge)),
