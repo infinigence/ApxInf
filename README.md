@@ -8,120 +8,17 @@ ApxInf is a reimagined edge inference engine born of the agentic coding era,
 combining high performance, reliability, and energy efficiency across devices
 with an evolving agentic workflow that radically simplifies custom model development.
 
-- implemented in Rust, with backend-specific native dependencies
+- implemented with system language Rust with no other externel dependencies
 - embodied AI is highest priority, VLA/WAM models on Jetson/DriveOS Thor/Orin
 - Agentically optimized CUDA Kernels
 
 The first version of ApxInf ships with highly optimized PI-0.5 VLA model on Jetson Thor &
 Orin devices, and supports BF16, FP8 and INT8 precisions.
 
-## What's NEW!
-- [2026/10] 🔥 ApxInf supports Decision 3.0 mini and Qwen3.8-27B with image inference.
-- [2026/10] 🔥 ApxInf supoorts SmolVLA, deployable on Jetson Xavier / Thor / Orin / RTX 4090.
-- [2026/09] 🔥 ApxInf supports PI0-FAST, GR00T-N1.7, Qwen-Drive, Qwen3.8-27B.
-- [2026/09] 🔥 Initial open-source release of ApxInf repo, with PI0.5 support. Backends: Jetson Thor / Orin / RTX 4090.
-
-## Feature Matrix
-<table width="100%" style="width: 100%; table-layout: auto; border-collapse: collapse;">
-  <thead align="center" valign="bottom">
-    <tr>
-      <th style="min-width: 260px;">VLA</th>
-      <th style="min-width: 260px;">VLM</th>
-      <th style="min-width: 260px;">Decision</th>
-      <th style="min-width: 260px;">Hardware</th>
-    </tr>
-  </thead>
-  <tbody valign="top">
-    <tr>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li>PI0.5 ✅</li>
-          <li>PI0-FAST ✅</li>
-          <li>GR00T-N1.7 ✅</li>
-          <li>WALL-OSS-0.5 ✅</li>
-          <li>Qwen-Drive ✅</li>
-          <li>SmolVLA ✅</li>
-        </ul>
-      </td>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li>Qwen3.8-27B ✅</li>
-          <li>Qwen3-VL ✅</li>
-        </ul>
-      </td>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li>Decision 3.0 mini ✅</li>
-        </ul>
-      </td>
-      <td>
-        <ul style="margin-left: 0; padding-left: 16px;">
-          <li>NVIDIA CUDA ✅
-          </li>
-          <li>AMD ROCm
-          </li>
-          <li>Apple Metal
-          </li>
-        </ul>
-      </td>
-    </tr>
-  </tbody>
-</table>
 
 ## Quick start
 
 Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf) for instructions.
-
-### Native Apple Silicon text inference
-
-The optional `mlx` feature runs Qwen3-0.6B and MiniCPM5-2B through native Rust
-models and the MLX 0.31.2 C++/Metal runtime. Native model composition lives in
-`metal_qwen3` and `metal_minicpm5`, independent of the evolving multi-backend
-contract. It does not run a Python model.
-Qwen3 offers BF16 and mixed W8 selections; MiniCPM5 offers BF16 and an explicit
-DSpark drafter selection. Existing CUDA VLA families retain their own support
-scope.
-
-```sh
-export MLX_ROOT=/path/to/mlx-0.31.2
-export DYLD_LIBRARY_PATH="$MLX_ROOT/lib"
-export CARGO_TARGET_DIR=devlocal/apxinf-mlx/cargo-target
-cargo build --release --features mlx
-"$CARGO_TARGET_DIR/release/apxinf" generate \
-  --model /path/to/Qwen3-0.6B --model-name metal_qwen3 --device metal --dtype bf16 \
-  --model-variant bf16-compiled --greedy --max-tokens 160 \
-  --chat-options '{"enable_thinking":false}' --prompt 'Explain gravity briefly.'
-```
-
-See the [MLX architecture and supported profiles](doc/mlx-backend.md) and
-[native SDK setup](crates/apxinf-mlx/README.md) for build requirements,
-MiniCPM/DSpark commands and supported options.
-
-### Run a d3-mini text decision
-
-Download the complete [`vllm-sr/d3-mini`](https://huggingface.co/vllm-sr/d3-mini)
-package and build with CUDA. Construct `D3_SYSTEM_PROMPT`, `D3_USER_PROMPT` and
-token IDs with the model's
-[`d3_format.py`](https://huggingface.co/vllm-sr/d3-mini/blob/main/d3_format.py).
-
-```bash
-cargo build --release --features cuda
-./target/release/apxinf decide \
-  --model /path/to/d3-mini \
-  --system "$D3_SYSTEM_PROMPT" --prompt "$D3_USER_PROMPT" --candidates 3 \
-  --autotune
-```
-
-The Python binding exposes the same pre-tokenized runtime:
-
-```python
-import numpy as np
-import apxinf_py
-
-runner = apxinf_py.DecisionRunner.load("/path/to/d3-mini", autotune=True)
-token_ids = np.asarray(formatted_d3_token_ids, dtype=np.uint32)
-print(runner.decide(token_ids, 3))
-```
 
 ### Quickly benchmarking PI-0.5
 
@@ -140,6 +37,21 @@ python scripts/bench_pi05.py --random-weights --model-variant fp8_static --layer
 
 Reported latency is P50 over 30 samples after 10 warm-up iterations
 (`--warmup` / `--samples`).
+
+### Local HTTP serving on macOS
+
+The separate `apxinf-serve` binary exposes local text generation through
+Anthropic Messages and OpenAI Chat Completions.
+It supports SSE output, client tools, cancellation, a bounded queue, and metrics.
+One MLX worker executes one request at a time.
+
+Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
+environment, deployment limits, and supported API fields.
+Read the [validation report](doc/serving/text-provider-acceptance.md) for
+Qwen3.5-2B measurements and actual Claude Code tasks.
+The [system design](doc/serving-system-design-20261009.md) defines the broader
+framework and staged extensions.
+This HTTP profile does not expose images, sessions, prefix reuse, or continuous batching.
 
 ### Run a policy through Python API
 
@@ -188,15 +100,6 @@ actions = client.infer(observation)["actions"]
 ```
 
 ## Performance
-
-### d3-mini
-
-Text decision model, BF16, batch 1. Public Jev Decision Index 0.3, 140,178
-requests. See [reproduction details](doc/d3-mini-decision-index.md).
-
-| Hardware | Precision | Public score | Coverage | P50 | P95 |
-|---|---|---:|---:|---:|---:|
-| Jetson AGX Thor | BF16 | **54.91** | **100%** | 128 ms | 1,165.7 ms |
 
 ### PI0.5
 
