@@ -194,6 +194,70 @@ async fn decision_context_rejection_reaps_and_loads_a_replacement() {
 }
 
 #[tokio::test]
+async fn decision_inference_failure_reaps_and_records_worker_cleanup() {
+    let probe = Probe::new();
+    let (service, task) = start(
+        &probe,
+        "inference_failure",
+        Duration::from_secs(10),
+        Duration::ZERO,
+    )
+    .await;
+    let mut ticket = service.enqueue_decision(request()).unwrap();
+    assert_eq!(ticket.begin.await.unwrap().unwrap().input_tokens, 9);
+    assert!(
+        matches!(ticket.output.recv().await, Some(Event::Error(error)) if error.status == 500 && error.code == "internal_error")
+    );
+    assert!(ticket.output.recv().await.is_none());
+    available(&service).await;
+    assert_eq!(service.metrics.worker_rotations.load(Ordering::Relaxed), 1);
+    assert_eq!(service.metrics.worker_faults.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.completed.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.active.load(Ordering::Relaxed), 0);
+    assert_eq!(service.metrics.reserved_bytes.load(Ordering::Relaxed), 0);
+    let metrics = service.metrics_text();
+    assert!(metrics
+        .contains("apxinf_request_outcomes_total{operation=\"decision\",status=\"failed\"} 1"));
+    let pid = probe
+        .events()
+        .iter()
+        .find(|event| event["event"] == "submitted")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap()
+        .success();
+    assert!(
+        !alive,
+        "The failed decision child still exists after settlement."
+    );
+    let mut next = service.enqueue_decision(request()).unwrap();
+    next.begin.await.unwrap().unwrap();
+    assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
+    stop(&service, task).await;
+    let cleanup_count = metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "apxinf_worker_terminal_to_settlement_seconds_count{operation=\"decision\"} ",
+            )
+        })
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(
+        cleanup_count, 1,
+        "A checked inference failure must contribute one worker cleanup sample."
+    );
+}
+
+#[tokio::test]
 async fn decision_deadline_and_cancel_kill_before_capacity_release() {
     for (mode, cancel) in [
         ("prepare_hold", false),
