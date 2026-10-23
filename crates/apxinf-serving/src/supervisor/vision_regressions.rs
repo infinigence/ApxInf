@@ -107,6 +107,7 @@ for line in sys.stdin:
             .into(),
         controls: Default::default(),
         sent_commands: 0,
+        retired: false,
     }
 }
 

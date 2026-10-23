@@ -216,3 +216,59 @@ fn shared_clef_stream_settlement() {
         );
     }
 }
+
+#[test]
+fn clef_ready_rejects_unapproved_identity_shapes() {
+    let corpus = corpus();
+    let record = |path: &str| json!({"path":path,"sha256":"a".repeat(64)});
+    let sources: Map<String, Value> = SOURCE_NAMES
+        .iter()
+        .map(|name| ((*name).into(), record(&format!("/adapter/{name}"))))
+        .collect();
+    let modules: Map<String, Value> = [
+        "mlx_core",
+        "mlx_lm",
+        "transformers",
+        "numpy",
+        "pillow",
+        "tokenizers",
+    ]
+    .iter()
+    .map(|name| ((*name).into(), record(&format!("/env/{name}"))))
+    .collect();
+    let manifest = json!({"checkpoint":"mlx-community/clef-flash-4bit","checkpoint_revision":"b5adbe2c3a95200d4bf04a0727c8ec457157d5e1","adapter_revision":"apxinf-python-clef-text-v1","platform":"macos-metal","artifacts":approved_artifacts(),"loader":{"path":"/loader.py","sha256":LOADER_SHA256},"runtime":corpus["objects"]["runtime"],"sources":sources,"python":record("/env/bin/python"),"runtime_files":{"modules":modules,"libraries":[record("/env/libmlx.dylib")]},"execution":{"provider":"python-clef","precision":"backbone-4bit-head-bf16","backend":"lm","max_context":4096,"max_output_tokens":0,"idle_cache_limit_bytes":0,"memory_limit_bytes":9000000000u64,"truncate":false,"kv_reuse":false,"worker_lifetime":"one-attempt"}});
+    let mut ready = json!({"protocol":PROTOCOL,"kind":"ready","worker_epoch":"00000000-0000-4000-8000-000000000001","model_manifest":manifest,"capabilities":corpus["objects"]["capabilities"],"limits":{"max_frame_bytes":MAX_FRAME_BYTES,"max_depth":MAX_DEPTH,"max_commands":MAX_COMMANDS},"model_path":"/model","runtime":corpus["objects"]["runtime"],"memory":{"active_bytes":0,"peak_bytes":0,"cache_bytes":0}});
+    let refresh = |frame: &mut Value| {
+        frame["model_revision"] =
+            canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"])
+                .unwrap()
+                .into();
+        frame["capability_revision"] =
+            canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"])
+                .unwrap()
+                .into();
+    };
+    refresh(&mut ready);
+    validate_frame(&ready).unwrap();
+    assert!(validate_command_envelope(&ready).is_err());
+    for (pointer, value) in [
+        ("/model_manifest/loader/sha256", json!("b".repeat(64))),
+        ("/model_manifest/artifacts/0/sha256", json!("b".repeat(64))),
+        (
+            "/model_manifest/sources/clef_worker.py/path",
+            json!("/wrong.py"),
+        ),
+        ("/runtime/python", json!("3.12.11")),
+        ("/capabilities/token_events", json!(true)),
+        ("/model_manifest/execution/max_output_tokens", json!(1)),
+    ] {
+        let mut invalid = ready.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        refresh(&mut invalid);
+        assert!(validate_frame(&invalid).is_err(), "{pointer}");
+    }
+    let mut unknown = ready.clone();
+    unknown["model_manifest"]["sources"]["extra.py"] = record("/adapter/extra.py");
+    refresh(&mut unknown);
+    assert!(validate_frame(&unknown).is_err());
+}

@@ -1,6 +1,7 @@
 //! Local serving with one device execution owner.
 pub mod contracts;
 pub mod decision;
+mod clef_identity;
 pub mod diagnostics;
 pub mod gateway;
 pub mod host_pressure;

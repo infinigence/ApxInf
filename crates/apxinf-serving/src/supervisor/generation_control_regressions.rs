@@ -78,14 +78,14 @@ fn request_fixture(timeout: Duration) -> (Service, Job, Ticket) {
     let cancel = Arc::new(AtomicBool::new(false));
     let job = Job {
         observation: Arc::new(RequestObservation::new(ingress, false)),
-        request: Request {
+        workload: Workload::Text(Request {
             selection: crate::sampling::Selection::Greedy,
             messages: vec![json!({"role":"user", "content":"control lifetime probe"})],
             tools: vec![],
             max_tokens: 4,
             stops: vec![],
             count_only: false,
-        },
+        }),
         id: "control-probe".into(),
         ingress,
         begin,
