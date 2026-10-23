@@ -1,8 +1,8 @@
 //! Compile the HIP device code when a ROCm toolchain is present.
 //!
-//! With ROCm: `kernels/apxinf_hip.hip` is compiled by `hipcc` for one GPU
-//! architecture, archived, and linked with `amdhip64` and `hipblas`, and the
-//! `apxinf_hip_runtime` cfg is set.
+//! With ROCm: every translation unit in [`SOURCES`] is compiled by `hipcc` for
+//! one GPU architecture, the objects are archived, the archive is linked with
+//! `amdhip64` and `hipblas`, and the `apxinf_hip_runtime` cfg is set.
 //!
 //! Without ROCm the crate still builds — macOS and CUDA-only hosts compile the
 //! workspace with `--features hip` — but the runtime cfg is absent, the C ABI is
@@ -20,11 +20,22 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Device translation units under `kernels/`. All of them include `common.h`.
+const SOURCES: &[&str] = &[
+    "apxinf_hip.hip",
+    "norm.hip",
+    "elementwise.hip",
+    "native_attention.hip",
+];
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_hip_runtime)");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=APXINF_HIP_ARCH");
-    println!("cargo:rerun-if-changed=kernels/apxinf_hip.hip");
+    println!("cargo:rerun-if-changed=kernels/common.h");
+    for source in SOURCES {
+        println!("cargo:rerun-if-changed=kernels/{source}");
+    }
 
     let rocm = PathBuf::from(env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into()));
     let hipcc = rocm.join("bin/hipcc");
@@ -39,26 +50,30 @@ fn main() {
 
     let arch = target_arch(&rocm);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let object = out_dir.join("apxinf_hip.o");
-    let source = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernels/apxinf_hip.hip");
+    let kernels = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernels");
 
-    let output = Command::new(&hipcc)
-        .args(["-c", "-O3", "-fPIC", "-std=c++17"])
-        .arg(format!("--offload-arch={arch}"))
-        .arg(&source)
-        .arg("-o")
-        .arg(&object)
-        .output()
-        .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
-    if !output.status.success() {
-        // ROCm's device linker needs libxml2.so.2; distributions that ship a
-        // newer libxml2 report it here. LD_LIBRARY_PATH must reach a
-        // compatible copy before the build starts.
-        panic!(
-            "apxinf-hip: hipcc failed for {arch}\n{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let mut objects = Vec::with_capacity(SOURCES.len());
+    for source in SOURCES {
+        let object = out_dir.join(Path::new(source).with_extension("o"));
+        let output = Command::new(&hipcc)
+            .args(["-c", "-O3", "-fPIC", "-std=c++17"])
+            .arg(format!("--offload-arch={arch}"))
+            .arg(kernels.join(source))
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
+        if !output.status.success() {
+            // ROCm's device linker needs libxml2.so.2; distributions that ship a
+            // newer libxml2 report it here. LD_LIBRARY_PATH must reach a
+            // compatible copy before the build starts.
+            panic!(
+                "apxinf-hip: hipcc failed on {source} for {arch}\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        objects.push(object);
     }
 
     let archive = out_dir.join("libapxinf_hip_kernels.a");
@@ -66,7 +81,7 @@ fn main() {
     let status = Command::new("ar")
         .arg("crs")
         .arg(&archive)
-        .arg(&object)
+        .args(&objects)
         .status()
         .expect("apxinf-hip: failed to run ar");
     assert!(status.success(), "apxinf-hip: ar failed");
