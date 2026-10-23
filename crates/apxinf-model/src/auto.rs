@@ -376,12 +376,17 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+            #[cfg(feature = "hip")]
+            if matches!(device, Device::Hip(_)) {
+                return crate::hip_pi05::load(path, device, options);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
