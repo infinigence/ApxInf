@@ -65,6 +65,7 @@ pub(super) async fn cpu_worker(model: PathBuf) -> Result<(Worker, Value), String
         epoch,
         controls: Default::default(),
         sent_commands: 0,
+        retired: false,
     };
     let ready = worker
         .receive(Duration::from_secs(3))
@@ -629,6 +630,7 @@ sys.stdin.readline()
             epoch: epoch.into(),
             controls: Default::default(),
             sent_commands: 0,
+            retired: false,
         };
         let service = Arc::new(Service {
             queue: PendingQueue::new(1),
