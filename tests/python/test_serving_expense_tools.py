@@ -334,7 +334,8 @@ class ExpenseToolCaseTests(unittest.TestCase):
             del capture["events"][1]["event"]["message"]["content"][index]
             del capture["events"][index + 2]
             self.assertFalse(self.outcome(fixture, capture)["passed"])
-        for arguments in ({"limit": 1}, {"offset": 1}, {"pages": "1"}, {"file_path": "unknown.txt"}):
+        for arguments in ({"limit": 1}, {"offset": 1}, {"pages": "1"}, {"file_path": "unknown.txt"},
+                          {"file_path": "nested/../transactions.csv"}):
             self.rejected(fixture, lambda value: value["events"][1]["event"]["message"]["content"][0]["input"].update(arguments))
 
     def test_mutations_wait_for_all_dependent_results(self):

@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 from practical_cases import exact_value, read_regular, reject_constant, unique_object
@@ -207,7 +206,7 @@ def tool_cycle(events, spec, directory):
                         if type(file_path) is not str or not file_path:
                             raise ValueError("A file tool has no valid path.")
                         path = Path(file_path)
-                        path = Path(os.path.abspath(path if path.is_absolute() else directory / path))
+                        path = path if path.is_absolute() else directory / path
                         relative = paths.get(path)
                         if relative is None:
                             raise ValueError("A file tool addresses an unknown path.")
