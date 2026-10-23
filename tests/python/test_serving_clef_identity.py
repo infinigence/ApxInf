@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -92,6 +93,19 @@ class ClefIdentityTests(unittest.TestCase):
             loader.write_text("raise AssertionError('must not import')")
             with self.assertRaises(identity.ClefError):
                 identity.load_dependency(loader)
+
+    def test_dependency_executes_only_the_checked_source_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loader = Path(directory) / "loader.py"
+            source = b"selected_value = 'approved source'\n"
+            loader.write_bytes(source)
+            with patch.object(c, "LOADER_SHA256", hashlib.sha256(source).hexdigest()), \
+                 patch("importlib.machinery.SourceFileLoader.exec_module",
+                       side_effect=AssertionError("The caching loader must not execute.")) as cached:
+                module = identity.load_dependency(loader)
+            self.assertEqual(module.selected_value, "approved source")
+            cached.assert_not_called()
+            self.assertFalse((Path(directory) / "__pycache__").exists())
 
     def test_wrong_runtime_never_imports_device_modules(self):
         with patch.object(identity.platform, "system", return_value="Darwin"), \
