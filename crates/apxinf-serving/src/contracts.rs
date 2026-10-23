@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 mod vision;
+pub mod clef;
+pub use clef::PROTOCOL as CLEF_PROTOCOL;
 
 pub const VISION_PROTOCOL: &str = "apxinf-worker/2.5";
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
@@ -418,6 +420,7 @@ fn is_event(kind: &str) -> bool {
 
 /// Check safe routing and settlement fields, without accepting payload values.
 pub fn validate_command_envelope(frame: &Value) -> Result<()> {
+    if frame["protocol"] == CLEF_PROTOCOL { return clef::validate_decision_frame(frame); }
     tree(frame, 1, false)?;
     object(frame)?;
     require(
@@ -462,6 +465,7 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
 
 /// Check a frame against its selected worker protocol without changing the frame.
 pub fn validate_frame(frame: &Value) -> Result<()> {
+    if frame["protocol"] == CLEF_PROTOCOL { return clef::validate_decision_frame(frame); }
     tree(frame, 1, false)?;
     object(frame)?;
     require(
