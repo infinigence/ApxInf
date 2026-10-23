@@ -189,7 +189,8 @@ def running_service(fixture):
 
 
 class ClefAcceptanceTests(unittest.TestCase):
-    def run_fixture(self, fixture, diagnostic=False, mutate_registration=None):
+    def run_fixture(self, fixture, diagnostic=False, mutate_registration=None, *,
+                    request_timeout=5, settlement_timeout=5):
         with tempfile.TemporaryDirectory() as directory, running_service(fixture) as url:
             root = Path(directory)
             registered = copy.deepcopy(fixture.registration)
@@ -197,7 +198,8 @@ class ClefAcceptanceTests(unittest.TestCase):
                 mutate_registration(registered)
             path = root / "registration.json"
             path.write_bytes(a.canonical(registered))
-            result = a.run(a.Config(url, path, root / "result", diagnostic, 0.5, 0.3))
+            result = a.run(a.Config(url, path, root / "result", diagnostic,
+                                    request_timeout, settlement_timeout))
             self.assertEqual(result, json.loads((root / "result/report.json").read_text()))
             result["raw_bodies"] = [(root / "result" / item["raw_body"]).read_bytes() for item in result["exchanges"]]
             return result
@@ -270,15 +272,37 @@ class ClefAcceptanceTests(unittest.TestCase):
         self.assertEqual(result["exchanges"], [])
         self.assertFalse(result["passed"])
 
-    def test_missing_rotation_fault_and_other_operations_fail(self):
-        for fault in ("no_rotation", "counter", "counter_decrease", "other_operation"):
+    def test_missing_rotation_fails_after_successful_response_and_resource_settlement(self):
+        fixture = ServiceFixture(fault="no_rotation")
+        epoch = fixture.ready["worker"]["worker_epoch"]
+        result = self.run_fixture(fixture, request_timeout=2, settlement_timeout=2)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["phase"], "case_settlement")
+        self.assertEqual(result["post_attempts"], 4)
+        self.assertEqual(len(fixture.posts), 4)
+        self.assertEqual(len(result["cases"]), 4)
+        self.assertTrue(all(row["passed"] for row in result["cases"][:3]))
+        last = result["cases"][-1]
+        self.assertEqual(last["name"], "outage")
+        self.assertEqual(last["post_state"], "response_received")
+        self.assertEqual(last["response"], answer(328))
+        self.assertFalse(last["passed"])
+        self.assertNotIn("after", last)
+        expected = a.expected_metrics(dict.fromkeys(a.METRICS, 0), a.cases("clef-flash")[3], fixture.registration)
+        self.assertEqual(fixture.metrics, expected)
+        self.assertEqual(fixture.pending, 0)
+        self.assertEqual(fixture.ready["worker"]["worker_epoch"], epoch)
+        self.assertRegex(result["error"], r"^(TimeoutError|ValueError): .*settlement")
+
+    def test_counter_fault_and_other_operations_fail(self):
+        for fault in ("counter", "counter_decrease", "other_operation"):
             with self.subTest(fault=fault):
                 fixture = ServiceFixture(fault=fault)
                 if fault == "counter_decrease":
                     fixture.metrics["apxinf_output_tokens_total"] = 1
                 result = self.run_fixture(fixture)
                 self.assertFalse(result["passed"])
-                self.assertIn("did not converge" if fault == "no_rotation" else "counter", result["error"])
+                self.assertIn("counter", result["error"])
                 self.assertEqual(len(fixture.posts), 4)
 
     def test_duplicate_successful_request_id_fails(self):
