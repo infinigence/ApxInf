@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn cpu_mask_excludes_future_rows_and_unused_capacity() {
         let stream = Stream::cpu().unwrap();
-        for (position, rows, width) in [(0, 1, 256), (255, 8, 512), (65535, 1, 65536)] {
+        for (position, rows, width) in [(0, 1, 256), (255, 8, 512), (65791, 1, 65792)] {
             let positions = Array::arange(&stream, 0., width as f32, 1., MlxDType::I32).unwrap();
             let index = Array::from_i32(&stream, &[1], &[position]).unwrap();
             let mask = causal_mask(&positions, &index, rows)
@@ -101,7 +101,7 @@ mod tests {
     fn cpu_extended_rope_preserves_the_original_prefix() {
         let stream = Stream::cpu().unwrap();
         let (small_cos, small_sin) = tables(&stream, 4096).unwrap();
-        let (large_cos, large_sin) = tables(&stream, 65536).unwrap();
+        let (large_cos, large_sin) = tables(&stream, 65792).unwrap();
         for (small, large) in [(small_cos, large_cos), (small_sin, large_sin)] {
             assert_eq!(
                 small.to_bytes().unwrap(),

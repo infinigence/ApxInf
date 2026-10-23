@@ -102,7 +102,7 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 40960 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
 | Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
 | Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
-| MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65536 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
+| MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 
