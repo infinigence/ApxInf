@@ -179,6 +179,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-serving"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "apxinf-tokenizer"
 version = "0.1.0"
 dependencies = [

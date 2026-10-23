@@ -1,0 +1,82 @@
+{
+  "format": "apxinf-serial-conformance-v1",
+  "templates": {
+    "submit": {"protocol":"apxinf-worker/2.0","kind":"submit","worker_epoch":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000002","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"model_revision":"71de68a222a5fe73d80d420bda9c1bba21311802eae52273b47cbfb16ba0dde3","capability_revision":"b0841e02feb6e1c553468e7ecfbd4aa77772599368d2a5511fceabd1ee78233b","token_ids":[1,2],"max_tokens":2,"remaining_timeout_ms":1000,"eos_token_ids":[7],"capacity_lease_ids":["00000000-0000-4000-8000-000000000004"]},
+    "accepted": {"protocol":"apxinf-worker/2.0","kind":"accepted","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":0},
+    "tokens": {"protocol":"apxinf-worker/2.0","kind":"tokens","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":1,"output_index":0,"token_ids":[5,6],"text_delta":"hello"},
+    "terminal": {"protocol":"apxinf-worker/2.0","kind":"terminal","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":2,"status":"completed","cause":"length","usage":{"input_tokens":2,"output_tokens":2},"state_result":{"validity":"none","consumed_position":4,"history_count":4},"text_delta":"","metrics":{"elapsed_ns":200,"ttft_ns":100,"peak_memory_bytes":64}},
+    "cleanup": {"protocol":"apxinf-worker/2.0","kind":"resources_released","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":3,"released_lease_ids":["00000000-0000-4000-8000-000000000004"],"retained_lease_ids":[]},
+    "rejected": {"protocol":"apxinf-worker/2.0","kind":"rejected","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":0,"error":{"code":"context_limit","message":"Context exceeds deployment limit.","scope":"request","state_validity":"none"}},
+    "failure": {"protocol":"apxinf-worker/2.0","kind":"terminal","worker_epoch":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"event_seq":1,"status":"failed","cause":"context_limit","usage":{"input_tokens":2,"output_tokens":0},"state_result":{"validity":"none","consumed_position":0,"history_count":2},"text_delta":"","metrics":{"elapsed_ns":10,"ttft_ns":0,"peak_memory_bytes":0},"error":{"code":"context_limit","message":"Context exceeds deployment limit.","scope":"request","state_validity":"none"}},
+    "cancel": {"protocol":"apxinf-worker/2.0","kind":"cancel_request","worker_epoch":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000005","request_id":"00000000-0000-4000-8000-000000000003","attempt":1,"reason":"user_cancel"},
+    "prepare": {"protocol":"apxinf-worker/2.0","kind":"prepare_input","worker_epoch":"00000000-0000-4000-8000-000000000001","command_id":"00000000-0000-4000-8000-000000000005","model_revision":"71de68a222a5fe73d80d420bda9c1bba21311802eae52273b47cbfb16ba0dde3","messages":[{"role":"user","content":"Read file A."}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read one file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}],"template_options":{"enable_thinking":false}},
+    "ready": {"protocol":"apxinf-worker/2.0","kind":"ready","worker_epoch":"00000000-0000-4000-8000-000000000001","model_revision":"71de68a222a5fe73d80d420bda9c1bba21311802eae52273b47cbfb16ba0dde3","capability_revision":"b0841e02feb6e1c553468e7ecfbd4aa77772599368d2a5511fceabd1ee78233b","model_manifest":{"adapter":"serial-test","artifacts":[]},"capabilities":{"text":true,"image":false,"greedy":true,"sampling":false,"token_events":true,"cancel_granularity":"token","max_active_sequences":1,"max_context":4096,"max_output_tokens":512,"exact_append":false,"state_schema":"none"},"limits":{"max_frame_bytes":1048576,"max_depth":16,"max_commands":10000},"model_path":"/models/serial-test","eos_token_ids":[7],"vocab_size":8,"runtime":{"python":"test","mlx":"test","mlx_lm":"test"},"memory":{"active_bytes":0,"peak_bytes":0,"cache_bytes":0}}
+  },
+  "frame_cases": [
+    {"name":"valid_submit","template":"submit","valid":true},
+    {"name":"valid_ready","template":"ready","valid":true},
+    {"name":"valid_prepare_with_schema","template":"prepare","valid":true},
+    {"name":"boolean_is_not_integer","template":"submit","set":{"/attempt":true},"valid":false},
+    {"name":"float_is_not_integer","template":"submit","set":{"/max_tokens":2.0},"valid":false},
+    {"name":"unknown_outer_key","template":"submit","set":{"/temperature":0},"valid":false},
+    {"name":"missing_timeout","template":"submit","remove":["remaining_timeout_ms"],"valid":false},
+    {"name":"invalid_protocol","template":"submit","set":{"/protocol":"apxinf-worker/2.1"},"valid":false},
+    {"name":"empty_prompt","template":"submit","set":{"/token_ids":[]},"valid":false},
+    {"name":"negative_token","template":"submit","set":{"/token_ids":[-1]},"valid":false},
+    {"name":"duplicate_lease","template":"submit","set":{"/capacity_lease_ids":["00000000-0000-4000-8000-000000000004","00000000-0000-4000-8000-000000000004"]},"valid":false},
+    {"name":"empty_token_event","template":"tokens","set":{"/token_ids":[]},"valid":false},
+    {"name":"invalid_ready_digest","template":"ready","set":{"/model_revision":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"valid":false},
+    {"name":"EOS_outside_vocabulary","template":"ready","set":{"/eos_token_ids":[8]},"valid":false},
+    {"name":"unknown_nested_option","template":"prepare","set":{"/template_options/new_flag":true},"valid":false},
+    {"name":"null_content","template":"prepare","set":{"/messages":[{"role":"user","content":null}]},"valid":false},
+    {"name":"valid_object_tool_argument","template":"prepare","set":{"/messages":[{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"A"}}}]}]},"valid":true},
+    {"name":"failed_without_error","template":"terminal","set":{"/status":"failed","/cause":"internal_error"},"valid":false},
+    {"name":"success_with_error","template":"terminal","set":{"/error":{"code":"internal_error","message":"Failure.","scope":"worker","state_validity":"none"}},"valid":false},
+    {"name":"retained_state_forbidden","template":"cleanup","set":{"/retained_lease_ids":["00000000-0000-4000-8000-000000000004"]},"valid":false},
+    {"name":"duplicate_json_key","raw":"{\"protocol\":\"apxinf-worker/2.0\",\"kind\":\"drained\",\"kind\":\"drained\",\"worker_epoch\":\"00000000-0000-4000-8000-000000000001\"}","valid":false},
+    {"name":"unpaired_surrogate","raw":"{\"protocol\":\"apxinf-worker/2.0\",\"kind\":\"drained\",\"worker_epoch\":\"\\ud800\"}","valid":false},
+    {"name":"negative_zero_counter","raw":"{\"protocol\":\"apxinf-worker/2.0\",\"kind\":\"accepted\",\"worker_epoch\":\"00000000-0000-4000-8000-000000000001\",\"request_id\":\"00000000-0000-4000-8000-000000000003\",\"attempt\":1,\"event_seq\":-0}","valid":false}
+  ],
+  "document_cases": [
+    {"name":"positive_safe_integer_boundary","raw":"9007199254740991","valid":true,"value":9007199254740991},
+    {"name":"negative_safe_integer_boundary","raw":"-9007199254740991","valid":true,"value":-9007199254740991},
+    {"name":"unsafe_positive_integer","raw":"9007199254740992","valid":false},
+    {"name":"unsafe_negative_integer","raw":"-9007199254740992","valid":false},
+    {"name":"unsigned_integer_overflow","raw":"18446744073709551616","valid":false},
+    {"name":"unsigned_integer_overflow_rounding","raw":"18446744073709551617","valid":false},
+    {"name":"signed_integer_underflow","raw":"-9223372036854775809","valid":false},
+    {"name":"long_integer_literal","raw":"99999999999999999999999999999999999999999999999999","valid":false},
+    {"name":"nested_integer_overflow","raw":"{\"options\":{\"revision\":18446744073709551617}}","valid":false},
+    {"name":"array_integer_underflow","raw":"[1,{\"revision\":-18446744073709551617}]","valid":false},
+    {"name":"explicit_large_decimal","raw":"18446744073709551617.0","valid":true,"value":1.8446744073709552e19},
+    {"name":"explicit_large_exponent","raw":"-1e20","valid":true,"value":-1e20},
+    {"name":"finite_fraction","raw":"{\"weights\":[0.25,1.5e-2]}","valid":true,"value":{"weights":[0.25,0.015]}},
+    {"name":"negative_zero_document","raw":"-0","valid":true,"value":-0.0},
+    {"name":"integer_text_is_literal","raw":"{\"18446744073709551617\":\"-18446744073709551617\"}","valid":true,"value":{"18446744073709551617":"-18446744073709551617"}},
+    {"name":"escaped_quotes_preserve_integer_text","raw":"{\"text\":\"\\\"18446744073709551617\\\"\",\"value\":1}","valid":true,"value":{"text":"\"18446744073709551617\"","value":1}},
+    {"name":"escaped_backslash_ends_before_integer","raw":"{\"text\":\"\\\\\",\"value\":18446744073709551617}","valid":false}
+  ],
+  "stream_cases": [
+    {"name":"successful_cleanup","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"cleanup"}],"failure_at":null,"done":true},
+    {"name":"rejected_reservation_settles","events":[{"template":"rejected"},{"template":"failure"},{"template":"cleanup","set":{"/event_seq":2}}],"failure_at":null,"done":true},
+    {"name":"stale_epoch","events":[{"template":"accepted","set":{"/worker_epoch":"00000000-0000-4000-8000-000000000009"}}],"failure_at":0,"done":false},
+    {"name":"sequence_gap","events":[{"template":"accepted"},{"template":"tokens","set":{"/event_seq":2}}],"failure_at":1,"done":false},
+    {"name":"range_gap","events":[{"template":"accepted"},{"template":"tokens","set":{"/output_index":1}}],"failure_at":1,"done":false},
+    {"name":"token_after_terminal","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"tokens","set":{"/event_seq":3,"/output_index":2}}],"failure_at":3,"done":false},
+    {"name":"duplicate_terminal","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"terminal","set":{"/event_seq":3}}],"failure_at":3,"done":false},
+    {"name":"wrong_usage","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal","set":{"/usage/output_tokens":1}}],"failure_at":2,"done":false},
+    {"name":"release_before_terminal","events":[{"template":"accepted"},{"template":"cleanup","set":{"/event_seq":1}}],"failure_at":1,"done":false},
+    {"name":"missing_capacity_release","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"cleanup","set":{"/released_lease_ids":[]}}],"failure_at":3,"done":false},
+    {"name":"unknown_capacity_release","events":[{"template":"accepted"},{"template":"tokens"},{"template":"terminal"},{"template":"cleanup","set":{"/released_lease_ids":["00000000-0000-4000-8000-000000000099"]}}],"failure_at":3,"done":false},
+    {"name":"token_after_reject","events":[{"template":"rejected"},{"template":"tokens"}],"failure_at":1,"done":false},
+    {"name":"wrong_attempt","events":[{"template":"accepted","set":{"/attempt":2}}],"failure_at":0,"done":false}
+  ],
+  "token_digests": [
+    {"tokens":[],"digest":"e11e90adf13ba043f187879cc23a25570be1dc7d4cd86336eb4484822de82ba3"},
+    {"tokens":[1,256,2147483647],"digest":"86cf5f7e7b0d0768bf235e5e4aa3fb8103c75f06bcad5652e36aca5e2baa5b69"}
+  ],
+  "identity_digests": [
+    {"domain":"apxinf-model-identity-v1","value":{"artifacts":[],"adapter":"serial-test"},"digest":"71de68a222a5fe73d80d420bda9c1bba21311802eae52273b47cbfb16ba0dde3"},
+    {"domain":"apxinf-test-v1","value":{"b":[true,0,9007199254740991],"a":"line\n中文/\""},"digest":"77e9b0912fcd403318c2f18c3ced756170058b14b7e1ef21e66b3041d8a05781"}
+  ]
+}
