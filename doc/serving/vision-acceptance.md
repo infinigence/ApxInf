@@ -12,7 +12,7 @@ Broader media inputs, maximum output lengths, and the full memory range remain u
 ## Evidence scope
 
 Historical observations come from the pinned fork tree `d82ae3b`. They are not new measurements from this split.
-The local split report records the CPU commands and results for each branch.
+Later checks must state their commit and configuration separately.
 
 Original records remain in the fork history:
 

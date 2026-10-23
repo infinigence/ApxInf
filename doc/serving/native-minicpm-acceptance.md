@@ -7,12 +7,12 @@ The bounded profile counts its 512 hidden reasoning tokens against the output bu
 Claude tool-loop completion did not satisfy the pelican drawing criterion. The recorded visual acceptance checks failed.
 Larger budgets, natural thinking closure, and repetition diagnostics did not resolve that task.
 These failures do not establish a native arithmetic defect or general model incapacity.
-This split repeats CPU checks only. Native MLX compilation and device execution require separate verification.
+CPU checks do not qualify device execution or model quality.
 
 ## Evidence scope
 
 Historical observations come from the pinned fork tree `d82ae3b`. They are not new measurements from this split.
-The local split report records the CPU commands and results for each branch.
+Later checks must state their commit and configuration separately.
 
 Original records remain in the fork history:
 

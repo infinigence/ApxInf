@@ -582,7 +582,7 @@ An asynchronous submission does not mark that step complete.
 Model load, warmup, and restore use the same device policy.
 The serial adapter must synchronize its captured generation stream before it releases request state.
 Synchronizing another default stream does not establish this completion.
-The [memory calibration profile](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-calibration-v0.1.md) defines offline observations without changing worker frames or serving budgets.
+The [memory calibration profile](memory-calibration-v0.1.md) defines offline observations without changing worker frames or serving budgets.
 
 ## Host pressure admission
 

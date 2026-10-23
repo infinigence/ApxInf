@@ -24,23 +24,23 @@
 | [有界思考验证](native-minicpm-acceptance.md) | 原生预算边界、15K 输入、真实客户端和图像检查 | 控制机制通过，视觉验收未通过 |
 | [默认上下文策略验证](native-minicpm-acceptance.md) | 4K 输出下的真实工具流程与直接绘图对照 | 短工具流程通过，任务质量未通过 |
 | [依赖边界](dependencies.md) | 依赖版本、公开 API 和替换边界 | 独立实现审计 |
-| [Metal 实验](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-experiments.md) | M4 上的实验矩阵与创新候选 | 测量方案 |
-| [Metal 参数实测](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-results-20261009.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
+| [Metal 实验](metal-experiments.md) | M4 上的实验矩阵与创新候选 | 测量方案 |
+| [Metal 参数实测](benchmark-acceptance.md) | 九组参数、输出差异、内存和交互延迟 | 配置选择依据 |
 | [实现与验证](text-provider-acceptance.md) | 实际实现范围、HTTP 指标、资源边界和下一阶段 | 交付证据 |
 | [2026-10-11 验证](text-provider-acceptance.md) | 当前 Rust、真实 HTTP、Claude Code、故障清理和分级内存校准结果 | 本轮验证证据与未覆盖范围 |
 | [退出与工具解析修复](supervisor-acceptance.md) | SIGINT/SIGTERM、HTTP 退出等待、工具 JSON 边界和测试同步 | 工作区修复及 PR 集成验证 |
 | [生命周期加固](supervisor-acceptance.md) | 命令轮换、准备结算、队列回收、关闭竞态和回归结果 | 本轮可靠性修复证据 |
-| [阶段观测与到达率负载](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/observability-load-20261009.md) | 阶段直方图、submit deadline、绝对 HTTP 超时及实机过载结果 | 后续内存准入和调度的测量依据 |
+| [阶段观测与到达率负载](benchmark-acceptance.md) | 阶段直方图、submit deadline、绝对 HTTP 超时及实机过载结果 | 后续内存准入和调度的测量依据 |
 | [内存压力准入与预算加固](supervisor-acceptance.md) | 运行期压力控制、预算溢出修复、峰值补报及验证边界 | 内存准入的当前实现与证据 |
-| [内存校准规范](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-calibration-v0.1.md) | 专用 stream 同步、缓存观测、离线样本与进程回收 | 内存估算前的原始证据格式 |
-| [stream 同步与校准实测](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-calibration-20261009.md) | 同步修复、失败恢复和本次加载后压力阻塞记录 | 本轮实现与验证边界 |
+| [内存校准规范](memory-calibration-v0.1.md) | 专用 stream 同步、缓存观测、离线样本与进程回收 | 内存估算前的原始证据格式 |
+| [stream 同步与校准实测](benchmark-acceptance.md) | 同步修复、失败恢复和本次加载后压力阻塞记录 | 本轮实现与验证边界 |
 | [生成公开截止时间修复](supervisor-acceptance.md) | 及时公开 expiry、继续资源结算、迟到事件与单次计数 | 生成生命周期回归证据 |
-| [内存覆盖规范](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-coverage-v0.1.md) | 计划、执行、实际达到、峰值归属与缺失范围 | 校准证据的离线检查规则 |
+| [内存覆盖规范](memory-coverage-v0.1.md) | 计划、执行、实际达到、峰值归属与缺失范围 | 校准证据的离线检查规则 |
 | [诊断输出隔离与覆盖检查](supervisor-acceptance.md) | stderr 故障修复、CPU 回归和旧实测覆盖回放 | 2026-10-10 实现与验证结果 |
-| [分级内存实测计划](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-evidence-plan-20261010.md) | 长输出、上下文边界、较晚取消、重复与独立输入 | 待执行的原创测量矩阵 |
-| [内存实测记录](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-evidence-20261010.md) | 短请求生成、EOS 缺口、压力阻断和输入冻结 | 2026-10-10 实测与验证范围 |
-| [生产内存验证判据](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/production-memory-validation-v0.1.md) | 正常生产同步、指标口径、结算和独立输入验收 | 待执行的 P1 验证协议，无批准数值 |
-| [Qwen3.5 缓存几何](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/qwen35-memory-geometry-20261010.md) | 固定状态、KV 扩容、预计算和采样边界 | 固定版本源码推断，不替代实测 |
+| [分级内存实测计划](benchmark-acceptance.md) | 长输出、上下文边界、较晚取消、重复与独立输入 | 待执行的原创测量矩阵 |
+| [内存实测记录](benchmark-acceptance.md) | 短请求生成、EOS 缺口、压力阻断和输入冻结 | 2026-10-10 实测与验证范围 |
+| [生产内存验证判据](production-memory-validation-v0.1.md) | 正常生产同步、指标口径、结算和独立输入验收 | 待执行的 P1 验证协议，无批准数值 |
+| [Qwen3.5 缓存几何](benchmark-acceptance.md) | 固定状态、KV 扩容、预计算和采样边界 | 固定版本源码推断，不替代实测 |
 | [Claude Code 验证](text-provider-acceptance.md) | 真实客户端任务、工具记录和取消检查 | Agent 路径实测 |
 | [仓库规则](../../AGENTS.md) | 独立编写、接口一致性和文档要求 | 约束后续仓库工作 |
 

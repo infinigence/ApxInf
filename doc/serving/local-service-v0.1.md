@@ -574,8 +574,8 @@ python3 -m pytest -q \
   tests/python/test_serving_http.py
 ```
 
-Follow [the benchmark guide](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/benchmarks/serving/README.md) for real model and Claude Code tests.
-Follow [the Metal experiments](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-experiments.md) for controlled parameter comparisons.
+Follow [the benchmark guide](../../benchmarks/serving/README.md) for real model and Claude Code tests.
+Follow [the Metal experiments](metal-experiments.md) for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
 The [lifecycle report](supervisor-acceptance.md) separates the latest CPU checks from historical model measurements.

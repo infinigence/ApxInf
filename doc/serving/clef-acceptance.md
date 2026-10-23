@@ -7,12 +7,12 @@ The default macOS host-pressure gate did not pass.
 All positive hardware HTTP and lifecycle results used an explicit diagnostic configuration with that gate disabled.
 The longest recorded successful input contained 2828 tokens. A complete forward pass at the 4096-token boundary remains unverified.
 Images, streaming, generation, thinking, and throughput acceptance are outside this profile.
-This split runs CPU fixtures only and does not change those hardware acceptance limits.
+CPU fixtures do not change those hardware acceptance limits.
 
 ## Evidence scope
 
 Historical observations come from the pinned fork tree `d82ae3b`. They are not new measurements from this split.
-The local split report records the CPU commands and results for each branch.
+Later checks must state their commit and configuration separately.
 
 Original records remain in the fork history:
 

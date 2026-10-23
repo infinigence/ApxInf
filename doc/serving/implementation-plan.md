@@ -184,7 +184,7 @@ P1a host pressure exit checks:
 - Check disabled policy visibility and bounded metric labels.
 - Check the real sensor without creating artificial host memory pressure.
 
-The [memory calibration profile](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-calibration-v0.1.md) defines the next estimator evidence step.
+The [memory calibration profile](memory-calibration-v0.1.md) defines the next estimator evidence step.
 Its raw observations cannot complete the measured memory estimator gate by themselves.
 
 Memory calibration exit checks:
@@ -195,7 +195,7 @@ Memory calibration exit checks:
 - Preserve blocked, failed, skipped, and interrupted cases with their cleanup results.
 - Exercise chunk boundaries, context boundaries, stopping, and repeated requests under the approved execution profile.
 
-The [memory coverage profile](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-coverage-v0.1.md) defines offline evidence checks before estimator design.
+The [memory coverage profile](memory-coverage-v0.1.md) defines offline evidence checks before estimator design.
 It distinguishes completed runs from reached shapes and retains missing input and output intervals.
 Neither complete planned cases nor complete shape enumeration establishes a universal memory bound.
 
@@ -226,7 +226,7 @@ Long-context exit checks:
 - Check mixed short and long workloads when a future batch adapter passes its own correctness gate.
 
 The [memory evidence plan](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/memory-evidence-plan-20261010.md) defines the current measurement sequence.
-The [production validation profile](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/production-memory-validation-v0.1.md) defines the separate production evidence boundary.
+The [production validation profile](production-memory-validation-v0.1.md) defines the separate production evidence boundary.
 Neither document approves a memory budget or promises a larger supported context size.
 
 ### Remaining P1 checks
