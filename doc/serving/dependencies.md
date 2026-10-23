@@ -7,6 +7,31 @@ All new ApxInf source, tests, and fixtures are handwritten.
 The [serial profile](serial-profile-v0.1.md) defines the wire interface.
 `Cargo.lock` records the resolved Rust dependency versions.
 
+## Clef text runtime
+
+The [Clef text profile](clef-text-v0.1.md) selects a separate Python environment.
+It requires Python 3.12.10 and the following package versions.
+These packages do not change the existing text or vision runtime pins.
+
+| Dependency | Version | Public API and role |
+| --- | --- | --- |
+| External `clef_mlx.py` | SHA-256 `852223c944819a32fad5cf798d9d1dff30419820eaf5ad1f10cb9698afec97d5` | `load`, `encode_record`, and `model.logits` load and execute the joint schema head. |
+| `mlx` | `0.32.3` | Device arrays, softmax, synchronization, allocator limits, and memory counters. |
+| `mlx-lm` | `0.32.0` | The dependency's explicit language-only model backend. |
+| `transformers` | `5.19.0` | Local checkpoint configuration and tokenizer interfaces. |
+| `numpy` | `2.5.4` | Host array support used by the dependency. |
+| `Pillow` | `12.3.0` | An imported dependency boundary. This profile accepts no images. |
+
+The external loader stays outside first-party source.
+The worker calls its public APIs without importing its HTTP server.
+It selects `backend="lm"`, a BF16 head, and an effective absent processor.
+It checks complete model artifacts before and after loading.
+Rust and Python share the maintained `clef_artifacts.json` digest table.
+The ready identity includes that table, adapter sources, interpreter, and imported runtime files.
+The worker disables remote model resolution and executes one attempt per process.
+The supervisor verifies these files independently before readiness.
+These calls add no Rust package dependency or first-party model implementation.
+
 ## Separate MiniCPM-V candidate runtime
 
 The [vision profile](minicpm-vision-v0.1.md) defines a separately selected runtime.
