@@ -1,11 +1,210 @@
 //! Real-checkpoint lifecycle checks, separate from numerical qualification.
 use super::{config::Config, weights::Weights, MiniCpm5, Variant};
-use crate::{LlmTrait, TextPreparationState};
+use crate::{
+    GenerationBoundary, GenerationOptions, GenerationRequest, LlmInput, LlmTrait,
+    TextPreparationState,
+};
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_mlx::{clear_cache, memory_stats, MlxBackend};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{env, path::PathBuf};
+
+fn last_logits(model: &MiniCpm5, output: &Tensor) -> Result<Vec<f32>> {
+    let values = model.backend.array(output)?.to_f32_vec()?;
+    Ok(values[values.len() - model.vocab_size()..].to_vec())
+}
+
+fn check_chunk_logits(expected: &[f32], actual: &[f32], length: usize) {
+    assert_eq!(expected.len(), actual.len());
+    let mut maximum_error = 0.0f32;
+    for (&whole, &chunked) in expected.iter().zip(actual) {
+        assert!(
+            whole.is_finite() && chunked.is_finite(),
+            "nonfinite logits at {length}"
+        );
+        let error = (whole - chunked).abs();
+        maximum_error = maximum_error.max(error);
+        assert!(
+            error <= 0.5 + 0.02 * whole.abs(),
+            "BF16 tolerance at {length}: {whole} versus {chunked}"
+        );
+    }
+    let greedy = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        greedy(expected),
+        greedy(actual),
+        "greedy token changed at {length}"
+    );
+    eprintln!(
+        "prompt_tokens={length} maximum_logit_error={maximum_error} greedy_token={}",
+        greedy(actual)
+    );
+}
+
+#[test]
+#[ignore = "requires official MiniCPM checkpoint, isolated process and shared Metal lock"]
+fn real_checkpoint_chunked_prefill_equivalence_and_cancellation() -> Result<()> {
+    let checkpoint = env::var_os("APXINF_MINICPM_CHECKPOINT")
+        .map(PathBuf::from)
+        .ok_or(Error::Contract(
+            "set APXINF_MINICPM_CHECKPOINT for this ignored test",
+        ))?;
+    let tokenizer = apxinf_tokenizer::Tokenizer::from_file(checkpoint.join("tokenizer.json"))?;
+    let prompt = tokenizer.encode(include_str!(
+        "../../tests/fixtures/minicpm-context-prompt.txt"
+    ))?;
+    assert!(
+        prompt.len() >= 513,
+        "original prompt fixture must cover every boundary"
+    );
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) =
+        apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend, Variant::Compiled)?;
+    let mut recovery_reference = Vec::new();
+    for length in [255, 256, 257, 513] {
+        let ids = &prompt[..length];
+        model.reset();
+        model.prepare(length, 1)?;
+        let full = model.forward(ids, 0)?;
+        assert_eq!(full.shape().dims(), [length, model.vocab_size()]);
+        let expected = last_logits(&model, &full)?;
+        drop(full);
+        model.reset();
+        model.prepare(length, 1)?;
+        let mut boundaries = Vec::new();
+        let chunked = model
+            .prefill_controlled(LlmInput::text(ids), &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(true)
+            })?
+            .unwrap();
+        assert_eq!(chunked.shape().dims(), [1, model.vocab_size()]);
+        check_chunk_logits(&expected, &last_logits(&model, &chunked)?, length);
+        assert_eq!(model.offset, length);
+        let mut expected_boundaries = vec![GenerationBoundary::PrefillStart];
+        expected_boundaries.extend(
+            (256..length)
+                .step_by(256)
+                .chain(std::iter::once(length))
+                .map(|consumed_tokens| GenerationBoundary::PrefillProgress { consumed_tokens }),
+        );
+        assert_eq!(boundaries, expected_boundaries);
+        if length == 257 {
+            recovery_reference = expected;
+        }
+    }
+
+    model.reset();
+    model.prepare(513, 1)?;
+    let mut invalid = prompt[..513].to_vec();
+    invalid[400] = model.vocab_size() as u32;
+    let mut callbacks = 0;
+    assert!(model
+        .prefill_controlled(LlmInput::text(&invalid), &mut |_| {
+            callbacks += 1;
+            Ok(true)
+        })
+        .is_err());
+    assert_eq!(callbacks, 0);
+    assert_eq!(model.offset, 0);
+    assert_eq!(
+        model.preparation_status().state,
+        TextPreparationState::Ready
+    );
+
+    let before = model.prefill_controlled(LlmInput::text(&prompt[..513]), &mut |boundary| {
+        assert_eq!(boundary, GenerationBoundary::PrefillStart);
+        Ok(false)
+    })?;
+    assert!(before.is_none());
+    assert_eq!(model.offset, 0);
+    let options = GenerationOptions::greedy(1, None);
+    let mut boundaries = Vec::new();
+    let cancelled = model.generate_streaming_controlled_dyn(
+        GenerationRequest {
+            input: LlmInput::text(&prompt[..513]),
+            options: &options,
+        },
+        &mut |boundary| {
+            boundaries.push(boundary);
+            Ok(matches!(boundary, GenerationBoundary::PrefillStart))
+        },
+    )?;
+    assert!(cancelled.tokens.is_empty());
+    assert_eq!(
+        boundaries,
+        vec![
+            GenerationBoundary::PrefillStart,
+            GenerationBoundary::PrefillProgress {
+                consumed_tokens: 256
+            }
+        ]
+    );
+    assert_eq!(model.offset, 256);
+    model.release_request_state()?;
+    assert_eq!(model.offset, 0);
+    assert_eq!(
+        model.preparation_status().state,
+        TextPreparationState::Unprepared
+    );
+    model.prepare(257, 1)?;
+    let recovered = model.prefill(LlmInput::text(&prompt[..257]))?;
+    check_chunk_logits(&recovery_reference, &last_logits(&model, &recovered)?, 257);
+    drop(recovered);
+    model.release_request_state()?;
+    let mut resumed_boundaries = Vec::new();
+    let resumed = model.generate_streaming_controlled_dyn(
+        GenerationRequest {
+            input: LlmInput::text(&prompt[..257]),
+            options: &options,
+        },
+        &mut |boundary| {
+            resumed_boundaries.push(boundary);
+            Ok(true)
+        },
+    )?;
+    assert_eq!(resumed.tokens.len(), 1);
+    let expected_token = recovery_reference
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0 as u32;
+    assert_eq!(resumed.tokens[0].token_id, expected_token);
+    assert_eq!(
+        resumed_boundaries,
+        vec![
+            GenerationBoundary::PrefillStart,
+            GenerationBoundary::PrefillProgress {
+                consumed_tokens: 256
+            },
+            GenerationBoundary::PrefillProgress {
+                consumed_tokens: 257
+            },
+            GenerationBoundary::Token(resumed.tokens[0]),
+        ]
+    );
+    assert_eq!(
+        model.preparation_status().prepared_sequence_lengths,
+        vec![1, 256, 257]
+    );
+    model.release_request_state()?;
+    eprintln!(
+        "whole_input_rejection=true cancel_before=true cancel_after=256 release_and_recovery=true"
+    );
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct ReplayInputs {

@@ -286,7 +286,11 @@ impl Tokenizer {
     }
 
     /// Encode text, optionally applying the tokenizer's post-processor.
-    pub fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    pub fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>> {
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
@@ -421,9 +425,18 @@ impl Tokenizer {
         self.render_chat_template(messages, options, true)
     }
 
-    fn render_chat_template(
+    /// Render checked structured messages without flattening tool arguments.
+    pub fn apply_rich_chat_template(
         &self,
-        messages: &[ChatMessage],
+        messages: &[serde_json::Value],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.render_chat_template(messages, options, true)
+    }
+
+    fn render_chat_template<M: Serialize>(
+        &self,
+        messages: &[M],
         options: &serde_json::Map<String, serde_json::Value>,
         hf_whitespace: bool,
     ) -> Result<String> {
@@ -703,6 +716,25 @@ mod tests {
 
         let system = ChatMessage::system("You are helpful");
         assert_eq!(system.role, "system");
+    }
+
+    #[test]
+    fn rich_template_preserves_argument_objects_and_tool_result_identity() {
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ messages[0].tool_calls[0].function.arguments.path }}|{{ messages[1].role }}|{{ messages[1].tool_call_id }}|{{ messages[1].content }}".into()),
+        };
+        let messages = vec![
+            serde_json::json!({"role":"assistant","content":"","tool_calls":[{"id":"call1","type":"function","function":{"name":"Read","arguments":{"path":"brief.txt"}}}]}),
+            serde_json::json!({"role":"tool","content":"Draw a bicycle.","tool_call_id":"call1"}),
+        ];
+        assert_eq!(
+            tokenizer
+                .apply_rich_chat_template(&messages, &serde_json::Map::new())
+                .unwrap(),
+            "brief.txt|tool|call1|Draw a bicycle."
+        );
     }
 
     #[test]
