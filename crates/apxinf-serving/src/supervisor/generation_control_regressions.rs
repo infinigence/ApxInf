@@ -79,6 +79,7 @@ fn request_fixture(timeout: Duration) -> (Service, Job, Ticket) {
     let job = Job {
         observation: Arc::new(RequestObservation::new(ingress, false)),
         request: Request {
+            selection: crate::sampling::Selection::Greedy,
             messages: vec![json!({"role":"user", "content":"control lifetime probe"})],
             tools: vec![],
             max_tokens: 4,

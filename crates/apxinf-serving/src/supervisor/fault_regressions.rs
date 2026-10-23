@@ -53,6 +53,7 @@ for line in sys.stdin:
         .spawn()
         .unwrap();
     let worker = Worker {
+        protocol: PROTOCOL,
         input: child.stdin.take(),
         frames: read_worker_frames(child.stdout.take().unwrap()),
         child,
@@ -68,6 +69,7 @@ for line in sys.stdin:
     let (completion, stopped) = watch::channel(None);
     Arc::get_mut(&mut service).unwrap().stopped = stopped;
     let request = Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user", "content":"original fault delivery probe"})],
         tools: vec![],
         max_tokens: 65,

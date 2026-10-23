@@ -159,6 +159,7 @@ dependencies = [
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
+ "apxinf-tokenizer",
  "half",
  "once_cell",
  "serde",
@@ -182,6 +183,11 @@ dependencies = [
 name = "apxinf-serving"
 version = "0.1.0"
 dependencies = [
+ "apxinf-core",
+ "apxinf-loader",
+ "apxinf-mlx",
+ "apxinf-model",
+ "apxinf-tokenizer",
  "axum",
  "clap",
  "futures-util",

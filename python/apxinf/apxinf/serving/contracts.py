@@ -9,6 +9,10 @@ import struct
 from typing import Any
 
 PROTOCOL = "apxinf-worker/2.0"
+NATIVE_PROTOCOL = "apxinf-worker/2.1"
+NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
+NATIVE_THINKING_PROTOCOL = "apxinf-worker/2.3"
+NATIVE_BOUNDED_THINKING_PROTOCOL = "apxinf-worker/2.4"
 MAX_FRAME_BYTES = 1_048_576
 MAX_DEPTH = 16
 MAX_COMMANDS = 10_000
@@ -154,13 +158,38 @@ def _messages(messages: Any, tools: Any) -> None:
             _require(type(function["strict"]) is bool, "tool strict must be Boolean")
 
 
-def _capabilities(value: Any) -> None:
+def _sampling(value: Any) -> None:
+    _require(type(value) is dict, "expected sampling object")
+    _enum(value.get("mode"), {"greedy", "random"})
+    if value["mode"] == "greedy":
+        _keys(value, {"mode"})
+        return
+    _keys(value, {"mode", "temperature", "top_p", "seed"})
+    for key, maximum in (("temperature", 2.0), ("top_p", 1.0)):
+        number = value[key]
+        _require(type(number) in (int, float) and 0 < number <= maximum,
+                 "sampling number outside allowed range")
+        narrowed = struct.unpack("!f", struct.pack("!f", number))[0]
+        _require(0 < narrowed < float("inf"), "sampling number underflows binary32")
+    _int(value["seed"])
+
+
+def _submit_fields(frame: dict) -> set[str]:
+    fields = {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}
+    if frame["protocol"] in (NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL):
+        fields.add("sampling")
+    return fields
+
+
+def _capabilities(value: Any, native: bool = False, sampled: bool = False) -> None:
     _keys(value, {"text", "image", "greedy", "sampling", "token_events", "cancel_granularity", "max_active_sequences", "max_context", "max_output_tokens", "exact_append", "state_schema"})
-    for name, expected in {"text": True, "image": False, "greedy": True, "sampling": False, "token_events": True, "exact_append": False}.items():
+    for name, expected in {"text": True, "image": False, "greedy": True, "sampling": sampled, "token_events": True, "exact_append": False}.items():
         _require(type(value[name]) is bool and value[name] is expected, "unsupported serial capability")
-    _enum(value["cancel_granularity"], {"token", "token_or_prefill_chunk"})
+    cancellation = {"token_or_prefill_chunk"} if sampled else ({"end_prefill_or_token", "token_or_prefill_chunk"} if native else {"token", "token_or_prefill_chunk"})
+    _enum(value["cancel_granularity"], cancellation)
     _int(value["max_active_sequences"], 1, 1)
-    _int(value["max_context"], 1, MAX_PROMPT_TOKENS)
+    context_limit = (16384 if value["cancel_granularity"] == "token_or_prefill_chunk" else 4096) if native else MAX_PROMPT_TOKENS
+    _int(value["max_context"], 1, context_limit)
     _int(value["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)
     _enum(value["state_schema"], {"none"})
 
@@ -175,13 +204,13 @@ def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") == PROTOCOL, "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
     shapes = {
         "prepare_input": (COMMAND, {"model_revision", "messages", "tools", "template_options"}),
-        "submit": (REQUEST_COMMAND, {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"}),
+        "submit": (REQUEST_COMMAND, _submit_fields(frame)),
         "cancel_request": (REQUEST_COMMAND, {"reason"}),
         "stop_generation": (REQUEST_COMMAND, {"cause", "output_token_count", "text_byte_cutoff"}),
         "query_stats": (COMMAND, set()), "drain": (COMMAND, set()), "shutdown": (COMMAND, set()),
@@ -201,7 +230,11 @@ def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] == PROTOCOL, "unsupported protocol")
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL), "unsupported protocol")
+    bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
+    thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL or bounded
+    sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL or thinking
+    native = frame["protocol"] == NATIVE_PROTOCOL or sampled
     _uuid(frame["worker_epoch"])
     kind = frame["kind"]
     _str(kind)
@@ -214,12 +247,59 @@ def validate_frame(frame: dict) -> None:
         _int(frame.get("event_seq"))
     if kind == "ready":
         _keys(frame, BASE | {"model_revision", "capability_revision", "model_manifest", "capabilities", "limits", "model_path", "eos_token_ids", "vocab_size", "runtime", "memory"})
-        _capabilities(frame["capabilities"])
+        manifest = frame["model_manifest"]
+        _require(type(manifest) is dict, "model manifest must be an object")
+        if not bounded:
+            execution = manifest.get("execution")
+            _require(manifest.get("adapter_revision") != "apxinf-native-minicpm5-bounded-thinking-v1"
+                     and not (type(execution) is dict and (
+                         execution.get("output_policy") == "minicpm5-initial-thinking-fixed512-v1"
+                         or "initial_reasoning" in execution)),
+                     "bounded thinking identity requires protocol 2.4")
+        _capabilities(frame["capabilities"], native, sampled)
         _keys(frame["limits"], {"max_frame_bytes", "max_depth", "max_commands"})
         _require(frame["limits"] == {"max_frame_bytes": MAX_FRAME_BYTES, "max_depth": MAX_DEPTH, "max_commands": MAX_COMMANDS}, "incompatible transport limits")
         for value in frame["limits"].values():
             _int(value)
-        _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
+        if native:
+            _keys(frame["runtime"], {"kind", "apxinf", "mlx", "executable_sha256", "metal_library_sha256"})
+            _require(frame["runtime"]["kind"] == "native_minicpm5" and frame["runtime"]["apxinf"] == "0.1.0" and frame["runtime"]["mlx"] == "0.31.2", "unsupported native runtime")
+            _digest(frame["runtime"]["executable_sha256"])
+            _digest(frame["runtime"]["metal_library_sha256"])
+            _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
+            _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
+            if sampled:
+                manifest = frame["model_manifest"]
+                execution = manifest.get("execution")
+                _require(type(execution) is dict, "expected execution identity")
+                if thinking:
+                    required = {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
+                                "max_output_tokens", "memory_limit_bytes", "sampling", "output_policy"}
+                    if bounded:
+                        required.add("initial_reasoning")
+                    _keys(execution, required)
+                    output_policy = "minicpm5-initial-thinking-fixed512-v1" if bounded else "minicpm5-initial-thinking-v1"
+                    _require(execution["output_policy"] == output_policy,
+                             "unsupported native thinking output policy")
+                if bounded:
+                    reasoning = execution["initial_reasoning"]
+                    _keys(reasoning, {"budget_tokens", "close_token_id", "selection"})
+                    _int(reasoning["budget_tokens"], 512, 512)
+                    _int(reasoning["close_token_id"], 9, 9)
+                    _enum(reasoning["selection"], {"cpu-constrained-close-v1"})
+                adapter = ("apxinf-native-minicpm5-bounded-thinking-v1" if bounded else
+                           "apxinf-native-minicpm5-thinking-v1" if thinking else "apxinf-native-minicpm5-sampled-v1")
+                _require(manifest.get("adapter_revision") == adapter
+                         and execution.get("provider") == "metal_minicpm5"
+                         and execution.get("precision") == "bf16"
+                         and execution.get("variant") == "bf16-compiled"
+                         and execution.get("enable_thinking") is thinking
+                         and execution.get("sampling") == {
+                             "algorithm": "apxinf-cpu-categorical-v1", "temperature": "1",
+                             "top_p": "0.95", "seed_policy": "request-id-sha256-v1",
+                         }, "unsupported native sampling identity")
+        else:
+            _keys(frame["runtime"], {"python", "mlx", "mlx_lm"})
         for value in frame["runtime"].values():
             _str(value)
         _counts(frame["memory"], {"active_bytes", "peak_bytes", "cache_bytes"})
@@ -228,6 +308,9 @@ def validate_frame(frame: dict) -> None:
         _int(frame["vocab_size"], 1, 2_147_483_648)
         _tokens(frame["eos_token_ids"], 256)
         _require(all(token < frame["vocab_size"] for token in frame["eos_token_ids"]), "EOS outside vocabulary")
+        if bounded:
+            _require(9 < frame["vocab_size"] and 9 not in frame["eos_token_ids"],
+                     "initial reasoning close token must be inside vocabulary and outside EOS")
         _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
         _require(frame["model_revision"] == canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"]), "model revision mismatch")
         _require(frame["capability_revision"] == canonical_identity_digest("apxinf-capability-v1", frame["capabilities"]), "capability revision mismatch")
@@ -237,6 +320,8 @@ def validate_frame(frame: dict) -> None:
         _messages(frame["messages"], frame["tools"])
         _keys(frame["template_options"], {"enable_thinking"})
         _require(type(frame["template_options"]["enable_thinking"]) is bool, "enable_thinking must be Boolean")
+        _require(not thinking or frame["template_options"]["enable_thinking"] is True,
+                 "protocol 2.4 requires thinking preparation" if bounded else "protocol 2.3 requires thinking preparation")
     elif kind == "prepared_input":
         _keys(frame, COMMAND | {"model_revision", "token_ids", "effective_input_tokens", "prompt_digest"})
         _digest(frame["model_revision"])
@@ -245,7 +330,9 @@ def validate_frame(frame: dict) -> None:
         _require(frame["effective_input_tokens"] == len(frame["token_ids"]), "prepared input count mismatch")
         _require(frame["prompt_digest"] == token_prefix_digest(frame["token_ids"]), "prepared input digest mismatch")
     elif kind == "submit":
-        _keys(frame, REQUEST_COMMAND | {"model_revision", "capability_revision", "token_ids", "max_tokens", "remaining_timeout_ms", "eos_token_ids", "capacity_lease_ids"})
+        _keys(frame, REQUEST_COMMAND | _submit_fields(frame))
+        if sampled:
+            _sampling(frame["sampling"])
         _digest(frame["model_revision"])
         _digest(frame["capability_revision"])
         _tokens(frame["token_ids"], MAX_PROMPT_TOKENS, 1)
@@ -409,6 +496,7 @@ class AttemptTracker:
         validate_frame(submit)
         _require(submit["kind"] == "submit", "tracker requires submit")
         self.key = tuple(submit[key] for key in ("worker_epoch", "request_id", "attempt"))
+        self.protocol = submit["protocol"]
         self.input_tokens = len(submit["token_ids"])
         self.max_tokens = submit["max_tokens"]
         self.leases = set(submit["capacity_lease_ids"])
@@ -424,7 +512,7 @@ class AttemptTracker:
     def observe(self, event: dict) -> None:
         validate_frame(event)
         _require(event["kind"] in ATTEMPT_EVENTS, "not an attempt event")
-        _require(tuple(event[key] for key in ("worker_epoch", "request_id", "attempt")) == self.key, "attempt identity mismatch")
+        _require(event["protocol"] == self.protocol and tuple(event[key] for key in ("worker_epoch", "request_id", "attempt")) == self.key, "attempt identity mismatch")
         _require(event["event_seq"] == self.next_seq, "event sequence mismatch")
         kind = event["kind"]
         phase = self.phase

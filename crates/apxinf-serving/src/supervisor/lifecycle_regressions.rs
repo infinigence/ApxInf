@@ -57,6 +57,7 @@ pub(super) async fn cpu_worker(model: PathBuf) -> Result<(Worker, Value), String
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let mut worker = Worker {
+        protocol: PROTOCOL,
         child,
         _diagnostics: None,
         input,
@@ -100,6 +101,7 @@ fn cpu_service_with_completion(
 
 pub(super) fn request(count_only: bool) -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"original lifecycle request"})],
         tools: vec![],
         max_tokens: 0,
@@ -619,6 +621,7 @@ sys.stdin.readline()
         let input = child.stdin.take().unwrap();
         let frames = read_worker_frames(child.stdout.take().unwrap());
         let mut worker = Worker {
+            protocol: PROTOCOL,
             child,
             _diagnostics: None,
             input: Some(input),
@@ -647,6 +650,7 @@ sys.stdin.readline()
         };
         let ticket = service
             .enqueue(Request {
+                selection: crate::sampling::Selection::Greedy,
                 messages: vec![json!({"role":"user","content":content})],
                 tools: vec![],
                 max_tokens: 0,

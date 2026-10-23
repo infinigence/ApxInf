@@ -8,7 +8,9 @@ The measurement report records actual model and client results separately.
 ## Components
 
 `apxinf-serve` owns HTTP, request admission, deadlines, output parsing, and worker supervision.
-One Python worker owns the model and all MLX operations.
+One selected worker owns the model and all MLX operations.
+The default provider uses Python and MLX-LM.
+The explicit native provider uses the [MiniCPM5 profile](native-minicpm-v0.1.md).
 One bounded queue precedes that worker.
 The default queue holds 16 waiting requests.
 The worker executes one request at a time.
@@ -71,6 +73,64 @@ Writer availability does not establish destination progress.
 Loss counters exclude unread stderr bytes and records without final accounting when the process exits.
 
 ## Build and start
+
+### Native MiniCPM5
+
+Build the native executable with the existing MLX 0.31.2 C++ SDK.
+Select the provider and runtime files explicitly.
+The native provider does not fall back to Python.
+Its context limit permits 16384 positions with fixed 256-token prefill chunks.
+The [validation report](native-minicpm-acceptance.md) records measured deployment gates.
+This limit includes the input and output reservation.
+
+```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
+export MLX_ROOT=/absolute/path/to/mlx-0.31.2
+cargo build -p apxinf-serving --features native-minicpm5 --release
+DYLD_LIBRARY_PATH="$MLX_ROOT/lib" target/release/apxinf-serve \
+  --provider native-minicpm5 \
+  --native-worker "$PWD/target/release/apxinf-native-worker" \
+  --metal-library "$MLX_ROOT/lib/libmlx.dylib" \
+  --model /absolute/path/to/MiniCPM5-2B \
+  --model-id minicpm5 --max-context 4096 --max-output-tokens 1024
+```
+
+`/readyz` reports `minicpm5_xml` for native tools and binds the selected runtime identity.
+The worker hides all checkpoint EOS tokens, including token 130073.
+The worker reports allocator bytes after each request through stderr diagnostics.
+These observations do not measure total process memory.
+Live model and client qualification remains a separate deployment gate.
+
+Select `--provider native-minicpm5-sampled` to use the explicit [sampling profile](native-sampling-v0.1.md).
+Keep the same native worker, runtime library, model, and precision.
+This profile uses temperature 1 and top-p 0.95 when the request omits both parameters.
+Set request temperature to zero to select greedy generation.
+The ready response reports `sampling=true` and public profile `apxinf-native-sampled-v0.1`.
+Model thinking and image input remain disabled in this profile.
+For the measured 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
+The total includes prompt tokens and the requested output allowance.
+
+Select `--provider native-minicpm5-thinking` for the explicit [model thinking profile](native-thinking-v0.1.md).
+This deployment enables the model template and hides its initial reasoning prefix from public output.
+Readiness reports `model_thinking=initial_hidden` and `thinking=false` under public capabilities.
+The latter value means that Anthropic extended-thinking blocks and budget settings remain unsupported.
+All generated reasoning tokens count toward the output allowance.
+For a larger allowance within 16K total context, select `--max-output-tokens 8192` explicitly.
+The service still rejects a prompt and requested output allowance that exceed 16384 positions.
+
+Select `--provider native-minicpm5-thinking-bounded` for the [bounded thinking profile](native-bounded-thinking-v0.1.md).
+This separate profile limits initial reasoning to 512 generated tokens before it selects the closing token.
+An earlier termination or shorter output allowance can end generation before closure.
+The closing token uses one position within the existing output allowance.
+Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
+The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
+The original thinking provider retains its behavior without a separate reasoning budget.
+The [validation record](native-minicpm-acceptance.md) covers native controls and a completed real client tool cycle.
+The original pelican output still fails visual acceptance.
+The [default-policy record](native-minicpm-acceptance.md) tests 4096 output tokens without the private blocking-limit override.
+Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
+
+### Python MLX-LM
 
 Run the following commands from the repository root on an Apple Silicon Mac.
 The worker requires the exact interpreter and package versions below.

@@ -105,6 +105,7 @@ while True:
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let worker = Worker {
+        protocol: PROTOCOL,
         child,
         _diagnostics: None,
         input,
@@ -146,6 +147,7 @@ while True:
 
 fn request() -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"original generation deadline probe"})],
         tools: vec![],
         max_tokens: 1,

@@ -109,6 +109,7 @@ sys.stdin.buffer.readline()
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let worker = Worker {
+        protocol: PROTOCOL,
         child,
         _diagnostics: None,
         input,
@@ -146,6 +147,7 @@ sys.stdin.buffer.readline()
 
 fn request() -> Request {
     Request {
+        selection: crate::sampling::Selection::Greedy,
         messages: vec![json!({"role":"user","content":"submit write probe"})],
         tools: vec![],
         max_tokens: 1,

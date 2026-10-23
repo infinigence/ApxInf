@@ -18,8 +18,8 @@ SPEC.loader.exec_module(contracts)
 CORPUS = json.loads((ROOT / "tests/fixtures/serving/serial-v0.1.json").read_text())
 
 
-def fixture(case: dict) -> dict:
-    value = copy.deepcopy(CORPUS["templates"][case["template"]])
+def fixture(case: dict, corpus: dict = CORPUS) -> dict:
+    value = copy.deepcopy(corpus["templates"][case["template"]])
     for pointer, replacement in case.get("set", {}).items():
         keys = pointer.split("/")[1:]
         target = value
@@ -32,6 +32,79 @@ def fixture(case: dict) -> dict:
 
 
 class ServingContractTests(unittest.TestCase):
+    def test_shared_native_sampling_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-sampling-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+
+    def test_shared_native_thinking_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-thinking-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+
+    def test_shared_native_bounded_thinking_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-bounded-thinking-v0.1.json").read_text())
+        self.check_sampled_profile(corpus)
+        self.check_event_transcripts(corpus)
+
+    def check_sampled_profile(self, corpus):
+        for case in corpus["frame_cases"]:
+            with self.subTest(case["name"]):
+                frame = fixture(case, corpus)
+                if case.get("refresh_identity"):
+                    frame["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"])
+                    frame["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", frame["capabilities"])
+                before = copy.deepcopy(frame)
+                if case["valid"]:
+                    contracts.validate_frame(frame)
+                    self.assertEqual(contracts.decode_frame(contracts.encode_frame(frame)), frame)
+                else:
+                    with self.assertRaises(contracts.ContractError):
+                        contracts.validate_frame(frame)
+                if "envelope_valid" in case:
+                    if case["envelope_valid"]:
+                        contracts.validate_command_envelope(frame)
+                    else:
+                        with self.assertRaises(contracts.ContractError):
+                            contracts.validate_command_envelope(frame)
+                self.assertEqual(frame, before, "validator changed frame")
+        for vector in corpus["identity_digests"]:
+            value = corpus["templates"][vector["template"]]
+            for key in vector["pointer"].split("/")[1:]:
+                value = value[key]
+            self.assertEqual(contracts.canonical_identity_digest(vector["domain"], value), vector["digest"])
+        frame = fixture({"template": "submit", "set": {"/sampling": {
+            "mode": "random", "temperature": "number-literal", "top_p": 1, "seed": 0,
+        }}}, corpus)
+        for literal in corpus["invalid_number_literals"]:
+            with self.subTest(literal):
+                raw = json.dumps(frame).replace('"number-literal"', literal)
+                with self.assertRaises(contracts.ContractError):
+                    contracts.decode_frame(raw)
+
+    def test_shared_native_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-v0.1.json").read_text())
+        base = copy.deepcopy(CORPUS["templates"]["ready"])
+        base["protocol"] = "apxinf-worker/2.1"
+        base["runtime"] = corpus["runtime"]
+        base["capabilities"] = corpus["capabilities"]
+        base["model_manifest"]["runtime"] = corpus["runtime"]
+        base["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", base["model_manifest"])
+        base["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", base["capabilities"])
+        for case in corpus["cases"]:
+            with self.subTest(case["name"]):
+                frame = copy.deepcopy(base)
+                for pointer, replacement in case["set"].items():
+                    keys = pointer.split("/")[1:]
+                    target = frame
+                    for key in keys[:-1]:
+                        target = target[key]
+                    target[keys[-1]] = replacement
+                frame["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", frame["capabilities"])
+                if case["valid"]:
+                    contracts.validate_frame(frame)
+                else:
+                    with self.assertRaises(contracts.ContractError):
+                        contracts.validate_frame(frame)
+
     def test_shared_document_cases(self):
         for case in CORPUS["document_cases"]:
             with self.subTest(case["name"]):
@@ -55,14 +128,17 @@ class ServingContractTests(unittest.TestCase):
                         contracts.decode_frame(raw)
 
     def test_shared_event_transcripts(self):
-        for case in CORPUS["stream_cases"]:
+        self.check_event_transcripts(CORPUS)
+
+    def check_event_transcripts(self, corpus):
+        for case in corpus["stream_cases"]:
             with self.subTest(case["name"]):
-                tracker = contracts.AttemptTracker(CORPUS["templates"]["submit"])
+                tracker = contracts.AttemptTracker(corpus["templates"]["submit"])
                 failure = None
                 for index, selected in enumerate(case["events"]):
                     before = copy.deepcopy(tracker.__dict__)
                     try:
-                        tracker.observe(fixture(selected))
+                        tracker.observe(fixture(selected, corpus))
                     except contracts.ContractError:
                         self.assertEqual(tracker.__dict__, before, "invalid event changed state")
                         failure = index

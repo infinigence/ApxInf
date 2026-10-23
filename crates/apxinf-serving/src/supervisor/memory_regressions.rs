@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Config {
     Config {
+        runtime: WorkerRuntime::Python,
         python: PathBuf::from("/missing/apxinf-memory-test-python"),
         worker: PathBuf::from("/missing/apxinf-memory-test-worker"),
         model: PathBuf::from("/missing/apxinf-memory-test-model"),
@@ -17,6 +18,119 @@ pub(super) fn configuration(memory_budget: u64, sequence_reservation: u64) -> Co
         sequence_reservation,
         host_pressure_policy: crate::host_pressure::HostPressurePolicy::Disabled,
     }
+}
+
+#[test]
+fn native_manifest_checks_selected_runtime_and_execution_profile() {
+    let mut config = configuration(4096, 1024);
+    config.model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/serving/native-tokenizer");
+    let executable = std::env::current_exe().unwrap();
+    let directory =
+        std::env::temp_dir().join(format!("apxinf-native-identity-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let library = directory.join("libmlx.dylib");
+    std::fs::write(&library, b"original runtime identity fixture").unwrap();
+    config.runtime = WorkerRuntime::NativeMiniCpm5 {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    let runtime = crate::native_identity::runtime(&executable, &library).unwrap();
+    let mut manifest = crate::native_identity::manifest(
+        &config.model,
+        runtime,
+        crate::native_identity::execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["runtime"]["executable_sha256"] = "0".repeat(64).into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest["runtime"] = crate::native_identity::runtime(&executable, &library).unwrap();
+    manifest["execution"]["precision"] = "auto".into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest["execution"]["precision"] = "bf16".into();
+    config.runtime = WorkerRuntime::NativeMiniCpm5Sampled {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest = crate::native_identity::manifest(
+        &config.model,
+        crate::native_identity::runtime(&executable, &library).unwrap(),
+        crate::native_identity::sampled_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["execution"]["sampling"]["top_p"] = "1".into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    config.runtime = WorkerRuntime::NativeMiniCpm5Thinking {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest = crate::native_identity::manifest(
+        &config.model,
+        crate::native_identity::runtime(&executable, &library).unwrap(),
+        crate::native_identity::thinking_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["execution"]["enable_thinking"] = false.into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    config.runtime = WorkerRuntime::NativeMiniCpm5BoundedThinking {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest = crate::native_identity::manifest(
+        &config.model,
+        crate::native_identity::runtime(&executable, &library).unwrap(),
+        crate::native_identity::bounded_thinking_execution(
+            config.max_context,
+            config.max_output,
+            config.memory_budget,
+        ),
+    )
+    .unwrap();
+    verify_manifest(&manifest, &config).unwrap();
+    manifest["execution"]["initial_reasoning"]["budget_tokens"] = 1024.into();
+    assert!(verify_manifest(&manifest, &config).is_err());
+    manifest["execution"]["initial_reasoning"]["budget_tokens"] = 512.into();
+    config.runtime = WorkerRuntime::NativeMiniCpm5Thinking {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    assert!(verify_manifest(&manifest, &config).is_err());
+    config.runtime = WorkerRuntime::NativeMiniCpm5BoundedThinking {
+        executable: executable.clone(),
+        metal_library: library.clone(),
+    };
+    config.prefill_step_size = 256;
+    config.max_context = 16384;
+    assert!(config.validate_memory().is_ok());
+    config.max_context = 16385;
+    assert!(config.validate_memory().is_err());
+    config.max_context = 4096;
+    config.prefill_step_size = 128;
+    assert!(config.validate_memory().is_err());
+    assert!(crate::native_identity::runtime(
+        &executable,
+        &config.model.join("tokenizer_config.json")
+    )
+    .is_err());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

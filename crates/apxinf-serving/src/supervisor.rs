@@ -20,12 +20,14 @@ mod rotation_pressure_regressions;
 mod shutdown_regressions;
 #[cfg(test)]
 mod submit_regressions;
+#[cfg(test)]
+mod thinking_regressions;
 use crate::{
     contracts,
     diagnostics::{self, WorkerDiagnostics},
     host_pressure::{HostPressure, HostPressurePolicy},
     metrics::{ObservationMetrics, Outcome, RequestObservation},
-    output::{OutputParser, Part, StopMatcher},
+    output::{OutputParser, OutputProfile, Part, StopMatcher},
 };
 use generation::{wait_for_generation_control, GenerationPublic};
 use pending_queue::PendingQueue;
@@ -78,8 +80,45 @@ impl ApiError {
     }
 }
 
+#[derive(Clone, Default)]
+pub enum WorkerRuntime {
+    #[default]
+    Python,
+    NativeMiniCpm5 {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
+    NativeMiniCpm5Sampled {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
+    NativeMiniCpm5Thinking {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
+    NativeMiniCpm5BoundedThinking {
+        executable: PathBuf,
+        metal_library: PathBuf,
+    },
+}
+
+impl WorkerRuntime {
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::Python => PROTOCOL,
+            Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
+            Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
+            Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
+            Self::NativeMiniCpm5BoundedThinking { .. } => {
+                contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
+    pub runtime: WorkerRuntime,
     pub python: PathBuf,
     pub worker: PathBuf,
     pub model: PathBuf,
@@ -97,6 +136,21 @@ pub struct Config {
 
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
+        if matches!(
+            self.runtime,
+            WorkerRuntime::NativeMiniCpm5 { .. }
+                | WorkerRuntime::NativeMiniCpm5Sampled { .. }
+                | WorkerRuntime::NativeMiniCpm5Thinking { .. }
+                | WorkerRuntime::NativeMiniCpm5BoundedThinking { .. }
+        ) && (self.max_context > 16384
+            || self.output_batch_tokens != 1
+            || self.prefill_step_size != 256)
+        {
+            return Err(
+                "Native MiniCPM5 requires at most 16384 positions, 256-token prefill chunks, and one token per output frame."
+                    .into(),
+            );
+        }
         if !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.memory_budget)
             || !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.sequence_reservation)
         {
@@ -134,6 +188,7 @@ fn ready_memory_totals(ready: &Value) -> Result<(u64, u64), String> {
 
 #[derive(Clone)]
 pub struct Request {
+    pub selection: crate::sampling::Selection,
     pub messages: Vec<Value>,
     pub tools: Vec<Value>,
     pub max_tokens: usize,
@@ -207,7 +262,20 @@ pub struct Service {
 }
 
 impl Service {
+    pub(crate) fn model_thinking(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_THINKING_PROTOCOL || self.bounded_thinking()
+    }
+
+    pub(crate) fn bounded_thinking(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
+    }
+
+    pub(crate) fn sampling_enabled(&self) -> bool {
+        self.ready["protocol"] == contracts::NATIVE_SAMPLED_PROTOCOL || self.model_thinking()
+    }
+
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
+        request.selection.validate(self.sampling_enabled())?;
         if !self.available.load(Ordering::Acquire) {
             if self.rotating.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -299,6 +367,7 @@ impl Service {
 }
 
 struct Worker {
+    protocol: &'static str,
     child: Child,
     _diagnostics: Option<WorkerDiagnostics>,
     input: Option<ChildStdin>,
@@ -334,7 +403,7 @@ impl Worker {
         self.sent_commands > contracts::MAX_COMMANDS - REQUEST_COMMAND_ALLOWANCE
     }
     fn command(&self, kind: &str) -> Value {
-        json!({"protocol":PROTOCOL,"kind":kind,"worker_epoch":self.epoch,"command_id":uuid::Uuid::new_v4().to_string()})
+        json!({"protocol":self.protocol,"kind":kind,"worker_epoch":self.epoch,"command_id":uuid::Uuid::new_v4().to_string()})
     }
     async fn receive(&mut self, timeout: Duration) -> Result<Value, ApiError> {
         let value = tokio::time::timeout(timeout, self.frames.recv())
@@ -342,7 +411,7 @@ impl Worker {
             .map_err(|_| ApiError::worker("The worker response timed out."))?
             .ok_or_else(|| ApiError::worker("The worker output pipe closed."))?
             .map_err(ApiError::worker)?;
-        if value["worker_epoch"] != self.epoch {
+        if value["worker_epoch"] != self.epoch || value["protocol"] != self.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -394,7 +463,7 @@ impl Worker {
         Ok(false)
     }
     fn consume_idle_frame(&mut self, value: &Value) -> Result<(), ApiError> {
-        if value["worker_epoch"] != self.epoch {
+        if value["worker_epoch"] != self.epoch || value["protocol"] != self.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -490,12 +559,22 @@ async fn launch_worker_until(
     }
     pressure.require_load().map_err(LaunchError::Pressure)?;
     let epoch = uuid::Uuid::new_v4().to_string();
-    let mut command = Command::new(&config.python);
+    let mut command = match &config.runtime {
+        WorkerRuntime::Python => {
+            let mut command = Command::new(&config.python);
+            command.arg("-u").arg(&config.worker);
+            command
+        }
+        WorkerRuntime::NativeMiniCpm5 { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5BoundedThinking { executable, .. } => {
+            Command::new(executable)
+        }
+    };
     command
-        .arg("-u")
-        .arg(&config.worker)
         .arg("--protocol")
-        .arg(PROTOCOL)
+        .arg(config.runtime.protocol())
         .arg("--worker-epoch")
         .arg(&epoch)
         .arg("--model")
@@ -520,6 +599,18 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5BoundedThinking { metal_library, .. } = &config.runtime
+    {
+        command.arg("--metal-library").arg(metal_library).env(
+            "DYLD_LIBRARY_PATH",
+            metal_library
+                .parent()
+                .ok_or_else(|| "The Metal library needs a parent directory.".to_owned())?,
+        );
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("Cannot start worker: {e}"))?;
@@ -538,6 +629,7 @@ async fn launch_worker_until(
     };
     let frames = read_worker_frames(stdout);
     let mut worker = Worker {
+        protocol: config.runtime.protocol(),
         child,
         _diagnostics: Some(diagnostic_reader),
         input: Some(input),
@@ -1078,7 +1170,7 @@ async fn prepare_request(
     prepare["model_revision"] = service.ready["model_revision"].clone();
     prepare["messages"] = json!(job.request.messages);
     prepare["tools"] = json!(job.request.tools);
-    prepare["template_options"] = json!({"enable_thinking":false});
+    prepare["template_options"] = json!({"enable_thinking":service.model_thinking()});
     let mut stopped: Option<Instant> = None;
     wait_for_preparation(worker.send(&prepare), service, job, timeout, &mut stopped).await?;
     loop {
@@ -1100,7 +1192,7 @@ async fn prepare_request(
         )
         .await?;
         let result = (|| {
-            if event["worker_epoch"] != worker.epoch {
+            if event["worker_epoch"] != worker.epoch || event["protocol"] != worker.protocol {
                 return Err(ApiError::new(
                     500,
                     "protocol_fault",
@@ -1275,7 +1367,7 @@ async fn settle_stopped_submission(
                     ApiError::worker("The worker output closed during submission settlement.")
                 })?
                 .map_err(ApiError::worker)?;
-            if frame["worker_epoch"] != worker.epoch {
+            if frame["worker_epoch"] != worker.epoch || frame["protocol"] != worker.protocol {
                 return Err(ApiError::new(
                     500,
                     "protocol_fault",
@@ -1377,6 +1469,71 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         {
             return Err(format!("The model artifact identity differs: {name}"));
         }
+    }
+    if let WorkerRuntime::NativeMiniCpm5 {
+        executable,
+        metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5Sampled {
+        executable,
+        metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5Thinking {
+        executable,
+        metal_library,
+    }
+    | WorkerRuntime::NativeMiniCpm5BoundedThinking {
+        executable,
+        metal_library,
+    } = &config.runtime
+    {
+        let expected = crate::native_identity::runtime(executable, metal_library)?;
+        let bounded = config.runtime.protocol() == contracts::NATIVE_BOUNDED_THINKING_PROTOCOL;
+        let thinking = config.runtime.protocol() == contracts::NATIVE_THINKING_PROTOCOL;
+        let sampled = config.runtime.protocol() == contracts::NATIVE_SAMPLED_PROTOCOL;
+        let adapter = if bounded {
+            "apxinf-native-minicpm5-bounded-thinking-v1"
+        } else if thinking {
+            "apxinf-native-minicpm5-thinking-v1"
+        } else if sampled {
+            "apxinf-native-minicpm5-sampled-v1"
+        } else {
+            "apxinf-native-minicpm5-v1"
+        };
+        let execution = if bounded {
+            crate::native_identity::bounded_thinking_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else if thinking {
+            crate::native_identity::thinking_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else if sampled {
+            crate::native_identity::sampled_execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        } else {
+            crate::native_identity::execution(
+                config.max_context,
+                config.max_output,
+                config.memory_budget,
+            )
+        };
+        if manifest["runtime"] != expected
+            || manifest["adapter_revision"] != adapter
+            || manifest["execution"] != execution
+        {
+            return Err(
+                "The native execution identity differs from the selected configuration.".into(),
+            );
+        }
+        return Ok(());
     }
     let root = config
         .worker
@@ -1480,6 +1637,9 @@ async fn execute(
         .max(1) as u64);
     submit["eos_token_ids"] = service.ready["eos_token_ids"].clone();
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
+    if service.sampling_enabled() {
+        submit["sampling"] = job.request.selection.submission(&job.id);
+    }
     let mut tracker = contracts::AttemptTracker::new(&submit)
         .map_err(|e| ApiError::new(500, "protocol_fault", e.to_string()))
         .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
@@ -1490,8 +1650,22 @@ async fn execute(
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
-    let mut parser = OutputParser::new(job.request.tools.clone());
+    let profile = if matches!(
+        worker.protocol,
+        contracts::NATIVE_PROTOCOL
+            | contracts::NATIVE_SAMPLED_PROTOCOL
+            | contracts::NATIVE_THINKING_PROTOCOL
+            | contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
+    ) {
+        OutputProfile::MiniCpm5
+    } else {
+        OutputProfile::Qwen
+    };
+    let mut parser = OutputParser::with_profile(job.request.tools.clone(), profile);
     let mut stops = StopMatcher::new(job.request.stops.clone());
+    let mut thinking_prefix = service
+        .model_thinking()
+        .then(crate::output::InitialThinkingPrefix::new);
     let mut output_tokens = 0;
     let mut control_sent = false;
     let mut cancelled_at = None;
@@ -1541,7 +1715,7 @@ async fn execute(
         public.expire(&job, service, timeout, public_error.as_ref(), terminal.as_ref());
         let frame = event.ok_or_else(|| ApiError::worker("The worker output closed during execution."))?
             .map_err(ApiError::worker)?;
-        if frame["worker_epoch"] != worker.epoch {
+        if frame["worker_epoch"] != worker.epoch || frame["protocol"] != worker.protocol {
             return Err(ApiError::new(
                 500,
                 "protocol_fault",
@@ -1570,11 +1744,20 @@ async fn execute(
                     ));
                 }
                 if public_error.is_none() && public.status.is_none() {
-                    let text = stops.push(
-                        frame["text_delta"].as_str().unwrap_or(""),
-                        kind == "terminal",
-                    );
-                    match parser.push(&text, kind == "terminal" && frame["status"] == "completed") {
+                    let raw = frame["text_delta"].as_str().unwrap_or("");
+                    let text = match &mut thinking_prefix {
+                        Some(prefix) => prefix.push(raw),
+                        None => raw.to_owned(),
+                    };
+                    let incomplete_reasoning = thinking_prefix.as_ref().is_some_and(|prefix| !prefix.is_open())
+                        && kind == "terminal" && frame["status"] == "completed" && frame["cause"] == "eos";
+                    let parsed = if incomplete_reasoning {
+                        Err("The model ended before closing its initial reasoning block.".to_owned())
+                    } else {
+                        let text = stops.push(&text, kind == "terminal");
+                        parser.push(&text, kind == "terminal" && frame["status"] == "completed")
+                    };
+                    match parsed {
                         Ok(parts) => {
                             public.expire(&job, service, timeout, public_error.as_ref(),
                                 if kind == "terminal" { Some(&frame) } else { terminal.as_ref() });
@@ -1627,7 +1810,7 @@ async fn execute(
                                 "stop_generation",
                                 "stop_sequence",
                                 output_tokens,
-                                stops.cutoff,
+                                stops.cutoff + thinking_prefix.as_ref().map_or(0, |prefix| prefix.suppressed_bytes()),
                             ), &job, service, &mut public, timeout, at, public_error.as_ref(), terminal.as_ref()).await?;
                         control_sent = true;
                     }
@@ -1844,6 +2027,24 @@ pub(crate) fn gateway_test_service() -> (Arc<Service>, mpsc::UnboundedReceiver<R
 pub(crate) fn gateway_test_service_with_pressure(
     pressure: Arc<HostPressure>,
 ) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_config(pressure, PROTOCOL)
+}
+
+#[cfg(test)]
+pub(crate) fn gateway_test_service_with_protocol(
+    protocol: &str,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
+    gateway_test_service_config(
+        Arc::new(HostPressure::new(HostPressurePolicy::Disabled)),
+        protocol,
+    )
+}
+
+#[cfg(test)]
+fn gateway_test_service_config(
+    pressure: Arc<HostPressure>,
+    protocol: &str,
+) -> (Arc<Service>, mpsc::UnboundedReceiver<Request>) {
     let (observed, requests) = mpsc::unbounded_channel();
     let service = Arc::new(Service {
         queue: PendingQueue::new(8),
@@ -1851,6 +2052,7 @@ pub(crate) fn gateway_test_service_with_pressure(
         stopped: watch::channel(None).1,
         ready_state: RwLock::new(json!({"worker_epoch":"00000000-0000-4000-8000-000000000001"})),
         ready: json!({
+            "protocol": protocol,
             "worker_epoch": "00000000-0000-4000-8000-000000000001",
             "model_revision": "1111111111111111111111111111111111111111111111111111111111111111",
             "capabilities": {"max_context": 4096, "max_output_tokens": 1024}
@@ -1899,6 +2101,7 @@ mod lifecycle_tests {
 
     fn idle_request() -> Request {
         Request {
+            selection: crate::sampling::Selection::Greedy,
             messages: vec![json!({"role": "user", "content": "hello"})],
             tools: Vec::new(),
             max_tokens: 1,
@@ -2073,6 +2276,7 @@ mod lifecycle_tests {
         let input = child.stdin.take().unwrap();
         let frames = read_worker_frames(child.stdout.take().unwrap());
         Worker {
+            protocol: PROTOCOL,
             child,
             _diagnostics: None,
             input: Some(input),

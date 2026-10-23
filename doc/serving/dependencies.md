@@ -9,6 +9,18 @@ The [serial profile](serial-profile-v0.1.md) defines the wire interface.
 
 ## Rust gateway
 
+The optional native worker uses existing workspace libraries through their public Rust APIs.
+`apxinf-model` owns model loading and controlled generation.
+`apxinf-tokenizer` owns checkpoint template rendering and tokenization.
+`apxinf-core` supplies device and precision types.
+`apxinf-mlx` supplies checked allocator statistics and cache release.
+The native worker pins MLX 0.31.2 through the existing backend build checks.
+It calls the public `mlx::core::set_memory_limit` API before model loading.
+This API sets an allocation guideline during graph evaluation.
+It does not enforce a hard limit on total process memory or physical memory.
+These calls add no external package dependency.
+The Python runtime retains its existing version pins.
+
 | Dependency | Version constraint | Role | Replacement boundary |
 | --- | --- | --- | --- |
 | `axum` | `=0.8.9` | HTTP routing, bounded bodies, responses, and SSE transport | `gateway.rs` |
@@ -113,3 +125,10 @@ It does not import MLX or introduce a runtime dependency.
 Explicit calibration inputs use the existing first-party `prepare_input` validator for seed messages.
 The parent records bounded JSON inputs and their SHA-256 digests before it starts the probe.
 These operations add no package dependency or worker fields.
+
+## Bounded native reasoning tests
+
+The serving crate uses the existing workspace `apxinf-loader` crate as a test dependency.
+CPU generation tests use its `ModelConfig` type to implement an original toy model.
+This dependency adds no external package or serving runtime component.
+The runtime policy calls the existing CPU sampler and native model generation interfaces.

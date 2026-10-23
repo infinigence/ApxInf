@@ -20,3 +20,5 @@ target-p92i/
 
 # Local MLX toolchains and runtime state.
 .apxinf/
+/configs/tuning/**/*.recipe
+/configs/tuning/**/*.recipe.*.tmp
