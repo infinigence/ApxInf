@@ -138,6 +138,12 @@ class ClefContractTests(unittest.TestCase):
         request["questions"]["color"]["criteria"]["red"] = "mutated"
         self.assertEqual(dict(parsed.record.questions[0].criteria)["red"], "A red sample")
 
+    def test_frame_kind_must_be_a_string(self):
+        frame = expand(CORPUS["frames"]["accepted"])
+        for kind in ({}, [], None, True):
+            with self.subTest(kind=kind), self.assertRaises(c.ContractError):
+                c.validate_frame({**frame, "kind": kind})
+
 
 if __name__ == "__main__":
     unittest.main()
