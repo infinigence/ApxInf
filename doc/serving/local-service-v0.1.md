@@ -15,6 +15,10 @@ One bounded queue precedes that worker.
 The default queue holds 16 waiting requests.
 The worker executes one request at a time.
 
+The text provider rejects bundles with `joint_head_config.json` or `joint_head.safetensors`.
+This provider does not execute a decision head.
+The worker returns `model_unavailable` before model identity hashing or loading.
+
 The coordinator removes cancelled and expired waiting requests every 20 milliseconds and before enqueue.
 This cleanup proceeds during active execution and retains FIFO order for remaining requests.
 Queue and public result counters change once for each removed request.
