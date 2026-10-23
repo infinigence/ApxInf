@@ -137,6 +137,9 @@ The adapter does not call the dependency's rounded SystemOne projection.
 The execution context limit ranges from 1 through 4096 input IDs.
 The CLI requires `max_output_tokens=0`, an explicit Python interpreter, and an explicit external loader path.
 The CLI also requires the existing positive memory budget.
+The shared worker arguments require `prefill_step_size=256` and `output_batch_tokens=1` for launch compatibility.
+These fixed values do not enable chunked prefill, token events, or batching for Clef.
+The supervisor rejects other values before worker startup.
 The worker uses public allocator controls with idle cache limit zero and the configured memory budget.
 The worker must not increase the system wired-memory limit.
 Context overflow produces `context_limit` without truncation or inference.
