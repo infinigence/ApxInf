@@ -181,6 +181,12 @@ async fn decision_context_rejection_reaps_and_loads_a_replacement() {
         .events()
         .iter()
         .any(|event| event["event"] == "submitted"));
+    assert!(
+        service.metrics_text().lines().any(|line| line
+            == "apxinf_worker_terminal_to_settlement_seconds_count{operation=\"decision\"} 1"),
+        "A checked Clef failure must contribute one worker cleanup sample.\n{}",
+        service.metrics_text()
+    );
     let mut next = service.enqueue_decision(request()).unwrap();
     next.begin.await.unwrap().unwrap();
     assert!(matches!(next.output.recv().await, Some(Event::Decision(_))));
