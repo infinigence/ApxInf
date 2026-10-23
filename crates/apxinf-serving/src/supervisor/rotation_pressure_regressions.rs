@@ -27,10 +27,14 @@ fn pressure_service(ready: Value, timeout: Duration) -> Arc<Service> {
 async fn pressure_preload_refusal_precedes_spawn() {
     let config = super::memory_regressions::configuration(4096, 1024);
     let guard = HostPressure::with_sensor(|| Ok(Pressure::Warning));
-    assert!(matches!(
-        launch_worker(&config, &guard).await,
-        Err(LaunchError::Pressure(_))
-    ));
+    let message = match launch_worker(&config, &guard).await {
+        Err(LaunchError::Pressure(message)) => message,
+        _ => panic!("Expected a preload pressure refusal."),
+    };
+    assert_eq!(
+        message,
+        "Host memory pressure prevents model loading: warning. "
+    );
 }
 
 #[tokio::test]
@@ -39,15 +43,19 @@ async fn pressure_postload_refusal_reaps_the_created_worker() {
     let (mut worker, _) = cpu_worker(model.model()).await.unwrap();
     assert!(worker.child.id().is_some());
     let guard = HostPressure::with_sensor(|| Ok(Pressure::Warning));
-    assert!(matches!(
-        check_loaded_pressure(&mut worker, &guard).await,
-        Err(LaunchError::Pressure(_))
-    ));
+    let message = match check_loaded_pressure(&mut worker, &guard).await {
+        Err(LaunchError::Pressure(message)) => message,
+        _ => panic!("Expected a postload pressure refusal."),
+    };
     assert!(
         worker.child.id().is_none(),
         "The child must already be reaped."
     );
     assert!(worker.child.try_wait().unwrap().is_some());
+    assert_eq!(
+        message,
+        "Model loading completed, but host memory pressure blocked readiness. Host memory pressure prevents model loading: warning. "
+    );
 }
 
 #[tokio::test]
