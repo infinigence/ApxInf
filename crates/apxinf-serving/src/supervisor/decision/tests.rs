@@ -116,6 +116,206 @@ async fn available(service: &Service) {
     .unwrap();
 }
 
+fn decision_metric(service: &Service, name: &str) -> f64 {
+    let prefix = format!("{name}{{operation=\"decision\"}} ");
+    service
+        .metrics_text()
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn stopped_attempt(
+    probe: &Probe,
+    mode: &str,
+) -> (Worker, Arc<Service>, DecisionTracker, Value, Vec<Value>) {
+    let (mut worker, ready) = worker(probe.0.clone(), mode).await.unwrap();
+    let service =
+        super::super::lifecycle_regressions::cpu_service(ready, Duration::from_secs(10), 4);
+    let mut prepare = worker.command("prepare_decision");
+    prepare["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+    prepare["attempt"] = json!(1);
+    prepare["model_revision"] = service.ready["model_revision"].clone();
+    prepare["capability_revision"] = service.ready["capability_revision"].clone();
+    prepare["record"] = json!(request().record);
+    let tracker = DecisionTracker::new(&prepare).unwrap();
+    worker.send(&prepare).await.unwrap();
+    let prepared = worker.receive(Duration::from_secs(5)).await.unwrap();
+    let mut submit = worker.command("submit_decision");
+    submit["request_id"] = prepare["request_id"].clone();
+    submit["attempt"] = json!(1);
+    submit["model_revision"] = service.ready["model_revision"].clone();
+    submit["capability_revision"] = service.ready["capability_revision"].clone();
+    submit["preparation"] = prepared["preparation"].clone();
+    submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
+    worker.send(&submit).await.unwrap();
+    let mut frames = vec![prepared];
+    for _ in 0..3 {
+        frames.push(worker.receive(Duration::from_secs(5)).await.unwrap());
+    }
+    assert!(worker.child.wait().await.unwrap().success());
+    assert!(worker.frames.recv().await.is_none());
+    (worker, service, tracker, submit, frames)
+}
+
+fn pending_frames(worker: &mut Worker, frames: impl IntoIterator<Item = Value>) {
+    let (sender, receiver) = mpsc::channel(4);
+    for frame in frames {
+        sender.try_send(Ok(frame)).unwrap();
+    }
+    worker.frames = receiver;
+}
+
+#[tokio::test]
+async fn stopped_decision_preparation_ends_before_resource_settlement() {
+    let probe = Probe::new();
+    let (mut worker, service, mut tracker, _, frames) = stopped_attempt(&probe, "success").await;
+    pending_frames(&mut worker, frames.into_iter().take(1));
+    let observation = RequestObservation::decision(Instant::now());
+    observation.preparation_start(Instant::now());
+    observation.public_terminal(
+        &service.metrics.observations,
+        Outcome::Cancelled,
+        Instant::now(),
+    );
+    check_stopped_frames(&mut worker, &service, &mut tracker)
+        .await
+        .unwrap();
+    let preparation_count = decision_metric(&service, "apxinf_preparation_seconds_count");
+    observation.settled(&service.metrics.observations, Instant::now());
+    assert_eq!(preparation_count, 1.0);
+    assert_eq!(
+        decision_metric(&service, "apxinf_preparation_seconds_count"),
+        1.0
+    );
+    assert_eq!(
+        decision_metric(
+            &service,
+            "apxinf_worker_terminal_to_settlement_seconds_count"
+        ),
+        0.0
+    );
+}
+
+#[tokio::test]
+async fn stopped_decision_terminals_record_cleanup_without_replacing_cancellation() {
+    for mode in ["success", "inference_failure"] {
+        let probe = Probe::new();
+        let (mut worker, service, mut tracker, submit, mut frames) =
+            stopped_attempt(&probe, mode).await;
+        tracker.observe(&frames.remove(0)).unwrap();
+        tracker.observe(&submit).unwrap();
+        if mode == "success" {
+            frames[1]["metrics"]["peak_device_bytes"] = json!(1024);
+        }
+        pending_frames(&mut worker, frames);
+        let observation = RequestObservation::decision(Instant::now());
+        observation.preparation_start(Instant::now());
+        observation.preparation_end(&service.metrics.observations, Instant::now());
+        observation.public_terminal(
+            &service.metrics.observations,
+            Outcome::Cancelled,
+            Instant::now(),
+        );
+        check_stopped_frames(&mut worker, &service, &mut tracker)
+            .await
+            .unwrap();
+        observation.settled(&service.metrics.observations, Instant::now());
+        assert_eq!(
+            decision_metric(&service, "apxinf_preparation_seconds_count"),
+            1.0,
+            "{mode}"
+        );
+        assert_eq!(
+            decision_metric(
+                &service,
+                "apxinf_worker_terminal_to_settlement_seconds_count"
+            ),
+            1.0,
+            "{mode}"
+        );
+        assert_eq!(
+            service.metrics.peak_bytes.load(Ordering::Relaxed),
+            if mode == "success" { 1024 } else { 0 }
+        );
+        let metrics = service.metrics_text();
+        assert!(metrics.contains(
+            "apxinf_request_outcomes_total{operation=\"decision\",status=\"cancelled\"} 1"
+        ));
+        assert!(metrics.contains(
+            "apxinf_request_outcomes_total{operation=\"decision\",status=\"completed\"} 0"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn stopped_decision_invalid_frames_add_no_observations() {
+    for invalid in [
+        "epoch",
+        "command",
+        "probabilities",
+        "prepared_digest",
+        "prepared_context",
+    ] {
+        let probe = Probe::new();
+        let (mut worker, service, mut tracker, submit, mut frames) =
+            stopped_attempt(&probe, "success").await;
+        if invalid.starts_with("prepared") {
+            frames.truncate(1);
+            if invalid == "prepared_digest" {
+                frames[0]["preparation"]["preparation_digest"] = json!("0".repeat(64));
+            }
+        } else {
+            tracker.observe(&frames.remove(0)).unwrap();
+            tracker.observe(&submit).unwrap();
+            tracker.observe(&frames.remove(0)).unwrap();
+            frames.truncate(1);
+            frames[0]["metrics"]["peak_device_bytes"] = json!(2048);
+            match invalid {
+                "epoch" => frames[0]["worker_epoch"] = json!(uuid::Uuid::new_v4().to_string()),
+                "command" => frames[0]["command_id"] = json!(uuid::Uuid::new_v4().to_string()),
+                "probabilities" => frames[0]["probabilities"][0]["values"][0] = json!(2.0),
+                _ => unreachable!(),
+            }
+        }
+        let service = if invalid == "prepared_context" {
+            let mut ready = service.ready.clone();
+            ready["capabilities"]["max_context"] = json!(1);
+            super::super::lifecycle_regressions::cpu_service(ready, Duration::from_secs(10), 4)
+        } else {
+            service
+        };
+        pending_frames(&mut worker, frames);
+        let observation = RequestObservation::decision(Instant::now());
+        observation.preparation_start(Instant::now());
+        let error = check_stopped_frames(&mut worker, &service, &mut tracker)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "protocol_fault", "{invalid}");
+        assert_eq!(
+            decision_metric(&service, "apxinf_preparation_seconds_count"),
+            0.0,
+            "{invalid}"
+        );
+        observation.settled(&service.metrics.observations, Instant::now());
+        assert_eq!(
+            decision_metric(
+                &service,
+                "apxinf_worker_terminal_to_settlement_seconds_count"
+            ),
+            0.0,
+            "{invalid}"
+        );
+        assert_eq!(
+            service.metrics.peak_bytes.load(Ordering::Relaxed),
+            0,
+            "{invalid}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn decision_result_stays_private_until_clean_process_reap() {
     let probe = Probe::new();
