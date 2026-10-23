@@ -18,6 +18,7 @@
 | 资源结算 | 串行请求与取消结算 | 增加原生生成进度／取消接口及视觉请求状态清理；不确定清理永久隔离 worker |
 | 客户端验收 | Qwen 文本 Read／Edit／Check／Cancel | 增加真实 MiniCPM 工具链、视觉 HTTP 和客户端图片传输检查；记录失败任务 |
 | CPU CI | Rust／Python 契约测试 | 扩展共享 fixtures、图片与视觉 worker 测试；显式安装 NumPy／Pillow |
+| Clef 决策 | 无专用 provider 或接口 | 增加 `python-clef`、`/v1/systemone`、三种问题类型和进程回收后成功结算 |
 
 MiniCPM-V 接入调用 MLX-VLM 的公开接口。它不是新增的 Rust 原生视觉推理实现。
 初始思考配置不是 Anthropic extended-thinking API。后者仍不支持。
@@ -47,6 +48,11 @@ MiniCPM-V 接入调用 MLX-VLM 的公开接口。它不是新增的 Rust 原生�
 [默认上下文报告](minicpm-default-context-validation-20261023.md)。
 不同模型、配置和执行路径的结果不能互相替代。
 
+后续 Clef 增量使 Rust 默认套件达到 200 通过、1 忽略，原生套件达到 223 通过、1 忽略。
+Python serving 全量运行 355 项，348 通过、7 跳过。指定 Clef 环境的 30 项测试全部通过。
+[Clef serving 报告](clef-serving-validation-20261023.md)记录真实三类型 HTTP、2828-token 长输入及默认压力门控未通过的边界。
+这些最新总数包含上表已有测试，不能与旧数量相加。
+
 ## 明确保留的限制
 
 - 真实 MiniCPM-V Claude Code 图片修订未通过。模型路径大小写错误、读取二进制和未知工具调用阻止任务完成。
@@ -55,7 +61,7 @@ MiniCPM-V 接入调用 MLX-VLM 的公开接口。它不是新增的 Rust 原生�
 - 当前模型检查不构成通用内存上限证明。allocator 统计不是进程 RSS。
 - 视觉输入仅限有界 PNG。URL、其他图片格式、OpenAI 图片接口和视频不支持。
 - 不提供跨请求 KV cache 复用、连续批处理、多模型调度或持久会话。
-- Clef 决策接口尚未接入。文本 provider 明确拒绝决策头模型包；[参考启动验证](clef-validation-20261023.md)仍受内存压力阻断。
+- Clef 首版仅接受文本决策，每次结束后重载模型。默认压力门控仍可能阻止就绪，正向 HTTP 属于显式诊断配置。
 - 初始思考预算计入总输出额度。提高额度不能保证模型会正确使用工具或完成绘图。
 
 本次 PR 保留 serving 及必要原生接口。不提交本地实验、权重、虚拟环境或其他子系统修改。
