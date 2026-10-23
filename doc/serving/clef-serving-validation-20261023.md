@@ -169,6 +169,42 @@ macOS CI 还暴露了现有观察测试的过短等待预算。
 
 该表记录均位于忽略目录 `devlocal/clef-acceptance/`，模型、运行时、原始日志和设备观察器不进入提交。
 
+## 默认就绪与常驻压力诊断
+
+后续默认配置复跑记录为 `devlocal/clef-pressure/default-002/`。
+执行前重新核对 26 项已批准身份文件，模型、精度和运行参数保持不变。
+启动前压力为 `normal`，服务随后因 `warning` 退出，未发布 HTTP readiness，也未启动业务客户端。
+所属进程组已清空，根进程退出码为 1，观察线程已停止，设备锁已释放。
+
+为区分瞬时加载压力与加载后的压力，另执行一次独立 Python 常驻诊断。
+记录为 `devlocal/clef-pressure/resident-001/`，使用未修改的 `ClefRuntime` 构造、保持和关闭操作。
+私有包装只记录原调用前后的阶段，使用原检查点、BF16 决策头、4096 context 和 8 GiB allocator guideline。
+该进程不运行 Rust supervisor，不执行 Rust 的额外文件校验，不提供 HTTP 服务，也不执行模型推理。
+因此诊断完成不代表默认 serving 验收通过。
+
+第一次模型文件校验后及外部加载器调用前，压力均为 `normal`。
+加载器返回后，压力已为 `warning`，尚未开始第二次模型文件校验。
+完整构造结束后，模型静置至少 30 秒，期间 30 次采样全部为 `warning`。
+MLX 活跃值和峰值均保持 5281565712 字节，缓存值为零。
+保持期间诊断进程当前 RSS 范围为 339476480 至 560398336 字节，进程历史峰值为 1402421248 字节。
+RSS、MLX 分配、主机压力和 swap 是不同口径，不能互相替代或直接相加。
+关闭运行时后，驱动和外部观察器均读到 `normal`，进程退出码为零。
+最终所属进程组为空，监测线程停止，设备锁再次实际获取成功。
+
+这次观察不支持“加载后仅等待 30 秒即可恢复准入”的假设。
+它也证明本次 `warning` 并非必须等到第二次 Python 校验或 Rust 校验才出现。
+当前主机负载下的模型驻留与压力变化相关，但尚未独立隔离其他进程、文件缓存和物理 footprint。
+这是一轮插桩诊断，不构成加载性能、普遍容量或长时间稳定性结论。
+本轮未据此降低压力门槛，也未删除身份校验。
+
+| 压力诊断记录 | SHA-256 |
+| --- | --- |
+| `default-002/receipt.json` | `9c4328595add72e03f2569faa2ee003b5d6bf32755daff4aeb205ee5e73a4a4d` |
+| `resident-001/probe-summary.json` | `040d1d8dee2fb387e72f8b14e3194d9ca67df6b07ffd1d6ce91a5419d987cb8b` |
+| `resident-001/observed/receipt.json` | `e88d78da3078f3125337fa802371fe170c84d49ef07fed211e544c136b0303fa` |
+
+这些原始记录和插桩工具仅保存在忽略目录 `devlocal/clef-pressure/`。
+
 ## 保留限制
 
 这不是聊天生成模型接口，不能直接充当 Claude Code 的 Anthropic Messages provider。
