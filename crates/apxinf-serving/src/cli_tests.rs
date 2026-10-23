@@ -36,6 +36,31 @@ fn vision_provider_requires_an_explicit_interpreter() {
 }
 
 #[test]
+fn clef_provider_requires_an_explicit_interpreter() {
+    let args = Args::try_parse_from([
+        "apxinf-serve",
+        "--model",
+        "/model",
+        "--provider",
+        "python-clef",
+        "--clef-loader",
+        "/loader.py",
+        "--max-context",
+        "4096",
+        "--max-output-tokens",
+        "0",
+    ])
+    .unwrap();
+    let runtime = WorkerRuntime::PythonClef {
+        loader: args.clef_loader.unwrap(),
+    };
+    assert!(worker_paths(&runtime, args.python, args.worker)
+        .unwrap_err()
+        .to_string()
+        .contains("explicit --python"));
+}
+
+#[test]
 #[cfg(unix)]
 fn vision_launch_preserves_the_final_virtual_environment_symlink() {
     let root = std::env::temp_dir().join(format!("apxinf-vision-cli-{}", uuid::Uuid::new_v4()));
@@ -46,23 +71,26 @@ fn vision_launch_preserves_the_final_virtual_environment_symlink() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let worker = root.join("worker.py");
     std::fs::write(&worker, b"worker fixture").unwrap();
-    let (selected, _) = worker_paths(
-        &WorkerRuntime::PythonMiniCpmVision,
-        Some(link.clone()),
-        Some(worker.clone()),
-    )
-    .unwrap();
-    assert_eq!(selected.file_name().unwrap(), "python");
-    assert_eq!(selected.parent().unwrap().file_name().unwrap(), "bin");
-    assert!(selected
-        .symlink_metadata()
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert_eq!(
-        std::fs::canonicalize(selected).unwrap(),
-        std::fs::canonicalize(&real).unwrap()
-    );
+    for runtime in [
+        WorkerRuntime::PythonMiniCpmVision,
+        WorkerRuntime::PythonClef {
+            loader: "/loader.py".into(),
+        },
+    ] {
+        let (selected, _) =
+            worker_paths(&runtime, Some(link.clone()), Some(worker.clone())).unwrap();
+        assert_eq!(selected.file_name().unwrap(), "python");
+        assert_eq!(selected.parent().unwrap().file_name().unwrap(), "bin");
+        assert!(selected
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::canonicalize(selected).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+    }
     let (old, _) = worker_paths(&WorkerRuntime::Python, Some(link), Some(worker)).unwrap();
     assert_eq!(old, std::fs::canonicalize(real).unwrap());
     std::fs::remove_dir_all(root).unwrap();

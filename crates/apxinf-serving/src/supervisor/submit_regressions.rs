@@ -117,6 +117,7 @@ sys.stdin.buffer.readline()
         epoch: epoch.clone(),
         controls: Default::default(),
         sent_commands: 0,
+        retired: false,
     };
     let ready = json!({"worker_epoch":epoch, "model_revision":"1".repeat(64),
         "capability_revision":"2".repeat(64), "eos_token_ids":[2],

@@ -25,7 +25,7 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "python-clef", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
     provider: String,
     #[arg(long)]
     native_worker: Option<PathBuf>,
@@ -33,6 +33,8 @@ struct Args {
     metal_library: Option<PathBuf>,
     #[arg(long)]
     python: Option<PathBuf>,
+    #[arg(long)]
+    clef_loader: Option<PathBuf>,
     #[arg(long)]
     worker: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1")]
@@ -103,6 +105,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("A service limit is outside the supported range.".into());
     }
+    if args.provider != "python-clef" && args.clef_loader.is_some() {
+        return Err("The --clef-loader option requires --provider python-clef.".into());
+    }
     let runtime = if matches!(
         args.provider.as_str(),
         "native-minicpm5"
@@ -143,7 +148,19 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if args.native_worker.is_some() || args.metal_library.is_some() {
             return Err("Native runtime paths require a native MiniCPM provider.".into());
         }
-        if args.provider == "mlx-vlm-minicpmv47" {
+        if args.provider == "python-clef" {
+            if !(1..=4096).contains(&args.max_context) || args.max_output_tokens != 0 {
+                return Err(
+                    "Clef requires --max-context at most 4096 and --max-output-tokens 0.".into(),
+                );
+            }
+            WorkerRuntime::PythonClef {
+                loader: std::fs::canonicalize(
+                    args.clef_loader
+                        .ok_or("The python-clef provider requires --clef-loader.")?,
+                )?,
+            }
+        } else if args.provider == "mlx-vlm-minicpmv47" {
             WorkerRuntime::PythonMiniCpmVision
         } else {
             WorkerRuntime::Python
@@ -222,19 +239,27 @@ fn worker_paths(
     worker: Option<PathBuf>,
 ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let vision = matches!(runtime, WorkerRuntime::PythonMiniCpmVision);
-    if vision && python.is_none() {
-        return Err("The mlx-vlm-minicpmv47 provider requires an explicit --python path.".into());
+    let clef = matches!(runtime, WorkerRuntime::PythonClef { .. });
+    if (vision || clef) && python.is_none() {
+        return Err(if vision {
+            "The mlx-vlm-minicpmv47 provider requires an explicit --python path."
+        } else {
+            "The python-clef provider requires an explicit --python path."
+        }
+        .into());
     }
     let mut python =
         python.unwrap_or_else(|| ".apxinf/toolchains/mlx-lm-0.31.3-copies/bin/python".into());
     let mut worker = worker.unwrap_or_else(|| {
-        if vision {
+        if clef {
+            "python/apxinf/apxinf/serving/clef_worker.py".into()
+        } else if vision {
             "python/apxinf/apxinf/serving/vision_worker.py".into()
         } else {
             "python/apxinf/apxinf/serving/text_worker.py".into()
         }
     });
-    if vision {
+    if vision || clef {
         let absolute = std::path::absolute(&python)?;
         let parent = absolute
             .parent()

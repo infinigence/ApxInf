@@ -212,14 +212,14 @@ mod tests {
         (
             Job {
                 observation: Arc::new(crate::metrics::RequestObservation::new(ingress, false)),
-                request: Request {
+                workload: super::super::Workload::Text(Request {
                     selection: crate::sampling::Selection::Greedy,
                     messages: vec![json!({"role": "user", "content": "hello"})],
                     tools: Vec::new(),
                     max_tokens: 1,
                     stops: Vec::new(),
                     count_only: false,
-                },
+                }),
                 id: format!("00000000-0000-4000-8000-{index:012}"),
                 ingress,
                 begin,
