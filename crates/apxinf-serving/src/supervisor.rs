@@ -152,6 +152,18 @@ impl Config {
                 "Clef requires at most 4096 input positions and --max-output-tokens 0.".into(),
             );
         }
+        if matches!(self.runtime, WorkerRuntime::PythonClef { .. }) {
+            if self.prefill_step_size != 256 {
+                return Err(
+                    "Clef requires --prefill-step-size 256 for launch compatibility.".into(),
+                );
+            }
+            if self.output_batch_tokens != 1 {
+                return Err(
+                    "Clef requires --output-batch-tokens 1 for launch compatibility.".into(),
+                );
+            }
+        }
         if matches!(self.runtime, WorkerRuntime::PythonMiniCpmVision)
             && (!(1..=16384).contains(&self.max_context)
                 || self.max_output > 8192
