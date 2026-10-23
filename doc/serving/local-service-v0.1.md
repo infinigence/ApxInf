@@ -92,6 +92,8 @@ Select the existing pinned Python environment and external loader explicitly.
 The [dependency record](dependencies.md#clef-text-runtime) lists their roles and versions.
 The model bundle must match the approved artifact digests.
 The external loader remains an installed dependency outside this repository.
+The [Clef validation report](clef-serving-validation-20261023.md) records successful diagnostic HTTP tests.
+Default host pressure checks can still prevent readiness on the tested machine.
 
 ```sh
 cargo build --release --locked -p apxinf-serving

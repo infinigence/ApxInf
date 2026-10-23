@@ -1,5 +1,7 @@
 # Clef serving 验证记录
 
+本报告保留实现前的审查结果。后续实现与正向 HTTP 结果见[Clef serving 验收](clef-serving-validation-20261023.md)。
+
 日期：2026-10-23。设备为 Apple M4、16 GiB 统一内存。
 本轮验证结果未达到 Clef 在 ApxInf 内的正向 serving 验收。
 参考服务能否启动、ApxInf 是否执行决策头、业务请求是否成功是不同的检查。
