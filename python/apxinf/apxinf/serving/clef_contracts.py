@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any
 
@@ -19,10 +19,14 @@ CHECKPOINT = "mlx-community/clef-flash-4bit"
 CHECKPOINT_REVISION = "b5adbe2c3a95200d4bf04a0727c8ec457157d5e1"
 ADAPTER_REVISION = "apxinf-python-clef-text-v1"
 LOADER_SHA256 = "852223c944819a32fad5cf798d9d1dff30419820eaf5ad1f10cb9698afec97d5"
-SOURCE_FILES = ("clef_worker.py", "clef_runtime.py", "clef_identity.py", "clef_contracts.py", "contracts.py")
+SOURCE_FILES = ("clef_worker.py", "clef_runtime.py", "clef_identity.py", "clef_contracts.py", "contracts.py", "clef_artifacts.json")
 ID = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 TYPE_CODES = {"noul": 0, "choice": 1, "score": 2}
 ContractError = common.ContractError
+
+
+def approved_artifacts() -> list[dict]:
+    return json.loads(Path(__file__).with_name("clef_artifacts.json").read_text(encoding="utf-8"))
 
 
 def require(condition: bool, message: str) -> None:
@@ -332,6 +336,7 @@ def _ready(frame: dict) -> None:
         require(path.name == artifact["path"] and path.suffix in {".json", ".safetensors", ".jinja"}, "invalid artifact name")
         names.append(artifact["path"])
     require(names == sorted(set(names)), "artifacts must be sorted and unique")
+    require(artifacts == approved_artifacts(), "artifacts differ from the approved checkpoint")
     require(frame["model_revision"] == common.canonical_identity_digest("apxinf-model-identity-v1", manifest),
             "model revision mismatch")
     require(frame["capability_revision"] == common.canonical_identity_digest("apxinf-capability-v1", caps),
@@ -344,6 +349,7 @@ def validate_frame(frame: Any) -> None:
     require(frame["protocol"] == PROTOCOL, "unsupported decision protocol")
     common._uuid(frame["worker_epoch"])
     kind = frame["kind"]
+    common._str(kind)
     if kind == "ready":
         _ready(frame)
         return
