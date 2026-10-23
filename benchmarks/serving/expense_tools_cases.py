@@ -1,5 +1,3 @@
-"""Original expense tasks with calculation receipts and ordered tool evidence."""
-
 import hashlib
 import json
 from pathlib import Path
