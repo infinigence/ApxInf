@@ -217,13 +217,28 @@ class ProductionMemoryTests(unittest.TestCase):
 
     def test_missing_or_duplicate_peak_stays_unknown_without_aggregate_substitution(self):
         for changes in ({"omit_peak": True}, {"duplicate_peak": True}):
-            with self.subTest(changes), self.fixture(**changes) as (fixture, plan, args):
+            with self.subTest(changes), self.fixture(cleanup_delay=.15, **changes) as (fixture, plan, args):
                 code, report = self.collect(fixture, plan, args)
                 self.assertEqual(code, 1)
                 result = report["cases"][0]
                 self.assertEqual(result["checks"]["settlement"], "passed")
                 self.assertEqual(result["checks"]["runtime_peak"], "unknown")
                 self.assertIsNone(result["runtime_peak"]["bytes"])
+
+    def test_cleanup_after_settlement_deadline_stays_unknown_and_stops_progression(self):
+        with self.fixture(cleanup_delay=.15) as (fixture, plan, args):
+            plan["limits"]["settlement_timeout_ms"] = 50
+            second = copy.deepcopy(plan["cases"][0])
+            second["case_id"] = "must-not-run"
+            plan["cases"].append(second)
+            code, report = self.collect(fixture, plan, args)
+            self.assertEqual(code, 1)
+            self.assertEqual(fixture.requests, 1)
+            self.assertEqual(report["cases"][0]["checks"]["settlement"], "unknown")
+            self.assertEqual(report["cases"][1]["status"], "skipped")
+            observations = [json.loads(line) for line in (args.output_dir / "observations.jsonl").read_text().splitlines()]
+            self.assertEqual(observations[-1]["values"][probe.GAUGES[3]], 1)
+            self.assertEqual(observations[-1]["values"][probe.COMPLETED], 0)
 
     def test_early_eos_remains_unreached_and_next_settled_case_can_run(self):
         with self.fixture(output_tokens=2) as (fixture, plan, args):
