@@ -19,6 +19,7 @@ pub(crate) enum Semantic {
     /// residual and rounds again. This is deliberately distinct from
     /// [`Self::BiasResidual`], which rounds only the final sum.
     BiasThenResidual,
+    ChannelL2,
 }
 
 impl Semantic {
@@ -33,11 +34,12 @@ impl Semantic {
             Self::AdaGateResidual => 6,
             Self::AdaGateResidualRms => 7,
             Self::BiasThenResidual => 8,
+            Self::ChannelL2 => 9,
         }
     }
 
     fn writes_hidden(self) -> bool {
-        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
+        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms | Self::ChannelL2)
     }
 
     fn writes_normalized(self) -> bool {
@@ -54,7 +56,7 @@ impl Semantic {
     fn reads_weight(self) -> bool {
         matches!(
             self,
-            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
+            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer | Self::ChannelL2
         )
     }
 
@@ -174,6 +176,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Norm column count exceeds the CUDA kernel range"))?;
     let dtype = args.input.dtype();
+    if semantic == Semantic::ChannelL2 && (dtype != DType::BF16 || args.eps < f32::MIN_POSITIVE) {
+        return Err(invalid("ChannelL2 requires BF16 and a positive normal FP32 clamp epsilon"));
+    }
     if semantic == Semantic::BiasThenResidual && dtype != DType::BF16 {
         return Err(invalid(
             "BiasThenResidual is a BF16-only semantic because its intermediate rounding is part of the contract",

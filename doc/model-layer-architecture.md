@@ -69,6 +69,11 @@ independent of VLA `PreparationStatus` and owns no executable resources.
 `VlaRuntime` is the observation-to-action process. It owns continuous action
 generation, stochastic inputs, schedules, and prepared inference contracts that
 do not fit token sampling.
+`initial_latent_shape()` declares supplied-noise geometry independently of
+`action_shape()`. Its default preserves action-matrix noise; joint diffusion
+families override it with the full latent shape. The native binding validates
+that shape without parsing family config. The family runner binds it, precision
+and the sampling schedule to its prepared profile and validates every request.
 
 The contracts may share model-neutral tensor or RNG facilities. They should not
 be unified merely because both accept language or images.
@@ -135,6 +140,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| Cosmos Policy / `VlaRuntime` | `cosmos_policy/`; BF16 LIBERO direct profile, full joint action/future-state/image/value denoising, FP64 solver state and family-owned fixed-profile preparation. [Scope and validation status](cosmos-policy.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |

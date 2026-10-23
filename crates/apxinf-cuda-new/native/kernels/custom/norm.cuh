@@ -66,6 +66,29 @@ __device__ __forceinline__ float block_sum_parallel_unsafe(float value,
 // deliberately keeps a single signature so that mistake cannot recur.
 
 template <class T>
+__global__ void channel_l2_norm(const T* input, const T* weight, T* output,
+                               int rows, int cols, float eps) {
+  __shared__ float scratch[32];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  float sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float x = to_float(input[int64_t(row) * cols + col]);
+    sum = __fadd_rn(sum, __fmul_rn(x, x));
+  }
+  sum = block_sum_parallel_unsafe(sum, scratch);
+  const float norm = to_float(from_float<T>(__fsqrt_rn(sum)));
+  const float denominator = to_float(from_float<T>(fmaxf(norm, eps)));
+  const float scale = __fsqrt_rn(static_cast<float>(cols));
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t offset = int64_t(row) * cols + col;
+    const float divided = to_float(from_float<T>(__fdiv_rn(to_float(input[offset]), denominator)));
+    const float scaled = to_float(from_float<T>(__fmul_rn(divided, scale)));
+    output[offset] = from_float<T>(__fmul_rn(scaled, to_float(weight[col])));
+  }
+}
+
+template <class T>
 __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
                          int cols, float eps) {
   __shared__ float scratch[32];
