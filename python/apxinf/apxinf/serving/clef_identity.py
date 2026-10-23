@@ -124,9 +124,9 @@ def runtime_files(modules: dict[str, Any]) -> dict:
     for index in range(dyld._dyld_image_count()):
         raw = dyld._dyld_get_image_name(index)
         if raw is not None:
-            path = Path(raw.decode()).resolve(strict=True)
+            path = Path(raw.decode())
             if path.suffix == ".dylib" and "libmlx" in path.name:
-                loaded.add(path)
+                loaded.add(path.resolve(strict=True))
     if len(loaded) != 1 or not all(path.is_relative_to(environment) for path in loaded):
         raise ClefError("model_unavailable", "The Clef profile requires one MLX library from the selected environment.")
     return {"modules": records, "libraries": [file_record(path) for path in sorted(loaded)]}

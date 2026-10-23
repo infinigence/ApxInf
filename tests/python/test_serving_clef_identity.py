@@ -6,8 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "python/apxinf/apxinf/serving"
@@ -115,6 +116,20 @@ class ClefIdentityTests(unittest.TestCase):
             with self.assertRaises(identity.ClefError):
                 identity.check_runtime()
             imported.assert_not_called()
+
+    def test_runtime_identity_ignores_nonfile_system_shared_cache_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            library = root / "libmlx.dylib"
+            library.write_bytes(b"original runtime identity fixture")
+            module = root / "module.py"
+            module.write_bytes(b"original module identity fixture")
+            dyld = SimpleNamespace(_dyld_image_count=Mock(return_value=2),
+                _dyld_get_image_name=Mock(side_effect=[b"/nonexistent-system-shared-cache-image", str(library).encode()]))
+            with patch.object(identity.sys, "prefix", str(root)), \
+                 patch.object(identity.ctypes, "CDLL", return_value=dyld):
+                records = identity.runtime_files({"mlx_core": SimpleNamespace(__file__=str(module))})
+            self.assertEqual(records["libraries"], [identity.file_record(library)])
 
     def test_changed_checkpoint_never_imports_device_modules(self):
         with patch.object(identity, "model_artifacts", return_value=([], 128)), \

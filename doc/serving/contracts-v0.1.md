@@ -720,7 +720,8 @@ These measurements retain `apxinf-worker/2.0` and all existing wire fields.
 Service durations start from recorded coordinator events and use its monotonic clock.
 Enqueue time follows HTTP input reading and normalization in the serial profile.
 It does not represent HTTP ingress or client request start.
-The operation label is `generate` or `count_tokens`.
+The operation label is `generate`, `count_tokens`, or `decision`.
+The Clef text profile uses `decision` without token-generation measurements.
 
 | Histogram | Start | End |
 | --- | --- | --- |

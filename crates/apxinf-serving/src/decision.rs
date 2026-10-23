@@ -1,4 +1,3 @@
-//! Typed text decisions, exact encodings, and probability projection.
 use crate::contracts::{self, ContractError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
