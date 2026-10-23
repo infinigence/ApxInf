@@ -4,6 +4,60 @@ These tools contain original, handwritten Python code and fixtures.
 They use Python standard library APIs. They add no runtime dependency.
 HTTP clients accept loopback endpoints only.
 
+## Clef HTTP acceptance
+
+`clef_acceptance.py` checks an existing `python-clef` service with the 4096-token profile.
+It starts no processes and imports no model libraries.
+The caller owns service startup, shutdown, the accelerator lock, and external pressure monitoring.
+
+Prepare an independent registration before the HTTP run.
+Use schema `apxinf-clef-acceptance-registration-v1`.
+The registration contains exactly `schema`, `model`, `model_revision`, `capability_revision`, and `encodings`.
+Pin both revisions to the approved worker identity.
+The `encodings` object contains exactly `outage`, `healthy`, `boundary`, and `overflow`.
+Each entry contains exactly `request_sha256`, `input_tokens`, `input_ids_sha256`, and `source_receipt_sha256`.
+Every digest uses lowercase SHA-256 hexadecimal text.
+Every count uses a positive JSON integer.
+The boundary and overflow counts must equal 4096 and 4097, respectively.
+
+The maintained `cases(model)` function defines the original requests and their serial order.
+Encode each distinct valid request independently with the approved tokenizer and public encoder.
+Retain the input ID arrays and their source receipt outside the registration.
+Hash canonical request bytes with UTF-8, sorted keys, `ensure_ascii=False`, and separators `(',', ':')`.
+Hash the complete input ID array as ASCII JSON with separators `(',', ':')`.
+Hash the retained receipt bytes for `source_receipt_sha256`.
+Add no domain prefix or final newline to the request or array bytes.
+The registration binds requests but cannot prove historical independence or agreement between counts and retained arrays.
+
+```sh
+python3 benchmarks/serving/clef_acceptance.py \
+  --base-url http://127.0.0.1:8080 \
+  --registration /absolute/path/to/registration.json \
+  --output-dir devlocal/clef-acceptance/run-001
+```
+
+Use a new output directory for each run.
+`--request-timeout` bounds each HTTP exchange and defaults to 120 seconds.
+`--settlement-timeout` bounds each joint observation and defaults to 180 seconds.
+Settlement GET requests use the smaller remaining budget.
+Bodies have a 262144-byte limit. Python's HTTP parser also bounds header lines and header counts.
+The client accepts numeric HTTP loopback addresses without DNS resolution.
+
+The nine cases cover invalid streaming, an unknown alias, an image field, outage, healthy state, repetition, context boundary, overflow, and recovery.
+The tool checks all question projections, independent input counts, pinned identities, exact outcome deltas, worker replacement, and resource settlement.
+Score projection checks permit absolute error of at most `1e-12`.
+It stops after the first failure and never retries a POST.
+`report.json` uses atomic checkpoints and retains bounded response bodies in adjacent files.
+`post_attempts` counts dispatch attempts, which might not reach the service.
+Each case records its dispatch state, including uncertain transport failures.
+
+A successful run sets `passed` to `true` and exits with status zero.
+Default qualification requires observed `macos` pressure policy with normal, fresh samples.
+For an explicitly disabled policy, add `--diagnostic-disabled-pressure`.
+A diagnostic pass always leaves `default_pressure_qualified` set to `false`.
+Routing quality and repeated answer equality remain observations.
+The tool does not check independent logits, hidden `noul` probabilities, process reaping, or generation performance.
+
 ## Offline memory calibration
 
 `memory_calibration.py` records raw observations from the pinned local MLX adapter.
