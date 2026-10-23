@@ -117,6 +117,8 @@ The service does not copy its implementation into ApxInf.
 | `pillow` | `12.3.0` |
 
 Python owns the isolated worker process and dependency imports.
+The supervisor launches Clef with `-u -B -X pycache_prefix=/dev/null` before the worker path.
+Normal source imports therefore ignore existing bytecode caches and do not write new caches.
 MLX owns device arrays, softmax, synchronization, and allocator controls.
 MLX-LM loads the text backbone through the external loader's public API.
 Transformers supplies the tokenizer.

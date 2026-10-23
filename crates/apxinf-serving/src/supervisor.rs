@@ -676,7 +676,11 @@ async fn launch_worker_until(
         | WorkerRuntime::PythonMiniCpmVision
         | WorkerRuntime::PythonClef { .. } => {
             let mut command = Command::new(&config.python);
-            command.arg("-u").arg(&config.worker);
+            command.arg("-u");
+            if matches!(config.runtime, WorkerRuntime::PythonClef { .. }) {
+                command.args(["-B", "-X", "pycache_prefix=/dev/null"]);
+            }
+            command.arg(&config.worker);
             command
         }
         WorkerRuntime::NativeMiniCpm5 { executable, .. }
