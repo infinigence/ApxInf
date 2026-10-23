@@ -61,9 +61,11 @@ class ClientCaptureTests(unittest.TestCase):
 pathlib.Path('leader.pid').write_text(str(os.getpid()))
 ''' + body
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            directory = workspace.task
+            directory.mkdir()
             try:
-                result = client.capture_client([sys.executable, "-c", producer], directory,
+                result = client.capture_client([sys.executable, "-c", producer], workspace,
                                                dict(os.environ), timeout, False)
                 pgid = int((directory / "leader.pid").read_text())
                 live = [member for member in group_members(pgid)
@@ -122,11 +124,13 @@ child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'], s
 pathlib.Path('escaped.pid').write_text(str(child.pid))
 '''
         with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            directory = workspace.task
+            directory.mkdir()
             started = time.monotonic()
             try:
                 with self.assertRaisesRegex(RuntimeError, "pipes did not close"):
-                    client.capture_client([sys.executable, "-c", producer], directory,
+                    client.capture_client([sys.executable, "-c", producer], workspace,
                                           dict(os.environ), .2, False)
                 self.assertLess(time.monotonic() - started, 1.5)
                 escaped = int((directory / "escaped.pid").read_text())
@@ -171,9 +175,11 @@ print('{"type":"system","subtype":"init","tools":["Read","Edit"]}', flush=True)
 time.sleep(15)
 '''
         with tempfile.TemporaryDirectory() as temporary:
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            workspace.task.mkdir()
             result = client.capture_client(
                 [sys.executable, "-c", producer, "--tools", "Read,Edit,Write"],
-                Path(temporary), dict(os.environ), 2, False)
+                workspace, dict(os.environ), 2, False)
         self.assertEqual(result.get("tool_inventory", {}).get("missing", []), ["Write"])
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["tool_inventory"]["status"], "mismatch")
@@ -184,9 +190,11 @@ time.sleep(15)
 print('{"type":"result","subtype":"success","is_error":false,"result":"Done."}', flush=True)
 '''
         with tempfile.TemporaryDirectory() as temporary:
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            workspace.task.mkdir()
             result = client.capture_client(
                 [sys.executable, "-c", producer, "--tools", "Read,Edit"],
-                Path(temporary), dict(os.environ), 2, False)
+                workspace, dict(os.environ), 2, False)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["tool_inventory"], {"requested": ["Edit", "Read"],
                          "advertised": ["Edit", "Read"], "missing": [], "status": "verified"})
@@ -197,9 +205,11 @@ print('{"type":"system","subtype":"init","tools":null}', flush=True)
 time.sleep(15)
 '''
         with tempfile.TemporaryDirectory() as temporary:
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            workspace.task.mkdir()
             result = client.capture_client(
                 [sys.executable, "-c", producer, "--tools", "Read"],
-                Path(temporary), dict(os.environ), 2, False)
+                workspace, dict(os.environ), 2, False)
         self.assertEqual(result["tool_inventory"]["status"], "invalid")
         self.assertIsNone(result["tool_inventory"]["advertised"])
         self.assertFalse(result["timed_out"])
@@ -209,9 +219,11 @@ time.sleep(15)
 print('{"type":"system","subtype":"init","tools":["Read"]}', flush=True)
 '''
         with tempfile.TemporaryDirectory() as temporary:
+            workspace = client.TaskWorkspace.create(Path(temporary) / "attempt")
+            workspace.task.mkdir()
             result = client.capture_client(
                 [sys.executable, "-c", producer, "--tools", "Read"],
-                Path(temporary), dict(os.environ), 2, False)
+                workspace, dict(os.environ), 2, False)
         self.assertEqual(result["tool_inventory"]["status"], "invalid")
         self.assertIn("before advertising", " ".join(result["diagnostics"]))
 
@@ -224,24 +236,31 @@ while not pathlib.Path('release-producer').exists():
     time.sleep(0.01)
 '''
         with tempfile.TemporaryDirectory() as temporary, ThreadPoolExecutor(max_workers=1) as executor:
-            directory = Path(temporary)
+            attempts = (Path(temporary) / "tasks").resolve()
+            workspace = client.TaskWorkspace.create(attempts / "attempt")
+            directory = workspace.task
+            directory.mkdir()
             future = executor.submit(client.capture_client, [sys.executable, "-c", producer],
-                                     directory, dict(os.environ), 15, False)
+                                     workspace, dict(os.environ), 15, False)
             try:
                 deadline = time.monotonic() + 5
-                stdout = directory / "client.stdout.jsonl"
-                stderr = directory / "client.stderr.txt"
+                stdout = workspace.stdout
+                stderr = workspace.stderr
                 while time.monotonic() < deadline:
                     if ((directory / "producer-ready").exists() and stdout.read_bytes() and stderr.read_bytes()):
                         break
                     time.sleep(.01)
                 self.assertFalse(future.done())
-                identity = json.loads((directory / "client.process.json").read_text())
+                self.assertEqual(list(attempts.glob("*/client.process.json")), [workspace.process])
+                identity = json.loads(workspace.process.read_text())
                 self.assertGreater(identity["pid"], 0)
                 self.assertEqual(identity["pgid"], identity["pid"])
                 self.assertEqual(os.getpgid(identity["pid"]), identity["pgid"])
                 self.assertIn(b'"capture_probe"', stdout.read_bytes())
                 self.assertEqual(stderr.read_text(), "capture stderr probe\n")
+                for path in (stdout, stderr, workspace.process, workspace.config):
+                    self.assertFalse(path.is_relative_to(directory), str(path))
+                self.assertEqual(set(path.name for path in directory.iterdir()), {"producer-ready"})
             finally:
                 (directory / "release-producer").touch()
                 result = future.result(timeout=5)
@@ -249,9 +268,26 @@ while not pathlib.Path('release-producer').exists():
             self.assertEqual(result["pid"], identity["pid"])
             self.assertEqual(result["pgid"], identity["pgid"])
             self.assertEqual(result["events"][0]["event"]["subtype"], "capture_probe")
+            self.assertEqual(result["environment_revision"], "task-workspace-v2")
+            self.assertEqual(result["attempt_directory"], str(workspace.root))
 
 
 class TaskWorkspaceTests(unittest.TestCase):
+    def test_attempt_reservation_preserves_evidence_and_separates_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            first = client.TaskWorkspace.create(directory / "first")
+            self.assertTrue(first.root.is_absolute())
+            self.assertFalse(first.task.exists())
+            first.stdout.write_bytes(b"original capture\n")
+            with self.assertRaises(FileExistsError):
+                client.TaskWorkspace.create(first.root)
+            self.assertEqual(first.stdout.read_bytes(), b"original capture\n")
+            second = client.TaskWorkspace.create(directory / "second")
+            self.assertNotEqual(first.config, second.config)
+            self.assertTrue(first.config.is_dir())
+            self.assertTrue(second.config.is_dir())
+
     def test_run_exposes_only_case_files_in_client_working_directory(self):
         producer = '''import json, os, pathlib, sys
 print(json.dumps({"type": "system", "subtype": "init", "tools": ["Read", "Edit", "Bash"]}), flush=True)
@@ -276,8 +312,10 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                     patch.object(client, "metrics_snapshot", return_value={"values": {}}):
                 self.assertEqual(client.run(args), 1)
             report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["environment_revision"], "task-workspace-v2")
             self.assertEqual(len(report["tasks"]), 1)
             record = report["tasks"][0]
+            self.assertEqual(record["environment_revision"], "task-workspace-v2")
             self.assertEqual(record["exit_code"], 0)
             self.assertFalse(record["timed_out"])
             self.assertFalse(record["passed"])
@@ -286,10 +324,15 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
             observation = json.loads(record["result"]["result"])
             workspace = Path(observation["cwd"])
             self.assertEqual(workspace, Path(record["directory"]))
+            attempt = Path(record["attempt_directory"])
+            self.assertEqual(workspace, attempt / "task")
+            self.assertTrue(attempt.is_absolute())
             config = Path(observation["config_dir"])
             self.assertTrue(config.is_dir())
             for field in ("stdout_path", "stderr_path", "process_path"):
                 self.assertTrue(Path(record[field]).is_file(), record[field])
+                self.assertEqual(Path(record[field]).parent, attempt)
+            self.assertEqual(config, attempt / "client-config")
             self.assertEqual(Path(record["stderr_path"]).read_text(), "workspace probe stderr\n")
             identity = json.loads(Path(record["process_path"]).read_text())
             self.assertEqual(identity, {"pid": record["pid"], "pgid": record["pgid"]})
