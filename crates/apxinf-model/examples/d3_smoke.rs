@@ -16,17 +16,22 @@ fn print_output(
     label: &str,
     output: apxinf_model::DecisionOutput,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let output = output.into_single()?;
     let selected = output.selected()?;
     println!(
         "{label} selected={} token_id={} probability={:.8}",
-        selected.code, selected.token_id, selected.probability
+        selected.code,
+        selected.token_id.ok_or("d3 code has no token")?,
+        selected.probability
     );
     let mut top = output.scores;
     top.sort_by(|left, right| right.probability.total_cmp(&left.probability));
     for score in top.into_iter().take(5) {
         println!(
             "  {} token_id={} probability={:.8}",
-            score.code, score.token_id, score.probability
+            score.code,
+            score.token_id.ok_or("d3 code has no token")?,
+            score.probability
         );
     }
     Ok(())
