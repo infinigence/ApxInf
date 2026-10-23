@@ -317,6 +317,48 @@ An expired request remains a failed sample, including when content arrived befor
 
 ## Claude Code tasks
 
+The `expenses` and `meeting-actions` tasks measure bounded daily file work.
+Both tasks permit only `Read` and `Edit`.
+Each task creates original input files and an empty JSON output file.
+The prompt defines the schema and rules, but does not contain the expected answers.
+The task specification retains original input bytes, SHA-256 digests, an output limit, and a task revision.
+
+The `expenses-v1` input contains dated CSV transactions and expense rules.
+Include only posted CNY transactions in the listed categories.
+Include refunds as negative amounts. Exclude other currencies, pending rows, and unlisted categories.
+Convert decimal amounts to integer cents without rounding.
+The output file is `expenses.json` with exactly these fields:
+
+- `currency` is the string `CNY`.
+- `included_rows` contains included transaction IDs in source order.
+- `category_totals_cents` maps each listed category to its integer total.
+- `total_cents` is the integer sum across categories.
+
+The `meeting-actions-v1` input contains original meeting notes and extraction rules.
+Extract explicit actions and decisions in source order.
+Exclude suggestions and discussion without an explicit action.
+Use JSON null for an absent owner or due date.
+The output file is `meeting-actions.json` with exactly these fields:
+
+- `meeting_date` is the ISO date from the notes.
+- `actions` contains objects with exactly `task`, `owner`, and `due_date`.
+- `decisions` contains explicit decision strings.
+
+Both outputs must contain one strict JSON object within 8192 bytes.
+Duplicate fields, unknown fields, nonfinite numbers, and incorrect value types fail validation.
+The checker compares the complete structured result with independent, handwritten expectations.
+The checker never executes model output.
+
+A pass requires the actual initial tool inventory and a successful final client result.
+The client must exit with code zero without timeout or cancellation.
+Every input requires a successful `Read` before a successful output `Edit`.
+Tool IDs must be unique. Assistant messages contain calls. User messages contain results.
+All tool paths must resolve to an input or the fixed output.
+Every tool result must indicate success. Every input must retain its original bytes.
+The output must be a bounded regular file without a symbolic link.
+The report separates `tool_cycle_passed`, `inputs_unchanged`, `artifact_check`, `observed_input_usage`, and `passed`.
+These checks establish exact fixture completion, not general financial or meeting analysis quality.
+
 Run the three small tasks after service readiness:
 
 ```sh

@@ -18,6 +18,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from http_benchmark import local_url, metal_measurement_lock, metrics_snapshot, request_json
+import practical_cases
 
 
 PELICAN_TITLE = "Pelican Riding a Bicycle"
@@ -71,6 +72,8 @@ def context_compatibility_version(executable, server_context, client_context):
 
 def prepare_task(name, directory):
     directory.mkdir(parents=True, exist_ok=False)
+    if name in practical_cases.CASES:
+        return practical_cases.prepare(name, directory)
     if name == "read":
         marker = "APXINF_" + uuid.uuid4().hex
         (directory / "marker.txt").write_text(marker + "\n")
@@ -378,6 +381,8 @@ def capture_client(command, directory, environment, timeout, cancel_after_conten
 
 def task_outcome(name, spec, directory, capture):
     tools, results, final = inspect_events(capture["events"])
+    if name in practical_cases.CASES:
+        return {**practical_cases.outcome(spec, directory, capture), "tool_calls": tools, "tool_results": results}
     names = {tool["name"] for tool in tools}
     inventory_ok = "tool_inventory" not in capture or (
         isinstance(capture["tool_inventory"], dict) and
@@ -512,7 +517,7 @@ def parser():
     result.add_argument("--base-url", default="http://127.0.0.1:8080")
     result.add_argument("--model")
     result.add_argument("--claude", type=Path, default=Path("/opt/homebrew/bin/claude"))
-    result.add_argument("--tasks", nargs="+", choices=("read", "edit", "check", "cancel", "pelican"),
+    result.add_argument("--tasks", nargs="+", choices=("read", "edit", "check", "cancel", "pelican", "expenses", "meeting-actions"),
                         default=["read", "edit", "check"])
     result.add_argument("--repeats", type=int, default=1)
     result.add_argument("--timeout", type=float, default=180)
