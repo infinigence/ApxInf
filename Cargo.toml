@@ -9,6 +9,7 @@ members = [
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
     "crates/apxinf-py",
+    "crates/apxinf-serving",
 ]
 
 [package]
