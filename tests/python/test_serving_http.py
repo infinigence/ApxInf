@@ -224,6 +224,11 @@ class AccountingTests(unittest.TestCase):
 
 
 class ClientTaskTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = client.TaskWorkspace.create(Path(temporary.name) / "attempt")
+
     def test_ui_event_string_is_not_a_model_delta(self):
         self.assertFalse(client.has_content_delta({"type": "system", "subtype": "ui_invalidate", "event": "ui.render"}))
         self.assertTrue(client.has_content_delta({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "Original"}}}))
@@ -231,29 +236,30 @@ class ClientTaskTests(unittest.TestCase):
     def test_environment_does_not_inherit_credentials_or_proxy(self):
         with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "secret-test", "HTTP_PROXY": "proxy-test",
                                     "CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE": "999999"}):
-            environment = client.client_environment("http://127.0.0.1:8080", "local", Path("/tmp/config-test"))
+            environment = client.client_environment("http://127.0.0.1:8080", "local", self.workspace)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", environment)
         self.assertNotIn("HTTP_PROXY", environment)
         self.assertNotIn("CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE", environment)
         self.assertEqual(environment["CLAUDE_CODE_DISABLE_THINKING"], "1")
         self.assertEqual(environment["ANTHROPIC_API_KEY"], "apxinf-local-test-only")
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.workspace.config))
 
     def test_context_and_output_controls_use_documented_environment_keys(self):
-        environment = client.client_environment("http://127.0.0.1:8080", "apxinf-local", Path("/tmp/config-test"), 2048, 16384)
+        environment = client.client_environment("http://127.0.0.1:8080", "apxinf-local", self.workspace, 2048, 16384)
         self.assertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "16384")
         self.assertEqual(environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "2048")
         self.assertEqual(environment["DISABLE_AUTO_COMPACT"], "1")
         self.assertNotIn("DISABLE_COMPACT", environment)
 
     def test_context_compatibility_preserves_actual_window_and_output_allowance(self):
-        environment = client.client_environment("http://127.0.0.1:8080", "local", Path("/tmp/config-test"),
+        environment = client.client_environment("http://127.0.0.1:8080", "local", self.workspace,
                                                 8192, 16384, acceptance_context_compat=True)
         self.assertEqual(environment["CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE"], "16384")
         self.assertEqual(environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "16384")
         self.assertEqual(environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
         for context in (None, True, 0, -1, "16384"):
             with self.subTest(context=context), self.assertRaises(ValueError):
-                client.client_environment("http://127.0.0.1:8080", "local", Path("/tmp/config-test"),
+                client.client_environment("http://127.0.0.1:8080", "local", self.workspace,
                                           8192, context, acceptance_context_compat=True)
 
     def test_context_compatibility_requires_verified_limits_and_exact_client_version(self):

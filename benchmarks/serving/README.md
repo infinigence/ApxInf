@@ -488,7 +488,12 @@ Run this experiment without other requests to make the counter evidence attribut
 
 The report separates CLI elapsed time from HTTP latency.
 CLI time includes process startup, prompt construction, model requests, and tool execution.
-Each task directory retains client output, client errors, fixture files, and an isolated configuration directory.
+Each attempt directory contains a `task` child, which holds case files and serves as the client's working directory.
+Client output, client errors, `client.process.json`, and `client-config` remain beside that child.
+The existing `tasks/*/client.process.json` pattern still finds live process markers.
+The report and each capture record use `environment_revision` value `task-workspace-v2`.
+Each record identifies the attempt root in `attempt_directory` and the actual working directory in `directory`.
+Explicit capture paths identify the evidence files.
 The harness preserves failed results. It does not replace them with expected output.
 
 ## Lifecycle checks
