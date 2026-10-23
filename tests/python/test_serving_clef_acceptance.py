@@ -204,7 +204,14 @@ class ClefAcceptanceTests(unittest.TestCase):
 
     def test_nine_real_http_cases_require_joint_settlement(self):
         fixture = ServiceFixture(delay=True)
-        result = self.run_fixture(fixture)
+        fsync = a.os.fsync
+
+        def slow_evidence_write(descriptor):
+            time.sleep(0.035)
+            return fsync(descriptor)
+
+        with patch.object(a.os, "fsync", side_effect=slow_evidence_write):
+            result = self.run_fixture(fixture)
         self.assertTrue(result["passed"], result["error"])
         self.assertTrue(result["default_pressure_qualified"])
         self.assertEqual(fixture.posts, [case.body for case in a.cases("clef-flash")])
