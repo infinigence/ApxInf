@@ -1,5 +1,3 @@
-"""Calculate a bounded expense selection from fixed local files."""
-
 from __future__ import annotations
 
 import csv
