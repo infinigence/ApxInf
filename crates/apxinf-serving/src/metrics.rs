@@ -12,7 +12,7 @@ const BOUNDS_MS: [u64; 19] = [
     1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 30000, 60000, 120000, 300000,
     600000, 3600000,
 ];
-const OPERATIONS: [&str; 2] = ["generate", "count_tokens"];
+const OPERATIONS: [&str; 3] = ["generate", "count_tokens", "decision"];
 const STATUSES: [&str; 4] = ["completed", "cancelled", "failed", "expired"];
 
 #[derive(Clone, Copy)]
@@ -209,6 +209,13 @@ pub(crate) struct RequestObservation {
 }
 
 impl RequestObservation {
+    pub(crate) fn decision(ingress: Instant) -> Self {
+        Self {
+            ingress,
+            operation: 2,
+            state: Mutex::new(RequestState::default()),
+        }
+    }
     pub(crate) fn new(ingress: Instant, count_only: bool) -> Self {
         Self {
             ingress,

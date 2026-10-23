@@ -4,13 +4,21 @@ use serde_json::json;
 
 pub const PROTOCOL: &str = "apxinf-worker/2.6";
 pub const LOADER_SHA256: &str = "852223c944819a32fad5cf798d9d1dff30419820eaf5ad1f10cb9698afec97d5";
-pub const SOURCE_NAMES: [&str; 5] = [
+pub const SOURCE_NAMES: [&str; 6] = [
     "clef_worker.py",
     "clef_runtime.py",
     "clef_identity.py",
     "clef_contracts.py",
     "contracts.py",
+    "clef_artifacts.json",
 ];
+
+pub fn approved_artifacts() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../../python/apxinf/apxinf/serving/clef_artifacts.json"
+    ))
+    .expect("The committed Clef artifact pins must be valid JSON.")
+}
 
 fn file_record(value: &Value) -> Result<()> {
     fields(value, &[], &["path", "sha256"], &[])?;
@@ -118,6 +126,10 @@ pub fn validate_ready(frame: &Value) -> Result<()> {
         file_record(record)?;
     }
     let mut previous = "";
+    require(
+        manifest["artifacts"] == approved_artifacts(),
+        "Clef checkpoint artifacts differ from approved pins",
+    )?;
     for artifact in array(&manifest["artifacts"], 1, 1024)? {
         fields(artifact, &[], &["path", "size_bytes", "sha256"], &[])?;
         let path = string(&artifact["path"])?;

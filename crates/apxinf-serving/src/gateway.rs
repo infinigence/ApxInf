@@ -1,3 +1,4 @@
+mod decision;
 mod vision;
 use crate::{
     output::{anthropic_blocks, Part},
@@ -62,6 +63,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/systemone", post(decision::systemone))
         .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(1_000_000))
         .with_state(service)
@@ -90,6 +92,9 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
         body["public_capabilities"]["media_limits"] =
             service.ready["capabilities"]["media_limits"].clone();
     }
+    if service.decision_enabled() {
+        body["public_capabilities"] = json!({"workload":"decision","systemone":true,"text":true,"noul":true,"choice":true,"score":true,"images":false,"streaming":false,"token_events":false,"kv_reuse":false,"max_context":service.ready["capabilities"]["max_context"],"max_output_tokens":0,"max_active_requests":1,"cancel_granularity":"process_exit","sessions":false,"batching":false,"prompt_cache":false,"anthropic_messages":false,"openai_chat_completions":false,"count_tokens":false,"state_schema":"none"});
+    }
     if service.model_thinking() {
         body["public_capabilities"]["model_thinking"] = json!("initial_hidden");
     }
@@ -100,7 +105,9 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
 }
 
 fn public_profile(service: &Service) -> &'static str {
-    if service.image_enabled() {
+    if service.decision_enabled() {
+        "apxinf-clef-text-v0.1"
+    } else if service.image_enabled() {
         "apxinf-minicpm-vision-v0.1"
     } else if service.bounded_thinking() {
         "apxinf-native-bounded-thinking-v0.1"
@@ -161,6 +168,13 @@ async fn handle(
     api: Api,
     count_only: bool,
 ) -> Result<Response, ApiError> {
+    if service.decision_enabled() {
+        return Err(ApiError::new(
+            400,
+            "unsupported_feature",
+            "The selected Clef provider supports only /v1/systemone.",
+        ));
+    }
     let value = crate::contracts::parse_document(&body)
         .map_err(|e| ApiError::invalid(format!("The request is not valid JSON: {e}")))?;
     let (request, stream) = normalize(&value, api, count_only, &service)?;
@@ -213,6 +227,13 @@ async fn handle(
         let mut parts = Vec::new();
         while let Some(event) = receiver.recv().await {
             match event {
+                ModelEvent::Decision(_) => {
+                    return Err(ApiError::new(
+                        500,
+                        "protocol_fault",
+                        "A text request received a decision result.",
+                    ))
+                }
                 ModelEvent::Part(part) => parts.push(part),
                 ModelEvent::Error(error) => return Err(error),
                 ModelEvent::Done {
@@ -512,7 +533,11 @@ fn normalize(
             )?;
             let mut message = message.clone();
             if service.image_enabled() && message["content"].is_array() {
-                return Err(ApiError::new(400, "unsupported_feature", "OpenAI image inputs are unsupported."));
+                return Err(ApiError::new(
+                    400,
+                    "unsupported_feature",
+                    "OpenAI image inputs are unsupported.",
+                ));
             }
             if message["content"].is_null() && message.get("tool_calls").is_some() {
                 message["content"] = json!("");
@@ -769,6 +794,11 @@ impl PublicStream {
     }
     fn accept(&mut self, event: ModelEvent) {
         match event {
+            ModelEvent::Decision(_) => self.accept(ModelEvent::Error(ApiError::new(
+                500,
+                "protocol_fault",
+                "A text stream received a decision result.",
+            ))),
             ModelEvent::Part(Part::Text(text)) => {
                 if !text.is_empty() {
                     if self.api == Api::OpenAi {
