@@ -1,6 +1,6 @@
 //! Real-checkpoint lifecycle checks, separate from numerical qualification.
 use super::{config::Config, weights::Weights, MiniCpm5, Variant};
-use crate::{LlmTrait, TextPreparationState};
+use crate::{LlmInput, LlmTrait, TextPreparationState};
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_mlx::{clear_cache, memory_stats, MlxBackend};
 use serde::Deserialize;
@@ -52,6 +52,40 @@ fn full_forward(model: &mut MiniCpm5, case: &ReplayCase) -> Result<Tensor> {
         case.id
     );
     Ok(output)
+}
+
+#[test]
+#[ignore = "requires official MiniCPM checkpoint and exclusive shared Metal locks"]
+fn real_checkpoint_long_chunk_and_bucket_boundary() -> Result<()> {
+    let checkpoint = PathBuf::from(
+        env::var_os("APXINF_MINICPM_CHECKPOINT")
+            .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?,
+    );
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) =
+        apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+    model.prepare(3, 1)?;
+    let short = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+    let expected = digest(&backend, &short)?;
+    model.reset();
+    model.prepare(4351, 2)?;
+    assert_eq!(model.preparation_status().kv_capacity, Some(4608));
+    model.prefill(LlmInput::text(&vec![7; 4351]))?;
+    let traces = backend.stream().counters().trace_callbacks;
+    model.forward(&[2], 4351)?;
+    model.forward(&[3], 4352)?;
+    assert_eq!(backend.stream().counters().trace_callbacks, traces);
+    assert!(model.forward(&[3], 4608).is_err());
+    model.reset();
+    model.prepare(3, 1)?;
+    assert_eq!(model.preparation_status().kv_capacity, Some(256));
+    let repeated = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+    assert_eq!(digest(&backend, &repeated)?, expected);
+    assert_eq!(digest(&backend, &short)?, expected);
+    Ok(())
 }
 
 /// Run only this test in an isolated process under the shared Metal lock:
