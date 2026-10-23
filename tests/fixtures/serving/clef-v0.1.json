@@ -1,0 +1,200 @@
+{
+  "protocol": "apxinf-worker/2.6",
+  "profile": "apxinf-clef-text-v0.1",
+  "objects": {
+    "request": {
+      "model": "local-clef",
+      "state": "The sample has three labels and a warm color.",
+      "questions": {
+        "warm": {"type": "noul", "instructions": "Is the color warm?"},
+        "grade": {"type": "score", "instructions": "Rate the label count.", "criteria": ["None", "Some", "Many"]},
+        "color": {"type": "choice", "instructions": "Select the color.", "criteria": {"red": "A red sample", "blue": "A blue sample"}}
+      }
+    },
+    "record": {
+      "state": "The sample has three labels and a warm color.",
+      "questions": {
+        "color": {"type": "choice", "instructions": "Select the color.", "criteria": {"blue": "A blue sample", "red": "A red sample"}},
+        "grade": {"type": "score", "instructions": "Rate the label count.", "criteria": ["None", "Some", "Many"]},
+        "warm": {"type": "noul", "instructions": "Is the color warm?"}
+      }
+    },
+    "encoding": {
+      "input_ids": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+      "questions": [
+        {"question_id": "color", "question_type": 1, "question_span": [0, 1], "option_spans": [[1, 2], [2, 3]], "option_ids": ["blue", "red"]},
+        {"question_id": "grade", "question_type": 2, "question_span": [3, 4], "option_spans": [[4, 5], [5, 6], [6, 7]], "option_ids": ["0", "1", "2"]},
+        {"question_id": "warm", "question_type": 0, "question_span": [7, 8], "option_spans": [[8, 9], [9, 10]], "option_ids": ["true", "false"]}
+      ]
+    },
+    "probabilities": [
+      {"question_id": "color", "option_ids": ["blue", "red"], "values": [0.2, 0.8]},
+      {"question_id": "grade", "option_ids": ["0", "1", "2"], "values": [0.125, 0.25, 0.625]},
+      {"question_id": "warm", "option_ids": ["true", "false"], "values": [0.87654321, 0.12345679]}
+    ],
+    "response": {
+      "model": "local-clef",
+      "answers": {
+        "color": {"type": "choice", "choice": "red", "confidence": 0.8, "probabilities": {"blue": 0.2, "red": 0.8}},
+        "grade": {"type": "score", "score": 1.5, "confidence": 0.625, "legend": {"0": "None", "1": "Some", "2": "Many"}, "probabilities": {"0": 0.125, "1": 0.25, "2": 0.625}},
+        "warm": {"type": "noul", "noul": 0.87654321}
+      },
+      "usage": {"input_tokens": 12, "output_tokens": 0}
+    },
+    "runtime": {"python": "3.12.10", "mlx": "0.32.3", "mlx_lm": "0.32.0", "transformers": "5.19.0", "numpy": "2.5.4", "pillow": "12.3.0"},
+    "capabilities": {
+      "workload": "decision", "text": true, "noul": true, "choice": true, "score": true,
+      "image": false, "streaming": false, "token_events": false, "kv_reuse": false,
+      "state_schema": "none", "max_active_requests": 1, "vocab_size": 248320, "max_context": 4096,
+      "max_output_tokens": 0, "cancel_granularity": "process_exit"
+    },
+    "preparation_identity": {
+      "worker_epoch": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d",
+      "preparation_id": "00000000-0000-4000-8000-000000000003",
+      "record_digest": "6021e7de8843682bef1fcf101e7ea5d4aec6b0afa6c5bce722557d42832f42c6", "encoding_digest": "e49b4f0259b28b2cdd89b4028b83345bd8006cd0c3e7b2447b30992114db442c"
+    },
+    "preparation": {
+      "worker_epoch": "00000000-0000-4000-8000-000000000001",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d",
+      "preparation_id": "00000000-0000-4000-8000-000000000003",
+      "record": {"$ref": "objects.record"}, "encoding": {"$ref": "objects.encoding"},
+      "effective_input_tokens": 12,
+      "record_digest": "6021e7de8843682bef1fcf101e7ea5d4aec6b0afa6c5bce722557d42832f42c6", "encoding_digest": "e49b4f0259b28b2cdd89b4028b83345bd8006cd0c3e7b2447b30992114db442c",
+      "preparation_digest": "834707962e4316c3ede6c51475899ed5c8327da59e20f614770774b00dd795f1"
+    }
+  },
+  "requests": [
+    {"name": "all_three_types", "template": "request", "valid": true, "canonical": {"$ref": "objects.record"}},
+    {"name": "explicit_noul_descriptions", "template": "request", "set": {"/questions/warm/criteria": {"false": "No warm color", "true": "A warm color"}}, "valid": true},
+    {"name": "empty_text_state", "template": "request", "set": {"/state": ""}, "valid": true},
+    {"name": "unknown_request_key", "template": "request", "set": {"/stream": false}, "valid": false},
+    {"name": "unknown_question_key", "template": "request", "set": {"/questions/warm/temperature": 0}, "valid": false},
+    {"name": "structured_state", "template": "request", "set": {"/state": {"text": "warm"}}, "valid": false},
+    {"name": "missing_instructions", "template": "request", "remove": ["/questions/warm/instructions"], "valid": false},
+    {"name": "empty_instruction", "template": "request", "set": {"/questions/warm/instructions": ""}, "valid": false},
+    {"name": "unknown_question_type", "template": "request", "set": {"/questions/warm/type": "boolean"}, "valid": false},
+    {"name": "incomplete_noul", "template": "request", "set": {"/questions/warm/criteria": {"true": "Yes"}}, "valid": false},
+    {"name": "one_choice", "template": "request", "set": {"/questions/color/criteria": {"red": "Red"}}, "valid": false},
+    {"name": "unsafe_option_id", "template": "request", "set": {"/questions/color/criteria": {"red/blue": "Both", "none": "Neither"}}, "valid": false},
+    {"name": "score_object", "template": "request", "set": {"/questions/grade/criteria": {"0": "None", "1": "Some"}}, "valid": false},
+    {"name": "null_description", "template": "request", "set": {"/questions/grade/criteria": ["None", null]}, "valid": false},
+    {"name": "duplicate_top_key", "raw": "{\"model\":\"a\",\"model\":\"b\",\"state\":\"x\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"Yes?\"}}}", "valid": false},
+    {"name": "duplicate_question_id", "raw": "{\"model\":\"a\",\"state\":\"x\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"A?\"},\"q\":{\"type\":\"noul\",\"instructions\":\"B?\"}}}", "valid": false},
+    {"name": "unsafe_integer_literal", "raw": "{\"model\":\"a\",\"state\":9007199254740992,\"questions\":{}}", "valid": false},
+    {"name": "nan_literal", "raw": "{\"model\":\"a\",\"state\":NaN,\"questions\":{}}", "valid": false},
+    {"name": "infinity_literal", "raw": "{\"model\":\"a\",\"state\":Infinity,\"questions\":{}}", "valid": false},
+    {"name": "overflow_float_literal", "raw": "{\"model\":\"a\",\"state\":1e9999,\"questions\":{}}", "valid": false}
+  ],
+  "encodings": [
+    {"name": "valid_three_types", "template": "encoding", "valid": true},
+    {"name": "out_of_bounds_span", "template": "encoding", "set": {"/questions/2/option_spans/1": [9, 13]}, "valid": false},
+    {"name": "empty_span", "template": "encoding", "set": {"/questions/0/question_span": [0, 0]}, "valid": false},
+    {"name": "overlapping_option", "template": "encoding", "set": {"/questions/0/option_spans/1": [1, 3]}, "valid": false},
+    {"name": "wrong_type_code", "template": "encoding", "set": {"/questions/2/question_type": 1}, "valid": false},
+    {"name": "wrong_choice_order", "template": "encoding", "set": {"/questions/0/option_ids": ["red", "blue"]}, "valid": false},
+    {"name": "wrong_noul_order", "template": "encoding", "set": {"/questions/2/option_ids": ["false", "true"]}, "valid": false},
+    {"name": "wrong_score_order", "template": "encoding", "set": {"/questions/1/option_ids": ["0", "2", "1"]}, "valid": false},
+    {"name": "boolean_token", "template": "encoding", "set": {"/input_ids/0": true}, "valid": false},
+    {"name": "missing_question", "template": "encoding", "remove": ["/questions/2"], "valid": false}
+  ],
+  "probabilities": [
+    {"name": "full_precision_projection", "template": "probabilities", "valid": true, "response": {"$ref": "objects.response"}},
+    {"name": "choice_exact_tie", "template": "probabilities", "set": {"/0/values": [0.5, 0.5]}, "valid": true, "choice": "blue"},
+    {"name": "within_sum_tolerance", "template": "probabilities", "set": {"/0/values": [0.2, 0.800009]}, "valid": true},
+    {"name": "outside_sum_tolerance", "template": "probabilities", "set": {"/0/values": [0.2, 0.80002]}, "valid": false},
+    {"name": "negative_probability", "template": "probabilities", "set": {"/0/values": [-0.1, 1.1]}, "valid": false},
+    {"name": "wrong_cardinality", "template": "probabilities", "set": {"/0/values": [1.0]}, "valid": false},
+    {"name": "wrong_question_order", "template": "probabilities", "set": {"/0/question_id": "grade"}, "valid": false},
+    {"name": "wrong_option_order", "template": "probabilities", "set": {"/0/option_ids": ["red", "blue"]}, "valid": false},
+    {"name": "boolean_probability", "template": "probabilities", "set": {"/0/values": [true, 0]}, "valid": false},
+    {"name": "nonfinite_probability", "raw": "[{\"question_id\":\"color\",\"option_ids\":[\"blue\",\"red\"],\"values\":[NaN,0]}]", "valid": false}
+  ],
+  "digests": [
+    {"name": "record", "domain": "apxinf-clef-record-v1", "document": {"$ref": "objects.record"}, "expected": "6021e7de8843682bef1fcf101e7ea5d4aec6b0afa6c5bce722557d42832f42c6"},
+    {"name": "encoding", "domain": "apxinf-clef-encoding-v1", "document": {"$ref": "objects.encoding"}, "expected": "e49b4f0259b28b2cdd89b4028b83345bd8006cd0c3e7b2447b30992114db442c"},
+    {"name": "capability", "domain": "apxinf-capability-v1", "document": {"$ref": "objects.capabilities"}, "expected": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d"},
+    {"name": "preparation", "domain": "apxinf-clef-preparation-v1", "document": {"$ref": "objects.preparation_identity"}, "expected": "834707962e4316c3ede6c51475899ed5c8327da59e20f614770774b00dd795f1"}
+  ],
+  "frames": {
+    "prepare": {
+      "protocol": "apxinf-worker/2.6", "kind": "prepare_decision",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000003",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d",
+      "record": {"$ref": "objects.record"}
+    },
+    "prepared": {
+      "protocol": "apxinf-worker/2.6", "kind": "prepared_decision",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000003",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d",
+      "preparation": {"$ref": "objects.preparation"}
+    },
+    "submit": {
+      "protocol": "apxinf-worker/2.6", "kind": "submit_decision",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000004",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d",
+      "preparation": {"$ref": "objects.preparation"}, "capacity_lease_ids": ["00000000-0000-4000-8000-000000000005"]
+    },
+    "accepted": {
+      "protocol": "apxinf-worker/2.6", "kind": "accepted",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000004",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1, "event_seq": 0,
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "capability_revision": "eef701f209d40d196d262b844951f0d7344071c970208e3980e8d46c8e02494d"
+    },
+    "result": {
+      "protocol": "apxinf-worker/2.6", "kind": "decision_result",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000004",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1, "event_seq": 1,
+      "preparation_digest": "834707962e4316c3ede6c51475899ed5c8327da59e20f614770774b00dd795f1", "probabilities": {"$ref": "objects.probabilities"},
+      "usage": {"input_tokens": 12, "output_tokens": 0}, "metrics": {"elapsed_ms": 12, "peak_device_bytes": 7000000000}
+    },
+    "failure": {
+      "protocol": "apxinf-worker/2.6", "kind": "failure",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000004",
+      "request_id": "00000000-0000-4000-8000-000000000002", "attempt": 1, "event_seq": 1,
+      "code": "worker_lost", "message": "The decision operation failed."
+    },
+    "shutdown": {
+      "protocol": "apxinf-worker/2.6", "kind": "shutdown",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000006"
+    },
+    "drained": {
+      "protocol": "apxinf-worker/2.6", "kind": "drained",
+      "worker_epoch": "00000000-0000-4000-8000-000000000001", "command_id": "00000000-0000-4000-8000-000000000004", "reason": "attempt_complete"
+    }
+  },
+  "frame_checks": [
+    {"name": "valid_preparation", "template": "prepared", "valid": true},
+    {"name": "record_digest_mismatch", "template": "prepared", "set": {"/preparation/record/state": "Changed"}, "valid": false},
+    {"name": "encoding_digest_mismatch", "template": "prepared", "set": {"/preparation/encoding/input_ids/0": 99}, "valid": false},
+    {"name": "preparation_digest_mismatch", "template": "prepared", "set": {"/preparation/preparation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "valid": false},
+    {"name": "count_mismatch", "template": "prepared", "set": {"/preparation/effective_input_tokens": 11}, "valid": false},
+    {"name": "preparation_epoch_mismatch", "template": "prepared", "set": {"/preparation/worker_epoch": "00000000-0000-4000-8000-000000000009"}, "valid": false},
+    {"name": "boolean_attempt", "template": "submit", "set": {"/attempt": true}, "valid": false},
+    {"name": "generated_output_usage", "template": "result", "set": {"/usage/output_tokens": 1}, "valid": false},
+    {"name": "text_token_event", "template": "accepted", "set": {"/kind": "tokens"}, "valid": false}
+  ],
+  "streams": [
+    {"name": "success_requires_reap", "events": ["prepared", "submit", "accepted", "result", "drained"], "before_reap": {"public_success": false, "resources_released": false}, "reap": {"exit_code": 0, "eof": true}, "valid": true, "public_success": true, "resources_released": true},
+    {"name": "nonzero_exit_discards_result", "events": ["prepared", "submit", "accepted", "result", "drained"], "reap": {"exit_code": 7, "eof": true}, "valid": false, "public_success": false, "resources_released": true},
+    {"name": "missing_drained", "events": ["prepared", "submit", "accepted", "result"], "reap": {"exit_code": 0, "eof": true}, "valid": false, "public_success": false, "resources_released": true},
+    {"name": "missing_eof", "events": ["prepared", "submit", "accepted", "result", "drained"], "reap": {"exit_code": 0, "eof": false}, "valid": false, "public_success": false, "resources_released": true},
+    {"name": "result_before_acceptance", "events": ["prepared", "submit", "result"], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "duplicate_acceptance", "events": ["prepared", "submit", "accepted", "accepted"], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "duplicate_result", "events": ["prepared", "submit", "accepted", "result", "result"], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "late_cancel_discards_result", "events": ["prepared", "submit", "accepted", "result"], "cancelled": true, "reap": {"exit_code": -15, "eof": true}, "valid": false, "public_success": false, "resources_released": true},
+    {"name": "stale_result_epoch", "events": ["prepared", "submit", "accepted", {"template": "result", "set": {"/worker_epoch": "00000000-0000-4000-8000-000000000009"}}], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "wrong_result_preparation", "events": ["prepared", "submit", "accepted", {"template": "result", "set": {"/preparation_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "wrong_result_usage", "events": ["prepared", "submit", "accepted", {"template": "result", "set": {"/usage/input_tokens": 11}}], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "failure_after_acceptance", "events": ["prepared", "submit", "accepted", "failure", "drained"], "reap": {"exit_code": 1, "eof": true}, "valid": true, "public_success": false, "resources_released": true},
+    {"name": "second_submit_rejected", "events": ["prepared", "submit", "submit"], "valid": false, "public_success": false, "resources_released": false},
+    {"name": "wrong_drain_command", "events": ["prepared", "submit", "accepted", "result", {"template": "drained", "set": {"/command_id": "00000000-0000-4000-8000-000000000009"}}], "reap": {"exit_code": 0, "eof": true}, "valid": false, "public_success": false, "resources_released": true}
+  ]
+}

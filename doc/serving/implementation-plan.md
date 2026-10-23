@@ -5,6 +5,7 @@ Status: proposed work, version 0.1, 2026-10-09.
 This plan defines the full implementation sequence.
 The [serial profile](serial-profile-v0.1.md) defines the first implemented subset.
 The [local service](local-service-v0.1.md) records its boundaries.
+The [Clef text profile](clef-text-v0.1.md) defines a separate decision workload within the existing coordinator.
 P1a code and CPU checks do not complete the P1 acceptance gate.
 The plan applies structural principles from ASD-STE100 Issue 9. It does not claim full dictionary compliance or certification.
 
@@ -63,6 +64,13 @@ P3 depends on stable identity and lifecycle contracts. P3 does not require P2b w
 Each P4 feature requires its own measured benefit. P5 does not block the Mac service.
 
 ## P0: specification and conformance table
+
+The Clef extension uses a separate contract gate before implementation.
+That gate freezes its public schema, worker 2.6 frames, identity documents, and original shared corpus.
+Rust and Python validators must pass the same corpus before integration.
+The runtime gate requires direct-reference comparisons and real HTTP decisions for every supported question type.
+The lifecycle gate requires cancellation, deadline, failure, replacement, and process-reaping evidence.
+No earlier text or vision result completes these Clef gates.
 
 P0 defines component interfaces before the first runtime skeleton. It also records the reference environment and future acceptance measurements. The environment record includes hardware, model bundle, quantization, runtime versions, and the target client. The baseline compares existing ApxInf behavior with the proposed service under the same workload.
 Numerical latency and memory targets require measurements. The plan does not substitute estimates for these measurements.
