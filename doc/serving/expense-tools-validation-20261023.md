@@ -88,3 +88,46 @@ Claude Code 为 2.1.289，命令请求 `--max-turns 8`。
 | `observed/tasks/report.json` | `95b3b6e016341233cefdb8ddca673b92b0632eea6be4893cc3e96f0c399eb11a` |
 | `observed/server.stderr.txt` | `544dd87c8efff66c5b79c7a87f6a1c67b4c81724c3c9cf1840149ca376645012` |
 | `summary.json` | `8e008ac871db6355eff4e480986e6f9ffa7e51f10b4f9a0c529f51c56486506a` |
+
+## 后续工作目录修复
+
+上述六次运行暴露了测试环境的目录归属问题。
+客户端的工作目录同时包含案例文件、配置、stdout、stderr 和进程记录。
+六次原始流均成功读取了自己的 stdout，返回内容分别约为 3.9 万字符。
+这证明了证据文件暴露和额外对话输入，尚未分离其对模型最终失败的影响。
+
+修复前新增的回归测试运行真实 Python 子进程，并保留实际任务准备、捕获及报告路径。
+HTTP 发现和指标使用本地替身，不启动模型。
+子进程退出零，工具清单验证通过，目录断言精确报告四项额外内容。
+
+```text
+AssertionError: Items in the first set but not the second:
+'client-config'
+'client.process.json'
+'client.stdout.jsonl'
+'client.stderr.txt'
+```
+
+随后引入统一的 `TaskWorkspace`，从一个 attempt 根目录派生全部路径。
+模型工作目录为 `attempt/task/`，只放案例输入与输出目标。
+客户端配置、捕获日志和进程记录位于其外层，由各自所有者保存。
+所有维护中的捕获与环境调用者一次迁移，不保留旧目录参数分支。
+
+报告新增 `environment_revision=task-workspace-v2` 和 `attempt_directory`。
+原有 `directory` 指向实际子进程工作目录，产物校验使用同一个路径。
+进程标记仍保持单层 `tasks/*/client.process.json` 布局，原观察器可以继续验证所属进程。
+原捕获循环、实时写入、截止时间、取消、管道排空和退出清理保持原行为。
+原任务提示、CSV、规则、计算工具、字面量答案、严格调用顺序和模型预算没有修改。
+该目录调整不限制父路径访问，不构成操作系统沙箱。
+
+同一真实子进程回归现在通过，观察到的目录精确包含六个案例文件。
+新增检查还覆盖独立配置目录、环境版本、实时单层进程标记和重复 attempt 的证据保留。
+Python serving 全量运行 426 项，419 通过、7 跳过，包含此前测试，不能与旧数量相加。
+独立正确性审查和注释审查均通过，没有阻塞发现。
+
+第一次修复后实机预检 `devlocal/task-workspace/default-isolated-001/` 未取得设备锁。
+错误为 `BlockingIOError: [Errno 35] Resource temporarily unavailable`。
+没有启动模型或客户端任务，未产生新的业务成功或失败样本。
+因此本节只证明目录缺陷已修复，不证明 MiniCPM5 已完成报销任务。
+实机重复仍待设备锁释放，六次原始失败记录保持不变。
+预检收据 SHA-256 为 `dccfc1a4b418c96aa12539c1ec75b36f2b83722ca638fd9748880f839a7aedee`。
