@@ -178,6 +178,41 @@ class RecurrentCache:
         raise AssertionError("A recurrent cache does not report a token offset.")
 
 
+class RuntimeBundleTests(unittest.TestCase):
+    def construct_to_manifest(self, bundle):
+        helper = types.SimpleNamespace(_pinned_toolchain_versions=lambda: {},
+                                       _parse_json=lambda data, name: json.loads(data))
+        spec = types.SimpleNamespace(loader=types.SimpleNamespace(exec_module=lambda module: None))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(worker_module.os.environ))
+            stack.enter_context(patch.object(worker_module.platform, "python_version", return_value="3.14.3"))
+            stack.enter_context(patch.object(worker_module.importlib.metadata, "version",
+                                            side_effect={"mlx": "0.32.1", "mlx-lm": "0.31.3"}.__getitem__))
+            stack.enter_context(patch.object(worker_module.importlib.util, "spec_from_file_location", return_value=spec))
+            stack.enter_context(patch.object(worker_module.importlib.util, "module_from_spec", return_value=helper))
+            stack.enter_context(patch.object(worker_module, "model_manifest", side_effect=AssertionError(
+                "The bundle reached model identity hashing.")))
+            worker_module.MLXRuntime(str(bundle), 64, 16)
+
+    def test_decision_head_bundle_is_rejected_before_identity_hashing(self):
+        for marker in ("joint_head_config.json", "joint_head.safetensors"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                bundle = Path(directory)
+                (bundle / "config.json").write_text('{"model_type": "qwen3_5"}')
+                (bundle / marker).write_bytes(b"original decision-head marker")
+                with self.assertRaises(worker_module.WorkerFailure) as failure:
+                    self.construct_to_manifest(bundle)
+                self.assertEqual(failure.exception.code, "model_unavailable")
+                self.assertIn("decision head", str(failure.exception))
+
+    def test_qwen35_text_bundle_reaches_identity_hashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "config.json").write_text('{"model_type": "qwen3_5"}')
+            with self.assertRaisesRegex(AssertionError, "The bundle reached model identity hashing"):
+                self.construct_to_manifest(bundle)
+
+
 class RuntimeMemoryTests(unittest.TestCase):
     def setUp(self):
         self.backend = MemoryBackend()

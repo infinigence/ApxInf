@@ -335,6 +335,14 @@ def _counts(value: Any, fields: set[str]) -> None:
 
 def validate_command_envelope(frame: dict) -> None:
     """Check routing and settlement fields, without accepting request content."""
+    if type(frame) is dict and frame.get("protocol") == "apxinf-worker/2.6":
+        if __package__:
+            from .clef_contracts import validate_frame as validate_decision_frame
+        else:
+            from clef_contracts import validate_frame as validate_decision_frame
+        validate_decision_frame(frame)
+        _require(frame["kind"] in {"prepare_decision", "submit_decision", "shutdown"}, "unknown command kind")
+        return
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
     _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
@@ -361,6 +369,13 @@ def validate_command_envelope(frame: dict) -> None:
 
 def validate_frame(frame: dict) -> None:
     """Check complete frame shape without changing the supplied object."""
+    if type(frame) is dict and frame.get("protocol") == "apxinf-worker/2.6":
+        if __package__:
+            from .clef_contracts import validate_frame as validate_decision_frame
+        else:
+            from clef_contracts import validate_frame as validate_decision_frame
+        validate_decision_frame(frame)
+        return
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
     _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")

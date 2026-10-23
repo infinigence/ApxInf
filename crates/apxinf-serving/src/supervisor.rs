@@ -1,4 +1,5 @@
 //! One worker, a bounded queue, and explicit attempt settlement.
+mod decision;
 mod generation;
 mod pending_queue;
 
@@ -87,6 +88,9 @@ pub enum WorkerRuntime {
     #[default]
     Python,
     PythonMiniCpmVision,
+    PythonClef {
+        loader: PathBuf,
+    },
     NativeMiniCpm5 {
         executable: PathBuf,
         metal_library: PathBuf,
@@ -110,6 +114,7 @@ impl WorkerRuntime {
         match self {
             Self::Python => PROTOCOL,
             Self::PythonMiniCpmVision => contracts::VISION_PROTOCOL,
+            Self::PythonClef { .. } => contracts::CLEF_PROTOCOL,
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
             Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
             Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
@@ -140,6 +145,13 @@ pub struct Config {
 
 impl Config {
     pub fn validate_memory(&self) -> Result<(), String> {
+        if matches!(self.runtime, WorkerRuntime::PythonClef { .. })
+            && (!(1..=4096).contains(&self.max_context) || self.max_output != 0)
+        {
+            return Err(
+                "Clef requires at most 4096 input positions and --max-output-tokens 0.".into(),
+            );
+        }
         if matches!(self.runtime, WorkerRuntime::PythonMiniCpmVision)
             && (!(1..=16384).contains(&self.max_context)
                 || self.max_output > 8192
@@ -213,6 +225,7 @@ pub struct Begin {
     pub input_tokens: u64,
 }
 pub enum Event {
+    Decision(crate::decision::DecisionResult),
     Part(Part),
     Done {
         cause: String,
@@ -223,15 +236,29 @@ pub enum Event {
     Error(ApiError),
 }
 
+enum Workload {
+    Text(Request),
+    Decision(crate::decision::DecisionRequest),
+}
+
 struct Job {
     observation: Arc<RequestObservation>,
-    request: Request,
+    workload: Workload,
     id: String,
     ingress: Instant,
     begin: oneshot::Sender<Result<Begin, ApiError>>,
     output: mpsc::Sender<Event>,
     terminal_output: Option<mpsc::OwnedPermit<Event>>,
     cancel: Arc<AtomicBool>,
+}
+
+impl Job {
+    fn text(&self) -> &Request {
+        match &self.workload {
+            Workload::Text(request) => request,
+            Workload::Decision(_) => unreachable!("Text execution requires a text workload."),
+        }
+    }
 }
 
 pub struct Ticket {
@@ -274,6 +301,9 @@ pub struct Service {
 }
 
 impl Service {
+    pub(crate) fn decision_enabled(&self) -> bool {
+        self.ready["protocol"] == contracts::CLEF_PROTOCOL
+    }
     pub(crate) fn model_thinking(&self) -> bool {
         self.ready["protocol"] == contracts::NATIVE_THINKING_PROTOCOL || self.bounded_thinking()
     }
@@ -293,11 +323,43 @@ impl Service {
     }
 
     pub fn enqueue(&self, request: Request) -> Result<Ticket, ApiError> {
+        if self.decision_enabled() {
+            return Err(ApiError::new(
+                400,
+                "unsupported_feature",
+                "Clef supports only text decisions.",
+            ));
+        }
         if self.image_enabled() {
             request.selection.validate_vision()?;
         } else {
             request.selection.validate(self.sampling_enabled())?;
         }
+        self.enqueue_workload(Workload::Text(request))
+    }
+
+    pub fn enqueue_decision(
+        &self,
+        request: crate::decision::DecisionRequest,
+    ) -> Result<Ticket, ApiError> {
+        if !self.decision_enabled() {
+            return Err(ApiError::new(
+                400,
+                "unsupported_feature",
+                "The selected provider does not support decisions.",
+            ));
+        }
+        if request.model != self.model_id {
+            return Err(ApiError::new(
+                404,
+                "model_not_found",
+                "The requested model is not loaded.",
+            ));
+        }
+        self.enqueue_workload(Workload::Decision(request))
+    }
+
+    fn enqueue_workload(&self, workload: Workload) -> Result<Ticket, ApiError> {
         if !self.available.load(Ordering::Acquire) {
             if self.rotating.load(Ordering::Acquire) {
                 return Err(ApiError::new(
@@ -316,8 +378,11 @@ impl Service {
         let cancel = Arc::new(AtomicBool::new(false));
         let ingress = Instant::now();
         let job = Job {
-            observation: Arc::new(RequestObservation::new(ingress, request.count_only)),
-            request,
+            observation: Arc::new(match &workload {
+                Workload::Text(request) => RequestObservation::new(ingress, request.count_only),
+                Workload::Decision(_) => RequestObservation::decision(ingress),
+            }),
+            workload,
             id: uuid::Uuid::new_v4().to_string(),
             ingress,
             begin,
@@ -397,6 +462,7 @@ struct Worker {
     epoch: String,
     controls: std::collections::HashSet<String>,
     sent_commands: u64,
+    retired: bool,
 }
 
 impl Worker {
@@ -422,7 +488,7 @@ impl Worker {
         .map_err(|_| ApiError::worker("The worker input pipe closed."))
     }
     fn requires_rotation(&self) -> bool {
-        self.sent_commands > contracts::MAX_COMMANDS - REQUEST_COMMAND_ALLOWANCE
+        self.retired || self.sent_commands > contracts::MAX_COMMANDS - REQUEST_COMMAND_ALLOWANCE
     }
     fn command(&self, kind: &str) -> Value {
         json!({"protocol":self.protocol,"kind":kind,"worker_epoch":self.epoch,"command_id":uuid::Uuid::new_v4().to_string()})
@@ -503,10 +569,19 @@ impl Worker {
     }
 }
 
+#[cfg(test)]
 fn read_worker_frames(
     stdout: tokio::process::ChildStdout,
 ) -> mpsc::Receiver<Result<Value, String>> {
+    read_worker_frames_for_protocol(stdout, PROTOCOL)
+}
+
+fn read_worker_frames_for_protocol(
+    stdout: tokio::process::ChildStdout,
+    protocol: &str,
+) -> mpsc::Receiver<Result<Value, String>> {
     let (sender, frames) = mpsc::channel(64);
+    let clean_eof = protocol == contracts::CLEF_PROTOCOL;
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
@@ -514,6 +589,7 @@ fn read_worker_frames(
             let parsed = loop {
                 match reader.fill_buf().await {
                     Err(e) => break Err(format!("Worker read failed: {e}")),
+                    Ok([]) if clean_eof && bytes.is_empty() => return,
                     Ok([]) => break Err("Worker stdout ended.".into()),
                     Ok(chunk) => {
                         let end = chunk.iter().position(|b| *b == b'\n').map(|p| p + 1);
@@ -582,7 +658,9 @@ async fn launch_worker_until(
     pressure.require_load().map_err(LaunchError::Pressure)?;
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut command = match &config.runtime {
-        WorkerRuntime::Python | WorkerRuntime::PythonMiniCpmVision => {
+        WorkerRuntime::Python
+        | WorkerRuntime::PythonMiniCpmVision
+        | WorkerRuntime::PythonClef { .. } => {
             let mut command = Command::new(&config.python);
             command.arg("-u").arg(&config.worker);
             command
@@ -594,6 +672,9 @@ async fn launch_worker_until(
             Command::new(executable)
         }
     };
+    if let WorkerRuntime::PythonClef { loader } = &config.runtime {
+        command.arg("--clef-loader").arg(loader);
+    }
     command
         .arg("--protocol")
         .arg(config.runtime.protocol())
@@ -649,7 +730,7 @@ async fn launch_worker_until(
         let cleanup = stop_child(&mut child).await;
         return Err(startup_failure("Worker stdout is absent.".into(), cleanup).into());
     };
-    let frames = read_worker_frames(stdout);
+    let frames = read_worker_frames_for_protocol(stdout, config.runtime.protocol());
     let mut worker = Worker {
         protocol: config.runtime.protocol(),
         child,
@@ -659,6 +740,7 @@ async fn launch_worker_until(
         epoch,
         controls: Default::default(),
         sent_commands: 0,
+        retired: false,
     };
     // The startup future borrows the worker. Cancellation retains its child for explicit reaping.
     let startup = async {
@@ -682,6 +764,18 @@ async fn launch_worker_until(
             );
         }
         verify_manifest(&ready["model_manifest"], &config)?;
+        if matches!(config.runtime, WorkerRuntime::PythonClef { .. }) {
+            let model_config = contracts::parse_document(
+                &std::fs::read(config.model.join("config.json"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            if ready["capabilities"]["vocab_size"] != model_config["text_config"]["vocab_size"] {
+                return Err(
+                    "The Clef vocabulary differs from the pinned model configuration.".into(),
+                );
+            }
+        }
         let (resident, _) = ready_memory_totals(&ready)?;
         config.check_resident_capacity(resident)?;
         Ok(ready)
@@ -975,7 +1069,11 @@ where
             .reserved_bytes
             .store(sequence_reservation, Ordering::Relaxed);
         let observation = job.observation.clone();
-        let result = execute(&mut worker, &shared, job, shared.timeout).await;
+        let result = if matches!(job.workload, Workload::Decision(_)) {
+            decision::execute_decision(&mut worker, &shared, job, shared.timeout).await
+        } else {
+            execute(&mut worker, &shared, job, shared.timeout).await
+        };
         if let Err(failure) = result {
             fault = Some(failure.error.message.clone());
             if !failure.reported {
@@ -1023,39 +1121,52 @@ where
     service.rotating.store(true, Ordering::Release);
     service.available.store(false, Ordering::Release);
     let old_epoch = worker.epoch.clone();
-    let shutdown = worker.command("shutdown");
-    worker.send(&shutdown).await?;
-    worker
-        .controls
-        .insert(shutdown["command_id"].as_str().unwrap().to_owned());
-    // No command can follow shutdown. Closing the pipe also releases the input reader.
-    drop(worker.input.take());
-    let started = Instant::now();
-    loop {
-        let frame = worker
-            .receive(SETTLEMENT_GRACE.saturating_sub(started.elapsed()))
-            .await?;
-        if worker.consume_control_reply(&frame)? {
-            continue;
+    if !worker.retired {
+        let shutdown = worker.command("shutdown");
+        worker.send(&shutdown).await?;
+        if worker.protocol != contracts::CLEF_PROTOCOL {
+            worker
+                .controls
+                .insert(shutdown["command_id"].as_str().unwrap().to_owned());
         }
-        if frame["kind"] == "drained" && worker.controls.is_empty() {
-            break;
+        drop(worker.input.take());
+        let started = Instant::now();
+        loop {
+            let frame = worker
+                .receive(SETTLEMENT_GRACE.saturating_sub(started.elapsed()))
+                .await?;
+            if worker.consume_control_reply(&frame)? {
+                continue;
+            }
+            if frame["kind"] == "drained" && worker.controls.is_empty() {
+                if worker.protocol == contracts::CLEF_PROTOCOL
+                    && (frame["command_id"] != shutdown["command_id"]
+                        || frame["reason"] != "shutdown")
+                {
+                    return Err(ApiError::new(
+                        500,
+                        "protocol_fault",
+                        "The Clef worker acknowledged a different shutdown command.",
+                    ));
+                }
+                break;
+            }
+            return Err(ApiError::new(
+                500,
+                "protocol_fault",
+                "The worker did not drain in protocol order.",
+            ));
         }
-        return Err(ApiError::new(
-            500,
-            "protocol_fault",
-            "The worker did not drain in protocol order.",
-        ));
-    }
-    let status = tokio::time::timeout(
-        SETTLEMENT_GRACE.saturating_sub(started.elapsed()),
-        worker.child.wait(),
-    )
-    .await
-    .map_err(|_| ApiError::worker("The drained worker did not exit."))?
-    .map_err(|_| ApiError::worker("The drained worker could not be reaped."))?;
-    if !status.success() {
-        return Err(ApiError::worker("The drained worker exited with an error."));
+        let status = tokio::time::timeout(
+            SETTLEMENT_GRACE.saturating_sub(started.elapsed()),
+            worker.child.wait(),
+        )
+        .await
+        .map_err(|_| ApiError::worker("The drained worker did not exit."))?
+        .map_err(|_| ApiError::worker("The drained worker could not be reaped."))?;
+        if !status.success() {
+            return Err(ApiError::worker("The drained worker exited with an error."));
+        }
     }
     if service.queue.is_closed() {
         service.rotating.store(false, Ordering::Release);
@@ -1190,8 +1301,8 @@ async fn prepare_request(
     job.observation.preparation_start(Instant::now());
     let mut prepare = worker.command("prepare_input");
     prepare["model_revision"] = service.ready["model_revision"].clone();
-    prepare["messages"] = json!(job.request.messages);
-    prepare["tools"] = json!(job.request.tools);
+    prepare["messages"] = json!(job.text().messages);
+    prepare["tools"] = json!(job.text().tools);
     prepare["template_options"] = json!({"enable_thinking":service.model_thinking()});
     let mut stopped: Option<Instant> = None;
     wait_for_preparation(worker.send(&prepare), service, job, timeout, &mut stopped).await?;
@@ -1239,7 +1350,7 @@ async fn prepare_request(
                         crate::vision_identity::verify_prepared(
                             &event,
                             &service.ready,
-                            &job.request.messages,
+                            &job.text().messages,
                         )
                         .map_err(|message| ApiError::new(500, "protocol_fault", message))?;
                     }
@@ -1469,6 +1580,9 @@ pub(crate) fn file_digest(path: &std::path::Path) -> Result<(u64, String), Strin
 }
 
 fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
+    if matches!(config.runtime, WorkerRuntime::PythonClef { .. }) {
+        return crate::clef_identity::verify_manifest(manifest, config);
+    }
     let mut names = std::fs::read_dir(&config.model)
         .map_err(|e| e.to_string())?
         .map(|item| {
@@ -1619,7 +1733,7 @@ async fn execute(
         .as_u64()
         .ok_or_else(|| ApiError::worker("Prepared input has no token count."))
         .map_err(|error| report_unadmitted_failure(&mut job, service, error.into()))?;
-    if input_tokens + job.request.max_tokens as u64
+    if input_tokens + job.text().max_tokens as u64
         > service.ready["capabilities"]["max_context"]
             .as_u64()
             .unwrap_or(0)
@@ -1639,7 +1753,7 @@ async fn execute(
         request_id: job.id.clone(),
         input_tokens,
     };
-    if job.request.count_only {
+    if job.text().count_only {
         service.metrics.completed.fetch_add(1, Ordering::Relaxed);
         job.observation.public_terminal(
             &service.metrics.observations,
@@ -1663,7 +1777,7 @@ async fn execute(
     submit["model_revision"] = service.ready["model_revision"].clone();
     submit["capability_revision"] = service.ready["capability_revision"].clone();
     submit["token_ids"] = prepared["token_ids"].clone();
-    submit["max_tokens"] = json!(job.request.max_tokens);
+    submit["max_tokens"] = json!(job.text().max_tokens);
     submit["remaining_timeout_ms"] = json!(timeout
         .saturating_sub(job.ingress.elapsed())
         .as_millis()
@@ -1672,9 +1786,9 @@ async fn execute(
     submit["capacity_lease_ids"] = json!([uuid::Uuid::new_v4().to_string()]);
     if service.sampling_enabled() {
         submit["sampling"] = if service.image_enabled() {
-            job.request.selection.vision_submission(&job.id)
+            job.text().selection.vision_submission(&job.id)
         } else {
-            job.request.selection.submission(&job.id)
+            job.text().selection.submission(&job.id)
         };
     }
     if service.image_enabled() {
@@ -1701,8 +1815,8 @@ async fn execute(
     } else {
         OutputProfile::Qwen
     };
-    let mut parser = OutputParser::with_profile(job.request.tools.clone(), profile);
-    let mut stops = StopMatcher::new(job.request.stops.clone());
+    let mut parser = OutputParser::with_profile(job.text().tools.clone(), profile);
+    let mut stops = StopMatcher::new(job.text().stops.clone());
     let mut thinking_prefix = service
         .model_thinking()
         .then(crate::output::InitialThinkingPrefix::new);
@@ -2111,7 +2225,10 @@ fn gateway_test_service_config(
     let coordinator = service.clone();
     tokio::spawn(async move {
         while let Some(job) = coordinator.queue.recv(&coordinator.metrics).await {
-            let _ = observed.send(job.request);
+            let _ = observed.send(match job.workload {
+                Workload::Text(request) => request,
+                Workload::Decision(_) => unreachable!(),
+            });
             let _ = job.begin.send(Err(ApiError::worker(
                 "Test coordinator observed admission.",
             )));
@@ -2328,6 +2445,7 @@ mod lifecycle_tests {
             epoch: EPOCH.into(),
             controls: Default::default(),
             sent_commands: 0,
+            retired: false,
         }
     }
 

@@ -16,6 +16,9 @@
 | [MiniCPM-V 配置](minicpm-vision-v0.1.md) | 独立 Python 环境、PNG 输入、准备重放和请求清理 | 显式选择，worker 2.5 |
 | [视觉 worker 验证](vision-acceptance.md) | 实际模型、HTTP、取消和长输入的证据边界 | HTTP 通过，Claude 图片修订未通过 |
 | [PR #116 增量汇总](supervisor-acceptance.md) | 原 PR 与本轮实现、已测范围和剩余限制 | 本轮交付说明 |
+| [Clef 初始审查](clef-acceptance.md) | 实现前的 provider 缺口、参考启动和错误接入修复 | 保留历史失败证据 |
+| [Clef 文本契约](clef-text-v0.1.md) | 独立决策类型、概率结果、worker 2.6 和进程结算 | Rust／Python 共同校验 |
+| [Clef serving 验收](clef-acceptance.md) | 三类型 HTTP、长输入、进程回收与压力边界 | 诊断功能通过，默认压力准入未通过 |
 | [本地服务](local-service-v0.1.md) | 启动方式、HTTP 能力与当前限制 | 当前实现说明 |
 | [有界初始思考](native-bounded-thinking-v0.1.md) | 显式 worker 2.4 配置、512-token 预算和完整用量计数 | 接口规范，控制机制已验证 |
 | [有界思考验证](native-minicpm-acceptance.md) | 原生预算边界、15K 输入、真实客户端和图像检查 | 控制机制通过，视觉验收未通过 |
