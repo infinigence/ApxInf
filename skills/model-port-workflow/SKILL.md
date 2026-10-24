@@ -83,7 +83,10 @@ Report physical process peaks as well as tensor-size budgets.
 Ordinary asynchronous text decode can use `LlmTrait::token_sequence` while the
 shared loop retains publication, EOS, budget and cancellation. Compiled Qwen3
 and ordinary MiniCPM5 share the MLX cursor in `mlx_decode.rs`; graph construction
-and KV remain family-owned. Preserve synchronous public `forward`, check sampler
+and KV remain family-owned. The returned logits must depend on every state
+array updated by decode, since only the checked token is an async evaluation
+root. Verify this dependency and continued decode after discarding lookahead
+on the actual model. Preserve synchronous public `forward`, check sampler
 admission before reset, and test one-step lookahead, discarded EOS work, real
 cancellation, position restoration, cleanup and synchronous fallback through
 `LoadedModel`. Never move generation scheduling into the array backend.
