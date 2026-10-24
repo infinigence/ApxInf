@@ -601,9 +601,6 @@ impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
             }
         }
     }
-    fn kv_outputs(&self) -> Vec<Array> {
-        self.states.clone()
-    }
     fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
         if let Err(error) = self.backend.stream().synchronize() {
             self.failure = Some(error.to_string());
