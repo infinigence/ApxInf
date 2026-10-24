@@ -20,8 +20,11 @@
 #define CUBLASLT_MATMUL_DESC_D_SCALE_POINTER \
     static_cast<cublasLtMatmulDescAttributes_t>(20)
 #endif
-#ifndef CUDA_R_8F_E4M3
-#define CUDA_R_8F_E4M3 static_cast<cudaDataType_t>(5)
+// CUDA_R_8F_E4M3 is a cudaDataType_t enumerator, not a macro, so an #ifndef
+// guard always fires. Gate on the toolkit that introduced it (CUDA 11.8),
+// with its library_types.h value.
+#if CUDART_VERSION < 11080
+#define CUDA_R_8F_E4M3 static_cast<cudaDataType_t>(28)
 #endif
 
 extern "C" cudaError_t apxinf_static_evict_l2(
