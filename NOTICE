@@ -16,6 +16,21 @@ MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
+The Clef Q4 decode, row padding, FP16 GEMMs (including the gate GEMM with a
+SwiGLU epilogue), causal depthwise convolution and gated delta recurrence kernels,
+and the Clef GPU+Neural Engine split and its Core ML programs, are adapted from
+EngineTailor (MIT), Copyright 2026 Haiyan Qin.
+
+The gated delta recurrence and the half-split rotary embedding kernel adapt
+MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
+Copyright (c) 2025 Prince Canuma. MIT License.
+
+The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h. The gate GEMM
+header contains MLX 0.32.3 Steel loader.h, mma.h, transforms.h and their
+utilities as installed, and the causal convolution follows MLX 0.32.3
+depthwise_conv_1d.
+Copyright (c) 2023-2024 Apple Inc. MIT License.
+
 The DSpark adaptation also derives from mlx-dspark, revision
 d6042f38f0aa7dd3e03a2a406111d725056d45a3.
 Copyright (c) 2026 erahim3. MIT License.
@@ -42,3 +57,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+apxinf-coreml's protobuf message subset (crates/apxinf-coreml/src/proto.rs)
+follows the Core ML specification files Model.proto, FeatureTypes.proto and
+MIL.proto, and its weight-file writer follows the MILBlob storage format, both
+from coremltools 9.0 (revision 428d4b2658dfc44194f27f4f36870751be402ff7).
+Copyright (c) 2020-2023, Apple Inc. All rights reserved. BSD 3-Clause License:
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder(s) nor the names of any
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
