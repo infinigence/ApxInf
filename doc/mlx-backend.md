@@ -68,6 +68,16 @@ generation schedule. The infallible `reset`/`prewarm_decode` hooks cannot
 swallow MLX failures: use a fallible family preparation method, or retain an
 invalidated error returned by the next fallible call.
 
+Compiled Qwen3 and ordinary compiled MiniCPM5 use one-step greedy lookahead.
+`greedy_token_arrays` produces an in-vocabulary device ID and a checked ID with
+an invalid-logits sentinel. `mlx_decode.rs` submits the next decode and complete
+KV outputs with `async_eval` before reading the current checked ID with
+`to_bytes_ready`. The latter waits only for that array. Stop/error cleanup drains
+the stream; EOS/cancellation then trims the unused logical position. No KV
+snapshot is retained. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback.
+Async generation profiles include callback wall time and the final drain, since
+callbacks can overlap GPU execution. Other variants keep their existing schedule.
+
 Keep `LlmTrait` and `VlaRuntime` distinct. A small text model may retain the
 existing `config.rs`, `weights.rs`, `general.rs` organization. A VLA uses its
 own Model and ModelRunner responsibilities. Do not import another family's

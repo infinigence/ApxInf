@@ -88,6 +88,10 @@ apxinf generate --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
 Sampling capability is supplied by the MLX backend. Currently only greedy
 selection without penalties/logprob is implemented; Qwen's random-sampling
 generation defaults must be overridden explicitly. Unsupported options fail.
+The compiled BF16 variant uses device greedy IDs with one-step async lookahead.
+Set `APXINF_MLX_SYNC_DECODE=1` to use the synchronous generation path. Public
+`forward` remains synchronous. EOS and cancellation drain the extra step and
+restore the position of the published prefix; async failures invalidate state.
 First preparation/compilation must be reported separately from warmed latency.
 Preparation uses `Compiled::prepare` to evaluate each supported callable twice
 and require no tracing on the second invocation. The presence of

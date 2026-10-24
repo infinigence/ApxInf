@@ -15,7 +15,7 @@ pub use array::{
     Compiled, MemoryStats, MetalKernel, MlxDType, Stream, StreamCounters, TemplateArg,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
-pub use backend::MlxBackend;
+pub use backend::{greedy_token_arrays, MlxBackend};
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use device_caps::MetalDeviceCaps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
