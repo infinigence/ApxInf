@@ -800,6 +800,14 @@ impl LlmTrait for DSpark {
         }
         self.forward(input.token_ids, 0)
     }
+    fn generate_streaming_cancellable_dyn(
+        &mut self,
+        _request: GenerationRequest<'_>,
+        _cancel: &crate::GenerationCancellation,
+        _on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        Err(Error::UnsupportedOp("DSpark cancellation"))
+    }
     fn generate_streaming_with_options_dyn(
         &mut self,
         request: GenerationRequest<'_>,
