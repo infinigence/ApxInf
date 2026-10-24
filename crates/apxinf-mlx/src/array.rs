@@ -767,6 +767,19 @@ impl Compiled {
         }
         Ok(output)
     }
+
+    /// Compile an exact input profile and verify reuse without evaluating it.
+    /// This prepares the MLX graph, not Metal pipelines or allocator workspaces.
+    /// The first evaluation can still incur device compilation and allocation.
+    pub fn prepare_trace(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.call(inputs)?;
+        let before = self.trace.stream.counters().trace_callbacks;
+        let output = self.call(inputs)?;
+        if self.trace.stream.counters().trace_callbacks != before {
+            return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
+        }
+        Ok(output)
+    }
 }
 impl Drop for Compiled {
     fn drop(&mut self) {
