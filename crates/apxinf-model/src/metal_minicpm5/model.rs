@@ -72,9 +72,16 @@ impl MiniCpm5 {
             None
         } else {
             let eps = epsilon.clone();
+            let native_norm = variant == Variant::Compiled;
+            let rms_norm_eps = config.rms_norm_eps;
             Some(LocalMath {
                 norm: Compiled::with_shapeless(stream, 1, true, move |a| {
-                    Ok(vec![math::norm(&a[0], &a[1], &eps)?])
+                    let normalized = if native_norm {
+                        a[0].fast_rms_norm(&a[1], rms_norm_eps)?
+                    } else {
+                        math::norm(&a[0], &a[1], &eps)?
+                    };
+                    Ok(vec![normalized])
                 })?,
                 rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
             })
