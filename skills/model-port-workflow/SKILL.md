@@ -92,7 +92,11 @@ Report physical process peaks as well as tensor-size budgets.
 For prefill tuning, keep warm shapes, admission and execution derived from the
 same family-owned schedule. Record construction-time chunk overrides and
 separate their BF16 numerical evidence from decode-attention changes. A 2 GiB
-allocator-cache limit is separate from live KV memory.
+allocator-cache limit is separate from live KV memory. MiniCPM5 compiled
+non-final chunks drop logits before evaluating every KV output. Keep the final
+chunk, Public mode, DSpark and full-row `forward` contracts intact. Validate
+actual long-prompt logits and subsequent decode across exact chunk multiples
+and one-row tails before accepting cache-only changes.
 
 MiniCPM5's prepared request also owns its resolved attention mode. Automatic
 exact attention covers compiled requests with 16384–65536 prompt tokens and
