@@ -62,8 +62,12 @@ in chunks of at most 512, evaluating only updated KV; then consume the last
 token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
+The experimental `APXINF_QWEN3_PREFILL_CHUNK` override accepts 512, 1024 or
+2048 and is captured at construction; the default remains 512. A family-local
+plan supplies the same prefix ranges to preparation and execution. Existing
+prepared-row admission for public `forward` remains unchanged.
 
-Long generation prepares the 512-token chunks and final row. It does not prepare
+Long generation prepares the selected chunks, tail and final row. It does not prepare
 a full prompt-sized `forward` above 2048 rows; that call fails explicitly.
 This avoids allocating a large `[prompt,vocabulary]` result during generation.
 

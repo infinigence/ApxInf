@@ -5,7 +5,7 @@
 //! enginetailor/models/mlx/m4/kernels.py. See README.md and LICENSE.engine-tailor.
 
 use super::{
-    config::{attention_width, Qwen3Config, Variant},
+    config::{attention_width, PrefillChunk, PrefillPlan, Qwen3Config, Variant},
     weights::{LayerWeights, Weights},
 };
 use crate::llm_trait::{
@@ -148,6 +148,7 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
 pub struct Qwen3Model {
     config: Qwen3Config,
     variant: Variant,
+    prefill_chunk: Option<PrefillChunk>,
     backend: MlxBackend,
     weights: Weights,
     seams: Option<Seams>,
@@ -182,6 +183,7 @@ impl Qwen3Model {
         variant: Variant,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_chunk = PrefillChunk::from_env()?;
         if variant == Variant::MixedW8 {
             config.validate_checkpoint_scope()?;
         }
@@ -216,6 +218,7 @@ impl Qwen3Model {
         let mut model = Self {
             config,
             variant,
+            prefill_chunk,
             backend,
             weights,
             seams,
@@ -324,18 +327,19 @@ impl Qwen3Model {
         if prompt_len <= 2048 {
             self.warm_length(prompt_len)?;
         }
-        // Source append_logits evaluates cache-only chunks, followed by one
-        // last-token forward. Register every prompt shape outside inference.
-        let prefix = prompt_len - 1;
-        if prefix >= 512 {
-            self.warm_length(512)?;
-        }
-        if prefix % 512 != 0 {
-            self.warm_length(prefix % 512)?;
+        for rows in self.prefill_plan(prompt_len)?.required_rows() {
+            self.warm_length(rows)?;
         }
         self.warm_decoder()?;
         self.backend.stream().synchronize()?;
         Ok(())
+    }
+
+    fn prefill_plan(&self, prompt: usize) -> Result<PrefillPlan> {
+        PrefillPlan::new(
+            prompt,
+            self.prefill_chunk.unwrap_or(PrefillChunk::Tokens512),
+        )
     }
 
     fn warm_length(&mut self, len: usize) -> Result<()> {
@@ -786,18 +790,19 @@ impl LlmTrait for Qwen3Model {
             return Err(err("Qwen3 does not support images"));
         }
         self.validate_input(input.token_ids, 0)?;
-        let prefix = input.token_ids.len() - 1;
+        let plan = self.prefill_plan(input.token_ids.len())?;
         // Check the entire schedule before consuming any part of the prompt.
-        if !self.prepared_lengths.contains(&1)
-            || (prefix >= 512 && !self.prepared_lengths.contains(&512))
-            || (prefix % 512 != 0 && !self.prepared_lengths.contains(&(prefix % 512)))
+        if !plan
+            .required_rows()
+            .iter()
+            .all(|rows| self.prepared_lengths.contains(rows))
         {
             return Err(err("Qwen3 prefill schedule was not prepared"));
         }
-        for chunk in input.token_ids[..prefix].chunks(512) {
-            self.execute(chunk, self.position, false)?;
+        for range in plan.chunks() {
+            self.execute(&input.token_ids[range], self.position, false)?;
         }
-        self.execute(&input.token_ids[prefix..], self.position, true)?
+        self.execute(&input.token_ids[plan.prefix_len..], self.position, true)?
             .ok_or_else(|| err("missing Qwen3 prefill logits"))
     }
 

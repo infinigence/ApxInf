@@ -1,9 +1,7 @@
 //! Native MiniCPM5 forward and request state. No Python model provider.
 //! Arithmetic/schedule adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 use super::{
-    config::{
-        attention_width, prefill_lengths, Config, Variant, DSPARK_CONTEXT_CAPACITY, PREFILL_CHUNK,
-    },
+    config::{attention_width, Config, PrefillChunk, PrefillPlan, Variant},
     math,
     weights::Weights,
 };
@@ -27,8 +25,8 @@ enum DecodeAttention {
     Exact,
 }
 
-struct PreparedDecode {
-    prompt: usize,
+struct PreparedRequest {
+    prefill: PrefillPlan,
     output: usize,
     positions: HashMap<usize, Array>,
 }
@@ -38,6 +36,7 @@ pub struct MiniCpm5 {
     pub(crate) weights: Rc<Weights>,
     config: Config,
     variant: Variant,
+    prefill_chunk: Option<PrefillChunk>,
     epsilon: Array,
     cos: Array,
     sin: Array,
@@ -45,7 +44,7 @@ pub struct MiniCpm5 {
     swiglu: Compiled,
     step: Option<Compiled>,
     attention: DecodeAttention,
-    prepared: Option<PreparedDecode>,
+    prepared: Option<PreparedRequest>,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -65,6 +64,7 @@ impl MiniCpm5 {
         variant: Variant,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_chunk = PrefillChunk::from_env()?;
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
         let (cos, sin) = math::tables(stream, 256)?;
@@ -93,6 +93,7 @@ impl MiniCpm5 {
             weights: Rc::new(weights),
             config,
             variant,
+            prefill_chunk,
             epsilon,
             cos,
             sin,
@@ -132,7 +133,7 @@ impl MiniCpm5 {
             && self
                 .prepared
                 .as_ref()
-                .is_some_and(|p| p.prompt == prompt && p.output == output)
+                .is_some_and(|p| p.prefill.prompt == prompt && p.output == output)
             && self.failure.is_none()
             && !self.states.is_empty()
         {
@@ -173,7 +174,11 @@ impl MiniCpm5 {
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
-        let lengths = prefill_lengths(prompt);
+        let prefill = PrefillPlan::new(
+            prompt,
+            self.prefill_chunk.unwrap_or(PrefillChunk::Tokens512),
+        )?;
+        let lengths = prefill.required_rows();
         for &rows in &lengths {
             if let Some(local) = &self.local {
                 let stream = self.backend.stream();
@@ -248,8 +253,8 @@ impl MiniCpm5 {
             }
         }
         self.failure = None;
-        self.prepared = Some(PreparedDecode {
-            prompt,
+        self.prepared = Some(PreparedRequest {
+            prefill,
             output,
             positions,
         });
@@ -492,11 +497,9 @@ impl MiniCpm5 {
         if self.states.is_empty() || self.prepared.is_none() {
             return Err(Error::Contract("prepare MiniCPM before inference"));
         }
-        let prompt = self.prepared.as_ref().unwrap().prompt;
-        let admitted = if prompt > DSPARK_CONTEXT_CAPACITY && position < prompt {
-            position % PREFILL_CHUNK == 0 && ids.len() == PREFILL_CHUNK.min(prompt - position)
-        } else if position == 0 {
-            prompt == ids.len()
+        let prefill = self.prepared.as_ref().unwrap().prefill;
+        let admitted = if position < prefill.prompt {
+            prefill.admits(position, ids.len())
         } else {
             ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
         };
@@ -663,7 +666,7 @@ impl LlmTrait for MiniCpm5 {
                 scopes.push(TextCompilationScope::DecodeStep);
             }
             lengths.extend(1..=max_rows);
-            lengths.extend(prefill_lengths(self.prepared.as_ref().unwrap().prompt));
+            lengths.extend(self.prepared.as_ref().unwrap().prefill.required_rows());
             lengths.sort_unstable();
             lengths.dedup();
         }
@@ -682,7 +685,11 @@ impl LlmTrait for MiniCpm5 {
                 Variant::DSpark => "dspark-target",
             }),
             compiled_scopes: scopes,
-            prepared_prompt_tokens: self.prepared.as_ref().filter(|_| ready).map(|p| p.prompt),
+            prepared_prompt_tokens: self
+                .prepared
+                .as_ref()
+                .filter(|_| ready)
+                .map(|p| p.prefill.prompt),
             prepared_sequence_lengths: lengths,
             kv_capacity: (self.capacity > 0).then_some(self.capacity),
             max_decode_rows: ready.then_some(max_rows),
@@ -724,7 +731,7 @@ impl LlmTrait for MiniCpm5 {
             return Err(Error::Contract("MiniCPM5 is text-only"));
         }
         if self.offset != 0
-            || self.prepared.as_ref().map(|p| p.prompt) != Some(input.token_ids.len())
+            || self.prepared.as_ref().map(|p| p.prefill.prompt) != Some(input.token_ids.len())
             || input.token_ids.is_empty()
             || input
                 .token_ids
@@ -735,14 +742,10 @@ impl LlmTrait for MiniCpm5 {
                 "MiniCPM prefill requires the complete prepared prompt and valid token IDs",
             ));
         }
-        let chunk_size = if input.token_ids.len() > DSPARK_CONTEXT_CAPACITY {
-            PREFILL_CHUNK
-        } else {
-            input.token_ids.len()
-        };
+        let plan = self.prepared.as_ref().unwrap().prefill;
         let mut logits = None;
-        for chunk in input.token_ids.chunks(chunk_size) {
-            logits = Some(self.run_tokens(chunk, self.offset, true)?);
+        for range in plan.chunks() {
+            logits = Some(self.run_tokens(&input.token_ids[range], self.offset, true)?);
         }
         let logits = logits.unwrap();
         self.backend

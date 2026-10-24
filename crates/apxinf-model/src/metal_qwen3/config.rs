@@ -6,6 +6,64 @@ use serde::Deserialize;
 /// Maximum total positions in the Qwen3-0.6B checkpoint.
 pub const MAX_CONTEXT: usize = 40960;
 
+#[derive(Clone, Copy)]
+pub(super) enum PrefillChunk {
+    Tokens512 = 512,
+    Tokens1024 = 1024,
+    Tokens2048 = 2048,
+}
+
+impl PrefillChunk {
+    pub(super) fn from_env() -> Result<Option<Self>> {
+        match std::env::var("APXINF_QWEN3_PREFILL_CHUNK") {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Ok(value) => match value.as_str() {
+                "512" => Ok(Some(Self::Tokens512)),
+                "1024" => Ok(Some(Self::Tokens1024)),
+                "2048" => Ok(Some(Self::Tokens2048)),
+                _ => Err(Error::Contract(
+                    "APXINF_QWEN3_PREFILL_CHUNK must be 512, 1024 or 2048",
+                )),
+            },
+            Err(_) => Err(Error::Contract("APXINF_QWEN3_PREFILL_CHUNK must be UTF-8")),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PrefillPlan {
+    pub(super) prefix_len: usize,
+    chunk: usize,
+}
+
+impl PrefillPlan {
+    pub(super) fn new(prompt: usize, chunk: PrefillChunk) -> Result<Self> {
+        Ok(Self {
+            prefix_len: prompt
+                .checked_sub(1)
+                .ok_or(Error::Contract("Qwen3 prompt must not be empty"))?,
+            chunk: chunk as usize,
+        })
+    }
+
+    pub(super) fn chunks(self) -> impl Iterator<Item = std::ops::Range<usize>> {
+        (0..self.prefix_len)
+            .step_by(self.chunk)
+            .map(move |start| start..(start + self.chunk).min(self.prefix_len))
+    }
+
+    pub(super) fn required_rows(self) -> Vec<usize> {
+        let mut rows: Vec<_> = self
+            .chunks()
+            .map(|r| r.len())
+            .chain(std::iter::once(1))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+}
+
 pub(super) fn attention_width(end: usize, capacity: usize) -> usize {
     if capacity <= 2048 {
         capacity
@@ -157,6 +215,31 @@ impl Variant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_plan_preserves_final_token_and_nonzero_tails() {
+        for chunk in [
+            PrefillChunk::Tokens512,
+            PrefillChunk::Tokens1024,
+            PrefillChunk::Tokens2048,
+        ] {
+            let width = chunk as usize;
+            assert!(PrefillPlan::new(0, chunk).is_err());
+            let one = PrefillPlan::new(1, chunk).unwrap();
+            assert_eq!(one.chunks().count(), 0);
+            assert_eq!(one.required_rows(), vec![1]);
+            let full = PrefillPlan::new(width + 1, chunk).unwrap();
+            assert_eq!(full.chunks().collect::<Vec<_>>(), vec![0..width]);
+            assert_eq!(full.required_rows(), vec![1, width]);
+            let tail = PrefillPlan::new(width + 3, chunk).unwrap();
+            assert_eq!(
+                tail.chunks().collect::<Vec<_>>(),
+                vec![0..width, width..width + 2]
+            );
+            assert_eq!(tail.required_rows(), vec![1, 2, width]);
+        }
+    }
+
     fn valid() -> serde_json::Value {
         serde_json::json!({"model_type":"qwen3", "hidden_size":1024,
             "intermediate_size":3072, "num_hidden_layers":28, "num_attention_heads":16,
