@@ -84,6 +84,15 @@ short-token differences and enforce each language's external teacher floor
 before accepting full-model performance results. Compare frozen reference and
 candidate binaries with the same inputs and policies.
 
+Qwen3's established-prefix compiled decoder uses `Bf16QkTableRope` for paired
+BF16 table rotation after native Q/K normalization. Keep the kernel and its
+shape guards in `apxinf-mlx`; keep table preparation and KV updates in the
+family. Preserve the decoder's 18-input/3-output array contract. Validate BF16
+bits at both tiny D8 and checkpoint D128, including unequal table halves,
+strided inputs, changed-operand compiled replay and retained outputs. Check
+full-model parity against the current norm path before interpreting performance.
+Prefill, fresh first-token, Public and MixedW8 paths retain their own RoPE.
+
 MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
 weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
 BF16 before multiplying the BF16 weight, preserving this family's rounding

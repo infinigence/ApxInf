@@ -30,6 +30,11 @@ time against the ordered implementation. The full MLX matrix remains pending.
 Both selections retain BF16 cos/sin tables and the two separate BF16 RoPE
 multiplication results. The compiled selection prepares local norm/RoPE functions
 and the complete B1/L1 decoder block with explicit input/output KV arrays.
+After prefix state exists, that block uses `Bf16QkTableRope` to rotate Q and K
+in one Metal call. The backend owns shape validation and separately rounded
+BF16 products and sums. The block captures the immutable kernel, while Q, K,
+and table rows remain explicit array operands. Its 18-input/3-output ABI is
+unchanged. Prefill and the fresh first-token path retain local compiled RoPE.
 Prefill uses the same layer composition with compiled local seams. Whole
 decode-step compilation is not implemented or claimed by this selection.
 
