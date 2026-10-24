@@ -79,6 +79,10 @@ and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
 warm decode buckets before use and test crossing a bucket without retracing.
 Long generation may prepare chunk shapes without preparing full prompt logits.
 Report physical process peaks as well as tensor-size budgets.
+For prefill tuning, keep warm shapes, admission and execution derived from the
+same family-owned schedule. Record construction-time chunk overrides and
+separate their BF16 numerical evidence from decode-attention changes. A 2 GiB
+allocator-cache limit is separate from live KV memory.
 
 Ordinary asynchronous text decode can use `LlmTrait::token_sequence` while the
 shared loop retains publication, EOS, budget and cancellation. Compiled Qwen3
