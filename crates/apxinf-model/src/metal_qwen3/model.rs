@@ -13,7 +13,7 @@ use crate::llm_trait::{
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::fusions::QkNormRope;
+use apxinf_mlx::fusions::{Bf16QkTableRope, QkNormRope};
 use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
 use std::{
     collections::{HashMap, HashSet},
@@ -91,7 +91,10 @@ impl Seams {
         })?;
         let c = config.clone();
         let block = if decoder {
-            Some(Compiled::new(stream, 3, move |a| decoder_block(a, &c))?)
+            let table_rope = Bf16QkTableRope::new(stream)?;
+            Some(Compiled::new(stream, 3, move |a| {
+                decoder_block(a, &c, &table_rope)
+            })?)
         } else {
             None
         };
@@ -101,7 +104,7 @@ impl Seams {
 
 /// Pure B=1/L=1 block. Weights, index, table row and KV state are explicit inputs.
 /// No mutable request state, host readback, or model object is captured.
-fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
+fn decoder_block(a: &[Array], c: &Qwen3Config, table_rope: &Bf16QkTableRope) -> Result<Vec<Array>> {
     if a.len() != 18 {
         return Err(err("Qwen3 decoder block expects 18 arrays"));
     }
@@ -128,8 +131,7 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
         .matmul(&a[12])?
         .reshape(&[1, 1, c.num_key_value_heads, c.head_dim])?
         .transpose(&[0, 2, 1, 3])?;
-    let q = rotate(&q, cos, sin, c.head_dim)?;
-    let k = rotate(&k, cos, sin, c.head_dim)?;
+    let (q, k) = table_rope.call(&q, &k, cos, sin)?;
     let keys = keys.slice_update(&k, index, &[2])?;
     let values = values.slice_update(&v, index, &[2])?;
     let width = a[17].shape()[0];

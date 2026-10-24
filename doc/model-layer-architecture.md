@@ -198,6 +198,12 @@ FP32 weights preserve ordered FP32 normalization for `bf16-public` and
 another mode argument or an unused alternate weight array. A second arithmetic
 contract using BF16 weights would require a richer private representation.
 
+Qwen3's compiled decoder block captures an immutable `Bf16QkTableRope` from
+`apxinf-mlx` for its established-prefix path. The backend owns paired table
+rotation, shape validation and device indexing. The family still supplies
+explicit Q/K and table operands and owns normalization, positions and KV updates.
+Prefill and the fresh first-token path keep their local RoPE composition.
+
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
 separately migrated; do not rename or import them as part of an unrelated port.

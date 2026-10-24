@@ -1,4 +1,5 @@
 //! Safe, shape-bound device fusions with explicit rounding contracts.
+pub use crate::bf16_qk_table_rope::Bf16QkTableRope;
 pub use crate::qk_norm_rope::QkNormRope;
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};

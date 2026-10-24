@@ -129,6 +129,14 @@ Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
 official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
 
+`Bf16QkTableRope` is a safe backend operation for BF16 Q `[1,Hq,1,D]`, K
+`[1,Hk,1,D]` and tables `[1,1,1,D]`, with positive heads and positive even D.
+It accepts array views and rounds each half-split product and sum to BF16.
+Qwen3 selects it only inside established-prefix `bf16-compiled` decoder blocks,
+after native Q/K normalization. Local prefill RoPE, `bf16-public`, and
+`mixed-w8` retain their existing operations. The backend owns launch geometry
+and bounds checks; Qwen3 owns table preparation, position and KV updates.
+
 The MLX allocator cache budget is process-wide and belongs to the embedding
 application, applied once before model loading. A cache limit does not cap
 active tensors or physical process memory. MiniCPM5 64K qualification on the
