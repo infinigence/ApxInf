@@ -1,6 +1,6 @@
 # Native Qwen3 on MLX
 
-This Metal-specific module owns checkpoint interpretation, ordered forward computation and
+This Metal-specific module owns checkpoint interpretation, forward computation and
 request KV state. It calls safe `apxinf-mlx` array operations, without Python or
 an external model provider. Initial target: Qwen/Qwen3-0.6B revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, original BF16 weights, batch one,
@@ -14,16 +14,31 @@ RoPE scaling and contexts beyond the checkpoint limit are rejected.
 of `hidden_size / num_attention_heads` (64). Sliding-window attention, RoPE
 scaling, projection biases and alternative activations are rejected. `weights.rs`
 checks every key, dtype and shape; maps HF `[out,in]` matrices to canonical
-`[in,out]` private views; preserves tied embedding storage; and caches FP32 norm
-weights. Unrecognized checkpoint tensors fail loading.
+`[in,out]` private views; preserves tied embedding storage; and prepares norm
+weights once. `bf16-compiled` retains checkpoint BF16 norm weights.
+`bf16-public` and `mixed-w8` materialize FP32 norm weights.
+Unrecognized checkpoint tensors fail loading.
 
 The BF16 selections are `bf16-public` and `bf16-compiled` (default).
-Both preserve FP32 norm statistics and weight multiplication before the BF16
-cast, BF16 cos/sin tables, and the two separate BF16 RoPE multiplication results.
-The compiled selection additionally prepares local norm/RoPE functions and the
-complete B1/L1 decoder block with explicit input/output KV arrays. Prefill uses
-the same ordered layer composition with compiled local seams. Whole decode-step
-compilation is not implemented or claimed by this selection.
+`bf16-public` computes norm statistics and weight multiplication in FP32 before
+the BF16 cast. `bf16-compiled` uses native weighted RMSNorm with BF16 activations
+and prepared BF16 weights for input, post-attention, Q, K, and final norms,
+including prefill. This changes normalization rounding. The text-fixed check
+differs at 222 of 1024 tokens from b2d58ea; external-teacher agreement is 221/222,
+with neither language below its reference. Five clean 1K blocks improve total
+time against the ordered implementation. The full MLX matrix remains pending.
+Both selections retain BF16 cos/sin tables and the two separate BF16 RoPE
+multiplication results. The compiled selection prepares local norm/RoPE functions
+and the complete B1/L1 decoder block with explicit input/output KV arrays.
+Prefill uses the same layer composition with compiled local seams. Whole
+decode-step compilation is not implemented or claimed by this selection.
+
+The private norm weight dtype selects the arithmetic. BF16 weights require BF16
+activations and select native weighted RMSNorm. FP32 weights select the ordered
+FP32 expression. The loader prepares one representation for every norm site,
+including the final norm, with no inference-time weight cast or alternate copy.
+The existing tiny public/compiled trajectory assertions remain unchanged.
+Historical qualification below predates this arithmetic change.
 
 `mixed-w8` uses affine 8-bit quantization with group size 64: W8 Q/K/V/O,
 fused gate/up and down projections only

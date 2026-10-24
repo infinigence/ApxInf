@@ -24,13 +24,19 @@ fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn norm(x: &Array, weight_fp32: &Array, epsilon: f32) -> Result<Array> {
-    let f = x.cast(MlxDType::F32)?;
-    let variance = f.mul(&f)?.mean(&[-1], true)?;
-    let reciprocal = variance
-        .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
-        .rsqrt()?;
-    f.mul(&reciprocal)?.mul(weight_fp32)?.cast(x.dtype())
+fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
+    match weight.dtype() {
+        MlxDType::BF16 if x.dtype() == MlxDType::BF16 => x.fast_rms_norm(weight, epsilon),
+        MlxDType::F32 => {
+            let f = x.cast(MlxDType::F32)?;
+            let variance = f.mul(&f)?.mean(&[-1], true)?;
+            let reciprocal = variance
+                .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
+                .rsqrt()?;
+            f.mul(&reciprocal)?.mul(weight)?.cast(x.dtype())
+        }
+        _ => Err(err("unsupported Qwen3 prepared norm dtype pair")),
+    }
 }
 
 fn rotate(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
@@ -73,7 +79,7 @@ impl Seams {
         let dims = config.head_dim;
         let norm = Compiled::new(stream, 1, move |a| {
             if a.len() != 2 {
-                return Err(err("norm trace requires x and FP32 weight"));
+                return Err(err("norm trace requires x and prepared weight"));
             }
             Ok(vec![norm(&a[0], &a[1], eps)?])
         })?;
